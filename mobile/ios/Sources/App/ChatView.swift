@@ -36,6 +36,8 @@ struct ChatView: View {
 struct ChatConversationView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.appCanvas) private var canvas
+    @Environment(\.chatFont) private var chatFont
 
     let conversation: ChatConversation
     var title: String
@@ -67,7 +69,7 @@ struct ChatConversationView: View {
                     .frame(maxWidth: .infinity)
             }
         }
-        .background(Color(uiColor: .systemBackground))
+        .background(canvas)
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
@@ -201,7 +203,7 @@ struct ChatConversationView: View {
         } label: {
             Text("Jump to latest")
                 .font(Theme.Typography.secondary.weight(.medium))
-                .foregroundStyle(.white)
+                .foregroundStyle(Theme.ink)
                 .padding(.horizontal, Theme.Spacing.x4)
                 .padding(.vertical, Theme.Spacing.x2)
                 .background(Theme.live)
@@ -246,43 +248,28 @@ struct ChatConversationView: View {
         .id(item.message.id)
     }
 
-    @ViewBuilder
     private var inputBar: some View {
-        if #available(iOS 26, *) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(alignment: .bottom, spacing: 12) {
-                    composerField
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 26))
-                    sendButton
-                        .buttonStyle(.glassProminent)
-                        .buttonBorderShape(.circle)
-                        .controlSize(.large)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
-        } else {
-            HStack(alignment: .bottom, spacing: 12) {
-                composerField
-                    .textFieldStyle(.roundedBorder)
-                sendButton
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.large)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.bar)
+        HStack(alignment: .bottom, spacing: 8) {
+            composerField
+                .padding(.vertical, 12)
+                .padding(.leading, 14)
+            sendButton
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.circle)
+                .frame(minWidth: 44, minHeight: 44)
+                .padding(4)
         }
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Theme.edge.opacity(0.35), lineWidth: 0.5))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 
     private var composerField: some View {
         @Bindable var conversation = conversation
         return TextField(placeholder, text: $conversation.draft, axis: .vertical)
             .focused($composerFocused)
-            .font(.body)
+            .font(chatFont)
             .lineLimit(1...5)
             .submitLabel(.send)
             .onSubmit { sendDraft() }
@@ -362,6 +349,7 @@ enum ChatErrorCopy {
 // renders as plain `alert` text (it's the app's own copy, not model
 // content, so it is never run through the Markdown renderer).
 private struct MessageBubbleRow: View {
+    @Environment(\.chatFont) private var chatFont
     let message: ChatMessage
     let maxContainerWidth: CGFloat
 
@@ -377,7 +365,7 @@ private struct MessageBubbleRow: View {
     private var bubbleContent: some View {
         if message.isFailed {
             Text(message.text)
-                .font(Theme.Typography.body)
+                .font(chatFont)
                 .foregroundStyle(Theme.alert)
         } else if message.text.isEmpty && message.isStreaming {
             TypingIndicatorView()
@@ -385,8 +373,8 @@ private struct MessageBubbleRow: View {
             MarkdownContent(blocks: MarkdownParser.parse(message.text))
         } else {
             Text(message.text)
-                .font(.body)
-                .foregroundStyle(.white)
+                .font(chatFont)
+                .foregroundStyle(Theme.ink)
                 .textSelection(.enabled)
         }
     }
@@ -412,7 +400,7 @@ private struct MessageBubbleRow: View {
 
     // Messages remain in the content layer; glass belongs to the controls.
     private var fill: Color {
-        message.role == .user ? .blue : Color(uiColor: .secondarySystemBackground)
+        message.role == .user ? Color(uiColor: .secondarySystemBackground) : .clear
     }
 
     // DESIGN.md: "radius 18 with the bottom-trailing corner at 4" (you) /

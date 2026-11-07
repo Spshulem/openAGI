@@ -142,7 +142,8 @@ struct AgentConnectionRow: View {
     var body: some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
-                Text(model.hostLabel).font(.subheadline)
+                Text(model.isOnPhone ? "This iPhone" : (model.credentials.server.host?.components(separatedBy: ".").first ?? model.hostLabel))
+                    .lineLimit(1).truncationMode(.middle)
                 Text(model.dataStatus).font(.caption).foregroundStyle(.secondary)
             }
         } icon: {
@@ -150,6 +151,8 @@ struct AgentConnectionRow: View {
                 .foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)
+        .padding(.vertical, 4)
+        .listRowBackground(Color.clear)
         .accessibilityIdentifier("agent-connection")
     }
 }
