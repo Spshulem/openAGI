@@ -153,6 +153,25 @@ function armStartupExitGuard() {
   });
 }
 
+// ─── A dev server dies with whoever started it ────────────────────────────
+//
+// An agent or terminal that ran the server and then went away left it
+// reparented to init, running the fleet scan for days. launchd and systemd
+// start it under pid 1 already, so only a parent that changes is a death.
+// The Mac app wants the same: its daemon must not outlive it.
+// OPENAGI_SURVIVE_PARENT=1 keeps a deliberately backgrounded server.
+export function watchParent(onOrphan, { intervalMs = 15_000, getPpid = () => process.ppid, env = process.env } = {}) {
+  const parent = getPpid();
+  if (env.OPENAGI_SURVIVE_PARENT === "1" || parent <= 1) return () => {};
+  const timer = setInterval(() => {
+    if (getPpid() === parent) return;
+    clearInterval(timer);
+    onOrphan();
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 // Boot env + start the hosted interface. Returns the listen address.
 // host/port fall back to HOST/PORT env then sane defaults; callers (the CLI)
 // can override.
@@ -214,8 +233,10 @@ export async function startServer({ host, port } = {}) {
   const onInt = () => onSignal("SIGINT");
   process.once("SIGTERM", onTerm);
   process.once("SIGINT", onInt);
+  const stopParentWatch = isMobileProfile() ? () => {} : watchParent(() => onSignal("parent-exit"));
   app.close = async () => {
     stopDiscovery();
+    stopParentWatch();
     process.removeListener("SIGTERM", onTerm);
     process.removeListener("SIGINT", onInt);
     return await originalClose();
