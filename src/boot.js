@@ -153,6 +153,26 @@ function armStartupExitGuard() {
   });
 }
 
+// ─── A dev server dies with whoever started it ────────────────────────────
+//
+// An agent or terminal that ran the server and then went away left it
+// reparented to init, running the fleet scan for days. launchd and systemd
+// start it under pid 1 already, so only a parent that changes is a death.
+// The Mac app wants the same: its daemon must not outlive it.
+// OPENAGI_SURVIVE_PARENT=1 keeps a deliberately backgrounded server.
+// Pass the parent read before startup: one that exits mid-boot would
+// otherwise look like pid 1 and switch the watch off.
+export function watchParent(onOrphan, { intervalMs = 15_000, getPpid = () => process.ppid, parent = getPpid(), env = process.env } = {}) {
+  if (env.OPENAGI_SURVIVE_PARENT === "1" || parent <= 1) return () => {};
+  const timer = setInterval(() => {
+    if (getPpid() === parent) return;
+    clearInterval(timer);
+    onOrphan();
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 // Boot env + start the hosted interface. Returns the listen address.
 // host/port fall back to HOST/PORT env then sane defaults; callers (the CLI)
 // can override.
@@ -163,6 +183,7 @@ function armStartupExitGuard() {
 // Linux installer used to set no token, which is precisely that hole — so this
 // is enforced here, fatally, rather than warned about.
 export async function startServer({ host, port } = {}) {
+  const parent = process.ppid;
   installCrashGuards();
   armStartupExitGuard();
   const dataDir = loadBootEnv();
@@ -214,8 +235,10 @@ export async function startServer({ host, port } = {}) {
   const onInt = () => onSignal("SIGINT");
   process.once("SIGTERM", onTerm);
   process.once("SIGINT", onInt);
+  const stopParentWatch = isMobileProfile() ? () => {} : watchParent(() => onSignal("parent-exit"), { parent });
   app.close = async () => {
     stopDiscovery();
+    stopParentWatch();
     process.removeListener("SIGTERM", onTerm);
     process.removeListener("SIGINT", onInt);
     return await originalClose();
