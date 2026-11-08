@@ -1,4 +1,4 @@
-@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 
 package sh.openagi.mobile.ui
 
@@ -391,8 +391,10 @@ fun ChatScreen(
     onComposerFocusChanged: (Boolean) -> Unit = {},
 ) {
     val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    var showingHistory by remember { mutableStateOf(false) }
+    var historyQuery by remember { mutableStateOf("") }
     var showingFallback by remember { mutableStateOf(false) }
-    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context, localAgentMode = credentials.isEmbedded) { showingFallback = false }
     val scope = rememberCoroutineScope()
     // Starts at the newest line (an index past the end is clamped to the
     // last item), so a reopened chat never flashes its oldest messages
@@ -407,12 +409,45 @@ fun ChatScreen(
     var isStreaming by conversationState.isStreaming
     var nextId by conversationState.nextId
 
+    // Both the history picker and the message list need the same row offset.
+    val olderExhausted by conversationState.olderExhausted
+    val loadingOlder by conversationState.loadingOlder
+    val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
+
+    var userScrolledAway by remember { mutableStateOf(false) }
+    if (showingHistory) {
+        androidx.compose.material3.ModalBottomSheet(onDismissRequest = { showingHistory = false }) {
+            Column(Modifier.fillMaxWidth().padding(24.dp)) {
+                Text("Conversation history", style = MaterialTheme.typography.headlineSmall)
+                androidx.compose.material3.OutlinedTextField(value = historyQuery, onValueChange = { historyQuery = it },
+                    label = { Text("Search saved messages") }, modifier = Modifier.fillMaxWidth())
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 480.dp)) {
+                    itemsIndexed(messages.filter { entry ->
+                        val text = when (entry) { is ChatEntry.User -> entry.text; is ChatEntry.Assistant -> entry.text }
+                        historyQuery.isBlank() || text.contains(historyQuery, ignoreCase = true)
+                    }) { _, entry ->
+                        androidx.compose.material3.ListItem(
+                            headlineContent = { Text(when (entry) { is ChatEntry.User -> entry.text; is ChatEntry.Assistant -> entry.text }, maxLines = 3) },
+                            supportingContent = { Text(if (entry is ChatEntry.User) "You" else "OpenAGI") },
+                            modifier = Modifier.clickable {
+                                val index = messages.indexOfFirst { it.id == entry.id }
+                                showingHistory = false
+                                if (index >= 0) {
+                                    userScrolledAway = true
+                                    scope.launch { listState.scrollToItem(index + if (showLoadOlder) 1 else 0) }
+                                }
+                            })
+                    }
+                }
+            }
+        }
+    }
+
     // DESIGN.md: "the list stays pinned to the bottom while the user has not
     // scrolled away; if they have scrolled up, do not yank them back." Only
     // the person's own drags and flings decide that (see ChatScroll); the
     // list merely having more below it, as it does on first open or while a
     // reply grows, never counts as scrolling away.
-    var userScrolledAway by remember { mutableStateOf(false) }
     val userScroll = remember {
         object : NestedScrollConnection {
             // Programmatic scrolls (following, Jump to latest) bypass nested
@@ -544,12 +579,6 @@ fun ChatScreen(
         conversationState.requestRefresh(client)
     }
 
-    // "Load earlier messages" sits above the oldest line while the shared
-    // thread may have more (PROTOCOL.md §3.1's before cursor).
-    val olderExhausted by conversationState.olderExhausted
-    val loadingOlder by conversationState.loadingOlder
-    val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
-
     // Opening a chat, or coming back to one, shows the newest message: once
     // the list has laid out anything, go to the very end. After that, keep
     // the end in view whenever there is more below it (a reply streaming in,
@@ -576,7 +605,12 @@ fun ChatScreen(
                     connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
                     onBack = onBack,
                 )
-                if (title == "Chat" || !streamAttached) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    androidx.compose.material3.TextButton(onClick = { showingHistory = true }) { Text("History") }
+                    if (credentials.isEmbedded) androidx.compose.material3.TextButton(onClick = { showingFallback = true }) { Text("Gemini Nano · On this phone") }
+                    else Text("Connected agent", style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(12.dp))
+                }
+                if (!credentials.isEmbedded && (title == "Chat" || !streamAttached)) {
                     androidx.compose.material3.TextButton(onClick = { showingFallback = true }, enabled = !isStreaming) {
                         Text(if (streamAttached) "Chat without server" else "Server reconnecting · Use local or hosted chat")
                     }
@@ -645,12 +679,14 @@ fun ChatScreen(
                         }
                     }
 
-                    if (messages.isEmpty() && starters.isNotEmpty()) {
-                        StarterChips(
-                            starters = starters,
-                            onPick = { start(it) },
-                            modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
-                        )
+                    if (messages.isEmpty()) {
+                        Column(Modifier.align(Alignment.Center).padding(gutter), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Text("What would you like to do?", style = MaterialTheme.typography.headlineLarge)
+                            Text(if (credentials.isEmbedded) "Your agent, tasks and conversations live on this phone." else "Plan your day, keep track of work, or ask your agent for help.",
+                                style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            StarterChips(starters = starters.ifEmpty { listOf("Help me plan my day", "Show my tasks", "Remember something for me") },
+                                onPick = { inputText = it })
+                        }
                     }
 
                     if (showJump) {

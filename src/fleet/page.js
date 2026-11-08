@@ -10,7 +10,7 @@ export const fleetPage = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1411">
-<title>Fleet - OpenAGI</title>
+<title>Supervisor - OpenAGI</title>
 <style>
 :root{color-scheme:dark;--bg:#0e1411;--surface:#141d18;--raise:#1b2721;--line:#27372e;--text:#e6efe9;--soft:#c3d2c9;--muted:#8fa397;--accent:#6fe1b1;--ink:#05110b;--warn:#f0c36a;--hot:#ff8f7e}
 *{box-sizing:border-box}
@@ -94,7 +94,8 @@ a.btn.primary{color:var(--ink)}
 </style></head>
 <body><div class="wrap">
 <header>
-  <div class="top"><h1>Fleet</h1><button id="scan" class="btn primary" type="button">Scan now</button></div>
+  <div class="top"><h1>Supervisor</h1><button id="scan" class="btn primary" type="button">Scan now</button></div>
+  <p class="hint">Your coding conversations, work in progress, and questions that need you. This works without glasses.</p>
   <div class="seg" role="group" aria-label="Mode">
     <button id="mode-observe" type="button" data-mode="observe" aria-pressed="false">Observe</button>
     <button id="mode-propose" type="button" data-mode="propose" aria-pressed="false">Propose</button>
@@ -104,12 +105,13 @@ a.btn.primary{color:var(--ink)}
   <div class="meta"><span id="scanned">Loading</span><span id="timer"></span><a href="/">Dashboard</a></div>
   <p id="lastError" class="lasterr"></p>
   <p id="status" class="status" role="status" aria-live="polite"></p>
+  <a id="reconnect" href="/?tab=nodes" target="_blank" rel="noopener noreferrer" hidden>Connection settings</a>
 </header>
 <main>
   <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div>
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
-  <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
+  <section aria-labelledby="infraH"><h2 id="infraH">System status</h2><div id="infraStrip" class="strip"></div></section>
   <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
   <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
 </main>
@@ -316,7 +318,7 @@ a.btn.primary{color:var(--ink)}
     var data = null;
     try { data = await res.json(); } catch (e) { data = null; }
     if (!res.ok) {
-      var message = res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
+      var message = data && data.error === 'main-pairing-required' ? 'Reconnect this desktop to your agent to see the same work as your phone. Your phone connection is unchanged.' : res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
       var err = new Error(message);
       err.status = res.status;
       err.data = data;
@@ -979,6 +981,16 @@ a.btn.primary{color:var(--ink)}
       if (errorShown) say('');
     } catch (e) {
       say(e.status ? e.message : 'Cannot reach OpenAGI. Retrying.', true);
+      if (e.data && e.data.error === 'main-pairing-required') {
+        var link = document.getElementById('reconnect'); link.hidden = false;
+        try {
+          var roster = await api('/nodes');
+          var origin = new URL(roster.pairedTo);
+          if ((origin.protocol === 'https:' || origin.protocol === 'http:') && !origin.username && !origin.password) {
+            link.href = origin.origin; link.textContent = 'Open your connected agent';
+          }
+        } catch (_) { /* The connection settings link remains available. */ }
+      }
     } finally {
       schedule();
     }

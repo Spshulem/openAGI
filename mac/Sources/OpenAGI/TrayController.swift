@@ -50,6 +50,9 @@ struct TrayMenu: View {
   @ObservedObject var capturePermissions: CapturePermissions = CapturePermissions.shared
   // Observe the outreach consumer so the pending-count line stays live.
   @ObservedObject var outreach: OutreachConsumer = OutreachConsumer.shared
+  @ObservedObject var approvals = PendingApprovalConsumer.shared
+  @ObservedObject var brief = BriefConsumer.shared
+  @ObservedObject var fleet = FleetConsumer.shared
   // Sparkle owns the persisted preferences; observing the wrapper keeps these
   // toggles in sync after the user changes one from the tray.
   @ObservedObject var updates: UpdateController = UpdateController.shared
@@ -74,7 +77,11 @@ struct TrayMenu: View {
   // language and the agent's add_task tool routes it. Top-task entries +
   // "View all" still go to the Tasks tab for the structured view.
   @ViewBuilder private var tasksSection: some View {
-    if state.topTasks.isEmpty {
+    if state.tasksUnavailable {
+      Button("Tasks unavailable — open dashboard…") { state.openDashboard(path: "/?tab=tasks") }
+    } else if !state.tasksLoaded {
+      Text("Loading tasks…").disabled(true).font(.caption)
+    } else if state.topTasks.isEmpty {
       Text("No pending tasks").disabled(true).font(.caption)
     } else {
       Text("Top tasks").disabled(true).font(.caption)
@@ -89,11 +96,15 @@ struct TrayMenu: View {
   // Proactive-outreach items needing the user. Count acts as the tray "badge";
   // opening it summons the Quick Ask overlay where the full list + buttons live.
   @ViewBuilder private var outreachSection: some View {
-    let count = outreach.items.count
+    let count = AttentionBadge.count(
+      briefKeys: brief.items.map { item in
+        item.entityRef.map { "\($0.kind):\($0.id)" } ?? "brief:\(item.id)"
+      }, outreach: outreach.items, approvalIDs: approvals.items.map(\.id),
+      fleetIDs: fleet.available ? fleet.questions.map(\.id) : [])
     if count > 0 {
       Button("● \(count) need\(count == 1 ? "s" : "") you…") {
         // Supervisor when every item is a question that tab lists instead.
-        OverlayState.shared.selectTab(FleetConsumer.shared.tab(showing: outreach.items))
+        OverlayState.shared.selectTab(!approvals.items.isEmpty || !brief.items.isEmpty ? .tasks : fleet.tab(showing: outreach.items))
         OverlayController.shared.show()
         OverlayState.shared.expanded = true
       }

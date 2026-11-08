@@ -1,3 +1,4 @@
+import { imageContent, imageHistory } from "./message-attachments.js";
 import { buildDefaultInstructions, buildTurnContext, toolResultImage } from "./model-provider.js";
 import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 
@@ -16,7 +17,7 @@ export class LocalModelProvider {
 
   isConfigured() { return Boolean(this.model.trim()); }
 
-  async generate({ input, instructions, turnContext, scrutiny, memoryHits = [], messages = [], agent,
+  async generate({ input, attachments = [], instructions, turnContext, scrutiny, memoryHits = [], messages = [], agent,
     toolRegistry, context = {}, onProgress, onTextDelta, maxToolHops }) {
     if (!this.isConfigured()) throw new Error("Choose a model installed in your local model server.");
     const endpoint = new URL(this.baseUrl);
@@ -27,8 +28,8 @@ export class LocalModelProvider {
     const system = { role: "system", content: instructions ?? buildDefaultInstructions({ agent }) };
     const reference = turnContext ?? buildTurnContext({ scrutiny, memoryHits });
     const conversation = [
-      ...messages.slice(-12).map(message => budget.mark({ role: message.role === "assistant" ? "assistant" : "user", content: String(message.content ?? "") }, { kind: "history" })),
-      budget.mark({ role: "user", content: reference ? `${reference}\n\n${input}` : String(input) }, { kind: "anchor" })
+      ...imageHistory(messages, input, attachments).map(message => budget.mark({ role: message.role === "assistant" ? "assistant" : "user", content: imageContent(String(message.content ?? ""), message.role === "user" ? message.metadata?.attachments : [], "chat") }, { kind: "history" })),
+      budget.mark({ role: "user", content: imageContent(reference ? `${reference}\n\n${input}` : String(input), attachments, "chat") }, { kind: "anchor" })
     ];
     const tools = (toolRegistry?.toOpenAITools?.() ?? []).map(tool => ({ type: "function", function: {
       name: tool.name, description: tool.description, parameters: tool.parameters ?? { type: "object", properties: {} }

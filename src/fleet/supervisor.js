@@ -95,6 +95,9 @@ const REVIEW_BACKOFF_MAX = 2;
 const JUDGE_MAX_PER_TICK = 6;
 const JUDGE_CONCURRENCY = 3;
 const JUDGE_CACHE_MS = 2 * 60 * MIN;
+// Idle dependencies can finish without a new chat message. Reassess them
+// periodically instead of treating an old worker report as current for hours.
+const IDLE_JUDGE_CACHE_MS = 10 * MIN;
 const JUDGE_DOWN_MS = 5 * MIN;
 const JUDGE_CALL_MS = 45_000;
 // All judge calls in one scan end by then (a call reads in ~10-20 s): each
@@ -216,7 +219,7 @@ function pausedDeliveryDecision(delivery, blockedSince, now) {
 // An automatic nudge the judge reads first. A resume after a limit reset or
 // an error retry stays mechanical.
 function judgeable(decision, thread) {
-  if (decision?.action !== "nudge" || !decision.message || !decision.route || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
+  if (decision?.action !== "nudge" || !decision.message || (!decision.route && !decision.requiresJudge) || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
   if (decision.playbook !== "resume") return true;
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
@@ -433,7 +436,7 @@ function ownerSpokeAt(thread) {
 }
 
 // How much of the agent's last message a thread's detail shows.
-const DETAIL_EXCERPT_MAX = 1200;
+const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
 // answered in the agent's app, never here.
 const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
@@ -1594,7 +1597,11 @@ export class FleetSupervisor {
     const thread = this.lastThreads.get(threadKey);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-    if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    if (!thread || !route) {
+      const detail = this.noRouteDetail(thread, deliveryState);
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
+      return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
+    }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
@@ -1604,7 +1611,9 @@ export class FleetSupervisor {
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
-    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
+      ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
   // One thread, expanded for the owner: the agent's last message and when,
@@ -1632,6 +1641,10 @@ export class FleetSupervisor {
       reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
       lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
       lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
+      lastOwnerMessage: thread && ownerSpokeAt(thread)
+        ? { text: clampTail(redactSecrets(thread.lastUserText ?? ""), DETAIL_EXCERPT_MAX), at: ownerSpokeAt(thread) }
+        : null,
+      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (thread && ownerSpokeAt(thread) ? String(thread.lastUserText ?? "").length > DETAIL_EXCERPT_MAX : false),
       lastActivityAt: row.lastActivityAt ?? null,
       pr: row.pr ?? null,
       watch: row.watch ?? null,
@@ -1899,7 +1912,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -2004,7 +2017,7 @@ export class FleetSupervisor {
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
       const key = judgeCacheKey(thread, decision, item.pr, item.classified, history.get(thread.key) ?? []);
       const cached = this.judgeCache.get(key);
-      if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
+      if (cached && started - cached.at < (decision.requiresJudge ? IDLE_JUDGE_CACHE_MS : JUDGE_CACHE_MS)) item.decision = this.applyJudgeVerdict(item, cached.verdict);
       else due.push({ item, key });
     }
     if (!due.length) return;
@@ -2088,6 +2101,8 @@ export class FleetSupervisor {
     const { decision, thread } = item;
     if (verdict.action === "wait") return judgeWait(decision, `judge: ${verdict.reason}`, false);
     if (verdict.action === "send") {
+      // Establish unfinished work before surfacing an unavailable route.
+      if (decision.deferredRouteDecision) return { ...decision.deferredRouteDecision, judged: true, reason: `${decision.deferredRouteDecision.reason}; judge: ${verdict.reason}` };
       const messageHash = shortHash(verdict.message);
       // The same words as the last send, with no reply since, is noise.
       const repeat = repeatsLastSend(thread, item.ledger, messageHash);
@@ -2351,7 +2366,9 @@ export class FleetSupervisor {
     const since = !SETTLED_PR_STATES.has(pr?.state);
     const about = PR_PLAYBOOKS.has(decision.playbook)
       || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
-    if (!since && !about) return null;
+    const reviewedPostMerge = decision.playbook === "idle-report" && decision.requiresJudge === true
+      && decision.judged === true && pr?.state === "MERGED" && fresh.state === "MERGED";
+    if (!since && (!about || reviewedPostMerge)) return null;
     return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }
 
@@ -2526,7 +2543,7 @@ export class FleetSupervisor {
       // The judge reads every automatic nudge first: one this scan did not
       // judge (the owner switched to Auto after judgeNudges ran) waits for
       // the next scan instead of going out unread.
-      if (judgeOn && !decision.judged && judgeable(decision, target)) {
+      if (!decision.judged && (decision.requiresJudge || (judgeOn && judgeable(decision, target)))) {
         decision.reason = `${decision.reason}; held: not judged this scan`;
         continue;
       }

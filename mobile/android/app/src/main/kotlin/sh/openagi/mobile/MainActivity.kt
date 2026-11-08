@@ -1,5 +1,10 @@
 package sh.openagi.mobile
 
+import sh.openagi.mobile.embedded.EmbeddedAgent
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -95,7 +100,7 @@ class MainActivity : ComponentActivity() {
     private val pendingTabState = mutableStateOf<AppTab?>(null)
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+        if (granted) SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value?.isEmbedded == false)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -116,6 +121,8 @@ class MainActivity : ComponentActivity() {
             // (configChanges in the manifest); rememberSaveable still keeps
             // the tab if Android recreates the Activity for another reason.
             var selectedTab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
+            var localStarting by remember { mutableStateOf(false) }
+            var localError by remember { mutableStateOf<String?>(null) }
             val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
             // Lifelog opens from Today; six tabs leave no room for a seventh.
             var lifelogOpen by rememberSaveable { mutableStateOf(false) }
@@ -129,14 +136,36 @@ class MainActivity : ComponentActivity() {
             // cancelled before the forget finished.
             val switchScope = rememberCoroutineScope()
 
+            fun usePhone() {
+                if (localStarting) return
+                localStarting = true
+                localError = null
+                switchScope.launch {
+                    try {
+                        val local = EmbeddedAgent.start(this@MainActivity, credentialsState.value, activate = false)
+                        sh.openagi.mobile.sync.activateWorkspace(this@MainActivity, local)
+                        credentialsState.value = local
+                        replaySetup = false
+                        selectedTab = AppTab.CHAT
+                    } catch (_: LinkageError) {
+                        localError = "This build couldn't load the phone agent. Your server pairing and phone data are kept. Update OpenAGI and try again."
+                    } catch (_: Exception) {
+                        localError = "Couldn't start the phone agent. Your server pairing and phone data are kept. Close and reopen OpenAGI, then try again."
+                    } finally { localStarting = false }
+                }
+            }
+            LaunchedEffect(Unit) {
+                if (credentialsState.value?.isEmbedded == true) usePhone()
+            }
+
             FoldAwareApp(this) {
                 if (credentials == null || replaySetup) {
                     FoldSafeSinglePane {
                         OnboardingScreen(
-                            context = this,
+                            context = this@MainActivity,
                             prefill = pendingPairing,
                             onPaired = {
-                                credentialsState.value = Credentials.load(this)
+                                credentialsState.value = Credentials.load(this@MainActivity)
                                 replaySetup = false
                                 // Spent. Left set, it would reach the paired branch
                                 // below as an incoming link and immediately offer to
@@ -144,6 +173,9 @@ class MainActivity : ComponentActivity() {
                                 pendingPairingState.value = null
                             },
                             onClose = if (credentials != null) ({ replaySetup = false }) else null,
+                            onUsePhone = { usePhone() },
+                            localStarting = localStarting,
+                            localError = localError,
                         )
                     }
                 } else {
@@ -158,13 +190,13 @@ class MainActivity : ComponentActivity() {
                     val supervisorDraft = rememberSaveable(credentials.nodeId) { mutableStateOf("") }
                     val chatConversation = remember(credentials) {
                         ChatConversationState(
-                            conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport,
+                            conversationScope, ChatHistoryStore(Credentials.workspaceDirectory(this@MainActivity, credentials), "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport,
                             draft = chatDraft,
                         )
                     }
                     val supervisorConversation = remember(credentials) {
                         ChatConversationState(
-                            conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD,
+                            conversationScope, ChatHistoryStore(Credentials.workspaceDirectory(this@MainActivity, credentials), "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD,
                             legacySessionKey = SupervisorFormat.LEGACY_SESSION_ID, threadSupport = threadSupport, draft = supervisorDraft,
                         )
                     }
@@ -197,7 +229,7 @@ class MainActivity : ComponentActivity() {
                     }
                     // Once per pairing: the app opened already paired, or a
                     // pairing just completed.
-                    LaunchedEffect(credentials) { startSupervisorAlerts() }
+                    LaunchedEffect(credentials) { if (!credentials.isEmbedded) startSupervisorAlerts() }
                     // Opened from a supervisor notification: show the
                     // questions themselves, not a chat left open over them.
                     val pendingTab = pendingTabState.value
@@ -216,6 +248,12 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    if (localStarting || localError != null) {
+                        AlertDialog(onDismissRequest = { if (!localStarting) localError = null },
+                            title = { Text(if (localStarting) "Starting phone agent" else "Phone agent needs attention") },
+                            text = { if (localStarting) CircularProgressIndicator() else Text(localError.orEmpty()) },
+                            confirmButton = { if (!localStarting) TextButton(onClick = { localError = null }) { Text("Done") } })
+                    }
                     AdaptiveAppScaffold(
                         selected = selectedTab,
                         inboxBadgeCount = inboxBadge,
@@ -262,6 +300,18 @@ class MainActivity : ComponentActivity() {
                                 context = this@MainActivity,
                                 credentials = credentials,
                                 onRevoked = { credentialsState.value = null },
+                                onUsePhone = { usePhone() },
+                                onUseServer = {
+                                    switchScope.launch {
+                                        try {
+                                            val backup = EmbeddedAgent.serverBackup(this@MainActivity)
+                                            sh.openagi.mobile.sync.activateWorkspace(this@MainActivity, backup)
+                                            credentialsState.value = backup
+                                        } catch (_: Exception) {
+                                            localError = "Couldn't switch workspaces. Try again when device storage is available."
+                                        }
+                                    }
+                                },
                                 onRestartSetup = { replaySetup = true },
                             )
                         }
@@ -286,8 +336,15 @@ class MainActivity : ComponentActivity() {
                             incomingServer = pendingPairing.serverUrl,
                             onSwitch = {
                                 switchScope.launch {
-                                    forgetPairing(this@MainActivity, credentials)
-                                    credentialsState.value = null
+                                    try {
+                                        forgetPairing(this@MainActivity, credentials)
+                                        credentialsState.value = null
+                                    } catch (error: Exception) {
+                                        if (error is kotlinx.coroutines.CancellationException) throw error
+                                        android.widget.Toast.makeText(this@MainActivity,
+                                            "Couldn't forget the previous pairing securely. Please try again.",
+                                            android.widget.Toast.LENGTH_LONG).show()
+                                    }
                                 }
                             },
                             onCancel = { pendingPairingState.value = null },
@@ -316,7 +373,8 @@ class MainActivity : ComponentActivity() {
         resumeSignalState.intValue += 1
         // Also how alerts come back after notifications were turned on in
         // system settings, or the service was stopped from the task manager.
-        SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+        if (credentialsState.value?.isEmbedded == true) EmbeddedAgent.reconnect()
+        else SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
     }
 
     // Consumed once, like the pair link above: left on the intent, a later

@@ -524,10 +524,16 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
     return { skipped: true, reason: "insufficient activity across all sources" };
   }
 
-  const candidates = this.runtime.tasks
-    .list({ status: "pending", limit: 30 })
-    .filter((t) => t.queue === "user");
-  if (candidates.length === 0) return { skipped: true, reason: "no pending user tasks" };
+  // Filter the queue before bounding the batch: a busy agent queue must
+  // not hide user work. Progress is not terminal; keep checking it for a
+  // completion receipt. Rotate so an unchanged first page cannot starve
+  // the rest of the backlog. This cursor is process-local and read-only.
+  const eligible = this.runtime.tasks.list({ queue: "user", limit: 100_000 })
+    .filter((t) => t.queue === "user" && ["pending", "in_progress"].includes(t.status));
+  if (eligible.length === 0) return { skipped: true, reason: "no pending user tasks" };
+  const offset = (this.taskScanOffset ?? 0) % eligible.length;
+  const candidates = [...eligible.slice(offset), ...eligible.slice(0, offset)].slice(0, 30);
+  const candidateIds = new Set(candidates.map((t) => t.id));
 
   const provider = this.runtime.agentHost?.modelProvider;
   if (!provider?.isConfigured?.() || provider.constructor.name === "DeterministicModelProvider") {
@@ -617,6 +623,7 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
     return { skipped: true, reason: "could not parse llm output" };
   }
 
+  this.taskScanOffset = (offset + candidates.length) % eligible.length;
   const updates = Array.isArray(parsed?.updates) ? parsed.updates : [];
   let completed = 0;
   let inProgressed = 0;
@@ -631,9 +638,9 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
   );
 
   for (const u of updates) {
-    if (!u?.taskId) continue;
+    if (!u?.taskId || !candidateIds.has(u.taskId)) continue;
     const task = this.runtime.tasks.get(u.taskId);
-    if (!task || task.status === "completed") continue;
+    if (!task || task.queue !== "user" || !["pending", "in_progress"].includes(task.status)) continue;
     const confidence = Number(u.confidence ?? 0);
     const sources = Array.isArray(u.sources) ? u.sources.filter((s) => typeof s === "string") : [];
     const completeThreshold = calibration.thresholdFor(sources).threshold;

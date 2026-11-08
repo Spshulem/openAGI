@@ -183,6 +183,8 @@ struct MarkdownContent: View {
                 blockView(block)
             }
         }
+        .lineLimit(nil)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -221,6 +223,9 @@ struct MarkdownContent: View {
             Text(MarkdownParser.inline(raw))
                 .font(chatFont)
                 .foregroundStyle(Theme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
