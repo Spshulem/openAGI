@@ -229,3 +229,31 @@ test("only owner-listed absolute Git folders are trusted, with a 16k brief and a
   assert.ok(timers.includes(2 * 60 * 60_000), "trusted runs get two hours");
   assert.ok(timers.includes(10 * 60_000), "restricted runs keep ten minutes");
 });
+
+test("copilot runs read-only by default, takes the prompt as one argument and resumes by its own id", t => {
+  const plain = codingArguments("copilot", { message: "Inspect; rm -rf /" });
+  assert.deepEqual(plain.slice(0, 2), ["-p", "Inspect; rm -rf /"]);
+  assert.ok(plain.includes("--allow-tool=read") && plain.includes("--deny-tool=write,shell") && plain.includes("--no-ask-user"));
+  const trusted = codingArguments("copilot", { trusted: true, nativeId });
+  assert.ok(trusted.includes("--allow-tool=read,write,shell(git:*),shell(gh:*),shell(node:*),shell(npm:*)"));
+  assert.ok(!trusted.some(a => /allow-all|yolo/.test(a)));
+  assert.deepEqual(trusted.slice(trusted.indexOf("--session-id")), ["--session-id", nativeId]);
+  assert.equal(codingChildEnv({ HOME: "/h", COPILOT_HOME: "/h/.cp", GITHUB_TOKEN: "x" }).COPILOT_HOME, "/h/.cp");
+});
+
+test("a copilot run completes from its message events and is resumable", t => {
+  const f = fixture(t); const args = f.prepare(); args.provider = "copilot"; f.supervisor.start(args);
+  assert.equal(f.launches[0][1][0], "-p");
+  const c = f.children[0];
+  c.stdout.write(JSON.stringify({ type: "assistant.message", data: { content: "Copilot done" } }) + "\n");
+  c.emit("close", 0);
+  const s = f.supervisor.list().sessions[0];
+  assert.equal(s.status, "idle"); assert.equal(s.provider, "copilot");
+});
+
+test("a copilot error event fails the run", t => {
+  const f = fixture(t); const args = f.prepare(); args.provider = "copilot"; f.supervisor.start(args);
+  f.children[0].stdout.write(JSON.stringify({ type: "assistant.message", data: { content: "x" } }) + "\n" + JSON.stringify({ type: "session.error", data: {} }) + "\n");
+  f.children[0].emit("close", 0);
+  assert.equal(f.supervisor.list().sessions[0].status, "failed");
+});

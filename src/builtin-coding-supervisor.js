@@ -7,7 +7,7 @@ import { StringDecoder } from "node:string_decoder";
 import { readJsonFile, writeJsonAtomic, ensureDir } from "./file-utils.js";
 
 const hash = (value) => crypto.createHash("sha256").update(value).digest("hex");
-const PROVIDERS = ["codex", "claude"];
+const PROVIDERS = ["codex", "claude", "copilot"];
 const MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/;
 const ID = /^[a-f0-9-]{36}$/;
 const MAX_OUTPUT = 2 * 1024 * 1024;
@@ -19,6 +19,8 @@ const MAX_MESSAGE = 4000;
 const TRUSTED_MAX_RUN_MS = 2 * 60 * 60_000;
 const TRUSTED_MAX_MESSAGE = 16_000;
 const TRUSTED_CLAUDE_TOOLS = "Bash(git:*),Bash(gh:*),Bash(node:*),Bash(npm:*)";
+const TRUSTED_COPILOT_TOOLS = "read,write,shell(git:*),shell(gh:*),shell(node:*),shell(npm:*)";
+const LOGIN_COMMANDS = { codex: "codex login", claude: "claude auth login", copilot: "copilot login" };
 
 // A repair brief says where to branch from with this token; prepare puts in
 // the workspace's own default branch: what origin/HEAD names, else main or
@@ -43,7 +45,7 @@ export function repositoryDefaultBranch(cwd, run = spawnSync) {
 
 // A trusted session also needs the owner's own CLI logins and Git push key.
 export function codingChildEnv(env = process.env, { trusted = false } = {}) {
-  const keys = ["HOME", "USER", "PATH", "LANG", "TMPDIR", "CODEX_HOME", ...(trusted ? ["CLAUDE_CONFIG_DIR", "CCODEX_HOME", "SSH_AUTH_SOCK"] : [])];
+  const keys = ["HOME", "USER", "PATH", "LANG", "TMPDIR", "CODEX_HOME", "COPILOT_HOME", ...(trusted ? ["CLAUDE_CONFIG_DIR", "CCODEX_HOME", "SSH_AUTH_SOCK"] : [])];
   return Object.fromEntries(keys.filter(key => env[key] !== undefined).map(key => [key, env[key]]));
 }
 
@@ -78,12 +80,22 @@ export function findCodingExecutable(provider, env = process.env) {
 // inherited from user config. Trusted (a workspace the owner listed on this
 // node): Codex writes inside the workspace with network for git and gh, under
 // the owner's own config and login, and never stops to ask; Claude accepts
-// edits and may run only git, gh, node and npm.
-export function codingArguments(provider, { nativeId, model, effort, trusted = false } = {}) {
+// edits and may run only git, gh, node and npm. Copilot: restricted may only
+// read (write and shell denied, no questions, no built-in MCP servers);
+// trusted may also write and run git, gh, node and npm.
+export function codingArguments(provider, { nativeId, model, effort, trusted = false, message = "" } = {}) {
   if (!PROVIDERS.includes(provider)) throw new Error("Unknown coding provider.");
   if (model && !MODEL.test(model)) throw new Error("Invalid model identifier.");
   if (nativeId && !ID.test(nativeId)) throw new Error("Invalid provider session identifier.");
   if (effort && !["low", "medium", "high"].includes(effort)) throw new Error("Unsupported reasoning effort.");
+  if (provider === "copilot") {
+    const tools = trusted ? ["--allow-tool=" + TRUSTED_COPILOT_TOOLS] : ["--allow-tool=read", "--deny-tool=write,shell"];
+    // --session-id creates the session on first use and resumes it after, so
+    // the supervisor's own UUID is the native id and nothing is parsed for it.
+    // Copilot has no stdin mode: the prompt is one argv entry, never a shell string.
+    return ["-p", message, "--output-format=json", "--no-ask-user", "--no-color", "--no-auto-update", "--disable-builtin-mcps", ...tools,
+      ...(nativeId ? ["--session-id", nativeId] : []), ...(model ? [`--model=${model}`] : []), ...(effort ? [`--effort=${effort}`] : [])];
+  }
   const codexTail = [...(model ? ["--model", model] : []), ...(effort ? ["-c", `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
     ...(nativeId ? ["resume", nativeId] : []), "-"];
   if (provider === "codex" && trusted) return ["exec", "--json", "--color", "never", "--sandbox", "workspace-write",
@@ -155,8 +167,8 @@ export class BuiltinCodingSupervisor {
       workspaces: (this.config.workspaces || []).map((workspace) => ({ id: workspace.id, label: workspace.label, trusted: this.isTrusted(workspace) })),
       providers: PROVIDERS.map(provider => ({ provider, installed: Boolean(this.findExecutable(provider)),
         authentication: "Sign in with the provider CLI; the first approved run verifies the account.",
-        loginCommand: provider === "codex" ? "codex login" : "claude auth login" })),
-      limitation: "Codex runs read-only. Claude keeps manual permissions; denied actions require review in Claude Code. No provider permissions are approved automatically. A workspace listed in OPENAGI_CODING_TRUSTED_WORKSPACES on this computer is trusted instead: Codex writes in it with network and no prompts, Claude accepts edits and runs git, gh, node and npm, for up to two hours. CLI usage is billed by your provider and is not capped by OpenAGI's chat budget." };
+        loginCommand: LOGIN_COMMANDS[provider] })),
+      limitation: "Codex runs read-only. Claude keeps manual permissions; denied actions require review in Claude Code. Copilot may only read files; write and shell tools are denied. No provider permissions are approved automatically. A workspace listed in OPENAGI_CODING_TRUSTED_WORKSPACES on this computer is trusted instead: Codex writes in it with network and no prompts, Claude and Copilot accept edits and run git, gh, node and npm, for up to two hours. CLI usage is billed by your provider and is not capped by OpenAGI's chat budget." };
   }
 
   workspace(id) {
@@ -168,7 +180,7 @@ export class BuiltinCodingSupervisor {
 
   prepare(args) {
     if (process.platform === "win32") throw new Error("The built-in supervisor currently supports macOS and Linux.");
-    if (!PROVIDERS.includes(args.provider)) throw new Error("Choose Claude Code or Codex.");
+    if (!PROVIDERS.includes(args.provider)) throw new Error("Choose Claude Code, Codex or GitHub Copilot.");
     const workspace = this.workspace(args.workspaceId);
     if (!this.findExecutable(args.provider)) throw new Error("Install and sign in to the selected coding CLI first.");
     codingArguments(args.provider, args);
@@ -243,7 +255,9 @@ export class BuiltinCodingSupervisor {
     row.updatedAt = new Date().toISOString();
     this.save(); // Persist before launch; a crash must never cause an automatic retry.
     let child;
-    try { child = this.spawn(executable, codingArguments(row.provider, { ...row, trusted }), { cwd: workspace.path, env: codingChildEnv(this.env, { trusted }), stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    // Copilot resumes by the id we chose; it is recorded only once a run succeeds.
+    const argRow = row.provider === "copilot" ? { ...row, nativeId: row.id, message } : row;
+    try { child = this.spawn(executable, codingArguments(row.provider, { ...argRow, trusted }), { cwd: workspace.path, env: codingChildEnv(this.env, { trusted }), stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { row.status = "failed"; this.save(); throw new Error("Could not start the provider CLI."); }
     const owned = { child, workspaceId: row.workspaceId, stopped: false };
     this.children.set(row.id, owned);
@@ -264,6 +278,14 @@ export class BuiltinCodingSupervisor {
       if (!event || typeof event !== "object" || Array.isArray(event)) return;
       const id = event.thread_id || event.session_id;
       if (ID.test(id || "")) row.nativeId = id;
+      if (row.provider === "copilot") {
+        // Copilot CLI JSONL: assistant.message (data.content), session.error, and a final result record.
+        if (event.type === "assistant.message" && typeof event.data?.content === "string" && event.data.content.trim() && !event.data.parentToolCallId) text = event.data.content.slice(-16000);
+        if (event.type === "session.error" || (event.type === "result" && event.exitCode !== undefined && event.exitCode !== 0)) failed = true;
+        if (event.type === "permission.completed" && event.data?.result?.kind && event.data.result.kind !== "approved") denied = true;
+        if (event.type === "result") completed = true;
+        return;
+      }
       if (event.type === "item.completed" && event.item?.type === "agent_message") text = String(event.item.text || "").slice(-16000);
       if (event.type === "assistant" && Array.isArray(event.message?.content)) text = event.message.content.filter(x => x?.type === "text").map(x => x.text).join("\n").slice(-16000);
       if (event.type === "turn.failed" || event.type === "error" || event.is_error) failed = true;
@@ -289,13 +311,16 @@ export class BuiltinCodingSupervisor {
       this.children.delete(row.id);
       // close confirms this owned process exited; only crash-recovered runs
       // stay interrupted, because their process ownership is unknown.
+      // Copilot may end without a result record; a clean exit with a reply counts.
+      if (row.provider === "copilot" && code === 0 && !failed && text.trim()) completed = true;
+      if (row.provider === "copilot" && completed && code === 0) row.nativeId = row.id;
       row.status = owned.stopped || failed || code !== 0 || !completed || !text.trim() ? "failed" : denied || /\?\s*$/.test(text) ? "waiting" : "idle";
       row.updatedAt = new Date().toISOString();
       row.turns.push({ role: "assistant", text: text || "No verified response. Check provider sign-in, version compatibility, permissions, and usage limits before retrying." });
       row.turns = row.turns.slice(-6);
       this.save(); this.notify();
     });
-    child.stdin.end(message);
+    child.stdin.end(row.provider === "copilot" ? undefined : message);
     this.notify();
     return { provider: row.provider, sessionId: row.id, status: "accepted", note: "The managed session started. This receipt is not proof that the coding task completed." };
   }
