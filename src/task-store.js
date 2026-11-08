@@ -342,7 +342,9 @@ export class TaskStore {
     let out = [...this.tasks.values()];
     if (queue) out = out.filter((t) => t.queue === queue);
     if (bucket) out = out.filter((t) => t.bucket === bucket);
-    if (status) out = out.filter((t) => t.status === status);
+    if (status === "active") out = out.filter((t) => !["completed", "cancelled"].includes(t.status));
+    else if (status === "terminal") out = out.filter((t) => ["completed", "cancelled"].includes(t.status));
+    else if (status) out = out.filter((t) => t.status === status);
     out.sort((a, b) => {
       // Sort by bucket order, then priority desc, then createdAt asc
       const ba = BUCKETS.indexOf(a.bucket);
@@ -471,7 +473,13 @@ export class TaskStore {
         ? Number.isFinite(Date.parse(lease.expiresAt)) && now >= Date.parse(lease.expiresAt)
         : false;
 
-      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired)) {
+      // A deferred claim keeps its attempt count but drops expiresAt. If
+      // resumed manually, it has no timed reservation; recover it after the
+      // same grace period as unleased work rather than wedging it forever.
+      const staleUnreserved = task.status === "in_progress"
+        && !Number.isFinite(Date.parse(lease?.expiresAt ?? ""))
+        && this._isStale(task, now);
+      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired || staleUnreserved)) {
         this._stall(task, attempts, now);
         report.stalled.push(task.id);
         continue;
@@ -482,11 +490,10 @@ export class TaskStore {
         report.requeued.push(task.id);
         continue;
       }
-      // No lease at all + long dead: pre-lease wreckage or an observer
-      // guess nobody acted on. Reclaim it — with attempts reset, since the
-      // queue never actually got a turn at it.
-      if (!lease && this._isStale(task, now)) {
-        this._requeue(task, "stale-in-progress", now, { resetAttempts: true });
+      // No valid reservation + long dead: recover abandoned work. Preserve
+      // recorded attempts; only pre-lease tasks get a fresh attempt budget.
+      if (staleUnreserved) {
+        this._requeue(task, "stale-in-progress", now, { resetAttempts: !lease });
         report.requeued.push(task.id);
       }
     }
@@ -615,14 +622,19 @@ export class TaskStore {
   // Roll up summary stats for dashboards / health.
   stats() {
     const out = {
-      user: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
-      agent: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
+      user: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
+      agent: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
     };
     for (const t of this.tasks.values()) {
       const slot = out[t.queue];
       if (!slot) continue;
       slot.total += 1;
-      if (slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      const terminal = ["completed", "cancelled"].includes(t.status);
+      if (!terminal) {
+        slot.active += 1;
+        if (t.bucket !== "done" && slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      } else if (t.status === "completed") slot.done += 1;
+      else slot.cancelled += 1;
       if (t.status === "pending") slot.pending += 1;
       if (t.status === "completed") slot.completed += 1;
     }

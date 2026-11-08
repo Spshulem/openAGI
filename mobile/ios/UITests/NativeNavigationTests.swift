@@ -18,23 +18,25 @@ final class NativeNavigationTests: XCTestCase {
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
         // Walking every accessibility type can stall while resolving system
         // toolbar snapshots, even for a fully visible native navigation row.
-        let isNativeButton = id == "open-settings" || id == "chat-jump-latest" || id.hasPrefix("inbox-approval-")
+        let isNativeButton = id == "approval-approve" || id == "open-settings" || id == "chat-jump-latest" || id.hasPrefix("inbox-approval-")
         let target = isNativeButton ? app.buttons[id] : element(app, id)
         if let listID {
             let list = element(app, listID)
             XCTAssertTrue(list.waitForExistence(timeout: 5), "Missing list \(listID)")
             // Native lists create offscreen accessibility elements lazily.
             // Scroll the active form, rather than the presenting screen.
+            let needsFullyVisibleTarget = listID == "settings-form" || listID == "approval-form"
             for _ in 0..<8 {
-                // Duo's settings rows can be hittable while their center is
-                // clipped by the form's bottom edge. Other forms keep native
-                // swipes: a coordinate drag can land in an API-key field.
+                // Duo can report a button as hittable with less than one pixel
+                // visible at the form edge. Settings and approval forms need
+                // the entire target visible before tapping. Other forms keep
+                // native swipes: a coordinate drag can land in an API-key field.
                 let viewport = list.frame.insetBy(dx: 16, dy: 88)
-                if target.exists && target.isHittable && (listID != "settings-form" || viewport.contains(target.frame)) {
+                if target.exists && target.isHittable && (!needsFullyVisibleTarget || viewport.contains(target.frame)) {
                     target.tap()
                     return
                 }
-                if listID != "settings-form" {
+                if !needsFullyVisibleTarget {
                     list.swipeUp()
                     continue
                 }

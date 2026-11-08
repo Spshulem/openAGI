@@ -8596,8 +8596,9 @@ async function renderTasks() {
   state.taskFilter = state.taskFilter || { bucket: "all" };
   const targetTaskId = new URLSearchParams(window.location.search).get("task");
   if (targetTaskId) state.taskFilter.bucket = "all";
+  const taskStatus = state.taskFilter.bucket === "done" ? "terminal" : "active";
   let data;
-  try { data = await fetchJson("/tasks?limit=200"); }
+  try { data = await fetchJson("/tasks?limit=200&status=" + taskStatus); }
   catch (error) { await renderWorkspaceUnavailable("Tasks", error, renderTasks); return; }
   let tasks = data.tasks ?? [];
   if (targetTaskId && !tasks.some((task) => task.id === targetTaskId)) {
@@ -8608,7 +8609,7 @@ async function renderTasks() {
   const filterB = state.taskFilter.bucket;
 
   const taskRow = (t) => {
-    const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && t.status !== "completed";
+    const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && !["completed", "cancelled"].includes(t.status);
     const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
     const sourceHref = t.sourceUrl ? safeLinkHref(t.sourceUrl) : null;
     const sourceBadge = t.source && t.source !== "manual"
@@ -8637,17 +8638,17 @@ async function renderTasks() {
     \`;
   };
 
-  const inBucket = (t) => filterB === "all" || t.bucket === filterB;
+  const inBucket = (t) => t.id === targetTaskId || (filterB === "done" ? ["completed", "cancelled"].includes(t.status) : !["completed", "cancelled"].includes(t.status) && (filterB === "all" || t.bucket === filterB));
   const userTasks = tasks.filter((t) => t.queue === "user" && inBucket(t));
   const agentTasks = tasks.filter((t) => t.queue === "agent" && inBucket(t));
-  const userTotal = stats.user?.total ?? 0;
-  const agentTotal = stats.agent?.total ?? 0;
+  const userTotal = stats.user?.active ?? 0;
+  const agentTotal = stats.agent?.active ?? 0;
 
   // Zero tasks EVER is almost always "no source is connected", not "inbox
   // zero". Diagnose it loudly instead of showing two empty sections: which
   // task sources are configured, and the last sync's skip reason when not.
   let gettingStarted = "";
-  if (userTotal === 0 && agentTotal === 0) {
+  if ((stats.user?.total ?? 0) === 0 && (stats.agent?.total ?? 0) === 0) {
     const integ = await fetchJson("/integrations/status").catch(() => null);
     const taskSources = (integ?.integrations ?? []).filter((s) => ["linear", "buildbetter"].includes(s.id));
     const rows = taskSources.map((s) => {
@@ -8683,7 +8684,7 @@ async function renderTasks() {
       <section class="ui-section">
         <div class="ui-section-header">
           <h3>My tasks</h3>
-          <span class="ui-section-meta">· \${userTotal} total</span>
+          <span class="ui-section-meta">· \${userTotal} open</span>
         </div>
         \${userTasks.length === 0
           ? \`<div class="ui-empty">Nothing here. Try saying "remind me to call Sarah tomorrow" or "add a task to fix the mouse bug".</div>\`
@@ -8693,7 +8694,7 @@ async function renderTasks() {
       <section class="ui-section">
         <div class="ui-section-header">
           <h3>Agent tasks</h3>
-          <span class="ui-section-meta">· \${agentTotal} total</span>
+          <span class="ui-section-meta">· \${agentTotal} open</span>
         </div>
         <p class="ui-meta" style="margin: 0 0 var(--space-2);">Things OpenAGI has committed to do for you (or that the proactive observer queued).</p>
         \${agentTasks.length === 0
