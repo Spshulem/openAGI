@@ -142,7 +142,7 @@ struct AgentConnectionRow: View {
     var body: some View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
-                Text(model.isOnPhone ? "This iPhone" : (model.credentials.server.host?.components(separatedBy: ".").first ?? model.hostLabel))
+                Text(model.isOnPhone ? "This iPhone" : model.hostLabel)
                     .lineLimit(1).truncationMode(.middle)
                 Text(model.dataStatus).font(.caption).foregroundStyle(.secondary)
             }
