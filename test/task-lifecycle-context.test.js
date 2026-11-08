@@ -104,6 +104,8 @@ for (const output of ["not json", "[]"]) {
     const result = await new TaskSweep({ runtime }).sweep();
     assert.equal(result.llmStatus, output === "[]" ? "partial" : "failed");
     assert.equal(result.llmReviewed, 0);
+    assert.equal(result.review.status, "failed");
+    assert.equal(result.review.lastReviewedAt, null);
     assert.equal(runtime.tasks.list()[0].status, "pending");
     assert.deepEqual(runtime.tasks.list()[0].tags, ["plan-action"]);
   });

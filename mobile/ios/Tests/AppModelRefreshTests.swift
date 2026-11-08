@@ -50,6 +50,7 @@ final class AppModelRefreshTests: XCTestCase {
                 data = summaryStatus == 304 ? Data() : summary
             case "/pending-actions": status = 200; data = actions
             case "/tasks/clarifications": status = 200; data = clarification
+            case "/tasks": status = 200; data = Data(#"{"tasks":[]}"#.utf8)
             default: status = 200; data = Data("{}".utf8)
             }
             return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,

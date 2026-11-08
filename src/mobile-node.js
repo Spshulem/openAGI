@@ -56,6 +56,7 @@ const FLEET_THREAD = `(?:${THREAD_KIND_PATTERN})(?::|%3A)[A-Za-z0-9_.-]{1,120}`;
 
 const EXACT = new Set([
   "GET /mobile/summary",
+  "GET /mobile/capabilities",
   // The phone's own push registration (relay pass + envelope key).
   "POST /mobile/push",
   "DELETE /mobile/push",
@@ -85,6 +86,8 @@ const EXACT = new Set([
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  "GET /conversations",
+  "POST /conversations",
   "GET /lifelog/moments",
   // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
   "GET /settings/models",

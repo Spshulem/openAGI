@@ -28,6 +28,33 @@ final class StubProtocol: URLProtocol {
 }
 
 final class DaemonClientTests: XCTestCase {
+    func testThreadContextUsesAuthenticatedReadAndDecodesRecentActivity() async throws {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"thread":{"key":"codex:fixture","lastAgentMessage":{"text":"Ready for review","at":"2026-10-26T12:00:00Z"},"lastOwnerMessage":{"text":"Explain the next step"},"scannedAt":"2026-10-26T12:01:00Z"}}"#.utf8))
+        }
+        let detail = try await makeClient().fleetThreadDetail(key: "codex:fixture")
+        XCTAssertEqual(detail.lastAgentMessage?.text, "Ready for review")
+        XCTAssertEqual(detail.lastOwnerMessage?.text, "Explain the next step")
+        XCTAssertNotNil(detail.scannedAt)
+        XCTAssertEqual(StubProtocol.lastRequest?.httpMethod, "GET")
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.path, "/fleet/api/threads/codex:fixture")
+        XCTAssertEqual(StubProtocol.lastRequest?.value(forHTTPHeaderField: "X-OpenAGI-Node-ID"), "mobile:abc")
+    }
+
+    func testThreadContextDoesNotShowAnotherThreadsResponse() async {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"thread":{"key":"codex:other"}}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().fleetThreadDetail(key: "codex:fixture")
+            XCTFail("Must reject a mismatched thread")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .malformedResponse)
+        } catch { XCTFail("Unexpected error: \(error)") }
+    }
+
     func testMainRoutingFailureIsDistinctFromRevokedPairing() async {
         StubProtocol.handler = { request in
             (HTTPURLResponse(url: request.url!, statusCode: 502, httpVersion: nil, headerFields: nil)!,

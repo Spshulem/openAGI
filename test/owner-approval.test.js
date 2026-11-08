@@ -48,6 +48,22 @@ function harness(t) {
 
 const announced = (emitted) => emitted.filter((event) => event.name === "pending-action");
 
+test("phone forwarding instructions run after a thread read without redundant codes; unrelated reads still wait", async t => {
+  const h = harness(t);
+  const sent = [];
+  h.registry.register({ name: "fleet_send_message", needsConfirmation: true, handler: args => { sent.push(args); return { status: "sent" }; } });
+  for (const phrase of ["Forward this screenshot to the project chat", "On the project mobile thread can you send it this screenshot of the error"]) {
+    const context = h.ownerContext("phone", phrase);
+    await h.registry.invoke("fleet_thread", {}, context);
+    const result = await h.registry.invoke("fleet_send_message", { key: "codex:synthetic", message: phrase }, context);
+    assert.equal(result.result.status, "sent");
+  }
+  const reading = h.ownerContext("phone", "What does this screenshot say?");
+  await h.registry.invoke("fleet_thread", {}, reading);
+  assert.equal((await h.registry.invoke("fleet_send_message", { key: "codex:synthetic", message: "Not authorized" }, reading)).result.status, "awaiting_owner_confirmation");
+  assert.equal(sent.length, 2);
+});
+
 test("an owner instruction runs the gated tool now, journaled owner:g2, with no approval card", async (t) => {
   const h = harness(t);
   const outcome = await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, h.ownerContext());

@@ -1,29 +1,100 @@
 import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
 
 // Native SwiftUI navigation, text entry and controls. Conversation state stays
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
-    @State private var showingFallback = false
+    @State private var columns: NavigationSplitViewVisibility = .all
+    @State private var compactColumn: NavigationSplitViewColumn = .detail
+    @State private var thread: ConversationThread = .agent
+    @State private var destination: ChatSheet?
+    @State private var selectedMessage: UUID?
     var onClose: (() -> Void)? = nil
 
+    private enum ChatSheet: String, Identifiable {
+        case model, settings, fallback, conversations
+        var id: String { rawValue }
+    }
+
+    private var conversation: ChatConversation {
+        model.conversations.selected(thread)
+    }
+
     var body: some View {
+        Group {
+            if onClose != nil {
+                // A supporting pane already shares the workspace's width.
+                // A nested split view can cover its detail and Close button.
+                conversationNavigation
+            } else {
+                conversationSplitView
+            }
+        }
+        .sheet(item: $destination) { sheet in
+            switch sheet {
+            case .model:
+                NavigationStack {
+                    ModelSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
+            case .fallback: FallbackChatView()
+            case .conversations:
+                NavigationStack {
+                    ConversationBrowser(thread: $thread) { message in
+                        selectedMessage = message
+                        destination = nil
+                    }
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            }
+        }
+        .task { await model.conversations.refresh() }
+    }
+
+    private var conversationSplitView: some View {
+        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+            ConversationBrowser(thread: $thread) { message in
+                selectedMessage = message
+                compactColumn = .detail
+            }
+            .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
+        } detail: {
+            conversationNavigation
+        }
+    }
+
+    private var conversationNavigation: some View {
         NavigationStack {
-            ChatConversationView(conversation: model.agentChat, title: "Chat")
-                .navigationBarTitleDisplayMode(.inline)
+            ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
+                                 scrollToMessageID: selectedMessage, onHistorySelectionConsumed: { selectedMessage = nil })
+                .id(conversation.identity)
                 .toolbar {
-                    if let onClose {
-                        ToolbarItem(placement: .cancellationAction) {
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        Button("Conversations", systemImage: "text.bubble") { destination = .conversations }
+                            .accessibilityIdentifier("chat-conversations")
+                        Button("Model", systemImage: "cpu") { destination = .model }
+                            .accessibilityIdentifier("chat-model")
+                        Menu {
+                            if onClose != nil {
+                                Picker("Conversation", selection: $thread) {
+                                    Text("Agent").tag(ConversationThread.agent)
+                                    Text("Supervisor").tag(ConversationThread.supervisor)
+                                }
+                            }
+                            Button("Settings", systemImage: "gearshape") { destination = .settings }
+                            if !model.isOnPhone {
+                                Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
+                            }
+                        } label: { Label("Chat options", systemImage: "ellipsis") }
+                        if let onClose {
                             Button("Close chat", systemImage: "xmark", action: onClose)
                                 .accessibilityIdentifier("close-chat-pane")
                         }
                     }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
-                            .accessibilityIdentifier("chat-fallback")
-                    }
                 }
-                .sheet(isPresented: $showingFallback) { FallbackChatView() }
         }
     }
 }
@@ -39,56 +110,93 @@ struct ChatConversationView: View {
 
     let conversation: ChatConversation
     var title: String
+    var scrollToMessageID: UUID? = nil
     var showsTitle = true
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
+    var onHistorySelectionConsumed: () -> Void = {}
 
+    @State private var scrollPosition = ScrollPosition(idType: UUID.self)
     @State private var isPinnedToBottom = true
+    @State private var hasContentBelow = false
+    @State private var isBottomVisible = false
+    @State private var userIsScrolling = false
+    @State private var showingPhotos = false
+    @State private var showingFiles = false
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var isPreparingImages = false
+    @State private var attachmentError: String?
+    @State private var selectedAttachment: ChatAttachment?
+    @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var messages: [ChatMessage] { conversation.messages }
 
     var body: some View {
         GeometryReader { geometry in
-            ConversationLayout(division: division(in: geometry), rightToLeft: layoutDirection == .rightToLeft) {
-                VStack(spacing: 0) {
-                    header
-                    GeometryReader { messagesGeometry in
-                        messageScroll(width: messagesGeometry.size.width)
-                    }
-                }
-                .frame(maxWidth: 600)
-                .frame(maxWidth: .infinity)
+            // Keep the composer below history in every pose. An overlay
+            // arrangement can put it behind the message scroll view, where
+            // it is visible but cannot receive taps or keyboard focus.
+            ConversationLayout(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                               rightToLeft: layoutDirection == .rightToLeft) {
+                conversationContent
                 inputBar
-                    .frame(maxWidth: 600)
-                    .frame(maxWidth: .infinity)
             }
         }
         .background(Color(uiColor: .systemBackground))
+        .photosPicker(isPresented: $showingPhotos, selection: $selectedPhotos,
+                      maxSelectionCount: max(1, ChatAttachment.maximumCount - conversation.draftAttachments.count), matching: .images)
+        .onChange(of: selectedPhotos) { _, photos in
+            guard !photos.isEmpty else { return }
+            Task { await importPhotos(photos) }
+        }
+        .fileImporter(isPresented: $showingFiles, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+            Task { await importFiles(result) }
+        }
+        .sheet(item: $selectedAttachment) { attachment in
+            NavigationStack {
+                ChatAttachmentImage(attachment: attachment, fullSize: true).padding()
+                    .navigationTitle(attachment.name).navigationBarTitleDisplayMode(.inline)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { selectedAttachment = nil } } }
+            }
+        }
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
-        .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
-        .task { await conversation.refresh() }
+        .onChange(of: composerFocused) { _, focused in
+            if focused {
+                dictation.stop()
+                if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+            }
+            onComposerFocusChanged(focused)
+        }
+        .task(id: conversation.identity) { await conversation.refresh() }
+        .onDisappear { dictation.stop() }
+        .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onChange(of: conversation.isSending) { _, sending in
+            if !sending { Task { await model.conversations.refresh() } }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
+            else { dictation.stop() }
         }
     }
 
-    private func division(in geometry: GeometryProxy) -> CGRect? {
-        if #available(iOS 27.1, *) {
-            return geometry.reservedRegions(kind: .division, layoutDirectionBehavior: .fixed).first.map { region in
-                let frame = region.frame
-                let left = layoutDirection == .rightToLeft ? region.margins.trailing : region.margins.leading
-                return CGRect(x: frame.minX - left,
-                              y: frame.minY - region.margins.top,
-                              width: frame.width + region.margins.leading + region.margins.trailing,
-                              height: frame.height + region.margins.top + region.margins.bottom)
+    private var conversationContent: some View {
+        VStack(spacing: 0) {
+            header
+            GeometryReader { geometry in
+                messageScroll(width: geometry.size.width)
             }
         }
-        return nil
+        .frame(maxWidth: 600)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Short histories may not scroll far enough to dismiss the keyboard.
+        // A normal tap keeps the draft and restores the system navigation.
+        .simultaneousGesture(TapGesture().onEnded { composerFocused = false })
     }
 
     @ViewBuilder
@@ -113,59 +221,97 @@ struct ChatConversationView: View {
     }
 
     private func messageScroll(width: CGFloat) -> some View {
-        ScrollViewReader { proxy in
-            ZStack(alignment: .bottom) {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        if conversation.nextBefore != nil {
-                            VStack(spacing: 8) {
-                                Button("Load earlier messages") {
-                                    Task { await conversation.loadOlder() }
-                                }
-                                .disabled(conversation.isLoadingOlder)
-                                if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
-                                if let error = conversation.olderHistoryError {
-                                    Text(error).font(.caption).foregroundStyle(.secondary)
-                                }
+        ZStack(alignment: .bottom) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if conversation.nextBefore != nil {
+                        VStack(spacing: 8) {
+                            Button("Load earlier messages") {
+                                Task { await conversation.loadOlder() }
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.bottom)
+                            .disabled(conversation.isLoadingOlder)
+                            if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
+                            if let error = conversation.olderHistoryError {
+                                Text(error).font(.caption).foregroundStyle(.secondary)
+                            }
                         }
-                        if messages.isEmpty && conversation.historyStatus == .unknown {
-                            ProgressView("Loading chat history…")
-                                .frame(maxWidth: .infinity)
-                                .padding(.top, Theme.Spacing.x8)
-                        } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
-                            EmptyStateView(headline: conversation.historyStatus == .synced
-                                           ? "No messages on this server yet." : "No saved messages on this phone.",
-                                           detail: emptyDetail + " Older conversations stay on the server where they happened. Check your connected server in Settings if you expected them here.")
-                                .padding(.top, Theme.Spacing.x8)
-                            if !starters.isEmpty { starterButtons }
-                        }
-                        ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
-                            messageItemView(item, width: width)
-                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.bottom)
                     }
-                    .padding(Theme.gutter)
+                    if messages.isEmpty && conversation.historyStatus == .unknown {
+                        ProgressView("Loading chat history…")
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, Theme.Spacing.x8)
+                    } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
+                        chatHome
+                        if !starters.isEmpty { starterButtons }
+                    }
+                    ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
+                        messageItemView(item, width: width)
+                    }
+                    Color.clear.frame(height: 1)
+                        .onScrollVisibilityChange(threshold: 0.01) { visible in
+                            isBottomVisible = visible
+                            if visible { isPinnedToBottom = true }
+                        }
                 }
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 60
-                } action: { _, atBottom in
-                    isPinnedToBottom = atBottom
+                .scrollTargetLayout()
+                .padding(Theme.gutter)
+            }
+            .accessibilityIdentifier("chat-history")
+            .scrollPosition($scrollPosition)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .alignment)
+            .onScrollPhaseChange { _, phase in
+                userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+            }
+            .onScrollGeometryChange(for: ChatScrollGeometry.self) { geometry in
+                ChatScrollGeometry(contentHeight: geometry.contentSize.height,
+                                   viewportHeight: geometry.containerSize.height,
+                                   offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
+            } action: { previous, geometry in
+                hasContentBelow = !geometry.isAtBottom
+                // Keyboard dismissal and fold changes resize the viewport
+                // after Send has already moved to the reply. Resolve the
+                // message again at that size, rather than retaining a lazy
+                // stack's estimated bottom offset.
+                if previous.viewportHeight != geometry.viewportHeight && isPinnedToBottom && !userIsScrolling {
+                    scrollToLatest()
                 }
-                .onChange(of: messages) { old, new in
-                    if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
-                        // Keep the message the reader was looking at in place
-                        // when an earlier page is inserted above it.
-                        proxy.scrollTo(first, anchor: .top)
-                    } else if isPinnedToBottom { scrollToLatest(proxy) }
+                // Loading history, streaming and keyboard resizing must
+                // not turn a programmatic scroll into 'reading older'.
+                // The final bottom update can arrive after the gesture
+                // becomes idle, or when a wider layout fits the history.
+                if geometry.isAtBottom { isPinnedToBottom = true }
+                else if userIsScrolling { isPinnedToBottom = false }
+            }
+            .onChange(of: messages) { old, new in
+                if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
+                    // Keep the message the reader was looking at in place
+                    // when an earlier page is inserted above it.
+                    scrollPosition.scrollTo(id: first, anchor: .top)
+                } else if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+            }
+            .onAppear {
+                if let id = scrollToMessageID {
+                    isPinnedToBottom = false
+                    scrollPosition.scrollTo(id: id, anchor: .center)
+                    onHistorySelectionConsumed()
+                } else { scrollToLatest() }
+            }
+            .onChange(of: scrollToMessageID) { _, id in
+                if let id {
+                    isPinnedToBottom = false
+                    scrollPosition.scrollTo(id: id, anchor: .center)
+                    onHistorySelectionConsumed()
                 }
-                .onAppear { scrollToLatest(proxy) }
-                .scrollDismissesKeyboard(.interactively)
+            }
+            .scrollDismissesKeyboard(.interactively)
 
-                if !isPinnedToBottom && !messages.isEmpty {
-                    jumpToLatestButton(proxy)
-                }
+            // A lazy stack's estimated height can still report more
+            // content after its actual end has become visible.
+            if !isPinnedToBottom && hasContentBelow && !isBottomVisible && !messages.isEmpty {
+                jumpToLatestButton()
             }
         }
     }
@@ -189,25 +335,36 @@ struct ChatConversationView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        guard let last = messages.last?.id else { return }
-        withAnimation(nil) { proxy.scrollTo(last, anchor: .bottom) }
+    private func scrollToLatest() {
+        withAnimation(nil) {
+            if let latest = messages.last?.id {
+                // An edge scroll can land in unmaterialized space when the
+                // lazy history and keyboard change size in the same turn.
+                // A real message ID gives SwiftUI a row to resolve and show.
+                scrollPosition.scrollTo(id: latest, anchor: .bottom)
+            } else {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
     }
 
-    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
-        Button {
+    private func jumpToLatestButton() -> some View {
+        let button = Button {
             isPinnedToBottom = true
-            scrollToLatest(proxy)
+            scrollToLatest()
         } label: {
-            Text("Jump to latest")
-                .font(Theme.Typography.secondary.weight(.medium))
-                .foregroundStyle(.white)
-                .padding(.horizontal, Theme.Spacing.x4)
-                .padding(.vertical, Theme.Spacing.x2)
-                .background(Theme.live)
-                .clipShape(Capsule())
+            Image(systemName: "arrow.down")
+                .font(.body.weight(.semibold))
+                .frame(width: 44, height: 44)
         }
+        .buttonBorderShape(.circle)
+        .accessibilityLabel("Jump to latest")
+        .accessibilityIdentifier("chat-jump-latest")
         .padding(.bottom, Theme.Spacing.x3)
+        return Group {
+            if #available(iOS 26.0, *) { button.buttonStyle(.glass) }
+            else { button.buttonStyle(.bordered) }
+        }
     }
 
     // DESIGN.md: "Consecutive messages from the same speaker tighten to 2pt
@@ -229,6 +386,20 @@ struct ChatConversationView: View {
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }
+            if !item.message.attachments.isEmpty {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 100))], spacing: 8) {
+                    ForEach(item.message.attachments) { attachment in
+                        Button { selectedAttachment = attachment } label: {
+                            ChatAttachmentImage(attachment: attachment)
+                                .frame(height: 120).frame(maxWidth: .infinity)
+                                .clipShape(.rect(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("chat-message-image")
+                    }
+                }
+                .frame(width: min(width * 0.78, 320))
+            }
             MessageBubbleRow(message: item.message, maxContainerWidth: width)
             // Offer a resend only when the daemon rejected the turn before
             // it ran. A lost stream can hide a completed action.
@@ -246,67 +417,232 @@ struct ChatConversationView: View {
         .id(item.message.id)
     }
 
+    private var chatHome: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Image(systemName: "sparkle").font(.largeTitle).foregroundStyle(.tint)
+            Text("What would you like to do?").font(.largeTitle.bold())
+            Text(model.isOnPhone
+                 ? "Your agent, tasks and conversations live on this iPhone."
+                 : "Plan your day, keep track of work, or ask your agent for help.")
+                .foregroundStyle(.secondary)
+            ForEach(["Help me plan my day", "Show my tasks", "Remember something for me"], id: \.self) { prompt in
+                Button { conversation.draft = prompt; composerFocused = true } label: {
+                    Label(prompt, systemImage: "arrow.up.left")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.bordered).controlSize(.large)
+            }
+        }
+        .padding(.vertical, 40)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("chat-home")
+    }
+
     @ViewBuilder
     private var inputBar: some View {
+        VStack(spacing: 8) {
+            if conversation.isReadOnly {
+                Text("Web conversation · Continue in a new chat with its latest 50 messages.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Continue in new chat", systemImage: "square.and.pencil") {
+                    Task { await model.conversations.create(thread: conversation.thread, sourceID: conversation.conversationID) }
+                }
+                .disabled(model.conversations.isCreating)
+                .accessibilityIdentifier("chat-continue-web")
+                if let error = model.conversations.error { Text(error).font(.footnote).foregroundStyle(.red) }
+            } else {
+            if !conversation.draftAttachments.isEmpty { attachmentStrip }
+            if isPreparingImages { ProgressView("Preparing images…").font(.caption) }
+            if let attachmentError {
+                Text(attachmentError).font(.footnote).foregroundStyle(.red)
+                    .accessibilityIdentifier("chat-attachment-error")
+            }
+            if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
+            composerBar
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var composerBar: some View {
         if #available(iOS 26, *) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(alignment: .bottom, spacing: 12) {
+            GlassEffectContainer(spacing: 8) {
+                composerLayout {
+                    attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
+                        .frame(width: 44, height: 44)
                     composerField
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 26))
+                        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
+                        .frame(width: 44, height: 44)
                     sendButton
                         .buttonStyle(.glassProminent)
                         .buttonBorderShape(.circle)
-                        .controlSize(.large)
+                        .controlSize(.regular)
+                        .frame(width: 44, height: 44)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
             }
+            .padding(.horizontal, 12).padding(.vertical, 8)
         } else {
-            HStack(alignment: .bottom, spacing: 12) {
-                composerField
-                    .textFieldStyle(.roundedBorder)
-                sendButton
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.large)
+            composerLayout {
+                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
+                composerField.background(.background.secondary, in: .rect(cornerRadius: 22))
+                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
+                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.bar)
+            .padding(.horizontal, 12).padding(.vertical, 8)
         }
     }
+
+    private var composerLayout: ComposerLayout {
+        ComposerLayout(prefersSeparateControls: dynamicTypeSize >= .xxLarge,
+                       rightToLeft: layoutDirection == .rightToLeft)
+    }
+
+    private var dictationButton: some View {
+        Button {
+            if dictation.isListening || dictation.isStarting { dictation.stop() }
+            else {
+                composerFocused = false
+                Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
+            }
+        } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
+        .accessibilityLabel(dictation.isListening || dictation.isStarting ? "Stop dictation" : "Dictate message")
+        .accessibilityValue(dictation.isListening ? "Listening" : "")
+        .accessibilityHint("Dictation appears in the message field. Review it before sending.")
+        .disabled(conversation.isSending)
+        .accessibilityIdentifier("chat-dictation")
+    }
+
+    private var attachmentMenu: some View {
+        Menu {
+            Button("Photo Library", systemImage: "photo.on.rectangle") { showingPhotos = true }
+            Button("Choose Image File", systemImage: "folder") { showingFiles = true }
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--ui-attachment-fixture") {
+                Button("Attach synthetic image") {
+                    Task { await importSyntheticImage() }
+                }
+            }
+            #endif
+        } label: { composerIcon("plus") }
+        .accessibilityLabel("Add images")
+        .menuIndicator(.hidden)
+        .accessibilityIdentifier("chat-attach")
+        .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
+    }
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 12) {
+                ForEach(conversation.draftAttachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        ChatAttachmentImage(attachment: attachment)
+                            .frame(width: 80, height: 80).clipShape(.rect(cornerRadius: 12))
+                            .accessibilityIdentifier("chat-draft-image")
+                        Button("Remove image", systemImage: "xmark.circle.fill") {
+                            conversation.draftAttachments.removeAll { $0.id == attachment.id }
+                        }
+                        .labelStyle(.iconOnly).buttonStyle(.bordered).buttonBorderShape(.circle)
+                        .accessibilityIdentifier("chat-remove-image")
+                    }
+                }
+            }.padding(.horizontal)
+        }.fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func appendImages(_ images: [ChatAttachment]) {
+        guard conversation.draftAttachments.count + images.count <= ChatAttachment.maximumCount else {
+            attachmentError = "Attach up to four images per message."
+            return
+        }
+        conversation.draftAttachments.append(contentsOf: images)
+    }
+
+    private func importPhotos(_ photos: [PhotosPickerItem]) async {
+        guard !isPreparingImages else { return }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false; selectedPhotos = [] }
+        do {
+            var prepared: [ChatAttachment] = []
+            for photo in photos {
+                guard let data = try await photo.loadTransferable(type: Data.self) else { throw ChatAttachmentPreparation.Failure.unreadable }
+                prepared.append(try await ChatAttachmentPreparation.prepare(data, name: "Photo.jpg"))
+            }
+            appendImages(prepared)
+        } catch { attachmentError = error.localizedDescription }
+    }
+
+    private func importFiles(_ result: Result<[URL], Error>) async {
+        guard !isPreparingImages else { return }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false }
+        do {
+            let urls = try result.get()
+            guard urls.count + conversation.draftAttachments.count <= ChatAttachment.maximumCount else {
+                attachmentError = "Attach up to four images per message."
+                return
+            }
+            var prepared: [ChatAttachment] = []
+            for url in urls { prepared.append(try await ChatAttachmentPreparation.file(url)) }
+            appendImages(prepared)
+        } catch { attachmentError = error.localizedDescription }
+    }
+
+    #if DEBUG
+    private func importSyntheticImage() async {
+        isPreparingImages = true
+        defer { isPreparingImages = false }
+        do {
+            let data = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC")!
+            appendImages([try await ChatAttachmentPreparation.prepare(data, name: "Synthetic image.png")])
+        } catch { attachmentError = error.localizedDescription }
+    }
+    #endif
 
     private var composerField: some View {
         @Bindable var conversation = conversation
         return TextField(placeholder, text: $conversation.draft, axis: .vertical)
+            .id(conversation.composerRevision)
             .focused($composerFocused)
             .font(.body)
-            .lineLimit(1...5)
+            .textFieldStyle(.plain)
+            .lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 3 : 5))
             .submitLabel(.send)
             .onSubmit { sendDraft() }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 44)
+            .clipShape(.rect(cornerRadius: 22))
             .accessibilityLabel(placeholder)
             .accessibilityIdentifier("chat-composer")
     }
 
     private var sendButton: some View {
-        Button("Send", systemImage: "arrow.up", action: sendDraft)
-            .labelStyle(.iconOnly)
+        Button(action: sendDraft) { composerIcon("arrow.up") }
+            .accessibilityLabel("Send")
             .disabled(!canSend)
             .accessibilityIdentifier("chat-send")
     }
 
+    private func composerIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 18, weight: .medium))
+            // Regular native glass adds seven points per side. Size the
+            // label so the button itself, not just its wrapper, is 44 points.
+            .frame(width: 30, height: 30)
+    }
+
     private func sendDraft() {
         guard canSend else { return }
-        let text = conversation.draft
-        conversation.draft = ""
-        isPinnedToBottom = true
-        Task { await conversation.send(text) }
+        dictation.stop()
+        if conversation.submitDraft() { isPinnedToBottom = true }
     }
 
     private var canSend: Bool {
-        !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
+        conversation.canSubmitDraft && !isPreparingImages
     }
 }
 
@@ -327,12 +663,14 @@ enum ChatSourceLabel {
 // same node session: duplicated user turns, repeated tool side effects, and
 // two streams writing one bubble. Now they share `send()`'s single-flight gate.
 enum ChatRetry {
-    static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String)? {
+    static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String, attachments: [ChatAttachment])? {
         guard !isSending,
               let index = messages.firstIndex(where: { $0.id == failedID }),
-              messages[index].isFailed && messages[index].retrySafe,              let userText = messages[..<index].last(where: { $0.role == .user })?.text
+              messages[index].isFailed && messages[index].retrySafe,
+              let user = messages[..<index].last(where: { $0.role == .user }),
+              user.attachments.allSatisfy({ $0.data != nil })
         else { return nil }
-        return (index, userText)
+        return (index, user.text, user.attachments)
     }
 }
 
@@ -344,14 +682,24 @@ enum ChatRetry {
 enum ChatErrorCopy {
     static func message(for error: DaemonError) -> String {
         switch error {
+        case .imagesUnsupported:
+            return "Update OpenAGI on your main server to send images. The images were not sent without their content."
         case .agentHostDisabled:
             return "OpenAGI can't reply -- no agent host is configured on this daemon. Open its dashboard and finish setup, then try again."
         case .unauthorized:
-            return "Needs re-pairing -- revoke and pair again in Settings."
+            return "The server didn't authorize this chat. Your saved connection was kept. Check the enrollment and server version in Connection Settings."
         case .mainConnection(let issue):
             return issue.message
-        case .notFound, .conflict, .malformedResponse, .server, .unreachableHost, .transport:
-            return "Can't reach OpenAGI. Check your connection and try again."
+        case .notFound:
+            return "This chat feature isn't available on the server. Check its OpenAGI version, then refresh. Your saved connection was kept."
+        case .conflict:
+            return "The server couldn't accept this turn yet. Refresh the conversation before sending again."
+        case .server(let status):
+            return "The server returned error \(status). Check the conversation before sending again."
+        case .malformedResponse:
+            return "The server returned an unexpected chat response. Check its OpenAGI version, then refresh the conversation."
+        case .unreachableHost, .transport:
+            return "Couldn't confirm delivery. Check your connection and refresh the conversation before sending again."
         }
     }
 }
@@ -368,7 +716,9 @@ private struct MessageBubbleRow: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: Theme.Spacing.x8) }
-            bubble
+            IntrinsicBubbleLayout(maxWidth: max(0, maxContainerWidth - 2 * Theme.gutter) * (message.role == .user ? 0.78 : 0.92)) {
+                bubble
+            }
             if message.role == .assistant { Spacer(minLength: Theme.Spacing.x8) }
         }
     }
@@ -393,14 +743,14 @@ private struct MessageBubbleRow: View {
 
     private var bubble: some View {
         bubbleContent
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, Theme.Spacing.x4)
             .padding(.vertical, Theme.Spacing.x3)
-            .frame(
-                maxWidth: maxContainerWidth * (message.role == .user ? 0.78 : 0.85),
-                alignment: message.role == .user ? .trailing : .leading
-            )
             .background(fill)
             .clipShape(bubbleShape)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("chat-bubble-\(message.role == .user ? "user" : "assistant")")
             .contextMenu {
                 Button {
                     UIPasteboard.general.string = message.text
@@ -412,7 +762,7 @@ private struct MessageBubbleRow: View {
 
     // Messages remain in the content layer; glass belongs to the controls.
     private var fill: Color {
-        message.role == .user ? .blue : Color(uiColor: .secondarySystemBackground)
+        message.role == .user ? .accentColor : .clear
     }
 
     // DESIGN.md: "radius 18 with the bottom-trailing corner at 4" (you) /
@@ -437,5 +787,39 @@ private struct TypingIndicatorView: View {
             Circle().fill(Theme.muted.opacity(0.4)).frame(width: 6, height: 6)
         }
         .accessibilityLabel("OpenAGI is typing")
+    }
+}
+
+// Measure short replies at their natural width, then cap longer content at
+// the available column width. A maxWidth frame around Text can stretch a
+// one-word reply on an expanded display.
+private struct IntrinsicBubbleLayout: Layout {
+    var maxWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let width = min(maxWidth, proposal.width ?? maxWidth, content.sizeThatFits(.unspecified).width)
+        let size = content.sizeThatFits(.init(width: width, height: nil))
+        return CGSize(width: width, height: size.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                             proposal: .init(width: bounds.width, height: bounds.height))
+    }
+}
+
+
+struct ChatScrollGeometry: Equatable {
+    let contentHeight: CGFloat
+    let viewportHeight: CGFloat
+    let offset: CGFloat
+    let bottomInset: CGFloat
+
+    var isAtBottom: Bool {
+        let maximumOffset = max(0, contentHeight + bottomInset - viewportHeight)
+        // Bottom alignment and rubber-banding can produce negative offsets
+        // even when the entire conversation fits in the visible viewport.
+        return maximumOffset == 0 || offset >= maximumOffset - 60
     }
 }

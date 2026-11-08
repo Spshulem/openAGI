@@ -24,7 +24,8 @@
 // `plan-action` is DRAFT-ONLY — autopilot prepares the artifact but never sends
 // externally. Untagged agent tasks are safe to fully execute.
 
-import { nowIso } from "./utils.js";
+import path from "node:path";
+import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 
 // Sources we created automatically — safe to auto-cancel when stale. Anything
 // else (manual, linear, buildbetter) is the user's; we only flag those.
@@ -45,12 +46,19 @@ const SYSTEM_PROMPT = [
   '  internal notes). Use null for queue "user".',
   "- stale: true if the task is obsolete, already handled, superseded by a newer one, or a near-duplicate",
   "  of another in the list; otherwise false.",
+  "Age or an overdue date ALONE is not evidence that work is obsolete or completed.",
+  "A clearly expired one-time opportunity (for example, a group order with an explicit closing time) can be obsolete.",
+  "Do not infer completion without evidence. Keep unclear tasks open.",
   "Return STRICT JSON array only — one object per input task, echoing the same i. No prose."
 ].join("\n");
 
 export class TaskSweep {
   constructor({ runtime, archiveDays } = {}) {
     this.runtime = runtime;
+    this.reviewFile = runtime?.tasks?.taskDir ? path.join(runtime.tasks.taskDir, "review.json") : null;
+    this.reviewStatus = null;
+    try { if (this.reviewFile) this.reviewStatus = readJsonFile(this.reviewFile, null, { quarantine: false }); }
+    catch { /* Optional review metadata must not prevent daemon startup. */ }
     this.archiveDays = Number(archiveDays ?? process.env.OPENAGI_TASK_ARCHIVE_DAYS) || ARCHIVE_DAYS_DEFAULT;
   }
 
@@ -62,6 +70,8 @@ export class TaskSweep {
     // Tasks flagged for human review (NOT the auto-cancelled stale ones).
     // Surfaced to the outreach feed so stalled work gets nudged.
     const flaggedTasks = [];
+    const attemptedAt = now.toISOString();
+    let reviewStatus = "no_tasks";
 
     // 1) Rule-based dedup within each queue.
     const active = tasks.list({ limit: 1000 }).filter((t) => ACTIVE.has(t.status));
@@ -88,12 +98,13 @@ export class TaskSweep {
     const remaining = tasks.list({ limit: 1000 }).filter((t) => ACTIVE.has(t.status));
     const provider = this.runtime?.agentHost?.modelProvider;
     const haveLLM = provider?.isConfigured?.() && provider.constructor.name !== "DeterministicModelProvider";
+    if (remaining.length && !haveLLM) reviewStatus = "unavailable";
     if (haveLLM && remaining.length) {
       try {
         const input = remaining.map((t, i) => ({
           i, queue: t.queue, source: t.source, title: t.title,
           description: String(t.description ?? "").slice(0, 1000),
-          status: t.status, createdAt: t.createdAt ?? null,
+          status: t.status, bucket: t.bucket, updatedAt: t.updatedAt ?? null, createdAt: t.createdAt ?? null,
           dueDate: t.dueDate ?? null, scheduledFor: t.scheduledFor ?? null,
           tags: Array.isArray(t.tags) ? t.tags : []
         }));
@@ -129,10 +140,12 @@ export class TaskSweep {
           }
         }
         if (summary.llmReviewed < remaining.length) summary.llmStatus = "partial";
+        reviewStatus = summary.llmStatus === "reviewed" ? "reviewed" : "failed";
       } catch {
         // Do not report a successful relevance review when the provider or
         // JSON output failed. Deterministic dedup and archival still run.
         summary.llmStatus = "failed";
+        reviewStatus = "failed";
       }
     }
 
@@ -146,7 +159,17 @@ export class TaskSweep {
       if (Number.isFinite(ts) && ts < cutoff && tasks.remove) { tasks.remove(t.id); summary.archived++; }
     }
 
-    summary.at = nowIso();
+    this.reviewStatus = {
+      status: reviewStatus, attemptedAt,
+      lastReviewedAt: ["reviewed", "no_tasks"].includes(reviewStatus)
+        ? attemptedAt : this.reviewStatus?.lastReviewedAt ?? null
+    };
+    if (this.reviewFile) {
+      try { writeJsonAtomic(this.reviewFile, this.reviewStatus); }
+      catch { /* in-memory status remains available when disk is read-only */ }
+    }
+    summary.review = this.reviewStatus;
+    summary.at = attemptedAt;
     summary.flaggedTasks = flaggedTasks;
     return summary;
   }
