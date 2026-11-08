@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.appCanvas) private var canvas
     let onRevoked: () -> Void
 
     @State private var path: [WorkspaceDestination] = []
@@ -15,6 +16,13 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             Form {
+                Section("App") {
+                    NavigationLink {
+                        AppearanceView()
+                    } label: {
+                        Label("Appearance", systemImage: "paintpalette")
+                    }
+                }
                 Section {
                     LabeledContent("Runs on", value: model.isOnPhone ? "This iPhone" : "Server")
                     if !model.isOnPhone {
@@ -129,6 +137,8 @@ struct SettingsView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(canvas)
             .accessibilityIdentifier("settings-form")
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)

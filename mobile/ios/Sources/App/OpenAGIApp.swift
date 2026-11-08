@@ -38,6 +38,7 @@ struct OpenAGIApp: App {
                 sessionContent
                 #endif
             }
+            .modifier(AppAppearanceModifier())
             .environment(session)
             .onOpenURL { url in
                 #if DEBUG
