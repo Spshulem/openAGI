@@ -25,6 +25,13 @@ public struct MobileSummary: Codable, Sendable, Equatable {
         public let headline: String
     }
 
+    public struct TaskReview: Codable, Sendable, Equatable {
+        public let status: String
+        public let attemptedAt: Date?
+        public let lastReviewedAt: Date?
+    }
+
+    public var taskReview: TaskReview? = nil
     public let generatedAt: Date
     public let today: [TaskItem]
     public let counts: Counts

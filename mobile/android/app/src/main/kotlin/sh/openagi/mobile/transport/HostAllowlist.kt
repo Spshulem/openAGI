@@ -22,6 +22,7 @@ object HostAllowlist {
         // precedes the scheme branch deliberately — putting it after would let
         // https://127.0.0.1 through, which is the gap iOS shipped and had to fix.
         if (url.host.lowercase() in setOf("127.0.0.1", "localhost", "::1")) {
+            if (url.scheme == "http" && url.host == "127.0.0.1" && url.port == EmbeddedLoopback.port) return origin
             throw DaemonException.UnreachableHost(url.host)
         }
         if (url.scheme == "https") return origin
@@ -49,3 +50,6 @@ object HostAllowlist {
         }
     }
 }
+
+// Only the native embedded host can open this loopback exception after health.
+internal object EmbeddedLoopback { @Volatile var port: Int? = null }

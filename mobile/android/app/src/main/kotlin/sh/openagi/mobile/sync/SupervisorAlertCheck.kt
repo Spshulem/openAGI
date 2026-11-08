@@ -33,6 +33,9 @@ suspend fun <T> withAlertLock(block: suspend () -> T): T = checkLock.withLock { 
 // then would wrongly clear pings the owner has not acted on yet.
 suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient): AlertCheckResult = checkLock.withLock {
     val app = context.applicationContext
+    val credentials = Credentials.load(app) ?: return@withLock AlertCheckResult.Unauthorized
+    if (!client.belongsTo(credentials)) return@withLock AlertCheckResult.Unauthorized
+    if (credentials.isEmbedded) return@withLock AlertCheckResult.NoSupervisor
     val state = try {
         client.fleetState()
     } catch (cancellation: CancellationException) {

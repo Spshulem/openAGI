@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     runs-on: xcode-27
-    timeout-minutes: 75
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       # 27.1 links the native Duo vertical bars and reserved-region APIs.
@@ -59,6 +59,43 @@ jobs:
           name: OpenAGI-device-unsigned-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/OpenAGI-device-unsigned.zip
           retention-days: 7
+      # Exercise the expanded-pane regression before the longer phone suites.
+      - name: Test expanded workspace navigation
+        working-directory: mobile/ios
+        run: |
+          device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"].startswith("iPad Pro 13-inch")))')
+          xcrun simctl list runtimes -j > "$RUNNER_TEMP/openagi-runtimes.json"
+          select_expanded_runtime() {
+            python3 -c 'import json,sys; rows=json.load(open(sys.argv[1]))["runtimes"]; candidates=[r for r in rows if r.get("isAvailable") and int(r["version"].split(".")[0]) >= 27 and any(d["identifier"] == sys.argv[2] for d in r.get("supportedDeviceTypes", []))]; print(max(candidates, key=lambda r: tuple(map(int, r["version"].split("."))))["identifier"] if candidates else "")' "$RUNNER_TEMP/openagi-runtimes.json" "$device_type"
+          }
+          runtime_id=$(select_expanded_runtime)
+          if [ -z "$runtime_id" ]; then
+            xcodebuild -downloadPlatform iOS -buildVersion 27.0
+            xcrun simctl list runtimes -j > "$RUNNER_TEMP/openagi-runtimes.json"
+            runtime_id=$(select_expanded_runtime)
+          fi
+          test -n "$runtime_id"
+          simulator_id=$(xcrun simctl create "OpenAGI expanded UI CI" "$device_type" "$runtime_id")
+          echo "OPENAGI_EXPANDED_SIM=$simulator_id" >> "$GITHUB_ENV"
+          xcrun simctl boot "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
+          xcodebuild test \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+            -resultBundlePath "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult" \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testNativeAdaptiveTabsAndOptionalChatPane \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testComputerApprovalWrapsAndFailedExecutionRemovesConsumedControls \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testLongLiveDictationStaysInBoundedEditorWithAccessibleControls \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testSelectingVisibleHistoryDoesNotOfferJumpToLatest \
+            -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES
+          xcrun simctl shutdown "$simulator_id"
       - name: Build and test iOS app
         working-directory: mobile/ios
         run: |
@@ -75,6 +112,21 @@ jobs:
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
           xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
+          python3 scripts/seed-test-photo.py "$simulator_id"
+          # Fail fast on the long-history scroll/send regression, before the
+          # remaining unit and UI suites. The full run skips this tested case.
+          xcodebuild test \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+            -resultBundlePath "$RUNNER_TEMP/OpenAGI-Duo-scroll-UI.xcresult" \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
+            -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -82,6 +134,7 @@ jobs:
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
+            -skip-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
             -parallel-testing-enabled NO \
             -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
@@ -108,6 +161,7 @@ jobs:
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
           xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
+          python3 scripts/seed-test-photo.py "$simulator_id"
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -122,38 +176,20 @@ jobs:
             CODE_SIGNING_ALLOWED=YES
       - name: Verify simulator runtime was bundled
         run: test -f "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
-      - name: Test expanded workspace navigation
-        if: ${{ !cancelled() && env.OPENAGI_PHONE_SIM != '' }}
-        working-directory: mobile/ios
-        run: |
-          xcrun simctl shutdown "$OPENAGI_PHONE_SIM" || true
-          device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"].startswith("iPad Pro 13-inch")))')
-          runtime_id=$(python3 -c 'import json,sys; rows=json.load(open(sys.argv[1]))["runtimes"]; candidates=[r for r in rows if r.get("isAvailable") and int(r["version"].split(".")[0]) >= 27 and any(d["identifier"] == sys.argv[2] for d in r.get("supportedDeviceTypes", []))]; print(max(candidates, key=lambda r: tuple(map(int, r["version"].split("."))))["identifier"])' "$RUNNER_TEMP/openagi-runtimes.json" "$device_type")
-          simulator_id=$(xcrun simctl create "OpenAGI expanded UI CI" "$device_type" "$runtime_id")
-          echo "OPENAGI_EXPANDED_SIM=$simulator_id" >> "$GITHUB_ENV"
-          xcrun simctl boot "$simulator_id"
-          xcrun simctl bootstatus "$simulator_id" -b
-          xcodebuild test \
-            -project OpenAGI.xcodeproj \
-            -scheme OpenAGI \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=$simulator_id" \
-            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
-            -resultBundlePath "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult" \
-            -only-testing:OpenAGIUITests/NativeNavigationTests/testNativeAdaptiveTabsAndOptionalChatPane \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_ALLOWED=YES
       - name: Package simulator app
+        if: ${{ !cancelled() }}
         run: |
+          # Preserve the compiled app for manual acceptance even if a UI test fails.
+          if [ ! -d "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app" ]; then exit 0; fi
           ditto -c -k --keepParent \
             "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app" \
             "$RUNNER_TEMP/OpenAGI-simulator.zip"
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: OpenAGI-simulator-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/OpenAGI-simulator.zip
+          if-no-files-found: ignore
           retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
@@ -164,7 +200,7 @@ jobs:
       - name: Export synthetic UI screenshots
         if: always()
         run: |
-          for result in "$RUNNER_TEMP/OpenAGI-tests.xcresult" "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult" "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult"; do
+          for result in "$RUNNER_TEMP/OpenAGI-tests.xcresult" "$RUNNER_TEMP/OpenAGI-Duo-scroll-UI.xcresult" "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult" "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult"; do
             if [ -f "$result/Info.plist" ]; then
               xcrun xcresulttool export attachments --path "$result" --output-path "$RUNNER_TEMP/openagi-ui-screenshots/$(basename "$result" .xcresult)"
             fi
@@ -174,6 +210,7 @@ jobs:
         with:
           name: OpenAGI-native-UI-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
+            ${{ runner.temp }}/OpenAGI-Duo-scroll-UI.xcresult
             ${{ runner.temp }}/OpenAGI-iPhone-UI.xcresult
             ${{ runner.temp }}/OpenAGI-expanded-UI.xcresult
             ${{ runner.temp }}/openagi-ui-screenshots

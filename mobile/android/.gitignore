@@ -3,3 +3,6 @@ build/
 local.properties
 *.iml
 .idea/
+
+# Pinned native Node runtime fetched by scripts/prepare-embedded-runtime.sh
+Vendor/
