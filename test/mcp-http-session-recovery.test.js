@@ -55,3 +55,36 @@ for (const status of [403, 500]) {
     assert.equal(client.sessionId, "expired-fixture");
   });
 }
+
+for (const reconnectFirst of [false, true]) {
+  test(`late success cannot restore an expired session ${reconnectFirst ? 'after' : 'before'} reconnect`, async t => {
+    let releaseLate;
+    const calls = [];
+    t.mock.method(globalThis, "fetch", async (_url, options) => {
+      const message = JSON.parse(options.body);
+      calls.push(message.method);
+      if (message.params?.name === "slow_fixture") {
+        return new Promise(resolve => { releaseLate = () => resolve(Response.json({ id: message.id, result: { content: [] } }, { headers: { "mcp-session-id": "expired-fixture" } })); });
+      }
+      if (message.params?.name === "expire_fixture") return new Response("Expired", { status: 404 });
+      if (message.method === "initialize") {
+        assert.equal(options.headers["mcp-session-id"], undefined);
+        return Response.json({ id: message.id, result: { capabilities: { tools: {} } } }, { headers: { "mcp-session-id": "fresh-fixture" } });
+      }
+      assert.equal(options.headers["mcp-session-id"], "fresh-fixture");
+      if (message.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return Response.json({ id: message.id, result: message.method === "tools/list" ? { tools: [] } : { content: [] } });
+    });
+    const client = connectedClient();
+    const late = client.callTool("slow_fixture", {});
+    await assert.rejects(client.callTool("expire_fixture", {}), /404/);
+    if (reconnectFirst) await client.callTool("read_fixture", {});
+    releaseLate();
+    await late;
+    assert.equal(client.sessionId, reconnectFirst ? "fresh-fixture" : null);
+    await client.callTool("read_fixture", {});
+    assert.equal(client.sessionId, "fresh-fixture");
+    assert.equal(calls.filter(method => method === "initialize").length, 1);
+    assert.equal(client.activeControllers.size, 0);
+  });
+}

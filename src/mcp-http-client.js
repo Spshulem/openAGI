@@ -197,7 +197,7 @@ export class McpHttpClient {
       }
       // Capture or update session id.
       const sid = response.headers.get("mcp-session-id");
-      if (sid && response.ok) this.sessionId = sid;
+      if (sid && response.ok && this.sessionId === requestSessionId) this.sessionId = sid;
 
       if (response.status === 401 && this.oauth && !retried) {
         // Force a re-auth on next call.
