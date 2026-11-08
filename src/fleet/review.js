@@ -461,7 +461,7 @@ function parseResult(stdout) {
 // the result's structured_output). --safe-mode skips the owner's hooks,
 // CLAUDE.md, skills and MCP servers, so a Stop hook never pushes the phone;
 // --no-session-persistence keeps the run out of the fleet's own scan.
-function createClaudeReview({ config, run, env, model }) {
+export function createClaudeReview({ config, run, env, model }) {
   const cwd = config?.paths?.relayCwd ?? null;
   const timeoutMs = config?.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
   return async function runClaude({ system, prompt, schema }) {

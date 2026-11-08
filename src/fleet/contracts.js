@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
+export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity", "paseo"]);
 // The one list every thread-key matcher is built from (server routes, the
 // broker's and the phone's allowlists): "kind:id", the id as sources mint it.
 export const THREAD_KIND_PATTERN = THREAD_KINDS.join("|");
@@ -19,8 +19,22 @@ export function isThreadKey(key) {
   return typeof key === "string" && THREAD_KEY_PATTERN.test(key);
 }
 
+// Preserve self-exclusion when a native session is represented by a Paseo agent.
+export function isSelfThread(thread, config) {
+  const self = new Set(config?.selfSessionIds ?? []);
+  const identities = [thread.id, thread.claudeSessionId, thread.key];
+  if (thread.kind === "paseo") {
+    for (const alias of thread.meta?.aliases ?? []) {
+      if (typeof alias !== "string") continue;
+      const match = /^(?:codex|claude|conductor|antigravity):(.+)$/.exec(alias);
+      if (match) identities.push(alias, match[1]);
+    }
+  }
+  return identities.some(id => typeof id === "string" && id.length > 0 && self.has(id));
+}
+
 // What the owner calls each kind's app in questions and labels.
-export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity" });
+export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity", paseo: "Paseo" });
 
 export function kindName(kind) {
   return KIND_NAMES[kind] ?? "Agent";
@@ -43,7 +57,7 @@ export const STATES = Object.freeze([
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
 // antigravity-send: agentapi send-message, the Antigravity app's own API.
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use", "antigravity-send"]);
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use", "antigravity-send", "paseo-send"]);
 // How supervisor text reaches a thread. "cli" is the original set of routes;
 // "computer-use" types into the app that shows the thread and never runs a
 // CLI; "computer-use-first" types when computer use is ready, else falls back.
@@ -363,6 +377,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // The nudge judge (judge.js): a model reads the chat before an automatic
     // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
     judge: {
+      provider: overrides.judge?.provider ?? parseReviewProvider(env.OPENAGI_FLEET_JUDGE_PROVIDER) ?? "codex",
       enabled: Boolean(overrides.judge?.enabled ?? envFlag(env.OPENAGI_FLEET_JUDGE)) && Boolean(overrides.judge?.model ?? String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim()),
       model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
       timeoutMs: overrides.judge?.timeoutMs ?? 40_000
@@ -383,6 +398,15 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     },
     // Antigravity conversations: read, and sent to with agentapi, unless
     // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
+    paseo: {
+      enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
+      only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
+      pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
+      url: env.OPENAGI_PASEO_URL || "ws://127.0.0.1:6767/ws",
+      password: env.OPENAGI_PASEO_PASSWORD,
+      serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
+      ...overrides.paseo
+    },
     antigravity: {
       enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
     },
@@ -530,6 +554,7 @@ export function openChatFor(thread) {
   if (!thread?.kind) return null;
   const name = (value) => clampText(value, CHAT_NAME_MAX);
   const title = name(thread.title);
+  if (thread.kind === "paseo") return { app: "paseo", url: null, label: `${title || "untitled chat"} (Paseo)`, serverId: thread.meta?.serverId, agentId: thread.id, note: "Open this existing chat on its Paseo host." };
   const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
   const target = uiTargetFor(thread);
   if (target?.app === "conductor") {

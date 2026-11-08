@@ -82,7 +82,7 @@ test("disabled job set: fixed list, plus integration jobs until their keys are s
   assert.throws(() => MOBILE_DISABLED_CRON_JOBS.add("daily-plan-morning"), TypeError);
   assert.deepEqual([...mobileDisabledCronJobs({})].sort(), [...FIXED_DISABLED, ...INTEGRATION_JOBS].sort());
   assert.deepEqual([...mobileDisabledCronJobs({ LINEAR_API_KEY: "lin_x", BUILDBETTER_API_KEY: "bb_x" })].sort(), [...FIXED_DISABLED].sort());
-  assert.deepEqual(MOBILE_MODEL_TOOLS, ["remember", "recall", "add_task", "complete_task", "move_task", "schedule_message"]);
+  assert.deepEqual(MOBILE_MODEL_TOOLS, ["remember", "recall", "add_task", "list_tasks", "complete_task", "move_task", "schedule_message"]);
   assert.ok(Object.isFrozen(MOBILE_MODEL_TOOLS));
 });
 

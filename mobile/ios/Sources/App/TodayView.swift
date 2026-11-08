@@ -26,6 +26,21 @@ struct TodayView: View {
                         Text(headline).font(.headline)
                     }
                 }
+                if let review = model.snapshot?.summary.taskReview {
+                    Section {
+                        if review.status == "reviewed" || review.status == "no_tasks", let date = review.lastReviewedAt {
+                            LabeledContent("Task relevance reviewed") { Text(date, style: .relative) }
+                        } else {
+                            Label(review.status == "unavailable" ? "Task review needs a model" : "Task review couldn't finish",
+                                  systemImage: "exclamationmark.clock")
+                            Text("Saved tasks remain visible. Refresh syncs the list; it doesn't reassess tasks.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if let date = review.lastReviewedAt {
+                                LabeledContent("Last successful review") { Text(date, style: .relative) }
+                            }
+                        }
+                    }
+                }
                 let visible = model.snapshot?.visibleToday ?? []
                 if visible.isEmpty {
                     Section { emptyState }
