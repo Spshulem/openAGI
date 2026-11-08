@@ -38,6 +38,14 @@ final class HostAllowlistTests: XCTestCase {
         XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "http://172.32.0.1:43210")!))
     }
 
+    func testPublicHostnamesContainingPrivateIPLabelsAreRefused() {
+        for raw in ["http://10.0.0.5.attacker.example", "http://192.168.1.20.attacker.example",
+                    "http://172.16.4.4.attacker.example", "http://attacker.10.0.0.5.example"] {
+            XCTAssertThrowsError(try HostAllowlist.validate(URL(string: raw)!), raw)
+        }
+        XCTAssertFalse(HostAllowlist.isBlockedByAppTransportSecurity("100.64.0.1.attacker.example"))
+    }
+
     func testHTTPSIsAlwaysAllowed() {
         XCTAssertNoThrow(try HostAllowlist.validate(URL(string: "https://openagi.example.com")!))
     }

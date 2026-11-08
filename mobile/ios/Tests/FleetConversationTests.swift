@@ -26,12 +26,24 @@ final class FleetConversationTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer " + String(repeating: "a", count: 43))
     }
 
+    func testReadsPaseoConversationWithHostScopedIdentity() async throws {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"thread":{"key":"paseo:host.agent","conversation":{"messages":[],"truncated":false,"unavailableReason":null}}}"#.utf8))
+        }
+        _ = try await client().fleetThreadDetail(key: "paseo:host.agent")
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.url?.path, "/fleet/api/threads/paseo:host.agent")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-OpenAGI-Node-ID"), "mobile:abc")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer " + String(repeating: "a", count: 43))
+    }
+
     func testRejectsAResponseForAnotherThreadAndPathsOutsideTheThreadRoute() async {
         StubProtocol.handler = { request in
             (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
              Data(#"{"thread":{"key":"codex:other"}}"#.utf8))
         }
-        for key in ["codex:chosen", "codex:../other", "codex:a?query=other", "unrecognized:a"] {
+        for key in ["codex:chosen", "codex:../other", "codex:a?query=other", "unrecognized:a", "paseo:../other", "paseo:a?query=other", "paseo:host.agent"] {
             do { _ = try await client().fleetThreadDetail(key: key); XCTFail("Must reject \(key)") }
             catch let error as DaemonError { XCTAssertEqual(error, .malformedResponse) }
             catch { XCTFail("Unexpected error: \(error)") }

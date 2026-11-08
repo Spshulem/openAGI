@@ -109,6 +109,8 @@ struct SettingsView: View {
 
                 Section("About") {
                     LabeledContent("Version", value: Self.buildVersion)
+                    Link("Privacy Policy", destination: URL(string: "https://github.com/Spshulem/openAGI/blob/main/mobile/PRIVACY.md")!)
+                    Link("Support", destination: URL(string: "https://github.com/Spshulem/openAGI/issues")!)
                     if !model.isOnPhone {
                         LabeledContent("Phone ID") {
                             Text(model.credentials.nodeID)

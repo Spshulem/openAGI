@@ -18,7 +18,7 @@ export const GET_STARTED_FLOWS = [
   {
     id: "agents", title: "Monitor your coding agents", time: "5 minutes",
     description: "Follow coding sessions and see what needs your attention. Start with a read-only view.",
-    steps: ["Open Coding Agents to configure a supported CLI and select existing Git projects.", "Use Fleet to inspect recent sessions in observe mode. Available sources depend on the host and installed apps.", "Review a real session and its evidence. A reported status is not proof that code passed tests, merged, or shipped."],
+    steps: ["Open Coding setup under Advanced to configure a supported CLI and select existing Git projects.", "Open Supervisor to inspect recent sessions in observe mode. Available sources depend on the host and installed apps.", "Review a real session and its evidence. A reported status is not proof that code passed tests, merged, or shipped."],
     link: "/?tab=coding-agents", linkLabel: "Set up Coding Agents",
     prompt: "Help me monitor my coding agents in read-only mode. First ask which coding app and computer I use."
   },

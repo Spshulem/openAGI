@@ -36,6 +36,23 @@ class HostAllowlistTest {
     }
 
     @Test
+    fun publicHostnamesContainingPrivateIPLabelsAreRefused() {
+        listOf(
+            "http://10.0.0.5.attacker.example",
+            "http://192.168.1.20.attacker.example",
+            "http://172.16.4.4.attacker.example",
+            "http://100.64.0.1.attacker.example",
+            "http://attacker.10.0.0.5.example",
+        ).forEach { raw ->
+            try {
+                HostAllowlist.validate(raw)
+                fail("expected a refusal for $raw")
+            } catch (expected: DaemonException.UnreachableHost) {
+            }
+        }
+    }
+
+    @Test
     fun httpsIsAlwaysAllowed() {
         assertEquals("openagi.example.com", HostAllowlist.validate("https://openagi.example.com").host)
     }

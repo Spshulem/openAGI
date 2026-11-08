@@ -43,6 +43,7 @@ struct OpenAGIApp: App {
                 #if DEBUG
                 if UITestProtocol.isEnabled || Self.isDeviceAcceptance { return }
                 #endif
+                if WebSignIn.handleCallback(url) { return }
                 // The Live Activity's tap target.
                 if url.scheme == "openagi", url.host == "supervisor" {
                     PushRouter.shared.openSupervisor()

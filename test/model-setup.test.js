@@ -27,6 +27,63 @@ test("saved model labels cannot escape setup markup", () => {
   assert.doesNotMatch(html, /<script>bad/);
 });
 
+function setupBrowser({ search = "", hasAuth = true } = {}) {
+  const elements = new Map();
+  const events = [], requests = [];
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, { hidden: true, focus() {}, click() { return this.onclick(); } });
+    return elements.get(id);
+  };
+  let selected = "openai";
+  const chatgpt = { set checked(value) { if (value) selected = "chatgpt"; } };
+  const steps = [0, 1, 2].map(step => ({ dataset: { step }, hidden: step !== 0 }));
+  const fields = ["openai", "chatgpt"].map(provider => ({ dataset: { provider } }));
+  Object.assign(element("form"), {
+    dataset: { hasAuth: String(hasAuth) },
+    querySelector: selector => selector.endsWith(":checked") ? { value: selected }
+      : selector.includes('value="chatgpt"') ? chatgpt : element(selector),
+    querySelectorAll: selector => selector === "[data-step]" ? steps : selector === "[data-provider]" ? fields : []
+  });
+  element("tokenInput").value = "fixture-owner";
+  const popup = { location: {}, close() {} };
+  const html = renderWizard({ existingEnv: { OPENAGI_AUTH_TOKEN: "fixture-owner" } });
+  vm.runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1], {
+    document: { getElementById: element, querySelectorAll: () => [], cookie: "" }, URLSearchParams,
+    window: { location: { search }, open() { events.push("popup"); return popup; } },
+    fetch: async (route, options) => {
+      events.push(route); requests.push({ route, body: options?.body ? JSON.parse(options.body) : null });
+      return { ok: true, json: async () => route.endsWith("/status")
+        ? { signedIn: true, planEnabled: true } : { authorizeUrl: "https://auth.openai.com/fixture" } };
+    }
+  });
+  return { element, events, requests, popup, steps, selected: () => selected };
+}
+
+test("Continue with ChatGPT opens the browser from the gesture and bootstraps before authorization", async () => {
+  const browser = setupBrowser({ hasAuth: false });
+  browser.element("chooseChatGPT").click();
+  await new Promise(setImmediate);
+  assert.equal(browser.selected(), "chatgpt");
+  assert.equal(browser.steps[1].hidden, false);
+  assert.deepEqual(browser.events, ["popup", "/setup/save", "/auth/chatgpt/start"]);
+  assert.deepEqual(browser.requests.map(r => r.body), [{ OPENAGI_AUTH_TOKEN: "fixture-owner" }, { returnTo: "setup" }]);
+  assert.equal(browser.popup.location.href, "https://auth.openai.com/fixture");
+  assert.equal(browser.popup.opener, null);
+});
+
+test("desktop ChatGPT returns select the connect step and show success or a recoverable error", async () => {
+  const connected = setupBrowser({ search: "?provider=chatgpt" });
+  await new Promise(setImmediate);
+  assert.equal(connected.selected(), "chatgpt");
+  assert.equal(connected.steps[1].hidden, false);
+  assert.match(connected.element("signInStatus").textContent, /ChatGPT is connected/);
+  const denied = setupBrowser({ search: "?provider=chatgpt&error=chatgpt-access-denied" });
+  assert.equal(denied.element("output").hidden, false);
+  assert.match(denied.element("output").textContent, /sign-in did not finish/);
+  assert.equal(denied.element("output").className, "error");
+  assert.equal(denied.requests.length, 0);
+});
+
 async function appFor(t, provider) {
   const keys = ["OPENAGI_DATA_DIR", "OPENAGI_AUTH_TOKEN", "OPENAGI_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAGI_LOCAL_MODEL", "OPENAGI_LOCAL_BASE_URL", "OPENAGI_LOCAL_API_KEY"];
   const before = Object.fromEntries(keys.map(key => [key, process.env[key]]));

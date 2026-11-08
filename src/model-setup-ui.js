@@ -60,13 +60,13 @@ button:disabled { opacity:.55; cursor:wait; } .actions .back { border:0; padding
 <div><form class="setup-card" id="form" data-selected="${selected}" data-has-auth="${Boolean(existingEnv.OPENAGI_AUTH_TOKEN)}"><input type="hidden" name="OPENAGI_AUTH_TOKEN" id="tokenInput" value="${escape(proposedToken)}">
 <section data-step="0"><h2>Choose your model</h2><p class="subtext">Use a cloud provider or keep inference on your device.</p><div class="model-options">
 ${choice('anthropic','Anthropic','Claude with your API key','Cloud')}${choice('openai','OpenAI','GPT with your API key','Cloud')}${choice('local','Local model','Ollama, LM Studio, or a compatible server','Your computer')}${choice('on-device','Apple Intelligence','Built-in model on a compatible Mac or iPhone','No API key')}${choice('chatgpt','ChatGPT plan','Connect an eligible ChatGPT account','Sign in')}
-</div><div class="actions"><span class="hint">You can change this later.</span><button class="primary" type="button" id="chooseNext">Continue →</button></div></section>
+</div><div class="actions"><button type="button" id="chooseChatGPT">Continue with ChatGPT</button><button class="primary" type="button" id="chooseNext">Continue →</button></div></section>
 <section data-step="1" hidden><h2 id="connectTitle">Connect your model</h2><p class="subtext" id="connectDescription">We’ll check the connection before you start chatting.</p>
 <fieldset data-provider="anthropic" disabled hidden><label class="field" for="anthropicKey">Anthropic API key ${saved('ANTHROPIC_API_KEY')}</label><input id="anthropicKey" name="ANTHROPIC_API_KEY" type="password" autocomplete="off" placeholder="sk-ant-…"><p class="hint">Get a key at <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer">console.anthropic.com ↗</a></p><details><summary>Model options</summary><label class="field" for="anthropicModel">Model</label><input id="anthropicModel" name="ANTHROPIC_MODEL" type="text" value="${value('ANTHROPIC_MODEL','claude-sonnet-4-6')}"></details></fieldset>
 <fieldset data-provider="openai" disabled hidden><label class="field" for="openaiKey">OpenAI API key ${saved('OPENAI_API_KEY')}</label><input id="openaiKey" name="OPENAI_API_KEY" type="password" autocomplete="off" placeholder="sk-…"><p class="hint">Get a key at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">platform.openai.com ↗</a></p><details><summary>Model options</summary><label class="field" for="openaiModel">Model</label><input id="openaiModel" name="OPENAI_MODEL" type="text" value="${value('OPENAI_MODEL','gpt-5')}"><label class="field" for="openaiBaseUrl">Responses-compatible base URL</label><input id="openaiBaseUrl" name="OPENAI_BASE_URL" type="url" value="${value('OPENAI_BASE_URL','https://api.openai.com/v1')}"><p class="hint">Use the endpoint and model supplied by your provider. An OpenRouter key cannot use the default OpenAI endpoint.</p></details></fieldset>
 <fieldset data-provider="local" disabled hidden><label class="field" for="localUrl">Model server URL</label><input id="localUrl" name="OPENAGI_LOCAL_BASE_URL" type="url" value="${value('OPENAGI_LOCAL_BASE_URL','http://localhost:11434/v1')}" required><label class="field" for="localModel">Installed model name</label><input id="localModel" name="OPENAGI_LOCAL_MODEL" type="text" value="${value('OPENAGI_LOCAL_MODEL')}" placeholder="e.g. llama3.2" required><div class="note"><strong>Using Ollama?</strong><br>Start <a href="https://ollama.com/download" target="_blank" rel="noopener noreferrer">Ollama</a>, run <code>ollama pull llama3.2</code>, then enter <code>llama3.2</code> above. For LM Studio, start its local server and use its URL ending in <code>/v1</code>.<br>Choose a model with tool support to let your agent take actions. Screen tools also require a model with vision support.</div><details><summary>Server authentication (optional)</summary><label class="field" for="localKey">Server API key ${saved('OPENAGI_LOCAL_API_KEY')}</label><input id="localKey" name="OPENAGI_LOCAL_API_KEY" type="password" autocomplete="off" placeholder="Only if your server requires one"></details></fieldset>
 <fieldset data-provider="on-device" disabled hidden><div class="note"><strong>Apple Intelligence</strong><p id="appleAvailability">Checking the native model connection…</p>Requires the OpenAGI Mac or iPhone app, macOS 26 or iOS 26, a compatible device, and Apple Intelligence enabled with its model downloaded. Small on-device models have a shorter context and a smaller tool set.</div><p class="hint">No API key or cloud model account is required.</p></fieldset>
-<fieldset data-provider="chatgpt" disabled hidden><div class="note">Sign in to connect your eligible ChatGPT plan. Your plan’s usage limits apply.</div><button type="button" id="chatgptSignIn">Sign in with ChatGPT ↗</button><p class="hint" id="signInStatus">Return here after signing in, then check the connection.</p></fieldset>
+<fieldset data-provider="chatgpt" disabled hidden><div class="note">Sign in to connect your eligible ChatGPT plan. No API key required. Your plan’s usage limits apply.</div><button type="button" id="chatgptSignIn">Continue with ChatGPT</button><p class="hint" id="signInStatus">Return here after signing in, then check the connection.</p></fieldset>
 ${!existingEnv.OPENAGI_AUTH_TOKEN ? `<details id="bootstrapAccess" hidden open><summary>Save your dashboard login</summary><p class="hint">Native models and ChatGPT sign-in need a dashboard login before model verification. Copy this token now so you can return even if the connection fails. Keep it private.</p><div class="token-actions"><input type="password" readonly value="${escape(proposedToken)}" aria-label="Dashboard access token"><button type="button" data-copy-token>Copy</button></div></details>` : ''}
 <div class="actions"><button class="back" type="button" id="connectBack">← Back</button><button class="primary" type="submit" id="saveBtn">Connect & verify →</button></div><p class="hint">Verification sends one short test message to your selected model.</p></section>
 <section data-step="2" hidden><div class="ready-mark" aria-hidden="true">✓</div><h2>Your agent is ready.</h2><p class="subtext" id="verifiedModel"></p><div class="ready-list"><div><strong>Start with one useful result</strong>Tell your agent what you’re working on. It will guide you from there.</div><div><strong>Make it yours over time</strong>Add memory, tools, coding agents, or other devices when you need them.</div></div><details><summary>Save your dashboard access</summary><p class="hint">We auto-generated a strong one for this dashboard. Save this token to sign in from another browser. Keep it private; don’t paste it into chat.</p><div class="token-actions"><input id="tokenView" type="password" readonly value="${escape(proposedToken)}" aria-label="Dashboard access token"><button id="copyToken" data-copy-token type="button">Copy</button></div></details><div class="actions"><button class="back" type="button" id="readyBack">← Change model</button><a class="primary-link" href="/?tab=chat&onboarding=1">Meet your agent →</a></div></section>
@@ -148,7 +148,7 @@ function setupClient() {
     const popup = window.open('about:blank','_blank');
     try {
       signIn.disabled = true; await bootstrapAuth();
-      const auth = await post('/auth/chatgpt/start', {});
+      const auth = await post('/auth/chatgpt/start', { returnTo:'setup' });
       if (!auth.authorizeUrl) throw new Error('Sign-in could not start.');
       if (popup) { popup.opener = null; popup.location.href = auth.authorizeUrl; }
       else {
@@ -158,6 +158,26 @@ function setupClient() {
     } catch (error) { popup?.close(); message(error.message, true); }
     finally { signIn.disabled = false; }
   };
+  document.getElementById('chooseChatGPT').onclick = () => {
+    form.querySelector('input[name="OPENAGI_PROVIDER"][value="chatgpt"]').checked = true;
+    void configure();
+    // Keep popup creation in the original user gesture.
+    document.getElementById('chatgptSignIn').click();
+  };
+  const query = new URLSearchParams(window.location.search);
+  if (query.get('provider') === 'chatgpt') {
+    form.querySelector('input[name="OPENAGI_PROVIDER"][value="chatgpt"]').checked = true;
+    void configure();
+    if (query.has('error')) {
+      message('ChatGPT sign-in did not finish. Continue with ChatGPT to try again, or choose another model.', true);
+    } else if (form.dataset.hasAuth === 'true') {
+      fetch('/auth/chatgpt/status').then(r => r.ok ? r.json() : null).then(status => {
+        if (status?.signedIn && status?.planEnabled) {
+          document.getElementById('signInStatus').textContent = 'ChatGPT is connected. Connect & verify below to finish setting up your agent.';
+        }
+      }).catch(() => {});
+    }
+  }
   form.querySelectorAll('[data-copy-token]').forEach(copy => { copy.onclick = async () => {
     try { await navigator.clipboard.writeText(document.getElementById('tokenInput').value); copy.textContent = 'Copied'; }
     catch { const input = copy.parentElement.querySelector('input'); input.type = 'text'; input.select(); }

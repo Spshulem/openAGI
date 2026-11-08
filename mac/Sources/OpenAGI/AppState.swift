@@ -32,6 +32,8 @@ final class AppState: ObservableObject {
   @Published var findings: [Finding] = []
   @Published var recentSessions: [SessionSummary] = []
   @Published var topTasks: [TaskSummary] = []
+  @Published var tasksLoaded = false
+  @Published var tasksUnavailable = false
   @Published var paused: Bool = false
 
   // Remote "main" pointer for proactive outreach. When set, OutreachConsumer
@@ -244,7 +246,7 @@ final class AppState: ObservableObject {
         // launch with a notification only; don't grab a window from someone
         // who may be running deterministic-only on purpose.
         offeredSetupThisLaunch = true
-        notify(title: "Connect a model to OpenAGI", body: "Choose an API model, Apple Intelligence, or a local model server.", path: "/setup")
+        notify(title: "Connect a model to OpenAGI", body: "Continue with ChatGPT, use an API key, or choose Apple Intelligence or a local model.", path: "/setup")
       }
     } catch {
       status = .down
@@ -321,8 +323,11 @@ final class AppState: ObservableObject {
     do {
       let r: TasksResponse = try await get("/tasks?queue=user&status=pending&limit=5")
       topTasks = Array((r.tasks ?? []).prefix(5))
+      tasksLoaded = true
+      tasksUnavailable = false
     } catch {
-      // Quietly skip; not critical.
+      tasksLoaded = true
+      tasksUnavailable = true
     }
     if status != .healthy { Task { await self.fetchAuditAndNotify() } }
   }

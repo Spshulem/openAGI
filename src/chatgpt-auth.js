@@ -53,8 +53,8 @@ export const CHATGPT_CALLBACK_PATH = "/auth/callback";
 export const CHATGPT_ALT_CALLBACK_PATH = "/auth/chatgpt/callback";
 /// Where the callback sends the browser afterwards when the start request
 /// asked for it. Allowlisted (no caller-supplied URLs: no open redirect).
-/// "openagi" is the iOS app's ASWebAuthenticationSession callback scheme.
-export const RETURN_TO_TARGETS = Object.freeze({ openagi: "openagi://chatgpt-signed-in" });
+/// "openagi" returns to the native iOS app; "setup" resumes desktop setup.
+export const RETURN_TO_TARGETS = Object.freeze({ openagi: "openagi://chatgpt-signed-in", setup: "/setup?provider=chatgpt" });
 
 // ─── Local policy ────────────────────────────────────────────────────────
 /// Pending authorization attempts expire (docs' website example uses 10 min).
@@ -593,8 +593,8 @@ function sendCallbackPage(res, statusCode, message) {
   res.end(body);
 }
 
-// Hand control back to the app: 302 plus meta-refresh and script fallbacks
-// for browsers that render the body. No template literals here on purpose.
+// Hand control back to the app, or commit a local page before resuming setup.
+// No template literals here on purpose.
 function sendAppRedirect(res, location) {
   const safe = escapeHtml(location);
   const body = "<!doctype html><html><head><meta charset=\"utf-8\">" +
@@ -603,8 +603,11 @@ function sendAppRedirect(res, location) {
     "<p><a href=\"" + safe + "\">Return to OpenAGI</a></p>" +
     "<script>window.location.replace(" + JSON.stringify(location).replace(/</g, "\\u003c") + ");</script>" +
     "</body></html>";
-  res.writeHead(302, {
-    location,
+  // Commit the local page before returning to setup so a Strict dashboard
+  // cookie can accompany that new same-origin navigation after OAuth.
+  const localPage = location.startsWith("/");
+  res.writeHead(localPage ? 200 : 302, {
+    ...(localPage ? {} : { location }),
     "content-type": "text/html; charset=utf-8",
     "content-length": Buffer.byteLength(body),
     "cache-control": "no-store",
@@ -658,7 +661,7 @@ export async function handleChatGPTAuthRoute({ method, pathname, url, req, res, 
         : "Signed in, but ChatGPT plan use was not allowed. Sign in again and allow it, or add an API key. You can close this window.");
     } catch (error) {
       if (appReturn) {
-        sendAppRedirect(res, appReturn + "?error=" + encodeURIComponent(error?.code ?? "chatgpt-error"));
+        sendAppRedirect(res, appReturn + (appReturn.includes("?") ? "&" : "?") + "error=" + encodeURIComponent(error?.code ?? "chatgpt-error"));
         return true;
       }
       sendCallbackPage(res, 400, `Sign-in failed. ${error?.message ?? "Try again."}`);

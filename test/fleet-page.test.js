@@ -12,7 +12,7 @@ function pageScript() {
 
 test("fleet page is a standalone document with the four sections", () => {
   assert.match(fleetPage, /^<!doctype html>/i);
-  for (const text of ["Needs you", "Doing", "Infra", "Fleet", "Scan now", 'href="/"']) {
+  for (const text of ["Needs you", "Doing", "System status", "Supervisor", "Scan now", 'href="/"']) {
     assert.ok(fleetPage.includes(text), text);
   }
   for (const mode of ["observe", "propose", "auto"]) assert.ok(fleetPage.includes('data-mode="' + mode + '"'), mode);
