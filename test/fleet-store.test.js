@@ -843,3 +843,18 @@ test("unchanged answered and dismissed judge asks survive the reply-key upgrade"
     assert.equal(changed.status, "open");
   }
 });
+
+test("mode write failure does not acknowledge Auto or change the effective mode", t => {
+  const dir = tempDir(t), store = new FleetStore({ dir, defaultMode: "observe" });
+  store.setMode("observe");
+  const originalPath = store.statePath;
+  const obstruction = path.join(dir, "not-a-directory");
+  fs.writeFileSync(obstruction, "fixture");
+  store.statePath = path.join(obstruction, "state.json");
+  assert.throws(() => store.setMode("auto"), /could not be saved/);
+  assert.equal(store.mode, "observe");
+  assert.equal(new FleetStore({ dir }).mode, "observe");
+  store.statePath = originalPath;
+  assert.equal(store.setMode("auto"), "auto");
+  assert.equal(new FleetStore({ dir }).mode, "auto");
+});

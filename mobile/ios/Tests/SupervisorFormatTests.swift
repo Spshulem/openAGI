@@ -6,6 +6,14 @@ import XCTest
 final class SupervisorFormatTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_790_000_000)
 
+    func testOpeningAThreadIsNavigationAndNeverAnAnswer() {
+        let question = FleetQuestion(id: "q", options: ["yes", "open thread", "opened", "dismiss", "  "],
+                                     threadKey: "codex:a", threadKeys: ["codex:a", "codex:b"])
+        XCTAssertEqual(SupervisorFormat.answerOptions(question), ["yes"])
+        XCTAssertEqual(SupervisorFormat.threadKeys(question), ["codex:a", "codex:b"])
+        XCTAssertTrue(SupervisorFormat.answerOptions(FleetQuestion(id: "q", options: ["open thread"])).isEmpty)
+    }
+
     func testThreadsSortWorstFirstThenMostRecent() {
         let threads = [
             FleetThread(key: "g-old", state: "running", lastActivityAt: now.addingTimeInterval(-600)),
@@ -49,7 +57,7 @@ final class SupervisorFormatTests: XCTestCase {
         XCTAssertEqual(SupervisorFormat.deliveryNote(FleetDelivery(status: "sent"), fallback: "Answered."),
                        .init(text: "Sent to the agent.", isAlert: false))
         XCTAssertEqual(SupervisorFormat.deliveryNote(FleetDelivery(status: "blocked", detail: " offline "), fallback: "x"),
-                       .init(text: "Saved. Couldn't reach the agent: offline", isAlert: true))
+                       .init(text: "Not sent. Couldn't reach the agent: offline", isAlert: true))
         XCTAssertEqual(SupervisorFormat.deliveryNote(nil, fallback: "Answered."), .init(text: "Answered.", isAlert: false))
         XCTAssertFalse(SupervisorFormat.failureNote(.transport(URLError(.timedOut))).isAlert)
         XCTAssertEqual(SupervisorFormat.failureNote(.conflict).text, "That's already been handled.")

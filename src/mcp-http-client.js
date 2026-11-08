@@ -165,7 +165,8 @@ export class McpHttpClient {
       headers.authorization = `Bearer ${token}`;
     }
     this.assertConnectionGeneration(generation);
-    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
+    const requestSessionId = this.sessionId;
+    if (requestSessionId) headers["mcp-session-id"] = requestSessionId;
 
     const controller = new AbortController();
     this.activeControllers.add(controller);
@@ -187,9 +188,16 @@ export class McpHttpClient {
     try {
       this.assertConnectionGeneration(generation);
       // Keep the deadline and disconnect handle until the body is consumed.
+      // Streamable HTTP uses 404 to terminate a session. Invalidate only the
+      // rejected generation; a late response must not erase a newer session.
+      // Do not replay this request: tools/call may have external side effects.
+      if (response.status === 404 && requestSessionId && this.sessionId === requestSessionId) {
+        this.sessionId = null;
+        this.connected = false;
+      }
       // Capture or update session id.
       const sid = response.headers.get("mcp-session-id");
-      if (sid) this.sessionId = sid;
+      if (sid && response.ok) this.sessionId = sid;
 
       if (response.status === 401 && this.oauth && !retried) {
         // Force a re-auth on next call.

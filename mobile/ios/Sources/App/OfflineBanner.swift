@@ -59,9 +59,9 @@ struct OfflineBanner: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            _ = try await AppSession.shared.switchBackToServer(detaching: model)
+            try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            errorText = "Can't reach your Mac yet. Your work stays on this iPhone until it can."
+            errorText = ServerConnectionGuidance.savedPairingFailure(error, server: AppSession.shared.serverBackup?.server ?? model.credentials.server)
         }
     }
 }

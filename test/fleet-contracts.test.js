@@ -261,11 +261,11 @@ test("openChatFor: the link that opens exactly that chat, or a label that says w
   assert.equal(openChatFor(null), null);
 });
 
-test("thread keys come from the one kind list, Antigravity included", () => {
-  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity"]);
-  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity");
-  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
-  for (const key of ["gemini:x", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
+test("thread keys come from the one kind list, Paseo included", () => {
+  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity", "paseo"]);
+  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity|paseo");
+  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "paseo:host.agent", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
+  for (const key of ["gemini:x", "paseo:", "paseo:host.agent/other", "paseo:host agent", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
   for (const kind of THREAD_KINDS) assert.ok(KIND_NAMES[kind], kind);
   assert.equal(kindName("antigravity"), "Antigravity");
   assert.equal(kindName("other"), "Agent");
