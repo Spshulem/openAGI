@@ -160,8 +160,9 @@ function armStartupExitGuard() {
 // start it under pid 1 already, so only a parent that changes is a death.
 // The Mac app wants the same: its daemon must not outlive it.
 // OPENAGI_SURVIVE_PARENT=1 keeps a deliberately backgrounded server.
-export function watchParent(onOrphan, { intervalMs = 15_000, getPpid = () => process.ppid, env = process.env } = {}) {
-  const parent = getPpid();
+// Pass the parent read before startup: one that exits mid-boot would
+// otherwise look like pid 1 and switch the watch off.
+export function watchParent(onOrphan, { intervalMs = 15_000, getPpid = () => process.ppid, parent = getPpid(), env = process.env } = {}) {
   if (env.OPENAGI_SURVIVE_PARENT === "1" || parent <= 1) return () => {};
   const timer = setInterval(() => {
     if (getPpid() === parent) return;
@@ -182,6 +183,7 @@ export function watchParent(onOrphan, { intervalMs = 15_000, getPpid = () => pro
 // Linux installer used to set no token, which is precisely that hole — so this
 // is enforced here, fatally, rather than warned about.
 export async function startServer({ host, port } = {}) {
+  const parent = process.ppid;
   installCrashGuards();
   armStartupExitGuard();
   const dataDir = loadBootEnv();
@@ -233,7 +235,7 @@ export async function startServer({ host, port } = {}) {
   const onInt = () => onSignal("SIGINT");
   process.once("SIGTERM", onTerm);
   process.once("SIGINT", onInt);
-  const stopParentWatch = isMobileProfile() ? () => {} : watchParent(() => onSignal("parent-exit"));
+  const stopParentWatch = isMobileProfile() ? () => {} : watchParent(() => onSignal("parent-exit"), { parent });
   app.close = async () => {
     stopDiscovery();
     stopParentWatch();

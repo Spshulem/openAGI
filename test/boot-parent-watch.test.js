@@ -39,6 +39,13 @@ test("watchParent leaves launchd/systemd, docker and opted-out servers alone", a
   assert.equal(fired, 0);
 });
 
+test("watchParent fires for a parent that exited during startup", async () => {
+  let fired = 0;
+  watchParent(() => { fired += 1; }, { intervalMs: 5, getPpid: () => 1, parent: 500, env: {} });
+  await wait(20);
+  assert.equal(fired, 1);
+});
+
 test("watchParent stop cancels the watch", async () => {
   let ppid = 500;
   let fired = 0;
