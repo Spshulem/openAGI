@@ -366,12 +366,14 @@ export class CronScheduler {
     if (job.intervalMs) return new Date(from.getTime() + job.intervalMs);
     if (job.dailyAt) {
       const [hour, minute] = job.dailyAt.split(":").map((part) => Number.parseInt(part, 10));
-      const next = new Date(from);
-      next.setHours(hour, minute ?? 0, 0, 0);
-      if (next <= from) next.setDate(next.getDate() + 1);
       const days = Array.isArray(job.days) && job.days.length ? job.days : null;
-      for (let i = 0; days && i < 7 && !days.includes(next.getDay()); i += 1) next.setDate(next.getDate() + 1);
-      return next;
+      // Build each candidate from the calendar date, so a skipped day whose
+      // wall-clock time does not exist (spring forward) cannot shift the hour
+      // of the day that actually runs.
+      for (let offset = 0; offset <= 8; offset += 1) {
+        const next = new Date(from.getFullYear(), from.getMonth(), from.getDate() + offset, hour, minute ?? 0, 0, 0);
+        if (next > from && (!days || days.includes(next.getDay()))) return next;
+      }
     }
     return new Date(from.getTime() + 1000 * 60 * 60 * 24);
   }

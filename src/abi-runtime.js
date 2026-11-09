@@ -1373,7 +1373,7 @@ export class AbiRuntime {
     const context = action.context ?? {};
     const job = this.cron?.listJobs().find(row => row.id === context.scheduledJobId)
       ?? { id: context.scheduledJobId, name: context.scheduledJobName ?? "Scheduled run", input: {} };
-    const input = { channel: context.channel, target: context.from, ...job.input };
+    const input = { channel: context.channel, target: context.from, agentId: context.agentId ?? undefined, ...job.input };
     const outcome = invokeResult?.ok
       ? `It ran. Result: ${JSON.stringify(invokeResult.result ?? null).slice(0, 2000)}`
       : `It failed: ${String(invokeResult?.error ?? "unknown error").slice(0, 500)}`;
@@ -1385,7 +1385,7 @@ export class AbiRuntime {
       text: `[Scheduled run "${job.name}" update: the owner approved "${action.summary}". ${outcome}]\n\nFinish the scheduled task and reply with the result.`,
       metadata: { scheduledJobId: job.id, scheduledJobName: job.name, approvalActionId: action.id },
       origin: "cron"
-    }, { ownerSchedule: input.createdBy === "owner" });
+    }, { ownerSchedule: context.ownerSchedule === true || input.createdBy === "owner" });
     await this.deliverScheduledResult({ ...job, input }, result);
     return result;
   }

@@ -2627,14 +2627,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           enabled: body.enabled ?? true,
           task: body.task ?? "prompt",
           replace: true,
-          input: body.input ?? {
-            prompt: body.prompt ?? "(empty)",
-            channel: body.channel ?? "local",
-            target: body.target ?? null,
-            agentId: body.agentId ?? "main",
-            sessionId: body.sessionId,
+          input: {
+            ...(body.input ?? {
+              prompt: body.prompt ?? "(empty)",
+              channel: body.channel ?? "local",
+              target: body.target ?? null,
+              agentId: body.agentId ?? "main",
+              sessionId: body.sessionId
+            }),
             oneShot: Boolean(body.delaySeconds),
-            // This route is owner-authenticated, so the schedule is the owner's.
+            // This route is owner-authenticated, so the schedule is the
+            // owner's, whichever input shape the client posted.
             createdBy: "owner"
           },
           intervalMs: body.intervalSeconds ? body.intervalSeconds * 1000 : body.intervalMs,

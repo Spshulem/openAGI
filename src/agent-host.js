@@ -325,6 +325,7 @@ export class AgentHost {
         origin: input.origin ?? channel,
         scheduledJobId: metadata.scheduledJobId ?? null,
         scheduledJobName: metadata.scheduledJobName ?? null,
+        ...(options.ownerSchedule === true ? { ownerSchedule: true } : {}),
         agentId,
         sessionId,
         runtime: this.runtime,

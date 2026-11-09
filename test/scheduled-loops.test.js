@@ -12,6 +12,8 @@ import { PendingActionStore } from "../src/pending-actions.js";
 import { AbiRuntime } from "../src/abi-runtime.js";
 import { AgentHost } from "../src/agent-host.js";
 import { ownerPrincipal } from "../src/owner-authority.js";
+import { OUTREACH_DEFAULTS } from "../src/outreach-config.js";
+import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 
 const owner = ownerPrincipal("owner");
 
@@ -203,4 +205,75 @@ test("an owner's schedule runs without the scrutiny throttle; gated tools still 
   assert.equal(captured.context.__owner, undefined);
   await host.handleMessage({ text: "Check my inbox", channel: "cron", from: "cron", origin: "cron" });
   assert.deepEqual(captured.tools, ["read_thing"]);
+});
+
+test("a skipped spring-forward day does not shift the next run's hour", () => {
+  const previous = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    const cron = new CronScheduler();
+    const friday = new Date(2026, 2, 6, 10, 0, 0); // Fri Mar 6; Sun Mar 8 has no 02:30
+    const next = cron.computeNextRun({ dailyAt: "02:30", days: [1, 2, 3, 4, 5] }, friday);
+    assert.equal(next.getDate(), 9);
+    assert.equal(next.getHours(), 2);
+    assert.equal(next.getMinutes(), 30);
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+});
+
+test("a one-shot run's approval resumes with the run's own access after the job is gone", async () => {
+  const { self, calls } = scheduledRuntime({ deliverResult: { ok: true } });
+  self.cron = { listJobs: () => [] };
+  const action = { id: "act_2", summary: "Run the triage skill",
+    context: { sessionId: "s-once", scheduledJobId: "job_gone", scheduledJobName: "Once", channel: "telegram", from: "123", agentId: "main", ownerSchedule: true } };
+  await AbiRuntime.prototype.resumeScheduledRun.call(self, action, { ok: true, result: null });
+  assert.equal(calls.messages[0].options.ownerSchedule, true);
+  assert.equal(calls.messages[0].input.agentId, "main");
+  assert.match(calls.messages[0].input.text, /Scheduled run "Once" update/);
+});
+
+test("an owner's scheduled run records its access on the cards it raises", t => {
+  const store = new PendingActionStore({ dir: tempDir(t, "loops-pending-owner-") });
+  const action = store.enqueue({ toolName: "run_skill", args: { name: "triage" }, summary: "Run triage",
+    context: { sessionId: "s1", origin: "cron", scheduledJobId: "job_f", ownerSchedule: true } });
+  assert.equal(action.context.ownerSchedule, true);
+  const other = store.enqueue({ toolName: "run_skill", args: { name: "other" }, summary: "Run other",
+    context: { sessionId: "s2", origin: "cron", scheduledJobId: "job_g", ownerSchedule: "yes" } });
+  assert.equal(other.context.ownerSchedule, undefined);
+});
+
+test("scheduled-run notices roll into the digest", () => {
+  assert.ok(OUTREACH_DEFAULTS.digestTypes.includes("scheduled-run"));
+});
+
+test("POST /cron marks dashboard-shaped schedules as the owner's", async t => {
+  const dataDir = tempDir(t, "loops-route-");
+  const prevToken = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = "test-token-abc";
+  const app = createHostedInterface(createDurableRuntime({ dataDir }), { host: "127.0.0.1", port: 0, channelsDir: path.join(dataDir, "channels") });
+  const { url } = await app.listen();
+  try {
+    const post = (body) => fetch(`${url}/cron`, {
+      method: "POST",
+      headers: { authorization: "Bearer test-token-abc", "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const res = await post({ name: "Inbox", task: "prompt", dailyAt: "08:00", days: "weekdays",
+      input: { prompt: "Check my inbox", channel: "local", target: null, createdBy: "someone" } });
+    const job = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(job.input.createdBy, "owner");
+    assert.equal(job.input.oneShot, false);
+    assert.deepEqual(job.days, [1, 2, 3, 4, 5]);
+    const once = await (await post({ name: "Once", prompt: "Ping", delaySeconds: 60 })).json();
+    assert.equal(once.input.oneShot, true);
+    assert.equal(once.input.createdBy, "owner");
+    assert.equal((await post({ name: "Bad", prompt: "x", dailyAt: "08:00", days: "someday" })).status, 400);
+  } finally {
+    await app.close();
+    if (prevToken === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = prevToken;
+  }
 });
