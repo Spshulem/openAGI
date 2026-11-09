@@ -90,6 +90,8 @@ export class CronScheduler {
       input: job.input ?? {},
       intervalMs: job.intervalMs ?? null,
       dailyAt: job.dailyAt ?? null,
+      // Days of week (0 = Sunday) a dailyAt job fires on. null = every day.
+      days: Array.isArray(job.days) && job.days.length ? job.days : null,
       // Per-job override of TIMEOUT_MS. null = use the global default.
       timeoutMs: Number.isFinite(job.timeoutMs) && job.timeoutMs > 0 ? job.timeoutMs : null,
       nextRunAt: job.nextRunAt ?? this.computeNextRun(job, new Date()).toISOString(),
@@ -341,7 +343,7 @@ export class CronScheduler {
     };
     if ("nextRunAt" in patch) {
       updated.nextRunAt = patch.nextRunAt;
-    } else if ("intervalMs" in patch || "dailyAt" in patch) {
+    } else if ("intervalMs" in patch || "dailyAt" in patch || "days" in patch) {
       updated.nextRunAt = this.computeNextRun(updated, new Date()).toISOString();
     }
     this.jobs.set(id, updated);
@@ -367,6 +369,8 @@ export class CronScheduler {
       const next = new Date(from);
       next.setHours(hour, minute ?? 0, 0, 0);
       if (next <= from) next.setDate(next.getDate() + 1);
+      const days = Array.isArray(job.days) && job.days.length ? job.days : null;
+      for (let i = 0; days && i < 7 && !days.includes(next.getDay()); i += 1) next.setDate(next.getDate() + 1);
       return next;
     }
     return new Date(from.getTime() + 1000 * 60 * 60 * 24);

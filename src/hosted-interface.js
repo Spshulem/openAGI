@@ -90,6 +90,7 @@ import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
 import { ownerPrincipal } from "./owner-authority.js";
+import { parseScheduleDays } from "./scheduled-prompt.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import { MobilePushStore, validatePushRegistration } from "./mobile-push-store.js";
 import { MobilePush } from "./mobile-push.js";
@@ -655,7 +656,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   }
 
+  async function deliverScheduledContinuation(action, invokeResult) {
+    const claim = runtime.pendingActions?.claimContinuation?.(action.id, { maxAttempts: 1 });
+    if (!claim) return;
+    try {
+      await runtime.resumeScheduledRun(action, invokeResult);
+      runtime.pendingActions.finishContinuation(action.id, { deliveryId: claim.deliveryId, delivered: true });
+    } catch (error) {
+      logAgentFailure(error, { sessionId: action.context?.sessionId });
+      // One attempt only: the resumed turn may already have run tools.
+      runtime.pendingActions.finishContinuation(action.id, {
+        deliveryId: claim.deliveryId, delivered: false, terminal: true, error: "scheduled continuation failed"
+      });
+      runtime.noticeScheduledRun?.({ id: action.context?.scheduledJobId, name: action.context?.scheduledJobName }, `Approved "${action.summary}", but the scheduled run could not finish.`);
+    }
+  }
+
   function queueApprovalContinuation(action, invokeResult, { resetFailed = false } = {}) {
+    if (action?.context?.scheduledJobId && action.toolName !== "start_computer_use_session" && action.context.sessionId && runtime.resumeScheduledRun) {
+      const continuation = runtime.pendingActions?.prepareContinuation?.(action.id, {
+        requestId: "approval_" + action.id,
+        sessionId: action.context.sessionId
+      });
+      if (!continuation) return null;
+      if (continuation.status === "pending") deliverScheduledContinuation(action, invokeResult).catch(() => {});
+      return { status: continuation.status === "delivered" ? "delivered" : "queued", sessionId: action.context.sessionId };
+    }
     if (
       action?.toolName !== "start_computer_use_session"
       || !invokeResult?.ok
@@ -2593,6 +2619,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/cron") return sendJson(res, 200, runtime.cron.listJobs());
       if (method === "POST" && pathname === "/cron") {
         const body = await readJson(req);
+        let days;
+        try { days = parseScheduleDays(body.days); } catch (error) { return sendJson(res, 400, { error: error.message }); }
         const job = runtime.cron.addJob({
           id: body.id,
           name: body.name ?? "manual-prompt",
@@ -2604,10 +2632,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             channel: body.channel ?? "local",
             target: body.target ?? null,
             agentId: body.agentId ?? "main",
-            sessionId: body.sessionId
+            sessionId: body.sessionId,
+            oneShot: Boolean(body.delaySeconds),
+            // This route is owner-authenticated, so the schedule is the owner's.
+            createdBy: "owner"
           },
           intervalMs: body.intervalSeconds ? body.intervalSeconds * 1000 : body.intervalMs,
           dailyAt: body.dailyAt,
+          days,
           // Per-job override of the 10-minute default (see TIMEOUT_MS). For the
           // rare job that legitimately runs longer than every other job should
           // be allowed to.

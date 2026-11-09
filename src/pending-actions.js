@@ -447,6 +447,9 @@ function serializableContext(ctx) {
     from: ctx.from ?? null,
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Lets an approval resume the scheduled run that raised it.
+    ...(typeof ctx.scheduledJobId === "string" ? { scheduledJobId: ctx.scheduledJobId.slice(0, 200) } : {}),
+    ...(typeof ctx.scheduledJobName === "string" ? { scheduledJobName: ctx.scheduledJobName.slice(0, 200) } : {}),
     // Audit only: a replayed record is plain data and never owner authority.
     authority: authorityRecord(ctx.__owner)
   };
