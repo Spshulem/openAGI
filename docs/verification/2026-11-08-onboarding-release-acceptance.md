@@ -15,7 +15,7 @@ by this QA pass.
 | Fresh native Mac v0.0.66 | Startup passed | Clean arm64 Mac on macOS 15.7.9: no prior app, data directory, or port listener. Copied notarized app launched its bundled daemon and served the first-run wizard. |
 | Linux x64 download | Startup passed | Published archive's launcher executed bundled Node on Linux; health returned 200 and a fresh visit redirected to the model wizard. |
 | Windows x64 runtime | Release CI passed | Exact v0.0.66 packaging job executed bundled node.exe, imported modules, started the runtime, and checked health, authenticated setup, and dashboard JavaScript before publication. |
-| Windows desktop experience | Blocked | Existing Windows 11 VM cannot be reached because Parallels Service fails to initialize. Normal app launch also timed out. No connected Windows host was available. |
+| Windows launcher and browser onboarding | Passed on Windows runner | Published ZIP, actual CMD launcher, Chromium setup/error recovery/chat, and restart persistence passed. Model responses use a deterministic HTTP fixture. Local Parallels remains unavailable but no longer blocks this acceptance. |
 | Physical iPhone | Launch only | Older build 2116 launched. Mirroring setup subsequently completed with notification forwarding declined, but connection to the phone timed out. UI acceptance remains blocked on a successful Mirroring connection. |
 
 ## Screenshots
@@ -59,11 +59,11 @@ with `bin/openagi.js serve` using disposable state, then requests and validates
 the pages. It does not run `Start-OpenAGI.cmd`, operate a browser, or connect a
 model. These are existing release-time results, not a new Windows QA run.
 
-To complete interactive Windows acceptance, restore a working Parallels
-service or provide a connected Windows host, extract the published ZIP, launch
-`Start-OpenAGI.cmd`, and complete model setup/chat in the browser. The service
-reported `Unable to connect to Parallels Service` and failed unattended
-initialization; no host reboot or privileged repair was attempted.
+The initial local Windows attempt was blocked by Parallels reporting
+`Unable to connect to Parallels Service`. The Windows runner follow-through
+below closes launcher/browser acceptance without repairing or rebooting that
+host. Explorer double-click, SmartScreen prompts, and Windows 11-specific UI
+were not exercised by the automated runner.
 
 ## Local-model limits and cleanup
 
@@ -73,10 +73,49 @@ scripted draft edit raced the asynchronous guided-draft handoff, sending the
 original guide text. A separately entered follow-up succeeded. Neither exact
 instruction adherence nor every draft race is claimed as passed.
 
-LM Studio, interactive Windows, remote native permission dialogs, and physical
+LM Studio, remote native permission dialogs, and physical
 iPhone UI remain unverified. Linux arm64 has release CI coverage but no separate
 manual execution in this QA pass. No app-usage telemetry was implemented.
 
 Task-owned local and remote runtimes, model downloads, mounts, and temporary
 installations were removed. The clean Mac's newly created data directory was
 removed after stopping its app and daemon; its port was confirmed clear.
+
+## Windows published-ZIP acceptance follow-through
+
+[Run 42553242233](https://github.com/Spshulem/openAGI/actions/runs/42553242233)
+passed at test commit `40b611a93cee5f3ca272d14ba7ac4b9b6806deca`.
+The test downloaded the actual v0.0.66 Windows ZIP and required SHA-256
+`8382dbf2a48e9d582c21e8134b3e063f6b18571c59082ce7d64cf04210ae90be`.
+It extracted into a directory containing spaces and started the shipped
+`Start-OpenAGI.cmd` through cmd.exe from a different working directory, with
+only Windows System32 on the launcher's PATH. No separate Node/npm installation
+was available to the app process.
+
+Automated Chromium on the Windows runner verified:
+
+1. First-run model wizard appears.
+2. An unreachable model fails visibly and writes no configuration.
+3. A compatible local HTTP model fixture verifies and reaches the ready screen.
+4. The guided onboarding draft sends and its reply is displayed in chat.
+5. Stopping the launcher process tree and restarting the same CMD preserves
+   configuration, browser access, and the saved conversation.
+6. No browser JavaScript page errors occurred.
+
+The fixture handles actual Chat Completions HTTP requests, including the setup
+probe and chat request. It is not real model inference or evidence of Ollama or
+LM Studio running on Windows. Real Ollama inference was tested on Mac above.
+The job uploads screenshots and a machine-readable result; it does not upload
+saved credentials, browser storage, or the generated data directory.
+
+- [Windows chat screenshot](onboarding-2026-11-08/windows-chat.png)
+- [Windows results](onboarding-2026-11-08/windows-results.json)
+- [Narrow-layout observation](onboarding-2026-11-08/windows-narrow-chat.png)
+
+The first run stopped at an added narrow-layout assertion after all setup/chat
+checks passed. A settled 390px viewport measured 394px document width: 4px
+horizontal overflow. Screenshot inspection showed the composer, Send button,
+and navigation remained usable. This is a non-blocking 2/10 layout finding,
+recorded separately from desktop acceptance; no responsive-layout fix is
+claimed. The completed run measured and retained it, then verified restart at
+1280px. Mobile/device work remains outside this Windows follow-through.
