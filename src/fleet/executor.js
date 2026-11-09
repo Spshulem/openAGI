@@ -293,6 +293,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
     if (thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return "conductor-owned: open it in Conductor";
     if (codexAppOwned(thread)) return "codex-app-owned: typed into the Codex app only";
+    if (codexExecBarred(thread)) return "Codex CLI ownership unverified: background resume is blocked; use the owning app";
     if (!isDirectory(thread.cwd)) return "cwd missing";
   }
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
@@ -682,6 +683,9 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     const route = backgroundRouteFor(thread, config);
     if (!route) {
       // The Codex app owns its threads even while it has not loaded one.
+      // Unknown ownership is also blocked, but must not be reported as an
+      // app-held writer lock: the metadata is simply insufficient to claim
+      // which process owns the transcript.
       if (thread?.kind === "codex" && (thread.writerLocked || codexAppOwned(thread))) why.locked = true;
       return null;
     }

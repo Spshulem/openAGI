@@ -15,12 +15,14 @@ const ago = (ms) => new Date(NOW - ms).toISOString();
 const HEAD = "b".repeat(40);
 
 function makeThread(overrides = {}) {
+  const { meta = {}, ...rest } = overrides;
   return {
     key: "codex:t1", kind: "codex", id: "t1", title: "Fix billing", cwd: "/work/t1", repo: "acme/app",
     branch: "spencer/fix", workspace: null, claudeSessionId: null, agentStatus: "idle",
     lastActivityAt: ago(60 * MIN), lastAgentText: "Pushed.", lastAgentAt: ago(60 * MIN),
     lastUserText: "continue", lastUserAt: ago(120 * MIN), error: null, openTasks: [], prRefs: ["acme/app#7"],
-    live: null, writerLocked: false, archived: false, excluded: null, meta: {}, ...overrides
+    live: null, writerLocked: false, archived: false, excluded: null, ...rest,
+    meta: { ...((rest.kind ?? "codex") === "codex" ? { source: "cli" } : {}), ...meta }
   };
 }
 
