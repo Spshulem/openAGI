@@ -18,7 +18,7 @@ Generate a phone pairing code on main and use the complete public HTTPS address 
 
 ## Telegram owner channel
 
-Create a bot through BotFather, save `TELEGRAM_BOT_TOKEN` in setup, and enable `TELEGRAM_POLLING=1` for long polling without an inbound tunnel. Alternatively register `/channels/telegram/webhook` with Telegram using a configured `TELEGRAM_WEBHOOK_SECRET`; use the same secret when calling Telegram's `setWebhook`.
+Create a bot through BotFather, save `TELEGRAM_BOT_TOKEN` in setup, and enable `TELEGRAM_POLLING=1` for long polling without an inbound tunnel. Alternatively register `/channels/telegram/webhook` with Telegram using a configured `TELEGRAM_WEBHOOK_SECRET`; use the same secret when calling Telegram's `setWebhook`. The webhook refuses every request until that secret is set.
 
 Request a one-use code through the authenticated `GET /channels/telegram/pairing-code` route, then send `/pair <code>` to the bot. Codes expire in ten minutes. Unknown/unpaired chats are silently ignored; repeated incorrect codes lock pairing for fifteen minutes.
 

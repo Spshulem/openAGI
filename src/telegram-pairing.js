@@ -43,7 +43,9 @@ export class TelegramPairing {
   // One pairing attempt from a chat. Persists the chat id on success.
   attempt(chatId, code, { now = Date.now() } = {}) {
     if (now < this.lockedUntil) return { ok: false, reason: "locked" };
-    if (!this.active) return this._fail(now, "no-active-code");
+    // No code is open, so there is nothing to guess. Counting this would let a
+    // stranger lock the owner out before the owner ever issues a code.
+    if (!this.active) return { ok: false, reason: "no-active-code" };
     if (now - this.active.createdAt > CODE_TTL_MS) {
       this.active = null;
       return this._fail(now, "expired");

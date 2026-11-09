@@ -2207,8 +2207,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         });
         if (!tg.ok) return sendJson(res, 401, { error: "unauthorized", reason: tg.reason });
         const body = await readJson(req);
-        const result = await channels.handleTelegramWebhook(body);
-        return sendJson(res, 200, result);
+        await channels.handleTelegramWebhook(body);
+        // The reply goes back through the Bot API. Never echo the turn result
+        // (reply, memory hits) to the HTTP caller.
+        return sendJson(res, 200, { ok: true });
       }
 
       if (method === "POST" && pathname === "/webhooks/buildbetter") {
