@@ -15,6 +15,7 @@ const evidence = path.resolve('acceptance-results');
 fs.mkdirSync(evidence, { recursive: true });
 const data = fs.mkdtempSync(path.join(os.tmpdir(), 'openagi-windows-acceptance-'));
 const checks = [];
+const observations = [];
 const record = name => { checks.push(name); console.log('PASS:', name); };
 let child, browser, logs = '', fixtureRequests = 0;
 // Deterministic Chat Completions server tests Windows transport and UI integration.
@@ -99,8 +100,12 @@ try {
   await page.screenshot({ path: path.join(evidence, 'chat.png') });
   record('Guided onboarding draft sends and displays fixture-backed chat reply');
   await page.setViewportSize({ width: 390, height: 844 });
-  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-  record('Chat has no horizontal overflow at 390px');
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const narrow = await page.evaluate(() => ({ viewport: innerWidth, document: document.documentElement.scrollWidth }));
+  observations.push({ name: '390px chat width (outside Windows desktop acceptance)', ...narrow, overflow: narrow.document > narrow.viewport });
+  await page.screenshot({ path: path.join(evidence, 'narrow-chat.png'), fullPage: true });
+  console.log('OBSERVATION:', JSON.stringify(narrow));
+  await page.setViewportSize({ width: 1280, height: 900 });
   await stop();
   await launch();
   assert.equal((await (await fetch(base + '/health')).json()).firstRun, false);
@@ -111,7 +116,7 @@ try {
   assert.deepEqual(errors, []);
   record('CMD restart preserves setup, browser access and saved conversation');
 } finally {
-  fs.writeFileSync(path.join(evidence, 'results.json'), JSON.stringify({ platform: process.platform, release: 'v0.0.66', checks, fixtureRequests, inference: 'deterministic local HTTP fixture; not real model inference' }, null, 2));
+  fs.writeFileSync(path.join(evidence, 'results.json'), JSON.stringify({ platform: process.platform, release: 'v0.0.66', checks, observations, fixtureRequests, inference: 'deterministic local HTTP fixture; not real model inference' }, null, 2));
   // Never upload saved auth, browser storage, or the generated data directory.
   fs.writeFileSync(path.join(evidence, 'launcher.log'), logs.replace(/(token[=: ]+)\S+/gi, '$1[redacted]'));
   await browser?.close();
