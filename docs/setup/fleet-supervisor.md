@@ -634,9 +634,19 @@ Inventory is paginated, including closed chats for exclusion. At most twelve
 changed chat histories are read per scan, four at a time; subsequent scans work
 through the remaining histories. Unknown or failed histories cannot produce
 nudges. Snapshot `paseo.discovered` and `paseo.historyPending` expose coverage;
-normal fleet scope limits still apply. Only bounded message text is retained,
-not tool output or images. Paseo workspaces are never probed through local git
-or filesystem scans. Migration aliases suppress duplicate legacy supervision.
+normal fleet scope limits still apply. Only bounded, redacted message text and
+provider error notices are retained, not tool output or images. Paseo workspaces
+are never probed through local git or filesystem scans. Migration aliases
+suppress duplicate legacy supervision.
+
+Structured Paseo error events and a failed agent's current `lastError` feed the
+same error policy as other sources. A model-capacity failure appears as red
+`infra-blocked` / `model-limit` and asks the owner to switch models or wait;
+the supervisor does not change models or repeatedly send “continue.” Error
+notices stay separate from assistant replies and judge conversation. A new
+active turn or later message clears a historical timeline error. Unknown
+history still excludes the chat from actions. This detects the failure; it
+does not restore provider capacity or guarantee that a retry succeeds.
 
 Native sends refresh the exact host and agent before dispatch. Running, closed,
 archived, permission-blocked, changed-workspace and changed-revision chats are

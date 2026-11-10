@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createPaseoSource, paseoThread, hostApi, withPaseo } from "../src/fleet/sources/paseo.js";
 import { deliverPaseo } from "../src/fleet/paseo-delivery.js";
-import { mergeThreads } from "../src/fleet/classify.js";
+import { classifyThread, mergeThreads, threadHealth } from "../src/fleet/classify.js";
+import { decideThread } from "../src/fleet/policy.js";
 import { openChatFor, resolveFleetConfig } from "../src/fleet/contracts.js";
 
 const config = { paseo: { enabled: true, historyPerScan: 1 } };
@@ -140,4 +141,110 @@ test("supervisor nudges never become owner instructions in judge context", () =>
   const row = paseoThread(agent("a"), "host", entries);
   assert.equal(row.lastUserText, "Review only");
   assert.deepEqual(row.meta.conversation.map(m => m.text), ["Review only", "Reviewed"]);
+});
+
+const capacityError = "Selected model is at capacity. Please try a different model.";
+const failureAt = "2026-01-01T00:10:00Z";
+const laterAt = "2026-01-01T00:20:00Z";
+const errorEntry = (message = capacityError) => ({ timestamp: failureAt, item: { type: "error", message } });
+
+test("Paseo system errors reach the existing model-limit question through fresh and cached discovery", async () => {
+  const a = agent("failed", { status: "error", model: "test-model", updatedAt: failureAt });
+  const entries = [
+    { timestamp: "2026-01-01T00:09:00Z", item: { type: "assistant_message", text: "I will finish the verification." } },
+    errorEntry(),
+    { timestamp: failureAt, item: { type: "tool_call", status: "failed", detail: { output: "private tool output" } } }
+  ];
+  const m = mock([a]);
+  m.client.agents.ref = id => ({ timeline: { refetch: async () => {
+    m.reads.push(id);
+    return { agent: a, entries };
+  } } });
+  const source = createPaseoSource(m);
+  for (let scan = 0; scan < 2; scan++) {
+    const [row] = await source(config);
+    assert.equal(row.error?.kind, "model-limit");
+    assert.equal(row.error.text, capacityError);
+    assert.equal(row.meta.model, "test-model");
+    const classified = classifyThread(row);
+    assert.equal(classified.state, "infra-blocked");
+    assert.equal(threadHealth(classified.state, row.error), "red");
+    const decision = decideThread(classified, row, { mode: "auto", now: Date.parse(laterAt) });
+    assert.equal(decision.action, "ask-user");
+    assert.equal(decision.message, null);
+    assert.match(decision.question.title, /test-model capped\. Switch model\?/);
+    assert.deepEqual(decision.question.options, ["switched", "wait"]);
+    assert.deepEqual(row.meta.conversation.map(m => m.text), ["I will finish the verification."]);
+    assert.equal(JSON.stringify(row).includes("private tool output"), false);
+  }
+  assert.equal(m.reads.length, 1, "cached scans retain the error without another history read");
+});
+
+test("Paseo snapshot errors survive a bounded history without an error event", () => {
+  const row = paseoThread(agent("failed", { status: "error", lastError: capacityError, updatedAt: failureAt }), "host");
+  assert.equal(row.error?.kind, "model-limit");
+  const unknown = paseoThread(agent("failed", { status: "error", lastError: "Provider failed unexpectedly" }), "host");
+  assert.equal(unknown.error?.kind, "other");
+  assert.equal(threadHealth(classifyThread(unknown).state, unknown.error), "red");
+  const unread = paseoThread(agent("failed", { status: "error", lastError: capacityError }), "host", [], false);
+  assert.equal(classifyThread(unread).state, "excluded", "an error cannot bypass unknown-history exclusion");
+});
+
+test("Paseo idle failures remain detectable and a newer failure replaces the older one", () => {
+  const row = paseoThread(agent("a"), "host", [errorEntry()]);
+  assert.equal(row.error?.kind, "model-limit");
+  const newer = paseoThread(agent("a"), "host", [errorEntry(), errorEntry("Connection failed")]);
+  assert.equal(newer.error?.kind, "network");
+});
+
+test("Paseo error notices clear after a newer message or a new active turn", () => {
+  for (const type of ["user_message", "assistant_message"]) {
+    const row = paseoThread(agent("a"), "host", [errorEntry(), { timestamp: laterAt, item: { type, text: "Continue" } }]);
+    assert.equal(row.error, null, type);
+  }
+  const entries = [errorEntry()];
+  const retry = paseoThread(agent("a", { lastUserMessageAt: laterAt }), "host", entries);
+  assert.equal(retry.error, null, "a retry outside the history page supersedes the old failure");
+  for (const extra of [
+    { status: "running" }, { status: "initializing" }, { status: "closed" },
+    { archivedAt: laterAt }, { status: "error", activeTurn: { startedAt: laterAt } }
+  ]) {
+    const row = paseoThread(agent("a", { lastError: capacityError, ...extra }), "host", entries);
+    assert.equal(row.error, null, JSON.stringify(extra));
+  }
+  assert.equal(paseoThread(agent("a", { lastError: capacityError }), "host").error, null,
+    "idle snapshot lastError alone is not evidence of a current failure");
+});
+
+test("Paseo detects only structured provider errors, not quoted errors or tool failures", () => {
+  const entries = [
+    { item: { type: "user_message", text: capacityError } },
+    { item: { type: "assistant_message", text: capacityError } },
+    { item: { type: "tool_call", status: "failed", error: capacityError } },
+    { item: { type: "notification", level: "info", message: capacityError } }
+  ];
+  assert.equal(paseoThread(agent("a"), "host", entries).error, null);
+});
+
+test("Paseo failure details are bounded and redacted without replacing the assistant report", () => {
+  const secret = "sk-" + "test".repeat(10);
+  const message = capacityError + " key=" + secret + " ".repeat(9000);
+  const row = paseoThread(agent("a"), "host", [
+    { item: { type: "assistant_message", text: "Work in progress." } }, errorEntry(message)
+  ]);
+  assert.equal(row.error?.kind, "model-limit");
+  assert.equal(row.error.text.includes(secret), false);
+  assert.match(row.error.text, /\[redacted\]/);
+  assert.ok(row.error.text.length <= 1000);
+  assert.equal(row.lastAgentFull, "Work in progress.");
+  assert.equal(row.meta.conversation.length, 1);
+});
+
+test("Paseo relative quota reset uses the failure time", () => {
+  const message = "Individual quota reached. Resets in 2h.";
+  for (const extra of [{}, { status: "error", lastError: message }]) {
+    const row = paseoThread(agent("a", { updatedAt: laterAt, ...extra }), "host", [errorEntry(message)]);
+    assert.equal(row.error?.kind, "usage-limit");
+    assert.equal(row.error.resetAt, "2026-01-01T02:10:00.000Z");
+  }
 });

@@ -1,5 +1,6 @@
 // Native Paseo reads. Never creates/imports/reloads an agent or changes its mode.
 import { SUPERVISOR_PREFIX, clampText, redactSecrets, parsePrRef } from "../contracts.js";
+import { classifyErrorText } from "../errors.js";
 
 export async function withPaseo(config, operation, factory) {
   const settings = config.paseo ?? {};
@@ -25,6 +26,28 @@ export async function hostApi(client, serverId, directory = null) {
   if (directory.self.serverId === serverId) return client;
   if (!directory.hosts.some(h => h.serverId === serverId && h.enabled && h.status === "online")) throw new Error("Paseo host unavailable");
   return client.hosts.client(serverId);
+}
+
+// A provider failure is a separate timeline item, not an assistant reply.
+// Keep it out of conversation/PR extraction, but pass it to the existing
+// infrastructure policy. Quoted errors and failed tools are not turn failures.
+function currentError(agent, entries) {
+  if (agent.archivedAt || agent.activeTurn || ["running", "initializing", "closed"].includes(agent.status)) return null;
+  let failure = null;
+  for (const entry of entries) {
+    if (["user_message", "assistant_message"].includes(entry.item?.type)) failure = null;
+    else if (entry.item?.type === "error") failure = entry;
+  }
+  // A newer retry may fall outside the bounded history page. A current
+  // error snapshot is authoritative even when its event is outside that page.
+  if (Date.parse(agent.lastUserMessageAt) > Date.parse(failure?.timestamp)) failure = null;
+  const snapshotError = agent.status === "error" ? redactSecrets(agent.lastError ?? "").slice(0, 8000).trim() : "";
+  if (!snapshotError && !failure && agent.status !== "error") return null;
+  const eventError = redactSecrets(failure?.item.message ?? "").slice(0, 8000).trim();
+  const message = snapshotError || eventError || "Paseo agent reported an error.";
+  const at = failure && (!snapshotError || snapshotError === eventError) ? failure.timestamp : agent.updatedAt;
+  const now = new Date(Number.isFinite(Date.parse(at)) ? Date.parse(at) : Date.now());
+  return { ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }), text: clampText(message, 1000) };
 }
 
 export function paseoThread(agent, serverId, entries = [], historyKnown = true) {
@@ -55,8 +78,9 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     lastActivityAt: agent.updatedAt, lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
     lastUserText: redactSecrets(owner?.item.text ?? "").slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
     lastAgentText: text.slice(-600), lastAgentTail: text, lastAgentFull: text,
-    error: null, openTasks: [], prRefs, live: null, writerLocked: false,
+    error: currentError(agent, entries), openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
+      model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: Boolean(agent.pendingPermissions?.length),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,
       conversation: messages.filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX)).map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
@@ -115,9 +139,12 @@ export function createPaseoSource({ factory } = {}) {
             ]).finally(() => clearTimeout(historyTimer));
             signal.throwIfAborted();
             row.agent = history.agent ?? a;
-            // Cache only bounded text messages, not code, tool output or images.
-            const entries = history.entries.filter(e => ["user_message", "assistant_message"].includes(e.item?.type))
-              .map(e => ({ timestamp: e.timestamp, item: { type: e.item.type, text: String(e.item.text ?? "").slice(-8000) } }));
+            // Cache bounded messages and provider errors, never tool output or
+            // images. Dropping error items hides failures from the next scan.
+            const entries = history.entries.filter(e => ["user_message", "assistant_message", "error"].includes(e.item?.type))
+              .map(e => ({ timestamp: e.timestamp, item: e.item.type === "error"
+                ? { type: "error", message: redactSecrets(e.item.message ?? "").slice(0, 8000) }
+                : { type: e.item.type, text: redactSecrets(e.item.text ?? "").slice(-8000) } }));
             cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries });
           } catch { /* uncertain history stays excluded and is tried later */ }
         }));
