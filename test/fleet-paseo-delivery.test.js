@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { deliverPaseo } from '../src/fleet/paseo-delivery.js';
+import { confirmedPaseoTurn, deliverPaseo } from '../src/fleet/paseo-delivery.js';
 import { paseoThread } from '../src/fleet/sources/paseo.js';
 function setup(t, extra = {}) {
  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'paseo-delivery-'));
@@ -34,6 +34,60 @@ test('storage failure prevents sending',async t=>{
 test('send exception cannot trigger a retry',async t=>{
  const f=setup(t);let attempts=0;f.ref.send=async()=>{attempts++;throw Error('lost response');};
  await deliverPaseo(f.args);await deliverPaseo(f.args);assert.equal(attempts,1);
+});
+
+test('confirmation accepts provider and turn correlation but rejects unrelated activity', () => {
+ const history = { agent: { status: 'idle' }, entries: [
+  { item: { type: 'user_message', messageId: 'provider-message' }, turnId: 'turn-1', seqEnd: 10 },
+  { item: { type: 'assistant_message', text: 'done' }, turnId: 'turn-1', seqStart: 11 }
+ ] };
+ assert.equal(confirmedPaseoTurn(history, { messageId: 'client-message', providerMessageId: 'provider-message', turnId: 'turn-1' }), true);
+ assert.equal(confirmedPaseoTurn(history, { messageId: 'different-message', turnId: 'different-turn' }), false);
+});
+
+test('persists a pre-send cursor and reads after it for exact confirmation', async t => {
+ const f = setup(t), reads = [];
+ f.ref.timeline.refetch = async options => {
+  reads.push(options);
+  if (options.direction === 'tail' && options.limit === 1) {
+   return { epoch: 'epoch-1', endCursor: { epoch: 'epoch-1', seq: 100 }, agent: f.ref.current(), entries: [] };
+  }
+  const own = { item: { type: 'user_message', clientMessageId: f.sent[0].options.messageId }, seqStart: 101, seqEnd: 101 };
+  return { agent: f.ref.current(), entries: [own, { item: { type: 'assistant_message', text: 'done' }, seqStart: 102 }] };
+ };
+ assert.equal((await deliverPaseo(f.args)).status, 'sent');
+ assert.equal(reads[0].direction, 'tail');
+ assert.deepEqual(reads[1], { direction: 'after', cursor: { epoch: 'epoch-1', seq: 100 }, limit: 80 });
+ assert.deepEqual(receipt(f).cursor, { epoch: 'epoch-1', seq: 100 });
+});
+
+test('persists host correlation and accepts an exact returned turn without guessing from text', async t => {
+ const f = setup(t);
+ f.ref.send = async (text, options) => { f.sent.push({ text, options }); return { clientMessageId: options.messageId, providerMessageId: 'provider-message', turnId: 'turn-1' }; };
+ f.ref.timeline.refetch = async options => options.direction === 'tail' && options.limit === 1
+  ? { epoch: 'epoch-1', endCursor: { epoch: 'epoch-1', seq: 10 }, agent: f.ref.current(), entries: [] }
+  : { agent: { ...f.ref.current(), status: 'running', activeTurn: { turnId: 'turn-1', startedAt: '2026-01-01T00:00:01Z' } }, entries: [] };
+ assert.equal((await deliverPaseo(f.args)).status, 'sent');
+ assert.deepEqual(receipt(f), {
+  messageId: f.sent[0].options.messageId,
+  clientMessageId: f.sent[0].options.messageId,
+  messageHash: 'hash',
+  activityAt: '2026-01-01T00:00:00Z',
+  cursor: { epoch: 'epoch-1', seq: 10 },
+  providerMessageId: 'provider-message',
+  turnId: 'turn-1',
+  pending: false,
+ });
+});
+
+test('mismatched host correlation remains pending and cannot be retried automatically', async t => {
+ const f = setup(t);
+ f.ref.send = async (text, options) => { f.sent.push({ text, options }); return { clientMessageId: 'different-client-message' }; };
+ const result = await deliverPaseo(f.args);
+ assert.equal(result.status, 'blocked');
+ assert.match(result.detail, /mismatched client message ID/);
+ assert.equal(receipt(f).pending, true);
+ assert.equal(f.sent.length, 1);
 });
 
 function receipt(f) {

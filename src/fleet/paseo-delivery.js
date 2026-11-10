@@ -6,25 +6,81 @@ import { writeJsonAtomic } from "../file-utils.js";
 import { withPaseo, hostApi } from "./sources/paseo.js";
 
 const active = new Set();
-export function confirmedPaseoTurn(history, messageId) {
+
+function nonEmpty(value) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function timelineCursor(history) {
+  const epoch = nonEmpty(history?.epoch);
+  const seq = Number.isInteger(history?.endCursor?.seq)
+    ? history.endCursor.seq
+    : Number.isInteger(history?.window?.maxSeq) ? history.window.maxSeq : null;
+  return epoch && seq !== null ? { epoch, seq } : null;
+}
+
+function receiptIds(receipt) {
+  return new Set([
+    receipt?.messageId,
+    receipt?.clientMessageId,
+    receipt?.providerMessageId,
+  ].map(nonEmpty).filter(Boolean));
+}
+
+function entryIds(entry) {
+  return [
+    entry?.item?.messageId,
+    entry?.item?.clientMessageId,
+    entry?.providerMessageId,
+    entry?.item?.providerMessageId,
+  ].map(nonEmpty).filter(Boolean);
+}
+
+/**
+ * Confirm only evidence attributable to this receipt. A host may expose the
+ * submitted client ID, a provider message ID, or the accepted turn ID. Text,
+ * timestamps, and unrelated later activity are deliberately not evidence.
+ */
+export function confirmedPaseoTurn(history, receipt) {
   const entries = history.entries ?? [];
-  const own = entries.find(e => e.item?.type === "user_message" && [e.item.messageId, e.item.clientMessageId].includes(messageId));
+  const ids = receiptIds(receipt);
+  const turnId = nonEmpty(receipt?.turnId);
+  const own = entries.find(e => e.item?.type === "user_message" && entryIds(e).some(id => ids.has(id)));
+  const activeTurn = history.agent?.activeTurn;
+  if (turnId && activeTurn?.turnId === turnId && history.agent?.status === "running") return true;
   if (!own) return false;
+  if (turnId && own.turnId === turnId) return true;
   const started = Date.parse(history.agent?.activeTurn?.startedAt ?? "");
   return (history.agent?.status === "running" && Number.isFinite(started) && started >= Date.parse(own.timestamp))
     || entries.some(e => e.item?.type === "assistant_message" && e.seqStart > own.seqEnd);
 }
 
-async function waitForPaseoTurn(ref, messageId, signal) {
+async function readPaseoConfirmation(ref, receipt, signal) {
+  const cursor = receipt?.cursor;
+  const options = cursor
+    ? { direction: "after", cursor, limit: 80 }
+    : { direction: "tail", limit: 40 };
+  try {
+    return await ref.timeline.refetch(options);
+  } catch (error) {
+    // Older hosts may not support cursor reads. A tail fallback remains safe
+    // because confirmation still requires the exact receipt identity.
+    if (!cursor) throw error;
+    signal?.throwIfAborted();
+    return ref.timeline.refetch({ direction: "tail", limit: 40 });
+  }
+}
+
+async function waitForPaseoTurn(ref, receipt, signal) {
   // The send acknowledgment can arrive before the message or provider turn
   // reaches the timeline. Recheck only this receipt; never repeat the send.
   // The surrounding Paseo request deadline also bounds every read and delay.
   const deadline = performance.now() + 5000;
   for (;;) {
     signal.throwIfAborted();
-    const history = await ref.timeline.refetch({ direction: "tail", limit: 40 });
+    const history = await readPaseoConfirmation(ref, receipt, signal);
     signal.throwIfAborted();
-    if (confirmedPaseoTurn(history, messageId)) return true;
+    if (confirmedPaseoTurn(history, receipt)) return true;
     const remaining = deadline - performance.now();
     if (remaining <= 0) return false;
     await delay(Math.min(250, remaining), undefined, { signal });
@@ -51,9 +107,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       try { previous = JSON.parse(fs.readFileSync(file, "utf8")); }
       catch (e) { if (e.code !== "ENOENT") return blocked("Paseo delivery journal cannot be read"); }
       if (previous?.pending) {
-        const history = await ref.timeline.refetch({ direction: "tail", limit: 40 });
+        const history = await readPaseoConfirmation(ref, previous, signal);
         signal.throwIfAborted();
-        if (!confirmedPaseoTurn(history, previous.messageId)) return blocked("Previous delivery has no confirmed turn; no automatic resend");
+        if (!confirmedPaseoTurn(history, previous)) return blocked("Previous delivery has no confirmed turn; no automatic resend");
         writeJsonAtomic(file, { ...previous, pending: false });
         // This receipt belongs to an older action, not the current proposal.
         return blocked("Previous Paseo turn confirmed; reassess the conversation before another send");
@@ -65,13 +121,34 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       if (!agent || agent.archivedAt || agent.status !== "idle" || agent.activeTurn) return blocked("Paseo chat is active, closed, or unavailable");
       if (agent.pendingPermissions?.length) return blocked("Paseo chat requires owner permission");
       if (agent.cwd !== thread.meta.paseoCwd || agent.workspaceId !== thread.meta.workspaceId || agent.updatedAt !== thread.meta.updatedAt) return blocked("Paseo chat changed; scan again before sending");
-      const intent = { messageId: randomUUID(), messageHash: base.messageHash, activityAt: agent.updatedAt, pending: true };
+      const baseline = await ref.timeline.refetch({ direction: "tail", limit: 1 });
+      signal.throwIfAborted();
+      const messageId = randomUUID();
+      const cursor = timelineCursor(baseline);
+      const intent = {
+        messageId,
+        clientMessageId: messageId,
+        messageHash: base.messageHash,
+        activityAt: agent.updatedAt,
+        ...(cursor ? { cursor } : {}),
+        pending: true,
+      };
       writeJsonAtomic(file, intent); // Disk failure prevents dispatch.
       signal.throwIfAborted();
-      await ref.send(text, { messageId: intent.messageId, activeTurnBehavior: "steer" });
+      const response = await ref.send(text, { messageId, activeTurnBehavior: "steer" });
       signal.throwIfAborted();
-      if (!await waitForPaseoTurn(ref, intent.messageId, signal)) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
-      writeJsonAtomic(file, { ...intent, pending: false });
+      const returnedClientMessageId = nonEmpty(response?.clientMessageId);
+      if (returnedClientMessageId && returnedClientMessageId !== messageId) return blocked("Paseo returned a mismatched client message ID; no automatic resend");
+      const correlated = {
+        ...intent,
+        ...(returnedClientMessageId ? { clientMessageId: returnedClientMessageId } : {}),
+        ...(nonEmpty(response?.providerMessageId) ? { providerMessageId: response.providerMessageId } : {}),
+        ...(nonEmpty(response?.messageId) && response.messageId !== messageId ? { providerMessageId: response.messageId } : {}),
+        ...(nonEmpty(response?.turnId) ? { turnId: response.turnId } : {}),
+      };
+      writeJsonAtomic(file, correlated);
+      if (!await waitForPaseoTurn(ref, correlated, signal)) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
+      writeJsonAtomic(file, { ...correlated, pending: false });
       return { status: "sent", route: "paseo-send", actionId, detail: "Paseo message and turn confirmed" };
     }, factory);
   } catch { return blocked("Paseo delivery unavailable or uncertain; no provider fallback or automatic resend"); }

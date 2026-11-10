@@ -640,19 +640,26 @@ or filesystem scans. Migration aliases suppress duplicate legacy supervision.
 
 Native sends refresh the exact host and agent before dispatch. Running, closed,
 archived, permission-blocked, changed-workspace and changed-revision chats are
-held. Each attempt first records a durable message ID; a failed or uncertain
-send is never automatically repeated. Acknowledgement alone is not success:
-the correlated message must have turn-start or subsequent assistant evidence.
-No provider import, reload, settings change or legacy-session fallback is used.
+held. Each attempt first records a durable client message ID and the timeline
+cursor immediately before dispatch; a failed or uncertain send is never
+automatically repeated. Acknowledgement alone is not success: the correlated
+client/provider message or accepted turn must have turn-start or subsequent
+assistant evidence. No provider import, reload, settings change or legacy-session
+fallback is used.
 
 Acceptance can precede the message and turn appearing in Paseo's timeline.
-Delivery rechecks the same message ID every 250 ms for a five-second confirmation
-window, bounded by the existing Paseo request timeout. These are sequential,
-read-only checks; the message is sent once and the chat stays locked against
-concurrent delivery. If confirmation is still unavailable, the durable receipt
-stays pending and the question card remains open. An unconfirmed-turn warning
-records uncertainty about execution: inspect the existing chat before retrying
-and preserve its delivery journal.
+Delivery rechecks only entries after that cursor every 250 ms for a five-second
+confirmation window, bounded by the existing Paseo request timeout. Hosts that
+return provider-message or turn correlation add those exact IDs to the durable
+receipt. These are sequential, read-only checks; the message is sent once and
+the chat stays locked against concurrent delivery. If confirmation is still
+unavailable, the durable receipt stays pending and the question card remains
+open. An unconfirmed-turn warning records uncertainty about execution: inspect
+the existing chat before retrying and preserve its delivery journal. Text,
+timestamps, nearby activity and a changed projection never settle a receipt.
+Older Paseo hosts may acknowledge a send without returning durable correlation;
+those receipts remain pending until the host exposes an exact ID or an owner
+reviews the existing chat.
 
 Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
 current public API has no atomic idle-only send precondition, and Paseo can fall
