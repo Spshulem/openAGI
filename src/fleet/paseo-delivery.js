@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { writeJsonAtomic } from "../file-utils.js";
 import { withPaseo, hostApi } from "./sources/paseo.js";
 
@@ -12,6 +13,22 @@ export function confirmedPaseoTurn(history, messageId) {
   const started = Date.parse(history.agent?.activeTurn?.startedAt ?? "");
   return (history.agent?.status === "running" && Number.isFinite(started) && started >= Date.parse(own.timestamp))
     || entries.some(e => e.item?.type === "assistant_message" && e.seqStart > own.seqEnd);
+}
+
+async function waitForPaseoTurn(ref, messageId, signal) {
+  // The send acknowledgment can arrive before the message or provider turn
+  // reaches the timeline. Recheck only this receipt; never repeat the send.
+  // The surrounding Paseo request deadline also bounds every read and delay.
+  const deadline = performance.now() + 5000;
+  for (;;) {
+    signal.throwIfAborted();
+    const history = await ref.timeline.refetch({ direction: "tail", limit: 40 });
+    signal.throwIfAborted();
+    if (confirmedPaseoTurn(history, messageId)) return true;
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return false;
+    await delay(Math.min(250, remaining), undefined, { signal });
+  }
 }
 
 // Never imports, reloads, archives or changes settings. Paseo owns the session.
@@ -53,9 +70,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       signal.throwIfAborted();
       await ref.send(text, { messageId: intent.messageId, activeTurnBehavior: "steer" });
       signal.throwIfAborted();
-      const history = await ref.timeline.refetch({ direction: "tail", limit: 40 });
-      signal.throwIfAborted();
-      if (!confirmedPaseoTurn(history, intent.messageId)) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
+      if (!await waitForPaseoTurn(ref, intent.messageId, signal)) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
       writeJsonAtomic(file, { ...intent, pending: false });
       return { status: "sent", route: "paseo-send", actionId, detail: "Paseo message and turn confirmed" };
     }, factory);
