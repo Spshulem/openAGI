@@ -638,28 +638,37 @@ normal fleet scope limits still apply. Only bounded message text is retained,
 not tool output or images. Paseo workspaces are never probed through local git
 or filesystem scans. Migration aliases suppress duplicate legacy supervision.
 
-Native sends refresh the exact host and agent before dispatch. Running, closed,
-archived, permission-blocked, changed-workspace and changed-revision chats are
-held. Each attempt first records a durable client message ID and the timeline
+Native sends refresh the exact host and agent before dispatch and revalidate
+both the baseline timeline's agent and the current handle after the read.
+Running, closed, archived, permission-blocked, changed-workspace and
+changed-revision chats are held. Each attempt first records a durable client message ID and the timeline
 cursor immediately before dispatch; a failed or uncertain send is never
-automatically repeated. Acknowledgement alone is not success: the correlated
-client/provider message or accepted turn must have turn-start or subsequent
-assistant evidence. No provider import, reload, settings change or legacy-session
+automatically repeated. Acknowledgement alone is not success: an exact turn ID,
+linked through the submitted message or returned by the host, must match a
+running turn or an assistant response. Later replies or start times alone cannot
+prove execution. No provider import, reload, settings change or legacy-session
 fallback is used.
 
 Acceptance can precede the message and turn appearing in Paseo's timeline.
-Delivery rechecks only entries after that cursor every 250 ms for a five-second
-confirmation window, bounded by the existing Paseo request timeout. Hosts that
-return provider-message or turn correlation add those exact IDs to the durable
-receipt. These are sequential, read-only checks; the message is sent once and
+Delivery rechecks entries after that cursor every 250 ms for a five-second
+confirmation window, bounded by the existing Paseo request timeout. Each read
+can follow up to ten pages of 80 entries; unsupported, stale or reset cursors
+fall back to a fresh 40-entry tail. Exact message-to-turn and client-to-provider
+IDs learned from the timeline are persisted immediately, so a later completed
+response can confirm the turn even if the original user entry leaves the page.
+These are sequential, read-only checks; the message is sent once and
 the chat stays locked against concurrent delivery. If confirmation is still
 unavailable, the durable receipt stays pending and the question card remains
 open. An unconfirmed-turn warning records uncertainty about execution: inspect
 the existing chat before retrying and preserve its delivery journal. Text,
 timestamps, nearby activity and a changed projection never settle a receipt.
-Older Paseo hosts may acknowledge a send without returning durable correlation;
-those receipts remain pending until the host exposes an exact ID or an owner
-reviews the existing chat.
+The pinned Paseo SDK's send method returns no correlation IDs. Confirmation
+therefore depends on IDs retained in its timeline; optional response IDs are
+supported for future adapters but are not required for current SDK operation.
+When history lacks those IDs, receipts remain pending. Installing this change
+does not reconstruct missing historical IDs or clear older uncertain receipts.
+Recovery requires authoritative correlation or a separate owner-reviewed
+reconciliation of the existing delivery.
 
 Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
 current public API has no atomic idle-only send precondition, and Paseo can fall
