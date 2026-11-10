@@ -645,6 +645,15 @@ send is never automatically repeated. Acknowledgement alone is not success:
 the correlated message must have turn-start or subsequent assistant evidence.
 No provider import, reload, settings change or legacy-session fallback is used.
 
+Acceptance can precede the message and turn appearing in Paseo's timeline.
+Delivery rechecks the same message ID every 250 ms for a five-second confirmation
+window, bounded by the existing Paseo request timeout. These are sequential,
+read-only checks; the message is sent once and the chat stays locked against
+concurrent delivery. If confirmation is still unavailable, the durable receipt
+stays pending and the question card remains open. An unconfirmed-turn warning
+records uncertainty about execution: inspect the existing chat before retrying
+and preserve its delivery journal.
+
 Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
 current public API has no atomic idle-only send precondition, and Paseo can fall
 back to interruption if steering is unsupported. The preflight checks reduce
