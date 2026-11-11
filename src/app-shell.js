@@ -49,15 +49,13 @@ export const navigation = `
 <aside class="app-navigation" id="appNavigation">
   <nav id="nav" aria-label="Main navigation">
     <div class="nav-group">${item('chat','Chat','chat')}${item('get-started','Get started','start')}</div>
-    <div class="nav-group"><p class="nav-label">Workspace</p>
-      ${item('supervisor','Supervisor','agents')}${item('tasks','Tasks','tasks')}
-      ${item('review','Inbox','review')}${item('approvals','Approvals','review','id="approvalsNav"')}
+    <div class="nav-group"><p class="nav-label">Your workspace</p>
+      ${item('supervisor','Supervisor','agents')}${item('memory','Saved preferences','memory')}
+      ${item('tasks','Tasks','tasks')}${item('review','Inbox','review')}${item('approvals','Approvals','review','id="approvalsNav"')}
     </div>
-    <div class="nav-group"><p class="nav-label">Your agent</p>
-      ${item('memory','Memory','memory')}${item('skills','Skills','start')}${item('integrations','Connections','connect')}
+    <details class="nav-advanced"><summary>Tools &amp; advanced</summary><div>
+      ${item('skills','Skills','start')}${item('integrations','Connections','connect')}
       ${item('activity','Computer history','screen')}${item('today','Today','review')}${item('computer-use','Computer use','screen')}
-    </div>
-    <details class="nav-advanced"><summary>Advanced</summary><div>
       ${item('suggestions','Suggestions','start')}${item('cron','Schedules','tasks')}
       ${item('coding-agents','Coding setup','agents')}${item('nodes','Devices','devices')}
       ${item('mcp','MCP servers','connect')}${item('channels','Channels','chat')}${item('agents','Specialists','agents')}
@@ -70,6 +68,14 @@ export const navigation = `
   <a href="https://github.com/Spshulem/openAGI" target="_blank" rel="noopener noreferrer">Source & documentation <span>↗</span></a></div>
 </aside>`;
 
+// Full-page tools share navigation without weakening frame protections or
+// nesting a second application inside an iframe.
+export function navigationLinks(active) {
+  return navigation.replace(/<button type="button" data-tab="([^"]+)"([^>]*)>([\s\S]*?)<\/button>/g,
+    (_, id, attrs, content) => `<a href="${id === "supervisor" ? "/fleet" : "/?tab=" + id}"${attrs}${id === active ? ' class="active" aria-current="page"' : ""}>${content}</a>`)
+    .replace('<button id="setupBtn" type="button">', '<a href="/setup" id="setupBtn">').replace('</button>\n  <a href="https://github.com', '</a>\n  <a href="https://github.com');
+}
+
 export const shellStyles = `
 ${designTokens}
 body { font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
@@ -80,7 +86,7 @@ a { color:var(--accent); }
 #nav { display:block; overflow-y:auto; margin:0; flex:1; min-height:0; }
 #nav button,#nav a,.nav-footer button { display:flex; align-items:center; gap:10px; padding:9px 12px; width:100%; min-height:38px; border:0; border-radius:6px; background:transparent; color:var(--muted); font-size:13px; line-height:20px; font-weight:500; text-align:left; text-decoration:none; cursor:pointer; }
 #nav button:hover,#nav a:hover,.nav-footer button:hover { background:var(--panel-2); color:var(--text); }
-#nav button.active { color:var(--accent); background:var(--accent-soft); font-weight:600; }
+#nav button.active,#nav a.active { color:var(--accent); background:var(--accent-soft); font-weight:600; }
 #nav svg { flex-shrink:0; }
 .nav-group { margin-bottom:20px; }
 .nav-label { padding:0 12px; margin:0 0 6px; font-size:11px; font-weight:600; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; }
@@ -145,6 +151,33 @@ a { color:var(--accent); }
 .guide-check input { accent-color:var(--accent); }
 .guide-footer { display:flex; gap:16px; justify-content:space-between; margin-top:28px; color:var(--muted); font-size:12px; }
 .ui-btn { text-decoration:none; }
+.onboarding-milestones { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; list-style:none; padding:0; margin:24px 0; }
+.onboarding-milestones li { padding:16px; border:1px solid var(--line); border-radius:10px; background:var(--panel); }
+.onboarding-milestones .complete { border-color:var(--accent); }
+.milestone-mark { color:var(--accent); display:block; margin-bottom:6px; }
+.onboarding-milestones small { display:block; color:var(--muted); font-size:11px; margin-top:6px; }
+.guide-next { display:flex; align-items:center; gap:20px; margin:24px 0; }
+.guide-next .eyebrow { margin:0; }
+.guide-core { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.guide-more { margin-top:28px; color:var(--muted); }
+.guide-more summary { cursor:pointer; margin-bottom:16px; }
+.memory-views { display:flex; gap:8px; flex-wrap:wrap; margin:20px 0; }
+.memory-views button[aria-pressed=true] { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+.memory-diagnostics { margin:20px 0; color:var(--muted); }
+.memory-diagnostics summary { cursor:pointer; margin-bottom:16px; }
+.coding-pane { max-width:1050px; width:100%; margin:0 auto; padding:28px; }
+.coding-pane button,.coding-pane select,.coding-pane input,.coding-pane textarea,.memory-views button,.mem-actions button,.mem-correction button { border:1px solid var(--line); border-radius:7px; background:var(--bg); color:var(--text); padding:9px 12px; }
+.coding-pane button,.memory-views button,.mem-actions button,.mem-correction button { cursor:pointer; min-height:38px; }
+.coding-pane button:hover,.mem-actions button:hover { background:var(--accent-soft); }
+.coding-pane label { display:block; margin:16px 0 8px; }
+.coding-pane textarea,.coding-pane input { width:100%; margin-top:6px; }
+.coding-pane details { border:1px solid var(--line); padding:18px; border-radius:10px; margin:20px 0; }
+.coding-pane summary { cursor:pointer; font-weight:600; }
+.coding-pane .card { border:1px solid var(--line); border-radius:10px; padding:20px; }
+.coding-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+.coding-watch-confirm { padding:16px; background:var(--panel); border:1px solid var(--line); border-radius:8px; margin-top:12px; }
+@media(max-width:1000px) { .onboarding-milestones { grid-template-columns:repeat(2,minmax(0,1fr)); } .guide-core { grid-template-columns:1fr; } }
+@media(max-width:480px) { .onboarding-milestones { grid-template-columns:1fr; } .guide-next { align-items:flex-start; flex-direction:column; } }
 .ui-toast-ok { background:var(--panel); color:var(--text); border:1px solid var(--line); }
 @media(max-width:1100px) { .body { grid-template-columns:190px minmax(0,1fr); } .guide-page { padding:32px; } .app { grid-template-columns:200px minmax(0,1fr); } }
 @media(max-width:760px) {

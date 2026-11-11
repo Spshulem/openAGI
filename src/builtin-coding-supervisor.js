@@ -155,6 +155,8 @@ export class BuiltinCodingSupervisor {
       workspaces: (this.config.workspaces || []).map((workspace) => ({ id: workspace.id, label: workspace.label, trusted: this.isTrusted(workspace) })),
       providers: PROVIDERS.map(provider => ({ provider, installed: Boolean(this.findExecutable(provider)),
         authentication: "Sign in with the provider CLI; the first approved run verifies the account.",
+        lastSuccessfulRunAt: [...this.records.values()].filter(row => row.provider === provider && row.lastSuccessfulRunAt)
+          .map(row => row.lastSuccessfulRunAt).sort().at(-1) ?? null,
         loginCommand: provider === "codex" ? "codex login" : "claude auth login" })),
       limitation: "Codex runs read-only. Claude keeps manual permissions; denied actions require review in Claude Code. No provider permissions are approved automatically. A workspace listed in OPENAGI_CODING_TRUSTED_WORKSPACES on this computer is trusted instead: Codex writes in it with network and no prompts, Claude accepts edits and runs git, gh, node and npm, for up to two hours. CLI usage is billed by your provider and is not capped by OpenAGI's chat budget." };
   }
@@ -291,6 +293,7 @@ export class BuiltinCodingSupervisor {
       // stay interrupted, because their process ownership is unknown.
       row.status = owned.stopped || failed || code !== 0 || !completed || !text.trim() ? "failed" : denied || /\?\s*$/.test(text) ? "waiting" : "idle";
       row.updatedAt = new Date().toISOString();
+      if (completed && !failed && !owned.stopped && code === 0 && text.trim()) row.lastSuccessfulRunAt = row.updatedAt;
       row.turns.push({ role: "assistant", text: text || "No verified response. Check provider sign-in, version compatibility, permissions, and usage limits before retrying." });
       row.turns = row.turns.slice(-6);
       this.save(); this.notify();

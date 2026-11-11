@@ -34,6 +34,15 @@ export function isProtectedMemory(item = {}) {
   );
 }
 
+// The owner's saved facts are the default memory view. Runtime logs and
+// generated summaries remain available separately for diagnosis.
+export function isSavedMemory(item = {}) {
+  return isProtectedMemory(item) && item.kind !== "principle";
+}
+
+const correctionText = value => String(value ?? "").toLowerCase()
+  .replace(/\b([a-z]{4,})s\b/g, "$1");
+
 function legacyStrengthFloor(item) {
   const tierFloor = item.tier === "long" ? 0.3 : item.tier === "medium" ? 0.25 : 0.2;
   const evidenceFloor = 0.2
@@ -227,7 +236,8 @@ export class MemorySystem {
     const selected = scored.slice(0, limit);
     this.recordRecalls(selected.map((entry) => entry.item.id), {
       now,
-      source: options.source ?? "retrieve"
+      source: options.source ?? "retrieve",
+      sessionId: options.sessionId ?? null
     });
     return selected;
   }
@@ -239,7 +249,7 @@ export class MemorySystem {
    * receipt. Keeping this separate also lets vector-backed principle recall
    * use the same accounting without copying private text into telemetry.
    */
-  recordRecalls(ids, { now = nowIso(), source = "retrieve" } = {}) {
+  recordRecalls(ids, { now = nowIso(), source = "retrieve", sessionId = null } = {}) {
     const recalledAt = now instanceof Date ? now.toISOString() : String(now);
     const safeSource = ["retrieve", "principle-context"].includes(source) ? source : "retrieve";
     const updated = [];
@@ -253,6 +263,8 @@ export class MemorySystem {
         ...(item.metadata ?? {}),
         recallCount: Math.max(0, Number(item.metadata?.recallCount) || 0) + 1,
         lastRecalledAt: recalledAt,
+        ...(sessionId && item.metadata?.sessionId && sessionId !== item.metadata.sessionId
+          ? { recalledInOtherSession: true } : {}),
         recallSources: {
           ...priorSources,
           [safeSource]: Math.max(0, Number(priorSources[safeSource]) || 0) + 1
@@ -296,13 +308,27 @@ export class MemorySystem {
       // even locked items, just not one already superseded.
       if (item && !item.metadata?.supersededBy) targets.push(item);
     } else if (query) {
-      const hits = this.retrieve(query, { limit: 5, scope, includeShared: false });
+      // Retrieval strength/recency favors summaries of the last conversation.
+      // A correction must find the saved fact itself, even if five newer logs
+      // quote it. Match text without reinforcing memories just by searching.
+      const matches = [...this.items.values()]
+        .filter(item => !item.metadata?.supersededBy && (item.scope ?? "main") === scope)
+        .map(item => ({ item, score: tokenOverlapScore(correctionText(query), correctionText(`${item.content} ${(item.tags ?? []).join(" ")}`)) }))
+        .filter(hit => hit.score > 0).sort((a, b) => b.score - a.score);
+      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5);
+      const hits = saved.length ? saved : matches;
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
         // retrieve() already hides superseded items; corrections themselves are
         // fair game so a re-correction supersedes the prior one (no stacking).
         if (score >= 0.15 && score >= top * 0.8) targets.push(item);
         if (targets.length >= 3) break;
+      }
+      // Hide automatic quotations of the replaced fact too, but never widen
+      // an explicit-id correction or supersede another owner's saved fact.
+      if (saved.length) for (const { item, score } of matches) {
+        if (isProtectedMemory(item) || score < top * 0.8) continue;
+        if (targets.some(target => tokenOverlapScore(correctionText(target.content), correctionText(item.content)) >= 0.75)) targets.push(item);
       }
     }
 
