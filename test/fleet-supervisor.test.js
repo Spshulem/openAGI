@@ -1944,7 +1944,8 @@ test("an owner answer in flight wins over a review that closes the question", as
     answering = holder.answerQuestion(entries[0].id, entries[0].options[0]);
     return entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "moot" }));
   });
-  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel, executor } });
+  // A merge ask is risky: its answer goes only typed into the app.
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, delivery: "computer-use", deps: { runModel: model.runModel, executor, uiDriver: readyDriver() } });
   holder = supervisor;
   await supervisor.tick();
   while (!release) await new Promise((resolve) => setImmediate(resolve));
@@ -2639,7 +2640,8 @@ test("a kept answer that cannot be sent within a day goes back to the owner", as
 });
 
 test("only a typing wait keeps an answer: a CLI fallback that fails leaves the question open", async (t) => {
-  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  // Not a risky ask: a risky one never takes the CLI fallback.
+  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Run the e2e suite?", options: ["yes", "no"] } } });
   const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }), appRunning: async () => true };
   const { supervisor } = fixture(t, {
     mode: "auto", delivery: "computer-use-first", threads: [asking],
@@ -3389,7 +3391,8 @@ test("judge wait: nothing sent, no attempt spent, no cooldown", async (t) => {
 
 test("judge ask-owner: an agent-ask question whose answer is relayed to the agent", async (t) => {
   const judge = fakeJudge({ action: "ask-owner", reason: "needs your merge call", question: { title: "Merge with --admin?", body: "Agent asks: --admin or wait for Nikhil.", options: ["merge --admin", "wait for Nikhil"] } });
-  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  // A merge ask: its answer goes only typed into the app.
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deps: { judge, uiDriver: readyDriver() } });
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 0);
   const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
@@ -3766,7 +3769,7 @@ test("a cached verdict is read again when the PR facts it saw change", () => {
 test("an owner answer during the review holds a judged nudge already decided", async (t) => {
   let clock = NOW;
   const thread = makeThread();
-  let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Merge now?", body: "b", options: ["merge", "wait"] } };
+  let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Run e2e now?", body: "b", options: ["run", "wait"] } };
   const judge = fakeJudge(() => verdict);
   const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], now: () => clock, deps: { judge } });
   await supervisor.tick({ reason: "test" });
@@ -3778,7 +3781,7 @@ test("an owner answer during the review holds a judged nudge already decided", a
   verdict = { action: "send", reason: "CI red", message: "verification is red. Fix it." };
   const review = supervisor.reviewOpenQuestions.bind(supervisor);
   supervisor.reviewOpenQuestions = async (args) => {
-    await supervisor.answerQuestion(question.id, "merge");
+    await supervisor.answerQuestion(question.id, "run");
     return review(args);
   };
   clock += 20 * MIN;
