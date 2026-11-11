@@ -59,12 +59,10 @@ function setupBrowser({ search = "", hasAuth = true } = {}) {
   return { element, events, requests, popup, steps, selected: () => selected };
 }
 
-test("Continue with ChatGPT opens the browser from the gesture and bootstraps before authorization", async () => {
+test("ChatGPT sign-in opens the browser from the gesture and bootstraps before authorization", async () => {
   const browser = setupBrowser({ hasAuth: false });
-  browser.element("chooseChatGPT").click();
+  browser.element("chatgptSignIn").click();
   await new Promise(setImmediate);
-  assert.equal(browser.selected(), "chatgpt");
-  assert.equal(browser.steps[1].hidden, false);
   assert.deepEqual(browser.events, ["popup", "/setup/save", "/auth/chatgpt/start"]);
   assert.deepEqual(browser.requests.map(r => r.body), [{ OPENAGI_AUTH_TOKEN: "fixture-owner" }, { returnTo: "setup" }]);
   assert.equal(browser.popup.location.href, "https://auth.openai.com/fixture");

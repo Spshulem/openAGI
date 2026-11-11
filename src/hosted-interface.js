@@ -1,6 +1,8 @@
 import { renderPhonePairingPage } from "./phone-pairing-page.js";
 import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
+import { isSavedMemory, isProtectedMemory } from "./memory-system.js";
+import { getStartedStatus } from "./get-started-status.js";
 import http from "node:http";
 import { normalizeMessageImages, MAX_IMAGE_MESSAGE_BODY } from "./message-attachments.js";
 import fsSync from "node:fs";
@@ -1141,6 +1143,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
           }
           const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
+          const keyName = preference === "openai" ? "OPENAI_API_KEY" : preference === "anthropic" ? "ANTHROPIC_API_KEY" : null;
+          if (keyName && !value(keyName)) return sendJson(res, 400, { ok: false, error: `Enter your ${preference === "openai" ? "OpenAI" : "Anthropic"} API key to continue.` });
           const { createModelProvider } = await import("./model-provider.js");
           // Verify a candidate without changing live credentials or the provider
           // used by existing chats and background jobs. Mobile fallback is off.
@@ -1222,6 +1226,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (checkAuth(req, url, getAuthToken()).ok) probe.status = runtime.status();
         return sendJson(res, 200, probe);
       }
+      if (method === "GET" && pathname === "/getting-started") return sendJson(res, 200, getStartedStatus(runtime));
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
       if (method === "POST" && pathname === "/memory/remember") {
         // Direct memory import (auth-gated) — for migrations from another
@@ -5276,6 +5281,8 @@ const state = {
   }
 };
 
+${isProtectedMemory.toString()}
+${isSavedMemory.toString()}
 const $ = (id) => document.getElementById(id);
 const main = $("main");
 const sidebar = $("sidebar");
@@ -5357,6 +5364,7 @@ function safeLinkHref(rawUrl) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+  if (["/fleet", "/setup", "/?tab=coding-agents", "/?tab=memory", "/?tab=get-started", "/?tab=computer-use", "/?tab=nodes"].includes(decoded)) return escapeHtml(decoded);
   let parsed;
   try { parsed = new URL(decoded); } catch (e) { return null; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
@@ -5446,6 +5454,7 @@ function renderMarkdown(input) {
   const blocks = [];
   let paragraph = [];
   let listTag = null;
+  let listStart = 1;
   let listItems = [];
 
   const flushParagraph = () => {
@@ -5455,7 +5464,7 @@ function renderMarkdown(input) {
   };
   const flushList = () => {
     if (!listTag) return;
-    blocks.push("<" + listTag + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
+    blocks.push("<" + listTag + (listTag === "ol" && listStart !== 1 ? ' start="' + listStart + '"' : "") + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
     listTag = null;
     listItems = [];
   };
@@ -5528,13 +5537,14 @@ function renderMarkdown(input) {
     }
 
     const unordered = /^ {0,3}[-*+]\\s+(.*)$/.exec(line);
-    const ordered = /^ {0,3}\\d+[.)]\\s+(.*)$/.exec(line);
+    const ordered = /^ {0,3}(\\d+)[.)]\\s+(.*)$/.exec(line);
     if (unordered || ordered) {
       flushParagraph();
       const nextTag = unordered ? "ul" : "ol";
       if (listTag && listTag !== nextTag) flushList();
+      if (!listTag && ordered) listStart = Math.min(2147483647, Number(ordered[1]));
       listTag = nextTag;
-      listItems.push((unordered ?? ordered)[1]);
+      listItems.push(unordered ? unordered[1] : ordered[2]);
       i += 1;
       continue;
     }
@@ -5711,6 +5721,12 @@ async function switchTab(tab) {
   if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
   if (tab !== "activity") state.historyObserver?.disconnect();
   if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
+  const tabUrl = new URL(window.location.href);
+  if (tabUrl.searchParams.get("tab") !== tab) {
+    tabUrl.searchParams.set("tab", tab);
+    for (const key of ["session", "request", "compose", "pending"]) tabUrl.searchParams.delete(key);
+    history.pushState(null, "", tabUrl);
+  }
   state.tab = tab;
   main.dataset.tab = tab;
   $("pageTitle").textContent = document.querySelector('nav button[data-tab="' + tab + '"] span')?.textContent || "Chat";
@@ -5733,6 +5749,7 @@ async function switchTab(tab) {
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
+    showSidebar(state.sessions.length > 0);
     // A bare Chat open should look like chat history, not an unexplained blank
     // composer. Select the newest human-facing session unless the user
     // explicitly pressed + New or a specific ?session= handoff is about to be
@@ -6254,7 +6271,9 @@ function renderChat() {
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
   updateModelNotice();
-  document.querySelectorAll("[data-starter]").forEach(button => { button.onclick = () => startGettingStartedChat(button.dataset.starter); });
+  document.querySelectorAll("[data-starter]").forEach(button => {
+    button.onclick = () => button.dataset.starter === "agents" ? switchTab("supervisor") : startGettingStartedChat(button.dataset.starter);
+  });
   const input = $("input");
   input.value = state.chatDraft || "";
   try {
@@ -6577,7 +6596,7 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   div.className = "msg " + (runtimeApproval ? "runtime" : msg.role === "user" ? "user" : "assistant");
   const meta = runtimeApproval
     ? "OpenAGI approval"
-    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.role === "user" && /^browser(?:-|$)/.test(msg.from ?? "") ? "You" : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
   const body = msg.role === "assistant" && !runtimeApproval ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
@@ -7242,7 +7261,8 @@ async function renderAgents() {
 async function renderMemory() {
   const snap = await fetchJson("/memory");
   state.memorySnap = snap;
-  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "" };
+  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "", view: "saved" };
+  if (!state.memoryFilter.view) state.memoryFilter.view = "saved";
   renderMemoryView();
 }
 
@@ -7253,6 +7273,7 @@ function renderMemoryView() {
   const counts = { short: active(snap.short).length, medium: active(snap.medium).length, long: active(snap.long).length };
   const total = counts.short + counts.medium + counts.long;
   const allActive = [...active(snap.short), ...active(snap.medium), ...active(snap.long)];
+  const savedCount = allActive.filter(isSavedMemory).length;
   const principles = allActive.filter((m) => m.kind === "principle").length;
   const corrections = allActive.filter((m) => m.kind === "correction" || m.locked).length;
   const recalled = allActive.filter((m) => (m.metadata?.recallCount ?? 0) > 0 || (m.lastAccessedAt || "") > (m.lastObservedAt || "")).length;
@@ -7261,9 +7282,17 @@ function renderMemoryView() {
   main.innerHTML = \`
     <div class="pane">
       <div class="row between" style="margin-bottom:14px;align-items:center;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} active · \${principles} principle\${principles===1?"":"s"} · \${corrections} correction\${corrections===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. Corrections are locked and replace stale facts.")}</span></h2>
+        <h2 style="margin:0;">Saved preferences</h2>
+        <span class="muted">\${savedCount} saved facts and preferences</span>
       </div>
+      <p class="muted">What you asked your agent to keep. Update a fact here, then try recalling it in a new chat.</p>
       <div id="memoryPageChat"></div>
+      <div class="memory-views" role="group" aria-label="Memory view">
+        <button type="button" data-memory-view="saved" aria-pressed="\${f.view === 'saved'}">Saved preferences</button>
+        <button type="button" data-memory-view="all" aria-pressed="\${f.view === 'all'}">All active memories</button>
+        <button type="button" data-memory-view="history" aria-pressed="\${f.view === 'history'}">Correction history</button>
+      </div>
+      <details class="memory-diagnostics"><summary>Advanced memory diagnostics</summary>
       <div class="grid stats" style="margin-bottom:14px;">
         <div class="card"><span class="desc">Recall coverage</span><div class="stat-value">\${recallCoverage}%</div><div class="desc">\${recalled} of \${total} active memories have been used</div></div>
         <div class="card"><span class="desc">Corrections locked</span><div class="stat-value">\${corrections}</div><div class="desc">Superseded facts stay hidden from recall</div></div>
@@ -7276,7 +7305,8 @@ function renderMemoryView() {
           <button data-tier="medium" class="\${f.tier==='medium'?'active':''}" title="Day-to-day. Promoted from short-tier when repeated; demoted to long if it sticks.">Medium <span class="count">\${counts.medium}</span></button>
           <button data-tier="long" class="\${f.tier==='long'?'active':''}" title="Lava — durable truths. Raw items + condensed principles that survived multiple reinforcements.">Long <span class="count">\${counts.long}</span></button>
         </div>
-        <input type="search" id="memSearch" placeholder="search content or tags…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
+      </div></details>
+      <div class="row" style="margin-bottom:16px"><input type="search" id="memSearch" aria-label="Search memories" placeholder="Search saved facts…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
       </div>
       <div class="mem-grid" id="memList"></div>
     </div>
@@ -7290,6 +7320,11 @@ function renderMemoryView() {
       renderMemoryView();
     }
   });
+  document.querySelectorAll("[data-memory-view]").forEach(button => button.addEventListener("click", () => {
+    state.memoryFilter.view = button.dataset.memoryView;
+    state.memoryFilter.tier = "all";
+    renderMemoryView();
+  }));
   document.querySelectorAll("[data-tier]").forEach((b) =>
     b.addEventListener("click", () => { state.memoryFilter.tier = b.dataset.tier; renderMemoryView(); })
   );
@@ -7313,7 +7348,8 @@ function fillMemoryGrid() {
   if (f.tier === "all" || f.tier === "short") items = items.concat((snap.short ?? []).map((m) => ({ ...m, _tier: "short" })));
   if (f.tier === "all" || f.tier === "medium") items = items.concat((snap.medium ?? []).map((m) => ({ ...m, _tier: "medium" })));
   if (f.tier === "all" || f.tier === "long") items = items.concat((snap.long ?? []).map((m) => ({ ...m, _tier: "long" })));
-  items = items.filter((m) => !m.metadata?.supersededBy);
+  items = items.filter(m => f.view === "history" ? Boolean(m.metadata?.supersededBy) : !m.metadata?.supersededBy);
+  if (f.view === "saved") items = items.filter(isSavedMemory);
 
   if (f.query) {
     const q = f.query.toLowerCase();
@@ -7326,12 +7362,12 @@ function fillMemoryGrid() {
   items.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 
   if (items.length === 0) {
-    list.innerHTML = '<div class="empty">No memory items match this filter.</div>';
+    list.innerHTML = '<div class="empty">' + (f.view === "saved" && !f.query ? 'No saved preferences yet. Try: “Remember that I prefer short checklists.”' : 'No memory items match this view.') + '</div>';
     return;
   }
 
   list.innerHTML = items.map((m) => {
-    const tags = (m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
+    const tags = (f.view === "saved" ? [] : m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
     const kindBadge = m.kind === "principle" ? '<span class="badge ok">principle</span>' : "";
     const dangerBadge = (m.dangerLevel || 0) > 0.7 ? '<span class="badge err">⚠ danger</span>' : "";
     const scopeBadge = m.scope && m.scope !== "main" ? \`<span class="badge">\${escapeHtml(m.scope)}</span>\` : "";
@@ -7342,14 +7378,12 @@ function fillMemoryGrid() {
     return \`
       <div class="mem-card tier-\${m._tier}" data-memory-id="\${escapeHtml(m.id)}">
         <div class="mem-head">
-          <span class="badge tier-\${m._tier}">\${m._tier}</span>
-          \${kindBadge}\${correctionBadge}\${dangerBadge}\${scopeBadge}\${recallBadge}
-          <span class="badge">str \${(m.strength ?? 0).toFixed(2)}</span>
+          \${f.view === "saved" ? correctionBadge + recallBadge : '<span class="badge">' + m._tier + '</span>' + kindBadge + correctionBadge + dangerBadge + scopeBadge + recallBadge + '<span class="badge">str ' + (m.strength ?? 0).toFixed(2) + '</span>'}
           <span class="mem-age">\${escapeHtml(age)}</span>
         </div>
         <div class="mem-content">\${escapeHtml(m.content || "")}</div>
         \${tags ? \`<div class="mem-tags">\${tags}</div>\` : ""}
-        <div class="mem-actions"><button type="button" data-memory-correct="\${escapeHtml(m.id)}">Correct this memory</button><span class="muted" data-memory-status></span></div>
+        <div class="mem-actions">\${m.metadata?.supersededBy ? '<span class="muted">Replaced by a newer fact · excluded from recall</span>' : '<button type="button" data-memory-correct="' + escapeHtml(m.id) + '">Update this fact</button>'}<span class="muted" role="status" data-memory-status></span></div>
         <form class="mem-correction" data-memory-form="\${escapeHtml(m.id)}" hidden>
           <label class="desc" for="memory-correction-\${escapeHtml(m.id)}">Replace it with the complete corrected fact</label>
           <textarea id="memory-correction-\${escapeHtml(m.id)}" name="correction" required>\${escapeHtml(m.content || "")}</textarea>
@@ -10168,17 +10202,20 @@ async function refreshAmbientBadge() {
     const apps = ctx.apps?.length ?? 0;
     const snippets = ctx.snippets?.length ?? 0;
     if (apps === 0 && snippets === 0) {
-      host.textContent = "👀 capture idle";
+      host.hidden = true;
+      host.textContent = "No recent screen context";
       host.style.color = "var(--muted)";
       host.style.borderColor = "var(--line)";
     } else {
+      host.hidden = false;
       const topApp = ctx.apps?.[0]?.app?.split(".").pop() ?? "";
       host.textContent = \`👀 \${apps} app\${apps === 1 ? "" : "s"} · \${snippets} snippet\${snippets === 1 ? "" : "s"}\${topApp ? " · " + topApp : ""}\`;
       host.style.color = "var(--accent)";
       host.style.borderColor = "var(--accent)";
     }
   } catch {
-    host.textContent = "👀 capture off";
+    host.hidden = true;
+    host.textContent = "Screen context unavailable";
     host.style.color = "var(--muted)";
     host.style.borderColor = "var(--line)";
   }
