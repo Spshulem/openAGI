@@ -10,6 +10,7 @@ on:
       - 'scripts/smoke-runtime.mjs'
       - 'test/get-started.test.js'
       - 'test/runtime-downloads.test.js'
+      - 'test/runtime-smoke.test.js'
       - 'test/atomic-write.test.js'
       - 'docs/INSTALL.md'
       - 'docs/GETTING_STARTED.md'
@@ -58,7 +59,7 @@ jobs:
           cache: npm
       - run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Check onboarding and packaging
-        run: node --test test/get-started.test.js test/runtime-downloads.test.js test/atomic-write.test.js
+        run: node --test test/get-started.test.js test/runtime-downloads.test.js test/runtime-smoke.test.js test/atomic-write.test.js
       - name: Include matching Node.js and third-party notices
         shell: bash
         run: curl --fail --location --retry 2 https://raw.githubusercontent.com/nodejs/node/v22.21.1/LICENSE --output "$RUNNER_TEMP/node-LICENSE"

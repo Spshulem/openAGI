@@ -25,6 +25,10 @@ validation or flatten CLI links, which can break package-relative imports.
 Linux CI extracts each tarball with Python's strict `data` filter, runs the
 dependency CLI from the relocated archive, and verifies runtime startup, setup,
 and the dashboard there before uploading the artifact.
+The startup smoke test allows 30 seconds for a cold hosted runner and reports
+elapsed readiness time. It still fails immediately on a child exit or spawn
+error and reports the last health-probe result on timeout. It uses isolated
+state, loopback binding, and disabled discovery.
 
 Keep [install availability](INSTALL.md#downloads) accurate. A successful PR
 artifact is not a public GitHub release asset. Do not create a tag or overwrite
