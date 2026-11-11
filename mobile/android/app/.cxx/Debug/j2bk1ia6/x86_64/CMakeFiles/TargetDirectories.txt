@@ -1,0 +1,3 @@
+/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/.cxx/Debug/j2bk1ia6/x86_64/CMakeFiles/openagi_node.dir
+/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/.cxx/Debug/j2bk1ia6/x86_64/CMakeFiles/edit_cache.dir
+/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/.cxx/Debug/j2bk1ia6/x86_64/CMakeFiles/rebuild_cache.dir

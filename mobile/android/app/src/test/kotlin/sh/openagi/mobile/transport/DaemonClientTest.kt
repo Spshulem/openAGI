@@ -528,6 +528,71 @@ class DaemonClientTest {
     }
 
     @Test
+    fun fleetReplyPostsTheReplyToTheQuestion() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"question":{"id":"fq_1"},"delivery":{"status":"queued","route":"computer-use"},"state":$fleetStateJson}""",
+            ),
+        )
+        val result = client().fleetReply("fq_1", "Use the second fix")
+        assertEquals("queued", result.delivery!!.status)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/fleet/api/questions/fq_1", request.path)
+        assertEquals("""{"reply":"Use the second fix"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetSendMessagePostsTheThreadAndMessage() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"delivery":{"status":"sent","route":"computer-use"},"state":$fleetStateJson}"""))
+        val result = client().fleetSendMessage("conductor:d1dbe71a", "Keep going")
+        assertEquals("sent", result.delivery!!.status)
+        assertEquals("observe", result.state!!.mode)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/fleet/api/send", request.path)
+        assertEquals("""{"threadKey":"conductor:d1dbe71a","message":"Keep going"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun repliesRefusedByAnOlderHubReadAsUnauthorized() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(403))
+        server.enqueue(MockResponse().setResponseCode(401))
+        server.enqueue(MockResponse().setResponseCode(404))
+        for (call in listOf<suspend () -> Unit>(
+            { client().fleetReply("fq_1", "hi") },
+            { client().fleetSendMessage("codex:abc", "hi") },
+            { client().fleetSendMessage("codex:abc", "hi") },
+        )) {
+            try {
+                call()
+                fail("Must refuse")
+            } catch (expected: DaemonException.Unauthorized) {
+            }
+        }
+    }
+
+    @Test
+    fun aGoneQuestionStaysNotFound() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(404))
+        try {
+            client().fleetReply("fq_1", "hi")
+            fail("Must say the question is gone")
+        } catch (expected: DaemonException.NotFound) {
+        }
+    }
+
+    @Test
+    fun aSendToAnOddKeyNeverLeavesThePhone() = runBlocking {
+        try {
+            client().fleetSendMessage("../state", "hi")
+            fail("Must refuse")
+        } catch (expected: DaemonException.NotFound) {
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
     fun fleetDismissPostsDismissTrue() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"question":{"id":"fq_1"},"state":$fleetStateJson}"""))
         val result = client().fleetDismiss("fq_1")

@@ -1,0 +1,20 @@
+                        -H/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/src/main/cpp
+-DCMAKE_SYSTEM_NAME=Android
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+-DCMAKE_SYSTEM_VERSION=31
+-DANDROID_PLATFORM=android-31
+-DANDROID_ABI=x86_64
+-DCMAKE_ANDROID_ARCH_ABI=x86_64
+-DANDROID_NDK=/Users/shooby/Library/Android/sdk/ndk/27.2.12479018
+-DCMAKE_ANDROID_NDK=/Users/shooby/Library/Android/sdk/ndk/27.2.12479018
+-DCMAKE_TOOLCHAIN_FILE=/Users/shooby/Library/Android/sdk/ndk/27.2.12479018/build/cmake/android.toolchain.cmake
+-DCMAKE_MAKE_PROGRAM=/Users/shooby/Library/Android/sdk/cmake/3.22.1/bin/ninja
+-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/build/intermediates/cxx/Debug/j2bk1ia6/obj/x86_64
+-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/build/intermediates/cxx/Debug/j2bk1ia6/obj/x86_64
+-DCMAKE_BUILD_TYPE=Debug
+-B/Users/shooby/Dev/oa-android-drilldown/mobile/android/app/.cxx/Debug/j2bk1ia6/x86_64
+-GNinja
+-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON
+-DANDROID_STL=c++_shared
+                        Build command args: []
+                        Version: 2

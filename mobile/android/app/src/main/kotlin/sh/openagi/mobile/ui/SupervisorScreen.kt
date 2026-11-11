@@ -47,6 +47,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -58,6 +59,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -88,6 +90,7 @@ import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.FleetAction
+import sh.openagi.mobile.protocol.FleetConversation
 import sh.openagi.mobile.protocol.FleetHealth
 import sh.openagi.mobile.protocol.FleetMode
 import sh.openagi.mobile.protocol.FleetOpenChat
@@ -116,8 +119,10 @@ import sh.openagi.mobile.util.RelativeTime
 
 // FEATURES.md's "Supervisor": the fleet supervisor's view of every coding
 // thread, read from /fleet/api/state. What needs a person comes first (its
-// open questions), then Watching: every thread grouped by what the supervisor
-// watches it for, with how long it has been that way. The mode, a manual
+// open questions), then In progress: every thread grouped by what the
+// supervisor watches it for, with how long it has been that way. Any
+// question card or thread row opens the thread sheet: its recent chat, its
+// open questions with their options, and a reply box. The mode, a manual
 // scan and a supervisor chat sit in the header. Nothing here is optimistic:
 // a mode change, an answer or a sent nudge shows only once the daemon says so,
 // the same rule approvals follow.
@@ -158,6 +163,13 @@ fun SupervisorScreen(
     // another thread opened while a nudge relays, and the result is not theirs.
     var actionNoteThread by remember { mutableStateOf<String?>(null) }
     var openThread by remember { mutableStateOf<FleetThread?>(null) }
+    // The question the sheet was opened from, if any: a typed reply answers it.
+    var focusQuestionId by remember { mutableStateOf<String?>(null) }
+    // Typed replies by thread key: closing the sheet, or a failed send, keeps
+    // the words; only a reply the hub took clears them.
+    val drafts = remember { mutableStateMapOf<String, String>() }
+    var replyBusyThread by remember { mutableStateOf<String?>(null) }
+    var replyNote by remember { mutableStateOf<Pair<String, SupervisorFormat.Note>?>(null) }
     // The open sheet's thread as GET /fleet/api/threads/:key reads it: the
     // longer last message, the owner's last word. Null until it lands, and
     // on a daemon without the route, where the sheet shows the row alone.
@@ -206,9 +218,9 @@ fun SupervisorScreen(
         voice.setFocus(VoiceFocus.supervisor(voiceQuestion, voiceAction, openThread))
     }
     var chatOpen by chatOpenState
-    // The clock the Watching durations read; ticks while the list is visible.
+    // The clock the In progress durations read; ticks while the list is visible.
     var now by remember { mutableStateOf(Instant.now()) }
-    // Which Watching groups the owner opened or folded, kept across refreshes.
+    // Which In progress groups the owner opened or folded, kept across refreshes.
     val groupOpen = remember { mutableStateMapOf<String, Boolean>() }
 
     // Responses can land out of order: a 30s poll sent while an answer was
@@ -380,13 +392,59 @@ fun SupervisorScreen(
         SupervisorFormat.Note("Unmuted.", isAlert = false) to result.state
     }
 
-    fun openSheet(thread: FleetThread) {
-        if (openThread?.key != thread.key) detail = null
+    fun openSheet(thread: FleetThread, focus: String? = null) {
+        if (openThread?.key != thread.key) { detail = null; replyNote = null }
         openThread = thread
+        focusQuestionId = focus
         voiceQuestion = null
         voiceAction = null
         actionNote = null
         threadNote = null
+    }
+
+    // A question card opens its thread's sheet, focused on that question.
+    // A thread the last scan no longer lists still opens, by its key alone.
+    fun openQuestion(question: FleetQuestion) {
+        val key = question.threadKey?.takeIf { it.isNotBlank() } ?: return
+        val thread = state?.snapshot?.threads?.firstOrNull { it.key == key }
+            ?: FleetThread(key = key, title = question.chatLabel ?: question.title, openChat = question.openChat)
+        openSheet(thread, question.id)
+    }
+
+    // A typed reply: to the question when the hub takes one, else to the
+    // thread as the owner's own message. The draft stays unless the hub took it.
+    fun reply(thread: FleetThread, target: ReplyFormat.Target) {
+        val text = ReplyFormat.cleaned(drafts[thread.key].orEmpty()) ?: return
+        if (replyBusyThread != null || target is ReplyFormat.Target.None) return
+        replyBusyThread = thread.key
+        replyNote = null
+        scope.launch {
+            try {
+                val (delivery, fresh) = when (target) {
+                    is ReplyFormat.Target.Question -> client.fleetReply(target.id, text).let { it.delivery to it.state }
+                    is ReplyFormat.Target.Thread -> client.fleetSendMessage(target.key, text).let { it.delivery to it.state }
+                    is ReplyFormat.Target.None -> return@launch
+                }
+                replyNote = thread.key to ReplyFormat.deliveryNote(delivery)
+                if (ReplyFormat.clearsDraft(delivery)) {
+                    // Only if unchanged: words typed while it sent stay.
+                    if (drafts[thread.key]?.trim() == text) drafts.remove(thread.key)
+                    if (target is ReplyFormat.Target.Question) {
+                        withAlertLock {
+                            SupervisorNotifier.cancel(context, target.id)
+                            NotifiedQuestionsStore(context.filesDir).remove(target.id)
+                        }
+                    }
+                }
+                fresh?.let { accept(order.next(), it) } ?: refresh()
+            } catch (error: DaemonException) {
+                replyNote = thread.key to (ReplyFormat.failureText(error)?.let { SupervisorFormat.Note(it, isAlert = true) }
+                    ?: failureNote(error, credentials.server))
+                if (target is ReplyFormat.Target.Question && error.meansAlreadyClosed()) refresh()
+            } finally {
+                replyBusyThread = null
+            }
+        }
     }
 
     LaunchedEffect(resumeSignal, chatOpen, showChatInline) {
@@ -504,7 +562,7 @@ fun SupervisorScreen(
                                 onAnswer = { question, option -> decide(question, option) },
                                 onDismiss = { question -> decide(question, null) },
                                 onVoiceFocus = { voiceQuestion = it; voiceAction = null },
-                                onOpenThread = { key -> current.snapshot?.threads?.firstOrNull { it.key == key }?.let(::openSheet) },
+                                onOpenQuestion = { openQuestion(it) },
                             )
                         }
                         item(key = "threads") {
@@ -550,12 +608,21 @@ fun SupervisorScreen(
         // showing what was last known rather than yanking the sheet away.
         val current = state
         val thread = current?.snapshot?.threads?.firstOrNull { it.key == opened.key } ?: opened
+        // The questions open now, as Needs you shows them, so one answered
+        // there leaves here at the same moment.
+        val questions = WatchFormat.questionsFor(thread.key, current?.questions.orEmpty())
+        val replyTarget = ReplyFormat.target(questions, focusQuestionId, thread.key)
         ThreadDetailSheet(
             thread = thread,
             detail = detail?.takeIf { it.key == thread.key },
-            // The questions open now, as Needs you shows them, so one
-            // answered there leaves here at the same moment.
-            questions = WatchFormat.questionsFor(thread.key, current?.questions.orEmpty()),
+            questions = questions,
+            replyTarget = replyTarget,
+            draft = drafts[thread.key].orEmpty(),
+            onDraft = { drafts[thread.key] = it },
+            replyBusy = replyBusyThread == thread.key,
+            anyReplyBusy = replyBusyThread != null,
+            replyNote = replyNote?.takeIf { it.first == thread.key }?.second,
+            onReply = { reply(thread, replyTarget) },
             now = now,
             proposed = if (current?.mode == FleetMode.PROPOSE) SupervisorFormat.proposedFor(thread, current.actions) else emptyList(),
             busyActionId = busyActionId,
@@ -581,6 +648,7 @@ fun SupervisorScreen(
             onUnmute = { unmute(thread) },
             onDismiss = {
                 openThread = null
+                focusQuestionId = null
                 voiceQuestion = null
                 voiceAction = null
                 detail = null
@@ -801,7 +869,7 @@ private fun NeedsYouSection(
     onAnswer: (FleetQuestion, String) -> Unit,
     onDismiss: (FleetQuestion) -> Unit,
     onVoiceFocus: (FleetQuestion) -> Unit,
-    onOpenThread: (String) -> Unit,
+    onOpenQuestion: (FleetQuestion) -> Unit,
 ) {
     val questions = state.questions.filter { it.id.isNotBlank() }
     val threads = state.snapshot?.threads.orEmpty()
@@ -823,8 +891,8 @@ private fun NeedsYouSection(
                         note = note?.takeIf { it.first == question.id }?.second,
                         onAnswer = { onAnswer(question, it) },
                         onDismiss = { onDismiss(question) },
-                    onVoiceFocus = { onVoiceFocus(question) },
-                        onOpenThread = onOpenThread,
+                        onVoiceFocus = { onVoiceFocus(question) },
+                        onOpen = question.threadKey?.takeIf { it.isNotBlank() }?.let { { onOpenQuestion(question) } },
                     )
                     if (index != questions.lastIndex) Hairline()
                 }
@@ -836,7 +904,8 @@ private fun NeedsYouSection(
 // One open question: what it asks, when the agent asked and in which chat,
 // where it is answered, and Open chat. A risky ask (a merge, a release, a
 // deploy, a delete) shows the agent's whole message, marked, before any
-// button; any other card shows it on a tap, with a way into the thread.
+// button. A card with a thread opens its sheet on a tap (the chat and a
+// reply box); one without shows the agent's message on a tap.
 @Composable
 private fun QuestionRow(
     question: FleetQuestion,
@@ -848,7 +917,9 @@ private fun QuestionRow(
     onAnswer: (String) -> Unit,
     onDismiss: () -> Unit,
     onVoiceFocus: () -> Unit,
-    onOpenThread: ((String) -> Unit)? = null,
+    // Opens the question's thread sheet; null in the sheet itself and for a
+    // question with no thread, where a tap expands the card instead.
+    onOpen: (() -> Unit)? = null,
     // Off in the thread sheet, whose header already carries Open chat.
     showChat: Boolean = true,
 ) {
@@ -860,11 +931,17 @@ private fun QuestionRow(
     val asked = WatchFormat.askedLine(question, if (group) "${question.threadKeys!!.size} threads" else thread?.let(SupervisorFormat::name), now)
     val context = listOfNotNull(asked, SupervisorFormat.prNumber(question.prRef))
     val askContext = question.askContext?.takeIf { it.isNotBlank() }
-    val canExpand = (!question.risky && askContext != null) || (thread != null && onOpenThread != null)
+    val canExpand = onOpen == null && !question.risky && askContext != null
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .then(if (canExpand) Modifier.clickable(onClickLabel = if (expanded) "Show less" else "Show more") { expanded = !expanded } else Modifier)
+            .then(
+                when {
+                    onOpen != null -> Modifier.clickable(onClickLabel = "Open chat and reply", onClick = onOpen)
+                    canExpand -> Modifier.clickable(onClickLabel = if (expanded) "Show less" else "Show more") { expanded = !expanded }
+                    else -> Modifier
+                },
+            )
             .padding(horizontal = 20.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -882,7 +959,8 @@ private fun QuestionRow(
                 }
             }
         }
-        if (canExpand && !expanded) Text("Tap for more", style = OpenAGIType.caption, color = muted)
+        if (onOpen != null) Text("Tap to read the chat and reply", style = OpenAGIType.caption, color = muted)
+        else if (canExpand && !expanded) Text("Tap for more", style = OpenAGIType.caption, color = muted)
         if (question.answeredInAgentApp) {
             val app = WatchFormat.appName(question.openChat?.app) ?: "the agent's app"
             Text("Answer it in $app: the agent reads the reply there.", style = OpenAGIType.caption, color = colors.caution)
@@ -892,11 +970,6 @@ private fun QuestionRow(
             question.chats.forEach { OpenChatLine(it.openChat) }
         } else if (showChat) {
             OpenChatLine(question.openChat ?: thread?.openChat)
-        }
-        if (expanded && thread != null && onOpenThread != null) {
-            TextButton(onClick = { onOpenThread(thread.key) }, modifier = Modifier.heightIn(min = 44.dp)) {
-                Text("Thread details", style = OpenAGIType.secondary, color = colors.live)
-            }
         }
         // "dismiss" can arrive as an option; it is the Dismiss button below.
         val options = WatchFormat.answerOptions(question)
@@ -967,7 +1040,7 @@ private fun openHere(context: Context, url: String) {
     runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
 }
 
-// Watching: every thread grouped by what the supervisor watches it for
+// In progress: every thread grouped by what the supervisor watches it for
 // (waiting on you, working, waiting on CI or BuildBot3, ...), longest wait
 // first, each with how long it has been that way. A daemon from before watch
 // groups by state instead. Quiet and out-of-scope groups start folded.
@@ -985,7 +1058,7 @@ private fun ThreadsSection(
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.Bottom) {
-            Text("Watching", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+            Text("In progress", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
             val inScope = snapshot?.counts?.inScope?.takeIf { it > 0 } ?: threads.size
             if (threads.isNotEmpty()) {
                 Text("$inScope", style = OpenAGIType.secondary, color = muted, modifier = Modifier.padding(start = 8.dp, bottom = 2.dp))
@@ -1122,16 +1195,25 @@ private fun DetailRow(label: String, value: String, valueColor: Color? = null, o
     }
 }
 
-// A Watching row expanded: Open chat, the questions open about it (answered
-// here), Push now with the words it would send, Mute, then what it waits on
+// A thread opened from In progress or from a question card: Open chat, its
+// recent conversation, the questions open about it (answered here) and a
+// reply box, Push now with the words it would send, Mute, then what it waits on
 // and since when, its PR, the supervisor's next step and why, and the
-// agent's last message. GET /fleet/api/threads/:key adds the longer message
-// and the owner's last word; without it the row's own fields stand in.
+// agent's last message where no conversation came back. GET
+// /fleet/api/threads/:key adds the conversation, the longer message and the
+// owner's last word; without it the row's own fields stand in.
 @Composable
 private fun ThreadDetailSheet(
     thread: FleetThread,
     detail: FleetThreadDetail?,
     questions: List<FleetQuestion>,
+    replyTarget: ReplyFormat.Target,
+    draft: String,
+    onDraft: (String) -> Unit,
+    replyBusy: Boolean,
+    anyReplyBusy: Boolean,
+    replyNote: SupervisorFormat.Note?,
+    onReply: () -> Unit,
     now: Instant,
     proposed: List<FleetAction>,
     busyActionId: String?,
@@ -1163,13 +1245,14 @@ private fun ThreadDetailSheet(
     val agentAt = detail?.lastAgentMessage?.at ?: thread.lastAgentAt
     val ownerAt = thread.lastOwnerAt ?: detail?.lastOwnerAt
     val actions = WatchFormat.rowActions(thread, now)
+    val conversation = detail?.conversation
 
     val rows = buildList<@Composable () -> Unit> {
         // How long: what it is watched for, the turn, the wait, the agent.
         thread.watch?.let { watch ->
             val group = watch.group?.takeIf { it.isNotBlank() }?.let { WatchFormat.groupLabel(it, byWatch = true) }
             val value = listOfNotNull(group, WatchFormat.watchLine(watch, now)).joinToString(", ")
-            if (value.isNotBlank()) add { DetailRow("Watching", value) }
+            if (value.isNotBlank()) add { DetailRow("In progress", value) }
         }
         WatchFormat.waitsOn(thread.watch, now)?.let { add { DetailRow("Waits on", it) } }
         thread.watch?.otherwise?.group?.takeIf { it.isNotBlank() }?.let { back ->
@@ -1247,6 +1330,21 @@ private fun ThreadDetailSheet(
 
             voiceControls()
 
+            if (conversation != null) {
+                ConversationBlock(thread.key, conversation)
+            } else {
+                agentText?.takeIf { it.isNotBlank() }?.let { text ->
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Last agent message (unverified)", style = OpenAGIType.caption, color = muted)
+                        Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            Box(modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
+                                MarkdownView(text, textColor = MaterialTheme.colorScheme.onSurface, style = OpenAGIType.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
             if (questions.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Waiting on you", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
@@ -1271,6 +1369,16 @@ private fun ThreadDetailSheet(
             }
             // An answered question leaves; its result still shows here.
             questionNote?.takeIf { note -> questions.none { it.id == note.first } }?.let { NoteLine(it.second) }
+
+            ReplyBox(
+                target = replyTarget,
+                draft = draft,
+                onDraft = onDraft,
+                busy = replyBusy,
+                enabled = !anyReplyBusy && busyQuestionId == null,
+                note = replyNote,
+                onSend = onReply,
+            )
 
             if (actions.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1309,17 +1417,6 @@ private fun ThreadDetailSheet(
                 }
             }
 
-            agentText?.takeIf { it.isNotBlank() }?.let { text ->
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Last agent message (unverified)", style = OpenAGIType.caption, color = muted)
-                    Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Box(modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
-                            MarkdownView(text, textColor = MaterialTheme.colorScheme.onSurface, style = OpenAGIType.secondary)
-                        }
-                    }
-                }
-            }
-
             proposed.forEach { action ->
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { onVoiceAction(action) }) { Text("Talk about this nudge", style = OpenAGIType.secondary) }
@@ -1343,6 +1440,104 @@ private fun ThreadDetailSheet(
     }
 }
 
+// The chat's recent history, oldest first, newest at the bottom, in a box
+// of its own height so the sheet's own controls stay in reach. Agent text is
+// the agent's, not checked by anyone: marked unverified.
+@Composable
+private fun ConversationBlock(threadKey: String, conversation: FleetConversation) {
+    val colors = LocalOpenAGIColors.current
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    var showAll by rememberSaveable(threadKey) { mutableStateOf(false) }
+    val visible = ReplyFormat.visible(conversation, showAll)
+    val hidden = conversation.messages.size - visible.size
+    val scroll = rememberScrollState()
+    // Open at the newest message, and follow new ones as they land.
+    LaunchedEffect(threadKey, conversation.messages.lastOrNull()?.id, conversation.messages.size) {
+        scroll.scrollTo(scroll.maxValue)
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Recent conversation", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+        conversation.unavailableReason?.let { Text(it, style = OpenAGIType.caption, color = muted) }
+        if (conversation.messages.isEmpty()) {
+            Text("No messages could be read from this chat yet.", style = OpenAGIType.caption, color = muted)
+            return@Column
+        }
+        if (hidden > 0) {
+            TextButton(onClick = { showAll = true }, modifier = Modifier.heightIn(min = 44.dp)) {
+                Text("Show $hidden earlier", style = OpenAGIType.secondary, color = colors.live)
+            }
+        } else if (conversation.truncated) {
+            Text("Earlier messages are outside this view.", style = OpenAGIType.caption, color = muted)
+        }
+        Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.heightIn(max = 420.dp).verticalScroll(scroll).padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                visible.forEach { message ->
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            listOfNotNull(ReplyFormat.speaker(message), message.at?.let { clockTime(it) }).joinToString(" · "),
+                            style = OpenAGIType.caption,
+                            color = if (message.fromOwner) colors.live else muted,
+                        )
+                        MarkdownView(message.text, textColor = MaterialTheme.colorScheme.onSurface, style = OpenAGIType.secondary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The owner's own words: to the open question when the hub takes a reply,
+// else to the chat itself. The draft lives with the screen, so it survives
+// a closed sheet and a failed send.
+@Composable
+private fun ReplyBox(
+    target: ReplyFormat.Target,
+    draft: String,
+    onDraft: (String) -> Unit,
+    busy: Boolean,
+    enabled: Boolean,
+    note: SupervisorFormat.Note?,
+    onSend: () -> Unit,
+) {
+    val colors = LocalOpenAGIColors.current
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Reply", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+        if (target is ReplyFormat.Target.None) {
+            Text(target.reason, style = OpenAGIType.caption, color = muted)
+            note?.let { NoteLine(it) }
+            return@Column
+        }
+        Text(
+            if (target is ReplyFormat.Target.Question) "Answers the question above in your words." else "Goes to this chat as your message.",
+            style = OpenAGIType.caption,
+            color = muted,
+        )
+        OutlinedTextField(
+            value = draft,
+            onValueChange = { onDraft(it.take(ReplyFormat.MAX_LENGTH)) },
+            placeholder = { Text("Type a reply") },
+            enabled = !busy,
+            minLines = 2,
+            maxLines = 6,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (target is ReplyFormat.Target.Question && target.risky) {
+            Text("Typed into the chat as you", style = OpenAGIType.caption, color = colors.alert)
+        }
+        PrimaryButton(
+            text = "Send",
+            onClick = onSend,
+            enabled = enabled && ReplyFormat.cleaned(draft) != null,
+            loading = busy,
+        )
+        if (busy) Text("Sending… a reply can take a few minutes to reach the agent.", style = OpenAGIType.caption, color = muted)
+        note?.let { NoteLine(it) }
+    }
+}
 
 @Composable
 private fun SupervisorVoiceControls(
