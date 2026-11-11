@@ -210,4 +210,43 @@ final class FleetDrillDownTests: XCTestCase {
     consumer.closeItem()
     OverlayState.shared.selectVoiceContext(VoiceFocus())
   }
+
+  func testQuestionClosedMidSendKeepsTheDraftOnItsOwnThread() async {
+    let open = #"{"enabled":true,"questions":[{"id":"q1","kind":"agent-ask","threadKey":"codex:a","canReply":true}],"snapshot":{"threads":[{"key":"codex:a","watch":{"group":"you"}},{"key":"codex:b","watch":{"group":"working"}}]}}"#
+    let closed = #"{"enabled":true,"questions":[],"snapshot":{"threads":[{"key":"codex:a","watch":{"group":"working"}},{"key":"codex:b","watch":{"group":"working"}}]}}"#
+    var loaded = false
+    var consumer: FleetConsumer!
+    consumer = FleetConsumer(
+      fetchDetail: { request in (Data(), HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!) },
+      send: { request in
+        if !loaded {
+          loaded = true
+          return self.response(request, 200, #"{"delivery":{"status":"blocked"},"state":\#(open)}"#)
+        }
+        if request.url?.path == "/fleet/api/questions/q1" {
+          // Meanwhile: Back, open thread B, send there; that state closes q1.
+          await MainActor.run { consumer.closeItem(); consumer.openThread("codex:b"); consumer.setDraft("b words", for: .thread("codex:b")) }
+          await consumer.sendReply(.thread("codex:b"))
+          return self.response(request, 503, #"{"error":"Supervisor isn't available."}"#)
+        }
+        return self.response(request, 200, #"{"delivery":{"status":"sent"},"state":\#(closed)}"#)
+      })
+    consumer.setDraft("x", for: .thread("codex:a"))
+    await consumer.sendReply(.thread("codex:a"))
+    consumer.setDraft("", for: .thread("codex:a"))
+    guard let question = consumer.question("q1") else { return XCTFail("the state's question") }
+    consumer.openQuestion(question)
+    let item = FleetOpenItem.question("q1")
+    consumer.setDraft("keep me", for: item)
+    await consumer.sendReply(item)
+
+    XCTAssertEqual(consumer.openItem, .thread("codex:b"))
+    XCTAssertEqual(consumer.drafts[FleetOpenItem.thread("codex:a").key], "keep me", "the unsent draft lands on its own thread")
+    XCTAssertEqual(consumer.replyNotes[FleetOpenItem.thread("codex:a").key]?.isError, true)
+    XCTAssertEqual(consumer.replyNotes[FleetOpenItem.thread("codex:b").key], FleetNote(text: "Sent to the agent.", isError: false),
+                   "another thread keeps its own result")
+    XCTAssertNil(consumer.drafts[item.key])
+    consumer.closeItem()
+    OverlayState.shared.selectVoiceContext(VoiceFocus())
+  }
 }

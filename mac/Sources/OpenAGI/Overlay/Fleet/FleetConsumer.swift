@@ -271,6 +271,10 @@ final class FleetConsumer: ObservableObject {
       replyNotes[slot] = FleetNote(text: why, isError: true)
       return
     }
+    // The question's own thread, before the send: a late result or an
+    // unsent draft goes there and nowhere else.
+    var fallbackKey: String? = nil
+    if case let .question(id) = item { fallbackKey = question(id)?.threadKey }
     replyInFlight.insert(slot)
     defer { replyInFlight.remove(slot) }
     replyNotes[slot] = nil
@@ -288,9 +292,9 @@ final class FleetConsumer: ObservableObject {
         } else {
           await refresh()
         }
-        // The question closed with no thread to fall back to: the panel-wide
+        // The thread left the scan with the screen on it: the panel-wide
         // line says what happened, since the screen is gone.
-        if openItem == nil {
+        if case .thread = target, openItem == nil {
           if note.note.isError { setActionError(note.note.text) } else { lastOutcome = note.note.text }
         }
       }
@@ -303,12 +307,20 @@ final class FleetConsumer: ObservableObject {
     // The chat moved on (or should have): read it again.
     if case let .thread(key) = target { await loadDetail(key) }
     if case .question = target, let key = replyThreadKey(item) { await loadDetail(key) }
-    // The question closed under the send (another refresh moved the screen
-    // to its thread): its result follows the screen.
-    if case let .question(id) = item, openItem != item, let open = openItem, question(id) == nil,
-       let note = replyNotes[slot] {
-      replyNotes[open.key] = note
+    // The question closed (this reply, or a refresh during it): its result
+    // and any unsent draft move to its own thread, else the panel-wide line.
+    if case let .question(id) = item, question(id) == nil {
+      let leftNote = replyNotes[slot]
+      let leftDraft = drafts[slot]
       replyNotes[slot] = nil
+      drafts[slot] = nil
+      if let key = fallbackKey, thread(key) != nil {
+        let to = FleetOpenItem.thread(key).key
+        if let leftNote { replyNotes[to] = leftNote }
+        if let leftDraft, (drafts[to] ?? "").isEmpty { drafts[to] = leftDraft }
+      } else if let leftNote {
+        if leftNote.isError { setActionError(leftNote.text) } else { lastOutcome = leftNote.text }
+      }
     }
   }
 
@@ -554,8 +566,9 @@ final class FleetConsumer: ObservableObject {
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: nil, openIDs: open, threadKeys: keys)
     }
     let liveSlots = Set(open.map { FleetOpenItem.question($0).key } + keys.map { FleetOpenItem.thread($0).key })
-    drafts = drafts.filter { liveSlots.contains($0.key) }
-    replyNotes = replyNotes.filter { liveSlots.contains($0.key) }
+    // A reply still in flight keeps its draft until its result is known.
+    drafts = drafts.filter { liveSlots.contains($0.key) || replyInFlight.contains($0.key) }
+    replyNotes = replyNotes.filter { liveSlots.contains($0.key) || replyInFlight.contains($0.key) }
     details = details.filter { keys.contains($0.key) }
     for (key, note) in threadNotes where !keys.contains(key) {
       lastOutcome = "\(key): \(note.text)"
