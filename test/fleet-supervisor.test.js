@@ -5135,3 +5135,15 @@ test("a send to a thread with an open risky ask goes only typed into its app", a
   assert.equal((await plain.supervisor.sendOwnerMessage("codex:t1", "Email them.")).delivery.status, "sent");
   assert.equal(plain.delivered[0].route, "codex-exec");
 });
+
+test("a risky answer kept for typing keeps later sends to its thread typed-only", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [asking({ meta: { originator: "codex_exec" } })], prs: new Map(), delivery: "computer-use-first", deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await supervisor.tick({ reason: "test" });
+  const queued = await supervisor.replyQuestion(agentAsk(supervisor).id, "Wait for Nikhil.");
+  assert.equal(queued.delivery.status, "queued");
+  assert.equal(agentAsk(supervisor), undefined, "the question is closed");
+  const later = await supervisor.sendOwnerMessage("codex:t1", "Actually, merge it now.");
+  assert.equal(later.delivery.status, "blocked");
+  assert.match(later.delivery.detail, /approve it in the chat/);
+  assert.equal(delivered.length, 0, "no codex exec fallback");
+});

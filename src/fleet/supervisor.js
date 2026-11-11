@@ -1681,7 +1681,11 @@ export class FleetSupervisor {
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     // A thread with an open risky ask hears the owner only typed into its
     // app, as an answer to that ask would be.
-    const risky = this.store.openQuestions().some((q) => (q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey)) && riskyQuestion(q));
+    // A risky answer kept for typing still counts: its question is closed,
+    // but the agent has not heard it yet.
+    const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
+    const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
+      || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     const route = risky && chosen !== "computer-use" ? null : chosen;
     if (!thread || !route) {
