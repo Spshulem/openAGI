@@ -317,7 +317,7 @@ final class FleetConsumer: ObservableObject {
       if let key = fallbackKey, thread(key) != nil {
         let to = FleetOpenItem.thread(key).key
         if let leftNote { replyNotes[to] = leftNote }
-        if let leftDraft, (drafts[to] ?? "").isEmpty { drafts[to] = leftDraft }
+        if let leftDraft { drafts[to] = Self.joinDrafts(drafts[to], leftDraft) }
       } else if let leftNote {
         if leftNote.isError { setActionError(leftNote.text) } else { lastOutcome = leftNote.text }
       }
@@ -329,6 +329,12 @@ final class FleetConsumer: ObservableObject {
     case let .thread(key): return key
     case let .question(id): return question(id)?.threadKey
     }
+  }
+
+  /// Two unsent drafts in one box: neither is lost.
+  static func joinDrafts(_ existing: String?, _ moved: String) -> String {
+    guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, existing != moved else { return moved }
+    return existing + "\n\n" + moved
   }
 
   /// What a reply's answer means: the note under the box, and whether the
@@ -556,6 +562,8 @@ final class FleetConsumer: ObservableObject {
         // below, as every closed question's does).
         let from = FleetOpenItem.question(id).key
         if let note = replyNotes[from] { replyNotes[item.key] = note }
+        // The answer just went to that chat: read it again.
+        if case let .thread(key) = item { Task { await loadDetail(key) } }
         // The voice focus follows the screen too, unless it was elsewhere.
         if case let .thread(key) = item, OverlayState.shared.voiceFocus.questionId == id, let thread = state.threads.first(where: { $0.key == key }) {
           OverlayState.shared.selectVoiceContext(.thread(thread))
@@ -565,12 +573,11 @@ final class FleetConsumer: ObservableObject {
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: nil, openIDs: open, threadKeys: keys)
     }
     // Any closed question's unsent draft (one left by Back included) moves
-    // to its own thread, when that thread has none.
+    // to its own thread, joined after the thread's own draft if it has one.
     for old in oldQuestions where !open.contains(old.id) {
       let from = FleetOpenItem.question(old.id).key
       guard !replyInFlight.contains(from), let draft = drafts[from], let key = old.threadKey, keys.contains(key) else { continue }
-      let to = FleetOpenItem.thread(key).key
-      if (drafts[to] ?? "").isEmpty { drafts[to] = draft }
+      drafts[FleetOpenItem.thread(key).key] = Self.joinDrafts(drafts[FleetOpenItem.thread(key).key], draft)
     }
     let liveSlots = Set(open.map { FleetOpenItem.question($0).key } + keys.map { FleetOpenItem.thread($0).key })
     // A reply still in flight keeps its draft until its result is known.

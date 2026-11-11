@@ -82,6 +82,13 @@ final class FleetDrillDownTests: XCTestCase {
     XCTAssertEqual(FleetReplyTarget.of(threadKey: "codex:z"), .thread(key: "codex:z"))
   }
 
+  func testJoinDraftsKeepsBoth() {
+    XCTAssertEqual(FleetConsumer.joinDrafts(nil, "q"), "q")
+    XCTAssertEqual(FleetConsumer.joinDrafts(" ", "q"), "q")
+    XCTAssertEqual(FleetConsumer.joinDrafts("q", "q"), "q")
+    XCTAssertEqual(FleetConsumer.joinDrafts("t", "q"), "t\n\nq")
+  }
+
   func testReplyMessageBounds() {
     XCTAssertEqual(FleetReplyTarget.message("  use main \n"), "use main")
     XCTAssertNil(FleetReplyTarget.message(" \n "))
