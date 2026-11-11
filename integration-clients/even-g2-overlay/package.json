@@ -1,6 +1,6 @@
 {
   "name": "@openagi/even-g2",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.24.0",
@@ -29,7 +29,7 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build && pnpm run check:bundle && pnpm run check:secrets"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "0.0.15",
+    "@evenrealities/even_hub_sdk": "0.0.16",
     "zod": "4.4.3"
   },
   "devDependencies": {

@@ -4,6 +4,24 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Compact status, contextual cues and easier setup
+
+The glasses show the time and animated Listening / Thinking / Checking status
+at the upper right. Lifelog transcript visibility is a separate one-tap phone
+control. Opt-in live cues offer brief read-only answers and task suggestions;
+tap a cue to expand, swipe to page, and double-tap to return. The phone keeps an
+expandable in-session cue list. Cues stop on pause, exit or foreground loss.
+
+Setup now explains installation, HTTPS/Tailscale access and pairing, and checks
+entered/saved main addresses without credentials. The SDK has no LAN peer
+discovery API. Native **Hey Even → OpenAGI** uses the main's `/g2/connect`
+setup page and a separately revocable token; it does not require opening Agents.
+See [setup and physical acceptance checks](../../docs/setup/even-g2.md).
+
+The client pins Even Hub SDK **0.0.16**, requiring Even app **2.2.10** or newer.
+Native wake-word routing, microphone continuity, connected-calendar answers
+and physical display readability still require device acceptance.
+
 ### Version 0.5.0: three modes, consent once
 
 The glasses home has exactly one setting, chosen on the phone:
