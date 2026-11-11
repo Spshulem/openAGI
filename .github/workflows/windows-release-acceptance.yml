@@ -1,0 +1,48 @@
+name: Windows published release acceptance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-release-acceptance.yml'
+      - 'scripts/windows-release-acceptance.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  published-zip:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - name: Download and verify published v0.0.66 ZIP
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'OpenAGI release acceptance'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $zip = Join-Path $root 'OpenAGI-Windows-x64.zip'
+          Invoke-WebRequest 'https://github.com/Spshulem/openAGI/releases/download/v0.0.66/OpenAGI-Windows-x64.zip' -OutFile $zip
+          $expected = '8382dbf2a48e9d582c21e8134b3e063f6b18571c59082ce7d64cf04210ae90be'
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw 'Release ZIP checksum mismatch' }
+          Expand-Archive $zip -DestinationPath $root
+          "ACCEPTANCE_RUNTIME=$root\OpenAGI" >> $env:GITHUB_ENV
+          "ACCEPTANCE_BROWSER=$env:RUNNER_TEMP\acceptance-browser" >> $env:GITHUB_ENV
+      - name: Install isolated browser test tooling
+        shell: pwsh
+        run: |
+          npm install --prefix "$env:ACCEPTANCE_BROWSER" --no-audit --no-fund --ignore-scripts playwright@1.56.1
+          & "$env:ACCEPTANCE_BROWSER\node_modules\.bin\playwright.cmd" install chromium
+      - name: Exercise CMD launcher and browser onboarding
+        run: node scripts/windows-release-acceptance.mjs
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-v0.0.66-acceptance
+          path: acceptance-results/
+          if-no-files-found: error
+          retention-days: 14
