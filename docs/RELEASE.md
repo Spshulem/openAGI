@@ -15,6 +15,17 @@ release events created with `GITHUB_TOKEN` do not trigger another workflow.
 Packaging uses an explicit source allowlist and a clean `npm ci --omit=dev`;
 never archive an operator checkout, `.env`, or the agent's state directory.
 
+Portable bundles preserve internal relative symlinks, including npm's CLI
+aliases. Packaging rejects absolute, dangling, cyclic, or escaping links before
+writing the runtime manifest; every hop must stay inside the bundle. The
+explicit Node executable and license inputs are copied as regular files even
+when supplied through system symlinks. Fix an invalid dependency link in the
+clean release inputs and package into a new output directory; do not bypass
+validation or flatten CLI links, which can break package-relative imports.
+Linux CI extracts each tarball with Python's strict `data` filter, runs the
+dependency CLI from the relocated archive, and verifies runtime startup, setup,
+and the dashboard there before uploading the artifact.
+
 Keep [install availability](INSTALL.md#downloads) accurate. A successful PR
 artifact is not a public GitHub release asset. Do not create a tag or overwrite
 an older release merely to advertise download links.
