@@ -880,3 +880,23 @@ test("an empty reply sends nothing", async () => {
   assert.equal(page.requests.filter((r) => r.method === "POST").length, 0);
   assert.equal(page.el("status").textContent, "Type a reply first.");
 });
+
+test("words typed while a reply sends stay as the next draft", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  let release;
+  page.responses.push(new Promise((resolve) => { release = resolve; }));
+  let area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "First message.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  const sending = findAll(rowOf(page, "No plan"), (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  area.value = "Second message.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  release({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await sending;
+  await settle();
+  assert.deepEqual(page.requests.find((r) => r.method === "POST").body, { threadKey: "conductor:p2", message: "First message." });
+  area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  assert.equal(area.value, "Second message.");
+});

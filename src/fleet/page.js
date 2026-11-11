@@ -675,8 +675,10 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     try {
       var r = await api(target.path, target.body(text));
       var note = replyNote(r && r.delivery);
-      if (note.done) drafts.delete(target.id);
-      else drafts.set(target.id, area.value);
+      // Words typed while it sent stay as the next draft.
+      var now = drafts.has(target.id) ? drafts.get(target.id) : area.value;
+      if (note.done && String(now || '').trim() === text) drafts.delete(target.id);
+      else drafts.set(target.id, now);
       // The chat refetches with the new message in it.
       details.delete(key);
       replying.delete(target.id);

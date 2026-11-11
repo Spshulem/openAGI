@@ -5047,7 +5047,7 @@ test("a risky answer waits for typing instead of the CLI fallback, then is typed
   assert.equal(delivered.length, 0, "codex exec is not used while the screen is locked");
   driver.ready = true;
   await supervisor.tick({ reason: "test" });
-  assert.deepEqual(delivered.map((d) => [d.route, d.message]), [["computer-use", "Owner says: Wait for Nikhil's approval."]]);
+  assert.deepEqual(delivered.map((d) => [d.route, d.message, d.typedOnly]), [["computer-use", "Owner says: Wait for Nikhil's approval.", true]]);
   assert.equal(supervisor.store.queuedAnswers().length, 0);
 });
 
@@ -5072,4 +5072,63 @@ test("the Mac capability routes a reply through to replyQuestion", async (t) => 
   assert.equal(res.response.body.delivery.status, "sent");
   assert.equal(delivered.at(-1).message, "Owner says: Follow-up PR.");
   assert.equal(res.state.questions.some((q) => q.id === ask.id), false);
+});
+
+test("a long multi-line reply reopens when its background send fails after launch", async (t) => {
+  const { supervisor } = fixture(t, { threads: [plainAsking()], prs: new Map(), deps: { executor: backgroundExecutor(() => false) } });
+  await supervisor.tick();
+  const ask = agentAsk(supervisor);
+  const words = "Email them.\n\n" + "Say sorry and give the timeline. ".repeat(20);
+  const result = await supervisor.replyQuestion(ask.id, words);
+  assert.equal(result.question.status, "answered");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.store.question(ask.id).status, "open", "the clamped stored answer still matches");
+});
+
+test("risky answers ask the executor for typed-only delivery, immediate and queued", async (t) => {
+  const driver = { ready: true, readiness: async () => ({ ready: driver.ready, detail: driver.ready ? null : "screen locked" }) };
+  const thread = asking({ writerLocked: true, meta: { originator: "Codex Desktop" } });
+  const { supervisor, delivered } = fixture(t, { threads: [thread], prs: new Map(), delivery: "computer-use", deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  await supervisor.replyQuestion(agentAsk(supervisor).id, "Wait.");
+  assert.equal(delivered.at(-1).typedOnly, true);
+  const plain = fixture(t, { threads: [plainAsking({ writerLocked: true, meta: { originator: "Codex Desktop" } })], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await plain.supervisor.tick({ reason: "test" });
+  await plain.supervisor.replyQuestion(agentAsk(plain.supervisor).id, "Yes.");
+  assert.equal(plain.delivered.at(-1).typedOnly, undefined);
+});
+
+test("a send to a thread with an open risky ask goes only typed into its app", async (t) => {
+  // CLI Mac: blocked, nothing relayed or resumed.
+  const cli = fixture(t, { threads: [asking()], prs: new Map() });
+  await cli.supervisor.tick({ reason: "test" });
+  assert.equal(agentAsk(cli.supervisor).risky, true);
+  const blocked = await cli.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(blocked.delivery.status, "blocked");
+  assert.match(blocked.delivery.detail, /approve it in the chat/);
+  assert.equal(cli.delivered.length, 0);
+  // A live peer would be a relay: refused too.
+  const peer = fixture(t, { threads: [asking({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" } })], prs: new Map() });
+  await peer.supervisor.tick({ reason: "test" });
+  assert.equal(agentAsk(peer.supervisor).risky, true);
+  assert.equal((await peer.supervisor.sendOwnerMessage("claude:c1", "Merge it.")).delivery.status, "blocked");
+  assert.equal(peer.delivered.length, 0, "no peer relay");
+  // Computer-use-first with the screen locked: no codex exec fallback.
+  const first = fixture(t, { threads: [asking({ meta: { originator: "codex_exec" } })], prs: new Map(), delivery: "computer-use-first", deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await first.supervisor.tick({ reason: "test" });
+  const waits = await first.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(waits.delivery.status, "blocked");
+  assert.match(waits.delivery.detail, /once the Mac can type, or approve it in the chat/);
+  assert.equal(first.delivered.length, 0);
+  // Typed into the app when it can be, and typed-only there.
+  const typed = fixture(t, { threads: [asking({ writerLocked: true, meta: { originator: "Codex Desktop" } })], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await typed.supervisor.tick({ reason: "test" });
+  const sent = await typed.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(sent.delivery.status, "sent");
+  assert.deepEqual(typed.delivered.map((d) => [d.route, d.typedOnly]), [["computer-use", true]]);
+  // No risky ask open: the usual route.
+  const plain = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await plain.supervisor.tick({ reason: "test" });
+  assert.equal((await plain.supervisor.sendOwnerMessage("codex:t1", "Email them.")).delivery.status, "sent");
+  assert.equal(plain.delivered[0].route, "codex-exec");
 });
