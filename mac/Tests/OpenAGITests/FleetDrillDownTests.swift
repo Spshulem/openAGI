@@ -89,6 +89,12 @@ final class FleetDrillDownTests: XCTestCase {
     XCTAssertEqual(FleetConsumer.joinDrafts("t", "q"), "t\n\nq")
   }
 
+  func testOnlyTheSentTextLeavesTheBox() {
+    XCTAssertNil(FleetConsumer.unsentRest("hi", submitted: "hi"))
+    XCTAssertNil(FleetConsumer.unsentRest(nil, submitted: "hi"))
+    XCTAssertEqual(FleetConsumer.unsentRest("hi\n\nquestion text", submitted: "hi"), "question text")
+  }
+
   func testReplyMessageBounds() {
     XCTAssertEqual(FleetReplyTarget.message("  use main \n"), "use main")
     XCTAssertNil(FleetReplyTarget.message(" \n "))

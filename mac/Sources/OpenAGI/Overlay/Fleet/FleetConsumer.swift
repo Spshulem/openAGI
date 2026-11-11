@@ -256,7 +256,7 @@ final class FleetConsumer: ObservableObject {
   /// or queued): a refusal, an older hub's 400, or no answer keeps it.
   func sendReply(_ item: FleetOpenItem) async {
     let slot = item.key
-    guard !replyInFlight.contains(slot), let message = FleetReplyTarget.message(drafts[slot] ?? "") else { return }
+    guard !replyInFlight.contains(slot), let submitted = drafts[slot], let message = FleetReplyTarget.message(submitted) else { return }
     let target = replyTarget(item)
     let path: String
     let body: [String: Any]
@@ -284,7 +284,7 @@ final class FleetConsumer: ObservableObject {
       let (data, response) = try await send(req)
       let code = (response as? HTTPURLResponse)?.statusCode ?? 0
       let note = Self.replyNote(code: code, data: data, target: target)
-      if note.taken { drafts[slot] = nil }
+      if note.taken { drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted) }
       replyNotes[slot] = note.note
       if (200..<300).contains(code) {
         if let state = (try? JSONDecoder().decode(FleetQuestionResponse.self, from: data))?.state {
@@ -329,6 +329,15 @@ final class FleetConsumer: ObservableObject {
     case let .thread(key): return key
     case let .question(id): return question(id)?.threadKey
     }
+  }
+
+  /// After a send is taken: what is left in the box that was not sent (a
+  /// closed question's draft joined on meanwhile), or nil.
+  static func unsentRest(_ current: String?, submitted: String) -> String? {
+    guard let current, current != submitted else { return nil }
+    let rest = current.hasPrefix(submitted) ? String(current.dropFirst(submitted.count)) : current
+    let trimmed = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
   }
 
   /// Two unsent drafts in one box: neither is lost.
