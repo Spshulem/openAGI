@@ -87,6 +87,9 @@ final class FleetDrillDownTests: XCTestCase {
     XCTAssertNil(FleetReplyTarget.message(" \n "))
     XCTAssertNotNil(FleetReplyTarget.message(String(repeating: "a", count: 2000)))
     XCTAssertNil(FleetReplyTarget.message(String(repeating: "a", count: 2001)))
+    // The hub counts UTF-16 units: 1001 emoji are 2002 of them.
+    XCTAssertNil(FleetReplyTarget.message(String(repeating: "\u{1F600}", count: 1001)))
+    XCTAssertNotNil(FleetReplyTarget.message(String(repeating: "\u{1F600}", count: 1000)))
   }
 
   // MARK: - Open and close

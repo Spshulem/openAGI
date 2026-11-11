@@ -70,8 +70,11 @@ enum FleetReplyTarget: Equatable {
   /// The words to send, or nil when there are none or too many.
   static func message(_ draft: String) -> String? {
     let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-    return text.isEmpty || text.count > maxLength ? nil : text
+    return text.isEmpty || length(text) > maxLength ? nil : text
   }
+
+  /// Measured as the hub measures it: JavaScript's UTF-16 length.
+  static func length(_ text: String) -> Int { text.utf16.count }
 
   /// The hub's SEND_MAX and the question reply's cap.
   static let maxLength = 2000

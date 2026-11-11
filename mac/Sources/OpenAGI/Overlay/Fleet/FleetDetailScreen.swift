@@ -76,7 +76,10 @@ struct FleetDetailScreen: View {
             .textSelection(.enabled)
         }
         if let key, fleet.thread(key) != nil || detail != nil {
-          FleetThreadLines(summary: FleetThreadSummary(thread: fleet.thread(key), detail: detail), showsExcerpt: false)
+          // An older hub sends no chat: the agent's last words stand in,
+          // unless the ask's own words already show.
+          FleetThreadLines(summary: FleetThreadSummary(thread: fleet.thread(key), detail: detail),
+                           showsExcerpt: conversation == nil && question.displayAskContext == nil)
         }
         if let note = question.reviewNote {
           Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(3)
@@ -157,14 +160,24 @@ struct FleetDetailScreen: View {
 
     FleetConversationList(conversation: conversation, loading: fleet.detailLoading.contains(key))
 
-    ForEach(asks) { question in
-      VStack(alignment: .leading, spacing: 3) {
-        FleetQuestionAnswer(question: question)
-        Button("Open this question") { fleet.openQuestion(question) }
-          .buttonStyle(.borderless).font(.system(size: 10))
+    if !asks.isEmpty {
+      // Several asks, or a long risky one, scroll: the reply box stays on screen.
+      ScrollView {
+        VStack(alignment: .leading, spacing: 6) {
+          ForEach(asks) { question in
+            VStack(alignment: .leading, spacing: 3) {
+              FleetQuestionAnswer(question: question)
+              Button("Open this question") { fleet.openQuestion(question) }
+                .buttonStyle(.borderless).font(.system(size: 10))
+            }
+            .padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.08)))
+          }
+        }
+        .padding(.trailing, 8)
       }
-      .padding(6)
-      .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.08)))
+      .frame(maxHeight: Self.infoHeight)
     }
 
     HStack(spacing: 8) {
@@ -284,7 +297,7 @@ struct FleetReplyBox: View {
   var body: some View {
     let draft = fleet.drafts[item.key] ?? ""
     let sending = fleet.replyInFlight.contains(item.key)
-    let tooLong = draft.count > FleetReplyTarget.maxLength
+    let tooLong = FleetReplyTarget.length(draft) > FleetReplyTarget.maxLength
     VStack(alignment: .leading, spacing: 4) {
       switch target {
       case let .none(why):
@@ -303,7 +316,7 @@ struct FleetReplyBox: View {
             Text("Typed into the chat as you").font(.system(size: 10)).foregroundStyle(.orange)
           }
           if tooLong {
-            Text("\(draft.count)/\(FleetReplyTarget.maxLength)").font(.system(size: 10)).foregroundStyle(.red)
+            Text("\(FleetReplyTarget.length(draft))/\(FleetReplyTarget.maxLength)").font(.system(size: 10)).foregroundStyle(.red)
           }
           Spacer(minLength: 0)
           if sending { ProgressView().controlSize(.small) }

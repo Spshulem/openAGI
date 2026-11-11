@@ -303,6 +303,13 @@ final class FleetConsumer: ObservableObject {
     // The chat moved on (or should have): read it again.
     if case let .thread(key) = target { await loadDetail(key) }
     if case .question = target, let key = replyThreadKey(item) { await loadDetail(key) }
+    // The question closed under the send (another refresh moved the screen
+    // to its thread): its result follows the screen.
+    if case let .question(id) = item, openItem != item, let open = openItem, question(id) == nil,
+       let note = replyNotes[slot] {
+      replyNotes[open.key] = note
+      replyNotes[slot] = nil
+    }
   }
 
   private func replyThreadKey(_ item: FleetOpenItem) -> String? {
@@ -533,10 +540,15 @@ final class FleetConsumer: ObservableObject {
       let closed = open.contains(id) ? nil : oldQuestions.first { $0.id == id }
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: closed, openIDs: open, threadKeys: keys)
       if let item = openItem, item != .question(id) {
-        // The draft and result follow the screen to the thread.
+        // The draft and result follow the screen to the thread; a draft
+        // still being sent stays put, so it can't be sent twice.
         let from = FleetOpenItem.question(id).key
         if let note = replyNotes[from] { replyNotes[item.key] = note }
-        if drafts[item.key] == nil, let draft = drafts[from] { drafts[item.key] = draft }
+        if !replyInFlight.contains(from), drafts[item.key] == nil, let draft = drafts[from] { drafts[item.key] = draft }
+        // The voice focus follows the screen too, unless it was elsewhere.
+        if case let .thread(key) = item, OverlayState.shared.voiceFocus.questionId == id, let thread = state.threads.first(where: { $0.key == key }) {
+          OverlayState.shared.selectVoiceContext(.thread(thread))
+        }
       }
     } else {
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: nil, openIDs: open, threadKeys: keys)
