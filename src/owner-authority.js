@@ -78,6 +78,8 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`message\s+${NOT_TOLD}(?!(?:received|sent|delivered|read|history|log|box|board)\b)\w`,
       String.raw`(?:reply|respond|write back|answer back)\s+to\s+(?!(?:me|us)\b)\w`,
       String.raw`(?:send|write|reply|respond|answer)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
+      String.raw`(?:forward|pass along)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
+      String.raw`(?:in|on)\s+${NAMED_RECIPIENT}\s*[,;:]?\s*(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:send|forward)\s+(?:it|this|that|these)\b`,
       String.raw`(?:ask|answer)\s+${NAMED_RECIPIENT}`,
       String.raw`(?:send|write|reply|respond|answer)\s+(?:back\s+)?(?:to|in|on|into)\s+${NAMED_RECIPIENT}`,
       String.raw`ask\s+(?!(?:me|us|you|yourself|a|an|the|some|any|questions?|them|everyone|people|this|that)\b)[\w-]+\s+to\b`,

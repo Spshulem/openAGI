@@ -11,7 +11,7 @@ import { readThreadConversation, unavailableConversation } from "./conversation.
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
-import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
@@ -24,6 +24,7 @@ import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import { createPaseoSource } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -94,6 +95,9 @@ const REVIEW_BACKOFF_MAX = 2;
 const JUDGE_MAX_PER_TICK = 6;
 const JUDGE_CONCURRENCY = 3;
 const JUDGE_CACHE_MS = 2 * 60 * MIN;
+// Idle dependencies can finish without a new chat message. Reassess them
+// periodically instead of treating an old worker report as current for hours.
+const IDLE_JUDGE_CACHE_MS = 10 * MIN;
 const JUDGE_DOWN_MS = 5 * MIN;
 const JUDGE_CALL_MS = 45_000;
 // All judge calls in one scan end by then (a call reads in ~10-20 s): each
@@ -215,7 +219,7 @@ function pausedDeliveryDecision(delivery, blockedSince, now) {
 // An automatic nudge the judge reads first. A resume after a limit reset or
 // an error retry stays mechanical.
 function judgeable(decision, thread) {
-  if (decision?.action !== "nudge" || !decision.message || !decision.route || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
+  if (decision?.action !== "nudge" || !decision.message || (!decision.route && !decision.requiresJudge) || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
   if (decision.playbook !== "resume") return true;
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
@@ -246,7 +250,7 @@ function judgeFacts(pr, classified, decision = null) {
 // nudges the prompt shows (nudgeHistory), so a nudge sent since is read again.
 export function judgeCacheKey(thread, decision, pr = null, classified = null, nudges = []) {
   const shown = (nudges ?? []).map((nudge) => [nudge.at ?? null, nudge.playbook ?? null, nudge.message ?? null]);
-  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
+  return [thread.key, replyMark(thread), shortHash(JSON.stringify([thread.lastUserAt, thread.lastUserText, thread.lastActivityAt, thread.meta?.conversation])), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
 }
 
 // Which agent message a verdict was read from.
@@ -432,7 +436,7 @@ function ownerSpokeAt(thread) {
 }
 
 // How much of the agent's last message a thread's detail shows.
-const DETAIL_EXCERPT_MAX = 1200;
+const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
 // answered in the agent's app, never here.
 const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
@@ -645,6 +649,9 @@ export class FleetSupervisor {
   // deadlineAt: a remote caller's. Its probes end before it, and a request
   // with no time left reports computer use not ready (the send waits).
   async probeDelivery({ deadlineAt = null } = {}) {
+    if (this.config.paseo?.enabled && this.config.paseo.only) {
+      return this.lastDelivery = { mode: "paseo", ready: null, detail: "Paseo native delivery checks each chat before sending", checkedAt: new Date(this.now()).toISOString() };
+    }
     const mode = this.config.delivery ?? "cli";
     let state = { mode, ready: null, detail: null };
     const driver = mode === "cli" ? null : this.uiDriver;
@@ -717,14 +724,18 @@ export class FleetSupervisor {
     return this._playbooks;
   }
 
+  get scanIntervalMs() {
+    return this.config.paseo?.enabled && this.config.paseo.only ? Math.max(15000, this.config.paseo.pollMs ?? 30000) : this.config.tickMs;
+  }
+
   start() {
     if (!this.config.enabled || this.timer) return false;
     const fire = (reason) => this.tick({ reason }).catch(() => { /* recorded in lastError */ });
-    this.timer = setInterval(() => fire("interval"), this.config.tickMs);
+    this.timer = setInterval(() => fire("interval"), this.scanIntervalMs);
     this.timer.unref?.();
     this.kickTimer = setTimeout(() => fire("start"), START_DELAY_MS);
     this.kickTimer.unref?.();
-    if (this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
+    if (!(this.config.paseo?.enabled && this.config.paseo.only) && this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
       this.idleTimer = setInterval(() => { this.idleCheck().catch(() => { /* next poll */ }); }, this.config.idleDrain.pollMs ?? 15_000);
       this.idleTimer.unref?.();
     }
@@ -833,11 +844,13 @@ export class FleetSupervisor {
       suggestions: store.suggestions(),
       diagnosis: structuredClone(store.state.diagnosis),
       settings: {
-        tickMinutes: Math.round(this.config.tickMs / MIN),
+        tickMinutes: Math.ceil(this.scanIntervalMs / MIN),
+        tickSeconds: this.scanIntervalMs / 1000,
         lookbackHours: this.config.lookbackHours,
         push: this.config.push ?? null,
         relayModel: this.config.relayModel,
         managerRef: this.config.managerRef,
+        paseo: { enabled: Boolean(this.config.paseo?.enabled), only: Boolean(this.config.paseo?.only) },
         delivery: this.lastDelivery.mode,
         deliveryReady: this.lastDelivery.ready,
         deliveryDetail: this.lastDelivery.detail,
@@ -912,13 +925,14 @@ export class FleetSupervisor {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    const saved = this.store.setMode(mode);
     if (mode !== "propose") {
       for (const action of this.store.actions(this.config.limits.maxActionsKept)) {
         if (action.status === "proposed") this.store.updateAction(action.id, { status: "stale", detail: "mode changed" });
       }
     }
     if (mode === "observe") this.selfFixHub.stop("all").catch(() => {});
-    return this.store.setMode(mode);
+    return saved;
   }
 
   dismissQuestion(id) {
@@ -1583,7 +1597,11 @@ export class FleetSupervisor {
     const thread = this.lastThreads.get(threadKey);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-    if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    if (!thread || !route) {
+      const detail = this.noRouteDetail(thread, deliveryState);
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
+      return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
+    }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
@@ -1593,7 +1611,9 @@ export class FleetSupervisor {
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
-    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
+      ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
   // One thread, expanded for the owner: the agent's last message and when,
@@ -1621,6 +1641,10 @@ export class FleetSupervisor {
       reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
       lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
       lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
+      lastOwnerMessage: thread && ownerSpokeAt(thread)
+        ? { text: clampTail(redactSecrets(thread.lastUserText ?? ""), DETAIL_EXCERPT_MAX), at: ownerSpokeAt(thread) }
+        : null,
+      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (thread && ownerSpokeAt(thread) ? String(thread.lastUserText ?? "").length > DETAIL_EXCERPT_MAX : false),
       lastActivityAt: row.lastActivityAt ?? null,
       pr: row.pr ?? null,
       watch: row.watch ?? null,
@@ -1777,35 +1801,41 @@ export class FleetSupervisor {
         return fallback;
       });
 
+    const paseoOnly = config.paseo?.enabled && config.paseo.only;
     let peers = new Map();
-    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
+    try { if (!paseoOnly) peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
 
     // The Codex keys whose open card this tick's scan settled (see act).
     const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
-    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
-      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
-      guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
-      guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
-      guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
-      guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
-      guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
-      this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
-      guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null),
+    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, paseoThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
+      paseoOnly ? [] : guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
+      paseoOnly ? [] : guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
+      paseoOnly ? [] : guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
+      paseoOnly ? [] : guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
+      guard("paseo", () => (d.listPaseoThreads ?? (this.paseoSource ??= createPaseoSource()))(config), []),
+      paseoOnly ? [] : guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
+      paseoOnly ? [] : guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
+      paseoOnly || this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
+      paseoOnly ? null : guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null),
       // Free space only (statfs); a failed read keeps the last one.
       storageOn ? guard("storage", () => this.storage.refreshVolumes(), null) : null
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
-    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
+    if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
+    // With migration discovery unavailable, legacy identities are not safe to resume.
+    if (config.paseo?.enabled && sourceErrors.paseo) {
+      for (const thread of threads) if (thread.kind !== "paseo") thread.excluded = "paseo-discovery-unavailable";
+    }
     const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
-    const selfIds = new Set(config.selfSessionIds);
     for (const thread of threads) {
-      if (selfIds.has(thread.id) || selfIds.has(thread.claudeSessionId) || thread.branch?.startsWith("selffix/")
+      if (isSelfThread(thread, config) || thread.branch?.startsWith("selffix/")
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
     }
-    const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
+    const manager = paseoOnly ? null : (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads
       .filter((thread) => !thread.excluded)
@@ -1829,8 +1859,8 @@ export class FleetSupervisor {
     const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs, askedPrs), unreadPrs);
 
     const infra = {
-      bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
-      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [], errorsUnknown: Boolean(sourceErrors.lbErrors) },
+      bb3: bb3 ?? { ...emptyBb3(), error: paseoOnly || this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
+      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [], errorsUnknown: paseoOnly || Boolean(sourceErrors.lbErrors) },
       localVerify: (localVerify ?? []).map((row) => ({ ...row, threadKey: processes.matchThreadByCwd(row.cwd, inScope) }))
     };
 
@@ -1882,7 +1912,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -1942,6 +1972,7 @@ export class FleetSupervisor {
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
     const unknownKinds = new Set(THREAD_KINDS.filter((kind) => sourceErrors[kind]));
+    if (config.paseo?.enabled && sourceErrors.paseo) for (const kind of THREAD_KINDS) unknownKinds.add(kind);
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
@@ -1968,7 +1999,7 @@ export class FleetSupervisor {
   // replaced in place.
   async judgeNudges(items, { started }) {
     const judge = this.nudgeJudge;
-    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode !== "auto") return;
+    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode === "observe") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
     for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
     // Only answers given since this scan began count (ownerAnswerThreads).
@@ -1986,7 +2017,7 @@ export class FleetSupervisor {
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
       const key = judgeCacheKey(thread, decision, item.pr, item.classified, history.get(thread.key) ?? []);
       const cached = this.judgeCache.get(key);
-      if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
+      if (cached && started - cached.at < (decision.requiresJudge ? IDLE_JUDGE_CACHE_MS : JUDGE_CACHE_MS)) item.decision = this.applyJudgeVerdict(item, cached.verdict);
       else due.push({ item, key });
     }
     if (!due.length) return;
@@ -2005,12 +2036,15 @@ export class FleetSupervisor {
     // time left ends sooner is only read next scan.
     const fullMs = Math.min(JUDGE_CALL_MS, this.config.judge?.timeoutMs ?? JUDGE_CALL_MS);
     const results = await mapLimit(now, JUDGE_CONCURRENCY, async ({ item }) => {
+      let conversation;
+      try { conversation = await readThreadConversation(item.thread, this.config); }
+      catch { return { error: "conversation unavailable" }; }
       const left = JUDGE_TICK_MS - (this.now() - judgeStart);
       if (left < JUDGE_MIN_CALL_MS) return { later: true };
       const capMs = Math.min(JUDGE_CALL_MS, left);
       try {
         const verdict = await withTimeout(Promise.resolve(judge.judge({
-          thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
+          conversation, thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
         })), capMs, "judge");
         return { verdict };
       } catch (error) {
@@ -2067,6 +2101,8 @@ export class FleetSupervisor {
     const { decision, thread } = item;
     if (verdict.action === "wait") return judgeWait(decision, `judge: ${verdict.reason}`, false);
     if (verdict.action === "send") {
+      // Establish unfinished work before surfacing an unavailable route.
+      if (decision.deferredRouteDecision) return { ...decision.deferredRouteDecision, judged: true, reason: `${decision.deferredRouteDecision.reason}; judge: ${verdict.reason}` };
       const messageHash = shortHash(verdict.message);
       // The same words as the last send, with no reply since, is noise.
       const repeat = repeatsLastSend(thread, item.ledger, messageHash);
@@ -2330,7 +2366,9 @@ export class FleetSupervisor {
     const since = !SETTLED_PR_STATES.has(pr?.state);
     const about = PR_PLAYBOOKS.has(decision.playbook)
       || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
-    if (!since && !about) return null;
+    const reviewedPostMerge = decision.playbook === "idle-report" && decision.requiresJudge === true
+      && decision.judged === true && pr?.state === "MERGED" && fresh.state === "MERGED";
+    if (!since && (!about || reviewedPostMerge)) return null;
     return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }
 
@@ -2505,7 +2543,7 @@ export class FleetSupervisor {
       // The judge reads every automatic nudge first: one this scan did not
       // judge (the owner switched to Auto after judgeNudges ran) waits for
       // the next scan instead of going out unread.
-      if (judgeOn && !decision.judged && judgeable(decision, target)) {
+      if (!decision.judged && (decision.requiresJudge || (judgeOn && judgeable(decision, target)))) {
         decision.reason = `${decision.reason}; held: not judged this scan`;
         continue;
       }
@@ -2794,6 +2832,7 @@ export class FleetSupervisor {
       infra,
       infraDecisions,
       storage,
+      paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: null } : null,
       sourceErrors
     };
   }

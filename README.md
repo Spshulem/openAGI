@@ -308,7 +308,11 @@ curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
   -H "authorization: Bearer $OPENAGI_AUTH_TOKEN"
 ```
 
-On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly.
+Tool discovery follows opaque `tools/list` continuation cursors over both HTTP and stdio, including empty intermediate pages. Refresh replaces the inventory only after all pages succeed; invalid or repeated cursors and listings exceeding 100 pages fail explicitly instead of publishing a partial inventory. Silent HTTP connection attempts remain non-interactive on every page.
+
+When an HTTP MCP server rejects an expired session with HTTP 404, OpenAGI discards that session and reconnects on the next call. The rejected request still fails and is never automatically replayed, since a tool action may have side effects. Other HTTP errors retain the session; a delayed rejection from an older session cannot invalidate a newer connection.
+
+On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. Concurrent first-use HTTP calls share one initialization and tool-discovery handshake; a failed handshake rejects its waiting callers and a later call can retry. Interactive callers waiting on a silent OAuth attempt can authorize after an authorization-required failure, without replaying tool actions. Closing a client cancels queued initialization and prevents late OAuth responses from reopening transport. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Streaming replies accept LF, CRLF, and CR line endings, including line endings split across transport chunks. Matching streaming tool errors are returned immediately and completed response streams are released.
 
 ---
 
@@ -594,6 +598,17 @@ without a bulk rewrite of existing data.
 No bulk migration runs automatically, and previously superseded memories are
 not restored.
 
+### Quick Ask attention badge
+
+The floating badge counts current brief items, pending approvals, Supervisor
+questions, and decision notifications from the last seven days. Shared source
+references count once. Informational notifications and digest summaries remain
+in Notifications without inflating the badge. Old or undated notification-only
+decisions remain there for review; canonical current queues and coding approvals
+never expire from the badge. No stored tasks, notifications, or approvals are
+changed by this presentation policy. Counts above 99 display as `99+`; the
+accessibility label and tooltip retain the exact count.
+
 The iMessage self-chat importer opens the Messages SQLite database strictly read-only,
 with a bounded lock wait. It reads committed WAL messages without checkpointing or
 creating the source database. Cursor checkpoints stay in OpenAGI's own data directory.
@@ -603,3 +618,49 @@ The self-chat task importer supports both plain `text` and modern Messages
 text takes precedence. Unreadable bodies and attachment-only rows advance the
 cursor without creating empty tasks; other chats remain excluded. First enable
 remains forward-only unless backfill is explicitly configured.
+
+### Task lifecycle and computer approvals
+
+Tasks are one-off work records; recurring jobs live separately under Cron. The agent pulse claims eligible agent work, prepares draft-only tasks for review, and waits on approvals or blockers rather than treating every visible row as executable. Backlog triage reviews suggestions and drafts; the task sweep handles task deduplication, routing and relevance.
+
+Task relevance checks include the current clock and each task's creation/due/scheduled dates, status and bounded description. Age alone does not prove completion. Sweep receipts distinguish full, partial, failed and unavailable model review from deterministic cleanup. Completion scans use existing activity evidence, check both pending and in-progress user tasks, and rotate bounded 30-task batches across the user queue so agent work and an unchanged first page cannot starve older tasks. Without evidence, the scan skips; it does not claim the work is finished.
+
+Computer approval grants permission for the displayed goal on one specific node. Readiness is refreshed at approval time before resolving that same node. A genuinely unavailable or permission-blocked node still fails closed; approval never switches computers or grants system permissions.
+### Agent task recovery
+
+Agent claims expire rather than reserving work forever. Deferred claims retain
+their attempt count; manually resuming one does not create a new timed lease.
+After the stale-work grace period, the queue recovers agent work with a missing
+or invalid lease expiry, preserving the retry budget and parking exhausted
+work as blocked. Fresh work, valid live leases, and tasks awaiting draft review
+remain protected. User-owned tasks retain their status. Recovery happens during
+normal queue sweeps, not when opening the store.
+
+
+### Desktop workspace
+
+Supervisor opens the same ongoing-work and questions view used by the companion
+clients. Coding CLI configuration is separate under Advanced → Coding setup;
+provider, model, and reasoning controls stay inside Advanced options. Connections
+holds integration setup; device and glasses tools are optional advanced views.
+Get started links to model setup before the optional introductory chat.
+
+Tasks and Today preserve request failures instead of showing zero tasks. A paired
+worker forwards Inbox reads, draft and suggestion actions, and backlog cleanup
+with its run-status polling to its main; it never substitutes a local queue when
+main denies workspace access. The main retains authority over every request.
+Recovery links open the connected agent for sign-in; no token is passed in the URL
+and no enrollment is changed automatically.
+
+Inbox shows the latest completed cleanup report: reviewed, retired, and awaiting
+model review counts, including reviews postponed by cadence, provider availability,
+budget, or the item cap. Inconclusive review annotations are shown separately
+because they can overlap unjudged items. Cleanup concerns suggestions and drafts, not automatic completion of user
+tasks. Old age alone is not proof that a task is finished. Background activity
+shows scheduled-run receipts and explicitly distinguishes inferred scores from
+user feedback and delivered work.
+
+Computer history loads older rows automatically near the bottom, using bounded
+pages with a fixed upper timestamp, with Load more retained as a fallback.
+Computer Use has an explicit enable action and permission guidance; enabling tools
+does not grant operating-system permissions or approve a control session.

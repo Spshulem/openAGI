@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(openagi_node)
+add_library(node SHARED IMPORTED)
+set_target_properties(node PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/../../../../Vendor/bin/${ANDROID_ABI}/libnode.so)
+add_library(openagi_node SHARED embedded-node.cpp)
+target_link_libraries(openagi_node node log)
+target_link_options(openagi_node PRIVATE "-Wl,-z,max-page-size=16384")

@@ -53,13 +53,13 @@ internal fun connectionDotStyle(state: ConnectionState): Pair<androidx.compose.u
 }
 
 // The daemon's address, whatever the state.
-internal fun connectionHost(state: ConnectionState): String = when (state) {
+internal fun connectionHost(state: ConnectionState): String = (when (state) {
     is ConnectionState.Synced -> state.host
     is ConnectionState.Failed -> state.host
     is ConnectionState.NeverSynced -> state.host
     is ConnectionState.Live -> state.host
     is ConnectionState.Reconnecting -> state.host
-}
+}).let { if (it.startsWith("http://127.0.0.1:")) "This phone" else it }
 
 // The status word the connection line shows after the host.
 internal fun connectionCaption(state: ConnectionState): String = when (state) {

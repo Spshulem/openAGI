@@ -480,10 +480,23 @@ stops sending the same note to every thread.
   **wait** (the agent already answered, or waits on CI, a queued run, a
   reviewer, a limit), or **ask you** (it needs your decision, approval or a
   credential). Your answer goes to the agent like any agent question.
-- Only in Auto, only for merge-ready, ci-finished, status-check,
+- In Auto and Propose (Propose saves drafts without sending), for merge-ready, ci-finished, status-check,
   idle-report, bb3-slow-agent and resume. A resume after a limit reset or an
   error stays automatic. Your answers and messages are never judged.
-- At most 6 calls per scan, 3 at once. A verdict holds 2 hours while the
+- With the judge enabled, idle conversations with no linked PR or a merged PR
+  are also reviewed, including ones older than six hours. Eligibility does not
+  depend on promise keywords: mentions of the owner, releases, or deployment
+  reach the contextual reviewer. It checks the requested outcome, prior scope,
+  unfinished work and stale background-worker claims. Completed work stays
+  quiet; missing authorization becomes an owner question. An overdue worker
+  can prompt inspection of the existing job, never a duplicate job.
+- Idle-review verdicts expire after 10 minutes so dependencies can be checked
+  again even without a new chat message. Reviews remain bounded and fair across
+  scans; this is not a guarantee that every discovered chat is read each scan.
+  Muting, deliberate stops, recent owner activity, delivery receipts, cooldowns
+  and send caps remain enforced. Disabling or failing the judge never sends an
+  unreviewed contextual continuation.
+- At most 6 calls per scan, 3 at once. Other verdicts hold 2 hours while the
   chat, playbook and PR facts are the same. Cooldowns and the same-message
   guard still apply to its sends.
 - A failure or timeout (90 s) waits; nothing is sent blind. A scan where
@@ -600,3 +613,100 @@ commands, notifications, pushes and delivery are disabled. A target metric
 must improve and untouched playbooks may not increase questions or sends by
 more than 10%. An unknown metric fails closed. P4's richer diagnostic metrics
 can extend this replay contract later.
+
+### Paseo discovery (opt-in)
+
+`OPENAGI_FLEET_PASEO=1` discovers existing Paseo chats through the public
+`@getpaseo/client` SDK. It includes background workspaces, preserves host and
+agent identity, and never imports, reloads, or resumes original provider sessions.
+`OPENAGI_FLEET_PASEO_ONLY=1` additionally skips legacy session, process, LB,
+BuildBot3, and computer-use readiness probes. Both flags are needed for exclusive
+Paseo discovery. Existing observe/propose/auto settings are unchanged.
+
+The default endpoint is `ws://127.0.0.1:6767/ws`. Set `OPENAGI_PASEO_URL` for a
+different endpoint, `OPENAGI_PASEO_PASSWORD` in the local secret environment if
+required, and `OPENAGI_PASEO_SERVER_IDS` to comma-separated registered destination
+IDs. Remote endpoints require WSS; URL credentials are rejected. Remote hosts
+must already be enabled and online. This integration does not register hosts or
+change trust settings.
+
+Inventory is paginated, including closed chats for exclusion. At most twelve
+changed chat histories are read per scan, four at a time; subsequent scans work
+through the remaining histories. Unknown or failed histories cannot produce
+nudges. Snapshot `paseo.discovered` and `paseo.historyPending` expose coverage;
+normal fleet scope limits still apply. Only bounded message text is retained,
+not tool output or images. Paseo workspaces are never probed through local git
+or filesystem scans. Migration aliases suppress duplicate legacy supervision.
+
+Native sends refresh the exact host and agent before dispatch and revalidate
+both the baseline timeline's agent and the current handle after the read.
+Running, closed, archived, permission-blocked, changed-workspace and
+changed-revision chats are held. Each attempt first records a durable client message ID and the timeline
+cursor immediately before dispatch; a failed or uncertain send is never
+automatically repeated. Acknowledgement alone is not success: an exact turn ID,
+linked through the submitted message or returned by the host, must match a
+running turn or an assistant response. Later replies or start times alone cannot
+prove execution. No provider import, reload, settings change or legacy-session
+fallback is used.
+
+Acceptance can precede the message and turn appearing in Paseo's timeline.
+Delivery rechecks entries after that cursor every 250 ms for a five-second
+confirmation window, bounded by the existing Paseo request timeout. Each read
+can follow up to ten pages of 80 entries; unsupported, stale or reset cursors
+fall back to a fresh 40-entry tail. Exact message-to-turn and client-to-provider
+IDs learned from the timeline are persisted immediately, so a later completed
+response can confirm the turn even if the original user entry leaves the page.
+These are sequential, read-only checks; the message is sent once and
+the chat stays locked against concurrent delivery. If confirmation is still
+unavailable, the durable receipt stays pending and the question card remains
+open. An unconfirmed-turn warning records uncertainty about execution: inspect
+the existing chat before retrying and preserve its delivery journal. Text,
+timestamps, nearby activity and a changed projection never settle a receipt.
+The pinned Paseo SDK's send method returns no correlation IDs. Confirmation
+therefore depends on IDs retained in its timeline; optional response IDs are
+supported for future adapters but are not required for current SDK operation.
+When history lacks those IDs, receipts remain pending. Installing this change
+does not reconstruct missing historical IDs or clear older uncertain receipts.
+Recovery requires authoritative correlation or a separate owner-reviewed
+reconciliation of the existing delivery.
+
+Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
+current public API has no atomic idle-only send precondition, and Paseo can fall
+back to interruption if steering is unsupported. The preflight checks reduce
+this race; they do not provide an atomic guarantee. Pending uncertain deliveries
+remain held for inspection/reconciliation instead of prompting repeatedly.
+
+### Confirmed mode changes and conversation review
+
+A successful mode response now means the selected fleet computer saved and
+confirmed that mode. Disk-write failures return an error and retain the previous
+mode. An older remote refresh cannot overwrite a newer acknowledged response.
+Changing a selector on a disconnected client is not confirmation; check the
+returned mode and connection error before relying on unattended operation.
+
+The nudge judge reads a bounded recent conversation, including owner instructions,
+instead of only the final assistant reply. New owner instructions invalidate the
+cached verdict. Missing history is labelled as incomplete. The judge also runs in
+Propose mode, producing contextual drafts without sending them. Observe still
+sends nothing. Existing approval, scope, cooldown and delivery checks remain.
+
+For a Claude/Sonnet judge, set `OPENAGI_FLEET_JUDGE_PROVIDER=claude`,
+`OPENAGI_FLEET_JUDGE_MODEL` to a model supported by the configured Claude CLI, and
+`OPENAGI_FLEET_JUDGE=1`. It uses the existing tool-free, safe-mode, nonpersistent
+structured-review runner. Codex remains the default provider; changing the
+question-review model alone does not change the nudge judge.
+
+Paseo-only discovery scans every 30 seconds by default; `OPENAGI_PASEO_POLL_MS`
+sets a different interval with a 15-second minimum. Scans share the supervisor's
+existing in-flight guard and retain bounded history/model budgets. Explicit
+GitHub PR links in the recent conversation feed the existing CI and review
+lookup without probing remote workspaces locally. This is bounded polling,
+not event-driven completion tracking. Large backlogs still require several scans.
+
+These changes do not enable the integration, change an installed mode, or bypass
+the per-chat delivery checks above. Installing them and selecting a mode are
+separate from verifying a real message started and completed an agent turn.
+
+The Paseo SDK loads only when a Paseo operation runs. Embedded mobile bundles
+can omit this desktop dependency while Paseo is disabled without preventing
+the daemon from starting. Enabling Paseo requires the SDK to be installed.

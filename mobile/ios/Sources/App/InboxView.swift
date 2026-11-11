@@ -2,12 +2,12 @@ import SwiftUI
 
 struct InboxView: View {
     @Environment(AppModel.self) private var model
-    @State private var pendingActions: [PendingAction] = []
-    @State private var pendingActionsError: String?
-    @State private var clarifications: [Clarification] = []
-    @State private var clarificationsError: String?
-    @State private var isLoading = false
-    @State private var hasLoaded = false
+    private var pendingActions: [PendingAction] { model.workspace.pendingActions ?? [] }
+    private var pendingActionsError: String? { model.pendingActionsError }
+    private var clarifications: [Clarification] { model.workspace.clarifications ?? [] }
+    private var clarificationsError: String? { model.clarificationsError }
+    private var isLoading: Bool { model.isRefreshingInbox }
+    private var hasLoaded: Bool { model.workspace.pendingActions != nil && model.workspace.clarifications != nil }
 
     var body: some View {
         NavigationStack {
@@ -26,7 +26,7 @@ struct InboxView: View {
                         if let pendingActionsError { errorRow(pendingActionsError) }
                         ForEach(pendingActions) { action in
                             NavigationLink {
-                                ApprovalDetailView(action: action, onDecided: { await load() })
+                                ApprovalDetailView(action: action, onDecided: { model.bumpInboxGeneration(); await load(force: true) })
                             } label: {
                                 inboxRow(title: action.summary, secondary: action.toolName)
                             }
@@ -39,7 +39,7 @@ struct InboxView: View {
                         if let clarificationsError { errorRow(clarificationsError) }
                         ForEach(clarifications) { clarification in
                             NavigationLink {
-                                ClarificationDetailView(clarification: clarification, onAnswered: { await load() })
+                                ClarificationDetailView(clarification: clarification, onAnswered: { model.bumpInboxGeneration(); await load(force: true) })
                             } label: {
                                 inboxRow(title: clarification.question, secondary: "About one of your tasks")
                             }
@@ -50,7 +50,7 @@ struct InboxView: View {
             }
             .navigationTitle("Inbox")
             .toolbar { WorkspaceChatToolbar() }
-            .refreshable { await load() }
+            .refreshable { await load(force: true) }
             .task(id: model.inboxGeneration) { await load() }
         }
     }
@@ -71,26 +71,11 @@ struct InboxView: View {
     private func errorRow(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
-            Button("Retry") { Task { await load() } }
+            Button("Retry") { Task { await load(force: true) } }
         }
     }
 
-    private func load() async {
-        isLoading = true
-        defer { isLoading = false }
-        async let actionsResult: Result<[PendingAction], Error> = fetchResult { try await model.client.pendingActions(status: "pending") }
-        async let clarificationsResult: Result<[Clarification], Error> = fetchResult { try await model.client.clarifications(status: "pending") }
-        let combined = InboxLoader.combine(pendingActions: await actionsResult, clarifications: await clarificationsResult)
-        guard !Task.isCancelled else { return }
-        pendingActions = combined.pendingActions
-        pendingActionsError = combined.pendingActionsError
-        clarifications = combined.clarifications
-        clarificationsError = combined.clarificationsError
-        hasLoaded = true
-        await model.refreshInboxCounts()
-    }
-
-    private func fetchResult<T: Sendable>(_ operation: () async throws -> T) async -> Result<T, Error> {
-        do { return .success(try await operation()) } catch { return .failure(error) }
+    private func load(force: Bool = false) async {
+        await model.refreshInbox(force: force)
     }
 }

@@ -1,3 +1,4 @@
+import { collectMcpTools } from "./mcp-tool-list.js";
 // HTTP MCP client. Implements the Streamable HTTP transport (MCP spec
 // 2025-03-26): single endpoint, JSON-RPC over POST, response is either
 // application/json (single message) or text/event-stream (one or more
@@ -36,6 +37,9 @@ export class McpHttpClient {
     this.serverInfo = null;
     this.tools = [];
     this.connected = false;
+    this.connectPromise = null;
+    this.connectionGeneration = 0;
+    this.connectInteractive = null;
     this.lastError = null;
     this.activeControllers = new Set();
   }
@@ -56,11 +60,49 @@ export class McpHttpClient {
 
   async connect({ interactive = true } = {}) {
     if (this.connected) return { tools: this.tools, serverInfo: this.serverInfo };
+    const generation = this.connectionGeneration;
+    if (this.connectPromise) {
+      const pending = this.connectPromise;
+      const mayAuthorize = interactive && !this.connectInteractive;
+      try {
+        return await pending;
+      } catch (error) {
+        this.assertConnectionGeneration(generation);
+        // Upgrade only a silent authorization failure. No tool request has
+        // been issued yet, and all interactive waiters share the retry.
+        if (mayAuthorize && error.code === "OAUTH_INTERACTIVE_REQUIRED") {
+          return this.connect({ interactive: true });
+        }
+        throw error;
+      }
+    }
+    this.connectInteractive = interactive;
+    const pending = Promise.resolve().then(() => {
+      this.assertConnectionGeneration(generation);
+      return this.initializeConnection({ interactive, generation });
+    });
+    this.connectPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      // An older cancelled attempt must not clear a newer connection latch.
+      if (this.connectPromise === pending) {
+        this.connectPromise = null;
+        this.connectInteractive = null;
+      }
+    }
+  }
+
+  assertConnectionGeneration(generation) {
+    if (generation !== this.connectionGeneration) {
+      throw Object.assign(new Error("MCP connection closed"), { name: "AbortError" });
+    }
+  }
+
+  async initializeConnection({ interactive, generation }) {
     if (this.logDir) ensureDir(this.logDir);
     try {
-      // `interactive` is threaded per-request (not latched on the instance) so
-      // a silent boot connect can't leave later tool calls unable to re-auth.
-      this.serverInfo = await this.request(
+      const serverInfo = await this.request(
         "initialize",
         {
           protocolVersion: PROTOCOL_VERSION,
@@ -69,23 +111,25 @@ export class McpHttpClient {
         },
         { timeoutMs: this.initializeTimeoutMs, interactive }
       );
-      // notifications/initialized has no response.
+      this.assertConnectionGeneration(generation);
       await this.notify("notifications/initialized", {}, { interactive });
-      const list = await this.request("tools/list", {}, { interactive });
-      this.tools = list?.tools ?? [];
+      this.assertConnectionGeneration(generation);
+      const tools = await collectMcpTools((method, params) => this.request(method, params, { interactive }));
+      this.assertConnectionGeneration(generation);
+      this.serverInfo = serverInfo;
+      this.tools = tools;
       this.connected = true;
       this.lastError = null;
       return { tools: this.tools, serverInfo: this.serverInfo };
     } catch (error) {
-      this.lastError = error.message;
+      if (generation === this.connectionGeneration) this.lastError = error.message;
       throw error;
     }
   }
 
   async listTools() {
     if (!this.connected) await this.connect();
-    const list = await this.request("tools/list", {});
-    this.tools = list?.tools ?? this.tools;
+    this.tools = await collectMcpTools((method, params) => this.request(method, params));
     return this.tools;
   }
 
@@ -109,6 +153,7 @@ export class McpHttpClient {
    * On 401 with an oauth client: refresh once, retry once.
    */
   async send(message, { isNotification = false, timeoutMs = this.timeoutMs, retried = false, interactive = true } = {}) {
+    const generation = this.connectionGeneration;
     const headers = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -119,7 +164,9 @@ export class McpHttpClient {
       const token = await this.oauth.ensureToken({ interactive });
       headers.authorization = `Bearer ${token}`;
     }
-    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
+    this.assertConnectionGeneration(generation);
+    const requestSessionId = this.sessionId;
+    if (requestSessionId) headers["mcp-session-id"] = requestSessionId;
 
     const controller = new AbortController();
     this.activeControllers.add(controller);
@@ -138,46 +185,61 @@ export class McpHttpClient {
       this.log("error", { method: message.method, error: error.message });
       throw error;
     }
-    clearTimeout(timer);
-    this.activeControllers.delete(controller);
+    try {
+      this.assertConnectionGeneration(generation);
+      // Keep the deadline and disconnect handle until the body is consumed.
+      // Streamable HTTP uses 404 to terminate a session. Invalidate only the
+      // rejected generation; a late response must not erase a newer session.
+      // Do not replay this request: tools/call may have external side effects.
+      if (response.status === 404 && requestSessionId && this.sessionId === requestSessionId) {
+        this.sessionId = null;
+        this.connected = false;
+      }
+      // Capture or update session id.
+      const sid = response.headers.get("mcp-session-id");
+      if (sid && response.ok && this.sessionId === requestSessionId) this.sessionId = sid;
 
-    // Capture or update session id.
-    const sid = response.headers.get("mcp-session-id");
-    if (sid) this.sessionId = sid;
+      if (response.status === 401 && this.oauth && !retried) {
+        // Force a re-auth on next call.
+        const cache = this.oauth.loadCache();
+        if (cache) this.oauth.saveCache({ ...cache, access_token: null, expires_at: 0 });
+        await response.body?.cancel();
+        clearTimeout(timer);
+        this.activeControllers.delete(controller);
+        return this.send(message, { isNotification, timeoutMs, retried: true, interactive });
+      }
 
-    if (response.status === 401 && this.oauth && !retried) {
-      // Force a re-auth on next call.
-      const cache = this.oauth.loadCache();
-      if (cache) this.oauth.saveCache({ ...cache, access_token: null, expires_at: 0 });
-      return this.send(message, { isNotification, timeoutMs, retried: true, interactive });
+      if (response.status === 202) {
+        await response.body?.cancel();
+        // Notification accepted.
+        this.log("notify", { method: message.method });
+        return null;
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        this.log("error", { method: message.method, status: response.status, body: body.slice(0, 500) });
+        const err = new Error(`HTTP ${response.status} from ${this.name}: ${body.slice(0, 200) || response.statusText}`);
+        err.status = response.status;
+        throw err;
+      }
+
+      if (isNotification) {
+        // Drain body and return.
+        await response.text();
+        return null;
+      }
+
+      const ct = (response.headers.get("content-type") ?? "").toLowerCase();
+      if (ct.includes("text/event-stream")) {
+        return await this.readSseForResponse(response, message.id);
+      }
+      const json = await response.json();
+      return this.unwrap(json, message.id);
+    } finally {
+      clearTimeout(timer);
+      this.activeControllers.delete(controller);
     }
-
-    if (response.status === 202) {
-      // Notification accepted.
-      this.log("notify", { method: message.method });
-      return null;
-    }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      this.log("error", { method: message.method, status: response.status, body: body.slice(0, 500) });
-      const err = new Error(`HTTP ${response.status} from ${this.name}: ${body.slice(0, 200) || response.statusText}`);
-      err.status = response.status;
-      throw err;
-    }
-
-    if (isNotification) {
-      // Drain body and return.
-      try { await response.text(); } catch { /* ignore */ }
-      return null;
-    }
-
-    const ct = (response.headers.get("content-type") ?? "").toLowerCase();
-    if (ct.includes("text/event-stream")) {
-      return this.readSseForResponse(response, message.id);
-    }
-    const json = await response.json().catch(() => ({}));
-    return this.unwrap(json, message.id);
   }
 
   /**
@@ -189,29 +251,45 @@ export class McpHttpClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buffer.indexOf("\n\n")) >= 0) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const data = parseSseBlock(block);
-        if (!data) continue;
-        try {
-          const msg = JSON.parse(data);
+    let previousCR = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // SSE permits LF, CRLF, and bare CR. Normalize only decoded
+        // line endings, remembering a CR at a transport chunk boundary
+        // so the following LF cannot become a spurious blank event.
+        let chunk = decoder.decode(value, { stream: true });
+        if (chunk) {
+          const endsWithCR = chunk.endsWith("\r");
+          if (previousCR && chunk.startsWith("\n")) chunk = chunk.slice(1);
+          previousCR = endsWithCR;
+          buffer += chunk.replace(/\r\n|\r/g, "\n");
+        }
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const data = parseSseBlock(block);
+          if (!data) continue;
+          let msg;
+          try {
+            msg = JSON.parse(data);
+          } catch (err) {
+            this.log("error", { sseParse: err.message, raw: data.slice(0, 200) });
+            continue;
+          }
           if (msg.id != null && msg.id === expectedId) {
             return this.unwrap(msg, expectedId);
           }
-          // Any other message is a notification or unrelated response — log it.
           this.log("notify", { msg });
-        } catch (err) {
-          this.log("error", { sseParse: err.message, raw: data.slice(0, 200) });
         }
       }
+      throw new Error(`SSE stream ended without a response for request ${expectedId}`);
+    } finally {
+      try { await reader.cancel(); } catch { /* an aborted stream is already closed */ }
+      reader.releaseLock();
     }
-    throw new Error(`SSE stream ended without a response for request ${expectedId}`);
   }
 
   unwrap(json, expectedId) {
@@ -233,6 +311,10 @@ export class McpHttpClient {
   }
 
   async close() {
+    this.connectionGeneration++;
+    this.connectPromise = null;
+    this.connectInteractive = null;
+    this.sessionId = null;
     this.connected = false;
     this.oauth?.cancelAuthorization?.();
     for (const controller of this.activeControllers) controller.abort();

@@ -606,6 +606,19 @@ class DaemonClientTest {
         }
     }
 
+    @Test
+    fun paseoThreadAndActionsUseTheThreadRoutes() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"thread":{"key":"paseo:host.agent"}}"""))
+        repeat(3) { server.enqueue(MockResponse().setResponseCode(200).setBody("""{"muted":null}""")) }
+        assertEquals("paseo:host.agent", client().fleetThread("paseo:host.agent").thread!!.key)
+        client().fleetPush("paseo:host.agent")
+        client().fleetMute("paseo:host.agent", 24)
+        client().fleetUnmute("paseo:host.agent")
+        listOf("", "/push", "/mute", "/unmute").forEach { suffix ->
+            assertEquals("/fleet/api/threads/paseo:host.agent$suffix", server.takeRequest().path)
+        }
+    }
+
     // A key the daemon never sends goes nowhere: no path built from it.
     @Test
     fun aThreadKeyOutsideTheContractIsNotSent() = runBlocking {

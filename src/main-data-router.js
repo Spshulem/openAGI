@@ -6,8 +6,19 @@ import { isMobileRouteAllowed } from "./mobile-node.js";
 // A paired worker has its own stores for its local capabilities. They are
 // never a fallback for the main's workspace. Forward the client's credential
 // unchanged: the main, not the worker, decides what that client may access.
-export function isMainDataRoute(method, pathname) {
+export function isMainDataRoute(method, pathname, searchParams = null) {
   if (method === "POST" && pathname === "/nodes/enroll/exchange") return true;
+  // Inbox rows, their destinations/actions, and cleanup must share one store.
+  // This is routing only: main still checks the unchanged credential and may
+  // refuse these owner-only endpoints. Other cron jobs stay worker-local.
+  if (method === "GET" && (["/review-queue", "/drafts", "/proactive/suggestions"].includes(pathname)
+    || (pathname === "/channels" && searchParams?.get("source") === "main")
+    || /^\/proactive\/suggestions\/[^/]+\/outcome$/.test(pathname)
+    || (searchParams?.get("source") === "main" && /^\/cron\/runs\/[^/]+$/.test(pathname)))) return true;
+  if (method === "PATCH" && /^\/drafts\/[^/]+$/.test(pathname)) return true;
+  if (method === "POST" && (pathname === "/cron/backlog-triage/run"
+    || /^\/drafts\/[^/]+\/(approve|discard|stop-asking|send)$/.test(pathname)
+    || /^\/proactive\/suggestions\/[^/]+\/(accept|reject|dismiss)$/.test(pathname))) return true;
   // Main authenticates the phone and selects the configured fleet computer.
   // Hardware capabilities still belong to this worker.
   return isMobileRouteAllowed(method, pathname)
@@ -34,7 +45,7 @@ export function mainDataTimeout(method, pathname, timeoutMs = 15_000) {
 
 export function routeMainData(req, res, url, { pairing, identity, ownerAuthenticated, ownerBearerAuthenticated = false,
   allowInsecureRemote = false, timeoutMs = 15_000 } = {}) {
-  if (!pairing?.remote || !isMainDataRoute(req.method, url.pathname)) return false;
+  if (!pairing?.remote || !isMainDataRoute(req.method, url.pathname, url.searchParams)) return false;
   if (req.headers["x-openagi-main-hop"]) {
     failure(res, 508, "main-routing-loop", "This worker's main connection loops back to another worker.");
     return true;

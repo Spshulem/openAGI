@@ -64,6 +64,8 @@ export class RemoteFleetSupervisor {
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
     this.lastEmitted = null;
+    this.requestSequence = 0;
+    this.appliedSequence = 0;
   }
   getState() {
     const state = structuredClone(this.state);
@@ -83,21 +85,25 @@ export class RemoteFleetSupervisor {
     else this.pendingOutreachDecisions.set(id, count - 1);
   }
   async request(method, path, body) {
+    const sequence = ++this.requestSequence;
     let reached = false;
     let status = null;
     try {
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
-      this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
-      this.questionsAuthoritative = true;
-      this.mirrorQuestions();
+      if (sequence >= this.appliedSequence) {
+        this.appliedSequence = sequence;
+        this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
+        this.questionsAuthoritative = true;
+        this.mirrorQuestions();
+      }
       status = result.response?.status ?? null;
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      if (!missingThread) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      if (!missingThread && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
       throw Object.assign(new Error(missingThread ? error.message : this.state.lastError), { reached, status });
     }
@@ -117,7 +123,7 @@ export class RemoteFleetSupervisor {
   emitIfChanged() {
     try {
       const state = this.getState();
-      const signature = JSON.stringify([state.snapshot?.at ?? null, state.questions.map(q => q.id).sort()]);
+      const signature = JSON.stringify([state.mode, state.snapshot?.at ?? null, state.questions.map(q => q.id).sort()]);
       if (signature === this.lastEmitted) return;
       this.lastEmitted = signature;
       this.runtime?.events?.emit?.("fleet", { at: state.snapshot?.at ?? null, reason: "remote-refresh", counts: state.snapshot?.counts ?? null });
