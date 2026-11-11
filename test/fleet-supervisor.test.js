@@ -8,6 +8,7 @@ import { FleetSupervisor, groupQuestions, judgeAskKey, judgeCacheKey } from "../
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { DEADLINE_MARGIN_MS, restartMaxMs } from "../src/fleet/ui-delivery.js";
+import { paseoThread } from "../src/fleet/sources/paseo.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -4727,6 +4728,33 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   await started;
   try { assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/); }
   finally { release(); await tick; }
+});
+
+test("Paseo capacity failure produces a visible model question without sending to the chat", async (t) => {
+  const thread = paseoThread({
+    id: "failed", provider: "codex", status: "error", model: "test-model",
+    updatedAt: ago(5 * MIN), lastUserMessageAt: ago(30 * MIN)
+  }, "host", [{ timestamp: ago(5 * MIN), item: {
+    type: "error", message: "Selected model is at capacity. Please try a different model."
+  } }]);
+  const { supervisor, delivered, notified } = fixture(t, {
+    mode: "auto", review: { enabled: false },
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => supervisor.stop());
+  await supervisor.tick({ reason: "test" });
+  const state = supervisor.getState();
+  assert.equal(state.snapshot.threads[0].state, "infra-blocked");
+  assert.equal(state.snapshot.threads[0].health, "red");
+  assert.equal(state.snapshot.threads[0].error.kind, "model-limit");
+  assert.equal(state.questions.length, 1);
+  assert.match(state.questions[0].title, /test-model capped\. Switch model\?/);
+  assert.deepEqual(state.questions[0].options, ["switched", "wait"]);
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.getState().questions.length, 1, "the same failure is deduplicated");
+  assert.equal(new Set(notified.map(q => q.id)).size, 1);
+  assert.equal(delivered.length, 0);
 });
 
 test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async (t) => {
