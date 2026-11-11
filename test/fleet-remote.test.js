@@ -600,3 +600,34 @@ test('mode API rejects an unconfirmed successful response', async t => {
   assert.equal(result.status, 503);
   assert.equal(result.body.state.mode, 'observe');
 });
+
+test("the main passes a reply through to the fleet computer, which checks canReply there", async t => {
+  const { remote, state, calls } = fixture(t);
+  state.questions[0].canReply = true;
+  const replies = [];
+  const route = createFleetRoute({ supervisor: remote });
+  await remote.refresh();
+  // The fleet computer's own supervisor answers the reply.
+  const capability = createFleetCapability({ getState: () => structuredClone(state),
+    replyQuestion: async (id, reply, options) => { replies.push([id, reply, options]); state.questions = []; return { question: { id, status: 'answered', answer: reply }, delivery: { status: 'sent', route: 'computer-use' } }; } });
+  const dispatch = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => { calls.push(args); return capability.invoke(args[2], args[3]); };
+  const res = await route('POST', '/fleet/api/questions/fq_one', null, async () => ({ reply: 'Use main.' }));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.delivery.status, 'sent');
+  assert.deepEqual(replies.map(([id, reply]) => [id, reply]), [['fq_one', 'Use main.']]);
+  const sent = calls.at(-1);
+  assert.deepEqual(sent[3], { method: 'POST', path: '/fleet/api/questions/fq_one', body: { reply: 'Use main.' } });
+  assert.equal(sent[4].timeoutMs, 5 * 60 * 1000, 'a reply waits as long as any delivery');
+  assert.equal(remote.getState().questions.length, 0);
+  remote.runtime.nodeCapabilities.dispatch = dispatch;
+});
+
+test("a reply the fleet computer refuses surfaces as an error on the main", async t => {
+  const { remote, state } = fixture(t);
+  state.questions[0].canReply = false;
+  await remote.refresh();
+  const route = createFleetRoute({ supervisor: remote });
+  const res = await route('POST', '/fleet/api/questions/fq_one', null, async () => ({ reply: 'Use main.' }));
+  assert.equal(res.status, 409, 'the main reads canReply from the mirrored state');
+});

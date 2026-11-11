@@ -745,3 +745,138 @@ test('clarification cards collect an answer and show its unresolved state as tex
   assert.match(f.el('status').textContent, /still unresolved/);
   assert.equal(f.el('needsList').all().some(e => e.tagName === 'IMG'), false);
 });
+
+// ─── chat and reply ───────────────────────────────────────────────────────
+
+const conversationDetail = (key) => ({ thread: { key, conversation: { truncated: false, unavailableReason: null, messages: [
+  { id: "m1", role: "user", text: "Ship the fix <b>now</b>", at: new Date(Date.now() - 30 * 60_000).toISOString() },
+  { id: "m2", role: "assistant", text: "Tests pass. Merge to main or wait?", at: new Date(Date.now() - 5 * 60_000).toISOString() }
+] } } });
+
+function chatOf(root) {
+  return findAll(root, (e) => e.tagName === "DETAILS" && e.className === "chatwrap")[0];
+}
+
+test("the thread list is headed In progress, not Watching", () => {
+  assert.match(fleetPage, /<h2 id="fleetH">In progress /);
+  assert.doesNotMatch(fleetPage, /<h2[^>]*>Watching/);
+});
+
+test("a question card opens Chat and reply: the conversation, then a reply that posts { reply }", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: false };
+  const page = boot({ state });
+  await settle();
+  const needs = page.el("needsList");
+  const chat = chatOf(needs);
+  assert.ok(chat, "the card has a Chat and reply block");
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA").length, 0, "filled only once opened");
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chat);
+  const get = page.requests.find((r) => r.path.startsWith("/fleet/api/threads/"));
+  assert.equal(get.path, "/fleet/api/threads/codex%3Aa");
+  const opened = chatOf(page.el("needsList"));
+  assert.ok(opened.textContent.includes("Ship the fix <b>now</b>"), "messages as plain text");
+  assert.ok(opened.textContent.includes("Tests pass. Merge to main or wait?"));
+  assert.ok(opened.textContent.indexOf("Ship the fix") < opened.textContent.indexOf("Tests pass"), "oldest first");
+  const area = findAll(opened, (e) => e.tagName === "TEXTAREA")[0];
+  assert.equal(area.maxLength, 2000);
+  area.value = "  Wait for Nikhil, then merge.  ";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.responses.push({ status: 200, body: { question: { id: "fq_one", status: "answered" }, delivery: { status: "sent", route: "computer-use" }, state: sampleState({ questions: [] }) } });
+  await findAll(opened, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_one");
+  assert.deepEqual(post.body, { reply: "Wait for Nikhil, then merge." });
+  assert.equal(page.el("status").textContent, "Sent to the agent.");
+});
+
+test("a blocked reply keeps the words and says why", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: true };
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chatOf(page.el("needsList")));
+  let chat = chatOf(page.el("needsList"));
+  assert.ok(chat.textContent.includes("only typed into the agent app"), "a risky reply says how it goes");
+  const area = findAll(chat, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Merge it.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.responses.push({ status: 200, body: { question: state.questions[0], delivery: { status: "blocked", detail: "risky ask: approve it in the chat" }, state } });
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await findAll(chat, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  assert.match(page.el("status").textContent, /^Not sent: risky ask: approve it in the chat/);
+  chat = chatOf(page.el("needsList"));
+  assert.equal(chat.open, true, "stays open across the repaint");
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA")[0].value, "Merge it.", "the draft survives");
+});
+
+test("a question only the app answers has no reply box: Answer it in the app, and Open chat", async () => {
+  const state = watchState();
+  state.questions = [{ ...state.questions[0], kind: "agent-card", answerIn: "agent app", options: ["open thread"], canReply: false,
+    openChat: { app: "codex", url: "codex://threads/01a13388", label: "amex · Codex", note: null } }];
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("conductor:d1") });
+  await expand(chatOf(page.el("needsList")));
+  const chat = chatOf(page.el("needsList"));
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA").length, 0);
+  assert.ok(chat.textContent.includes("Answer it in Codex."));
+  assert.equal(findAll(chat, (e) => e.tagName === "A" && e.textContent === "Open chat")[0].href, "codex://threads/01a13388");
+});
+
+test("a question with no single thread has no chat block", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], kind: "limit", threadKey: null, threadKeys: ["codex:a", "claude:b"], canReply: false };
+  const page = boot({ state });
+  await settle();
+  assert.equal(chatOf(page.el("needsList")), undefined);
+});
+
+test("an In progress row shows its chat and sends the owner's message to the thread", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("conductor:p2") });
+  await expand(rowOf(page, "No plan"));
+  const row = rowOf(page, "No plan");
+  assert.ok(row.textContent.includes("Chat and reply"));
+  assert.ok(row.textContent.includes("Tests pass. Merge to main or wait?"));
+  const area = findAll(row, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Rebase on main first.";
+  page.responses.push({ status: 200, body: { delivery: { status: "queued", detail: "Saved. It goes to the agent once the Mac can type (owner using the Mac)." }, state: watchState() } });
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/send");
+  assert.deepEqual(post.body, { threadKey: "conductor:p2", message: "Rebase on main first." });
+  assert.match(page.el("status").textContent, /^Saved\. It goes to the agent once the Mac can type/);
+});
+
+test("a row whose question takes a reply answers that question", async () => {
+  const state = watchState();
+  state.questions[0].canReply = true;
+  const page = boot({ state });
+  await settle();
+  const row = rowOf(page, "Capacity fix");
+  const area = findAll(row, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Add a slot, then rerun.";
+  page.responses.push({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_cap");
+  assert.deepEqual(post.body, { reply: "Add a slot, then rerun." });
+});
+
+test("an empty reply sends nothing", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const row = rowOf(page, "No plan");
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  assert.equal(page.requests.filter((r) => r.method === "POST").length, 0);
+  assert.equal(page.el("status").textContent, "Type a reply first.");
+});

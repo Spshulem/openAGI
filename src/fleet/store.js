@@ -420,10 +420,13 @@ export class FleetStore {
 
   // The owner answered, but the answer could not be typed yet: the question
   // is answered (off the owner's list) and its message waits to be sent.
-  queueAnswer(id, answer, message) {
+  // typedOnly: a risky ask's, sent only typed into the app. messageMax: an
+  // owner's reply keeps all its words.
+  queueAnswer(id, answer, message, { typedOnly = false, messageMax = this.limits.bodyMax } = {}) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
-    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, Math.max(this.limits.bodyMax, messageMax)), since: iso(this.now()),
+      ...(typedOnly ? { typedOnly: true } : {}) } });
   }
 
   queuedAnswers() {

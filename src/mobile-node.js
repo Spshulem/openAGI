@@ -82,6 +82,8 @@ const EXACT = new Set([
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
+  // The owner's own message to one fleet thread (its chat's reply box).
+  "POST /fleet/api/send",
   // Shared device threads and the read-only lifelog. Owner decision: paired
   // phones may read the lifelog.
   "GET /conversations/agent/messages",

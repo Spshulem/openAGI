@@ -89,6 +89,13 @@ a.btn.primary{color:var(--ink)}
 .item .acts .btn{margin:0;width:auto;flex:1 1 auto}
 .ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
 .ask .t{display:block}
+.chat{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.chat .log{max-height:420px;overflow:auto}
+.said{margin-top:8px}
+.said.you .quote{border-left-color:var(--accent)}
+details.chatwrap{margin-top:14px}
+details.chatwrap>summary{display:flex;align-items:center;justify-content:center}
+textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--raise);color:var(--text);font:inherit;resize:vertical}
 @media (prefers-reduced-motion:no-preference){.card{transition:box-shadow .4s ease,border-color .4s ease}}
 @media (min-width:700px){.wrap{padding-top:32px}.opts{grid-template-columns:repeat(2,1fr)}.opts .btn.ghost{grid-column:1/-1}}
 </style></head>
@@ -112,7 +119,7 @@ a.btn.primary{color:var(--ink)}
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">System status</h2><div id="infraStrip" class="strip"></div></section>
-  <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <section aria-labelledby="fleetH"><h2 id="fleetH">In progress <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
   <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
 </main>
 </div>
@@ -143,7 +150,7 @@ a.btn.primary{color:var(--ink)}
     done: 'dim', excluded: 'dim'
   };
   var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true, quiet: true };
-  // Watching: what the supervisor watches each thread for (snapshot watch.group).
+  // In progress: what the supervisor watches each thread for (snapshot watch.group).
   var WATCH_ORDER = ['you', 'working', 'waiting', 'push', 'blocked', 'quiet'];
   var WATCH_LABEL = {
     you: 'Waiting on you', working: 'Working', waiting: 'Waiting on CI or BuildBot3', push: 'Needs a push',
@@ -171,6 +178,8 @@ a.btn.primary{color:var(--ink)}
   // and the function that repaints that row once its detail arrives.
   var details = new Map();
   var detailLoading = new Set();
+  // Thread key -> the functions that repaint what shows its detail (its row,
+  // a question card's chat).
   var painters = new Map();
   var DETAIL_TTL_MS = 20000;
   var MUTE_HOURS = 24;
@@ -400,6 +409,7 @@ a.btn.primary{color:var(--ink)}
       } else if (q.kind === 'agent-ask') {
         el('p', 'note', 'Your answer goes to the agent.', card);
       }
+      cardChat(q, card);
     });
   }
 
@@ -527,6 +537,158 @@ a.btn.primary{color:var(--ink)}
       buttons.forEach(function (b) { b.disabled = false; });
       say(e.message, true);
       if (e.status === 404 || e.status === 409) await load();
+    }
+  }
+
+  // ─── chat and reply ──────────────────────────────────────────────────────
+
+  var CHAT_MAX = 12;
+  var REPLY_MAX = 2000;
+  // Unsent words by reply target ('q:' + question id, 't:' + thread key),
+  // kept across repaints; open question chats; sends in flight.
+  var drafts = new Map();
+  var chatOpen = new Set();
+  var replying = new Set();
+
+  // The chat's recent messages, from the thread's detail.
+  function paintConversation(box, key) {
+    var entry = details.get(key);
+    if (!entry) { el('p', 'note', detailLoading.has(key) ? 'Loading the chat…' : 'The chat loads when you open it.', box); return; }
+    if (entry.error) { el('p', 'note', 'The chat could not load: ' + clip(entry.error, 160), box); return; }
+    var conv = entry.thread && entry.thread.conversation ? entry.thread.conversation : null;
+    var msgs = conv && Array.isArray(conv.messages) ? conv.messages : [];
+    if (conv && typeof conv.unavailableReason === 'string' && conv.unavailableReason) el('p', 'note', conv.unavailableReason, box);
+    if (!msgs.length) { el('p', 'note', 'No messages to show.', box); return; }
+    if (msgs.length > CHAT_MAX || conv.truncated) el('p', 'note', 'Earlier messages not shown.', box);
+    msgs.slice(-CHAT_MAX).forEach(function (m) {
+      var you = m.role === 'user';
+      var row = el('div', 'said ' + (you ? 'you' : 'agent'), null, box);
+      var who = el('div', 'sub', null, row);
+      el('span', 'k', you ? 'You' : 'Agent', who);
+      if (m.at) el('span', null, ago(m.at), who).title = when(m.at);
+      el('p', 'quote', m.text, row);
+    });
+  }
+
+  // A row's question the reply box answers: one that takes a typed reply,
+  // else one only the agent's app takes.
+  function rowQuestion(key) {
+    var asks = questionsFor(key);
+    var reply = asks.filter(function (q) { return q.canReply === true; })[0];
+    if (reply) return reply;
+    return asks.filter(function (q) { return q.kind === 'agent-card' || q.kind === 'prompt'; })[0] || null;
+  }
+
+  // Where the reply box sends: the question's own reply when it takes one,
+  // else a message to the thread. null: only the agent's app answers it.
+  function replyTarget(q, key) {
+    if (q && q.canReply === true) {
+      return { id: 'q:' + q.id, label: 'Send reply', hint: 'Reply to the agent', path: '/fleet/api/questions/' + encodeURIComponent(q.id),
+        body: function (text) { return { reply: text }; } };
+    }
+    if (q && (q.kind === 'agent-card' || q.kind === 'prompt')) return null;
+    if (!key) return null;
+    return { id: 't:' + key, label: 'Send to chat', hint: 'Message this chat', path: '/fleet/api/send',
+      body: function (text) { return { threadKey: key, message: text }; } };
+  }
+
+  // Chat and reply: the conversation, then a box for the owner's own words.
+  function chatBlock(parent, key, q, oc) {
+    var box = el('div', 'chat', null, parent);
+    el('p', 'k', 'Chat and reply', box);
+    var log = el('div', 'log', null, box);
+    var paint = function () {
+      log.replaceChildren();
+      paintConversation(log, key);
+    };
+    addPainter(key, paint);
+    paint();
+    replyBox(box, key, q, oc);
+    return box;
+  }
+
+  // A question card's chat opens on tap and loads the thread's detail.
+  function cardChat(q, card) {
+    var key = q.threadKey;
+    if (!key) return;
+    var id = 'q:' + q.id;
+    var d = el('details', 'chatwrap', null, card);
+    d.open = chatOpen.has(id);
+    el('summary', 'btn', 'Chat and reply', d);
+    var filled = false;
+    var fill = function () {
+      if (filled) return;
+      filled = true;
+      chatBlock(d, key, q, q.openChat);
+    };
+    d.addEventListener('toggle', function () {
+      if (!d.open) { chatOpen.delete(id); return; }
+      var fresh = !chatOpen.has(id);
+      chatOpen.add(id);
+      fill();
+      wantDetail(key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);
+    });
+    if (d.open) { fill(); wantDetail(key, DETAIL_TTL_MS); }
+  }
+
+  function replyBox(parent, key, q, oc) {
+    var target = replyTarget(q, key);
+    if (!target) {
+      var app = oc && APP_NAME[oc.app] ? APP_NAME[oc.app] : 'the app';
+      el('p', 'note', 'Answer it in ' + app + '.', parent);
+      openChatLink(oc, 'btn primary', parent);
+      return;
+    }
+    var area = el('textarea', 'reply', null, parent);
+    area.maxLength = REPLY_MAX;
+    area.rows = 3;
+    area.placeholder = target.hint;
+    area.value = drafts.get(target.id) || '';
+    area.dataset.reply = target.id;
+    area.setAttribute('aria-label', target.hint);
+    area.addEventListener('input', function () { drafts.set(target.id, area.value); });
+    if (q && q.risky && q.canReply === true) el('p', 'note', 'Risky ask: your reply is only typed into the agent app, never relayed.', parent);
+    var acts = el('div', 'acts', null, parent);
+    var send = button(target.label, 'btn primary', acts, function () { return sendReply(target, area, send, key); });
+    send.disabled = replying.has(target.id);
+  }
+
+  function replyNote(delivery) {
+    var status = delivery && delivery.status;
+    var detail = delivery && typeof delivery.detail === 'string' ? clip(delivery.detail, 160) : '';
+    var card = delivery && delivery.prompt && delivery.prompt.text ? ' The chat shows a card: ' + clip(delivery.prompt.text, 120) : '';
+    if (status === 'sent') return { text: 'Sent to the agent.', bad: false, done: true };
+    if (status === 'queued') return { text: detail || 'Saved. It goes to the agent once the Mac can type.', bad: false, done: true };
+    if (status === 'dry-run') return { text: 'Dry run, nothing sent.', bad: false, done: false };
+    if (status === 'blocked') return { text: 'Not sent' + (detail ? ': ' + detail : '.') + card, bad: true, done: false };
+    if (status === 'failed') return { text: 'Send failed' + (detail ? ': ' + detail : '.') + card, bad: true, done: false };
+    return { text: 'Sent.', bad: false, done: true };
+  }
+
+  async function sendReply(target, area, b, key) {
+    var text = String(area.value || '').trim();
+    if (!text) { say('Type a reply first.', true); return; }
+    if (text.length > REPLY_MAX) { say('Keep it within ' + REPLY_MAX + ' characters.', true); return; }
+    if (replying.has(target.id)) return;
+    replying.add(target.id);
+    b.disabled = true;
+    try {
+      var r = await api(target.path, target.body(text));
+      var note = replyNote(r && r.delivery);
+      if (note.done) drafts.delete(target.id);
+      else drafts.set(target.id, area.value);
+      // The chat refetches with the new message in it.
+      details.delete(key);
+      replying.delete(target.id);
+      if (r && r.state) render(r.state); else await load();
+      say(note.text, note.bad);
+    } catch (e) {
+      replying.delete(target.id);
+      b.disabled = false;
+      say(e.message, true);
+      if (e.status === 404 || e.status === 409) await load();
+    } finally {
+      replying.delete(target.id);
     }
   }
 
@@ -746,8 +908,7 @@ a.btn.primary{color:var(--ink)}
     var have = details.get(key);
     if (detailLoading.has(key) || (have && Date.now() - have.at < maxAgeMs)) return;
     detailLoading.add(key);
-    var paint = painters.get(key);
-    if (paint) paint();
+    repaint(key);
     try {
       var r = await api(threadPath(key));
       details.set(key, { at: Date.now(), thread: r && r.thread ? r.thread : null, error: '' });
@@ -756,8 +917,16 @@ a.btn.primary{color:var(--ink)}
     } finally {
       detailLoading.delete(key);
     }
-    paint = painters.get(key);
-    if (paint) paint();
+    repaint(key);
+  }
+
+  function addPainter(key, fn) {
+    if (!painters.has(key)) painters.set(key, []);
+    painters.get(key).push(fn);
+  }
+
+  function repaint(key) {
+    (painters.get(key) || []).forEach(function (fn) { fn(); });
   }
 
   // What the owner can do from the row: answer or dismiss the question it
@@ -824,12 +993,13 @@ a.btn.primary{color:var(--ink)}
     if (top) el('div', 'blocker ' + (STATE_TONE[t.state] || 'dim'), clip(top, 160), s);
 
     rowActions(t, d);
+    chatBlock(d, t.key, rowQuestion(t.key), t.openChat);
     var more = el('div', 'more', null, d);
     var paint = function () {
       more.replaceChildren();
       paintMore(more, t, details.get(t.key));
     };
-    painters.set(t.key, paint);
+    addPainter(t.key, paint);
     paint();
     // A row the owner just opened wants fresh detail; one a re-render keeps
     // open (its toggle fires too) refetches only once the detail is stale.
@@ -889,7 +1059,6 @@ a.btn.primary{color:var(--ink)}
   function renderFleet(snap) {
     var box = $('fleetList');
     box.replaceChildren();
-    painters.clear();
     var threads = snap && Array.isArray(snap.threads) ? snap.threads : [];
     var counts = snap && snap.counts ? snap.counts : null;
     var inScope = counts && typeof counts.inScope === 'number' ? counts.inScope : threads.length;
@@ -949,6 +1118,7 @@ a.btn.primary{color:var(--ink)}
     var byKey = new Map();
     (snap && Array.isArray(snap.threads) ? snap.threads : []).forEach(function (t) { byKey.set(t.key, t); });
     renderHeader(s);
+    painters.clear();
     var questions = Array.isArray(s.questions) ? s.questions : [];
     renderNeeds(questions, byKey);
     renderReviewed(Array.isArray(s.reviewClosed) ? s.reviewClosed : [], questions);
@@ -975,9 +1145,16 @@ a.btn.primary{color:var(--ink)}
     timer = setTimeout(load, current && current.running ? BUSY_POLL_MS : POLL_MS);
   }
 
+  // A reply box has the focus: a poll repaint would take it away mid-word.
+  function typing() {
+    var a = document.activeElement;
+    return Boolean(a && a.dataset && a.dataset.reply);
+  }
+
   async function load() {
     try {
-      render(await api('/fleet/api/state'));
+      var fresh = await api('/fleet/api/state');
+      if (!typing()) render(fresh);
       if (errorShown) say('');
     } catch (e) {
       say(e.status ? e.message : 'Cannot reach OpenAGI. Retrying.', true);
