@@ -516,6 +516,9 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.lastPrs = new Map();
+    // threadKey -> scan ordinal. Activity alone must not keep quiet chats
+    // outside the scan forever when a fleet is larger than maxThreads.
+    this.scopeReadAt = new Map();
     // threadKey -> { classified, pr } and the infra and manager the last scan
     // read: what the owner's Push now decides from (pushNow).
     this.lastItems = new Map();
@@ -1842,7 +1845,9 @@ export class FleetSupervisor {
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
     // An older thread past the cap still has its open card asked: the Codex
     // source kept it for that card alone.
-    const inScope = [...ranked.slice(0, config.limits.maxThreads), ...ranked.slice(config.limits.maxThreads).filter(hasCard)];
+    const selected = this.selectScanScope(ranked, threads, sourceErrors);
+    const selectedKeys = new Set(selected.map((thread) => thread.key));
+    const inScope = [...selected, ...ranked.filter((thread) => !selectedKeys.has(thread.key) && hasCard(thread))];
     // An automation or no-repo thread's open question card still needs the
     // owner. It is decided (asked) with the rest, but never read for git or
     // PRs, and classify gives it nothing to nudge.
@@ -1990,6 +1995,29 @@ export class FleetSupervisor {
     }
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
     return snapshot;
+  }
+
+  // Keep a quarter of the slots for the most recently active conversations;
+  // rotate the rest through the least recently scanned. A busy top page can
+  // no longer starve older work. Selection changes no eligibility or send
+  // policy, and permission cards still bypass the cap in _tick.
+  selectScanScope(ranked, threads, sourceErrors) {
+    const present = new Set(threads.map((thread) => thread.key));
+    for (const key of this.scopeReadAt.keys()) {
+      if (!present.has(key) && !sourceErrors[key.split(":", 1)[0]]) this.scopeReadAt.delete(key);
+    }
+    const limit = this.config.limits.maxThreads;
+    const recent = ranked.slice(0, Math.floor(limit / 4));
+    const recentKeys = new Set(recent.map((thread) => thread.key));
+    // Stable sort preserves newest-first order among never-scanned or
+    // equally recent rows, including the first scan after a restart.
+    const rotated = ranked.filter((thread) => !recentKeys.has(thread.key))
+      .sort((a, b) => (this.scopeReadAt.get(a.key) ?? 0) - (this.scopeReadAt.get(b.key) ?? 0));
+    const selected = [...recent, ...rotated.slice(0, limit - recent.length)];
+    for (const thread of selected) this.scopeReadAt.set(thread.key, this.tickCount);
+    // Display order stays newest first even when selection rotates.
+    const keys = new Set(selected.map((thread) => thread.key));
+    return ranked.filter((thread) => keys.has(thread.key));
   }
 
   // The judge reads the chat before an automatic nudge goes out: send its
@@ -2819,7 +2847,9 @@ export class FleetSupervisor {
       mode,
       counts: {
         threads: threads.length,
+        eligible: threads.filter((thread) => !thread.excluded).length,
         inScope: inScope.length,
+        deferred: Math.max(0, threads.filter((thread) => !thread.excluded).length - inScope.length),
         sources,
         byState,
         byWatch,

@@ -126,6 +126,58 @@ test("auto delivers within maxSendsPerTick and respects cooldown across ticks", 
   assert.equal(delivered.length, 3);
 });
 
+test("capped scans eventually review quiet threads even while the newest thread stays active", async (t) => {
+  let now = NOW;
+  const reviewed = new Set();
+  const threads = Array.from({ length: 9 }, (_, n) => makeThread({
+    key: `codex:quiet${n}`, id: `quiet${n}`, cwd: `/work/quiet${n}`, prRefs: [],
+    lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN),
+    lastUserAt: ago(4 * 60 * MIN), lastAgentText: "The requested verification is still pending."
+  }));
+  const judge = { enabled: true, async judge({ thread }) {
+    reviewed.add(thread.key);
+    return { action: "wait", reason: "The existing verification is still active." };
+  } };
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", threads, now: () => now, limits: { maxThreads: 4 }, deps: { judge }
+  });
+  const seen = new Set();
+  for (let scan = 0; scan < 3; scan++) {
+    const snapshot = await supervisor.tick({ reason: "test" });
+    assert.equal(snapshot.counts.inScope, 4, "the work limit is retained");
+    assert.ok(snapshot.threads.some((row) => row.key === threads[0].key), "the newest chat stays visible");
+    for (const row of snapshot.threads) seen.add(row.key);
+    now += MIN;
+    threads[0].lastActivityAt = new Date(now).toISOString();
+  }
+  assert.equal(seen.size, threads.length, "quiet chats are scanned without needing new activity");
+  assert.equal(reviewed.size, threads.length, "every idle conversation reaches the contextual judge");
+  assert.equal(delivered.length, 0, "coverage does not bypass the judge's wait verdict");
+});
+
+test("a single-slot scan rotates and leaves excluded threads and deferred questions alone", async (t) => {
+  const threads = [0, 1, 2].map((n) => makeThread({
+    key: `codex:slot${n}`, id: `slot${n}`, cwd: `/work/slot${n}`,
+    lastActivityAt: ago((60 + n) * MIN)
+  }));
+  threads.push(makeThread({ key: "codex:excluded", id: "excluded", excluded: "closed", lastActivityAt: ago(0) }));
+  const { supervisor, delivered } = fixture(t, { threads, limits: { maxThreads: 1 } });
+  const question = supervisor.store.upsertQuestion({
+    kind: "agent-ask", dedupeKey: "held", title: "Choose the next step", options: ["wait"], threadKey: threads[2].key
+  });
+  const seen = [];
+  for (let scan = 0; scan < 3; scan++) {
+    const snapshot = await supervisor.tick({ reason: "test" });
+    assert.equal(snapshot.counts.inScope, 1);
+    assert.equal(snapshot.counts.eligible, 3);
+    assert.equal(snapshot.counts.deferred, 2);
+    seen.push(snapshot.threads[0].key);
+    if (scan < 2) assert.equal(supervisor.store.question(question.id).status, "open", "outside this scan does not mean gone");
+  }
+  assert.deepEqual(seen, threads.slice(0, 3).map((thread) => thread.key));
+  assert.equal(delivered.length, 0, "Observe stays read-only");
+});
+
 test("a throwing source is recorded and the tick completes", async (t) => {
   const { supervisor } = fixture(t, {
     deps: {
