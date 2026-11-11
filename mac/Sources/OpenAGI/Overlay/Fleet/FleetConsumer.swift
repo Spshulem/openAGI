@@ -552,11 +552,10 @@ final class FleetConsumer: ObservableObject {
       let closed = open.contains(id) ? nil : oldQuestions.first { $0.id == id }
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: closed, openIDs: open, threadKeys: keys)
       if let item = openItem, item != .question(id) {
-        // The draft and result follow the screen to the thread; a draft
-        // still being sent stays put, so it can't be sent twice.
+        // The result follows the screen to the thread (the draft moves
+        // below, as every closed question's does).
         let from = FleetOpenItem.question(id).key
         if let note = replyNotes[from] { replyNotes[item.key] = note }
-        if !replyInFlight.contains(from), drafts[item.key] == nil, let draft = drafts[from] { drafts[item.key] = draft }
         // The voice focus follows the screen too, unless it was elsewhere.
         if case let .thread(key) = item, OverlayState.shared.voiceFocus.questionId == id, let thread = state.threads.first(where: { $0.key == key }) {
           OverlayState.shared.selectVoiceContext(.thread(thread))
@@ -564,6 +563,14 @@ final class FleetConsumer: ObservableObject {
       }
     } else {
       openItem = FleetOpenItem.reconcile(openItem, closedQuestion: nil, openIDs: open, threadKeys: keys)
+    }
+    // Any closed question's unsent draft (one left by Back included) moves
+    // to its own thread, when that thread has none.
+    for old in oldQuestions where !open.contains(old.id) {
+      let from = FleetOpenItem.question(old.id).key
+      guard !replyInFlight.contains(from), let draft = drafts[from], let key = old.threadKey, keys.contains(key) else { continue }
+      let to = FleetOpenItem.thread(key).key
+      if (drafts[to] ?? "").isEmpty { drafts[to] = draft }
     }
     let liveSlots = Set(open.map { FleetOpenItem.question($0).key } + keys.map { FleetOpenItem.thread($0).key })
     // A reply still in flight keeps its draft until its result is known.

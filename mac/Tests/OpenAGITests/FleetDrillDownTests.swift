@@ -249,4 +249,30 @@ final class FleetDrillDownTests: XCTestCase {
     consumer.closeItem()
     OverlayState.shared.selectVoiceContext(VoiceFocus())
   }
+
+  func testBackKeepsADraftThatMovesToItsThreadWhenTheQuestionCloses() async {
+    let open = #"{"enabled":true,"questions":[{"id":"q1","kind":"agent-ask","threadKey":"codex:a","canReply":true}],"snapshot":{"threads":[{"key":"codex:a","watch":{"group":"you"}},{"key":"codex:b","watch":{"group":"working"}}]}}"#
+    let closed = #"{"enabled":true,"questions":[],"snapshot":{"threads":[{"key":"codex:a","watch":{"group":"working"}},{"key":"codex:b","watch":{"group":"working"}}]}}"#
+    var sends = 0
+    let consumer = FleetConsumer(
+      fetchDetail: { request in (Data(), HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!) },
+      send: { request in
+        sends += 1
+        return self.response(request, 200, #"{"delivery":{"status":"sent"},"state":\#(sends == 1 ? open : closed)}"#)
+      })
+    consumer.setDraft("x", for: .thread("codex:b"))
+    await consumer.sendReply(.thread("codex:b"))
+    guard let question = consumer.question("q1") else { return XCTFail("the state's question") }
+    consumer.openQuestion(question)
+    consumer.setDraft("half typed", for: .question("q1"))
+    consumer.closeItem()
+    consumer.openThread("codex:b")
+    consumer.setDraft("y", for: .thread("codex:b"))
+    await consumer.sendReply(.thread("codex:b"))
+    XCTAssertNil(consumer.question("q1"))
+    XCTAssertEqual(consumer.drafts[FleetOpenItem.thread("codex:a").key], "half typed")
+    XCTAssertNil(consumer.drafts[FleetOpenItem.question("q1").key])
+    consumer.closeItem()
+    OverlayState.shared.selectVoiceContext(VoiceFocus())
+  }
 }
