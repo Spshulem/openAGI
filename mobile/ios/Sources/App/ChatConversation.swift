@@ -137,6 +137,8 @@ final class ChatConversation {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
                 case .delta(let frame):
+                    // The working line stays under the text received so far
+                    // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
                         messages[index].text = frame.text
                     } else {
@@ -150,10 +152,15 @@ final class ChatConversation {
                         messages[index].text = "(no reply)"
                     }
                     messages[index].isStreaming = false
+                    messages[index].activity = nil
                 case .failure(let frame):
                     sawTerminalFrame = true
                     fail(replyID, text: (frame.error ?? "OpenAGI couldn't finish.") + " Check the conversation before sending again.")
-                case .status, .session:
+                case .status(let frame):
+                    if messages[index].isStreaming, let label = frame.activityLabel {
+                        messages[index].activity = label
+                    }
+                case .session:
                     break
                 }
             }
@@ -184,6 +191,7 @@ final class ChatConversation {
         guard let index = messages.firstIndex(where: { $0.id == replyID }) else { return }
         messages[index].text = text
         messages[index].isStreaming = false
+        messages[index].activity = nil
         messages[index].isFailed = true
         messages[index].retrySafe = retrySafe
     }

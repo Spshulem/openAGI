@@ -13,6 +13,20 @@ final class ChatEventTests: XCTestCase {
         XCTAssertEqual(frame.sessionId, "s1")
     }
 
+    func testStatusFrameNamesTheToolOrTheStageInPlainWords() {
+        let event = SSEEvent(name: "status", data: #"{"stage":"tool","tool":"fleet_status","hop":2}"#)
+        guard case let .status(frame) = ChatEvent.decode(event) else { return XCTFail("expected .status") }
+        XCTAssertEqual(frame.tool, "fleet_status")
+        XCTAssertEqual(frame.activityLabel, "Using fleet status")
+        XCTAssertEqual(ChatStatusFrame(stage: "routing").activityLabel, "Getting started")
+        XCTAssertEqual(ChatStatusFrame(stage: "thinking").activityLabel, "Thinking")
+        XCTAssertEqual(ChatStatusFrame(stage: "model").activityLabel, "Thinking")
+        XCTAssertEqual(ChatStatusFrame(stage: "queued").activityLabel, "Getting started")
+        XCTAssertEqual(ChatStatusFrame(stage: "model-call").activityLabel, "Model call")
+        XCTAssertEqual(ChatStatusFrame(stage: "tool", tool: "  ").activityLabel, "Tool")
+        XCTAssertNil(ChatStatusFrame(stage: " ").activityLabel)
+    }
+
     func testDecodesASessionFrame() {
         let event = SSEEvent(name: "session", data: #"{"id":"sess_1","messageCount":3}"#)
         guard case let .session(frame) = ChatEvent.decode(event) else { return XCTFail("expected .session") }
