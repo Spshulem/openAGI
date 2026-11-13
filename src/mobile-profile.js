@@ -59,6 +59,7 @@ export const MOBILE_MODEL_TOOLS = Object.freeze([
   "remember",
   "recall",
   "add_task",
+  "list_tasks",
   "complete_task",
   "move_task",
   "schedule_message"

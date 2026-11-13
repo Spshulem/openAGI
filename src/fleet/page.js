@@ -4,13 +4,15 @@
 // literal), no inline on* handlers (CSP), and every piece of dynamic data is
 // rendered with textContent. Client code uses plain string concatenation.
 
+import { navigationLinks, shellStyles } from "../app-shell.js";
+import { codingSessionUi } from "../coding-session-ui.js";
 import { DEFAULTS } from "./contracts.js";
 
 export const fleetPage = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1411">
-<title>Fleet - OpenAGI</title>
+<title>Supervisor - OpenAGI</title>
 <style>
 :root{color-scheme:dark;--bg:#0e1411;--surface:#141d18;--raise:#1b2721;--line:#27372e;--text:#e6efe9;--soft:#c3d2c9;--muted:#8fa397;--accent:#6fe1b1;--ink:#05110b;--warn:#f0c36a;--hot:#ff8f7e}
 *{box-sizing:border-box}
@@ -91,32 +93,86 @@ a.btn.primary{color:var(--ink)}
 .ask .t{display:block}
 @media (prefers-reduced-motion:no-preference){.card{transition:box-shadow .4s ease,border-color .4s ease}}
 @media (min-width:700px){.wrap{padding-top:32px}.opts{grid-template-columns:repeat(2,1fr)}.opts .btn.ghost{grid-column:1/-1}}
+/* SHARED_SHELL_STYLES */
+:root { --surface:var(--panel); --raise:var(--panel-2); --soft:var(--text); --ink:var(--primary-foreground); --hot:var(--err); }
+.fleet-shell { min-height:100dvh; }
+.fleet-shell .app-navigation { position:sticky; top:0; height:100dvh; }
+.fleet-workspace { display:block; }
+.fleet-workspace>.workspace-header { display:flex; align-items:center; border-bottom:1px solid var(--line); }
+.wrap { max-width:1050px; width:100%; padding:28px; }
+.wrap>.fleet-controls { padding:0; display:block; background:transparent; }
+.top h1 { font-size:24px; }
+.wrap h2 { font-size:19px; }
+.wrap .hint,.wrap .empty { font-size:14px; }
+#codingList { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+#codingList .card { margin:0; }
+#codingList details { margin:10px 0; padding:8px 0; border:0; }
+#codingDetail pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
+.infra-details { margin-top:28px; border-top:1px solid var(--line); padding-top:18px; }
+.infra-details summary { cursor:pointer; color:var(--muted); }
+@media(max-width:760px) { .fleet-shell .app-navigation { position:fixed; height:auto; } .wrap { padding:20px 16px; } }
 </style></head>
-<body><div class="wrap">
-<header>
-  <div class="top"><h1>Fleet</h1><button id="scan" class="btn primary" type="button">Scan now</button></div>
-  <div class="seg" role="group" aria-label="Mode">
+<body><div class="app fleet-shell">
+<!-- SHARED_NAVIGATION -->
+<div class="workspace fleet-workspace">
+<header class="workspace-header"><button type="button" id="menuToggle" aria-label="Toggle navigation" aria-controls="appNavigation" aria-expanded="false">☰</button><h1>Supervisor</h1></header>
+<div class="wrap coding-pane">
+<section class="fleet-controls" aria-label="Supervisor controls">
+  <div class="top"><button id="scan" class="btn primary" type="button">Scan now</button></div>
+  <p class="hint">Follow your coding work and review what needs you. Replies to managed sessions always require approval.</p>
+  <p id="lastError" class="lasterr"></p>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+  <a id="reconnect" href="/?tab=nodes" target="_blank" rel="noopener noreferrer" hidden>Connection settings</a>
+</section>
+<main>
+  <section aria-labelledby="managedH"><div class="top"><h2 id="managedH">Managed sessions</h2><a class="btn" href="/?tab=coding-agents">Coding setup →</a></div>
+    <p class="hint">Sessions you start through OpenAGI. Inspect a reply, or watch for the next response.</p>
+    <p id="codingStatus" role="status">Loading managed sessions…</p><div id="codingList"></div><section id="codingDetail" aria-label="Selected session"></section>
+  </section>
+  <section aria-labelledby="otherH"><h2 id="otherH">Other coding conversations</h2>
+    <p class="hint">Discover existing Codex, Claude Code and other supported app conversations on the supervisor computer.</p>
+  <div class="seg" role="group" aria-label="Mode for other coding conversations">
     <button id="mode-observe" type="button" data-mode="observe" aria-pressed="false">Observe</button>
     <button id="mode-propose" type="button" data-mode="propose" aria-pressed="false">Propose</button>
     <button id="mode-auto" type="button" data-mode="auto" aria-pressed="false">Auto</button>
   </div>
   <p id="modeHint" class="hint"></p>
   <div class="meta"><span id="scanned">Loading</span><span id="timer"></span><a href="/">Dashboard</a></div>
-  <p id="lastError" class="lasterr"></p>
-  <p id="status" class="status" role="status" aria-live="polite"></p>
-</header>
-<main>
+  <p class="hint"><a href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md" target="_blank" rel="noopener noreferrer">About automatic scans and supported apps ↗</a></p></section>
   <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div>
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
-  <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
   <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
-  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
+  <details class="infra-details"><summary>Advanced system diagnostics</summary><section aria-labelledby="infraH"><h2 id="infraH">System status</h2><div id="infraStrip" class="strip"></div></section>
+  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section></details>
 </main>
-</div>
+</div></div></div>
 <script>
 (function () {
   'use strict';
+  /* SHARED_CODING_CONTROLS */
+  function fetchJson(path) { return api(path); }
+  function postJson(path, body) { return api(path, body); }
+  function switchTab(tab) { window.location.href = '/?tab=' + encodeURIComponent(tab); }
+  var managedSignature = null;
+  var managedLoading = false;
+  async function loadManagedSessions() {
+    if (managedLoading) return;
+    managedLoading = true;
+    try {
+      var snapshot = await api('/coding-agents');
+      var signature = JSON.stringify([snapshot.sessions || [], snapshot.watches || [], snapshot.error || null]);
+      if (signature !== managedSignature) {
+        managedSignature = signature;
+        renderCodingSessionCards(snapshot, loadManagedSessions);
+      }
+      $('codingStatus').textContent = snapshot.error || snapshot.warning || ((snapshot.sessions || []).length ? 'Replies and actions require your approval.' : 'No managed sessions yet. Open Coding setup to connect a CLI and choose a project.');
+    } catch (error) {
+      $('codingStatus').textContent = 'Managed sessions could not be loaded. ' + error.message;
+      managedSignature = null;
+      $('codingList').replaceChildren();
+    } finally { managedLoading = false; }
+  }
   var POLL_MS = 30000;
   var BUSY_POLL_MS = 5000;
   // Policy's limits, filled in from DEFAULTS below: an admitted run is slow
@@ -316,7 +372,7 @@ a.btn.primary{color:var(--ink)}
     var data = null;
     try { data = await res.json(); } catch (e) { data = null; }
     if (!res.ok) {
-      var message = res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
+      var message = data && data.error === 'main-pairing-required' ? 'Reconnect this desktop to your agent to see the same work as your phone. Your phone connection is unchanged.' : res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
       var err = new Error(message);
       err.status = res.status;
       err.data = data;
@@ -350,7 +406,9 @@ a.btn.primary{color:var(--ink)}
       b.setAttribute('aria-pressed', current && current.mode === m ? 'true' : 'false');
       b.disabled = modeBusy;
     });
-    $('modeHint').textContent = current ? (MODE_HINT[current.mode] || '') : '';
+    $('modeHint').textContent = !current ? ''
+      : current.modeConfirmed === false ? (current.mode ? 'Last reported mode. Waiting for the fleet computer.' : 'Waiting for the fleet computer.')
+      : (MODE_HINT[current.mode] || '');
   }
 
   function renderHeader(s) {
@@ -893,7 +951,10 @@ a.btn.primary{color:var(--ink)}
     var inScope = counts && typeof counts.inScope === 'number' ? counts.inScope : threads.length;
     $('fleetCount').textContent = threads.length ? String(inScope) : '';
     if (!snap) { el('p', 'empty', 'No scan yet. Tap Scan now.', box); return; }
-    if (!threads.length) { el('p', 'empty', 'No recent coding threads.', box); return; }
+    if (!threads.length) {
+      el('p', 'empty', 'No recent coding threads. Start a conversation in a supported coding app on this computer, then choose Scan now. Sessions started through OpenAGI appear under Managed sessions above.', box);
+      var setup = el('a', '', 'Set up a coding tool →', box); setup.href = '/?tab=coding-agents'; return;
+    }
     // Grouped by what the supervisor watches each thread for; a snapshot from
     // before watch existed groups by state as it used to. Out of scope last.
     var byWatch = threads.some(function (t) { return t.watch; });
@@ -974,17 +1035,29 @@ a.btn.primary{color:var(--ink)}
   }
 
   async function load() {
+    void loadManagedSessions();
     try {
       render(await api('/fleet/api/state'));
       if (errorShown) say('');
     } catch (e) {
       say(e.status ? e.message : 'Cannot reach OpenAGI. Retrying.', true);
+      if (e.data && e.data.error === 'main-pairing-required') {
+        var link = document.getElementById('reconnect'); link.hidden = false;
+        try {
+          var roster = await api('/nodes');
+          var origin = new URL(roster.pairedTo);
+          if ((origin.protocol === 'https:' || origin.protocol === 'http:') && !origin.username && !origin.password) {
+            link.href = origin.origin; link.textContent = 'Open your connected agent';
+          }
+        } catch (_) { /* The connection settings link remains available. */ }
+      }
     } finally {
       schedule();
     }
   }
 
   async function scan() {
+    void loadManagedSessions();
     if (scanning) return;
     scanning = true;
     paintScan();
@@ -1018,6 +1091,14 @@ a.btn.primary{color:var(--ink)}
     }
   }
 
+  var menu = document.getElementById('menuToggle');
+  if (menu) menu.addEventListener('click', function () {
+    var nav = $('appNavigation');
+    var opened = nav.classList.toggle('open'); menu.setAttribute('aria-expanded', String(opened));
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && menu) { $('appNavigation').classList.remove('open'); menu.setAttribute('aria-expanded', 'false'); }
+  });
   $('scan').addEventListener('click', function () { return scan(); });
   MODES.forEach(function (m) {
     $('mode-' + m).addEventListener('click', function () { return setMode(m); });
@@ -1029,5 +1110,8 @@ a.btn.primary{color:var(--ink)}
 })();
 </script>
 </body></html>`
+  .replace("/* SHARED_SHELL_STYLES */", shellStyles)
+  .replace("<!-- SHARED_NAVIGATION -->", navigationLinks("supervisor"))
+  .replace("/* SHARED_CODING_CONTROLS */", codingSessionUi)
   .replace("FLEET_FULL_SLOW_SEC", String(DEFAULTS.fullRunSlowMs / 1000))
   .replace("FLEET_QUICK_SLOW_SEC", String(DEFAULTS.quickVerifyEscalateMs / 1000));

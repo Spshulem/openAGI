@@ -12,10 +12,23 @@ function pageScript() {
 
 test("fleet page is a standalone document with the four sections", () => {
   assert.match(fleetPage, /^<!doctype html>/i);
-  for (const text of ["Needs you", "Doing", "Infra", "Fleet", "Scan now", 'href="/"']) {
+  for (const text of ["Needs you", "Doing", "System status", "Supervisor", "Scan now", 'href="/"']) {
     assert.ok(fleetPage.includes(text), text);
   }
   for (const mode of ["observe", "propose", "auto"]) assert.ok(fleetPage.includes('data-mode="' + mode + '"'), mode);
+});
+
+test("fleet page says when the mode is not confirmed by the fleet computer", async () => {
+  const waiting = boot({ state: sampleState({ mode: null, modeConfirmed: false }) });
+  await flush();
+  assert.equal(waiting.el("modeHint").textContent, "Waiting for the fleet computer.");
+  for (const mode of ["observe", "propose", "auto"]) assert.equal(waiting.el("mode-" + mode).attributes?.["aria-pressed"] ?? "false", "false");
+  const last = boot({ state: sampleState({ mode: "auto", modeConfirmed: false }) });
+  await flush();
+  assert.equal(last.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
+  const live = boot({ state: sampleState({ mode: "auto", modeConfirmed: true }) });
+  await flush();
+  assert.notEqual(live.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
 });
 
 test("fleet page script parses", () => {
@@ -44,6 +57,7 @@ class FakeElement {
     this.children = [];
     this.listeners = {};
     this.dataset = {};
+    this.style = {};
     this.attributes = {};
     this._text = "";
     this.className = "";
@@ -63,20 +77,24 @@ class FakeElement {
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
   set innerHTML(_value) { throw new Error("innerHTML must not be used"); }
-  append(...nodes) { for (const node of nodes) this.children.push(node); }
+  append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } }
   appendChild(node) { this.children.push(node); return node; }
   replaceChildren(...nodes) { this._text = ""; this.children = [...nodes]; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
   addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
-  async click() { for (const fn of this.listeners.click ?? []) await fn({ preventDefault() {} }); }
+  async click() { if (this.onclick) await this.onclick({ preventDefault() {} }); for (const fn of this.listeners.click ?? []) await fn({ preventDefault() {} }); }
+  focus() { this.focused = true; }
+  get isConnected() { return true; }
+  querySelector(selector) { return this.all().find(e => selector.startsWith('.') ? e.className === selector.slice(1) : e.tagName.toLowerCase() === selector) ?? null; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); }
   scrollIntoView(options) { this.scrolled = options; }
   all() { return [this, ...this.children.flatMap((c) => c.all())]; }
 }
 
 const STATIC_IDS = [
   "scan", "scanned", "timer", "modeHint", "status", "lastError", "needsList", "needsCount", "doingList", "doingCount",
-  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
+  "codingList", "codingDetail", "codingStatus", "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
 ];
 
 function sampleState(overrides = {}) {
@@ -132,7 +150,7 @@ function sampleState(overrides = {}) {
   };
 }
 
-function boot({ search = "", state = sampleState(), confirmResult = true, promptResult = null } = {}) {
+function boot({ search = "", state = sampleState(), managed = { sessions: [], watches: [] }, confirmResult = true, promptResult = null } = {}) {
   const elements = new Map(STATIC_IDS.map((id) => [id, new FakeElement(id.startsWith("mode-") ? "button" : "div")]));
   for (const mode of ["observe", "propose", "auto"]) elements.get("mode-" + mode).dataset.mode = mode;
   const requests = [];
@@ -141,6 +159,11 @@ function boot({ search = "", state = sampleState(), confirmResult = true, prompt
   const fetch = async (path, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
     requests.push({ path, method: init.method ?? "GET", body });
+    if (path === '/coding-agents/watch') {
+      managed.watches = body.enabled ? [{ provider: body.provider, sessionId: body.sessionId, active: true }] : [];
+      return { ok: true, status: 200, json: async () => ({ watching: body.enabled }) };
+    }
+    if (path === '/coding-agents') return { ok: true, status: 200, json: async () => managed };
     const pending = responses.shift();
     const next = pending ? await pending : null;
     if (next) return { ok: next.status < 400, status: next.status, json: async () => next.body };
@@ -185,7 +208,7 @@ function findAll(root, predicate) {
 test("page renders state with text only and neutralises unsafe links", async () => {
   const page = boot();
   await settle();
-  assert.equal(page.requests[0].path, "/fleet/api/state");
+  assert.ok(page.requests.some(request => request.path === "/fleet/api/state"));
   const needs = page.el("needsList");
   assert.ok(needs.textContent.includes("<img src=x onerror=alert(1)>"), "untrusted title is plain text");
   const optionButtons = findAll(needs, (e) => e.tagName === "BUTTON");
@@ -744,4 +767,28 @@ test('clarification cards collect an answer and show its unresolved state as tex
   assert.match(f.el('needsList').textContent, /Your clarification: <img src=x> synthetic answer/);
   assert.match(f.el('status').textContent, /still unresolved/);
   assert.equal(f.el('needsList').all().some(e => e.tagName === 'IMG'), false);
+});
+
+
+test("managed exec sessions remain visible and watching requires an explicit in-page confirmation", async () => {
+  const page = boot({ state: sampleState({ snapshot: { threads: [], counts: { threads: 1, inScope: 0 } } }), managed: {
+    sessions: [{ provider: "codex", sessionId: "managed-1", project: "<img src=x> onboarding project", status: "idle", route: "builtin-cli", replyAvailable: true, model: "gpt-5" }], watches: []
+  } });
+  await settle();
+  assert.match(page.el("codingList").textContent, /onboarding project/);
+  assert.match(page.el("codingList").textContent, /Response ready/);
+  assert.equal(findAll(page.el("codingList"), e => e.tagName === "IMG").length, 0);
+  const named = label => findAll(page.el("codingList"), e => e.tagName === "BUTTON" && e.textContent === label)[0];
+  await named("Watch session").click();
+  assert.equal(page.requests.filter(r => r.path === "/coding-agents/watch").length, 0);
+  assert.ok(named("Start watching").focused);
+  await named("Cancel").click();
+  assert.equal(page.requests.filter(r => r.path === "/coding-agents/watch").length, 0);
+  await named("Watch session").click();
+  await named("Start watching").click();
+  assert.ok(named("Stop watching"));
+  assert.deepEqual(page.requests.filter(r => r.path === "/coding-agents/watch").map(r => r.body.enabled), [true]);
+  await named("Stop watching").click();
+  assert.ok(named("Watch session"));
+  assert.deepEqual(page.requests.filter(r => r.path === "/coding-agents/watch").map(r => r.body.enabled), [true, false]);
 });

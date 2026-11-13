@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Alpha-only version of the OpenAGI mark for Android's themed icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:pivotX="512"
+        android:pivotY="512"
+        android:scaleX="0.833333"
+        android:scaleY="0.833333">
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="44"
+            android:strokeLineCap="round"
+            android:pathData="M444,181 C314,206 217,322 217,466 C217,585 276,685 366,738 M580,181 C710,206 807,322 807,466 C807,585 748,694 654,744" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="37"
+            android:pathData="M452,359 L570,359 C624,359 667,403 667,467 C667,531 624,576 570,576 L452,576 C397,576 352,531 352,467 C352,403 397,359 452,359 Z" />
+        <path
+            android:fillColor="#00000000"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="35"
+            android:strokeLineCap="round"
+            android:pathData="M446,449 L446,487 M573,449 L573,487" />
+        <path
+            android:fillColor="#FF000000"
+            android:pathData="M347,640 C436,651 494,690 510,817 C525,690 583,651 677,640 C664,721 620,774 544,794 C565,754 587,731 609,712 C557,737 528,786 526,850 L526,857 Q526,863 520,863 L505,863 Q499,863 499,857 L499,850 C497,786 468,737 416,712 C438,731 460,754 481,794 C405,774 361,721 347,640 Z" />
+    </group>
+</vector>

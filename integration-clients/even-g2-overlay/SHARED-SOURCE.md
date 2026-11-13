@@ -7,7 +7,8 @@ The exact inputs are now checked in: no dirty workspace or moving branch is need
 
 The standalone entry is src/openagi-main.ts. The older src/main.ts remains an
 overlay entry for compatible combined clients, excluded from this build.
-The lockfile pins the dependency graph, including Even SDK 0.0.15.
+The lockfile pins the dependency graph, including Even SDK 0.0.16 (upgraded
+from the frozen snapshot's 0.0.15; Even app 2.2.10 or newer is required).
 Use pnpm install --frozen-lockfile, then pnpm test and pnpm package:agents.
 Shared-input or SDK upgrades require client regressions and physical testing.
 

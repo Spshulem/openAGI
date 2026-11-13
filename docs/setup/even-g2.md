@@ -25,6 +25,63 @@ The implementation and release boundary is captured in the
 7. The answer is paginated on the glasses. Later questions retain the session
    until **New conversation** is selected.
 
+## Native “Hey Even” agent
+
+Even AI supports custom agents through **Settings → Even AI → Agent
+Configuration → Add Agent**. Even developer access is required for this menu.
+See [Even's custom-agent tutorial](https://support.evenrealities.com/hc/en-us/articles/16280926743695-Tutorial-Bridging-G2-to-OpenClaw-Bring-Your-Own-Agent).
+
+1. Install and finish setup on your OpenAGI main, configure its exact HTTPS
+   origin as described below, and connect any calendar or other data you want
+   to ask about.
+2. Open **Connect glasses** at `<main>/g2/connect` on the authenticated main.
+   Choose **Create Even AI connection**.
+3. In Even, use the name **OpenAGI**, the full **Agent URL** ending in
+   `/nodes/g2/chat/completions`, and the one-time **Token** from that page.
+   Save, select, and activate the agent.
+4. Say “Hey Even” and ask a question. Your OpenAGI main handles the question
+   with its configured model and connected tools. Its model API keys stay on main.
+
+This connection has its own G2-scoped credential. Remove its **Even AI ·
+OpenAGI** row in Devices to revoke it. OpenAGI stores only the token hash; a
+lost token must be replaced. Duplicate immediate requests share one agent turn.
+The adapter accepts one user text message, without streaming or caller-selected
+sessions. Native microphone, wake-word and display behavior remain controlled
+by Even AI; the companion UI below applies to the separate Agents app.
+
+## Compact status, live cues and optional transcript
+
+The Agents app uses a small upper-right clock with animated **Listening…**,
+**Thinking…**, and **Checking…** states. Quiet Lifelog leaves the rest of the
+display clear until an answer or cue arrives. **Show transcript / Hide
+transcript** is one tap on the phone and does not start or stop recording.
+
+Enable **Live cues** on the phone during consented foreground Lifelog for
+brief facts, answers, or task suggestions. A brief appears at the upper left;
+tap to expand it, swipe through details, and double-tap to return. A phone cue
+list retains up to 30 entries in the current session. Calendar questions use
+connected read-only tools and the phone's timezone. A task cue suggests
+capturing a task; it does not create one automatically. Cues use only the last
+three utterances (at most 3000 characters), check at most every 30 seconds, and
+are limited to 20 checks per hour per node. Pause, exit and foreground loss
+discard pending cues and clear their rolling context. The separate Lifelog
+retention setting still governs saved transcripts.
+
+These interactions take inspiration from
+[Even Conversate](https://support.evenrealities.com/hc/en-us/articles/14273795154319-Conversate).
+They do not change the SDK's background microphone limits.
+
+### Finding and pairing your main
+
+The phone setup includes installation, network, and pairing steps. **Find /
+check my main** checks an entered HTTPS or Tailscale address and remembers the
+last main for next time. It checks only explicit/saved addresses, without
+credentials or redirects. Even Hub SDK 0.0.16 exposes no Bonjour or Tailscale
+peer-browser API, so this is address verification rather than automatic LAN
+discovery. Use your computer's HTTPS hostname, not `localhost` on the phone.
+After a successful check, generate a pairing code or connection card on main
+and paste it into the companion.
+
 ## Optional always-listening mode
 
 The phone companion can opt into **Always listening while this app is open**.
@@ -119,7 +176,8 @@ five failures while a code is active. Pairing creates the token on the phone
 before exchange, making a lost response safe to retry. Enrolled clients send
 both node id and token for heartbeat/self-revocation; compatible direct clients
 may omit the node id only on `/nodes/g2/ask`, `/nodes/g2/listen`, and
-`/nodes/g2/speech-token`. A G2 token
+`/nodes/g2/speech-token`, as well as the scoped native-chat and live-cue routes.
+A G2 token
 cannot read tasks/integrations/topology, submit generic node
 messages, capture memory directly, or poll node-control work. Conversation ids
 are only discriminators: the server hashes them with the authenticated node id
@@ -127,6 +185,14 @@ and chooses the durable AgentHost session, so a wearable cannot attach itself
 to an owner or another node's session.
 
 ## Verification boundary
+
+The companion pins **Even Hub SDK 0.0.16** (minimum Even app **2.2.10**).
+Source tests cover native request deduplication and scoped authentication,
+read-only cue tools and consent, transcript independence, expansion, and stale
+cue cancellation. Install the updated main and companion together. Before
+claiming device acceptance, test native “Hey Even” with the full URL/token,
+a real connected-calendar question, upper-right status readability, cue
+expansion, transcript toggling and foreground pause/resume on physical G2.
 
 ### Live speech (source implementation; physical validation required)
 

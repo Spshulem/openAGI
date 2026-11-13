@@ -225,8 +225,9 @@ export class ObservationStore {
     return { count, mode: "sqlite" };
   }
 
-  async search({ query, since, until, app, machine, kinds, limit = 25 } = {}) {
+  async search({ query, since, until, app, machine, kinds, offset = 0, limit = 25 } = {}) {
     await this.ready;
+    offset = Math.max(0, Math.min(1_000_000, Number.isSafeInteger(offset) ? offset : 0));
     const normalizedKinds = normalizeSearchKinds(kinds);
     if (normalizedKinds && normalizedKinds.length === 0) return [];
     if (this.fallback) {
@@ -245,7 +246,7 @@ export class ObservationStore {
       if (machine) out = out.filter((o) => o.sourceMachineId === machine);
       if (since) out = out.filter((o) => (o.at ?? "") >= since);
       if (until) out = out.filter((o) => (o.at ?? "") <= until);
-      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit).map((row) => capTranscriptText({
+      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(offset, offset + limit).map((row) => capTranscriptText({
         ...row,
         kind: row.kind === "frame-summary" ? "frame" : row.kind,
         ...(row.kind === "frame" || row.kind === "frame-summary"
@@ -278,7 +279,7 @@ export class ObservationStore {
          ${since ? "AND at >= ?" : ""}
          ${until ? "AND at <= ?" : ""}
          ${machineClause}
-         ORDER BY at DESC LIMIT ?`
+         ORDER BY at DESC, kind DESC, ref DESC LIMIT ? OFFSET ?`
       );
       const params = [matchExpr];
       if (normalizedKinds) params.push(...normalizedKinds);
@@ -286,7 +287,7 @@ export class ObservationStore {
       if (since) params.push(since);
       if (until) params.push(until);
       if (machine) { params.push(machine); params.push(machine); params.push(machine); }
-      params.push(limit);
+      params.push(limit, offset);
       return rows.all(...params).map(capTranscriptText);
     }
     // No query normally returns recent focus activity for backward
@@ -310,12 +311,12 @@ export class ObservationStore {
       if (since) { clauses.push("at >= ?"); params.push(since); }
       if (until) { clauses.push("at <= ?"); params.push(until); }
       if (machine) { clauses.push("sourceMachineId = ?"); params.push(machine); }
-      params.push(limit);
+      params.push(limit, offset);
       return this.db.prepare(
         `SELECT kind, ref, at, app, window, event, sourceMachineId, text
          FROM (${sources.join(" UNION ALL ")})
          WHERE ${clauses.join(" AND ")}
-         ORDER BY at DESC LIMIT ?`
+         ORDER BY at DESC, kind DESC, ref DESC LIMIT ? OFFSET ?`
       ).all(...params).map(capWindowText);
     }
     if (normalizedKinds && !normalizedKinds.includes("activity")) return [];
@@ -325,8 +326,8 @@ export class ObservationStore {
     if (since) { where += " AND at >= ?"; params.push(since); }
     if (until) { where += " AND at <= ?"; params.push(until); }
     if (machine) { where += " AND source_machine_id = ?"; params.push(machine); }
-    params.push(limit);
-    return this.db.prepare(`SELECT 'activity' AS kind, app, window, at, event, source_machine_id AS sourceMachineId FROM activity WHERE ${where} ORDER BY at DESC LIMIT ?`).all(...params);
+    params.push(limit, offset);
+    return this.db.prepare(`SELECT 'activity' AS kind, app, window, at, event, source_machine_id AS sourceMachineId FROM activity WHERE ${where} ORDER BY at DESC, id DESC LIMIT ? OFFSET ?`).all(...params);
   }
 
   // Return text-bearing observation rows inside a time window without changing

@@ -16,9 +16,10 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     // so the phone can say when a message came from another device.
     var sourceNodeId: String?
     var sourceName: String?
+    var attachments: [ChatAttachment]
 
     init(id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false, isFailed: Bool = false,
-         timestamp: Date = Date(), serverID: String? = nil, sourceNodeId: String? = nil, sourceName: String? = nil) {
+         timestamp: Date = Date(), serverID: String? = nil, sourceNodeId: String? = nil, sourceName: String? = nil, attachments: [ChatAttachment] = []) {
         self.id = id
         self.role = role
         self.text = text
@@ -28,6 +29,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         self.serverID = serverID
         self.sourceNodeId = sourceNodeId
         self.sourceName = sourceName
+        self.attachments = attachments
     }
 }
 
@@ -47,9 +49,10 @@ enum ChatHistoryCodec {
             at: message.timestamp,
             text: stopped ? stoppedText : message.text,
             failed: message.isFailed || message.isStreaming,
-            retrySafe: !message.isStreaming && message.retrySafe,
+            retrySafe: !message.isStreaming && message.retrySafe && message.attachments.isEmpty,
             sourceNodeId: message.sourceNodeId,
-            sourceName: message.sourceName
+            sourceName: message.sourceName,
+            attachments: message.attachments.isEmpty ? nil : message.attachments.map(\.previewOnly)
         )
     }
 
@@ -62,10 +65,22 @@ enum ChatHistoryCodec {
             timestamp: entry.at,
             serverID: entry.serverID,
             sourceNodeId: entry.sourceNodeId,
-            sourceName: entry.sourceName
+            sourceName: entry.sourceName,
+            attachments: entry.attachments ?? []
         )
         message.retrySafe = entry.retrySafe ?? !entry.failed
         return message
+    }
+
+    static func restored(_ entries: [SavedChatEntry]) -> [ChatMessage] {
+        var messages = entries.map(message)
+        for index in messages.indices where messages[index].role == .assistant && messages[index].isFailed && messages[index].retrySafe {
+            guard let user = messages[..<index].last(where: { $0.role == .user }),
+                  user.attachments.contains(where: { $0.data == nil }) else { continue }
+            messages[index].retrySafe = false
+            messages[index].text += "\n\nReattach the images to try again; saved previews can't be sent to the model."
+        }
+        return messages
     }
 }
 
@@ -99,11 +114,12 @@ enum ChatHistoryMerge {
             if let index = result.firstIndex(where: {
                 $0.serverID == nil && !$0.isStreaming && !$0.isFailed
                     && $0.role == role(item.role) && normalized($0.text) == normalized(item.text)
+                    && $0.attachments.map(\.id) == (item.attachments ?? []).map(\.id)
                     && abs(item.at.timeIntervalSince($0.timestamp)) <= clockSlack
             }) {
                 result[index] = ChatMessage(id: result[index].id, role: role(item.role), text: item.text,
                                             timestamp: item.at, serverID: item.id,
-                                            sourceNodeId: item.sourceNodeId, sourceName: item.sourceName)
+                                            sourceNodeId: item.sourceNodeId, sourceName: item.sourceName, attachments: item.attachments ?? [])
                 continue
             }
             // A saved cache can include messages older than this page, with
@@ -112,7 +128,7 @@ enum ChatHistoryMerge {
             let boundary = result.firstIndex(where: { $0.serverID == cursor }) ?? result.endIndex
             let index = result[..<boundary].firstIndex(where: { $0.timestamp > item.at }) ?? boundary
             result.insert(ChatMessage(role: role(item.role), text: item.text, timestamp: item.at,
-                                      serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName), at: index)
+                                      serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName, attachments: item.attachments ?? []), at: index)
         }
         return result
     }
@@ -143,6 +159,7 @@ enum ChatHistoryMerge {
                 return !claimed.contains(candidate.id)
                     && role(candidate.role) == message.role
                     && normalized(candidate.text) == text
+                    && message.attachments.map(\.id) == (candidate.attachments ?? []).map(\.id)
                     && candidate.at >= message.timestamp.addingTimeInterval(-clockSlack)
             }) else { continue }
             claimed.insert(server[index].id)
@@ -167,7 +184,10 @@ enum ChatHistoryMerge {
                 timestamp: item.at,
                 serverID: item.id,
                 sourceNodeId: item.sourceNodeId,
-                sourceName: item.sourceName
+                sourceName: item.sourceName,
+                attachments: (item.attachments ?? []).map { preview in
+                    local.first(where: { $0.id == uuidForServerID[item.id] })?.attachments.first(where: { $0.id == preview.id && $0.data != nil }) ?? preview
+                }
             )
             result.append((message, item.at))
         }

@@ -820,3 +820,40 @@ it('tap on a reopened recent answer follows that original thread, not a newer on
     expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', original, expect.any(Function), expect.any(AbortSignal), 'agent')
   } finally { await f.app.systemExit() }
 })
+
+
+it('offers an opt-in brief cue, expands on tap, and toggles transcript without stopping capture', async () => {
+  const f = await lifelogFixture()
+  const cue = vi.fn(), cueDetail = vi.fn(), transcriptVisible = vi.fn()
+  Object.assign(f.renderer, { cue, cueDetail, transcriptVisible })
+  const liveCue = vi.fn(() => Promise.resolve({ cue: { id: 'cue-one', kind: 'answer', title: 'Tomorrow', brief: 'Two meetings.', detail: 'Your first meeting is at 10 AM.', at: Date.now() } }))
+  Object.assign(f.api, { liveCue })
+  try {
+    f.callbacks().utterance('Any meetings tomorrow?'); expect(liveCue).not.toHaveBeenCalled()
+    await f.app.configureLiveCues(true)
+    f.callbacks().utterance('Any meetings tomorrow?')
+    await vi.waitFor(() => expect(cue).toHaveBeenCalledWith('Tomorrow', 'Two meetings.'))
+    f.app.tap(); expect(cueDetail).toHaveBeenCalledWith(expect.stringContaining('10 AM'), 0, 1)
+    f.app.doubleTap()
+    const stops = f.audio.stop.mock.calls.length
+    await f.app.toggleTranscript(); expect(transcriptVisible).toHaveBeenLastCalledWith(true)
+    expect(f.audio.stop).toHaveBeenCalledTimes(stops); expect(f.store.snapshot().recordingConsent).toBe(true)
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
+it('drops an in-flight cue when the glasses leave the foreground', async () => {
+  const f = await lifelogFixture(), cue = vi.fn()
+  let finish!: (result: unknown) => void
+  const liveCue = vi.fn(() => new Promise(resolve => { finish = resolve }))
+  Object.assign(f.api, { liveCue }); Object.assign(f.renderer, { cue })
+  try {
+    await f.app.configureLiveCues(true); f.callbacks().utterance('Any meetings tomorrow?')
+    expect(liveCue).toHaveBeenCalledOnce()
+    f.app.setForeground(false)
+    finish({ cue: { id: 'stale', kind: 'answer', title: 'Stale', brief: 'Stale', detail: 'Stale', at: Date.now() } })
+    await Promise.resolve(); await Promise.resolve()
+    expect(cue).not.toHaveBeenCalled()
+    expect(liveCue.mock.calls[0]).toHaveLength(3)
+  } finally { await f.app.systemExit() }
+})

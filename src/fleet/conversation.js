@@ -116,6 +116,7 @@ function lastExchange(thread, reason) {
 }
 
 export async function readThreadConversation(thread, config) {
+  if (thread.kind === "paseo") return boundConversation(thread.meta?.conversation ?? [], true);
   if (["codex", "claude"].includes(thread.kind) && thread.meta?.file) {
     const file = thread.meta.file;
     const text = readTail(file, READ_BYTES);

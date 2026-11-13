@@ -27,6 +27,8 @@ struct OpenAGIApp: App {
                 #if DEBUG
                 if UITestProtocol.isEnabled {
                     UITestRoot()
+                } else if ProcessInfo.processInfo.arguments.contains("--mobile-recovery-acceptance") {
+                    MobileRecoveryAcceptanceView()
                 } else if ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") {
                     LocalAgentAcceptanceView()
                 } else {
@@ -36,10 +38,11 @@ struct OpenAGIApp: App {
                 sessionContent
                 #endif
             }
+            .modifier(AppAppearanceModifier())
             .environment(session)
             .onOpenURL { url in
                 #if DEBUG
-                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
+                if UITestProtocol.isEnabled || Self.isDeviceAcceptance { return }
                 #endif
                 if WebSignIn.handleCallback(url) { return }
                 // The Live Activity's tap target.
@@ -53,7 +56,7 @@ struct OpenAGIApp: App {
             }
             .onChange(of: scenePhase) { _, newPhase in
                 #if DEBUG
-                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
+                if UITestProtocol.isEnabled || Self.isDeviceAcceptance { return }
                 #endif
                 switch newPhase {
                 case .active:
@@ -65,6 +68,11 @@ struct OpenAGIApp: App {
                 }
             }
         }
+    }
+
+    private static var isDeviceAcceptance: Bool {
+        ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") ||
+        ProcessInfo.processInfo.arguments.contains("--mobile-recovery-acceptance")
     }
 
     @ViewBuilder

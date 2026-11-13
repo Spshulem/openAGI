@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
-  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, codexExecBarred, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
   ANTIGRAVITY_LS, defaultBinaries, openImmutableDb, isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
@@ -195,6 +195,28 @@ test("uiTargetFor maps threads to the app that shows them, or none", () => {
   assert.equal(uiTargetFor(null), null);
 });
 
+test("Codex background execution requires positive CLI ownership evidence", () => {
+  const thread = (meta) => ({ kind: "codex", meta });
+  for (const meta of [
+    undefined, null, {},
+    { source: null, originator: null },
+    { source: "future-app", originator: "future-client" },
+    { originator: "codex_cli_rs" },
+    { source: "vscode", originator: null },
+    { source: "vscode", originator: "codex_cli_rs" },
+    { source: "cli", originator: "Codex Desktop" },
+    { source: "exec", originator: "codex_work_desktop" },
+    { source: "cli", originator: "codex_sdk_ts" }
+  ]) {
+    assert.equal(codexExecBarred(thread(meta)), true, JSON.stringify(meta));
+  }
+  for (const source of ["cli", "exec"]) {
+    assert.equal(codexExecBarred(thread({ source })), false, source);
+    assert.equal(codexExecBarred(thread({ source, originator: "codex_cli_rs" })), false, source);
+  }
+  assert.equal(codexExecBarred({ kind: "conductor", meta: {} }), false, "does not change other providers' wait policy");
+});
+
 test("background routes are off unless listed, and never include claude-resume; the idle watcher is on unless turned off", () => {
   assert.deepEqual(parseBackgroundRoutes("codex-exec, peer-relay claude-resume bogus codex-exec"), ["codex-exec", "peer-relay"]);
   assert.deepEqual(parseBackgroundRoutes(""), []);
@@ -261,11 +283,11 @@ test("openChatFor: the link that opens exactly that chat, or a label that says w
   assert.equal(openChatFor(null), null);
 });
 
-test("thread keys come from the one kind list, Antigravity included", () => {
-  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity"]);
-  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity");
-  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
-  for (const key of ["gemini:x", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
+test("thread keys come from the one kind list, Paseo included", () => {
+  assert.deepEqual(THREAD_KINDS, ["codex", "claude", "conductor", "antigravity", "paseo"]);
+  assert.equal(THREAD_KIND_PATTERN, "codex|claude|conductor|antigravity|paseo");
+  for (const key of ["codex:019f-a", "claude:abc", "conductor:c.1", "paseo:host.agent", "antigravity:e8b9db19-dae3-4406-84b6-81df9fff3df8"]) assert.equal(isThreadKey(key), true, key);
+  for (const key of ["gemini:x", "paseo:", "paseo:host.agent/other", "paseo:host agent", "antigravity:", "antigravity:a b", "xantigravity:1", "codex:a/b", null, 7]) assert.equal(isThreadKey(key), false, String(key));
   for (const kind of THREAD_KINDS) assert.ok(KIND_NAMES[kind], kind);
   assert.equal(kindName("antigravity"), "Antigravity");
   assert.equal(kindName("other"), "Agent");

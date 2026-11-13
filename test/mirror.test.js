@@ -12,7 +12,8 @@ import {
   importMirrorSnapshot,
   importOfflineWork,
   listOfflineWork,
-  markOfflineWorkSent
+  markOfflineWorkSent,
+  validateOfflineWork
 } from "../src/mirror.js";
 
 const AGENT = "devices:agent:main";
@@ -203,6 +204,40 @@ test("mirror round trip: snapshot, phone import, offline work back to the Mac", 
   await settle(mac.runtime, phone.runtime);
 });
 
+test("offline photo pixels survive acknowledged upload and the replacement snapshot", async () => {
+  const mac = makeRuntime("photo-main"), phone = makeRuntime("photo-phone", { OPENAGI_PROFILE: "mobile" });
+  await settle(mac.runtime, phone.runtime);
+  importMirrorSnapshot(phone.runtime, buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir }), { dataDir: phone.dir });
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC", "base64");
+  const data = Buffer.concat([png, Buffer.alloc(64 * 1024)]).toString("base64");
+  const attachment = { id: "synthetic-photo", name: "Synthetic.png", mimeType: "image/png", data };
+  const original = phone.runtime.agentHost.store.appendMessage(AGENT, { role: "user", content: "Describe the synthetic photo",
+    metadata: { attachments: [attachment], authority: { owner: true }, ownerTurn: { untrusted: false } } }).messages.at(-1);
+  const work = listOfflineWork(phone.runtime, { dataDir: phone.dir });
+  assert.equal(work.version, 2, "Legacy version-1 servers must refuse the page before acknowledging its images");
+  assert.deepEqual(work.messages.agent[0].attachments, [attachment]);
+  assert.equal(work.messages.agent[0].metadata.authority, undefined);
+  assert.equal(work.messages.agent[0].metadata.ownerTurn, undefined);
+  assert.equal(importOfflineWork(mac.runtime, work, { dataDir: mac.dir, fromNodeId: "synthetic-phone" }).added.messages, 1);
+  markOfflineWorkSent(phone.runtime, { dataDir: phone.dir, work });
+  const snapshot = buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir });
+  assert.equal(snapshot.version, 2);
+  importMirrorSnapshot(phone.runtime, snapshot, { dataDir: phone.dir });
+  for (const runtime of [mac.runtime, phone.runtime]) {
+    const message = runtime.agentHost.store.getSession(AGENT).messages.find(m => m.id === original.id);
+    assert.deepEqual(message.metadata.attachments, [attachment]);
+    assert.equal(message.metadata.authority, undefined);
+  }
+  assert.equal(importOfflineWork(mac.runtime, work, { dataDir: mac.dir, fromNodeId: "synthetic-phone" }).added.messages, 0);
+  for (const invalid of [
+    { ...work, version: 1 },
+    { ...work, messages: { agent: [{ ...work.messages.agent[0], attachments: [{ ...attachment, data: "invalid" }] }] } },
+    { ...work, messages: { agent: [{ ...work.messages.agent[0], role: "assistant" }] } }
+  ]) {
+    assert.throws(() => validateOfflineWork(invalid), error => error.code === "invalid_mirror");
+  }
+});
+
 test("imports reject malformed, oversized and unknown-version input", async () => {
   const mac = seedMac();
   const phone = makeRuntime("phone-reject");
@@ -215,7 +250,7 @@ test("imports reject malformed, oversized and unknown-version input", async () =
 
   rejects(null, "invalid_mirror");
   rejects([], "invalid_mirror");
-  rejects({ ...snap, version: 2 }, "unsupported_version");
+  rejects({ ...snap, version: 3 }, "unsupported_version");
   rejects({ ...snap, extra: true }, "invalid_mirror");
   rejects({ ...snap, persona: "x".repeat(64 * 1024 + 1) }, "invalid_mirror");
   rejects({ ...snap, skills: [{ name: "../evil", content: "x" }] }, "invalid_mirror");
@@ -240,5 +275,33 @@ test("imports reject malformed, oversized and unknown-version input", async () =
   rejectsWork({ ...work, edits: [] }, { fromNodeId: "phone-1" }, "invalid_mirror");
   rejectsWork({ ...work, tasks: Array.from({ length: 501 }, (_, i) => ({ id: `t${i}`, queue: "user", title: "x" })) }, { fromNodeId: "phone-1" }, "mirror_too_large");
   assert.deepEqual(importOfflineWork(mac.runtime, work, { dataDir: mac.dir, fromNodeId: "phone-1" }).added, { messages: 0, tasks: 0, memories: 0 });
+  await settle(mac.runtime, phone.runtime);
+});
+
+
+test("snapshot replacement and later rotation do not resend acknowledged or baseline archives", async () => {
+  const mac = makeRuntime("archive-main"), phone = makeRuntime("archive-phone", { OPENAGI_PROFILE: "mobile" });
+  await settle(mac.runtime, phone.runtime);
+  const store = phone.runtime.agentHost.store;
+  store.maxActiveMessages = 4;
+  store.retainedMessages = 2;
+  mac.runtime.agentHost.store.appendMessage(AGENT, { role: "user", content: "Already on the server" });
+  importMirrorSnapshot(phone.runtime, buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir }), { dataDir: phone.dir });
+  for (let i = 0; i < 6; i++) store.appendMessage(AGENT, { role: "user", content: `Delivered offline ${i}` });
+  const work = listOfflineWork(phone.runtime, { dataDir: phone.dir });
+  assert.equal(work.messages.agent.length, 6);
+  markOfflineWorkSent(phone.runtime, { dataDir: phone.dir, work });
+  const bounded = buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir });
+  bounded.threads.agent = [];
+  importMirrorSnapshot(phone.runtime, bounded, { dataDir: phone.dir });
+  assert.deepEqual(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent, []);
+  const fresh = [];
+  for (let i = 0; i < 6; i++) {
+    fresh.push(store.appendMessage(AGENT, { role: "user", content: `New offline ${i}` }).messages.at(-1).id);
+  }
+  assert.equal(store.getSession(AGENT).metadata.historyArchived, true);
+  assert.deepEqual(new Set(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent.map(m => m.id)), new Set(fresh));
+  importMirrorSnapshot(phone.runtime, bounded, { dataDir: phone.dir });
+  assert.deepEqual(new Set(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent.map(m => m.id)), new Set(fresh));
   await settle(mac.runtime, phone.runtime);
 });

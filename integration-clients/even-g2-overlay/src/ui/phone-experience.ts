@@ -29,7 +29,9 @@ export class PhoneExperience {
       if (!node) return
       node.dataset.controlLabel = id; move(`[data-control-label="${id}"]`, destination)
     }
-    for (const selector of ['[data-action="ask"]', '#cancel-request', '#pending-question', '#draft-review', '[data-action="newConversation"]']) move(selector, '#talk-primary')
+    for (const selector of ['[data-action="ask"]', '#cancel-request', '#pending-question', '#draft-review', '#cue-panel', '[data-action="newConversation"]']) move(selector, '#talk-primary')
+    const cues = focused.querySelector<HTMLElement>('#cue-panel')
+    if (cues) { delete cues.dataset.page; cues.hidden = false; this.restores.push(() => { cues.dataset.page = 'listen' }) }
     for (const selector of ['#live-transcript', '#speech-timing', '#answer-preview', '#previous-page', '#next-page']) move(selector, '#talk-result')
     move('#activity-log', '#talk-activity')
     move('#mode-picker', '#mode-slot')
@@ -68,7 +70,7 @@ export const experienceStyles = `
   [data-experience="focused"] button{background:#263943;border-color:#415766;color:#e9edef;cursor:pointer;font-weight:550}
   [data-experience="focused"] button[aria-pressed="true"],[data-experience="focused"] [data-action="ask"]{background:#e8eef2;color:#15232c;border-color:#e8eef2}
   #talk-primary{display:grid;grid-template-columns:1fr 1fr;gap:12px}#talk-primary [data-action="ask"]{grid-column:1/-1;min-height:76px;font-size:22px}
-  #talk-primary #draft-review,#talk-primary #pending-question{grid-column:1/-1}
+  #talk-primary #cue-panel,#talk-primary #draft-review,#talk-primary #pending-question{grid-column:1/-1}
   #talk-primary [data-action="newConversation"]{background:transparent;grid-column:1/-1}
   #talk-result{display:grid;grid-template-columns:1fr 1fr;gap:12px}#talk-result p{grid-column:1/-1;white-space:pre-wrap;line-height:1.6;overflow-wrap:anywhere}
   #talk-result #answer-preview{max-height:40vh;overflow:auto;margin:0;padding:18px 0}

@@ -442,7 +442,9 @@ export function registerCoreTools(registry, runtime) {
     },
     handler: async (args, context) => {
       const scope = context?.agentId && context.agentId !== "main" ? `specialist:${context.agentId}` : null;
-      const hits = runtime.memory.retrieve(String(args.query ?? ""), { limit: args.limit ?? 5, scope });
+      // Record cross-chat proof only for an explicit recall tool call, not
+      // background context assembly or opening the Memory page.
+      const hits = runtime.memory.retrieve(String(args.query ?? ""), { limit: args.limit ?? 5, scope, sessionId: context?.sessionId });
       return {
         count: hits.length,
         items: hits.map(({ item, score }) => ({
@@ -469,7 +471,7 @@ export function registerCoreTools(registry, runtime) {
       type: "object",
       properties: {
         correction: { type: "string", description: "The corrected fact, stated fully and standalone (e.g. 'The Acme review meeting is at 4pm, not 3pm')." },
-        query: { type: "string", description: "What the stale memory was about — used to find it (e.g. 'Acme review meeting time')." },
+        query: { type: "string", description: "The specific topic and subject of the stale fact (e.g. 'Acme review meeting time'). Prefer its exact id from recall; do not target a general transcript summary." },
         id: { type: "string", description: "Exact memory id to supersede, when known (from a recall result). Takes precedence over query." },
         tags: { type: "array", items: { type: "string" }, description: "Optional extra tags for the correction." }
       },

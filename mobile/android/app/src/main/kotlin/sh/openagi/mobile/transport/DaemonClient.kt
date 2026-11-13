@@ -95,6 +95,9 @@ class DaemonClient(
     private val client: OkHttpClient = defaultClient,
     private val enforceAllowlist: Boolean = true,
 ) {
+    internal fun belongsTo(credentials: sh.openagi.mobile.store.Credentials): Boolean =
+        server == credentials.server && nodeId == credentials.nodeId && token == credentials.token
+
     // SSE reads can legitimately go 15+ seconds between bytes — PROTOCOL.md
     // §7's own ": ping" cadence is every 15s, and a chat reply can think for
     // longer than that between deltas. `client`'s ordinary read timeout
@@ -452,7 +455,7 @@ class DaemonClient(
     companion object {
         private val JSON = "application/json".toMediaType()
         // The fleet thread keys the daemon routes (src/mobile-node.js FLEET_THREAD).
-        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$""")
+        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$""")
 
         val defaultClient: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)

@@ -174,6 +174,7 @@ struct CodeBlockView: View {
 // Renders a full assistant reply: an ordered stack of blocks, each drawn per
 // DESIGN.md's Chat section.
 struct MarkdownContent: View {
+    @Environment(\.chatFont) private var chatFont
     let blocks: [MarkdownBlock]
 
     var body: some View {
@@ -182,6 +183,8 @@ struct MarkdownContent: View {
                 blockView(block)
             }
         }
+        .lineLimit(nil)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -189,11 +192,11 @@ struct MarkdownContent: View {
         switch block {
         case .paragraph(let raw):
             Text(MarkdownParser.inline(raw))
-                .font(Theme.Typography.body)
+                .font(chatFont)
                 .foregroundStyle(Theme.ink)
         case .heading(let level, let raw):
             Text(MarkdownParser.inline(raw))
-                .font(level <= 2 ? Theme.Typography.section : Theme.Typography.body.weight(.semibold))
+                .font(level <= 2 ? Theme.Typography.section : chatFont.weight(.semibold))
                 .foregroundStyle(Theme.ink)
         case .bulletList(let items):
             VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
@@ -215,11 +218,14 @@ struct MarkdownContent: View {
     private func listRow(marker: String, raw: String) -> some View {
         HStack(alignment: .top, spacing: Theme.Spacing.x2) {
             Text(marker)
-                .font(Theme.Typography.body)
+                .font(chatFont)
                 .foregroundStyle(Theme.muted)
             Text(MarkdownParser.inline(raw))
-                .font(Theme.Typography.body)
+                .font(chatFont)
                 .foregroundStyle(Theme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
