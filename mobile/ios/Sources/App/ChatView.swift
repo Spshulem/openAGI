@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var thread: ConversationThread = .agent
@@ -54,15 +55,22 @@ struct ChatView: View {
         .task { await model.conversations.refresh() }
     }
 
+    // Unfolded like a book, the conversation list fills the leading page
+    // and the conversation, composer included, the trailing one, so neither
+    // runs across the fold.
     private var conversationSplitView: some View {
-        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
-            ConversationBrowser(thread: $thread) { message in
-                selectedMessage = message
-                compactColumn = .detail
+        GeometryReader { geometry in
+            let page = ChatBookPages.sidebarWidth(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                                                  size: geometry.size, rightToLeft: layoutDirection == .rightToLeft)
+            NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+                ConversationBrowser(thread: $thread) { message in
+                    selectedMessage = message
+                    compactColumn = .detail
+                }
+                .navigationSplitViewColumnWidth(min: page ?? 220, ideal: page ?? 270, max: page ?? 320)
+            } detail: {
+                conversationNavigation
             }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
-        } detail: {
-            conversationNavigation
         }
     }
 
@@ -132,6 +140,8 @@ struct ChatConversationView: View {
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
     @State private var reviewingApproval: PendingAction?
+    // Cards put away in this chat. The approval stays in the Inbox.
+    @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
@@ -266,7 +276,8 @@ struct ChatConversationView: View {
                         messageItemView(item, width: width)
                     }
                     ForEach(raisedApprovals) { action in
-                        ChatApprovalCard(action: action) { reviewingApproval = action }
+                        ChatApprovalCard(action: action, onReview: { reviewingApproval = action },
+                                         onHide: { hiddenApprovals.insert(action.id) })
                             .padding(.top, Theme.Spacing.x3)
                     }
                     Color.clear.frame(height: 1)
@@ -307,7 +318,14 @@ struct ChatConversationView: View {
                 else if userIsScrolling { isPinnedToBottom = false }
             }
             .onChange(of: raisedApprovals.map(\.id)) { _, ids in
-                if !ids.isEmpty && (isPinnedToBottom || isBottomVisible) { scrollToLatest() }
+                guard !ids.isEmpty && (isPinnedToBottom || isBottomVisible) else { return }
+                scrollToLatest()
+                // A new card's height is only known after it lays out; settle
+                // on the real end once it has.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    scrollToLatest()
+                }
             }
             .onChange(of: messages) { old, new in
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
@@ -469,6 +487,7 @@ struct ChatConversationView: View {
                                     // phone chats under other session ids; keep
                                     // showing every recent approval there.
                                     scopedToSession: conversation.historyStatus != .needsUpdate)
+            .filter { !hiddenApprovals.contains($0.id) }
     }
 
     private var chatHome: some View {
@@ -567,7 +586,9 @@ struct ChatConversationView: View {
     }
 
     private var composerLayout: ComposerLayout {
-        ComposerLayout(prefersSeparateControls: dynamicTypeSize >= .xxLarge,
+        // One line, like Messages, up to the accessibility sizes. Duo's
+        // larger default text used to stack the controls under the field.
+        ComposerLayout(prefersSeparateControls: dynamicTypeSize.isAccessibilitySize,
                        rightToLeft: layoutDirection == .rightToLeft)
     }
 
@@ -898,6 +919,7 @@ struct ChatWorkingLine: View {
 struct ChatApprovalCard: View {
     let action: PendingAction
     let onReview: () -> Void
+    var onHide: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
@@ -911,19 +933,44 @@ struct ChatApprovalCard: View {
                 Text(reason)
                     .font(Theme.Typography.secondary)
                     .foregroundStyle(Theme.muted)
-                    .lineLimit(4)
+                    .lineLimit(5)
             }
-            Button("Review", action: onReview)
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.capsule)
-                .padding(.top, Theme.Spacing.x1)
+            // Two equal pills, the decision on the trailing side. Hide only
+            // puts the card away here; the approval waits in the Inbox.
+            HStack(spacing: Theme.Spacing.x3) {
+                Button(action: onHide) {
+                    Text("Hide").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
+                        .contentShape(Capsule())
+                }
+                .foregroundStyle(Theme.ink)
+                .accessibilityIdentifier("chat-approval-hide-\(action.id)")
+                Button(action: onReview) {
+                    Text("Review").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .foregroundStyle(Color(uiColor: .systemBackground))
+                        .background(Theme.ink, in: Capsule())
+                        .contentShape(Capsule())
+                }
                 .accessibilityIdentifier("chat-approval-review-\(action.id)")
+            }
+            .buttonStyle(.plain)
+            .padding(.top, Theme.Spacing.x2)
         }
-        .padding(Theme.Spacing.x4)
+        .padding(Theme.Spacing.x5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.surface, in: .rect(cornerRadius: 20, style: .continuous))
+        .background(Theme.surface, in: .rect(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat-approval-\(action.id)")
+    }
+}
+
+// The sidebar width that puts the split view's own divider on a vertical
+// fold: the leading page's width, or nil when there is no such fold.
+enum ChatBookPages {
+    static func sidebarWidth(division: CGRect?, size: CGSize, rightToLeft: Bool) -> CGFloat? {
+        guard let fold = division, fold.height > fold.width, fold.minX > 0, fold.maxX < size.width else { return nil }
+        return rightToLeft ? size.width - fold.maxX : fold.minX
     }
 }
 
