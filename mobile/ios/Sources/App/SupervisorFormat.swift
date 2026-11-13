@@ -7,6 +7,19 @@ import Foundation
 // page (src/fleet/page.js), so the phones and the dashboard describe the
 // same thread the same way.
 enum SupervisorFormat {
+    static func answerOptions(_ question: FleetQuestion) -> [String] {
+        question.options.filter {
+            let option = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !option.isEmpty && !["dismiss", "open thread", "opened"].contains(option)
+        }
+    }
+
+    static func threadKeys(_ question: FleetQuestion) -> [String] {
+        var seen = Set<String>()
+        return ([question.threadKey].compactMap { $0 } + (question.threadKeys ?? []))
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
     static let starters = ["What's running?", "What needs me?", "Which threads are red?"]
 
     // Worst first: what needs a person, then what needs a look, then what is
@@ -159,7 +172,7 @@ enum SupervisorFormat {
         switch delivery?.status {
         case "sent": return Note(text: "Sent to the agent.", isAlert: false)
         case "dry-run": return Note(text: "Saved. Dry run, nothing sent.", isAlert: false)
-        case "blocked": return Note(text: "Saved. Couldn't reach the agent" + (detail.map { ": \($0)" } ?? "."), isAlert: true)
+        case "blocked": return Note(text: "Not sent. Couldn't reach the agent" + (detail.map { ": \($0)" } ?? "."), isAlert: true)
         case "failed": return Note(text: "Saved. Send failed" + (detail.map { ": \($0)" } ?? "."), isAlert: true)
         default: return Note(text: fallback, isAlert: false)
         }
@@ -192,6 +205,8 @@ enum SupervisorFormat {
             return ("Supervisor isn't open to this phone.", "Update OpenAGI on your main. If the other tabs fail too, re-pair in Settings.")
         case .conflict:
             return ("That's already been handled.", "Someone or something else got there first — refresh to see the current state.")
+        case .mainConnection(let issue):
+            return ("Main connection needs attention.", issue.message)
         default:
             return ("Can't reach OpenAGI.", "Check your connection and pull to refresh.")
         }

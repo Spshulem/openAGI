@@ -147,8 +147,12 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         const mode = typeof body?.mode === "string" ? body.mode : "";
-        if (!MODES.includes(mode) || await supervisor.setMode(mode) === null) {
-          return fail(400, "Mode must be one of: " + MODES.join(", ") + ".");
+        if (!MODES.includes(mode)) return fail(400, "Mode must be one of: " + MODES.join(", ") + ".");
+        try {
+          const applied = await supervisor.setMode(mode);
+          if (applied !== mode || state().mode !== mode) return fail(503, "The fleet computer did not confirm the requested mode. Refresh and retry.", { state: state() });
+        } catch {
+          return fail(503, "Supervisor mode could not be confirmed and saved on the fleet computer. Check its connection and available disk space, then retry.", { state: state() });
         }
         return ok(state());
       }

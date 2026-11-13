@@ -610,3 +610,30 @@ test('a remote refresh emits "fleet" once per new snapshot or question set, not 
   state.questions = [{ id: 'fq_two', title: 'x', options: [] }];
   await remote.refresh();
 });
+
+test('a late Observe refresh cannot overwrite an acknowledged Auto change', async t => {
+  const { remote, runtime, state } = fixture(t);
+  const original = runtime.nodeCapabilities.dispatch;
+  let release;
+  runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].method === 'GET') {
+      const stale = structuredClone(state);
+      await new Promise(resolve => { release = resolve; });
+      return { state: stale, response: { status: 200, body: stale } };
+    }
+    return original(...args);
+  };
+  const refresh = remote.refresh();
+  assert.equal(await remote.setMode('auto'), 'auto');
+  release(); await refresh;
+  assert.equal(remote.getState().mode, 'auto');
+});
+
+test('mode API rejects an unconfirmed successful response', async t => {
+  const { remote, runtime, state } = fixture(t);
+  runtime.nodeCapabilities.dispatch = async () => ({ state, response: { status: 200, body: state } });
+  const route = createFleetRoute({ supervisor: remote });
+  const result = await route('POST', '/fleet/api/mode', null, async () => ({ mode: 'auto' }));
+  assert.equal(result.status, 503);
+  assert.equal(result.body.state.mode, 'observe');
+});

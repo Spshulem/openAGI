@@ -1,7 +1,10 @@
 import { renderPhonePairingPage } from "./phone-pairing-page.js";
 import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
+import { isSavedMemory, isProtectedMemory } from "./memory-system.js";
+import { getStartedStatus } from "./get-started-status.js";
 import http from "node:http";
+import { normalizeMessageImages, MAX_IMAGE_MESSAGE_BODY } from "./message-attachments.js";
 import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -11,12 +14,14 @@ import { attachVoiceRelay } from "./voice/relay.js";
 import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
+import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
+import { workspaceUi } from "./workspace-ui.js";
 import { getStartedUi } from "./get-started-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
@@ -101,7 +106,9 @@ import {
   sharedHistoryThread,
   sharedSessionId,
   sharedThreadForSession,
-  sharedThreadHistory
+  sharedThreadHistory,
+  sharedConversations,
+  createSharedConversation
 } from "./shared-conversations.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
@@ -249,6 +256,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   const events = new EventEmitter();
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
+  const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;
   try { g2Requests = channels?.g2 ? new G2Requests({ channel: channels.g2, dir: path.join(dataDir, "g2-requests"),
     onCancel: async record => {
@@ -937,7 +946,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
+        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
       const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
@@ -953,14 +962,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // the G2 voice routes; all generic node/control routes still require
       // the explicit X-OpenAGI-Node-ID header.
       const tokenOnlyG2Enrollment = !headerNodeId
-        && ["/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        && ["/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         ? nodeRegistry.enrollmentForToken(scopedBearer)
         : null;
       const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         || sharedHistoryRoute;
       // A mobile credential is accepted on its enumerated allowlist and
       // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
@@ -984,7 +993,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -1018,7 +1027,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // original scoped credential. Never grant this worker broader scopes.
       const gatewayOwnerAuthenticated = checkAuth(req, url, getAuthToken()).ok;
       if (routeMainData(req, res, url, {
-        pairing: readNodeConfig(dataDir), identity: localIdentity,
+        // An embedded phone owns its workspace. Even a migrated data directory
+        // with an old worker pairing must never route local tasks or decisions
+        // to a remote main. Desktop workers keep forwarding as before.
+        pairing: mobileProfile ? null : readNodeConfig(dataDir), identity: localIdentity,
         ownerAuthenticated: gatewayOwnerAuthenticated,
         ownerBearerAuthenticated: Boolean(getAuthToken() && scopedBearer && checkAuth(
           { headers: { authorization: req.headers.authorization } }, new URL("/", url), getAuthToken()
@@ -1131,6 +1143,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
           }
           const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
+          const keyName = preference === "openai" ? "OPENAI_API_KEY" : preference === "anthropic" ? "ANTHROPIC_API_KEY" : null;
+          if (keyName && !value(keyName)) return sendJson(res, 400, { ok: false, error: `Enter your ${preference === "openai" ? "OpenAI" : "Anthropic"} API key to continue.` });
           const { createModelProvider } = await import("./model-provider.js");
           // Verify a candidate without changing live credentials or the provider
           // used by existing chats and background jobs. Mobile fallback is off.
@@ -1202,11 +1216,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // i.e. it is the constant false on exactly the exposed installs this is
       // protecting. The Mac tray reads provider/memory out of `status` and DOES
       // send its bearer token (AppState.get), so it keeps the full body.
+      if (method === "GET" && pathname === "/health" && url.searchParams.get("client") === "g2") {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "no-store");
+        return sendJson(res, 200, { service: "openagi", pairing: "even_g2", role: readNodeConfig(dataDir)?.remote ? "node" : "main" });
+      }
       if (method === "GET" && pathname === "/health") {
         const probe = { ok: true, firstRun: isFirstRun() };
         if (checkAuth(req, url, getAuthToken()).ok) probe.status = runtime.status();
         return sendJson(res, 200, probe);
       }
+      if (method === "GET" && pathname === "/getting-started") return sendJson(res, 200, getStartedStatus(runtime));
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
       if (method === "POST" && pathname === "/memory/remember") {
         // Direct memory import (auth-gated) — for migrations from another
@@ -1316,7 +1336,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // shipped wearable already depends on.
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
         const platform = body.platform;
-        if (readNodeConfig(dataDir)?.remote) {
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
           return sendJson(res, 409, {
             error: platform === MOBILE_PLATFORM
               ? "phones must be enrolled on the main OpenAGI"
@@ -1368,6 +1388,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("cache-control", "no-store");
         return sendJson(res, 201, {
           agentUrl,
+          evenAiUrl: new URL("/nodes/g2/chat/completions", agentUrl).href,
           token: nodeToken,
           node: {
             id: nodeId,
@@ -1843,6 +1864,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // renew: the relay refused this same pass; the phone should mint a new one.
         return sendJson(res, 200, { ok: true, renew: record.renew === true });
       }
+      if (method === "GET" && pathname === "/mobile/capabilities") {
+        res.setHeader("Cache-Control", "no-store");
+        return sendJson(res, 200, { protocol: 1, imageAttachments: true, conversationCatalog: true });
+      }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
         const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(10, rawLimit)) : 5;
@@ -1921,12 +1946,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (sharedHistoryRoute) {
         res.setHeader("Cache-Control", "no-store");
         if (requestNodeId && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
-          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit }));
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main" }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+      if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          if (method === "GET") return sendJson(res, 200, sharedConversations(store));
+          const body = await readJsonLimited(req, 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => !["thread", "sourceId"].includes(key))) return sendJson(res, 400, { error: "invalid_conversation" });
+          return sendJson(res, 201, createSharedConversation(store, body));
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -1953,7 +1994,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, lifelogPage);
       }
       if (method === "GET" && pathname === "/g2/connect") {
-        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ConnectPage);
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return sendHtml(res, 200, g2ConnectPage);
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -2008,6 +2051,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, question));
           }
           return sendG2NodeJson(res, 200, g2Requests[body.op](requestNodeId, body.id));
+        } catch (error) { return sendG2NodeError(res, error); }
+      }
+      if (method === "POST" && ["/nodes/g2/chat/completions", "/nodes/g2/cues"].includes(pathname)) {
+        if (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        if (!evenAIAgent) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 24 * 1024);
+          if (pathname.endsWith("/chat/completions")) return sendG2NodeJson(res, 200, await evenAIAgent.complete(body, requestNodeId));
+          const consent = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!consent || consent.id !== body?.consentId) return sendG2NodeJson(res, 403, { error: "Start consented lifelog before live cues" });
+          const controller = new AbortController();
+          res.once("close", () => { if (!res.writableEnded) controller.abort(); });
+          const result = await g2LiveCues.suggest(body, requestNodeId, AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]));
+          const current = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!nodeRegistry.authenticate(requestNodeId, scopedBearer) || current?.id !== consent.id) return sendG2NodeJson(res, 403, { error: "Live cue consent ended" });
+          return sendG2NodeJson(res, 200, result);
         } catch (error) { return sendG2NodeError(res, error); }
       }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
@@ -2080,9 +2139,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
-        let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
+        let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
+        try {
+          if (body && typeof body === "object" && !Array.isArray(body)) {
+            const images = normalizeMessageImages(body.attachments);
+            if (images.length) {
+              body.attachments = images;
+              if (typeof body.text === "string" && !body.text.trim()) body.text = "Please describe the attached images.";
+            }
+          }
+        } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
@@ -2114,8 +2182,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // through /nodes/g2/experience). Generic nodes, such as the
             // iMessage bridge, stay in their own node-scoped conversations.
             if (requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "shared threads are for paired phones and G2" });
-            body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name));
+            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name)); }
+            catch (error) {
+              if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+              throw error;
+            }
           } else {
+            if (body.conversationId !== undefined) return sendJson(res, 400, { error: "conversationId requires a thread" });
             body = bindScopedNodeMessage(body, requestNodeId);
           }
         }
@@ -2237,7 +2310,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // tables for Computer History. Keep an authenticated-but-compromised
         // client from turning an arbitrary limit into an unbounded allocation.
         const limit = Math.max(1, Math.min(5_000, Number.isFinite(parsedLimit) ? parsedLimit : 25));
-        const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit });
+        const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0));
+        const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit, offset });
         return sendJson(res, 200, results);
       }
       if (method === "GET" && pathname === "/observations/timeline") {
@@ -2601,6 +2675,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // at a button that did nothing, forever, with no feedback.
       if (method === "POST" && pathname.match(/^\/cron\/[^/]+\/run$/)) {
         const id = decodeURIComponent(pathname.split("/")[2]);
+        // Inbox cleanup is main-backed on workers; ordinary cron runs are local.
+        const pollPath = (runId) => `/cron/runs/${encodeURIComponent(runId)}`
+          + (id === "backlog-triage" ? "?source=main" : "");
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
 
@@ -2632,7 +2709,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               runId: started.running?.runId ?? null,
               startedAt: started.running?.startedAt ?? null,
               source: started.running?.source ?? null,
-              poll: started.running?.runId ? `/cron/runs/${encodeURIComponent(started.running.runId)}` : null,
+              poll: started.running?.runId ? pollPath(started.running.runId) : null,
               message: "This job is already running. Wait for it to finish — running it twice concurrently is not safe."
             });
           }
@@ -2655,7 +2732,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             runId: started.runId,
             startedAt: pending?.startedAt ?? null,
             timeoutMs: pending?.timeoutMs ?? null,
-            poll: `/cron/runs/${encodeURIComponent(started.runId)}`,
+            poll: pollPath(started.runId),
             message: `Still running after ${graceMs}ms — poll the run for the outcome.`
           });
         }
@@ -4029,10 +4106,11 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
   const conversationNamespace = createHash("sha256").update(`thread:${body.thread}`, "utf8").digest("base64url");
   return {
     text: body.text,
+    ...(body.attachments?.length ? { attachments: body.attachments } : {}),
     channel: "node",
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
-    sessionId: sharedSessionId(body.thread),
+    sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
     metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread }
   };
 }
@@ -4043,6 +4121,7 @@ function bindScopedNodeMessage(body, requestNodeId) {
   const conversationNamespace = createHash("sha256").update(conversation, "utf8").digest("base64url");
   return {
     text: body.text,
+    ...(body.attachments?.length ? { attachments: body.attachments } : {}),
     channel: "node",
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
@@ -4269,7 +4348,7 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/enroll/exchange",
     "/nodes/heartbeat",
     "/nodes/revoke",
-    "/nodes/g2/ask",
+    "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask",
     "/nodes/g2/experience",
     "/nodes/g2/listen",
     "/nodes/g2/speech-token",
@@ -5202,6 +5281,8 @@ const state = {
   }
 };
 
+${isProtectedMemory.toString()}
+${isSavedMemory.toString()}
 const $ = (id) => document.getElementById(id);
 const main = $("main");
 const sidebar = $("sidebar");
@@ -5283,6 +5364,7 @@ function safeLinkHref(rawUrl) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+  if (["/fleet", "/setup", "/?tab=coding-agents", "/?tab=memory", "/?tab=get-started", "/?tab=computer-use", "/?tab=nodes"].includes(decoded)) return escapeHtml(decoded);
   let parsed;
   try { parsed = new URL(decoded); } catch (e) { return null; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
@@ -5372,6 +5454,7 @@ function renderMarkdown(input) {
   const blocks = [];
   let paragraph = [];
   let listTag = null;
+  let listStart = 1;
   let listItems = [];
 
   const flushParagraph = () => {
@@ -5381,7 +5464,7 @@ function renderMarkdown(input) {
   };
   const flushList = () => {
     if (!listTag) return;
-    blocks.push("<" + listTag + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
+    blocks.push("<" + listTag + (listTag === "ol" && listStart !== 1 ? ' start="' + listStart + '"' : "") + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
     listTag = null;
     listItems = [];
   };
@@ -5454,13 +5537,14 @@ function renderMarkdown(input) {
     }
 
     const unordered = /^ {0,3}[-*+]\\s+(.*)$/.exec(line);
-    const ordered = /^ {0,3}\\d+[.)]\\s+(.*)$/.exec(line);
+    const ordered = /^ {0,3}(\\d+)[.)]\\s+(.*)$/.exec(line);
     if (unordered || ordered) {
       flushParagraph();
       const nextTag = unordered ? "ul" : "ol";
       if (listTag && listTag !== nextTag) flushList();
+      if (!listTag && ordered) listStart = Math.min(2147483647, Number(ordered[1]));
       listTag = nextTag;
-      listItems.push((unordered ?? ordered)[1]);
+      listItems.push(unordered ? unordered[1] : ordered[2]);
       i += 1;
       continue;
     }
@@ -5635,7 +5719,14 @@ newBtn.addEventListener("click", async () => {
 
 async function switchTab(tab) {
   if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
+  if (tab !== "activity") state.historyObserver?.disconnect();
   if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
+  const tabUrl = new URL(window.location.href);
+  if (tabUrl.searchParams.get("tab") !== tab) {
+    tabUrl.searchParams.set("tab", tab);
+    for (const key of ["session", "request", "compose", "pending"]) tabUrl.searchParams.delete(key);
+    history.pushState(null, "", tabUrl);
+  }
   state.tab = tab;
   main.dataset.tab = tab;
   $("pageTitle").textContent = document.querySelector('nav button[data-tab="' + tab + '"] span')?.textContent || "Chat";
@@ -5658,6 +5749,7 @@ async function switchTab(tab) {
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
+    showSidebar(state.sessions.length > 0);
     // A bare Chat open should look like chat history, not an unexplained blank
     // composer. Select the newest human-facing session unless the user
     // explicitly pressed + New or a specific ?session= handoff is about to be
@@ -5667,6 +5759,9 @@ async function switchTab(tab) {
       const latest = latestInteractiveSession(state.sessions);
       if (latest) await loadSession(latest.id);
     }
+  } else if (tab === "supervisor") {
+    showSidebar(false);
+    renderSupervisor();
   } else if (tab === "get-started") {
     showSidebar(false);
     renderGettingStarted();
@@ -6176,7 +6271,9 @@ function renderChat() {
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
   updateModelNotice();
-  document.querySelectorAll("[data-starter]").forEach(button => { button.onclick = () => startGettingStartedChat(button.dataset.starter); });
+  document.querySelectorAll("[data-starter]").forEach(button => {
+    button.onclick = () => button.dataset.starter === "agents" ? switchTab("supervisor") : startGettingStartedChat(button.dataset.starter);
+  });
   const input = $("input");
   input.value = state.chatDraft || "";
   try {
@@ -6499,7 +6596,7 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   div.className = "msg " + (runtimeApproval ? "runtime" : msg.role === "user" ? "user" : "assistant");
   const meta = runtimeApproval
     ? "OpenAGI approval"
-    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.role === "user" && /^browser(?:-|$)/.test(msg.from ?? "") ? "You" : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
   const body = msg.role === "assistant" && !runtimeApproval ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
@@ -7144,6 +7241,7 @@ function openMcpComposer() {
   });
 }
 
+${workspaceUi}
 ${codingSupervisorUi}
 ${getStartedUi}
 ${vocaleoUi}
@@ -7163,7 +7261,8 @@ async function renderAgents() {
 async function renderMemory() {
   const snap = await fetchJson("/memory");
   state.memorySnap = snap;
-  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "" };
+  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "", view: "saved" };
+  if (!state.memoryFilter.view) state.memoryFilter.view = "saved";
   renderMemoryView();
 }
 
@@ -7174,6 +7273,7 @@ function renderMemoryView() {
   const counts = { short: active(snap.short).length, medium: active(snap.medium).length, long: active(snap.long).length };
   const total = counts.short + counts.medium + counts.long;
   const allActive = [...active(snap.short), ...active(snap.medium), ...active(snap.long)];
+  const savedCount = allActive.filter(isSavedMemory).length;
   const principles = allActive.filter((m) => m.kind === "principle").length;
   const corrections = allActive.filter((m) => m.kind === "correction" || m.locked).length;
   const recalled = allActive.filter((m) => (m.metadata?.recallCount ?? 0) > 0 || (m.lastAccessedAt || "") > (m.lastObservedAt || "")).length;
@@ -7182,9 +7282,17 @@ function renderMemoryView() {
   main.innerHTML = \`
     <div class="pane">
       <div class="row between" style="margin-bottom:14px;align-items:center;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} active · \${principles} principle\${principles===1?"":"s"} · \${corrections} correction\${corrections===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. Corrections are locked and replace stale facts.")}</span></h2>
+        <h2 style="margin:0;">Saved preferences</h2>
+        <span class="muted">\${savedCount} saved facts and preferences</span>
       </div>
+      <p class="muted">What you asked your agent to keep. Update a fact here, then try recalling it in a new chat.</p>
       <div id="memoryPageChat"></div>
+      <div class="memory-views" role="group" aria-label="Memory view">
+        <button type="button" data-memory-view="saved" aria-pressed="\${f.view === 'saved'}">Saved preferences</button>
+        <button type="button" data-memory-view="all" aria-pressed="\${f.view === 'all'}">All active memories</button>
+        <button type="button" data-memory-view="history" aria-pressed="\${f.view === 'history'}">Correction history</button>
+      </div>
+      <details class="memory-diagnostics"><summary>Advanced memory diagnostics</summary>
       <div class="grid stats" style="margin-bottom:14px;">
         <div class="card"><span class="desc">Recall coverage</span><div class="stat-value">\${recallCoverage}%</div><div class="desc">\${recalled} of \${total} active memories have been used</div></div>
         <div class="card"><span class="desc">Corrections locked</span><div class="stat-value">\${corrections}</div><div class="desc">Superseded facts stay hidden from recall</div></div>
@@ -7197,7 +7305,8 @@ function renderMemoryView() {
           <button data-tier="medium" class="\${f.tier==='medium'?'active':''}" title="Day-to-day. Promoted from short-tier when repeated; demoted to long if it sticks.">Medium <span class="count">\${counts.medium}</span></button>
           <button data-tier="long" class="\${f.tier==='long'?'active':''}" title="Lava — durable truths. Raw items + condensed principles that survived multiple reinforcements.">Long <span class="count">\${counts.long}</span></button>
         </div>
-        <input type="search" id="memSearch" placeholder="search content or tags…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
+      </div></details>
+      <div class="row" style="margin-bottom:16px"><input type="search" id="memSearch" aria-label="Search memories" placeholder="Search saved facts…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
       </div>
       <div class="mem-grid" id="memList"></div>
     </div>
@@ -7211,6 +7320,11 @@ function renderMemoryView() {
       renderMemoryView();
     }
   });
+  document.querySelectorAll("[data-memory-view]").forEach(button => button.addEventListener("click", () => {
+    state.memoryFilter.view = button.dataset.memoryView;
+    state.memoryFilter.tier = "all";
+    renderMemoryView();
+  }));
   document.querySelectorAll("[data-tier]").forEach((b) =>
     b.addEventListener("click", () => { state.memoryFilter.tier = b.dataset.tier; renderMemoryView(); })
   );
@@ -7234,7 +7348,8 @@ function fillMemoryGrid() {
   if (f.tier === "all" || f.tier === "short") items = items.concat((snap.short ?? []).map((m) => ({ ...m, _tier: "short" })));
   if (f.tier === "all" || f.tier === "medium") items = items.concat((snap.medium ?? []).map((m) => ({ ...m, _tier: "medium" })));
   if (f.tier === "all" || f.tier === "long") items = items.concat((snap.long ?? []).map((m) => ({ ...m, _tier: "long" })));
-  items = items.filter((m) => !m.metadata?.supersededBy);
+  items = items.filter(m => f.view === "history" ? Boolean(m.metadata?.supersededBy) : !m.metadata?.supersededBy);
+  if (f.view === "saved") items = items.filter(isSavedMemory);
 
   if (f.query) {
     const q = f.query.toLowerCase();
@@ -7247,12 +7362,12 @@ function fillMemoryGrid() {
   items.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 
   if (items.length === 0) {
-    list.innerHTML = '<div class="empty">No memory items match this filter.</div>';
+    list.innerHTML = '<div class="empty">' + (f.view === "saved" && !f.query ? 'No saved preferences yet. Try: “Remember that I prefer short checklists.”' : 'No memory items match this view.') + '</div>';
     return;
   }
 
   list.innerHTML = items.map((m) => {
-    const tags = (m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
+    const tags = (f.view === "saved" ? [] : m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
     const kindBadge = m.kind === "principle" ? '<span class="badge ok">principle</span>' : "";
     const dangerBadge = (m.dangerLevel || 0) > 0.7 ? '<span class="badge err">⚠ danger</span>' : "";
     const scopeBadge = m.scope && m.scope !== "main" ? \`<span class="badge">\${escapeHtml(m.scope)}</span>\` : "";
@@ -7263,14 +7378,12 @@ function fillMemoryGrid() {
     return \`
       <div class="mem-card tier-\${m._tier}" data-memory-id="\${escapeHtml(m.id)}">
         <div class="mem-head">
-          <span class="badge tier-\${m._tier}">\${m._tier}</span>
-          \${kindBadge}\${correctionBadge}\${dangerBadge}\${scopeBadge}\${recallBadge}
-          <span class="badge">str \${(m.strength ?? 0).toFixed(2)}</span>
+          \${f.view === "saved" ? correctionBadge + recallBadge : '<span class="badge">' + m._tier + '</span>' + kindBadge + correctionBadge + dangerBadge + scopeBadge + recallBadge + '<span class="badge">str ' + (m.strength ?? 0).toFixed(2) + '</span>'}
           <span class="mem-age">\${escapeHtml(age)}</span>
         </div>
         <div class="mem-content">\${escapeHtml(m.content || "")}</div>
         \${tags ? \`<div class="mem-tags">\${tags}</div>\` : ""}
-        <div class="mem-actions"><button type="button" data-memory-correct="\${escapeHtml(m.id)}">Correct this memory</button><span class="muted" data-memory-status></span></div>
+        <div class="mem-actions">\${m.metadata?.supersededBy ? '<span class="muted">Replaced by a newer fact · excluded from recall</span>' : '<button type="button" data-memory-correct="' + escapeHtml(m.id) + '">Update this fact</button>'}<span class="muted" role="status" data-memory-status></span></div>
         <form class="mem-correction" data-memory-form="\${escapeHtml(m.id)}" hidden>
           <label class="desc" for="memory-correction-\${escapeHtml(m.id)}">Replace it with the complete corrected fact</label>
           <textarea id="memory-correction-\${escapeHtml(m.id)}" name="correction" required>\${escapeHtml(m.content || "")}</textarea>
@@ -7565,6 +7678,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
       <div class="card">
         <div class="name">Add an Even Realities G2 node</div>
         <div class="desc">The glasses receive their own revocable node identity with voice-input and text-display capabilities only.</div>
+        <div class="desc"><a href="/g2/connect">Use OpenAGI with “Hey Even” in native Even AI →</a></div>
         <div class="row" style="margin-top:10px; gap:8px;">
           <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn">Generate pairing code</button>
           <button class="ui-btn ui-btn-sm" id="g2DirectTokenBtn">Generate agent URL + token</button>
@@ -7801,11 +7915,11 @@ async function renderOutcomes() {
   const agg = data.aggregate ?? {};
   const recent = data.recent ?? [];
   const byKindCards = Object.entries(agg.byKind ?? {})
-    .map(([k, v]) => \`<div class="card"><span class="desc">\${escapeHtml(k)}</span><div class="stat-value">\${v}</div></div>\`)
+    .map(([k, v]) => \`<div class="card"><span class="desc">\${escapeHtml(k === "autopilot-fire" ? "Scheduled agent runs" : k)}</span><div class="stat-value">\${v}</div></div>\`)
     .join("");
   main.innerHTML = \`
     <div class="pane">
-      <h2>Outcomes <span class="muted" style="font-size:14px;font-weight:400;">· last 7 days</span></h2>
+      <h2>Background activity <span class="muted" style="font-size:14px;font-weight:400;">· last 7 days</span></h2>
       <div class="grid stats">
         <div class="card"><span class="desc">Avg quality</span><div class="stat-value">\${agg.avgQuality ?? "—"}</div></div>
         <div class="card"><span class="desc">Resolved</span><div class="stat-value">\${agg.resolved ?? 0} <span class="muted" style="font-size:14px;">/ \${agg.total ?? 0}</span></div><div class="muted" style="font-size:11px;">\${agg.scored ?? 0} scored · \${agg.timedOut ?? 0} timed out</div></div>
@@ -7815,7 +7929,8 @@ async function renderOutcomes() {
         <div class="card"><span class="desc">Explicit quality</span><div class="stat-value">\${agg.avgExplicitQuality ?? "—"}</div><div class="muted" style="font-size:11px;">direct ratings only</div></div>
       </div>
       \${byKindCards ? \`<h3>By kind</h3><div class="grid stats">\${byKindCards}</div>\` : ""}
-      <h3>Recent</h3>
+      <p class="ui-meta">These are run receipts, not completed tasks. Inferred scores are automatic estimates; only ratings and follow-ups provide user feedback.</p>
+      <h3>Recent runs</h3>
       <div class="grid" id="outcomeList"></div>
     </div>
   \`;
@@ -7829,7 +7944,7 @@ async function renderOutcomes() {
     const sourceBadge = \`<span class="badge">\${escapeHtml(o.source === "explicit-rating" ? "user rated" : o.source === "user-followup" ? "follow-up signal" : o.source ?? "unresolved")}</span>\`;
     el.innerHTML = \`
       <div class="row between">
-        <span class="name">\${escapeHtml(o.kind)} · \${escapeHtml(o.scrutinyAction ?? "—")}</span>
+        <span class="name">\${escapeHtml(o.kind === "autopilot-fire" ? "Scheduled agent run" : o.kind)} · \${escapeHtml(o.scrutinyAction === "propagation" ? "Recommendation review" : o.scrutinyAction ?? "—")}</span>
         <span>\${sourceBadge} \${qBadge}</span>
       </div>
       <div class="desc">\${escapeHtml(o.sessionId ?? "")} · \${escapeHtml(o.channel ?? "")} · \${escapeHtml(new Date(o.at).toLocaleString())}</div>
@@ -7863,7 +7978,7 @@ async function renderScrutiny() {
     .join("");
   main.innerHTML = \`
     <div class="pane">
-      <h2>Scrutiny <span class="muted" style="font-size:14px;font-weight:400;">· cycle \${fitter.cycles ?? 0} · \${fitter.autoApply ? "auto-apply" : "warmup"}\${fitter.restoredWeightsAt ? \` · calibrated \${escapeHtml(new Date(fitter.restoredWeightsAt).toLocaleDateString())}\` : ""}</span></h2>
+      <h2>Learning diagnostics <span class="muted" style="font-size:14px;font-weight:400;">· cycle \${fitter.cycles ?? 0} · \${fitter.autoApply ? "auto-apply" : "warmup"}\${fitter.restoredWeightsAt ? \` · calibrated \${escapeHtml(new Date(fitter.restoredWeightsAt).toLocaleDateString())}\` : ""}</span></h2>
       <div class="row" style="gap:8px;margin-bottom:14px;">
         <button id="fitBtn">Run fit now</button>
       </div>
@@ -7880,7 +7995,8 @@ async function renderScrutiny() {
         <div class="card"><span class="desc">Last run</span><div class="stat-value" style="font-size:14px;">\${fitter.lastRunAt ? escapeHtml(new Date(fitter.lastRunAt).toLocaleString()) : "—"}</div></div>
       </div>
 
-      <h3>Pending proposals</h3>
+      <p class="ui-meta">Each review pass uses recent outcome scores to propose adjustments to internal scoring weights. These are tuning proposals, not tasks or delivered improvements. Automatic scores can be wrong; review the changes before applying them.</p>
+      <h3>Proposed scoring changes</h3>
       <div id="pendingList" class="grid"></div>
     </div>
   \`;
@@ -7900,7 +8016,7 @@ async function renderScrutiny() {
     for (const p of pending.proposals) {
       const c = document.createElement("div");
       c.className = "card";
-      c.innerHTML = \`<div class="row between"><span class="name">cycle \${p.cycle}</span>
+      c.innerHTML = \`<div class="row between"><span class="name">Scoring review \${p.cycle}</span>
         <span class="badge \${p.applied ? "ok" : "warn"}">\${p.applied ? "applied" : "pending"}</span></div>
         <details style="margin-top:8px;"><summary class="desc">view weight deltas</summary><pre>\${escapeHtml(JSON.stringify(p.proposals, null, 2))}</pre></details>
         <div class="row" style="margin-top:8px;"><button class="secondary" data-apply="\${p.cycle}" \${p.applied ? "disabled" : ""}>\${p.applied ? "Applied" : "Apply"}</button></div>\`;
@@ -8416,9 +8532,9 @@ async function renderIntegrations() {
 
   main.innerHTML = \`
     <div class="pane">
-      <h2>Integrations</h2>
+      <h2>Connections</h2>
       <section id="vocaleo-setup" aria-label="Vocaleo phone call setup"></section>
-      <p class="muted">Every source, channel, and MCP in one place. Each row shows all the paths you can use — direct API, MCP, or file-drop. Click "+ Connect this MCP" to register one with one click, or set credentials in <a href="/setup">/setup</a> step 5 / <code>.openagi/.env</code>.</p>
+      <p class="muted">Connect the tools you use here. For messaging and devices: <a href="/?tab=channels">Message channels</a> · <a href="/?tab=nodes">Computers and phones</a> · <a href="/phone-pairing">Connect a phone</a>. Glasses are optional: <a href="/g2/connect">Connect glasses</a>. Each tool below shows its available connection methods. Click "+ Connect this MCP" to register one with one click, or set credentials in <a href="/setup">/setup</a> step 5 / <code>.openagi/.env</code>.</p>
 
       \${integrations.map((it) => \`
         <div class="card" style="padding:14px; margin-bottom:12px;">
@@ -8542,7 +8658,10 @@ async function renderTasks() {
   state.taskFilter = state.taskFilter || { bucket: "all" };
   const targetTaskId = new URLSearchParams(window.location.search).get("task");
   if (targetTaskId) state.taskFilter.bucket = "all";
-  const data = await fetchJson("/tasks?limit=200").catch(() => ({ tasks: [], stats: {} }));
+  const taskStatus = state.taskFilter.bucket === "done" ? "terminal" : "active";
+  let data;
+  try { data = await fetchJson("/tasks?limit=200&status=" + taskStatus); }
+  catch (error) { await renderWorkspaceUnavailable("Tasks", error, renderTasks); return; }
   let tasks = data.tasks ?? [];
   if (targetTaskId && !tasks.some((task) => task.id === targetTaskId)) {
     const target = await fetchJson("/tasks/" + encodeURIComponent(targetTaskId)).catch(() => null);
@@ -8552,7 +8671,7 @@ async function renderTasks() {
   const filterB = state.taskFilter.bucket;
 
   const taskRow = (t) => {
-    const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && t.status !== "completed";
+    const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && !["completed", "cancelled"].includes(t.status);
     const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
     const sourceHref = t.sourceUrl ? safeLinkHref(t.sourceUrl) : null;
     const sourceBadge = t.source && t.source !== "manual"
@@ -8581,17 +8700,17 @@ async function renderTasks() {
     \`;
   };
 
-  const inBucket = (t) => filterB === "all" || t.bucket === filterB;
+  const inBucket = (t) => t.id === targetTaskId || (filterB === "done" ? ["completed", "cancelled"].includes(t.status) : !["completed", "cancelled"].includes(t.status) && (filterB === "all" || t.bucket === filterB));
   const userTasks = tasks.filter((t) => t.queue === "user" && inBucket(t));
   const agentTasks = tasks.filter((t) => t.queue === "agent" && inBucket(t));
-  const userTotal = stats.user?.total ?? 0;
-  const agentTotal = stats.agent?.total ?? 0;
+  const userTotal = stats.user?.active ?? 0;
+  const agentTotal = stats.agent?.active ?? 0;
 
   // Zero tasks EVER is almost always "no source is connected", not "inbox
   // zero". Diagnose it loudly instead of showing two empty sections: which
   // task sources are configured, and the last sync's skip reason when not.
   let gettingStarted = "";
-  if (userTotal === 0 && agentTotal === 0) {
+  if ((stats.user?.total ?? 0) === 0 && (stats.agent?.total ?? 0) === 0) {
     const integ = await fetchJson("/integrations/status").catch(() => null);
     const taskSources = (integ?.integrations ?? []).filter((s) => ["linear", "buildbetter"].includes(s.id));
     const rows = taskSources.map((s) => {
@@ -8627,7 +8746,7 @@ async function renderTasks() {
       <section class="ui-section">
         <div class="ui-section-header">
           <h3>My tasks</h3>
-          <span class="ui-section-meta">· \${userTotal} total</span>
+          <span class="ui-section-meta">· \${userTotal} open</span>
         </div>
         \${userTasks.length === 0
           ? \`<div class="ui-empty">Nothing here. Try saying "remind me to call Sarah tomorrow" or "add a task to fix the mouse bug".</div>\`
@@ -8637,7 +8756,7 @@ async function renderTasks() {
       <section class="ui-section">
         <div class="ui-section-header">
           <h3>Agent tasks</h3>
-          <span class="ui-section-meta">· \${agentTotal} total</span>
+          <span class="ui-section-meta">· \${agentTotal} open</span>
         </div>
         <p class="ui-meta" style="margin: 0 0 var(--space-2);">Things OpenAGI has committed to do for you (or that the proactive observer queued).</p>
         \${agentTasks.length === 0
@@ -8694,13 +8813,7 @@ async function renderReview({ append = false } = {}) {
   } catch (error) {
     if (requestGeneration !== review.requestGeneration || state.tab !== "review") return;
     review.loadingAppend = false;
-    main.innerHTML = \`
-      <div class="pane">
-        <h2>Review</h2>
-        <div class="ui-empty">Couldn\\'t load the review queue. <button class="ui-btn ui-btn-sm" id="reviewRetry">Try again</button></div>
-      </div>
-    \`;
-    $("reviewRetry")?.addEventListener("click", () => renderReview());
+    await renderWorkspaceUnavailable("Inbox", error, () => renderReview());
     return;
   }
 
@@ -8716,6 +8829,7 @@ async function renderReview({ append = false } = {}) {
   review.total = page.total ?? 0;
   review.byKind = page.byKind ?? {};
   review.summary = page.summary ?? { total: review.total, byKind: review.byKind };
+  const maintenance = page.maintenance;
 
   const allCounts = review.summary.byKind ?? {};
   const kinds = [
@@ -8760,7 +8874,7 @@ async function renderReview({ append = false } = {}) {
     <div class="pane">
       <div class="ui-row" style="justify-content:space-between; align-items:flex-start; gap:var(--space-4);">
         <div>
-          <h2 style="margin:0;">Review <span class="ui-badge">\${review.summary.total ?? 0} open items</span></h2>
+          <h2 style="margin:0;">Inbox <span class="ui-badge">\${review.summary.total ?? 0} open items</span></h2>
           <p class="ui-meta" style="margin:6px 0 0;">
             These are not all Tasks: the queue contains tasks, drafts, clarifications, and suggestions.
             Quick Ask currently shows \${quickReviewable} reviewable item\${quickReviewable === 1 ? "" : "s"}; \${more} more are searchable here.
@@ -8769,6 +8883,9 @@ async function renderReview({ append = false } = {}) {
         <button class="ui-btn ui-btn-ghost ui-btn-sm" id="reviewCleanup">Run cleanup now</button>
       </div>
 
+      <p class="ui-meta" role="status">\${maintenance?.finishedAt
+        ? "Last cleanup " + escapeHtml(new Date(maintenance.finishedAt).toLocaleString()) + ": " + maintenance.scanned + " reviewed, " + maintenance.retired + " retired, " + maintenance.deferred + " awaiting model review. " + (maintenance.deferralsAnnotated ?? 0) + " inconclusive reviews annotated (may overlap)." + (maintenance.dryRun ? " Preview only; nothing changed." : "") + (maintenance.degraded ? " Some checks could not finish." : "")
+        : "No completed cleanup report yet."} Cleanup checks suggestions and drafts; it does not complete your tasks or remove work just because it is old.</p>
       <form id="reviewSearchForm" class="ui-row" style="margin:var(--space-4) 0 var(--space-3); gap:var(--space-2); align-items:center;">
         <input class="ui-input ui-grow" id="reviewSearch" type="search" maxlength="300" value="\${escapeHtml(review.q)}" placeholder="Search titles, descriptions, sources, and draft text…">
         <select class="ui-input" id="reviewSort" aria-label="Sort review items">
@@ -8870,18 +8987,18 @@ async function renderToday() {
   const date = qsDate || today;
   const isTodayView = date === new Date().toISOString().slice(0, 10);
   const [data, clarifications, planResp, drafts, chStatus] = await Promise.all([
-    fetchJson("/recap/daily?date=" + encodeURIComponent(date)).catch(() => null),
+    fetchJson("/recap/daily?date=" + encodeURIComponent(date)).catch(error => ({ loadError: error })),
     fetchJson("/tasks/clarifications?status=pending").catch(() => []),
     isTodayView ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null),
     isTodayView ? fetchJson("/drafts?status=pending").catch(() => []) : Promise.resolve([]),
-    isTodayView ? fetchJson("/channels").catch(() => null) : Promise.resolve(null)
+    isTodayView ? fetchJson("/channels?source=main").catch(() => null) : Promise.resolve(null)
   ]);
   // Which real outbound transports exist? Only offer "Send" for these;
   // email has no native channel (the user copies it into their mail client).
   const sendChannels = [];
   if (chStatus?.telegram?.configured) sendChannels.push("telegram");
-  if (!data) {
-    main.innerHTML = '<div class="pane"><h2>Today</h2><div class="ui-empty">Couldn\\'t load today\\'s recap.</div></div>';
+  if (!data || data.loadError) {
+    await renderWorkspaceUnavailable("Today", data?.loadError, renderToday);
     return;
   }
   const r = data.recap;
@@ -9229,7 +9346,7 @@ async function renderComputerUse() {
           class="ui-btn \${enabled ? "" : "ui-btn-ghost"} ui-btn-sm"
           data-enabled="\${enabled ? "1" : "0"}"
           title="Toggle computer-use tools on or off without restarting the daemon. Off-flips any active session and unregisters the tools so the agent stops seeing them."
-        >\${enabled ? "✓ Enabled" : "Disabled"}</button>
+        >\${enabled ? "Turn off" : "Enable computer use"}</button>
       </div>
 
       <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
@@ -9249,6 +9366,7 @@ async function renderComputerUse() {
           <span class="ui-badge">tools: \${readiness.toolsRegistered ? "registered" : "hidden"}</span>
         </div>
         <div style="margin-top:var(--space-3);">
+          <p class="ui-meta">\${enabled ? "Select an app in chat and approve its session before control starts." : "Choose Enable computer use above. Then grant Screen Recording and Accessibility in macOS System Settings on the computer you want to control. Turning tools on does not grant these permissions."}</p>
           <button id="computerUseTry" class="ui-btn ui-btn-sm" \${enabled ? "" : "disabled"}>Try in Chat</button>
           <span class="ui-meta" style="margin-left:8px;">Starts with an explicit screen-inspection request; the session approval still appears before use.</span>
         </div>
@@ -9315,7 +9433,7 @@ async function renderComputerUse() {
       } catch (err) {
         showToast("Toggle failed: " + err.message, false);
         toggleBtn.disabled = false;
-        toggleBtn.textContent = wasEnabled ? "✓ Enabled" : "Disabled";
+        toggleBtn.textContent = wasEnabled ? "Turn off" : "Enable computer use";
       }
     });
   }
@@ -9379,6 +9497,12 @@ async function renderActivity() {
   \`;
 
   let listRequest = 0;
+  let historyLoading = false;
+  let historyHasMore = false;
+  let historyRows = [];
+  let historyUntil = new Date().toISOString();
+  state.historyObserver?.disconnect();
+  state.historyObserver = null;
   const loadStatus = async () => {
     const card = $("historyStatusCard");
     if (card) card.setAttribute("aria-busy", "true");
@@ -9400,13 +9524,17 @@ async function renderActivity() {
     const list = $("actResults");
     const loadWrap = $("historyLoadMoreWrap");
     if (!search || !range || !list || !loadWrap) return;
-    if (resetLimit) state.activityFilter.limit = HISTORY_PAGE_SIZE;
+    if (resetLimit) {
+      state.activityFilter.limit = HISTORY_PAGE_SIZE;
+      historyRows = [];
+      historyUntil = new Date().toISOString();
+    }
     const since = sinceFromOption(range.value);
     const q = search.value.trim();
     state.activityFilter.query = q;
     state.activityFilter.since = range.value;
-    const requestedLimit = state.activityFilter.limit;
     const requestId = ++listRequest;
+    historyLoading = true;
     list.setAttribute("aria-busy", "true");
     if (resetLimit) {
       list.innerHTML = '<div class="history-state"><strong>Loading computer history</strong>Gathering matching activity.</div>';
@@ -9418,24 +9546,30 @@ async function renderActivity() {
           ...(q ? { q } : {}),
           ...(since ? { since } : {}),
           kinds: "activity,frame",
-          limit: String(requestedLimit + 1)
+          until: historyUntil,
+          offset: String(historyRows.length),
+          limit: String(HISTORY_PAGE_SIZE + 1)
         }).toString()),
         // Skill cards enrich history but must never become a dependency for
         // reading it: a damaged suggestion store degrades to no cards.
         fetchJson("/proactive/suggestions?status=pending&category=skill&limit=200&view=summary").catch(() => [])
       ]);
       if (requestId !== listRequest || state.tab !== "activity") return;
-      const rows = (Array.isArray(results) ? results : [])
-        .slice(0, requestedLimit)
-        .filter((row) => row?.kind !== "transcript");
-      const hasMore = Array.isArray(results) && results.length > requestedLimit;
+      const page = (Array.isArray(results) ? results : []).slice(0, HISTORY_PAGE_SIZE);
+      historyRows = historyRows.concat(page);
+      const rows = historyRows.filter(row => row?.kind !== "transcript");
+      const hasMore = Array.isArray(results) && results.length > HISTORY_PAGE_SIZE;
+      historyHasMore = hasMore;
       const skillSuggestions = (Array.isArray(suggestions) ? suggestions : [])
         .filter((suggestion) => suggestion?.category === "skill" && suggestion?.status === "pending");
       renderActivityResults(rows, { query: q, hasMore, suggestions: skillSuggestions });
       bindHistorySkillButtons(() => reload());
     } catch (error) {
       if (requestId !== listRequest || state.tab !== "activity") return;
+      historyHasMore = false;
       renderActivityError(error, () => reload({ resetLimit: true }));
+    } finally {
+      if (requestId === listRequest) historyLoading = false;
     }
   };
 
@@ -9443,15 +9577,26 @@ async function renderActivity() {
   $("actSince").addEventListener("change", () => reload({ resetLimit: true }));
   $("historyLoadMore").addEventListener("click", async (event) => {
     const button = event.currentTarget;
+    if (historyLoading || !historyHasMore) return;
+    const pane = main.querySelector(".pane");
+    const previousScroll = pane?.scrollTop ?? 0;
     button.disabled = true;
     button.textContent = "Loading…";
     state.activityFilter.limit += HISTORY_PAGE_SIZE;
     await reload();
+    pane?.scrollTo({ top: previousScroll });
     if (state.tab === "activity" && document.body.contains(button)) {
       button.disabled = false;
       button.textContent = "Load more";
     }
   });
+  if (typeof IntersectionObserver !== "undefined") {
+    state.historyObserver = new IntersectionObserver(entries => {
+      if (state.tab !== "activity") { state.historyObserver?.disconnect(); return; }
+      if (!historyLoading && historyHasMore && entries.some(entry => entry.isIntersecting)) $("historyLoadMore")?.click();
+    }, { root: main, rootMargin: "400px" });
+    state.historyObserver.observe($("historyLoadMoreWrap"));
+  }
   $("askHistory").addEventListener("click", openHistoryChat);
   await Promise.all([reload({ resetLimit: true }), loadStatus()]);
 }
@@ -9903,7 +10048,12 @@ function debounce(fn, ms) {
 
 async function fetchJson(path) {
   const r = await fetch(path);
-  if (!r.ok) throw new Error(\`\${path} -> \${r.status}\`);
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    const error = new Error("Could not load this view.");
+    error.code = body.error; error.status = r.status;
+    throw error;
+  }
   return r.json();
 }
 async function postJson(path, body) {
@@ -10052,17 +10202,20 @@ async function refreshAmbientBadge() {
     const apps = ctx.apps?.length ?? 0;
     const snippets = ctx.snippets?.length ?? 0;
     if (apps === 0 && snippets === 0) {
-      host.textContent = "👀 capture idle";
+      host.hidden = true;
+      host.textContent = "No recent screen context";
       host.style.color = "var(--muted)";
       host.style.borderColor = "var(--line)";
     } else {
+      host.hidden = false;
       const topApp = ctx.apps?.[0]?.app?.split(".").pop() ?? "";
       host.textContent = \`👀 \${apps} app\${apps === 1 ? "" : "s"} · \${snippets} snippet\${snippets === 1 ? "" : "s"}\${topApp ? " · " + topApp : ""}\`;
       host.style.color = "var(--accent)";
       host.style.borderColor = "var(--accent)";
     }
   } catch {
-    host.textContent = "👀 capture off";
+    host.hidden = true;
+    host.textContent = "Screen context unavailable";
     host.style.color = "var(--muted)";
     host.style.borderColor = "var(--line)";
   }
@@ -10285,7 +10438,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","get-started","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","get-started","supervisor","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");

@@ -1141,3 +1141,40 @@ test("agentapi accepts exit zero without depending on one JSON success shape", a
     assert.equal((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).status, "sent");
   }
 });
+
+test("Paseo aliases cannot bypass the send-time self guard", async (t) => {
+  const { cwd, config, store } = setup(t);
+  const executor = createExecutor({ config: { ...config, selfSessionIds: ["native-self"] }, store });
+  for (const provider of ["codex", "claude", "conductor", "antigravity"]) {
+    const thread = { ...codexThread(cwd), kind: "paseo", id: "agent", key: "paseo:host.agent", meta: { aliases: [`${provider}:native-self`] } };
+    const result = await executor.deliver({ thread, message: "continue", route: "paseo-send" });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /own session/);
+  }
+});
+
+test("native Paseo results finalize proposed actions in the fleet journal", async t => {
+  const { cwd, config, store } = setup(t);
+  const thread = { ...codexThread(cwd), kind: "paseo", key: "paseo:host.agent", id: "agent" };
+  for (const status of ["sent", "blocked"]) {
+    const action = store.recordAction({ threadKey: thread.key, route: "paseo-send", status: "proposed" });
+    const executor = createExecutor({ config, store, paseoDelivery: async () => ({ status, detail: "native result", route: "paseo-send" }) });
+    const result = await executor.deliver({ thread, message: "continue", route: "paseo-send", actionId: action.id });
+    assert.equal(result.status, status);
+    const saved = store.actions().find(a => a.id === action.id);
+    assert.equal(saved.status, status);
+    assert.equal(saved.detail, "native result");
+    assert.ok(saved.finishedAt);
+  }
+});
+
+test("existing legacy proposals cannot bypass the Paseo discovery hold", async t => {
+  const { cwd, executor, calls, store } = setup(t);
+  const thread = codexThread(cwd, { excluded: "paseo-discovery-unavailable" });
+  const action = store.recordAction({ threadKey: thread.key, route: "codex-exec", status: "proposed" });
+  const result = await executor.deliver({ thread, route: "codex-exec", message: "continue", actionId: action.id });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /Paseo only/);
+  assert.deepEqual(calls, []);
+  assert.equal(store.actions().find(a => a.id === action.id).status, "blocked");
+});

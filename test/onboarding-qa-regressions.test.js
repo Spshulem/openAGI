@@ -1,0 +1,56 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { MemorySystem } from "../src/memory-system.js";
+import { FileBackedMemorySystem } from "../src/file-backed-memory-system.js";
+import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
+import { getStartedStatus } from "../src/get-started-status.js";
+
+test("a correction replaces the saved preference even when newer summaries dominate recall", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboarding-correction-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const memory = new FileBackedMemorySystem({ dir });
+  const original = memory.remember({ content: "The user prefers checklists with exactly three bullets.", tags: ["tool:remember", "preference", "style", "communication"], scope: "main" }, { tier: "medium", strength: 0.2 });
+  const unrelated = memory.remember({ content: "The user prefers a dark editor.", tags: ["tool:remember", "preference"], scope: "main" });
+  for (let i = 0; i < 8; i++) memory.remember({ content: `Session ${i}: checklist format preference. The user prefers checklists with exactly three bullets. Decision: act.`, tags: ["agent-turn"], source: "agent-host", scope: "main" }, { tier: "short", strength: 1 });
+  const before = original.metadata.recallCount;
+  const corrected = memory.correct({ query: "checklist format preference", content: "The user prefers checklists with exactly two bullets.", scope: "main" });
+  assert.equal(original.metadata.supersededBy, corrected.item.id);
+  assert.equal(original.metadata.recallCount, before, "correction search is not a recall event");
+  assert.equal(unrelated.metadata.supersededBy, undefined);
+  const restored = new FileBackedMemorySystem({ dir });
+  const hits = restored.retrieve("checklist format preference", { limit: 20 });
+  assert.equal(hits[0].item.content, corrected.item.content);
+  assert.ok(!hits.some(({ item }) => item.content.includes("three bullets")), "automatic quotations do not keep the old preference alive");
+  const next = restored.correct({ query: "checklist format preference", content: "The user prefers checklists with exactly one bullet." });
+  assert.equal(restored.items.get(corrected.item.id).metadata.supersededBy, next.item.id);
+});
+
+test("onboarding progress requires actual activity and cross-chat recall, not guide clicks", async () => {
+  const memory = new MemorySystem();
+  let messages = [];
+  let sessions = [];
+  const runtime = { memory, agentHost: { modelProvider: { isConfigured: () => true }, store: {
+    listSessions: () => [{ id: "local:browser:main" }], getSession: () => ({ messages })
+  } }, codingSupervisor: { builtin: { list: () => ({ sessions }) } } };
+  assert.deepEqual(getStartedStatus(runtime), { model: true, chat: false, memory: false, memorySaved: false, agents: false });
+  messages = [{ role: "assistant", content: "fallback", metadata: { model: "deterministic", provider: "deterministic" } }];
+  assert.equal(getStartedStatus(runtime).chat, false);
+  messages = [{ role: "assistant", content: "Your useful answer", metadata: { model: "test-model", provider: "local" } }];
+  assert.equal(getStartedStatus(runtime).chat, true);
+  const tools = new ToolRegistry(); registerCoreTools(tools, runtime);
+  await tools.invoke("remember", { content: "I prefer three checklist bullets", tags: ["preference"] }, { agentId: "main", sessionId: "chat-a" });
+  assert.equal(getStartedStatus(runtime).memorySaved, true);
+  await tools.invoke("recall", { query: "checklist" }, { agentId: "main", sessionId: "chat-a" });
+  assert.equal(getStartedStatus(runtime).memory, false);
+  await tools.invoke("recall", { query: "checklist" }, { agentId: "main", sessionId: "chat-b" });
+  assert.equal(getStartedStatus(runtime).memory, true);
+  assert.equal([...memory.items.values()][0].metadata.recallCount, 2);
+  sessions = [{ status: "failed", replyAvailable: true }];
+  assert.equal(getStartedStatus(runtime).agents, false);
+  sessions = [{ status: "idle", replyAvailable: true }];
+  assert.equal(getStartedStatus(runtime).agents, true);
+  assert.doesNotMatch(JSON.stringify(getStartedStatus(runtime)), /three checklist|Your useful answer|chat-a/);
+});

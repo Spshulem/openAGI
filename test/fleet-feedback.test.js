@@ -42,7 +42,7 @@ test("feedback records: the owner's words, a known intent, a clipped target, sec
   assert.equal(normalizeFeedback({ utterance: "x", intent: "fix", source: "nope" }).source, "text");
   assert.throws(() => normalizeFeedback({ utterance: "", intent: "change" }), /words/);
   assert.throws(() => normalizeFeedback({ utterance: "x", intent: "merge" }), /Intent/);
-  assert.doesNotMatch(normalizeFeedback({ utterance: "key sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", intent: "change" }).utterance, /abcdefghijklmnop/);
+  assert.doesNotMatch(normalizeFeedback({ utterance: "key " + "sk-" + "a".repeat(40), intent: "change" }).utterance, /sk-a{40}/);
   assert.equal(normalizeTarget(null), null);
   assert.equal(normalizeTarget({ evil: "x" }), null);
 });

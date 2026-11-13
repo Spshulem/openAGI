@@ -213,6 +213,7 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| GET | `/mobile/capabilities` | authenticated image-upload support preflight |
 | POST | `/mobile/push` | iOS push registration, §7.1 |
 | DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
@@ -279,6 +280,36 @@ listed path are refused with `401`. Shapes are the daemon's
 Supervisor chat is the ordinary `POST /message` with `"thread": "supervisor"`
 (§3.1). The agent has two read-only tools for it, `fleet_status` and
 `fleet_thread`.
+
+### Image attachments
+
+`POST /message` also accepts `attachments` in both `agent` and `supervisor`
+threads. Each item is `{id, name, mimeType, data, thumbnail?}`: `data` is base64
+JPEG, PNG or WebP, and `thumbnail` is an optional base64 JPEG preview. No URLs
+or filesystem paths are accepted. Up to four images, 1 MiB each and 3 MiB total,
+fit within the 5 MiB JSON request limit. An empty text plus images is a valid turn.
+
+The iOS Photos and Files pickers downsample images off the main thread, normalize
+orientation, remove source metadata, and show removable previews before sending.
+Before uploading, iOS checks the authenticated `/mobile/capabilities` response
+for image support. A missing or unsupported endpoint shows update guidance and
+keeps the draft and its attachments available for retry.
+OpenAI/ChatGPT, Claude and compatible local vision models receive native image
+content blocks. Language-only on-device models explicitly report that a vision
+model is required. Old servers reject images with update guidance; the phone
+never retries an image turn as text alone.
+
+Full image data is retained in the agent session for subsequent model turns.
+Shared history returns only attachment identity/name and a bounded thumbnail;
+SSE does not echo the pixels. The phone caches only these small previews.
+
+Offline conversation mirrors carry validated full image attachments separately
+from bounded public message metadata. Pages and snapshots containing photos use
+mirror version 2; text-only payloads remain version 1. New readers accept both.
+Legacy readers reject version 2 before acknowledging an upload, so the phone
+retains unsent originals rather than replacing them with a text-only snapshot.
+Both import paths restore the validated pixels to message attachments without
+importing owner-authority metadata.
 
 ### 3.1 Chat threads
 
@@ -439,6 +470,14 @@ whole protocol:
   full pending count, uncapped.
 - `brief.headline` is one human-readable sentence assembled server-side
   ("2 things today, 1 overdue, 3 waiting on you").
+
+`taskReview` is optional (older servers omit it). It reports the latest
+relevance sweep as `{status, attemptedAt, lastReviewedAt}`. Status is `reviewed`,
+`no_tasks`, `unavailable` (no configured model), or `failed`. `lastReviewedAt`
+advances only after a complete valid review, or a sweep with no active tasks;
+a failed attempt retains the prior successful timestamp. Fetching the summary
+only syncs saved work; it does not trigger a relevance review. Age alone is
+not evidence that an unfinished task should be removed.
 
 ### ETag / 304
 

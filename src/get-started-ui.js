@@ -1,12 +1,5 @@
 import { GET_STARTED_FLOWS } from "./get-started.js";
 
-function gettingStartedProgress() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("openagi.getStarted.v1") || "[]");
-    return new Set(Array.isArray(saved) ? saved.filter(id => GET_STARTED_FLOWS.some(flow => flow.id === id)) : []);
-  } catch { return new Set(); }
-}
-
 async function startGettingStartedChat(id) {
   const flow = GET_STARTED_FLOWS.find(item => item.id === id);
   if (!flow) return;
@@ -40,57 +33,71 @@ async function startGettingStartedChat(id) {
   // Draft only. The user reads/edits the request and chooses Send.
 }
 
-function renderGettingStarted() {
-  const progress = gettingStartedProgress();
+async function renderGettingStarted() {
   main.innerHTML = "";
+  const page = document.createElement("div"); page.className = "guide-page";
+  main.append(page);
   const el = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text) node.textContent = text;
     if (className) node.className = className;
     return node;
   };
-  const page = el("div", "", "guide-page");
-  page.append(el("div", "Make it yours", "eyebrow"));
-  page.append(el("h2", "A little more useful, every day."));
-  page.append(el("p", "An agent that remembers your preferences, follows your work, and connects your devices. Start with one conversation. Add the rest when you need it.", "guide-intro"));
-  const cardFor = (flow, featured = false) => {
-    const card = el("section", "", featured ? "guide-featured" : "guide-card");
-    if (featured) card.append(el("span", "01", "guide-number"));
-    const body = el("div");
-    if (featured) body.append(el("div", "Start here · " + flow.time, "eyebrow"));
-    body.append(el("h3", flow.title), el("p", flow.description));
-    const chat = el("button", featured ? "Meet your agent →" : "Try it in chat →", featured ? "ui-btn ui-btn-primary" : "");
-    chat.type = "button";
-    chat.onclick = () => startGettingStartedChat(flow.id);
-    body.append(chat);
-    const details = el("details");
-    details.append(el("summary", "What you’ll try"));
-    const steps = el("ol");
-    for (const step of flow.steps) steps.append(el("li", step));
+  page.append(el("div", "Make it yours", "eyebrow"), el("h2", "Three ways to put your agent to work."));
+  page.append(el("p", "Get a useful answer, teach a preference, or follow a coding session. Start with what matters to you.", "guide-intro"));
+  let progress = null;
+  try { progress = await fetchJson("/getting-started"); } catch { /* show an honest unavailable state */ }
+  if (!page.isConnected) return;
+  const milestones = [
+    ["model", "Model configured", "Connect a model", "/setup"],
+    ["chat", "First model reply", "Meet your agent", "chat"],
+    ["memory", "Preference recalled in another chat", progress?.memorySaved ? "Verify your saved preference" : "Save a preference", "memory"],
+    ["agents", "Managed session replied", "Connect a coding session", "agents"]
+  ];
+  const progressList = el("ol", "", "onboarding-milestones");
+  progressList.setAttribute("aria-label", "Setup progress");
+  for (const [id, label] of milestones) {
+    const item = el("li", "", progress?.[id] ? "complete" : "");
+    item.append(el("span", progress?.[id] ? "✓" : "○", "milestone-mark"), el("span", label));
+    item.append(el("small", progress ? (progress[id] ? "Verified from saved activity" : id === "memory" && progress.memorySaved ? "Saved · try recalling it in a new chat" : "Ready when you are") : "Could not check progress"));
+    progressList.append(item);
+  }
+  page.append(progressList);
+  const next = progress && milestones.find(([id]) => !progress[id]);
+  if (next) {
+    const box = el("section", "", "guide-next");
+    box.append(el("span", "Next step", "eyebrow"));
+    const action = el(next[3] === "/setup" ? "a" : "button", next[2] + " →", "ui-btn ui-btn-primary");
+    if (next[3] === "/setup") action.href = "/setup";
+    else action.onclick = () => next[3] === "agents" ? window.location.assign("/fleet") : startGettingStartedChat(next[3]);
+    box.append(action); page.append(box);
+  }
+  const cardFor = flow => {
+    const card = el("section", "", "guide-card");
+    card.append(el("h3", flow.title), el("p", flow.description));
+    const action = el(flow.id === "agents" ? "a" : "button", flow.id === "agents" ? "Open Supervisor →" : "Try it in chat →", "ui-btn");
+    if (flow.id === "agents") action.href = "/fleet";
+    else action.onclick = () => startGettingStartedChat(flow.id);
+    card.append(action);
+    const details = el("details"); details.append(el("summary", "How it works"));
+    const steps = el("ol"); for (const step of flow.steps) steps.append(el("li", step));
     const link = el("a", flow.linkLabel + " →"); link.href = flow.link;
     if (flow.link.startsWith("https://")) { link.target = "_blank"; link.rel = "noopener noreferrer"; }
     details.append(steps, link);
-    const label = el("label", "", "guide-check");
-    const check = el("input"); check.type = "checkbox"; check.checked = progress.has(flow.id);
-    check.onchange = () => {
-      if (check.checked) progress.add(flow.id); else progress.delete(flow.id);
-      try { localStorage.setItem("openagi.getStarted.v1", JSON.stringify([...progress])); } catch { /* private browsing */ }
-      renderGettingStarted();
-    };
-    label.append(check, el("span", "I tried this guide"));
-    details.append(label); body.append(details); card.append(body); return card;
+    if (flow.id === "agents") {
+      const chat = el("button", "Ask your agent for help"); chat.onclick = () => startGettingStartedChat("agents"); details.append(chat);
+    }
+    card.append(details); return card;
   };
-  page.append(cardFor(GET_STARTED_FLOWS[0], true));
-  page.append(el("h3", "Explore at your own pace", "section-label"));
-  const grid = el("div", "", "guide-grid");
-  for (const flow of GET_STARTED_FLOWS.slice(1)) grid.append(cardFor(flow));
-  page.append(grid);
+  const core = el("div", "", "guide-grid guide-core");
+  GET_STARTED_FLOWS.slice(0, 3).forEach(flow => core.append(cardFor(flow))); page.append(core);
+  const more = el("details", "", "guide-more"); more.append(el("summary", "Explore screen access, devices and building your own integrations"));
+  const grid = el("div", "", "guide-grid"); GET_STARTED_FLOWS.slice(3).forEach(flow => grid.append(cardFor(flow))); more.append(grid); page.append(more);
   const footer = el("div", "", "guide-footer");
-  footer.append(el("span", progress.size + " of " + GET_STARTED_FLOWS.length + " guides tried · Your personal checklist"));
-  const guide = el("a", "Read the getting started guide ↗");
-  guide.href = "https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md"; guide.target = "_blank"; guide.rel = "noopener noreferrer";
-  footer.append(guide); page.append(footer); main.append(page);
+  footer.append(el("span", "Progress comes from your saved activity. Opening a guide never marks it complete."));
+  const guide = el("a", "Getting started guide ↗"); guide.href = "https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md";
+  guide.target = "_blank"; guide.rel = "noopener noreferrer"; footer.append(guide); page.append(footer);
 }
 
 export const getStartedUi = `const GET_STARTED_FLOWS = ${JSON.stringify(GET_STARTED_FLOWS)};\n`
-  + [gettingStartedProgress, startGettingStartedChat, renderGettingStarted].map(fn => fn.toString()).join("\n");
+  + [startGettingStartedChat, renderGettingStarted].map(fn => fn.toString()).join("\n");
