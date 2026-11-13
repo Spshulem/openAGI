@@ -97,9 +97,13 @@ final class PendingActionDecodingTests: XCTestCase {
             action("mine", session: "devices:agent:main", at: 10),
             action("mine-before-asking", session: "devices:agent:main", at: -60)
         ]
-        let raised = PendingAction.raised(in: actions, thread: "agent", conversationID: "main", since: asked)
+        let raised = PendingAction.raised(in: actions, thread: .agent, conversationID: "main", since: asked)
         XCTAssertEqual(raised.map(\.id), ["mine"])
-        XCTAssertEqual(actions[4].sessionID, "devices:agent:main")
-        XCTAssertNil(actions[3].sessionID)
+        XCTAssertEqual(actions.first { $0.id == "mine" }?.sessionID, "devices:agent:main")
+        XCTAssertNil(actions.first { $0.id == "no-context" }?.sessionID)
+        // A main without shared threads: no session to match, keep the old window.
+        let legacy = PendingAction.raised(in: actions, thread: .agent, conversationID: "main",
+                                          since: asked, scopedToSession: false)
+        XCTAssertEqual(legacy.map(\.id), ["other-1", "other-2", "other-3"])
     }
 }

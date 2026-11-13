@@ -31,8 +31,10 @@ public struct ChatStatusFrame: Codable, Sendable, Equatable {
         let stage = stage.trimmingCharacters(in: .whitespacesAndNewlines)
         switch stage {
         case "": return nil
-        case "routing": return "Getting started"
-        case "thinking": return "Thinking"
+        // Every model hop reports `model`, and a queued local turn `queued`:
+        // say what the person sees, not the pipeline's stage name.
+        case "routing", "queued": return "Getting started"
+        case "thinking", "model": return "Thinking"
         case "saving": return "Saving"
         default:
             let words = stage.replacingOccurrences(of: "-", with: " ")

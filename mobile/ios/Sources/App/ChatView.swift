@@ -462,9 +462,13 @@ struct ChatConversationView: View {
     private var raisedApprovals: [PendingAction] {
         guard let asked = messages.last(where: { $0.role == .user })?.timestamp else { return [] }
         return PendingAction.raised(in: model.workspace.pendingActions ?? [],
-                                    thread: conversation.thread.rawValue,
+                                    thread: conversation.thread,
                                     conversationID: conversation.conversationID,
-                                    since: asked)
+                                    since: asked,
+                                    // A main that predates shared threads runs
+                                    // phone chats under other session ids; keep
+                                    // showing every recent approval there.
+                                    scopedToSession: conversation.historyStatus != .needsUpdate)
     }
 
     private var chatHome: some View {
@@ -826,7 +830,7 @@ private struct MessageBubbleRow: View {
             } else if !message.text.isEmpty {
                 MarkdownContent(blocks: MarkdownParser.parse(message.text))
             }
-            if message.isStreaming && (message.text.isEmpty || message.activity != nil) {
+            if message.isStreaming {
                 ChatWorkingLine(text: message.activity ?? "Thinking")
             }
             if showsActions { actions }

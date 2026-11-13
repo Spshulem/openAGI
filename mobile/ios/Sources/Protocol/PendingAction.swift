@@ -31,11 +31,11 @@ extension PendingAction {
     // `/pending-actions` is daemon-wide: keep only the approvals this
     // conversation raised since `since`, before limiting, so other chats'
     // requests can neither appear here nor displace this turn's own.
-    public static func raised(in actions: [PendingAction], thread: String, conversationID: String,
-                              since: Date, limit: Int = 3) -> [PendingAction] {
-        let session = "devices:\(thread):\(conversationID)"
+    public static func raised(in actions: [PendingAction], thread: ConversationThread, conversationID: String,
+                              since: Date, scopedToSession: Bool = true, limit: Int = 3) -> [PendingAction] {
+        let session = "devices:\(thread.rawValue):\(conversationID)"
         return Array(actions
-            .filter { $0.sessionID == session && $0.createdAt >= since.addingTimeInterval(-5) }
+            .filter { (!scopedToSession || $0.sessionID == session) && $0.createdAt >= since.addingTimeInterval(-5) }
             .prefix(limit))
     }
 }

@@ -20,6 +20,8 @@ final class ChatEventTests: XCTestCase {
         XCTAssertEqual(frame.activityLabel, "Using fleet status")
         XCTAssertEqual(ChatStatusFrame(stage: "routing").activityLabel, "Getting started")
         XCTAssertEqual(ChatStatusFrame(stage: "thinking").activityLabel, "Thinking")
+        XCTAssertEqual(ChatStatusFrame(stage: "model").activityLabel, "Thinking")
+        XCTAssertEqual(ChatStatusFrame(stage: "queued").activityLabel, "Getting started")
         XCTAssertEqual(ChatStatusFrame(stage: "model-call").activityLabel, "Model call")
         XCTAssertEqual(ChatStatusFrame(stage: "tool", tool: "  ").activityLabel, "Tool")
         XCTAssertNil(ChatStatusFrame(stage: " ").activityLabel)
