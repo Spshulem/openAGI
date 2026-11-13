@@ -444,18 +444,22 @@ export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
 // they are only ever typed into the app, never resumed in the background.
 export const CODEX_DESKTOP_ORIGINATOR = "Codex Desktop";
 const CODEX_APP_ORIGINATORS = new Set([CODEX_DESKTOP_ORIGINATOR, "codex_work_desktop"]);
+const CODEX_CLI_SOURCES = new Set(["cli", "exec"]);
 
-// A thread an app started. Older catalogs leave originator null, but still
-// record source "vscode" for the app's threads (codex exec writes "exec",
-// the CLI "cli").
+// Preserve the app boundary for legacy catalogs with no originator. A CLI-like
+// originator alone must not override source "vscode": it can describe the
+// client resuming a thread, not the app where that thread belongs.
 export function codexAppOwned(thread) {
   return CODEX_APP_ORIGINATORS.has(thread?.meta?.originator) || thread?.meta?.source === "vscode";
 }
 
-// A Codex thread codex exec must not resume: Conductor's (it would fork) or
-// the Codex app's (it would lock the owner out of it).
+// A Codex thread codex exec must not resume: Conductor's (it would fork), the
+// Codex app's (it would lock the owner out), or anything whose ownership is
+// not positively identified as CLI-owned.
 export function codexExecBarred(thread) {
-  return thread?.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread);
+  if (thread?.kind !== "codex") return false;
+  return thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread)
+    || !CODEX_CLI_SOURCES.has(thread.meta?.source);
 }
 
 // sessionTitle: the Conductor tab title (null when untitled); sessionCount:
