@@ -302,6 +302,52 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
     }
 
+    func testChatRedesignEmptyStateRepliesWorkingLineAndApprovalCard() {
+        let app = launch(["--ui-chat-redesign", "--ui-dark"])
+        tab(app, "Chat")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        let composer = element(app, "chat-composer")
+        composer.tap()
+        composer.typeText("What is waiting on me?")
+        capture("redesign-chat-composer", app: app)
+        tap(app, "chat-send")
+        XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertTrue(element(app, "chat-reply-copy").waitForExistence(timeout: 5), "The newest reply offers Copy")
+        XCTAssertTrue(element(app, "chat-approval-raised-approval").waitForExistence(timeout: 10),
+                      "An approval raised by the turn shows under its reply")
+        capture("redesign-chat-approval", app: app)
+        tap(app, "chat-approval-review-raised-approval")
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 5))
+        capture("redesign-chat-approval-review", app: app)
+    }
+
+    func testChatRedesignEmptyStateOffersStartingPoints() {
+        let app = launch(["--ui-empty-chat", "--ui-dark"])
+        tab(app, "Chat")
+        XCTAssertTrue(element(app, "chat-home").waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["What can I take off your plate?"].exists)
+        let plan = element(app, "chat-suggestion-plan")
+        XCTAssertEqual(plan.frame.minX, app.frame.width - plan.frame.maxX, accuracy: 2,
+                       "Starting points sit inside the screen gutters, centred")
+        capture("redesign-chat-empty", app: app)
+        tap(app, "chat-suggestion-plan")
+        XCTAssertEqual(element(app, "chat-composer").value as? String, "Help me plan my day")
+    }
+
+    func testChatRedesignWorkingLineNamesTheTool() {
+        let app = launch(["--ui-chat-working", "--ui-dark"])
+        tab(app, "Chat")
+        let composer = element(app, "chat-composer")
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        composer.tap()
+        composer.typeText("Check my agents")
+        tap(app, "chat-send")
+        let working = element(app, "chat-working")
+        XCTAssertTrue(working.waitForExistence(timeout: 10))
+        XCTAssertTrue(working.label.contains("Using fleet status"), working.label)
+        capture("redesign-chat-working", app: app)
+    }
+
     func testShortBubblesStayCompactAndLongMarkdownWrapsWithoutClipping() {
         let app = launch(["--ui-long-chat"])
         tab(app, "Chat")
