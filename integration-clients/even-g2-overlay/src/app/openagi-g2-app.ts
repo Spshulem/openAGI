@@ -563,7 +563,7 @@ export class OpenAGIG2App {
         if (stored.homeMode === 'lifelog') { await this.startLifelog(); return }
         if (stored.homeMode === 'talk') {
           let index = -1
-          stored.history.forEach((entry, position) => { if (entry.conversationId === stored.conversationId) index = position })
+          stored.history.forEach((entry, position) => { if (entry.thread === 'agent' && entry.conversationId === stored.conversationId) index = position })
           if (index >= 0) await this.selectAnswer(index)
         }
         return
@@ -780,7 +780,7 @@ export class OpenAGIG2App {
       } catch (error) { this.phone.activity?.(`Shared conversation unavailable: ${safeOpenAGIError(error)} Showing answers saved on this phone.`) }
       if (request !== this.recentRequest || this.mode !== from || this.exited) return
     }
-    this.recentEntries = entries ?? this.store.snapshot().history.map((entry, local) => ({ question: entry.question, reply: entry.reply, local }))
+    this.recentEntries = entries ?? this.store.snapshot().history.flatMap((entry, local) => entry.thread === this.thread ? [{ question: entry.question, reply: entry.reply, local }] : [])
     this.showRecent(this.recentEntries.length - 1)
   }
   private showRecent(index: number): void {
@@ -894,6 +894,13 @@ export class OpenAGIG2App {
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
     const entry = this.store.snapshot().history[index]
     if (!entry) return
+    if (entry.thread === 'supervisor') {
+      // Read-only: a supervisor reply never moves the agent chat.
+      this.pages = paginateText(plainAnswer(entry.reply), 260); this.phone.paired(true); this.showAnswer(0)
+      this.phone.preview?.(entry.reply)
+      this.phone.set('Supervisor answer', `${entry.question} — Switch to Supervisor to ask the supervisor a follow-up.`)
+      return
+    }
     await this.store.update({ conversationId: entry.conversationId, continuation: entry.continuation })
     this.pages = paginateText(plainAnswer(entry.reply), 260); this.phone.paired(true); this.showAnswer(0)
     this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(entry.reply)
@@ -1124,8 +1131,10 @@ export class OpenAGIG2App {
     const conversationId = this.store.snapshot().conversationId
     if (!conversationId) { this.fail(new Error('Start a conversation before asking.')); return }
     // Talk and Lifelog share the owner's agent conversation across devices;
-    // Supervisor mode talks to the supervisor's own thread.
-    const thread = this.thread
+    // Supervisor mode talks to the supervisor's own thread. A resumed request
+    // keeps the thread it was sent on.
+    const thread = recovery?.resume ? (this.store.snapshot().pendingRequest?.thread ?? 'agent') : this.thread
+    const answerer = thread === 'supervisor' ? 'The supervisor' : 'The agent'
     const controller = new AbortController()
     this.requestController = controller; this.mode = 'thinking'; this.pages = []; this.page = 0
     this.cancelConfirmation = false; this.activityView = false; this.activityLines = []; this.activityOffset = 0
@@ -1179,7 +1188,7 @@ export class OpenAGIG2App {
       received = result
       await this.store.update({ savedDraft: '' })
       this.phone.pendingQuestion?.(null); this.phone.draft?.(null)
-      await this.store.remember(result.question, result.reply)
+      await this.store.remember(result.question, result.reply, thread)
       this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(plainAnswer(result.reply))
       this.pages = paginateText(plainAnswer(result.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
       this.phone.set('Answer ready', `${this.pages.length} page${this.pages.length === 1 ? '' : 's'} on G2`)
@@ -1191,11 +1200,11 @@ export class OpenAGIG2App {
         // discard the completed answer or offer to repeat completed actions.
         this.phone.preview?.(plainAnswer(received.reply))
         this.pages = paginateText(plainAnswer(received.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
-        this.phone.set('Answer received · local update failed', `${safeOpenAGIError(error)} The agent already completed this question. Do not resend to retry saving history.`)
+        this.phone.set('Answer received · local update failed', `${safeOpenAGIError(error)} ${answerer} already completed this question. Do not resend to retry saving history.`)
         this.phone.activity?.(`Answer received; local update failed: ${safeOpenAGIError(error)}`)
       } else if (rejected) this.fail(error)
       else if (partial) {
-        await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`).catch(() => undefined)
+        await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`, thread).catch(() => undefined)
         this.phone.history?.(this.store.snapshot().history)
         this.phone.preview?.(`Incomplete answer:\n${plainAnswer(partial)}`)
         this.pages = paginateText(`Incomplete answer:\n${plainAnswer(partial)}`, 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
