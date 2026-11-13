@@ -137,7 +137,8 @@ final class ChatConversation {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
                 case .delta(let frame):
-                    messages[index].activity = nil
+                    // The working line stays under the text received so far
+                    // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
                         messages[index].text = frame.text
                     } else {

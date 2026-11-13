@@ -326,9 +326,12 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Chat")
         XCTAssertTrue(element(app, "chat-home").waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["What can I take off your plate?"].exists)
+        // Measure against the chat column, not the window: on a foldable
+        // the chat sits on one side of the hinge.
+        let column = element(app, "chat-history").frame
         let plan = element(app, "chat-suggestion-plan")
-        XCTAssertEqual(plan.frame.minX, app.frame.width - plan.frame.maxX, accuracy: 2,
-                       "Starting points sit inside the screen gutters, centred")
+        XCTAssertEqual(plan.frame.minX - column.minX, column.maxX - plan.frame.maxX, accuracy: 2,
+                       "Starting points sit inside the chat gutters, centred")
         capture("redesign-chat-empty", app: app)
         tap(app, "chat-suggestion-plan")
         XCTAssertEqual(element(app, "chat-composer").value as? String, "Help me plan my day")

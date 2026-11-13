@@ -261,6 +261,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             actions.insert(["id": "raised-approval", "toolName": "send_email",
                             "summary": "Send Alex the QA access follow-up",
                             "reason": "You promised Alex an update on QA access. The draft recaps both workflows and keeps enablement pending until you confirm.",
+                            "context": ["sessionId": "devices:agent:main"],
                             "status": "pending", "createdAt": raised], at: 0)
         }
         let decided = decidedActions.withLock { $0 }

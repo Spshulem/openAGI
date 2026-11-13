@@ -20,6 +20,26 @@ public struct PendingAction: Codable, Sendable, Equatable, Identifiable {
     public let error: String?
 }
 
+extension PendingAction {
+    // The daemon records the turn's session in `context.sessionId`; phone
+    // chats run as `devices:<thread>:<conversationId>` (shared-conversations.js).
+    public var sessionID: String? {
+        if case .object(let fields) = context, case .string(let id) = fields["sessionId"] { return id }
+        return nil
+    }
+
+    // `/pending-actions` is daemon-wide: keep only the approvals this
+    // conversation raised since `since`, before limiting, so other chats'
+    // requests can neither appear here nor displace this turn's own.
+    public static func raised(in actions: [PendingAction], thread: String, conversationID: String,
+                              since: Date, limit: Int = 3) -> [PendingAction] {
+        let session = "devices:\(thread):\(conversationID)"
+        return Array(actions
+            .filter { $0.sessionID == session && $0.createdAt >= since.addingTimeInterval(-5) }
+            .prefix(limit))
+    }
+}
+
 public struct PendingActionsResponse: Codable, Sendable {
     public let actions: [PendingAction]
 }

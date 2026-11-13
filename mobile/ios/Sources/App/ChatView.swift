@@ -457,13 +457,14 @@ struct ChatConversationView: View {
 
     private static let endOfConversation = UUID()
 
-    // Approvals the agent raised since your latest message, shown under its
-    // reply. Older ones live in the Inbox.
+    // Approvals this conversation raised since your latest message, shown
+    // under its reply. Older ones, and other chats', live in the Inbox.
     private var raisedApprovals: [PendingAction] {
         guard let asked = messages.last(where: { $0.role == .user })?.timestamp else { return [] }
-        return Array((model.workspace.pendingActions ?? [])
-            .filter { $0.createdAt >= asked.addingTimeInterval(-5) }
-            .prefix(3))
+        return PendingAction.raised(in: model.workspace.pendingActions ?? [],
+                                    thread: conversation.thread.rawValue,
+                                    conversationID: conversation.conversationID,
+                                    since: asked)
     }
 
     private var chatHome: some View {

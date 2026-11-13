@@ -76,4 +76,30 @@ final class PendingActionDecodingTests: XCTestCase {
         XCTAssertTrue(description.contains("a@b.com"))
         XCTAssertTrue(description.contains("[x, y]"))
     }
+
+    // `/pending-actions` is daemon-wide. A chat shows only approvals its own
+    // session raised since the owner's latest message, so another chat's
+    // newer requests can neither appear nor push this turn's out of the limit.
+    func testRaisedApprovalsKeepOnlyThisConversationsRecentRequests() {
+        let asked = Date(timeIntervalSince1970: 1_000_000)
+        func action(_ id: String, session: String?, at offset: TimeInterval) -> PendingAction {
+            PendingAction(id: id, toolName: "send_email", args: nil,
+                          context: session.map { .object(["sessionId": .string($0)]) },
+                          summary: id, reason: nil, dedupeKey: nil, status: "pending",
+                          createdAt: asked.addingTimeInterval(offset), expiresAt: nil,
+                          decidedAt: nil, decidedBy: nil, result: nil, error: nil)
+        }
+        let actions = [
+            action("other-1", session: "devices:agent:other", at: 30),
+            action("other-2", session: "devices:supervisor:main", at: 29),
+            action("other-3", session: "devices:agent:other", at: 28),
+            action("no-context", session: nil, at: 27),
+            action("mine", session: "devices:agent:main", at: 10),
+            action("mine-before-asking", session: "devices:agent:main", at: -60)
+        ]
+        let raised = PendingAction.raised(in: actions, thread: "agent", conversationID: "main", since: asked)
+        XCTAssertEqual(raised.map(\.id), ["mine"])
+        XCTAssertEqual(actions[4].sessionID, "devices:agent:main")
+        XCTAssertNil(actions[3].sessionID)
+    }
 }
