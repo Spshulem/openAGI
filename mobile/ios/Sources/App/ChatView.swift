@@ -292,8 +292,11 @@ struct ChatConversationView: View {
             }
             .accessibilityIdentifier("chat-history")
             .scrollPosition($scrollPosition)
+            // Long histories open at the newest line. No bottom anchor for
+            // .alignment: with a history about one screen tall it fed a
+            // layout loop with the keyboard's safe area (the app hung as the
+            // keyboard rose). A short chat reads from the top.
             .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .alignment)
             .onScrollPhaseChange { _, phase in
                 userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
             }
