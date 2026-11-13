@@ -18,6 +18,19 @@ test("fleet page is a standalone document with the four sections", () => {
   for (const mode of ["observe", "propose", "auto"]) assert.ok(fleetPage.includes('data-mode="' + mode + '"'), mode);
 });
 
+test("fleet page says when the mode is not confirmed by the fleet computer", async () => {
+  const waiting = boot({ state: sampleState({ mode: null, modeConfirmed: false }) });
+  await flush();
+  assert.equal(waiting.el("modeHint").textContent, "Waiting for the fleet computer.");
+  for (const mode of ["observe", "propose", "auto"]) assert.equal(waiting.el("mode-" + mode).attributes?.["aria-pressed"] ?? "false", "false");
+  const last = boot({ state: sampleState({ mode: "auto", modeConfirmed: false }) });
+  await flush();
+  assert.equal(last.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
+  const live = boot({ state: sampleState({ mode: "auto", modeConfirmed: true }) });
+  await flush();
+  assert.notEqual(live.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
+});
+
 test("fleet page script parses", () => {
   assert.doesNotThrow(() => new vm.Script(pageScript()));
 });

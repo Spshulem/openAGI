@@ -406,7 +406,9 @@ a.btn.primary{color:var(--ink)}
       b.setAttribute('aria-pressed', current && current.mode === m ? 'true' : 'false');
       b.disabled = modeBusy;
     });
-    $('modeHint').textContent = current ? (MODE_HINT[current.mode] || '') : '';
+    $('modeHint').textContent = !current ? ''
+      : current.modeConfirmed === false ? (current.mode ? 'Last reported mode. Waiting for the fleet computer.' : 'Waiting for the fleet computer.')
+      : (MODE_HINT[current.mode] || '');
   }
 
   function renderHeader(s) {
