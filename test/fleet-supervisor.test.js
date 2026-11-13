@@ -180,6 +180,82 @@ test("a single-slot scan rotates and leaves excluded threads and deferred questi
   assert.equal(delivered.length, 0, "Observe stays read-only");
 });
 
+// Two Codex and two Claude chats, two slots: each scan reads one pair and
+// defers the other. A deferred chat was not reassessed, so nothing it holds
+// is cleared on its account (PR #279 review).
+const rotatingPairs = (overrides = {}) => [["codex", "a", 1], ["codex", "b", 2], ["claude", "c", 3], ["claude", "d", 4]].map(([kind, id, n]) => makeThread({
+  key: `${kind}:${id}`, kind, id, cwd: `/work/${id}`, lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN), ...overrides
+}));
+
+test("a capped scan keeps deferred members in their grouped question", async (t) => {
+  const threads = rotatingPairs({ agentStatus: "error", prRefs: [], error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } });
+  const { supervisor } = fixture(t, { threads, prs: new Map(), limits: { maxThreads: 2 } });
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.deepEqual(group.threadKeys, ["codex:a", "codex:b"]);
+  await supervisor.tick({ reason: "test" });
+  const kept = supervisor.store.question(group.id);
+  assert.equal(kept.status, "open");
+  assert.deepEqual([...kept.threadKeys].sort(), ["claude:c", "claude:d", "codex:a", "codex:b"], "the deferred pair keeps its seat");
+  assert.match(kept.title, /^4 threads capped/);
+});
+
+test("a capped scan keeps the blocked-UI clock of a deferred thread, so the 30-minute alert still fires", async (t) => {
+  let now = NOW;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const busy = makeThread({ key: "claude:x", kind: "claude", id: "x", cwd: "/work/x", agentStatus: "running", prRefs: [], lastAgentAt: ago(41 * MIN), lastActivityAt: ago(41 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "secure input is on" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [stopped, busy], now: () => now, limits: { maxThreads: 1 }, deps: { uiDriver: driver } });
+  for (let minute = 0; minute <= 40; minute += 5) {
+    await supervisor.tick({ reason: "test" });
+    now += 5 * MIN;
+  }
+  assert.ok(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), "rotation does not restart the clock");
+});
+
+test("a capped scan keeps a deferred thread's proposal open and sendable", async (t) => {
+  const threads = rotatingPairs();
+  const { supervisor, delivered } = fixture(t, { mode: "propose", threads, limits: { maxThreads: 2 } });
+  await supervisor.tick({ reason: "test" });
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed" && a.threadKey === "codex:a");
+  assert.ok(proposed);
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.ok(!snapshot.threads.some((row) => row.key === "codex:a"), "codex:a was deferred");
+  assert.equal(supervisor.store.action(proposed.id).status, "proposed");
+  const result = await supervisor.sendProposed(proposed.id);
+  assert.equal(result?.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+});
+
+test("a capped scan keeps a deferred thread's outage recovery until it is read", async (t) => {
+  let healthy = false;
+  const blocked = makeThread({ agentStatus: "aborted", error: { kind: "lb" }, prRefs: [], lastActivityAt: ago(30 * MIN), lastAgentAt: ago(30 * MIN), lastUserAt: ago(120 * MIN) });
+  const other = makeThread({ key: "claude:x", kind: "claude", id: "x", cwd: "/work/x", agentStatus: "running", prRefs: [], lastActivityAt: ago(31 * MIN), lastAgentAt: ago(31 * MIN) });
+  const threads = [blocked, other];
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads, prs: new Map(), limits: { maxThreads: 1 }, deps: { checkLb: async () => ({ healthy, detail: healthy ? "200" : "503", watchLine: null }) } });
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t1"]);
+  healthy = true;
+  const recovery = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(recovery.threads.map((row) => row.key), ["claude:x"]);
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t1"], "deferred, not reassessed");
+  threads[0] = makeThread({ ...blocked, error: null });
+  await supervisor.tick({ reason: "test" });
+  assert.ok(delivered.some((d) => d.thread.key === "codex:t1" && d.playbook === "infra-recovered"));
+});
+
+test("a capped scan counts a deferred chat when deciding whether a checkout is shared", async (t) => {
+  const looked = [];
+  const clone = ["a", "b"].map((id, n) => makeThread({ key: `codex:${id}`, id, cwd: "/work/clone", branch: "feature/canvas", prRefs: [], lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN) }));
+  const own = makeThread({ key: "codex:c", id: "c", cwd: "/work/own", branch: "feature/own", prRefs: [], lastActivityAt: ago(70 * MIN), lastAgentAt: ago(70 * MIN) });
+  const { supervisor } = fixture(t, { threads: [...clone, own], limits: { maxThreads: 2 }, deps: { findPrForBranch: async (repo, branch) => { looked.push(branch); return branch === "feature/canvas" ? "acme/app#7" : null; } } });
+  await supervisor.tick({ reason: "test" });
+  const second = await supervisor.tick({ reason: "test" });
+  assert.equal(second.threads.length, 2);
+  assert.ok(!looked.includes("feature/canvas"), "the shared checkout's branch is never looked up");
+  for (const thread of clone) assert.deepEqual(thread.prRefs, [], thread.key);
+});
+
 test("a throwing source is recorded and the tick completes", async (t) => {
   const { supervisor } = fixture(t, {
     deps: {
