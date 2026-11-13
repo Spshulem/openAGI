@@ -34,7 +34,9 @@ function setup(t, { results = [], hold = false } = {}) {
 }
 
 function codexThread(cwd, extra = {}) {
-  return { key: "codex:t1", kind: "codex", id: "t1", cwd, archived: false, writerLocked: false, live: null, meta: {}, ...extra };
+  const { meta = {}, ...rest } = extra;
+  return { key: "codex:t1", kind: "codex", id: "t1", cwd, archived: false, writerLocked: false, live: null,
+    meta: { source: "cli", ...meta }, ...rest };
 }
 
 function claudeThread(cwd, extra = {}) {
@@ -108,6 +110,7 @@ test("preconditions block delivery without running anything", async (t) => {
     [{ thread: codexThread(cwd, { archived: true }), route: "codex-exec" }, /archived/],
     [{ thread: codexThread(cwd, { writerLocked: true }), route: "codex-exec" }, /writer-locked/],
     [{ thread: codexThread(cwd, { meta: { originator: "Codex Desktop" } }), route: "codex-exec" }, /codex-app-owned/],
+    [{ thread: { ...codexThread(cwd), meta: {} }, route: "codex-exec" }, /ownership unverified/],
     [{ thread: codexThread(path.join(cwd, "gone")), route: "codex-exec" }, /cwd missing/],
     [{ thread: codexThread(null), route: "codex-exec" }, /cwd missing/],
     [{ thread: claudeThread(cwd), route: "peer-relay" }, /no live peer/],
@@ -125,6 +128,21 @@ test("preconditions block delivery without running anything", async (t) => {
   }
   assert.equal(calls.length, 0);
   assert.deepEqual(store.actions(), []);
+});
+
+test("older Codex exec proposals with unverified ownership are blocked before spawning", async (t) => {
+  const { cwd, calls, store, executor } = setup(t);
+  for (const meta of [undefined, null, {}, { source: null }, { source: "future-app" }, { originator: "codex_cli_rs" }]) {
+    const thread = { ...codexThread(cwd), meta };
+    const proposed = store.recordAction({ threadKey: thread.key, route: "codex-exec", status: "proposed" });
+    const result = await executor.deliver({ thread, message: "continue", route: "codex-exec", actionId: proposed.id });
+    assert.equal(result.status, "blocked", JSON.stringify(meta));
+    assert.match(result.detail, /CLI ownership unverified/);
+    assert.equal(store.action(proposed.id).status, "blocked");
+    assert.equal((await executor.deliver({ thread, message: "continue", route: "codex-exec", dryRun: true })).status, "blocked");
+  }
+  assert.equal(calls.length, 0, "neither direct sends nor dry runs start a child");
+  assert.deepEqual(executor.inFlight(), []);
 });
 
 test("the supervisor never delivers to its own session", async (t) => {
@@ -677,6 +695,21 @@ function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"],
 
 const ownerAtCodex = () => [{ status: "blocked", detail: "owner using Codex", evidence: undefined }];
 
+test("unknown and legacy Codex ownership never bypasses a presence or identity block", async (t) => {
+  for (const detail of ["owner using Codex", "ambiguous: two threads share this title"]) {
+    for (const meta of [undefined, {}, { source: null }, { source: "future-app" },
+      { source: "vscode", originator: null }, { source: "vscode", originator: "codex_cli_rs" }]) {
+      const { cwd, calls, executor, requests } = fallbackSetup(t, { results: [{ status: "blocked", detail }] });
+      const thread = { ...codexThread(cwd), title: "Fixture chat", agentStatus: "idle", meta };
+      const result = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+      assert.equal(result.status, "blocked", JSON.stringify({ meta, detail }));
+      assert.equal(result.route, "computer-use");
+      assert.equal(requests.length, 1);
+      assert.equal(calls.length, 0, "no background child after the UI block");
+    }
+  }
+});
+
 test("an app send blocked only by the owner's presence goes by an allowed background route", async (t) => {
   withoutLbKey(t);
   const { cwd, calls, store, executor, requests } = fallbackSetup(t, { results: ownerAtCodex() });
@@ -850,8 +883,10 @@ test("background route helpers: the presence block and the per-thread route", ()
     assert.equal(isPresenceBlock(delivery), false, JSON.stringify(delivery));
   }
   const config = { backgroundRoutes: ["codex-exec"] };
-  const codex = { kind: "codex", id: "t1", cwd: "/w", meta: {} };
+  const codex = { kind: "codex", id: "t1", cwd: "/w", meta: { source: "exec" } };
   assert.equal(backgroundRouteFor(codex, config), "codex-exec");
+  assert.equal(backgroundRouteFor({ ...codex, meta: { source: "vscode", originator: "codex_cli_rs" } }, config), null, "a CLI-like originator does not undo app protection");
+  assert.equal(backgroundRouteFor({ ...codex, meta: {} }, config), null, "unknown ownership is never a background route");
   assert.equal(backgroundRouteFor({ ...codex, cwd: null }, config), null);
   assert.equal(backgroundRouteFor({ ...codex, agentStatus: "running" }, config), null);
   assert.equal(backgroundRouteFor(codex, { backgroundRoutes: ["peer-relay"] }), null);

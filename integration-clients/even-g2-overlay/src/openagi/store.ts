@@ -33,7 +33,7 @@ const StateSchema = z.object({
   autoSend: z.boolean().default(true),
   connectionMode: z.enum(['enrollment', 'direct']).default('enrollment'),
   agentOrigin: z.string().url().nullable().default(null),
-  history: z.array(z.object({ conversationId: z.string().uuid(), continuation: z.string().max(200).nullable().default(null), question: z.string(), reply: z.string(), at: z.string() })).max(30).default([]),
+  history: z.array(z.object({ conversationId: z.string().uuid(), continuation: z.string().max(200).nullable().default(null), question: z.string(), reply: z.string(), at: z.string(), thread: z.enum(['agent', 'supervisor']).default('agent') })).max(30).default([]),
 })
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
@@ -77,9 +77,10 @@ export class OpenAGIStore {
     return this.snapshot()
   }
   snapshot(): OpenAGIState { return structuredClone(this.state) }
-  async remember(question: string, reply: string): Promise<void> {
+  // Supervisor replies are kept apart from the agent chat they never joined.
+  async remember(question: string, reply: string, thread: ConversationThread = 'agent'): Promise<void> {
     if (!this.state.conversationId) return
-    await this.update({ history: [...this.state.history, { conversationId: this.state.conversationId, continuation: this.state.continuation, question: question.slice(0, 4000), reply: reply.slice(0, 16000), at: new Date().toISOString() }].slice(-30) })
+    await this.update({ history: [...this.state.history, { conversationId: this.state.conversationId, continuation: this.state.continuation, question: question.slice(0, 4000), reply: reply.slice(0, 16000), at: new Date().toISOString(), thread }].slice(-30) })
   }
   update(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const savedPatch = structuredClone(patch)

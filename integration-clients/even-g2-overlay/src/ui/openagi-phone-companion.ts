@@ -454,7 +454,7 @@ export class OpenAGIPhoneCompanion {
     list.prepend(item)
     while (list.children.length > 12) list.lastChild?.remove()
   }
-  history(entries: { question: string; at: string }[]): void {
+  history(entries: { question: string; at: string; thread?: 'agent' | 'supervisor' }[]): void {
     const root = this.actionsSection.querySelector('#recent-answers')
     if (!root) return
     root.replaceChildren()
@@ -474,7 +474,8 @@ export class OpenAGIPhoneCompanion {
       question.textContent = entry.question
       const action = document.createElement('span')
       action.className = 'recent-resume'
-      action.textContent = 'Resume conversation →'
+      // Supervisor replies open to read; only agent answers resume a chat.
+      action.textContent = entry.thread === 'supervisor' ? 'Supervisor · read answer →' : 'Resume conversation →'
       button.append(timestamp, question, action)
       root.append(button)
     })

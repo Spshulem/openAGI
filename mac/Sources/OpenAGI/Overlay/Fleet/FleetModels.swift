@@ -227,7 +227,8 @@ struct FleetState: Decodable, Equatable {
 extension FleetState {
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
-    mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? "observe"
+    // Empty until the fleet computer has reported one: never a guess.
+    mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? ""
     enabled = (try? c.decodeIfPresent(Bool.self, forKey: .enabled)) ?? false
     running = (try? c.decodeIfPresent(Bool.self, forKey: .running)) ?? false
     lastTickAt = try? c.decodeIfPresent(String.self, forKey: .lastTickAt)
