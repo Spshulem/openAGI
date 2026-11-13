@@ -325,13 +325,19 @@ final class NativeNavigationTests: XCTestCase {
         let app = launch(["--ui-empty-chat", "--ui-dark"])
         tab(app, "Chat")
         XCTAssertTrue(element(app, "chat-home").waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["What can I take off your plate?"].exists)
-        // Measure against the chat column, not the window: on a foldable
-        // the chat sits on one side of the hinge.
-        let column = element(app, "chat-history").frame
-        let plan = element(app, "chat-suggestion-plan")
-        XCTAssertEqual(plan.frame.minX - column.minX, column.maxX - plan.frame.maxX, accuracy: 2,
-                       "Starting points sit inside the chat gutters, centred")
+        let heading = app.staticTexts["What can I take off your plate?"]
+        XCTAssertTrue(heading.exists)
+        // Measure against the empty state's own column, not the window or
+        // the scroll view: those run under the safe area, which is lopsided
+        // when the tab rail and status bar sit on one side (iPhone Duo).
+        let home = element(app, "chat-home").frame
+        let history = element(app, "chat-history").frame
+        let plan = element(app, "chat-suggestion-plan").frame
+        XCTAssertEqual(plan.minX, home.minX, accuracy: 2, "Starting points span the chat column")
+        XCTAssertEqual(plan.maxX, home.maxX, accuracy: 2, "Starting points span the chat column")
+        XCTAssertEqual(heading.frame.midX, home.midX, accuracy: 2, "The question is centred in the column")
+        XCTAssertGreaterThanOrEqual(home.minX - history.minX, 18,
+                                    "The empty chat keeps its leading gutter; an edge scroll must not offset it")
         capture("redesign-chat-empty", app: app)
         tap(app, "chat-suggestion-plan")
         XCTAssertEqual(element(app, "chat-composer").value as? String, "Help me plan my day")
