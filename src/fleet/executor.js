@@ -719,7 +719,9 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     return { route, live: { ...thread.live, peerName: fresh.live.peerName, pid: fresh.live.pid, status: fresh.live.status } };
   }
 
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false } = {}) {
+  // typedOnly: a risky ask's owner answer, which only ever goes typed into
+  // the app; a block there returns as is, never by a background route.
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -773,7 +775,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       // for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
       const identity = isCodexIdentityBlock(thread, result);
-      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor")) return result;
+      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor") || typedOnly) return result;
       const why = {};
       const fallback = await fallbackRoute(thread, step.target, deadlineAt, why);
       if (!fallback && identity && why.locked) {

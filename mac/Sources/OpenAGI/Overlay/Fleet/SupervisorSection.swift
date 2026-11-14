@@ -56,22 +56,31 @@ struct SupervisorSection: View {
         statusRow(error, color: .red)
       }
 
-      if fleet.questions.isEmpty {
-        Text("Nothing needs you.").font(.system(size: 11)).foregroundStyle(.tertiary)
+      if let item = fleet.openItem {
+        FleetDetailScreen(item: item)
       } else {
-        ScrollView {
-          VStack(alignment: .leading, spacing: 7) {
-            ForEach(fleet.questions) { question in
-              row(question)
-            }
+        lists
+      }
+    }
+  }
+
+  @ViewBuilder private var lists: some View {
+    Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+    if fleet.questions.isEmpty {
+      Text("Nothing needs you.").font(.system(size: 11)).foregroundStyle(.tertiary)
+    } else {
+      ScrollView {
+        VStack(alignment: .leading, spacing: 7) {
+          ForEach(fleet.questions) { question in
+            row(question)
           }
         }
-        // Taller while a card is opened or a risky ask shows in full.
-        .frame(maxHeight: fleet.expandedQuestions.isEmpty && !fleet.questions.contains(where: \.risky) ? 300 : 420)
       }
-
-      WatchingList()
+      // Taller while a risky ask shows in full.
+      .frame(maxHeight: fleet.questions.contains(where: \.risky) ? 420 : 300)
     }
+
+    WatchingList()
   }
 
   /// A panel-wide message. Its control only hides the message, so it is an
@@ -92,25 +101,28 @@ struct SupervisorSection: View {
     let busy = fleet.inFlight.contains(question.id) || fleet.stillSending.contains(question.id)
     let selected = overlay.fleetContext?.entityRef?.id == question.id || overlay.voiceFocus.questionId == question.id
     let options = question.tappableOptions
-    let open = fleet.expandedQuestions.contains(question.id)
     // A risky ask (release, deploy, delete, merge) is read in full before
-    // any button; so is an opened card.
-    let full = question.risky || open
+    // any button.
+    let full = question.risky
     let chat = question.openChat ?? question.chats.first
     return VStack(alignment: .leading, spacing: 4) {
       if question.risky { FleetRiskyLabel() }
       HStack(alignment: .firstTextBaseline, spacing: 6) {
-        Button { fleet.toggleQuestion(question) } label: {
-          Text(question.title)
-            .font(.system(size: 12, weight: .semibold))
-            .lineLimit(full ? nil : 3)
-            .multilineTextAlignment(.leading)
-            .fixedSize(horizontal: false, vertical: full)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
+        Button { fleet.openQuestion(question) } label: {
+          HStack(alignment: .firstTextBaseline, spacing: 4) {
+            Text(question.title)
+              .font(.system(size: 12, weight: .semibold))
+              .lineLimit(full ? nil : 3)
+              .multilineTextAlignment(.leading)
+              .fixedSize(horizontal: false, vertical: full)
+            Image(systemName: "chevron.right")
+              .font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(open ? "Show less" : "Show the agent's words, the PR and the next step")
+        .help("Open: read the chat and reply")
         if let age = FleetConsumer.age(question.askedTime) {
           Text(age).font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize()
             .help("Asked \(question.askedTime ?? "")")
@@ -125,11 +137,10 @@ struct SupervisorSection: View {
           .lineLimit(full ? nil : 6)
           .fixedSize(horizontal: false, vertical: full)
       }
-      if question.risky && !open, let context = question.displayAskContext {
+      if question.risky, let context = question.displayAskContext {
         Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
-      if open { opened(question) }
       if let note = question.reviewNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
       }
@@ -177,32 +188,6 @@ struct SupervisorSection: View {
     .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(selected ? 0.18 : 0.06)))
     .contentShape(Rectangle())
     .contextMenu { rowMenu(question, busy: busy) }
-  }
-
-  /// An opened card: the agent's words the ask came from, every chat a
-  /// grouped question is about, and its thread's PR, wait and next step.
-  @ViewBuilder private func opened(_ question: FleetQuestion) -> some View {
-    if let context = question.displayAskContext {
-      Text("The agent said:").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-      Text(context)
-        .font(.system(size: 11))
-        .lineLimit(question.risky ? nil : 12)
-        .textSelection(.enabled)
-    }
-    if question.chats.count > 1 {
-      ForEach(Array(question.chats.prefix(6).enumerated()), id: \.offset) { _, chat in
-        FleetOpenChatLine(chat: chat, prefix: "·")
-      }
-    } else if let chat = question.openChat ?? question.chats.first, chat.link == nil, let note = chat.note {
-      Text(note).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(2)
-    }
-    if let key = question.threadKey, fleet.thread(key) != nil || fleet.details[key] != nil {
-      let hasAgentWords = !(question.askContext ?? "").isEmpty
-      FleetThreadLines(summary: FleetThreadSummary(thread: fleet.thread(key), detail: fleet.details[key]),
-                       showsExcerpt: !hasAgentWords)
-    } else if let key = question.threadKey, fleet.detailLoading.contains(key) {
-      ProgressView().controlSize(.small)
-    }
   }
 
   /// "In remote-dev · Remote dev setup (Conductor) · asked 3h ago".

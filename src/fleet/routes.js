@@ -17,6 +17,7 @@ function pathCardId(segment) {
   return CARD_ID_PATTERN.test(id) ? id : null;
 }
 const SEND_MAX = 2000;
+const REPLY_MAX = 2000;
 const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
@@ -52,7 +53,7 @@ export function createFleetRoute({ supervisor } = {}) {
 
   async function handleQuestion(id, readBody, sendOptions) {
     const body = await readObject(readBody);
-    if (!body) return fail(400, "Send a JSON object: { answer }, { dismiss: true } or { reopen: true }.");
+    if (!body) return fail(400, "Send a JSON object: { answer }, { reply }, { dismiss: true } or { reopen: true }.");
     // Brings back a question the supervisor's review closed.
     if (body.reopen === true) {
       if (typeof supervisor.reopenReviewed !== "function") return fail(503, "Reopening is not available.");
@@ -66,6 +67,18 @@ export function createFleetRoute({ supervisor } = {}) {
       const question = await supervisor.dismissQuestion(id);
       if (!question) return fail(409, "Question already closed.");
       return ok({ question, state: state() });
+    }
+    // The owner's own words to the agent that asked (questions whose
+    // canReply is true): sent or kept closes it, blocked leaves it open.
+    if (body.reply !== undefined) {
+      const reply = typeof body.reply === "string" ? body.reply.trim() : "";
+      if (!reply || reply.length > REPLY_MAX) return fail(400, `Reply must be 1-${REPLY_MAX} characters.`);
+      if (!open) return fail(404, "No open question with that id.");
+      if (open.canReply !== true) return fail(409, "This question takes no typed reply. Pick an option, or answer it in its chat.");
+      if (typeof supervisor.replyQuestion !== "function") return fail(503, "Replies are not available.");
+      const result = await supervisor.replyQuestion(id, reply, sendOptions);
+      if (!result) return fail(409, "Question already closed.");
+      return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
     }
     const answer = typeof body.answer === "string" ? body.answer.trim() : "";
     if (!answer || answer.length > ANSWER_MAX) return fail(400, "Pick one of the question's options.");

@@ -1213,3 +1213,13 @@ test("existing legacy proposals cannot bypass the Paseo discovery hold", async t
   assert.deepEqual(calls, []);
   assert.equal(store.actions().find(a => a.id === action.id).status, "blocked");
 });
+
+test("a typed-only send blocked by the owner's presence never takes a background route", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, executor, requests } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads", agentStatus: "idle" }), message: "Owner says: merge it", route: "computer-use", playbook: "owner-answer", typedOnly: true });
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Codex");
+  assert.equal(requests.length, 1);
+  assert.equal(calls.length, 0, "no codex exec or relay");
+});
