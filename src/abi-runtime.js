@@ -44,6 +44,7 @@ import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
 import { ClarificationStore } from "./clarification-store.js";
 import { DraftStore } from "./draft-store.js";
+import { GroundedOutcomes } from "./learning/grounded-outcomes.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -178,6 +179,13 @@ export class AbiRuntime {
         this.propagation.recordOutcomeQuality?.(specialistId, outcome.qualityScore);
       }
     };
+    // Grounded grades (what happened to the work) feed the specialist's quality.
+    this.outcomes.onGrounded = (outcome, previous) => {
+      const specialistId = outcome.metadata?.specialistId;
+      if (specialistId && typeof outcome.groundedScore === "number") {
+        this.propagation.recordGroundedQuality?.(specialistId, outcome.groundedScore, previous);
+      }
+    };
     this.outcomes.onFeedback = (outcome, previous) => {
       const specialistId = outcome.metadata?.specialistId;
       if (specialistId && typeof outcome.qualityScore === "number") {
@@ -231,6 +239,9 @@ export class AbiRuntime {
       runtime: this,
       dir: options.dataDir ? `${options.dataDir}/drafts` : undefined
     });
+    // Grades drafts, suggestions and agent-completed tasks by what the owner
+    // did with them (see src/learning/grounded-outcomes.js).
+    this.grounded = options.grounded ?? new GroundedOutcomes({ runtime: this });
     // Proactive outreach: store + mapper that turn existing runtime events
     // (drafts, suggestions, pending actions, clarifications) into a single
     // outreach feed. The event bus is late-bound by hosted-interface.js (this
@@ -331,6 +342,22 @@ export class AbiRuntime {
       // reached 1.26 GiB of screen OCR. 05:15 is deliberately AFTER the 02:30
       // nightly miner (which reads a 28-day window) and off every other slot, so
       // retention never shares a tick with another job.
+      this.cron.addJob({
+        id: "grounded-sweep",
+        name: "Daily grading of drafts, suggestions and agent tasks by what happened",
+        enabled: true,
+        task: "grounded-sweep",
+        dailyAt: "04:45"
+      });
+      // Manual only: run it from the dashboard or POST /cron/grounded-backfill/run
+      // with input { apply: true }. Without apply it reports what it would grade.
+      this.cron.addJob({
+        id: "grounded-backfill",
+        name: "One-time grading of work resolved before grading existed (manual)",
+        enabled: false,
+        task: "grounded-backfill",
+        dailyAt: "04:50"
+      });
       this.cron.addJob({
         id: "observation-retention",
         name: "Daily observation retention — prune expired capture, reclaim disk",
@@ -841,6 +868,12 @@ export class AbiRuntime {
         setTimeout(() => process.exit(0), 500);
       }
       return result;
+    }
+    if (job.task === "grounded-sweep") {
+      return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };
+    }
+    if (job.task === "grounded-backfill") {
+      return this.grounded?.backfill({ apply: job.input?.apply === true }) ?? { skipped: true, reason: "grading unavailable" };
     }
     if (job.task === "observation-retention") {
       const { pruneObservations } = await import("./observation-retention.js");

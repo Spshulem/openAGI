@@ -994,8 +994,8 @@ export function registerCoreTools(registry, runtime) {
       required: ["id"],
       additionalProperties: false
     },
-    handler: async (args) => {
-      const task = runtime.tasks.complete(args.id, args.completedVia ?? "agent");
+    handler: async (args, context) => {
+      const task = runtime.tasks.complete(args.id, args.completedVia ?? "agent", { byAgent: true, signal: context?.__signal ?? null });
       return task ? { id: task.id, status: task.status } : { error: "unknown task" };
     }
   });
@@ -1153,7 +1153,7 @@ export function registerCoreTools(registry, runtime) {
       required: ["title", "body"],
       additionalProperties: false
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       if (!runtime.drafts?.add) throw new Error("no draft store available");
       // One open draft per task, ever. Without this, a task that never got
       // completed collected a fresh draft every 30-minute pulse — 69 of the
@@ -1177,6 +1177,8 @@ export function registerCoreTools(registry, runtime) {
         }
       }
       const draft = runtime.drafts.add(args);
+      // A coalesced exact repeat is the same draft, not new work.
+      if (!draft.sourceMeta?.duplicateCount) runtime.grounded?.onDraftCreated?.(draft, context?.__signal ?? null);
       // The draft is the deliverable: release the agent's lease and reset the
       // attempt counter, and mark the task as awaiting review so the queue
       // stops serving it and the user can see what's waiting on them.

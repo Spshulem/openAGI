@@ -339,6 +339,15 @@ export class AgentHost {
         __reason: principal ? `owner instruction via ${principal.via}`
           : toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
         __allowedTools: allowedToolNames,
+        // The scrutiny decision behind this turn, so work a tool produces
+        // (a saved draft, a completed task) can be graded against it later.
+        __signal: {
+          id: signal.id,
+          scrutinyAction: output.scrutiny.action,
+          scrutinyScore: output.scrutiny.score,
+          scrutinyDimensions: output.scrutiny.dimensions,
+          specialistId: agent.role === "specialist" ? agent.id : null
+        },
         __subagentDepth: options.subagentDepth ?? 0,
         // Server-built per turn. The model controls only tool names and args;
         // tool results are data and can only taint __turn (ToolRegistry).

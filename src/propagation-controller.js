@@ -26,6 +26,14 @@ export function selectScopedTools(tools, scopeText) {
   return [...new Set(scored.slice(0, MAX_SCOPE_TOOLS).map((entry) => entry.name))];
 }
 
+function specialistMetadata(signal = {}) {
+  return {
+    domain: signal.domain ?? "general",
+    taskType: signal.taskType ?? signal.type ?? "signal",
+    tags: (signal.tags ?? []).filter((t) => typeof t === "string").slice(0, 12)
+  };
+}
+
 export class PropagationController {
   constructor(options = {}) {
     this.specialists = new Map();
@@ -85,6 +93,9 @@ export class PropagationController {
       existing.lastActivatedAt = nowIso();
       existing.activationCount += 1;
       existing.reasons.push(...(scrutiny?.reasons ?? []).slice(0, 2));
+      // Keep the last 20: this list grew by two lines per activation forever.
+      existing.reasons = existing.reasons.slice(-20);
+      if (!existing.metadata) existing.metadata = specialistMetadata(signal);
       return { created: false, reason: "existing-specialist-activated", specialist: existing };
     }
 
@@ -112,6 +123,12 @@ export class PropagationController {
       retiredAt: null,
       retirementReason: null,
       seasonal: signal.seasonal === true,
+      // What the router matches on besides the scope text.
+      metadata: specialistMetadata(signal),
+      // Quality from grounded outcomes (what happened to its work), not the
+      // self-assigned score. Drives routing preference and retirement.
+      groundedMean: null,
+      groundedSamples: 0,
       parentSpecialistId: parentSpecialistId ?? null,
       depth: parent ? (parent.depth ?? 0) + 1 : 0
     };
@@ -146,6 +163,25 @@ export class PropagationController {
     return sp;
   }
 
+  /**
+   * Fold a grounded grade into the specialist's running mean. With `previous`
+   * (a regrade of the same outcome), replace that value without counting twice.
+   */
+  recordGroundedQuality(specialistId, score, previous = null) {
+    if (typeof score !== "number") return null;
+    const sp = [...this.specialists.values()].find((s) => s.id === specialistId);
+    if (!sp) return null;
+    const n = sp.groundedSamples ?? 0;
+    const mean = sp.groundedMean ?? 0;
+    if (typeof previous === "number" && n > 0) {
+      sp.groundedMean = Math.max(0, Math.min(1, (mean * n - previous + score) / n));
+    } else {
+      sp.groundedMean = (mean * n + score) / (n + 1);
+      sp.groundedSamples = n + 1;
+    }
+    return sp;
+  }
+
   retire(specialistId, reason = "manual") {
     const sp = [...this.specialists.values()].find((s) => s.id === specialistId);
     if (!sp || sp.status === "retired") return null;
@@ -173,10 +209,11 @@ export class PropagationController {
         retired.push(sp);
         continue;
       }
-      if ((sp.outcomeSamples ?? 0) >= minSamples && (sp.meanOutcomeQuality ?? 1) < qualityFloor) {
+      // Grounded grades only: the self-assigned meanOutcomeQuality no longer retires anyone.
+      if ((sp.groundedSamples ?? 0) >= minSamples && (sp.groundedMean ?? 1) < qualityFloor) {
         sp.status = "retired";
         sp.retiredAt = nowIso();
-        sp.retirementReason = `mean quality ${sp.meanOutcomeQuality?.toFixed(2)} < ${qualityFloor}`;
+        sp.retirementReason = `grounded mean ${sp.groundedMean?.toFixed(2)} < ${qualityFloor}`;
         retired.push(sp);
       }
     }

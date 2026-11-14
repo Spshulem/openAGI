@@ -220,6 +220,10 @@ export class TaskStore {
     if (patch.bucket !== undefined && BUCKETS.includes(patch.bucket)) next.bucket = patch.bucket;
     if (patch.priority !== undefined) next.priority = clamp(Number(patch.priority), 0, 100);
     if (patch.status !== undefined && STATUSES.includes(patch.status)) {
+      if (patch.status !== task.status) {
+        next.statusHistory = [...(task.statusHistory ?? []), { status: patch.status, at: nowIso(), via: patch.completedVia ?? null }].slice(-20);
+        if (task.status === "completed") next.reopenedAt = nowIso();
+      }
       next.status = patch.status;
       if (patch.status === "completed" && !next.completedAt) {
         next.completedAt = nowIso();
@@ -247,11 +251,21 @@ export class TaskStore {
     this.appendEvent(next.queue, { op: "update", id, patch });
     this.snapshot();
     this.runtime?.events?.emit?.("task-updated", { op: "update", task: next });
+    if (task.status === "completed" && next.status !== "completed") this.runtime?.grounded?.onTaskReopened?.(next);
+    // Every route to completion (complete(), PATCH /tasks/:id, integrations)
+    // passes through here, so a suggestion's task finishing always grades it.
+    if (task.status !== "completed" && next.status === "completed" && next.sourceMeta?.suggestionId) {
+      this.runtime?.grounded?.onSuggestionTaskCompleted?.(next.sourceMeta.suggestionId);
+    }
     return next;
   }
 
-  complete(id, via = "manual") {
+  complete(id, via = "manual", { byAgent = false, signal = null } = {}) {
+    // Grading follows a real transition only: completing an already
+    // completed task must not credit the agent with someone else's work.
+    const wasCompleted = this.tasks.get(id)?.status === "completed";
     const next = this.update(id, { status: "completed", completedVia: via });
+    if (next && !wasCompleted && byAgent) this.runtime?.grounded?.onAgentTaskCompleted?.(next, signal);
     // Story 2: completing a task records an outcome with the lineage
     // back to the proactive-suggestion that proposed it (when present).
     // Aggregator can then report "this proposal led to N completed tasks".
