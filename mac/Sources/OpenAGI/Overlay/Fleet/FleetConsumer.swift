@@ -35,10 +35,16 @@ final class FleetConsumer: ObservableObject {
   /// Scan, refresh, and closed-question results.
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
-  /// The Watching row the owner opened (one at a time), and the question
-  /// cards they opened. Both change the panel's height.
-  @Published private(set) var expandedThread: String? = nil
-  @Published private(set) var expandedQuestions: Set<String> = []
+  /// The question or thread on the detail screen; nil shows the lists.
+  /// Changes the panel's height.
+  @Published private(set) var openItem: FleetOpenItem? = nil
+  /// Typed replies not sent yet, by FleetOpenItem.key. Kept across Back and
+  /// a failed send; cleared once the hub takes it.
+  @Published private(set) var drafts: [String: String] = [:]
+  /// FleetOpenItem keys with a reply in flight.
+  @Published private(set) var replyInFlight: Set<String> = []
+  /// Each item's last reply result, under its reply box.
+  @Published private(set) var replyNotes: [String: FleetNote] = [:]
   /// GET /fleet/api/threads/:key, by thread key, for opened rows and cards.
   @Published private(set) var details: [String: FleetThreadDetail] = [:]
   @Published private(set) var detailLoading: Set<String> = []
@@ -69,9 +75,13 @@ final class FleetConsumer: ObservableObject {
   private var lastDetailTick: String?
   private var pendingDetails: Set<String> = []
   private let fetchDetail: (URLRequest) async throws -> (Data, URLResponse)
+  /// Replies' POSTs; tests stand in for the hub.
+  private let send: (URLRequest) async throws -> (Data, URLResponse)
 
-  init(fetchDetail: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
+  init(fetchDetail: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) },
+       send: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
     self.fetchDetail = fetchDetail
+    self.send = send
   }
 
   func refresh() async {
@@ -192,31 +202,184 @@ final class FleetConsumer: ObservableObject {
     }
   }
 
-  // MARK: - One thread
+  // MARK: - Detail screen
 
-  /// Opens a Watching row (closing any other) and loads its detail.
-  func toggleThread(_ key: String) {
-    if expandedThread == key {
-      expandedThread = nil
-      if OverlayState.shared.voiceFocus.threadKey == key { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
-      return
-    }
-    expandedThread = key
+  /// Opens an In progress thread's detail screen and loads its chat.
+  func openThread(_ key: String) {
+    openItem = .thread(key)
     if let thread = thread(key) { OverlayState.shared.selectVoiceContext(.thread(thread)) }
     Task { await loadDetail(key) }
   }
 
-  /// Opens a question card: the agent's words it came from, and its
-  /// thread's PR, wait and next step.
-  func toggleQuestion(_ question: FleetQuestion) {
-    if expandedQuestions.contains(question.id) {
-      expandedQuestions.remove(question.id)
-      if OverlayState.shared.voiceFocus.questionId == question.id { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
-      return
-    }
-    expandedQuestions.insert(question.id)
+  /// Opens a Needs you question's detail screen and loads its thread's chat.
+  func openQuestion(_ question: FleetQuestion) {
+    openItem = .question(question.id)
     OverlayState.shared.selectVoiceContext(.question(question))
     if let key = question.threadKey { Task { await loadDetail(key) } }
+  }
+
+  /// Back to the lists. The voice focus stays only if it was on something
+  /// else.
+  func closeItem() {
+    guard let item = openItem else { return }
+    openItem = nil
+    let focus = OverlayState.shared.voiceFocus
+    switch item {
+    case let .question(id):
+      if focus.questionId == id { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
+    case let .thread(key):
+      if focus.threadKey == key, focus.questionId == nil { OverlayState.shared.selectVoiceContext(VoiceFocus()) }
+    }
+  }
+
+  func question(_ id: String) -> FleetQuestion? { questions.first { $0.id == id } }
+
+  /// Where the open item's typed reply goes.
+  func replyTarget(_ item: FleetOpenItem) -> FleetReplyTarget {
+    switch item {
+    case let .question(id):
+      return question(id).map { FleetReplyTarget.of($0) } ?? .none(why: "The question has closed.")
+    case let .thread(key):
+      return .of(threadKey: key)
+    }
+  }
+
+  func setDraft(_ text: String, for item: FleetOpenItem) {
+    drafts[item.key] = text.isEmpty ? nil : text
+  }
+
+  func clearReplyNote(_ item: FleetOpenItem) {
+    replyNotes[item.key] = nil
+  }
+
+  /// Sends the item's draft. The draft stays until the hub takes it (sent
+  /// or queued): a refusal, an older hub's 400, or no answer keeps it.
+  func sendReply(_ item: FleetOpenItem) async {
+    let slot = item.key
+    guard !replyInFlight.contains(slot), let submitted = drafts[slot], let message = FleetReplyTarget.message(submitted) else { return }
+    let target = replyTarget(item)
+    let path: String
+    let body: [String: Any]
+    switch target {
+    case let .question(id):
+      path = "/fleet/api/questions/\(id)"
+      body = ["reply": message]
+    case let .thread(key):
+      path = "/fleet/api/send"
+      body = ["threadKey": key, "message": message]
+    case let .none(why):
+      replyNotes[slot] = FleetNote(text: why, isError: true)
+      return
+    }
+    // The question's own thread, before the send: a late result or an
+    // unsent draft goes there and nowhere else.
+    var fallbackKey: String? = nil
+    if case let .question(id) = item { fallbackKey = question(id)?.threadKey }
+    replyInFlight.insert(slot)
+    defer { replyInFlight.remove(slot) }
+    replyNotes[slot] = nil
+    var req = request(path: path, method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      let note = Self.replyNote(code: code, data: data, target: target)
+      if note.taken { drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted) }
+      replyNotes[slot] = note.note
+      if (200..<300).contains(code) {
+        if let state = (try? JSONDecoder().decode(FleetQuestionResponse.self, from: data))?.state {
+          apply(state)
+        } else {
+          await refresh()
+        }
+        // The thread left the scan with the screen on it: the panel-wide
+        // line says what happened, since the screen is gone.
+        if case .thread = target, openItem == nil {
+          if note.note.isError { setActionError(note.note.text) } else { lastOutcome = note.note.text }
+        }
+      }
+    } catch let error as URLError where error.code == .timedOut {
+      replyNotes[slot] = FleetNote(text: "No reply yet. It may still be sending; check the chat before sending again.", isError: false)
+      await refresh()
+    } catch {
+      replyNotes[slot] = FleetNote(text: "Couldn't reach the supervisor. Try again.", isError: true)
+    }
+    // The chat moved on (or should have): read it again.
+    if case let .thread(key) = target { await loadDetail(key) }
+    if case .question = target, let key = replyThreadKey(item) { await loadDetail(key) }
+    // The question closed (this reply, or a refresh during it): its result
+    // and any unsent draft move to its own thread, else the panel-wide line.
+    if case let .question(id) = item, question(id) == nil {
+      let leftNote = replyNotes[slot]
+      let leftDraft = drafts[slot]
+      replyNotes[slot] = nil
+      drafts[slot] = nil
+      if let key = fallbackKey, thread(key) != nil {
+        let to = FleetOpenItem.thread(key).key
+        if let leftNote { replyNotes[to] = leftNote }
+        if let leftDraft { drafts[to] = Self.joinDrafts(drafts[to], leftDraft) }
+      } else if let leftNote {
+        if leftNote.isError { setActionError(leftNote.text) } else { lastOutcome = leftNote.text }
+      }
+    }
+  }
+
+  private func replyThreadKey(_ item: FleetOpenItem) -> String? {
+    switch openItem ?? item {
+    case let .thread(key): return key
+    case let .question(id): return question(id)?.threadKey
+    }
+  }
+
+  /// After a send is taken: what is left in the box that was not sent (a
+  /// closed question's draft joined on meanwhile), or nil.
+  static func unsentRest(_ current: String?, submitted: String) -> String? {
+    guard let current, current != submitted else { return nil }
+    let rest = current.hasPrefix(submitted) ? String(current.dropFirst(submitted.count)) : current
+    let trimmed = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// Two unsent drafts in one box: neither is lost.
+  static func joinDrafts(_ existing: String?, _ moved: String) -> String {
+    guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, existing != moved else { return moved }
+    return existing + "\n\n" + moved
+  }
+
+  /// What a reply's answer means: the note under the box, and whether the
+  /// hub took the words (so the draft can go). Pure, unit-tested.
+  static func replyNote(code: Int, data: Data, target: FleetReplyTarget) -> (note: FleetNote, taken: Bool) {
+    switch code {
+    case 200..<300:
+      let decoded = try? JSONDecoder().decode(FleetQuestionResponse.self, from: data)
+      let note = FleetThreadOutcome.reply(decoded?.delivery)
+      return (note, !note.isError)
+    case 400:
+      // An older hub refuses { reply } with "Pick one of the question's options."
+      return (FleetNote(text: serverError(data) ?? "The supervisor couldn't take that reply.", isError: true), false)
+    case 404:
+      if case .question = target {
+        return (FleetNote(text: serverError(data) ?? "The question has closed.", isError: true), false)
+      }
+      return (FleetNote(text: serverError(data) ?? "This hub can't send replies yet.", isError: true), false)
+    case 409:
+      return (FleetNote(text: serverError(data) ?? "The question already closed.", isError: true), false)
+    case 401:
+      return (FleetNote(text: "Daemon sign-in failed.", isError: true), false)
+    case 503:
+      return (FleetNote(text: serverError(data) ?? "Supervisor isn't available.", isError: true), false)
+    default:
+      return (FleetNote(text: serverError(data) ?? "Couldn't reach the supervisor. Try again.", isError: true), false)
+    }
+  }
+
+  /// The thread whose chat the detail screen shows.
+  var openThreadKey: String? {
+    switch openItem {
+    case let .thread(key): return key
+    case let .question(id): return question(id)?.threadKey
+    case nil: return nil
+    }
   }
 
   /// The open questions about one thread, grouped ones included.
@@ -283,7 +446,7 @@ final class FleetConsumer: ObservableObject {
         let decoded = try? JSONDecoder().decode(FleetThreadActionResponse.self, from: data)
         threadNotes[key] = action == "push" ? FleetThreadOutcome.push(decoded?.delivery) : FleetThreadOutcome.muted(decoded?.muted)
         if let state = decoded?.state { apply(state) } else { await refresh() }
-        if expandedThread == key { await loadDetail(key) }
+        if openItem == .thread(key) { await loadDetail(key) }
       case 503:
         threadNotes[key] = FleetNote(text: Self.serverError(data) ?? "Supervisor isn't available.", isError: true)
       case 401:
@@ -393,20 +556,49 @@ final class FleetConsumer: ObservableObject {
     }
     stillSending.formIntersection(open)
     notes = notes.filter { open.contains($0.key) }
+    let oldQuestions = questions
     questions = state.questions
     threads = state.threads
     status = state.status
-    // Opened rows and cards stay open while their thread or question does.
+    // The detail screen stays while its question or thread does; a closed
+    // question falls back to its thread.
     let keys = Set(state.threads.map(\.key))
-    if let key = expandedThread, !keys.contains(key) { expandedThread = nil }
-    expandedQuestions.formIntersection(open)
+    if case let .question(id) = openItem {
+      let closed = open.contains(id) ? nil : oldQuestions.first { $0.id == id }
+      openItem = FleetOpenItem.reconcile(openItem, closedQuestion: closed, openIDs: open, threadKeys: keys)
+      if let item = openItem, item != .question(id) {
+        // The result follows the screen to the thread (the draft moves
+        // below, as every closed question's does).
+        let from = FleetOpenItem.question(id).key
+        if let note = replyNotes[from] { replyNotes[item.key] = note }
+        // The answer just went to that chat: read it again.
+        if case let .thread(key) = item { Task { await loadDetail(key) } }
+        // The voice focus follows the screen too, unless it was elsewhere.
+        if case let .thread(key) = item, OverlayState.shared.voiceFocus.questionId == id, let thread = state.threads.first(where: { $0.key == key }) {
+          OverlayState.shared.selectVoiceContext(.thread(thread))
+        }
+      }
+    } else {
+      openItem = FleetOpenItem.reconcile(openItem, closedQuestion: nil, openIDs: open, threadKeys: keys)
+    }
+    // Any closed question's unsent draft (one left by Back included) moves
+    // to its own thread, joined after the thread's own draft if it has one.
+    for old in oldQuestions where !open.contains(old.id) {
+      let from = FleetOpenItem.question(old.id).key
+      guard !replyInFlight.contains(from), let draft = drafts[from], let key = old.threadKey, keys.contains(key) else { continue }
+      drafts[FleetOpenItem.thread(key).key] = Self.joinDrafts(drafts[FleetOpenItem.thread(key).key], draft)
+    }
+    let liveSlots = Set(open.map { FleetOpenItem.question($0).key } + keys.map { FleetOpenItem.thread($0).key })
+    // A reply still in flight keeps its draft until its result is known.
+    drafts = drafts.filter { liveSlots.contains($0.key) || replyInFlight.contains($0.key) }
+    replyNotes = replyNotes.filter { liveSlots.contains($0.key) || replyInFlight.contains($0.key) }
     details = details.filter { keys.contains($0.key) }
     for (key, note) in threadNotes where !keys.contains(key) {
       lastOutcome = "\(key): \(note.text)"
     }
     threadNotes = threadNotes.filter { keys.contains($0.key) }
     // A new scan: the opened row's agent message may have moved on.
-    if state.lastTickAt != lastDetailTick, let key = expandedThread { Task { await loadDetail(key) } }
+    if state.lastTickAt != lastDetailTick, let key = openThreadKey { Task { await loadDetail(key) } }
     lastDetailTick = state.lastTickAt
     hasSupervisor = state.enabled || !state.questions.isEmpty
     // Answering the last question with auto-scan off must not pull the
@@ -427,8 +619,9 @@ final class FleetConsumer: ObservableObject {
     notes = [:]
     stillSending = []
     sendingDeadline = [:]
-    expandedThread = nil
-    expandedQuestions = []
+    openItem = nil
+    drafts = [:]
+    replyNotes = [:]
     details = [:]
     threadNotes = [:]
     hasSupervisor = false
