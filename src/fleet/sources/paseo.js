@@ -213,9 +213,17 @@ export function createPaseoSource({ factory } = {}) {
           ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
           || (Number(Boolean(b.agent.requiresAttention)) - Number(Boolean(a.agent.requiresAttention)))
           || ((Date.parse(b.agent.updatedAt ?? "") || 0) - (Date.parse(a.agent.updatedAt ?? "") || 0)));
+      const startedAt = Date.now();
+      const totalTimeoutMs = config.paseo.timeoutMs ?? 20000;
+      const perHistoryMs = config.paseo.historyTimeoutMs ?? 3000;
+      const historyDeadline = startedAt + Math.max(0, totalTimeoutMs - Math.min(1500, Math.floor(totalTimeoutMs * 0.2)));
       const budget = Math.min(80, Math.max(1, config.paseo.historyPerScan ?? 48));
       for (let offset = 0; offset < Math.min(budget, candidates.length); offset += 4) {
         signal.throwIfAborted();
+        if (offset > 0 && Date.now() >= historyDeadline) break;
+        const batchTimeoutMs = offset > 0
+          ? Math.max(10, Math.min(perHistoryMs, historyDeadline - Date.now()))
+          : Math.min(perHistoryMs, Math.max(20, Math.floor(totalTimeoutMs * 0.75)));
         await Promise.all(candidates.slice(offset, Math.min(offset + 4, budget)).map(async row => {
           const { api, agent: a, key } = row;
           cache.set(key, { attempted: Date.now() });
@@ -224,7 +232,7 @@ export function createPaseoSource({ factory } = {}) {
             let historyTimer;
             const history = await Promise.race([
               api.agents.ref(a.id).timeline.refetch({ direction: "tail", limit: 80 }),
-              new Promise((_, reject) => { historyTimer = setTimeout(() => reject(new Error("History timed out")), config.paseo.historyTimeoutMs ?? 3000); })
+              new Promise((_, reject) => { historyTimer = setTimeout(() => reject(new Error("History timed out")), batchTimeoutMs); })
             ]).finally(() => clearTimeout(historyTimer));
             signal.throwIfAborted();
             row.agent = history.agent ?? a;

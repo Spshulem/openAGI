@@ -813,6 +813,13 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
         stderr: ""
       };
     }
+    if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) {
+      return {
+        code: 0,
+        stdout: JSON.stringify([{ name: "test", state: "SUCCESS", bucket: "pass" }]),
+        stderr: ""
+      };
+    }
     if (args[0] === "pr" && args[1] === "merge" && !args.includes("--admin")) {
       return { code: 1, stdout: "", stderr: "X Pull request #9599 is not mergeable: the base branch policy prohibits the merge." };
     }
@@ -860,6 +867,44 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     })
   });
   assert.equal(changesRequested.status, "halted");
+
+  // Missing/expected required check must halt BEFORE --admin even when rollup has an optional green check!
+  let adminAttempted = false;
+  const unpostedRequired = await executeSafePrMerge({
+    prRef: "acme/webapp#9599",
+    ownerConfirmed: true,
+    run: async (_cmd, args) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            state: "OPEN",
+            isDraft: false,
+            mergeStateStatus: "BLOCKED",
+            mergeable: "MERGEABLE",
+            reviewDecision: "REVIEW_REQUIRED",
+            headRefOid: "abc9599def",
+            statusCheckRollup: [{ name: "optional-lint", status: "COMPLETED", conclusion: "SUCCESS" }]
+          }),
+          stderr: ""
+        };
+      }
+      if (args[0] === "pr" && args[1] === "merge" && !args.includes("--admin")) {
+        return { code: 1, stdout: "", stderr: "blocked by branch protection" };
+      }
+      if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) {
+        return {
+          code: 8,
+          stdout: JSON.stringify([{ name: "required-e2e", state: "EXPECTED", bucket: "pending" }]),
+          stderr: ""
+        };
+      }
+      if (args.includes("--admin")) adminAttempted = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+  });
+  assert.equal(unpostedRequired.status, "halted");
+  assert.equal(adminAttempted, false);
 
   // 2. merge_and_deploy + Paseo inline choice card delivery on risky production choice
   const delivered = [];
@@ -960,6 +1005,23 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     assert.equal(replied.kind, "reply");
     assert.equal(delivered.length, 3);
     assert.match(delivered[2].message, /Roll out to staging first/);
+
+    // Long (>40 char) Paseo choices sharing a 39-char prefix stay distinct and deliver the full untruncated label
+    const longOptA = "Deploy to staging environment first and run full regression suite";
+    const longOptB = "Deploy to staging environment first and skip regression suite";
+    const longCardQ = supervisor.store.upsertQuestion({
+      dedupeKey: "card:paseo:host1.agent-5560:aq-long",
+      kind: "agent-card",
+      threadKey: paseoRow.key,
+      title: "Success pages: Rollout verification mode?",
+      body: `1. ${longOptA} 2. ${longOptB}`,
+      options: [`1. ${longOptA.slice(0, 36)}…`, `2. ${longOptB.slice(0, 36)}…`, "open thread"],
+      meta: { app: "paseo", cardId: "aq-long", labels: [longOptA, longOptB] }
+    });
+    const longAnswered = await supervisor.actCard(longCardQ.id, { op: "secondary" });
+    assert.equal(longAnswered.ok, true);
+    assert.equal(delivered.length, 4);
+    assert.ok(delivered[3].message.includes(longOptB), `expected full untruncated choice in "${delivered[3].message}"`);
   } finally {
     cleanup();
   }

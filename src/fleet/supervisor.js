@@ -1672,7 +1672,23 @@ export class FleetSupervisor {
       // fixed a login/disk blocker, is an explicit instruction: every mode.
       const retry = question.kind === "infra" && answer === "retry";
       if ((question.kind === "agent-ask" || paseoCardAnswer || retry) && question.threadKey && answer !== "open thread") {
-        const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
+        let deliveredChoice = answer;
+        if (paseoCardAnswer && Array.isArray(question.meta?.labels) && question.meta.labels.length > 0) {
+          if (question.meta.labels.includes(answer)) {
+            deliveredChoice = answer;
+          } else {
+            const numbered = /^([1-4])\.\s/.exec(String(answer ?? ""));
+            const byIndex = numbered ? question.meta.labels[Number(numbered[1]) - 1] : null;
+            if (typeof byIndex === "string" && byIndex.trim()) {
+              deliveredChoice = byIndex;
+            } else {
+              const prefix = String(answer ?? "").replace(/…$/, "").trim();
+              const matches = prefix ? question.meta.labels.filter((label) => label.startsWith(prefix)) : [];
+              if (matches.length === 1) deliveredChoice = matches[0];
+            }
+          }
+        }
+        const message = retry ? RETRY_DELIVERY : ownerDelivery(deliveredChoice);
         const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling });
         if (sent.queued) {
           this.resolveOutreach(question, answer, "acted");
@@ -1967,6 +1983,7 @@ export class FleetSupervisor {
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
         ownerConfirmed: true,
+        config: this.config,
         ghBin: this.config.bins?.gh ?? "gh",
         run: this.deps.run ?? runCommand
       });

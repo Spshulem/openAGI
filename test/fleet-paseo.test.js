@@ -266,6 +266,15 @@ test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, g
     assert.equal(cfg.paseo.url, "ws://127.0.0.1:6767/ws");
     assert.equal(cfg.paseo.password, "local-secret-pw");
 
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "6770" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6770/ws");
+
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "/tmp/paseo.sock" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6767/ws");
+
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "unix:///tmp/paseo.sock" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6767/ws");
+
     const withConductorLabel = paseoThread(
       agent("migrated", {
         title: "Success pages — consolidation #5560",
@@ -310,6 +319,30 @@ test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, g
     assert.deepEqual(m.reads, ["attention-chat"]);
     await source({ paseo: { enabled: true, historyPerScan: 1 } });
     assert.deepEqual(m.reads, ["attention-chat", "newer-idle"]);
+
+    // Long-prefix (>40 char) Paseo asyncQuestions stay distinct after clamping
+    const longA = "Deploy to staging environment first and run full regression suite";
+    const longB = "Deploy to staging environment first and skip regression suite";
+    const longThread = paseoThread(
+      agent("long-opts", {
+        persistence: { metadata: { asyncQuestions: [{ id: "aq-l", question: "Pick rollout", options: [longA, longB], resolution: null }] } }
+      }),
+      "local",
+      []
+    );
+    const longDecision = decideThread(classifyThread(longThread), longThread, { mode: "auto", now: Date.now() });
+    const longQ = longDecision.cardQuestion ?? longDecision.question;
+    assert.equal(longQ.options.length, 3);
+    assert.notEqual(longQ.options[0], longQ.options[1]);
+    assert.deepEqual(longQ.meta.labels, [longA, longB]);
+
+    // 36 hanging histories (9 batches * 35ms = 315ms > 160ms) stay bounded inside timeoutMs instead of rejecting the scan
+    const slowAgents = Array.from({ length: 36 }, (_, idx) => agent(`slow-${idx}`));
+    const slowMock = mock(slowAgents);
+    slowMock.client.agents.ref = () => ({ timeline: { refetch: () => new Promise(() => {}) } });
+    const slowSource = createPaseoSource(slowMock);
+    const slowRows = await slowSource({ paseo: { enabled: true, timeoutMs: 160, historyTimeoutMs: 35, historyPerScan: 48 } });
+    assert.equal(slowRows.length, 36);
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }

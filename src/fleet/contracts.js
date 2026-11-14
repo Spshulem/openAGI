@@ -319,6 +319,38 @@ function envNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizeLocalPaseoListen(listen, tlsEnabled) {
+  const scheme = tlsEnabled ? "wss" : "ws";
+  const fallback = `${scheme}://127.0.0.1:6767/ws`;
+  const raw = String(listen ?? "").trim();
+  if (!raw || raw.startsWith("/") || /^unix:/i.test(raw)) return fallback;
+  if (/^\d{2,5}$/.test(raw)) {
+    const port = Number(raw);
+    return port >= 1 && port <= 65535 ? `${scheme}://127.0.0.1:${port}/ws` : fallback;
+  }
+  if (/^wss?:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (!parsed.hostname) return fallback;
+      const pathname = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "/ws";
+      return `${parsed.protocol}//${parsed.host}${pathname}`;
+    } catch {
+      return fallback;
+    }
+  }
+  const hostPort = raw.startsWith(":")
+    ? `127.0.0.1${raw}`
+    : raw.replace(/^0\.0\.0\.0:/, "127.0.0.1:").replace(/^\[::\]:/, "[::1]:");
+  if (!/^(?:\[[^\]]+\]|[^/\s:]+):\d{1,5}$/.test(hostPort)) return fallback;
+  try {
+    const parsed = new URL(`${scheme}://${hostPort}/ws`);
+    const port = Number(parsed.port);
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? parsed.toString() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function resolveLocalPaseoDefaults(home, env = process.env) {
   const paseoHome = String(env.PASEO_HOME ?? "").trim() || path.join(home, ".paseo");
   let listen = null;
@@ -326,7 +358,9 @@ function resolveLocalPaseoDefaults(home, env = process.env) {
   let password = undefined;
   try {
     const pidInfo = JSON.parse(fs.readFileSync(path.join(paseoHome, "paseo.pid"), "utf8"));
-    if (typeof pidInfo?.listen === "string" && pidInfo.listen.trim()) listen = pidInfo.listen.trim();
+    if (typeof pidInfo?.listen === "number" || (typeof pidInfo?.listen === "string" && pidInfo.listen.trim())) {
+      listen = String(pidInfo.listen).trim();
+    }
   } catch { /* optional */ }
   try {
     const cfg = JSON.parse(fs.readFileSync(path.join(paseoHome, "config.json"), "utf8"));
@@ -336,14 +370,7 @@ function resolveLocalPaseoDefaults(home, env = process.env) {
     const rawPw = fs.readFileSync(path.join(paseoHome, "pilot-password"), "utf8").trim();
     if (rawPw) password = rawPw;
   } catch { /* optional */ }
-  let url = "ws://127.0.0.1:6767/ws";
-  if (listen) {
-    const normalized = listen.startsWith(":")
-      ? `127.0.0.1${listen}`
-      : listen.replace(/^0\.0\.0\.0:/, "127.0.0.1:");
-    url = `${tlsEnabled ? "wss" : "ws"}://${normalized}/ws`;
-  }
-  return { url, password };
+  return { url: normalizeLocalPaseoListen(listen, tlsEnabled), password };
 }
 
 // Single place that turns env + explicit overrides into the config every
