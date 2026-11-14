@@ -334,6 +334,8 @@ export class ProactiveObserver {
           candidate.taskAutoCreated = true;
           candidate.note = "Auto-created task from proactive observer (OPENAGI_AUTO_TASKS=1).";
         }
+        // Record the proposal as work to be graded by what the owner does with it.
+        if (!task) candidate.workOutcomeId = this.runtime?.grounded?.onSuggestionProposed?.(candidate) ?? null;
         writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
         return { task };
       }
@@ -387,6 +389,7 @@ export class ProactiveObserver {
     candidate.resolvedAt = nowIso();
     if (note) candidate.note = note;
     writeJsonAtomic(file, candidate);
+    this.runtime?.grounded?.onSuggestionResolved?.(candidate, status);
     return candidate;
   }
 }

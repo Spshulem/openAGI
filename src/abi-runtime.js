@@ -44,6 +44,7 @@ import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
 import { ClarificationStore } from "./clarification-store.js";
 import { DraftStore } from "./draft-store.js";
+import { GroundedOutcomes } from "./learning/grounded-outcomes.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -231,6 +232,9 @@ export class AbiRuntime {
       runtime: this,
       dir: options.dataDir ? `${options.dataDir}/drafts` : undefined
     });
+    // Grades drafts, suggestions and agent-completed tasks by what the owner
+    // did with them (see src/learning/grounded-outcomes.js).
+    this.grounded = options.grounded ?? new GroundedOutcomes({ runtime: this });
     // Proactive outreach: store + mapper that turn existing runtime events
     // (drafts, suggestions, pending actions, clarifications) into a single
     // outreach feed. The event bus is late-bound by hosted-interface.js (this

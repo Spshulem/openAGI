@@ -579,6 +579,7 @@ export class BacklogTriage {
       raw.resolvedAt = nowIso();
       raw.note = resolution.reason;
       writeJsonAtomic(file, raw);
+      this.runtime?.grounded?.onSuggestionResolved?.(raw, AUTO_DISMISSED);
       return true;
     } catch (error) {
       degraded.push(`write:${resolution.id}: ${String(error?.message ?? error).slice(0, 80)}`);

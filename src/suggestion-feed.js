@@ -56,6 +56,7 @@ export function resolveSuggestion(runtime, id, status, note = null) {
   raw.resolvedAt = nowIso();
   if (note) raw.note = note;
   writeJsonAtomic(file, raw);
+  runtime?.grounded?.onSuggestionResolved?.(raw, status);
   return normalize(raw, file);
 }
 

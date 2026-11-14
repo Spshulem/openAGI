@@ -4631,7 +4631,12 @@ async function applyOutreachFeedback(runtime, item, verdict, note = null) {
     resolved = runtime.outcomes.resolve(fresh.id, score, "explicit-rating", resolutionNote);
   }
   if (item.sourceRef?.kind === "suggestion" && runtime.proactiveObserver?.resolve) {
+    // The observer's resolve grades the suggestion itself (accepted / rejected).
     runtime.proactiveObserver.resolve(item.sourceRef.id, verdict === "up" ? "accepted" : "rejected", resolutionNote);
+  } else if (item.sourceRef?.kind === "draft") {
+    runtime.grounded?.onRated?.(runtime.outcomes?.byWorkRef?.("work-draft", item.sourceRef.id), verdict);
+  } else {
+    runtime.grounded?.onRated?.(resolved, verdict);
   }
   return resolved;
 }
