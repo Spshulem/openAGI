@@ -315,8 +315,27 @@ export class MemorySystem {
         .filter(item => !item.metadata?.supersededBy && (item.scope ?? "main") === scope)
         .map(item => ({ item, score: tokenOverlapScore(correctionText(query), correctionText(`${item.content} ${(item.tags ?? []).join(" ")}`)) }))
         .filter(hit => hit.score > 0).sort((a, b) => b.score - a.score);
-      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5);
-      const hits = saved.length ? saved : matches;
+      const strongest = matches[0];
+      // Condensed principles inherit protected tags. Follow their same-scope
+      // evidence so a stronger principle can still lead back to its saved fact.
+      const principleSources = new Set();
+      const lineage = [strongest?.item];
+      for (const principle of lineage) {
+        if (principle?.kind !== "principle" || !Array.isArray(principle.metadata?.sources)) continue;
+        for (const id of principle.metadata.sources) {
+          const source = this.items.get(id);
+          if (principleSources.has(id) || !source || source.metadata?.supersededBy || (source.scope ?? "main") !== scope) continue;
+          principleSources.add(id);
+          lineage.push(source);
+        }
+      }
+      // Prefer saved facts tied for the strongest match, or quoted by an
+      // automatic memory or a principle derived from that saved fact.
+      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5 && (
+        hit.score >= strongest.score || ((!isProtectedMemory(strongest.item) || principleSources.has(hit.item.id))
+          && tokenOverlapScore(correctionText(hit.item.content), correctionText(strongest.item.content)) >= 0.75)
+      ));
+      const hits = saved.length ? saved : matches.filter(hit => !isSavedMemory(hit.item) || hit.score >= strongest.score);
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
         // retrieve() already hides superseded items; corrections themselves are
@@ -324,11 +343,13 @@ export class MemorySystem {
         if (score >= 0.15 && score >= top * 0.8) targets.push(item);
         if (targets.length >= 3) break;
       }
-      // Hide automatic quotations of the replaced fact too, but never widen
-      // an explicit-id correction or supersede another owner's saved fact.
-      if (saved.length) for (const { item, score } of matches) {
-        if (isProtectedMemory(item) || score < top * 0.8) continue;
-        if (targets.some(target => tokenOverlapScore(correctionText(target.content), correctionText(item.content)) >= 0.75)) targets.push(item);
+      // Retire near-tied saved copies and automatic quotations of the winning
+      // fact. Compare with the original saved targets so copies cannot pull
+      // in progressively less related facts. Explicit-id corrections stay exact.
+      const savedTargets = targets.filter(isSavedMemory);
+      if (savedTargets.length) for (const { item, score } of matches) {
+        if (targets.includes(item) || score < top * 0.8 || (isProtectedMemory(item) && !isSavedMemory(item))) continue;
+        if (savedTargets.some(target => tokenOverlapScore(correctionText(target.content), correctionText(item.content)) >= 0.75)) targets.push(item);
       }
     }
 

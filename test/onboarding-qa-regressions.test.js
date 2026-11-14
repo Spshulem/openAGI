@@ -28,6 +28,72 @@ test("a correction replaces the saved preference even when newer summaries domin
   assert.equal(restored.items.get(corrected.item.id).metadata.supersededBy, next.item.id);
 });
 
+test("a stronger automatic fact wins over an unrelated saved preference during correction", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboarding-correction-target-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const prefix of ["Acme", "Acme weekly", "Acme weekly engineering project"]) {
+    const caseDir = path.join(dir, prefix);
+    const memory = new FileBackedMemorySystem({ dir: caseDir });
+    const preference = memory.remember({ content: `${prefix} review meeting notes should be short.`, tags: ["tool:remember", "preference"] });
+    const stale = memory.remember({ content: `${prefix} review meeting time is 3pm.`, source: "agent-host" });
+    const corrected = memory.correct({ query: `${prefix} review meeting time`, content: `${prefix} review meeting time is 4pm.` });
+    assert.deepEqual(corrected.superseded.map(item => item.id), [stale.id]);
+    assert.equal(preference.metadata.supersededBy, undefined);
+    assert.equal(stale.metadata.supersededBy, corrected.item.id);
+
+    const restored = new FileBackedMemorySystem({ dir: caseDir });
+    const recalled = restored.retrieve(`${prefix} review meeting time`, { limit: 20 });
+    assert.ok(recalled.some(({ item }) => item.id === corrected.item.id));
+    assert.ok(recalled.some(({ item }) => item.id === preference.id));
+    assert.ok(!recalled.some(({ item }) => item.id === stale.id), "the stale 3pm fact must not survive restart");
+  }
+});
+
+test("saved-memory priority does not discard a stronger earlier correction", () => {
+  const memory = new MemorySystem();
+  const preference = memory.remember({ content: "Acme review meeting notes should be short.", tags: ["tool:remember"] });
+  const previous = memory.correct({ content: "Acme review meeting time is 3pm." });
+  const corrected = memory.correct({ query: "Acme review meeting time", content: "Acme review meeting time is 4pm." });
+  assert.deepEqual(corrected.superseded.map(item => item.id), [previous.item.id]);
+  assert.equal(preference.metadata.supersededBy, undefined);
+});
+
+test("corrections retire near-tied saved copies of the winning fact and preserve other preferences", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboarding-saved-copies-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const strongestIsCorrection of [false, true]) {
+    for (const reverse of [false, true]) {
+      const caseDir = path.join(dir, `${strongestIsCorrection}-${reverse}`);
+      const memory = new FileBackedMemorySystem({ dir: caseDir });
+      const facts = ["Acme weekly meeting time is 3pm.", "Acme weekly team meeting time is 3pm."];
+      if (reverse) facts.reverse();
+      const stale = facts.map(content => strongestIsCorrection && content.includes("team")
+        ? memory.correct({ content }).item
+        : memory.remember({ content, tags: ["tool:remember"] }));
+      const preference = memory.remember({ content: "Acme weekly team meeting notes should be short.", tags: ["tool:remember", "preference"] });
+      const corrected = memory.correct({ query: "Acme weekly team meeting time", content: "Acme weekly team meeting time is 4pm." });
+      assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set(stale.map(item => item.id)));
+      assert.equal(preference.metadata.supersededBy, undefined);
+
+      const restored = new FileBackedMemorySystem({ dir: caseDir });
+      const recalled = restored.retrieve("Acme weekly team meeting time", { limit: 20 });
+      assert.ok(recalled.some(({ item }) => item.id === corrected.item.id));
+      assert.ok(recalled.some(({ item }) => item.id === preference.id));
+      assert.ok(!recalled.some(({ item }) => stale.some(previous => previous.id === item.id)), "no saved 3pm copy survives a restart");
+    }
+  }
+});
+
+test("near-tied saved copies remain correction targets for queries with unmatched details", () => {
+  for (const extra of ["location owner agenda date schedule", "location owner agenda date schedule room"]) {
+    const memory = new MemorySystem();
+    const stale = ["Acme weekly meeting time is 3pm.", "Acme weekly team meeting time is 3pm."]
+      .map(content => memory.remember({ content, tags: ["tool:remember"] }));
+    const corrected = memory.correct({ query: "Acme weekly team meeting time " + extra, content: "Acme weekly team meeting time is 4pm." });
+    assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set(stale.map(item => item.id)));
+  }
+});
+
 test("onboarding progress requires actual activity and cross-chat recall, not guide clicks", async () => {
   const memory = new MemorySystem();
   let messages = [];
