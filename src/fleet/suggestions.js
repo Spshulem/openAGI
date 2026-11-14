@@ -6,6 +6,7 @@ import { createNudgeJudge } from "./judge.js";
 import { FIX_AREAS } from "./feedback.js";
 import { clampText, redactSecrets } from "./contracts.js";
 import { isQuietHour } from "./notify.js";
+import { isSuppressedByQuietCadence } from "./preferences.js";
 import { ACTION_LOG_MAX, DAY_MS, diagnose, localDay } from "./diagnose.js";
 
 import { REMEDIES, assertCodeRemedy, remedyOf, suggestionPlan } from "./remedies.js";
@@ -252,6 +253,7 @@ export class SuggestionManager {
       }
       const question = this.store.upsertQuestion(suggestionQuestion(s));
       if (question.suppressed || question.status !== "open") continue;
+      if (isSuppressedByQuietCadence(question, this.store.preferences?.())) continue;
       const allowPush = !this.store.suggestions().some((v) => v.pushedAt && localDay(v.pushedAt) === localDay(now))
         && !isQuietHour(new Date(now), this.config.limits?.quietHours)
         && this.store.pushesSince(60 * 60_000, now) < (this.config.limits?.pushPerHour ?? 3);

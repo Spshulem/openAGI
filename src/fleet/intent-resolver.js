@@ -117,17 +117,20 @@ export async function executeSafePrMerge({
     };
   }
 
-  if (pending.length > 0 || mergeState === "BLOCKED" && pending.length > 0) {
+  const headArgs = liveSha ? ["--match-head-commit", liveSha] : [];
+
+  if (pending.length > 0) {
     if (mergePolicy === "queue_when_green") {
       const queueRes = await run(
         ghBin,
-        ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--auto", "--squash"],
+        ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--auto", "--squash", ...headArgs],
         { timeoutMs: 30_000 }
       );
       if (queueRes.code === 0) {
         return {
           status: "queued_when_green",
           prRef,
+          headRefOid: liveSha || null,
           url: view.url ?? null,
           detail: `Queued squash merge for ${prRef} once ${pending.length} running check(s) pass.`
         };
@@ -148,9 +151,28 @@ export async function executeSafePrMerge({
     };
   }
 
+  if (mergeState === "BEHIND") {
+    return {
+      status: "halted",
+      reason: "behind_base",
+      prRef,
+      canFixCi: true,
+      detail: `${prRef} is behind the base branch and must be updated before merging.`
+    };
+  }
+
+  if (mergeState === "BLOCKED" || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
+    return {
+      status: "halted",
+      reason: "blocked",
+      prRef,
+      detail: `${prRef} is blocked by branch protection, unposted checks, or required reviews (${mergeState || mergeable}). Merge halted safely.`
+    };
+  }
+
   const mergeRes = await run(
     ghBin,
-    ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--squash"],
+    ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--squash", ...headArgs],
     { timeoutMs: 30_000 }
   );
   if (mergeRes.code === 0) {

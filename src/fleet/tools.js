@@ -283,7 +283,7 @@ export function registerFleetTools(registry, supervisor) {
       type: "object",
       properties: {
         cardId: { type: "string", minLength: 1, maxLength: 120 },
-        op: { type: "string", enum: ["primary", "secondary", "defer", "fix_ci", "preference", "veto", "ship"] },
+        op: { type: "string", enum: ["primary", "secondary", "defer", "dismiss", "fix_ci", "merge", "answer", "open_chat", "preference", "veto", "ship"] },
         value: { type: "string", maxLength: 200 },
         clarification: { type: "string", maxLength: MESSAGE_MAX },
         instructions: { type: "string", maxLength: MESSAGE_MAX }
@@ -359,31 +359,57 @@ function fleetTarget(supervisor, args = {}) {
 function fleetCardTarget(supervisor, args = {}) {
   const cardId = typeof args?.cardId === "string" ? args.cardId.trim() : "";
   if (!cardId) throw new Error("Pass a cardId from fleet_status cards.");
-  const op = typeof args?.op === "string" ? args.op.trim() : "primary";
+  const rawOp = typeof args?.op === "string" ? args.op.trim().toLowerCase() : "primary";
+  const explicitValue = typeof args?.value === "string" && args.value.trim() ? args.value.trim() : null;
   const state = readState(supervisor);
-  if (op === "veto" || cardId.startsWith("pref:")) {
+  if (rawOp === "veto") {
     const prefCard = (state.cards ?? []).find((c) => c.id === cardId) ?? null;
     return {
       cardId,
-      op,
-      ...(args?.value ? { value: String(args.value).trim() } : {}),
+      op: "veto",
+      ...(explicitValue ? { value: explicitValue } : {}),
       headline: clip(prefCard?.headline ?? "Supervisor preference", 120),
-      actionLabel: op === "veto" ? "Revert autonomous preference" : clip(prefCard?.primaryAction?.label ?? "Update preference", 60)
+      actionLabel: "Revert autonomous preference"
+    };
+  }
+  if (cardId.startsWith("pref:") || rawOp === "preference") {
+    const prefCard = (state.cards ?? []).find((c) => c.id === cardId) ?? null;
+    const isDefer = rawOp === "defer" || rawOp === "dismiss";
+    const actionObj = isDefer ? null : (rawOp === "secondary" ? prefCard?.secondaryAction : prefCard?.primaryAction);
+    const resolvedOp = isDefer ? "defer" : "preference";
+    const resolvedValue = explicitValue
+      ?? (isDefer
+        ? `keep:${cardId}`
+        : (actionObj?.value ?? (rawOp === "secondary" ? `keep:${cardId}` : cardId.replace(/^pref:/, ""))));
+    return {
+      cardId,
+      op: resolvedOp,
+      ...(resolvedValue ? { value: String(resolvedValue).trim() } : {}),
+      headline: clip(prefCard?.headline ?? "Supervisor preference", 120),
+      actionLabel: isDefer ? "Keep current default" : clip(actionObj?.label ?? "Update preference", 60)
     };
   }
   const card = (state.cards ?? []).find((c) => c.id === cardId || c.questionId === cardId) ?? null;
   const question = (state.questions ?? []).find((q) => q.id === (card?.questionId ?? cardId)) ?? null;
   if (!card && !question) throw new Error("No open Supervisor decision card with that id. Call fleet_status for current cards.");
-  const actionObj = op === "secondary" ? card?.secondaryAction : card?.primaryAction;
-  const actionLabel = op === "defer"
+  const actionObj = rawOp === "secondary" ? card?.secondaryAction : (rawOp === "primary" ? card?.primaryAction : null);
+  const resolvedOp = rawOp === "primary" || rawOp === "secondary"
+    ? (actionObj?.op ?? "answer")
+    : rawOp;
+  const resolvedValue = explicitValue
+    ?? (actionObj?.value != null ? String(actionObj.value).trim() : null)
+    ?? (resolvedOp === "answer" ? (question?.options ?? []).find((opt) => opt !== "dismiss") ?? null : null);
+  const actionLabel = resolvedOp === "defer" || resolvedOp === "dismiss"
     ? "Defer"
-    : op === "fix_ci"
-      ? "Ask coding session to fix CI"
-      : clip(args?.value || actionObj?.label || op, 60);
+    : resolvedOp === "fix_ci"
+      ? clip(actionObj?.label || "Ask coding session to fix CI", 60)
+      : resolvedOp === "merge" || resolvedOp === "ship"
+        ? clip(actionObj?.label || `Merge ${card?.prRef ?? resolvedValue ?? "PR"}`, 60)
+        : clip(resolvedValue || actionObj?.label || resolvedOp, 60);
   return {
     cardId: card?.id ?? question.id,
-    op,
-    ...(args?.value ? { value: String(args.value).trim() } : {}),
+    op: resolvedOp,
+    ...(resolvedValue ? { value: resolvedValue } : {}),
     ...(args?.clarification ? { clarification: String(args.clarification).trim() } : {}),
     ...(args?.instructions ? { instructions: String(args.instructions).trim() } : {}),
     headline: clip(card?.headline ?? question?.title ?? cardId, 120),

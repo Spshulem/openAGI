@@ -131,6 +131,20 @@ export function classifyQuestionSlice(question) {
   return null;
 }
 
+// Shared policy for "quiet_until_ready" cadence: suppresses routine idle
+// check-ins and low-urgency suggestions across the deck, notifications, and
+// outreach feeds while letting PR-ready, risky, and blocker items through.
+export function isSuppressedByQuietCadence(question, rawPrefs) {
+  const cadence = typeof rawPrefs?.cadence === "string" ? rawPrefs.cadence : "balanced";
+  if (cadence !== "quiet_until_ready" || !isObject(question)) return false;
+  const critical = question.kind === "ready"
+    || Boolean(question.mergeAsk)
+    || Boolean(question.risky)
+    || ["prompt", "infra", "limit", "deliver", "paused", "storage", "self-fix"].includes(question.kind);
+  if (critical) return false;
+  return question.kind === "suggestion" || question.kind === "idle-report" || question.playbook === "idle-report";
+}
+
 export function pickAffirmativeOption(options = []) {
   for (const option of Array.isArray(options) ? options : []) {
     if (typeof option === "string" && AFFIRMATIVE_ANSWERS.has(option.trim().toLowerCase())) {

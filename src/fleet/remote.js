@@ -10,7 +10,8 @@ import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
-import { buildSupervisorDeck } from './cards.js';
+import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
+import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 
 const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|preferences|route|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
@@ -98,12 +99,33 @@ export class RemoteFleetSupervisor {
     const state = structuredClone(this.state);
     state.questionsAuthoritative = this.questionsAuthoritative;
     state.modeConfirmed = this.questionsAuthoritative;
+    const localFixQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
     if (this.selfFixHub) {
       state.fixes = this.selfFixHub.store.fixes();
-      state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
+      state.questions = [...state.questions, ...localFixQuestions];
     }
-    if (!Array.isArray(state.cards) || this.selfFixHub) {
+    if (!Array.isArray(state.cards)) {
+      const remoteAutonomy = state.autonomy ?? null;
       Object.assign(state, buildSupervisorDeck(state, { preferences: state.preferences }));
+      if (remoteAutonomy) state.autonomy = remoteAutonomy;
+    } else if (localFixQuestions.length > 0) {
+      const prefs = normalizePreferences(state.preferences);
+      const rowsByKey = new Map((state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+      const actions = Array.isArray(state.actions) ? state.actions : [];
+      const existingIds = new Set(state.cards.flatMap((c) => [c?.id, c?.questionId].filter(Boolean)));
+      const localCards = localFixQuestions
+        .filter((q) => q?.id && !existingIds.has(q.id) && !isSuppressedByQuietCadence(q, prefs))
+        .map((q) => {
+          const { rank: _rank, ...card } = buildSupervisorCard(q, { rowsByKey, actions, prefs });
+          return card;
+        });
+      if (localCards.length > 0) {
+        const nonPref = state.cards.filter((c) => c.kind !== 'preference');
+        const prefCards = state.cards.filter((c) => c.kind === 'preference');
+        state.cards = [...nonPref, ...localCards, ...prefCards];
+        state.activeSummary = buildActiveSummary(state.snapshot, state.cards);
+        state.catchUpSummary = buildCatchUpSummary(state.cards, state.activeSummary);
+      }
     }
     return state;
   }
@@ -299,7 +321,9 @@ export class RemoteFleetSupervisor {
   mirrorQuestions() {
     const outreach = this.runtime.outreach;
     if (!outreach) return;
-    const openIds = new Set(this.getState().questions.map(q => q.id));
+    const currentState = this.getState();
+    const liveQuestions = currentState.questions.filter((q) => !isSuppressedByQuietCadence(q, currentState.preferences));
+    const openIds = new Set(liveQuestions.map(q => q.id));
     for (const item of outreach.list()) {
       if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
           && (item.sourceRef.nodeId !== this.nodeId
@@ -308,7 +332,7 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
-    for (const q of this.getState().questions) {
+    for (const q of liveQuestions) {
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'

@@ -4,7 +4,7 @@
 // so Android, push extensions, and older clients stay 100% compatible.
 
 import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
-import { buildProgressivePreferenceCards, normalizePreferences, SAFE_SLICES } from "./preferences.js";
+import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -70,14 +70,7 @@ function isQuestionLiveForDeck(question, row, prefs) {
       return false;
     }
   }
-  if (prefs.cadence === "quiet_until_ready") {
-    const critical = question.kind === "ready"
-      || Boolean(question.mergeAsk)
-      || Boolean(question.risky)
-      || ["prompt", "infra", "limit", "deliver", "paused", "storage", "self-fix"].includes(question.kind);
-    if (!critical && question.kind === "suggestion") return false;
-    if (!critical && question.playbook === "idle-report") return false;
-  }
+  if (isSuppressedByQuietCadence(question, prefs)) return false;
   return true;
 }
 
@@ -334,7 +327,7 @@ export function buildAutonomySummary(actions = [], rawPrefs = null, openQuestion
   const since = now - DAY_MS;
   const recentSent = actions.filter((a) => {
     const at = Date.parse(a?.at ?? "");
-    return Number.isFinite(at) && at >= since && (
+    return Number.isFinite(at) && at >= since && !String(a?.playbook ?? "").startsWith("auto-slice:") && (
       (a.kind === "nudge" && a.status === "sent")
       || (a.kind === "review" && a.status === "done")
     );
@@ -356,6 +349,7 @@ export function buildAutonomySummary(actions = [], rawPrefs = null, openQuestion
       threadKey: item.threadKey,
       summary: item.summary,
       reverted: item.reverted === true,
+      vetoed: item.reverted === true,
       canVeto: !item.reverted && Boolean(item.slice)
     })),
     ...recentSent.slice(0, 5).map((act) => ({
@@ -366,6 +360,7 @@ export function buildAutonomySummary(actions = [], rawPrefs = null, openQuestion
       threadKey: act.threadKey ?? null,
       summary: clampText(redactSecrets(act.reason || act.detail || act.playbook || "Handled routine check"), 140),
       reverted: false,
+      vetoed: false,
       canVeto: false
     }))
   ].slice(0, 6);
@@ -376,7 +371,10 @@ export function buildAutonomySummary(actions = [], rawPrefs = null, openQuestion
 
   return {
     handledToday,
+    handledCount: handledToday,
+    totalDecisions: denominator,
     autonomyPercent,
+    autonomousPercent: autonomyPercent,
     mergePolicy: prefs.mergePolicy,
     cadence: prefs.cadence,
     activeAutoSlices,

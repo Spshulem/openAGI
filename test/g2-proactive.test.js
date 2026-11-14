@@ -415,10 +415,21 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
     title: "PR #88 ready",
     summary: "Auth token refresh fix",
     needsDecision: true,
-    actions: ["dismiss"]
+    actions: ["merged", "later", "dismiss"]
+  });
+  outreach.push({
+    id: "o-routine",
+    status: "unseen",
+    createdAt: at,
+    sourceRef: { kind: "fleet", id: "fq_idle" },
+    title: "Routine idle update",
+    summary: "Agent paused on routine check",
+    needsDecision: true,
+    actions: ["continue", "dismiss"]
   });
   const acted = [];
   let allowMerge = false;
+  let cadence = "balanced";
   runtime.outreach.get = (id) => outreach.find(i => i.id === id);
   runtime.outreach.resolve = (id, decision, opts) => {
     const found = outreach.find(i => i.id === id);
@@ -428,12 +439,16 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
     getState: () => ({
       mode: "propose",
       lastTickAt: at,
+      preferences: { cadence },
       catchUpSummary: "2 sessions need you: 1 PR ready, 1 preference.",
-      questions: [{ id: "fq_pr", threadKey: "codex:auth" }],
+      questions: [
+        { id: "fq_pr", kind: "ready", threadKey: "codex:auth" },
+        { id: "fq_idle", kind: "idle-report", threadKey: "codex:docs" }
+      ],
       cards: [
         {
           id: "q:fq_pr",
-          kind: "pr_ready",
+          kind: "merge_ready",
           questionId: "fq_pr",
           threadKey: "codex:auth",
           headline: "PR #88 ready to merge",
@@ -441,7 +456,7 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
           recommendation: "Merge PR #88",
           prRef: "acme/api#88",
           ciState: "passing",
-          primaryAction: { action: "merge_pr", label: "Merge PR" },
+          primaryAction: { op: "merge", label: "Merge PR" },
           updatedAt: at
         },
         {
@@ -450,7 +465,7 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
           headline: "Ping less on routine steps?",
           summary: "You deferred 3 routine checks in a row",
           recommendation: "Switch to Quiet until PR ready",
-          primaryAction: { action: "preference", label: "Quiet until ready" },
+          primaryAction: { op: "preference", label: "Quiet until ready" },
           updatedAt: at
         }
       ],
@@ -459,30 +474,36 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
     actCard: async (cardId, payload) => {
       acted.push([cardId, payload.op]);
       if (!allowMerge && cardId === "q:fq_pr") {
-        return { ok: false, status: "ci_failing", detail: "CI check lint failed; PR left open" };
+        return { ok: false, status: "halted", detail: "CI check lint failed; PR left open" };
       }
       return { ok: true, status: "merged", detail: "Merged acme/api#88 via squash" };
     }
   };
   call({ op: "configure", settings: { supervisorOnly: true } });
+  assert.equal(call({ op: "feed" }).items.length, 3);
+
+  // Quiet until ready suppresses routine idle-report outreach items on the glasses.
+  cadence = "quiet_until_ready";
   const feed = call({ op: "feed" }).items;
   assert.equal(feed.length, 2);
+  assert.equal(feed.some(i => i.id === "o-routine"), false);
   const prItem = feed.find(i => i.id === "o-pr");
   assert.equal(prItem.cardId, "q:fq_pr");
-  assert.equal(prItem.cardKind, "pr_ready");
+  assert.equal(prItem.cardKind, "merge_ready");
   assert.equal(prItem.primaryLabel, "Merge PR");
   assert.equal(prItem.prRef, "acme/api#88");
   assert.match(prItem.pmBrief, /Rec: Merge PR #88/);
-  assert.equal(prItem.action, "act-fleet-card");
+  assert.equal(prItem.action, "answer-fleet");
 
   const prefItem = feed.find(i => i.id === "card:pref:cadence:quiet_until_ready");
   assert.ok(prefItem);
   assert.equal(prefItem.primaryLabel, "Quiet until ready");
+  assert.equal(prefItem.action, "act-fleet-card");
 
   // Failing preflight keeps the card open on the glasses.
   const blocked = await store.actFleetCard("one", { id: "o-pr", cardOp: "primary" });
   assert.equal(blocked.ok, false);
-  assert.equal(blocked.status, "ci_failing");
+  assert.equal(blocked.status, "halted");
   assert.ok(call({ op: "feed" }).items.some(i => i.id === "o-pr"));
 
   // Green preflight merges and removes the item from the glasses feed.

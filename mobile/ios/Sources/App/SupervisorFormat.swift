@@ -272,7 +272,7 @@ enum SupervisorFormat {
             return SupervisorCard(
                 id: "question:\(question.id)",
                 questionId: question.id,
-                kind: isReady ? "pr_ready" : "agent_decision",
+                kind: isReady ? "merge_ready" : "agent_decision",
                 kindLabel: isReady ? "PR ready" : "Needs your decision",
                 headline: nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
                 summary: nonBlank(question.body),
@@ -323,19 +323,47 @@ enum SupervisorFormat {
     static func cardActNote(_ result: FleetCardActResult) -> Note {
         let message = nonBlank(result.message)
         switch result.status {
-        case "merged":
+        case "merged", "already_merged":
             return Note(text: message ?? "Merged pull request.", isAlert: false)
-        case "queued_auto_merge", "ci_pending_watch":
+        case "watching_ci", "queued_when_green", "queued_auto_merge", "ci_pending_watch":
             return Note(text: message ?? "Watching CI — will ping when green.", isAlert: false)
-        case "merge_blocked", "ci_failed", "sha_changed", "not_mergeable":
-            return Note(text: message ?? "Merge halted safely — check PR status first.", isAlert: true)
+        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed":
+            return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
         case "deferred", "dismissed":
             return Note(text: message ?? "Saved for later.", isAlert: false)
-        case "preference_saved":
+        case "updated", "preference_saved", "reverted":
             return Note(text: message ?? "Preference updated.", isAlert: false)
         default:
-            if !result.ok, let message { return Note(text: message, isAlert: true) }
+            if !result.ok {
+                return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
+            }
             return deliveryNote(result.delivery, fallback: message ?? "Sent to the agent.")
+        }
+    }
+
+    static func fallbackSearchHits(_ threads: [FleetThread], query: String) -> [FleetSearchHit] {
+        let lower = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return [] }
+        return threads.filter {
+            ($0.title?.lowercased().contains(lower) ?? false)
+                || ($0.workspace?.lowercased().contains(lower) ?? false)
+                || ($0.repo?.lowercased().contains(lower) ?? false)
+                || ($0.branch?.lowercased().contains(lower) ?? false)
+                || ($0.pr?.ref?.lowercased().contains(lower) ?? false)
+                || ($0.lastAgentText?.lowercased().contains(lower) ?? false)
+        }.map { thread in
+            FleetSearchHit(
+                key: thread.key,
+                title: thread.title,
+                workspace: thread.workspace,
+                repo: thread.repo,
+                branch: thread.branch,
+                state: thread.state,
+                health: thread.health,
+                snippet: nonBlank(thread.lastAgentText) ?? nonBlank(thread.reason),
+                prRef: thread.pr?.ref,
+                live: thread.live || thread.state == "running" || thread.state == "local-verify"
+            )
         }
     }
 

@@ -25,7 +25,7 @@ import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } fr
 import { localDay } from "./diagnose.js";
 import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
-import { applyPreferencePatch, classifyQuestionSlice, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
+import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { buildBugDispatchMessage, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
@@ -1654,8 +1654,22 @@ export class FleetSupervisor {
   }
 
   updatePreferences(patch = {}) {
-    const next = applyPreferencePatch(this.store.preferences(), patch, { now: this.now() });
+    const prev = this.store.preferences();
+    const next = applyPreferencePatch(prev, patch, { now: this.now() });
     this.store.savePreferences(next);
+    if (next.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && isSuppressedByQuietCadence(q, next)) {
+          this.resolveOutreach(q, "resolved", "dismissed");
+        }
+      }
+    } else if (prev.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && !isSuppressedByQuietCadence(q, next)) {
+          this.reopenOutreach(q);
+        }
+      }
+    }
     this.store.recordAction({
       kind: "preference",
       playbook: "owner-preference",
@@ -1713,10 +1727,14 @@ export class FleetSupervisor {
 
     if (id.startsWith("pref:") || op === "preference") {
       const prefCard = (this.getState().cards ?? []).find((c) => c.id === id) ?? null;
-      const actionObj = String(op).toLowerCase() === "secondary" ? prefCard?.secondaryAction : prefCard?.primaryAction;
+      const normOp = String(op ?? "primary").toLowerCase();
+      const isDefer = normOp === "defer" || normOp === "dismiss";
+      const actionObj = isDefer ? null : (normOp === "secondary" ? prefCard?.secondaryAction : prefCard?.primaryAction);
       const choice = typeof value === "string" && value
         ? value
-        : (actionObj?.value ?? (String(op).toLowerCase() === "secondary" ? `keep:${id}` : id.replace(/^pref:/, "")));
+        : (isDefer
+            ? `keep:${id}`
+            : (actionObj?.value ?? (normOp === "secondary" ? `keep:${id}` : id.replace(/^pref:/, ""))));
       const preferences = this.updatePreferences({ choice });
       return { ok: true, kind: "preference", status: "updated", detail: choice.startsWith("keep:") ? "Kept current default." : "Updated Supervisor preference.", preferences };
     }
@@ -2654,6 +2672,7 @@ export class FleetSupervisor {
     // One app thread can back two fleet threads (a Conductor session and the
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
+    const autoAnsweredThreads = new Set();
 
     // A Codex question card is asked beside the thread's own decision.
     const asks = decisions.flatMap((decision) => [
@@ -2673,28 +2692,38 @@ export class FleetSupervisor {
       const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
+      // The head it is asked at: a move past it settles the ask (settledAsk).
+      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
+      asked.add(question.dedupeKey);
+      // The owner (or an earlier automatic slice) already answered or dismissed this one; stay quiet.
+      if (question.suppressed) continue;
       // Progressive preference slices: ONLY when the owner explicitly made a
       // safe routine slice automatic (never merges or risky asks) and mode is auto.
-      if (this.mode === "auto" && fields.kind === "agent-ask" && fields.threadKey && !fields.mergeAsk) {
+      if (this.mode === "auto" && fields.kind === "agent-ask" && fields.threadKey && !fields.mergeAsk && !store.mutedUntil(fields.threadKey)) {
         const slice = classifyQuestionSlice(fields);
         const prefs = store.preferences();
         const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
         const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
         const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
-        if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use")) {
+        const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
+        if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
           const delivery = await this.executor.deliver({ thread: targetThread, message: ownerDelivery(autoChoice), route, playbook: "owner-answer" });
           if (delivery.status === "sent") {
             sends += 1;
             attempted.add(targetThread.key);
+            autoAnsweredThreads.add(targetThread.key);
+            if (uiKey) typedInto.add(uiKey);
+            store.answerQuestion(question.id, autoChoice);
+            this.resolveOutreach(question, autoChoice, "acted");
             store.recordNudge(targetThread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: "owner-answer" });
-            const { prefs: updatedPrefs } = recordAutonomousSliceAction(prefs, {
+            const { prefs: updatedPrefs, record: autoRecord } = recordAutonomousSliceAction(prefs, {
               slice,
               threadKey: targetThread.key,
               summary: clampText(`${fields.title} -> ${autoChoice}`, 160),
               now: started
             });
             store.savePreferences(updatedPrefs);
-            store.recordAction({
+            const actionRecord = store.recordAction({
               kind: "nudge",
               playbook: `auto-slice:${slice}`,
               threadKey: targetThread.key,
@@ -2703,15 +2732,29 @@ export class FleetSupervisor {
               reason: clampText(`autonomous preference (${slice}): ${fields.title}`, 240),
               at
             });
+            if (delivery.done) {
+              this.reopenIfUndelivered(
+                question.id,
+                [delivery.done.then((reached) => {
+                  if (reached) return null;
+                  const latestPrefs = store.preferences();
+                  const entry = latestPrefs.autonomousActions.find((a) => a.id === autoRecord.id);
+                  if (entry) {
+                    entry.reverted = true;
+                    store.savePreferences(latestPrefs);
+                  }
+                  if (actionRecord?.id) {
+                    store.updateAction(actionRecord.id, { status: "failed", detail: "background delivery failed" });
+                  }
+                  return targetThread.key;
+                })],
+                autoChoice
+              );
+            }
             continue;
           }
         }
       }
-      // The head it is asked at: a move past it settles the ask (settledAsk).
-      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
-      asked.add(question.dedupeKey);
-      // The owner already answered or dismissed this one; stay quiet.
-      if (question.suppressed) continue;
       toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
     }
     // The supervisor reviews its own list before a new question reaches the
@@ -2727,9 +2770,11 @@ export class FleetSupervisor {
       // close) waits for the next review; a failed review lets all out.
       this.awaitingReview = new Set([...this.awaitingReview].filter((id) => unsettled.has(id)));
     }
+    const notifyPrefs = store.preferences();
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
       if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      if (isSuppressedByQuietCadence(question, notifyPrefs)) continue;
       const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
       if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
@@ -2754,6 +2799,7 @@ export class FleetSupervisor {
     sends += restartedNow.sent;
     for (const key of restartedNow.uiKeys) typedInto.add(key);
     for (const key of restartedNow.threads) answeredNow.threads.add(key);
+    for (const key of autoAnsweredThreads) answeredNow.threads.add(key);
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
