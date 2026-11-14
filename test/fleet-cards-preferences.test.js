@@ -15,6 +15,7 @@ import { registerFleetTools } from "../src/fleet/tools.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
 import { executeApprovedAction } from "../src/approval-executor.js";
+import { OutreachStore } from "../src/outreach-store.js";
 
 function tempSupervisor({ ghRun = null, executor = null, notifier = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-cards-prefs-"));
@@ -479,6 +480,58 @@ test("automatic routine slices persist answered questions, deduplicate across sc
       skipReview: true
     });
     assert.equal(deliveries.length, 1, "must not auto-answer a question the owner already dismissed");
+
+    // Background CLI failure (delivery.done -> false) reopens the question so next scan retries/surfaces it
+    let bgAttempt = 0;
+    supervisor._executor = {
+      deliver: async (payload) => {
+        bgAttempt += 1;
+        return {
+          status: "sent",
+          route: payload.route ?? "claude-resume",
+          detail: "Spawned background resume",
+          done: Promise.resolve(bgAttempt > 1)
+        };
+      }
+    };
+    const bgAsk = {
+      action: "ask-user",
+      threadKey: thread.key,
+      playbook: null,
+      question: {
+        dedupeKey: "ask:paseo:t-slice:bg-fail",
+        kind: "agent-ask",
+        threadKey: thread.key,
+        title: "Re-run vitest suite?",
+        body: "Flaky test in suite.",
+        options: ["yes", "no"],
+        agentAskedAt: new Date(t0 + 8 * 60_000).toISOString()
+      }
+    };
+    await supervisor.act([bgAsk], {
+      mode: "auto",
+      byKey,
+      manager: null,
+      started: t0 + 8 * 60_000,
+      config: supervisor.config,
+      items: [{ thread }],
+      skipReview: true
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const reopenedBg = supervisor.store.state.questions.find((q) => q.dedupeKey === "ask:paseo:t-slice:bg-fail");
+    assert.equal(reopenedBg.status, "open", "failed background delivery must reopen the automatic answer");
+    await supervisor.act([bgAsk], {
+      mode: "auto",
+      byKey,
+      manager: null,
+      started: t0 + 9 * 60_000,
+      config: supervisor.config,
+      items: [{ thread }],
+      skipReview: true
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(bgAttempt, 2, "next scan retries once reopened");
+    assert.equal(supervisor.store.state.questions.find((q) => q.dedupeKey === "ask:paseo:t-slice:bg-fail").status, "answered");
   } finally {
     cleanup();
   }
@@ -614,6 +667,29 @@ test("preference card defer/dismiss keeps current setting, quiet_until_ready sup
     });
     await suggestionMgr.refresh();
     assert.equal(suggestionNotified, 0, "quiet_until_ready suppresses suggestion notifications");
+
+    // 4. Switching to quiet_until_ready hides live routine outreach items and switching back to balanced restores them
+    const outreach = new OutreachStore({ dir: path.join(dir, "outreach"), runtime: supervisor.runtime });
+    supervisor.runtime.outreach = outreach;
+    supervisor._notifier = null;
+    supervisor.updatePreferences({ cadence: "balanced" });
+    const routineQ = supervisor.store.upsertQuestion({
+      dedupeKey: "idle:codex:reversible",
+      kind: "stuck",
+      playbook: "idle-report",
+      threadKey: thread.key,
+      title: "Reversible routine check-in",
+      body: "Waiting on routine step.",
+      options: ["keep going", "later"]
+    });
+    const notifyRes = await supervisor.notifier.notifyQuestion(routineQ);
+    assert.ok(notifyRes.outreachId);
+    assert.equal(outreach.get(notifyRes.outreachId).status, "unseen");
+    supervisor.updatePreferences({ cadence: "quiet_until_ready" });
+    assert.equal(outreach.get(notifyRes.outreachId).status, "dismissed");
+    assert.equal(outreach.get(notifyRes.outreachId).decision, "resolved");
+    supervisor.updatePreferences({ cadence: "balanced" });
+    assert.equal(outreach.get(notifyRes.outreachId).status, "seen", "leaving quiet_until_ready restores open routine outreach item");
   } finally {
     fs.rmSync(hubDir, { recursive: true, force: true });
     cleanup();

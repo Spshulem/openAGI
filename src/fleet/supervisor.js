@@ -1654,12 +1654,19 @@ export class FleetSupervisor {
   }
 
   updatePreferences(patch = {}) {
-    const next = applyPreferencePatch(this.store.preferences(), patch, { now: this.now() });
+    const prev = this.store.preferences();
+    const next = applyPreferencePatch(prev, patch, { now: this.now() });
     this.store.savePreferences(next);
     if (next.cadence === "quiet_until_ready") {
       for (const q of this.store.openQuestions()) {
         if (q.outreachId && isSuppressedByQuietCadence(q, next)) {
-          this.resolveOutreach(q, "quiet-cadence", "dismissed");
+          this.resolveOutreach(q, "resolved", "dismissed");
+        }
+      }
+    } else if (prev.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && !isSuppressedByQuietCadence(q, next)) {
+          this.reopenOutreach(q);
         }
       }
     }
@@ -2709,14 +2716,14 @@ export class FleetSupervisor {
             store.answerQuestion(question.id, autoChoice);
             this.resolveOutreach(question, autoChoice, "acted");
             store.recordNudge(targetThread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: "owner-answer" });
-            const { prefs: updatedPrefs } = recordAutonomousSliceAction(prefs, {
+            const { prefs: updatedPrefs, record: autoRecord } = recordAutonomousSliceAction(prefs, {
               slice,
               threadKey: targetThread.key,
               summary: clampText(`${fields.title} -> ${autoChoice}`, 160),
               now: started
             });
             store.savePreferences(updatedPrefs);
-            store.recordAction({
+            const actionRecord = store.recordAction({
               kind: "nudge",
               playbook: `auto-slice:${slice}`,
               threadKey: targetThread.key,
@@ -2725,6 +2732,25 @@ export class FleetSupervisor {
               reason: clampText(`autonomous preference (${slice}): ${fields.title}`, 240),
               at
             });
+            if (delivery.done) {
+              this.reopenIfUndelivered(
+                question.id,
+                [delivery.done.then((reached) => {
+                  if (reached) return null;
+                  const latestPrefs = store.preferences();
+                  const entry = latestPrefs.autonomousActions.find((a) => a.id === autoRecord.id);
+                  if (entry) {
+                    entry.reverted = true;
+                    store.savePreferences(latestPrefs);
+                  }
+                  if (actionRecord?.id) {
+                    store.updateAction(actionRecord.id, { status: "failed", detail: "background delivery failed" });
+                  }
+                  return targetThread.key;
+                })],
+                autoChoice
+              );
+            }
             continue;
           }
         }

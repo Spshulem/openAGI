@@ -138,7 +138,12 @@ export function createNotifier({
     }
     const at = current();
     const outreachId = latest.outreachId ?? postOutreach(latest);
-    if (outreachId) refreshOutreach(outreachId, latest);
+    if (outreachId) {
+      if (latest.outreachId) {
+        try { runtime?.outreach?.reopen?.(outreachId); } catch { /* best-effort */ }
+      }
+      refreshOutreach(outreachId, latest);
+    }
     const result = allowPush ? await push(latest, at) : skip("suggestion-cap");
     if (store && ((outreachId && outreachId !== latest.outreachId) || result.pushed)) {
       store.markQuestionNotified?.(latest.id, { outreachId, pushedAt: result.pushed ? at.toISOString() : undefined });
