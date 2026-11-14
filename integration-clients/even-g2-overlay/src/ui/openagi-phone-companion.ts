@@ -416,8 +416,10 @@ export class OpenAGIPhoneCompanion {
       card.append(title, summary)
       const hasCardAct = Boolean(item.supervisor && item.cardId && item.primaryLabel)
       if (hasCardAct) {
-        const b = document.createElement('button'); b.textContent = item.cardKind === 'pr_ready' && item.prRef ? `${item.primaryLabel} (${item.prRef})` : item.primaryLabel!; b.className = 'answer'; b.dataset.cardOp = 'primary'; b.dataset.id = item.id; card.append(b)
-        if (item.ciState === 'failing') {
+        const isMergeCard = item.cardKind === 'merge_ready' || item.cardKind === 'pr_ready'
+        const primaryIsFix = /fix ci|rebase/i.test(item.primaryLabel ?? '')
+        const b = document.createElement('button'); b.textContent = isMergeCard && !primaryIsFix && item.prRef ? `${item.primaryLabel} (${item.prRef})` : item.primaryLabel!; b.className = 'answer'; b.dataset.cardOp = 'primary'; b.dataset.id = item.id; card.append(b)
+        if (['failing', 'failure', 'error'].includes((item.ciState ?? '').toLowerCase()) && !primaryIsFix) {
           const fix = document.createElement('button'); fix.textContent = 'Have agent fix CI'; fix.className = 'answer'; fix.dataset.cardOp = 'fix_ci'; fix.dataset.id = item.id; card.append(fix)
         }
       }

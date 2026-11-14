@@ -84,8 +84,10 @@ export class OpenAGIG2App {
   private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null; this.lastPingedSupervisor = null }
   private showNotice(item: InboxItem): void {
     this.clearNotice()
+    const isMergeNotice = item.cardKind === 'merge_ready' || item.cardKind === 'pr_ready'
+    const isBlockedNotice = item.cardKind === 'blocker' || item.cardKind === 'blocked'
     const label = item.supervisor
-      ? (item.cardKind === 'pr_ready' ? 'PR ready · Supervisor' : item.cardKind === 'blocked' ? 'Agent blocked · Supervisor' : item.cardKind === 'preference' ? 'Preference · Supervisor' : 'Supervisor question')
+      ? (isMergeNotice ? 'PR ready · Supervisor' : isBlockedNotice ? 'Agent blocked · Supervisor' : item.cardKind === 'preference' ? 'Preference · Supervisor' : 'Supervisor question')
       : item.reminder ? 'Reminder suggested' : /^Follow up:/i.test(item.title) ? 'Follow-up suggested' : item.category === 'memory' ? 'Action identified' : item.category === 'highlight' ? 'Lifelog' : 'Update from main'
     const detail = item.supervisor && item.pmBrief ? `${plainAnswer(item.title)}\n${plainAnswer(item.pmBrief)}` : plainAnswer(item.title)
     this.renderer.notice?.(label, detail)
@@ -319,10 +321,13 @@ export class OpenAGIG2App {
         this.ambientRunning && !this.lifelogUserPaused ? { label: 'Pause listening', op: 'pause' as const } : { label: 'Resume listening', op: 'resume' as const },
         { label: 'Recent answers', op: 'recent' }]
     }
-    const primaryCard = item?.supervisor && item.cardId && (item.action === 'act-fleet-card' || item.cardKind === 'pr_ready' || item.cardKind === 'preference')
-      ? [{ label: item.cardKind === 'pr_ready' ? `${item.primaryLabel || 'Merge PR'}${item.prRef ? ` (${item.prRef})` : ''}` : (item.primaryLabel || 'Approve'), op: 'act-card' as const, cardOp: 'primary' as const }]
+    const isMergeCard = item?.cardKind === 'merge_ready' || item?.cardKind === 'pr_ready'
+    const ciFailed = ['failing', 'failure', 'error'].includes((item?.ciState ?? '').toLowerCase())
+    const primaryIsFix = /fix ci|rebase/i.test(item?.primaryLabel ?? '')
+    const primaryCard = item?.supervisor && item.cardId && (item.action === 'act-fleet-card' || isMergeCard || item.cardKind === 'preference')
+      ? [{ label: isMergeCard && !primaryIsFix ? `${item.primaryLabel || 'Merge PR'}${item.prRef ? ` (${item.prRef})` : ''}` : (item.primaryLabel || 'Approve'), op: 'act-card' as const, cardOp: 'primary' as const }]
       : []
-    const fixCiCard = item?.supervisor && item.cardId && item.ciState === 'failing'
+    const fixCiCard = item?.supervisor && item.cardId && ciFailed && !primaryIsFix
       ? [{ label: 'Have agent fix CI', op: 'act-card' as const, cardOp: 'fix_ci' as const }]
       : []
     const deferCard = item?.supervisor && item.cardId

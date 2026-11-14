@@ -840,8 +840,10 @@ private struct SupervisorCardDeckView: View {
 
     @ViewBuilder
     private var cardActions: some View {
-        let isExplicitActionCard = card.kind == "pr_ready" || card.kind == "ci_failed" || card.kind == "preference"
-            || card.primaryAction?.op == "merge" || card.primaryAction?.op == "fix_ci" || card.primaryAction?.op == "set_preference"
+        let isExplicitActionCard = card.kind == "merge_ready" || card.kind == "pr_ready"
+            || card.kind == "ci_failed" || card.kind == "preference"
+            || card.primaryAction?.op == "merge" || card.primaryAction?.op == "fix_ci"
+            || card.primaryAction?.op == "preference" || card.primaryAction?.op == "set_preference"
 
         HStack(spacing: 8) {
             if isExplicitActionCard, let primary = card.primaryAction, !primary.label.isEmpty {
@@ -1073,18 +1075,8 @@ private struct ActiveSessionsSheet: View {
                     searchError = nil
                 } catch DaemonError.notFound {
                     // Fallback to local thread filtering against an older daemon
-                    let lower = trimmed.lowercased()
-                    searchHits = []
+                    searchHits = SupervisorFormat.fallbackSearchHits(threads, query: trimmed)
                     searchError = nil
-                    let localMatches = threads.filter {
-                        ($0.title?.lowercased().contains(lower) ?? false)
-                            || ($0.workspace?.lowercased().contains(lower) ?? false)
-                            || ($0.repo?.lowercased().contains(lower) ?? false)
-                            || ($0.branch?.lowercased().contains(lower) ?? false)
-                    }
-                    if localMatches.isEmpty {
-                        searchError = "No matching threads in current snapshot."
-                    }
                 } catch {
                     searchError = "Couldn't search sessions right now."
                 }
@@ -1431,7 +1423,9 @@ private struct ThreadDetailSheet: View {
                 if let question {
                     Section("Your response") {
                         if questionIsOpen {
-                            if let card, card.kind == "pr_ready", let primary = card.primaryAction {
+                            let isMergeCard = card?.kind == "merge_ready" || card?.kind == "pr_ready"
+                                || card?.primaryAction?.op == "merge" || card?.primaryAction?.op == "fix_ci"
+                            if let card, isMergeCard, let primary = card.primaryAction {
                                 Button(primary.label) {
                                     onCardPrimary(card, primary)
                                 }
@@ -1442,7 +1436,7 @@ private struct ThreadDetailSheet: View {
                             ForEach(options, id: \.self) { option in
                                 Button(option) { onAnswer(option) }.disabled(questionBusy)
                             }
-                            if options.isEmpty && card?.kind != "pr_ready" {
+                            if options.isEmpty && !isMergeCard {
                                 Label("Respond in the original app on your Mac. Reading this thread does not send an answer.", systemImage: "macbook")
                                     .font(.footnote).foregroundStyle(.secondary)
                             }

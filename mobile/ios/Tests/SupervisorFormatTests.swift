@@ -130,4 +130,72 @@ final class SupervisorFormatTests: XCTestCase {
             SupervisorFormat.cardActNote(FleetCardActResult(ok: false, status: "ci_failed", message: "Checks failed.")).isAlert
         )
     }
+
+    func testDecodesLiveDaemonWirePayloadsAndFallbackSearch() throws {
+        let decoder = JSONDecoder()
+
+        let haltedJSON = Data("""
+        {"result":{"ok":false,"status":"halted","reason":"ci_failed","detail":"Checks failing on lint"},"state":{"mode":"auto"}}
+        """.utf8)
+        let halted = try decoder.decode(FleetCardActResult.self, from: haltedJSON)
+        XCTAssertFalse(halted.ok)
+        XCTAssertEqual(halted.status, "halted")
+        XCTAssertEqual(halted.reason, "ci_failed")
+        XCTAssertEqual(halted.message, "Checks failing on lint")
+        XCTAssertEqual(halted.state?.mode, "auto")
+        XCTAssertEqual(SupervisorFormat.cardActNote(halted), .init(text: "Checks failing on lint", isAlert: true))
+
+        for (status, detail) in [
+            ("watching_ci", "Watching CI until green."),
+            ("queued_when_green", "Queued squash auto-merge."),
+            ("merged", "Merged #285 via squash."),
+            ("updated", "Preference saved.")
+        ] {
+            let payload = Data("""
+            {"result":{"status":"\(status)","detail":"\(detail)"},"state":{"mode":"propose"}}
+            """.utf8)
+            let decoded = try decoder.decode(FleetCardActResult.self, from: payload)
+            XCTAssertTrue(decoded.ok, "Expected ok=true for \(status)")
+            XCTAssertEqual(SupervisorFormat.cardActNote(decoded), .init(text: detail, isAlert: false))
+        }
+
+        let stateJSON = Data("""
+        {
+          "mode": "auto",
+          "preferences": {
+            "mergePolicy": "manual_confirm",
+            "cadence": "quiet_until_ready",
+            "autoSlices": {
+              "in_scope_test_fix": "auto",
+              "rebase_onto_main": "ask",
+              "safe_ci_rerun": "auto"
+            }
+          },
+          "autonomy": {
+            "handledToday": 3,
+            "autonomyPercent": 75,
+            "recentActions": [
+              {"id": "fa_1", "slice": "safe_ci_rerun", "summary": "Reran flaky CI", "reverted": true}
+            ]
+          }
+        }
+        """.utf8)
+        let state = try decoder.decode(FleetState.self, from: stateJSON)
+        XCTAssertEqual(state.preferences?.cadence, "quiet_until_ready")
+        XCTAssertEqual(state.preferences?.autoSlices, ["in_scope_test_fix", "safe_ci_rerun"])
+        XCTAssertEqual(state.autonomy?.handledCount, 3)
+        XCTAssertEqual(state.autonomy?.autonomousPercent, 75)
+        XCTAssertEqual(state.autonomy?.recentActions.first?.vetoed, true)
+        XCTAssertEqual(SupervisorFormat.autonomyLine(state.autonomy), "Handled 3 routine decisions · 75% autonomous")
+
+        let threads = [
+            FleetThread(key: "codex:auth", title: "OAuth refresh bug", workspace: "api", repo: "acme/api",
+                        branch: "fix/oauth", state: "running", pr: FleetPR(ref: "acme/api#88"), lastAgentText: "Added refresh retry"),
+            FleetThread(key: "claude:billing", title: "Invoice export", workspace: "web", state: "idle-no-pr")
+        ]
+        let hits = SupervisorFormat.fallbackSearchHits(threads, query: "acme/api#88")
+        XCTAssertEqual(hits.map(\.key), ["codex:auth"])
+        XCTAssertEqual(hits.first?.snippet, "Added refresh retry")
+        XCTAssertTrue(hits.first?.live == true)
+    }
 }

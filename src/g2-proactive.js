@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
+import { isSuppressedByQuietCadence } from "./fleet/preferences.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -349,6 +350,7 @@ export class G2Proactive {
         const coding = kind === "coding-watch";
         const fleet = kind === "fleet";
         const q = fleet ? questions.get(i.sourceRef.id) : null;
+        if (fleet && q && isSuppressedByQuietCadence(q, fleetState?.preferences)) continue;
         const card = fleet ? (cardsByQuestion.get(i.sourceRef.id) ?? cardsById.get(i.sourceRef.id) ?? cardsById.get(`q:${i.sourceRef.id}`) ?? null) : null;
         if (card?.id) seenCardIds.add(card.id);
         const threadKey = fleet ? (q ? q.threadKey : (card?.threadKey ?? null)) : null;
