@@ -78,10 +78,13 @@ const EXACT = new Set([
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
   "GET /fleet/api/diagnose",
+  "GET /fleet/api/search",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
+  "POST /fleet/api/preferences",
+  "POST /fleet/api/route",
   // Shared device threads and the read-only lifelog. Owner decision: paired
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
@@ -125,6 +128,7 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
+  { method: "POST", re: /^\/fleet\/api\/cards\/[A-Za-z0-9:%_-]{1,160}\/act$/ },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
   // One fleet thread's detail, and the owner's Push now, Mute and Unmute.

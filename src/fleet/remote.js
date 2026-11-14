@@ -10,8 +10,10 @@ import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
+import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
+import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|preferences|route|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -31,6 +33,10 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/diagnose') for (const key of ['window', 'area']) {
         if (typeof payload.body?.[key] === 'string') url.searchParams.set(key, payload.body[key]);
       }
+      if (payload.path === '/fleet/api/search') {
+        if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
@@ -49,7 +55,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -93,9 +99,33 @@ export class RemoteFleetSupervisor {
     const state = structuredClone(this.state);
     state.questionsAuthoritative = this.questionsAuthoritative;
     state.modeConfirmed = this.questionsAuthoritative;
+    const localFixQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
     if (this.selfFixHub) {
       state.fixes = this.selfFixHub.store.fixes();
-      state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
+      state.questions = [...state.questions, ...localFixQuestions];
+    }
+    if (!Array.isArray(state.cards)) {
+      const remoteAutonomy = state.autonomy ?? null;
+      Object.assign(state, buildSupervisorDeck(state, { preferences: state.preferences }));
+      if (remoteAutonomy) state.autonomy = remoteAutonomy;
+    } else if (localFixQuestions.length > 0) {
+      const prefs = normalizePreferences(state.preferences);
+      const rowsByKey = new Map((state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+      const actions = Array.isArray(state.actions) ? state.actions : [];
+      const existingIds = new Set(state.cards.flatMap((c) => [c?.id, c?.questionId].filter(Boolean)));
+      const localCards = localFixQuestions
+        .filter((q) => q?.id && !existingIds.has(q.id) && !isSuppressedByQuietCadence(q, prefs))
+        .map((q) => {
+          const { rank: _rank, ...card } = buildSupervisorCard(q, { rowsByKey, actions, prefs });
+          return card;
+        });
+      if (localCards.length > 0) {
+        const nonPref = state.cards.filter((c) => c.kind !== 'preference');
+        const prefCards = state.cards.filter((c) => c.kind === 'preference');
+        state.cards = [...nonPref, ...localCards, ...prefCards];
+        state.activeSummary = buildActiveSummary(state.snapshot, state.cards);
+        state.catchUpSummary = buildCatchUpSummary(state.cards, state.activeSummary);
+      }
     }
     return state;
   }
@@ -121,15 +151,18 @@ export class RemoteFleetSupervisor {
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
         this.mirrorQuestions();
+        this.emitIfChanged();
       }
       status = result.response?.status ?? null;
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      if (!missingThread && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
+      const nonOutage404 = missingThread || closedCard;
+      if (!nonOutage404 && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(missingThread ? error.message : this.state.lastError), { reached, status });
+      throw Object.assign(new Error(nonOutage404 ? error.message : this.state.lastError), { reached, status });
     }
   }
   refresh() {
@@ -143,11 +176,19 @@ export class RemoteFleetSupervisor {
     return this.refreshing;
   }
   // The main's push sender listens for "fleet" like a local supervisor's
-  // tick. Only a new snapshot or a changed set of open questions is news.
+  // tick. Only a new snapshot or a changed set of open questions/cards is news.
   emitIfChanged() {
     try {
       const state = this.getState();
-      const signature = JSON.stringify([state.mode, state.snapshot?.at ?? null, state.questions.map(q => q.id).sort()]);
+      const signature = JSON.stringify([
+        state.mode,
+        state.snapshot?.at ?? null,
+        state.questions.map(q => q.id).sort(),
+        (state.cards ?? []).map(c => c.id).sort(),
+        state.preferences?.mergePolicy ?? null,
+        state.preferences?.cadence ?? null,
+        state.preferences?.autoSlices ?? null
+      ]);
       if (signature === this.lastEmitted) return;
       this.lastEmitted = signature;
       this.runtime?.events?.emit?.("fleet", { at: state.snapshot?.at ?? null, reason: "remote-refresh", counts: state.snapshot?.counts ?? null });
@@ -201,6 +242,33 @@ export class RemoteFleetSupervisor {
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
+  async searchThreads(options = {}) { return this.request('GET', '/fleet/api/search', options); }
+  async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
+  async routeIssue(input = {}) {
+    const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
+    return rest;
+  }
+  async actCard(cardId, input = {}) {
+    if (this.selfFixHub && typeof cardId === 'string') {
+      const localQuestion = this.selfFixHub.store.question(cardId);
+      if (localQuestion) {
+        const op = String(input?.op ?? 'primary').toLowerCase();
+        if (op === 'defer' || op === 'dismiss') {
+          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(cardId), delivery: null };
+        }
+        const answer = typeof input?.value === 'string' && input.value ? input.value : (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
+        if (!answer) return null;
+        const res = await this.selfFixHub.answer(cardId, answer);
+        return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;
+      }
+    }
+    try {
+      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+    } catch (error) {
+      if (error.status === 404) return null;
+      throw error;
+    }
+  }
   async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
   // Fix it queues in this main's hub (where fixes are listed, revised and
   // stopped); the computer only links the suggestion to that fix id.
@@ -253,7 +321,9 @@ export class RemoteFleetSupervisor {
   mirrorQuestions() {
     const outreach = this.runtime.outreach;
     if (!outreach) return;
-    const openIds = new Set(this.getState().questions.map(q => q.id));
+    const currentState = this.getState();
+    const liveQuestions = currentState.questions.filter((q) => !isSuppressedByQuietCadence(q, currentState.preferences));
+    const openIds = new Set(liveQuestions.map(q => q.id));
     for (const item of outreach.list()) {
       if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
           && (item.sourceRef.nodeId !== this.nodeId
@@ -262,7 +332,7 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
-    for (const q of this.getState().questions) {
+    for (const q of liveQuestions) {
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'

@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var thread: ConversationThread = .agent
@@ -54,15 +55,22 @@ struct ChatView: View {
         .task { await model.conversations.refresh() }
     }
 
+    // Unfolded like a book, the conversation list fills the leading page
+    // and the conversation, composer included, the trailing one, so neither
+    // runs across the fold.
     private var conversationSplitView: some View {
-        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
-            ConversationBrowser(thread: $thread) { message in
-                selectedMessage = message
-                compactColumn = .detail
+        GeometryReader { geometry in
+            let page = ChatBookPages.sidebarWidth(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                                                  size: geometry.size, rightToLeft: layoutDirection == .rightToLeft)
+            NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+                ConversationBrowser(thread: $thread) { message in
+                    selectedMessage = message
+                    compactColumn = .detail
+                }
+                .navigationSplitViewColumnWidth(min: page ?? 220, ideal: page ?? 270, max: page ?? 320)
+            } detail: {
+                conversationNavigation
             }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
-        } detail: {
-            conversationNavigation
         }
     }
 
@@ -117,6 +125,8 @@ struct ChatConversationView: View {
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+    var topAccessory: AnyView? = nil
+    var composerAccessory: ((Bool) -> AnyView)? = nil
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
     var onHistorySelectionConsumed: () -> Void = {}
 
@@ -131,6 +141,9 @@ struct ChatConversationView: View {
     @State private var isPreparingImages = false
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
+    @State private var reviewingApproval: PendingAction?
+    // Cards put away in this chat. The approval stays in the Inbox.
+    @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
@@ -166,6 +179,15 @@ struct ChatConversationView: View {
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { selectedAttachment = nil } } }
             }
         }
+        .sheet(item: $reviewingApproval) { action in
+            NavigationStack {
+                ApprovalDetailView(action: action) {
+                    model.bumpInboxGeneration()
+                    await model.refreshInbox(force: true)
+                }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { reviewingApproval = nil } } }
+            }
+        }
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in
@@ -178,8 +200,13 @@ struct ChatConversationView: View {
         .task(id: conversation.identity) { await conversation.refresh() }
         .onDisappear { dictation.stop() }
         .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
-            if !sending { Task { await model.conversations.refresh() } }
+            if !sending {
+                Task { await model.conversations.refresh() }
+                // A turn can raise an approval; show it under the reply.
+                Task { await model.refreshInbox(force: true) }
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
@@ -189,6 +216,7 @@ struct ChatConversationView: View {
 
     private var conversationContent: some View {
         VStack(spacing: 0) {
+            if let topAccessory { topAccessory }
             header
             GeometryReader { geometry in
                 messageScroll(width: geometry.size.width)
@@ -251,7 +279,13 @@ struct ChatConversationView: View {
                     ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
                         messageItemView(item, width: width)
                     }
+                    ForEach(raisedApprovals) { action in
+                        ChatApprovalCard(action: action, onReview: { reviewingApproval = action },
+                                         onHide: { hiddenApprovals.insert(action.id) })
+                            .padding(.top, Theme.Spacing.x3)
+                    }
                     Color.clear.frame(height: 1)
+                        .id(Self.endOfConversation)
                         .onScrollVisibilityChange(threshold: 0.01) { visible in
                             isBottomVisible = visible
                             if visible { isPinnedToBottom = true }
@@ -262,8 +296,11 @@ struct ChatConversationView: View {
             }
             .accessibilityIdentifier("chat-history")
             .scrollPosition($scrollPosition)
+            // Long histories open at the newest line. No bottom anchor for
+            // .alignment: with a history about one screen tall it fed a
+            // layout loop with the keyboard's safe area (the app hung as the
+            // keyboard rose). A short chat reads from the top.
             .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .alignment)
             .onScrollPhaseChange { _, phase in
                 userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
             }
@@ -286,6 +323,16 @@ struct ChatConversationView: View {
                 // becomes idle, or when a wider layout fits the history.
                 if geometry.isAtBottom { isPinnedToBottom = true }
                 else if userIsScrolling { isPinnedToBottom = false }
+            }
+            .onChange(of: raisedApprovals.map(\.id)) { _, ids in
+                guard !ids.isEmpty && (isPinnedToBottom || isBottomVisible) else { return }
+                scrollToLatest()
+                // A new card's height is only known after it lays out; settle
+                // on the real end once it has.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    scrollToLatest()
+                }
             }
             .onChange(of: messages) { old, new in
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
@@ -339,14 +386,17 @@ struct ChatConversationView: View {
 
     private func scrollToLatest() {
         withAnimation(nil) {
-            if let latest = messages.last?.id {
+            if !raisedApprovals.isEmpty {
+                // Approval cards follow the newest reply; keep them in view.
+                scrollPosition.scrollTo(id: Self.endOfConversation, anchor: .bottom)
+            } else if let latest = messages.last?.id {
                 // An edge scroll can land in unmaterialized space when the
                 // lazy history and keyboard change size in the same turn.
                 // A real message ID gives SwiftUI a row to resolve and show.
                 scrollPosition.scrollTo(id: latest, anchor: .bottom)
-            } else {
-                scrollPosition.scrollTo(edge: .bottom)
             }
+            // Nothing to scroll to yet. An edge scroll here offset the empty
+            // chat's centred content by the gutter.
         }
     }
 
@@ -402,7 +452,8 @@ struct ChatConversationView: View {
                 }
                 .frame(width: min(width * 0.78, 320))
             }
-            MessageBubbleRow(message: item.message, maxContainerWidth: width)
+            MessageBubbleRow(message: item.message, maxContainerWidth: width,
+                             showsActions: item.message.id == latestFinishedReplyID)
             // Offer a resend only when the daemon rejected the turn before
             // it ran. A lost stream can hide a completed action.
             if item.message.isFailed && item.message.retrySafe {
@@ -419,29 +470,87 @@ struct ChatConversationView: View {
         .id(item.message.id)
     }
 
+    // Centred, one question and a short list of things to hand off. A tap
+    // fills the composer rather than sending, so the owner can add detail.
+    // Only the newest finished reply carries Copy and Share under it; older
+    // ones keep them in the long-press menu, so the page stays quiet.
+    private var latestFinishedReplyID: UUID? {
+        guard let last = messages.last, last.role == .assistant, !last.isStreaming, !last.isFailed,
+              !last.text.isEmpty else { return nil }
+        return last.id
+    }
+
+    private static let endOfConversation = UUID()
+
+    // Approvals this conversation raised since your latest message, shown
+    // under its reply. Older ones, and other chats', live in the Inbox.
+    private var raisedApprovals: [PendingAction] {
+        guard let asked = messages.last(where: { $0.role == .user })?.timestamp else { return [] }
+        return PendingAction.raised(in: model.workspace.pendingActions ?? [],
+                                    thread: conversation.thread,
+                                    conversationID: conversation.conversationID,
+                                    since: asked,
+                                    // A main that predates shared threads runs
+                                    // phone chats under other session ids; keep
+                                    // showing every recent approval there.
+                                    scopedToSession: conversation.historyStatus != .needsUpdate)
+            .filter { !hiddenApprovals.contains($0.id) }
+    }
+
     private var chatHome: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Image(systemName: "sparkle").font(.largeTitle).foregroundStyle(.tint)
-            Text("What would you like to do?").font(.largeTitle.bold())
-            Text(model.isOnPhone
-                 ? "Your agent, tasks and conversations live on this iPhone."
-                 : "Plan your day, keep track of work, or ask your agent for help.")
-                .foregroundStyle(.secondary)
-            ForEach(["Help me plan my day", "Show my tasks", "Remember something for me"], id: \.self) { prompt in
-                Button { conversation.draft = prompt; composerFocused = true } label: {
-                    Label(prompt, systemImage: "arrow.up.left")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }.buttonStyle(.bordered).controlSize(.large)
+        let isSupervisor = conversation.thread == .supervisor
+        let suggestions = isSupervisor ? ChatHomeSuggestion.supervisorAll : ChatHomeSuggestion.all
+        return VStack(spacing: Theme.Spacing.x6) {
+            VStack(spacing: Theme.Spacing.x2) {
+                Image(systemName: isSupervisor ? "binoculars" : "sparkles").font(.title).foregroundStyle(.tint)
+                    .frame(width: 56, height: 56)
+                    .background(.tint.opacity(0.12), in: .circle)
+                    .accessibilityHidden(true)
+                Text(isSupervisor ? "Your coding agents, one thread" : "What can I take off your plate?")
+                    .font(.title2.bold()).multilineTextAlignment(.center)
+                Text(isSupervisor
+                     ? emptyDetail
+                     : (model.isOnPhone
+                        ? "Your agent, tasks and conversations live on this iPhone."
+                        : "Ask for anything. OpenAGI works on it and checks with you before big steps."))
+                    .font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity)
+            VStack(spacing: Theme.Spacing.x2) {
+                ForEach(suggestions) { suggestion in
+                    Button { conversation.draft = suggestion.prompt; composerFocused = true } label: {
+                        HStack(spacing: Theme.Spacing.x3) {
+                            Image(systemName: suggestion.symbol).font(.body).foregroundStyle(.tint)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(suggestion.title).font(.body.weight(.semibold)).foregroundStyle(Theme.ink)
+                                Text(suggestion.detail).font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(Theme.Spacing.x4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.surface, in: .rect(cornerRadius: 16, style: .continuous))
+                        .contentShape(.rect(cornerRadius: 16))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("chat-suggestion-\(suggestion.id)")
+                }
+            }
+            .frame(maxWidth: .infinity)
         }
         .padding(.vertical, 40)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat-home")
     }
 
     @ViewBuilder
     private var inputBar: some View {
         VStack(spacing: 8) {
+            if let composerAccessory { composerAccessory(composerFocused) }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -464,41 +573,34 @@ struct ChatConversationView: View {
         }
     }
 
+    // One pill holds every control, like Messages: attachments, the field,
+    // the microphone and Send. Glass belongs to the pill, not each button.
     @ViewBuilder
     private var composerBar: some View {
-        if #available(iOS 26, *) {
-            GlassEffectContainer(spacing: 8) {
-                composerLayout {
-                    attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
-                        .frame(width: 44, height: 44)
-                    composerField
-                        .glassEffect(.regular, in: .rect(cornerRadius: 22))
-                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
-                        .frame(width: 44, height: 44)
-                    sendButton
-                        .buttonStyle(.glassProminent)
-                        .buttonBorderShape(.circle)
-                        .controlSize(.regular)
-                        .frame(width: 44, height: 44)
-                }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-        } else {
-            composerLayout {
-                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
-                    .frame(width: 44, height: 44)
-                composerField.background(.background.secondary, in: .rect(cornerRadius: 22))
-                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
-                    .frame(width: 44, height: 44)
-                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle).controlSize(.regular)
-                    .frame(width: 44, height: 44)
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
+        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
+        let pill = composerLayout {
+            attachmentMenu.buttonStyle(.plain).foregroundStyle(Theme.muted).frame(width: 44, height: 44)
+            composerField
+            dictationButton.buttonStyle(.plain).foregroundStyle(dictation.isListening ? Theme.alert : Theme.muted)
+                .frame(width: 44, height: 44)
+            sendButton.buttonStyle(.plain).frame(width: 44, height: 44)
         }
+        .padding(.horizontal, 4).padding(.vertical, 2)
+        Group {
+            if #available(iOS 26, *) {
+                pill.glassEffect(.regular, in: shape)
+            } else {
+                pill.background(.background.secondary, in: shape)
+                    .overlay(shape.strokeBorder(composerFocused ? Theme.live.opacity(0.6) : Theme.edge, lineWidth: 1))
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
     private var composerLayout: ComposerLayout {
-        ComposerLayout(prefersSeparateControls: dynamicTypeSize >= .xxLarge,
+        // One line, like Messages, up to the accessibility sizes. Duo's
+        // larger default text used to stack the controls under the field.
+        ComposerLayout(prefersSeparateControls: dynamicTypeSize.isAccessibilitySize,
                        rightToLeft: layoutDirection == .rightToLeft)
     }
 
@@ -615,15 +717,22 @@ struct ChatConversationView: View {
             .lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 3 : 5))
             .submitLabel(.send)
             .onSubmit { sendDraft() }
-            .padding(.horizontal, 14).padding(.vertical, 10)
+            .padding(.horizontal, 6).padding(.vertical, 10)
             .frame(minWidth: 0, maxWidth: .infinity, minHeight: 44)
-            .clipShape(.rect(cornerRadius: 22))
             .accessibilityLabel(placeholder)
             .accessibilityIdentifier("chat-composer")
     }
 
     private var sendButton: some View {
-        Button(action: sendDraft) { composerIcon("arrow.up") }
+        Button(action: sendDraft) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(canSend ? Color(uiColor: .systemBackground) : Theme.muted)
+                .frame(width: 32, height: 32)
+                .background(canSend ? Theme.ink : Theme.muted.opacity(0.2), in: .circle)
+                .frame(width: 44, height: 44)
+                .contentShape(.circle)
+        }
             .accessibilityLabel("Send")
             .disabled(!canSend)
             .accessibilityIdentifier("chat-send")
@@ -632,9 +741,10 @@ struct ChatConversationView: View {
     private func composerIcon(_ name: String) -> some View {
         Image(systemName: name)
             .font(.system(size: 18, weight: .medium))
-            // Regular native glass adds seven points per side. Size the
-            // label so the button itself, not just its wrapper, is 44 points.
-            .frame(width: 30, height: 30)
+            // Plain buttons take their label's size: the label itself is
+            // the 44-point touch target.
+            .frame(width: 44, height: 44)
+            .contentShape(.rect)
     }
 
     private func sendDraft() {
@@ -706,91 +816,201 @@ enum ChatErrorCopy {
     }
 }
 
-// One row: the bubble, aligned and filled per speaker, sized to DESIGN.md's
-// max-width fractions of the available width. A resting three-dot
-// indicator stands in before the first token arrives; a failed reply
-// renders as plain `alert` text (it's the app's own copy, not model
-// content, so it is never run through the Markdown renderer).
+// One row. Your lines sit in a compact bubble on the trailing side; a reply
+// is plain text on the page, full width, like a document. While a reply
+// streams, a working line says what the agent is doing. A failed reply is
+// plain `alert` text (the app's own copy, never run through Markdown).
 private struct MessageBubbleRow: View {
     @Environment(\.chatFont) private var chatFont
     let message: ChatMessage
     let maxContainerWidth: CGFloat
+    var showsActions = false
 
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: Theme.Spacing.x8) }
-            IntrinsicBubbleLayout(maxWidth: max(0, maxContainerWidth - 2 * Theme.gutter) * (message.role == .user ? 0.78 : 0.92)) {
-                bubble
+        if message.role == .user {
+            HStack {
+                Spacer(minLength: Theme.Spacing.x8)
+                IntrinsicBubbleLayout(maxWidth: max(0, maxContainerWidth - 2 * Theme.gutter) * 0.78) {
+                    userBubble
+                }
             }
-            if message.role == .assistant { Spacer(minLength: Theme.Spacing.x8) }
-        }
-    }
-
-    @ViewBuilder
-    private var bubbleContent: some View {
-        if message.isFailed {
-            Text(message.text)
-                .font(chatFont)
-                .foregroundStyle(Theme.alert)
-        } else if message.text.isEmpty && message.isStreaming {
-            TypingIndicatorView()
-        } else if message.role == .assistant {
-            MarkdownContent(blocks: MarkdownParser.parse(message.text))
         } else {
-            Text(message.text)
-                .font(chatFont)
-                .foregroundStyle(Theme.ink)
-                .textSelection(.enabled)
+            reply
         }
     }
 
-    private var bubble: some View {
-        bubbleContent
+    private var userBubble: some View {
+        Text(message.text)
+            .font(chatFont)
+            .foregroundStyle(Theme.ink)
+            .textSelection(.enabled)
             .lineLimit(nil)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, Theme.Spacing.x4)
             .padding(.vertical, Theme.Spacing.x3)
-            .background(fill)
-            .clipShape(bubbleShape)
+            .background(Color(uiColor: .tertiarySystemFill), in: .rect(cornerRadius: 20, style: .continuous))
             .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("chat-bubble-\(message.role == .user ? "user" : "assistant")")
-            .contextMenu {
-                Button {
-                    UIPasteboard.general.string = message.text
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
+            .accessibilityIdentifier("chat-bubble-user")
+            .contextMenu { copyButton }
+    }
+
+    private var reply: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
+            if message.isFailed {
+                Text(message.text)
+                    .font(chatFont)
+                    .foregroundStyle(Theme.alert)
+            } else if !message.text.isEmpty {
+                MarkdownContent(blocks: MarkdownParser.parse(message.text))
             }
+            if message.isStreaming {
+                ChatWorkingLine(text: message.activity ?? "Thinking")
+            }
+            if showsActions { actions }
+        }
+        .lineLimit(nil)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-bubble-assistant")
+        .contextMenu { copyButton }
     }
 
-    // Messages remain in the content layer; glass belongs to the controls.
-    private var fill: Color {
-        message.role == .user ? Color(uiColor: .secondarySystemBackground) : .clear
+    // Copy and Share under the newest reply.
+    private var actions: some View {
+        HStack(spacing: Theme.Spacing.x1) {
+            Button {
+                UIPasteboard.general.string = message.text
+            } label: {
+                Image(systemName: "doc.on.doc").frame(width: 36, height: 36)
+            }
+            .accessibilityLabel("Copy reply")
+            .accessibilityIdentifier("chat-reply-copy")
+            ShareLink(item: message.text) {
+                Image(systemName: "square.and.arrow.up").frame(width: 36, height: 36)
+            }
+            .accessibilityLabel("Share reply")
+            .accessibilityIdentifier("chat-reply-share")
+        }
+        .font(.subheadline)
+        .foregroundStyle(Theme.muted)
+        .buttonStyle(.plain)
     }
 
-    // DESIGN.md: "radius 18 with the bottom-trailing corner at 4" (you) /
-    // "bottom-leading corner at 4" (OpenAGI).
-    private var bubbleShape: UnevenRoundedRectangle {
-        message.role == .user
-            ? UnevenRoundedRectangle(topLeadingRadius: 18, bottomLeadingRadius: 18, bottomTrailingRadius: 4, topTrailingRadius: 18, style: .continuous)
-            : UnevenRoundedRectangle(topLeadingRadius: 18, bottomLeadingRadius: 4, bottomTrailingRadius: 18, topTrailingRadius: 18, style: .continuous)
+    private var copyButton: some View {
+        Button {
+            UIPasteboard.general.string = message.text
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
+        }
     }
 }
 
-// DESIGN.md: "Before the first token, show a three-dot resting indicator
-// inside an assistant bubble -- not a full-screen spinner." Deliberately
-// static: the Motion section reserves this app's one animation for task
-// completion, and everything else -- explicitly including "no shimmer, no
-// pulsing dot" -- stays still.
-private struct TypingIndicatorView: View {
+// What the agent is doing right now, under a streaming reply: "Thinking",
+// "Using fleet status". Replaces the old three-dot indicator, which said
+// nothing about progress on a long, tool-heavy turn.
+struct ChatWorkingLine: View {
+    let text: String
+
     var body: some View {
-        HStack(spacing: 4) {
-            Circle().fill(Theme.muted).frame(width: 6, height: 6)
-            Circle().fill(Theme.muted.opacity(0.7)).frame(width: 6, height: 6)
-            Circle().fill(Theme.muted.opacity(0.4)).frame(width: 6, height: 6)
+        HStack(spacing: Theme.Spacing.x2) {
+            ProgressView().controlSize(.small)
+            Text(text)
+                .font(Theme.Typography.secondary)
+                .foregroundStyle(Theme.muted)
         }
-        .accessibilityLabel("OpenAGI is typing")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("OpenAGI is working: \(text)")
+        .accessibilityIdentifier("chat-working")
     }
+}
+
+// An approval the agent raised, inline in the conversation: what it wants to
+// do and why. Review opens the same detail the Inbox uses, where Approve and
+// Deny live with their full result handling.
+struct ChatApprovalCard: View {
+    let action: PendingAction
+    let onReview: () -> Void
+    var onHide: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
+            Text("NEEDS YOUR OK")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tint)
+            Text(action.summary)
+                .font(.headline)
+                .foregroundStyle(Theme.ink)
+            if let reason = action.reason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+                Text(reason)
+                    .font(Theme.Typography.secondary)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(5)
+            }
+            // Two equal pills, the decision on the trailing side. Hide only
+            // puts the card away here; the approval waits in the Inbox.
+            HStack(spacing: Theme.Spacing.x3) {
+                Button(action: onHide) {
+                    Text("Hide").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
+                        .contentShape(Capsule())
+                }
+                .foregroundStyle(Theme.ink)
+                .accessibilityIdentifier("chat-approval-hide-\(action.id)")
+                Button(action: onReview) {
+                    Text("Review").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .foregroundStyle(Color(uiColor: .systemBackground))
+                        .background(Theme.ink, in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .accessibilityIdentifier("chat-approval-review-\(action.id)")
+            }
+            .buttonStyle(.plain)
+            .padding(.top, Theme.Spacing.x2)
+        }
+        .padding(Theme.Spacing.x5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.surface, in: .rect(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-approval-\(action.id)")
+    }
+}
+
+// The sidebar width that puts the split view's own divider on a vertical
+// fold: the leading page's width, or nil when there is no such fold.
+enum ChatBookPages {
+    static func sidebarWidth(division: CGRect?, size: CGSize, rightToLeft: Bool) -> CGFloat? {
+        guard let fold = division, fold.height > fold.width, fold.minX > 0, fold.maxX < size.width else { return nil }
+        return rightToLeft ? size.width - fold.maxX : fold.minX
+    }
+}
+
+// The empty chat's starting points. Each fills the composer.
+struct ChatHomeSuggestion: Identifiable {
+    let id: String
+    let symbol: String
+    let title: String
+    let detail: String
+    let prompt: String
+
+    static let all = [
+        ChatHomeSuggestion(id: "plan", symbol: "sun.max", title: "Plan my day",
+                           detail: "What matters today, in order", prompt: "Help me plan my day"),
+        ChatHomeSuggestion(id: "tasks", symbol: "checklist", title: "Show my tasks",
+                           detail: "Open, overdue and coming up", prompt: "Show my tasks"),
+        ChatHomeSuggestion(id: "remember", symbol: "brain", title: "Remember something",
+                           detail: "A fact, a preference, a promise", prompt: "Remember something for me")
+    ]
+
+    static let supervisorAll = [
+        ChatHomeSuggestion(id: "status", symbol: "bolt.horizontal.circle", title: "Catch me up",
+                           detail: "What finished, what's green, and what needs me", prompt: "Catch me up on my coding agents"),
+        ChatHomeSuggestion(id: "bug", symbol: "ladybug", title: "Route a bug report",
+                           detail: "Find the right agent session and hand off a fix", prompt: "A customer hit a bug: "),
+        ChatHomeSuggestion(id: "search", symbol: "magnifyingglass", title: "Find a session",
+                           detail: "Search across every repo, PR and transcript", prompt: "Find the session working on ")
+    ]
 }
 
 // Measure short replies at their natural width, then cap longer content at

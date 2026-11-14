@@ -166,10 +166,32 @@ what makes a chat feel like a chat on both platforms, and it means no speaker
 labels at all.
 
 - **You:** right aligned, a compact bubble only as wide as its text (max 85%),
-  `live` at 12% opacity as the fill, `ink` text, radius 18 with the
-  bottom-trailing corner at 4.
-- **OpenAGI:** full width, no bubble, `ink` text — a reply reads like a page,
-  so a long answer fits as much per line as the screen allows.
+  a quiet system fill, `ink` text. On iOS the bubble is evenly rounded
+  (radius 20, continuous) — no tail.
+- **OpenAGI:** full width, no bubble, no inset, `ink` text — a reply reads
+  like a page, so a long answer fits as much per line as the screen allows.
+  The newest finished reply carries Copy and Share icons under it; older
+  replies keep Copy in the long-press menu.
+- **Working line.** While a reply streams, a small native spinner and one
+  `muted` line say what the agent is doing, from the stream's `status`
+  frames: "Using fleet status" for a tool hop, else the stage ("Thinking",
+  "Getting started"). It sits under the text received so far and goes away
+  with the final frame. It is never saved.
+- **Approvals raised by a turn** show under its reply as a card: "NEEDS YOUR
+  OK" in the accent, the summary, the agent's reason, and **Review**, which
+  opens the same approval detail the Inbox uses (Approve and Deny live
+  there, with their full result handling). Only approvals created since the
+  owner's latest message appear; the rest stay in the Inbox.
+- **Duo.** The cover screen keeps the composer on one line beside the
+  trailing control rail (it splits onto two rows only at accessibility text
+  sizes or under about 300 points). Unfolded like a book, the conversation
+  list fills the leading page and the conversation with its composer the
+  trailing page, so nothing runs across the fold. Approval cards end in two
+  equal pills: **Hide** (puts the card away here; the approval stays in the
+  Inbox) and **Review** (filled).
+- **Empty chat:** centred — one question ("What can I take off your
+  plate?"), one `muted` line, and three starting points as cards (icon,
+  title, one line). A tap fills the composer; it never sends.
 - Message text is 15 regular on a 22 line (chat body), not the 17 row body.
   Markdown keeps its own block spacing.
 - **Top bar:** one row, at least 52 tall (taller at large font scales, never
@@ -197,8 +219,8 @@ labels at all.
   than wrapping, and is long-press copyable. In a chat reply in light mode,
   code blocks and tables are `surface` with an `edge` hairline instead, since
   the reply sits straight on `canvas`.
-- **Streaming is the point.** Before the first token, show a three-dot resting
-  indicator inside an assistant bubble — not a full-screen spinner. As `delta`
+- **Streaming is the point.** Before the first token, show the working line
+  — not a full-screen spinner. As `delta`
   frames arrive, append into that same bubble so it grows. Opening a chat, or
   coming back to one, starts at the newest line. The list stays pinned to the
   very end of the newest message (not its top edge, so a long reply keeps
@@ -207,8 +229,10 @@ labels at all.
   not yank them back — show a small round down-arrow button at the
   bottom-trailing corner above the composer ("Jump to latest"), with room left
   under the last line while it shows so it never covers the reply.
-- The composer is a rounded pill (`surface`, `edge` hairline, `live` while
-  the field has focus) with the field and a round send arrow inside it. It
+- The composer is one rounded pill (`surface`, `edge` hairline, `live` while
+  the field has focus; Liquid Glass on iOS 26) holding every control:
+  attachments (+) at the leading edge, the field, the microphone, and a round
+  send arrow. Each control is a 44-point target. It
   sits above the keyboard, never behind it, and keeps the safe area on a
   home-indicator device. One line at rest; it grows to 6 lines then scrolls.
   Send is disabled and `muted` until there is non-whitespace text; enabled it

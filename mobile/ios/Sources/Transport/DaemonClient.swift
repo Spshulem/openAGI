@@ -93,6 +93,7 @@ public actor DaemonClient {
     // predates shared threads). In memory only: a relaunch probes again, so
     // an updated main is picked up.
     private var sharedThreadsUnsupported = false
+    private var focusedCardUnsupported = false
 
     public init(server: URL, nodeID: String, token: String, session: URLSession = .shared) {
         self.server = server
@@ -271,7 +272,8 @@ public actor DaemonClient {
     // main that still keeps it apart from Chat, and on a newer one the
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
-                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [], conversationId: String = "main") async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [],
+                                     conversationId: String = "main", focusedCardId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
         // Check before uploading pixels. Older mains can reject a large body
         // before returning a useful error; that is not a dropped agent turn.
         if !attachments.isEmpty { try await requireImageSupport() }
@@ -287,8 +289,22 @@ public actor DaemonClient {
         if let thread, !sharedThreadsUnsupported {
             var threaded = body
             threaded["thread"] = thread.rawValue
+            if let focusedCardId, !focusedCardId.isEmpty, !focusedCardUnsupported {
+                threaded["focusedCardId"] = focusedCardId
+            }
             do {
                 bytes = try await openMessageStream(body: threaded)
+            } catch is FocusedCardRejected {
+                focusedCardUnsupported = true
+                var fallbackThreaded = body
+                fallbackThreaded["thread"] = thread.rawValue
+                do {
+                    bytes = try await openMessageStream(body: fallbackThreaded)
+                } catch is SharedThreadsRejected {
+                    guard conversationId == "main" else { throw DaemonError.notFound }
+                    sharedThreadsUnsupported = true
+                    bytes = try await openMessageStream(body: body)
+                }
             } catch is SharedThreadsRejected {
                 // A named chat must never fall back into the default chat.
                 guard conversationId == "main" else { throw DaemonError.notFound }
@@ -323,6 +339,7 @@ public actor DaemonClient {
     }
 
     private struct SharedThreadsRejected: Error {}
+    private struct FocusedCardRejected: Error {}
 
     private struct MessageCapabilities: Decodable { let imageAttachments: Bool }
 
@@ -390,6 +407,7 @@ public actor DaemonClient {
                 let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
                 if text.contains("unsupported fields") {
                     if body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+                    if body["focusedCardId"] != nil { throw FocusedCardRejected() }
                     if body["thread"] != nil { throw SharedThreadsRejected() }
                 }
             }
@@ -521,6 +539,51 @@ public actor DaemonClient {
         request.timeoutInterval = 200
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
+    public func fleetActCard(id: String, op: String, value: String? = nil,
+                             clarification: String? = nil, instructions: String? = nil) async throws -> FleetCardActResult {
+        guard !id.isEmpty, !id.contains("/") else { throw DaemonError.malformedResponse }
+        var request = try authorizedRequest(path: "/fleet/api/cards/\(id)/act", method: "POST")
+        var body: [String: Any] = ["op": op]
+        if let value { body["value"] = value }
+        if let clarification { body["clarification"] = clarification }
+        if let instructions { body["instructions"] = instructions }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetCardActResult.self, from: data)
+    }
+
+    public func fleetUpdatePreferences(cadence: String? = nil, mergePolicy: String? = nil,
+                                       choice: String? = nil, vetoSlice: String? = nil,
+                                       vetoActionID: String? = nil) async throws -> FleetState {
+        struct Response: Decodable { let state: FleetState? }
+        var request = try authorizedRequest(path: "/fleet/api/preferences", method: "POST")
+        var body: [String: Any] = [:]
+        if let cadence { body["cadence"] = cadence }
+        if let mergePolicy { body["mergePolicy"] = mergePolicy }
+        if let choice { body["choice"] = choice }
+        if let vetoSlice { body["vetoSlice"] = vetoSlice }
+        if let vetoActionID { body["vetoActionId"] = vetoActionID }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        if let state = (try? Self.decodeJSON(Response.self, from: data))?.state {
+            return state
+        }
+        return try await fleetState()
+    }
+
+    public func fleetSearch(query: String, limit: Int = 20) async throws -> FleetSearchResponse {
+        let items = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "limit", value: String(min(max(limit, 1), 50)))
+        ]
+        let request = try authorizedRequest(path: "/fleet/api/search", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetSearchResponse.self, from: data)
     }
 
     // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)

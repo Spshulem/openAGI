@@ -85,4 +85,117 @@ final class SupervisorFormatTests: XCTestCase {
         XCTAssertEqual(LifelogFormat.meta(moment, calendar: calendar), "3:40 PM – 3:52 PM · Spencer's G2")
         XCTAssertEqual(LifelogFormat.errorCopy(.notFound).headline, "Update OpenAGI on your main.")
     }
+
+    func testResolvedCardsSynthesizesFallbackFromLegacyQuestionsAndPrefersEnrichedCards() {
+        let legacy = FleetState(
+            snapshot: FleetSnapshot(threads: [
+                FleetThread(key: "codex:fixture", title: "Synthetic review thread", workspace: "Demo workspace", state: "needs-human"),
+                FleetThread(key: "claude:run", state: "running"),
+                FleetThread(key: "paseo:ci", state: "waiting-ci"),
+            ]),
+            questions: [
+                FleetQuestion(id: "context-fixture", title: "Review the synthetic request",
+                              body: "Read the recent activity before choosing a response.",
+                              options: ["yes", "no", "open thread"], kind: "agent-ask", threadKey: "codex:fixture")
+            ]
+        )
+        let synthesized = SupervisorFormat.resolvedCards(legacy)
+        XCTAssertEqual(synthesized.count, 1)
+        XCTAssertEqual(synthesized[0].id, "question:context-fixture")
+        XCTAssertEqual(synthesized[0].questionId, "context-fixture")
+        XCTAssertEqual(synthesized[0].workspace, "Demo workspace")
+        XCTAssertEqual(synthesized[0].options, ["yes", "no"])
+        XCTAssertEqual(SupervisorFormat.activePill(legacy), "1 running · 1 CI")
+
+        let enrichedCard = SupervisorCard(
+            id: "pr:Spshulem/openAGI#283",
+            kind: "pr_ready",
+            kindLabel: "PR ready",
+            headline: "Merge PR #283",
+            primaryAction: SupervisorCardAction(op: "merge", label: "Merge PR")
+        )
+        let enriched = FleetState(
+            cards: [enrichedCard],
+            autonomy: SupervisorAutonomy(handledCount: 4, totalDecisions: 5, autonomousPercent: 80),
+            activeSummary: SupervisorActiveSummary(running: 2, waitingCi: 0, needsYou: 1, total: 3)
+        )
+        XCTAssertEqual(SupervisorFormat.resolvedCards(enriched), [enrichedCard])
+        XCTAssertEqual(SupervisorFormat.activePill(enriched), "2 running")
+        XCTAssertEqual(SupervisorFormat.autonomyLine(enriched.autonomy), "Handled 4 routine decisions · 80% autonomous")
+        XCTAssertEqual(
+            SupervisorFormat.cardActNote(FleetCardActResult(ok: true, status: "ci_pending_watch", message: "CI still running — watching.")),
+            .init(text: "CI still running — watching.", isAlert: false)
+        )
+        XCTAssertTrue(
+            SupervisorFormat.cardActNote(FleetCardActResult(ok: false, status: "ci_failed", message: "Checks failed.")).isAlert
+        )
+    }
+
+    func testDecodesLiveDaemonWirePayloadsAndFallbackSearch() throws {
+        let decoder = JSONDecoder()
+
+        let haltedJSON = Data("""
+        {"result":{"ok":false,"status":"halted","reason":"ci_failed","detail":"Checks failing on lint"},"state":{"mode":"auto"}}
+        """.utf8)
+        let halted = try decoder.decode(FleetCardActResult.self, from: haltedJSON)
+        XCTAssertFalse(halted.ok)
+        XCTAssertEqual(halted.status, "halted")
+        XCTAssertEqual(halted.reason, "ci_failed")
+        XCTAssertEqual(halted.message, "Checks failing on lint")
+        XCTAssertEqual(halted.state?.mode, "auto")
+        XCTAssertEqual(SupervisorFormat.cardActNote(halted), .init(text: "Checks failing on lint", isAlert: true))
+
+        for (status, detail) in [
+            ("watching_ci", "Watching CI until green."),
+            ("queued_when_green", "Queued squash auto-merge."),
+            ("merged", "Merged #285 via squash."),
+            ("updated", "Preference saved.")
+        ] {
+            let payload = Data("""
+            {"result":{"status":"\(status)","detail":"\(detail)"},"state":{"mode":"propose"}}
+            """.utf8)
+            let decoded = try decoder.decode(FleetCardActResult.self, from: payload)
+            XCTAssertTrue(decoded.ok, "Expected ok=true for \(status)")
+            XCTAssertEqual(SupervisorFormat.cardActNote(decoded), .init(text: detail, isAlert: false))
+        }
+
+        let stateJSON = Data("""
+        {
+          "mode": "auto",
+          "preferences": {
+            "mergePolicy": "manual_confirm",
+            "cadence": "quiet_until_ready",
+            "autoSlices": {
+              "in_scope_test_fix": "auto",
+              "rebase_onto_main": "ask",
+              "safe_ci_rerun": "auto"
+            }
+          },
+          "autonomy": {
+            "handledToday": 3,
+            "autonomyPercent": 75,
+            "recentActions": [
+              {"id": "fa_1", "slice": "safe_ci_rerun", "summary": "Reran flaky CI", "reverted": true}
+            ]
+          }
+        }
+        """.utf8)
+        let state = try decoder.decode(FleetState.self, from: stateJSON)
+        XCTAssertEqual(state.preferences?.cadence, "quiet_until_ready")
+        XCTAssertEqual(state.preferences?.autoSlices, ["in_scope_test_fix", "safe_ci_rerun"])
+        XCTAssertEqual(state.autonomy?.handledCount, 3)
+        XCTAssertEqual(state.autonomy?.autonomousPercent, 75)
+        XCTAssertEqual(state.autonomy?.recentActions.first?.vetoed, true)
+        XCTAssertEqual(SupervisorFormat.autonomyLine(state.autonomy), "Handled 3 routine decisions · 75% autonomous")
+
+        let threads = [
+            FleetThread(key: "codex:auth", title: "OAuth refresh bug", workspace: "api", repo: "acme/api",
+                        branch: "fix/oauth", state: "running", pr: FleetPR(ref: "acme/api#88"), lastAgentText: "Added refresh retry"),
+            FleetThread(key: "claude:billing", title: "Invoice export", workspace: "web", state: "idle-no-pr")
+        ]
+        let hits = SupervisorFormat.fallbackSearchHits(threads, query: "acme/api#88")
+        XCTAssertEqual(hits.map(\.key), ["codex:auth"])
+        XCTAssertEqual(hits.first?.snippet, "Added refresh retry")
+        XCTAssertTrue(hits.first?.live == true)
+    }
 }
