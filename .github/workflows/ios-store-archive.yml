@@ -1,0 +1,86 @@
+name: iOS App Store archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Optional CURRENT_PROJECT_VERSION override (defaults to mobile/ios/project.yml)
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/ios-store-archive.yml
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+      - name: Verify Xcode 27.2 release toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Xcode 27.2'
+          xcodebuild -version | grep -Fx 'Build version 27B52'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - name: Resolve build number
+        id: ver
+        run: |
+          set -euo pipefail
+          BUILD_NUM="${{ inputs.build_number }}"
+          if [[ -z "$BUILD_NUM" ]]; then
+            BUILD_NUM="$(python3 -c 'import re; m = re.search(r"CURRENT_PROJECT_VERSION:\s*\"([0-9]+)\"", open("mobile/ios/project.yml").read()); assert m; print(m.group(1))')"
+          fi
+          if ! [[ "$BUILD_NUM" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid build_number: $BUILD_NUM"
+            exit 1
+          fi
+          echo "build=$BUILD_NUM" >> "$GITHUB_OUTPUT"
+      - name: Fetch embedded Node runtime and production dependencies
+        run: mobile/ios/scripts/fetch-node-runtime.sh
+      - name: Generate Xcode project
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          cd mobile/ios
+          xcodegen generate
+      - name: Archive release for distribution signing
+        working-directory: mobile/ios
+        env:
+          BUILD_NUM: ${{ steps.ver.outputs.build }}
+        run: |
+          xcodebuild archive -project OpenAGI.xcodeproj -scheme OpenAGI \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OpenAGI.xcarchive" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            DEVELOPMENT_TEAM=38HE3W7T5K \
+            OPENAGI_BUNDLE_ID=com.spencershulem.openagi \
+            OPENAGI_APP_GROUP=group.com.spencershulem.openagi \
+            CODE_SIGNING_ALLOWED=NO
+          APP="$RUNNER_TEMP/OpenAGI.xcarchive/Products/Applications/OpenAGI.app"
+          test -f "$APP/Frameworks/NodeMobile.framework/NodeMobile"
+          test -f "$APP/openagi-daemon/bin/mobile-entry.mjs"
+          python3 - "$APP" "$BUILD_NUM" <<'PY'
+          import pathlib, plistlib, sys
+          app = pathlib.Path(sys.argv[1])
+          expected_build = sys.argv[2]
+          for rel in [".", "PlugIns/OpenAGIWidget.appex", "PlugIns/OpenAGINotify.appex"]:
+              info = plistlib.load(open(app / rel / "Info.plist", "rb"))
+              assert info.get("CFBundleVersion") == expected_build, f"{rel} CFBundleVersion={info.get('CFBundleVersion')} != {expected_build}"
+              assert info.get("DTXcodeBuild") == "27B52", f"{rel} DTXcodeBuild={info.get('DTXcodeBuild')} != 27B52"
+          print(f"Verified OpenAGI {info.get('CFBundleShortVersionString')} ({expected_build}) archived with Xcode 27.2 (27B52)")
+          PY
+          ditto -c -k --keepParent "$RUNNER_TEMP/OpenAGI.xcarchive" "$RUNNER_TEMP/OpenAGI-${BUILD_NUM}-archive.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-${{ steps.ver.outputs.build }}-archive
+          path: ${{ runner.temp }}/OpenAGI-${{ steps.ver.outputs.build }}-archive.zip
+          if-no-files-found: error
+          retention-days: 14

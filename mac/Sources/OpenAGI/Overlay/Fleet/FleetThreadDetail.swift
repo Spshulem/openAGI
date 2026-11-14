@@ -97,6 +97,73 @@ struct FleetDecision: Decodable, Equatable {
   }
 }
 
+/// One message of a thread's recent chat (src/fleet/conversation.js).
+/// `text` is required: a message without words shows nothing.
+struct FleetConversationMessage: Decodable, Equatable, Identifiable {
+  let id: String
+  /// "user" (the owner) or "assistant" (the agent).
+  let role: String
+  let text: String
+  let at: String?
+
+  enum CodingKeys: String, CodingKey { case id, role, text, at }
+
+  init(id: String, role: String, text: String, at: String? = nil) {
+    self.id = id
+    self.role = role
+    self.text = text
+    self.at = at
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let raw = try c.decode(String.self, forKey: .text).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else {
+      throw DecodingError.dataCorruptedError(forKey: .text, in: c, debugDescription: "empty text")
+    }
+    text = raw
+    role = (try? c.decodeIfPresent(String.self, forKey: .role)) ?? "assistant"
+    at = try? c.decodeIfPresent(String.self, forKey: .at)
+    // A hub without ids: the list index stands in (FleetConversation).
+    id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
+  }
+
+  var isOwner: Bool { role == "user" }
+  var speaker: String { isOwner ? "You" : "Agent" }
+}
+
+/// A thread's recent chat, oldest first. `unavailableReason`: why the hub
+/// could only read the last exchange (or nothing).
+struct FleetConversation: Decodable, Equatable {
+  let messages: [FleetConversationMessage]
+  let truncated: Bool
+  let unavailableReason: String?
+
+  enum CodingKeys: String, CodingKey { case messages, truncated, unavailableReason }
+
+  init(messages: [FleetConversationMessage], truncated: Bool = false, unavailableReason: String? = nil) {
+    self.messages = messages
+    self.truncated = truncated
+    self.unavailableReason = unavailableReason
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let raw = ((try? c.decodeIfPresent([LossyValue<FleetConversationMessage>].self, forKey: .messages)) ?? [])
+    // Ids are list keys: a missing or repeated one gets its position.
+    var seen = Set<String>()
+    messages = raw.enumerated().compactMap { index, item in
+      guard let message = item.value else { return nil }
+      let id = message.id.isEmpty || seen.contains(message.id) ? "#\(index)" : message.id
+      seen.insert(id)
+      return FleetConversationMessage(id: id, role: message.role, text: message.text, at: message.at)
+    }
+    truncated = (try? c.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
+    let reason = (try? c.decodeIfPresent(String.self, forKey: .unavailableReason))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    unavailableReason = (reason?.isEmpty ?? true) ? nil : reason
+  }
+}
+
 /// GET /fleet/api/threads/:key -> { thread }, trimmed to what the expanded
 /// row shows. Only `key` is required.
 struct FleetThreadDetail: Decodable, Equatable {
@@ -118,9 +185,11 @@ struct FleetThreadDetail: Decodable, Equatable {
   let muted: String?
   let openChat: FleetOpenChat?
   let scannedAt: String?
+  /// The recent chat. Nil from a hub before it (PR #248).
+  var conversation: FleetConversation? = nil
 
   enum CodingKeys: String, CodingKey {
-    case key, title, workspace, branch, agentStatus, reason, blockers, lastAgentMessage, lastOwnerAt, pr, watch, decision, pushPreview, muted, openChat, scannedAt
+    case key, title, workspace, branch, agentStatus, reason, blockers, lastAgentMessage, lastOwnerAt, pr, watch, decision, pushPreview, muted, openChat, scannedAt, conversation
   }
   private enum MessageKeys: String, CodingKey { case text, at }
   private enum Envelope: String, CodingKey { case thread }
@@ -128,7 +197,9 @@ struct FleetThreadDetail: Decodable, Equatable {
   init(key: String, title: String? = nil, workspace: String? = nil, branch: String? = nil, agentStatus: String? = nil,
        reason: String? = nil, blockers: [String] = [], lastAgentText: String? = nil, lastAgentAt: String? = nil,
        lastOwnerAt: String? = nil, pr: FleetPR? = nil, watch: FleetWatch? = nil, decision: FleetDecision? = nil,
-       muted: String? = nil, openChat: FleetOpenChat? = nil, scannedAt: String? = nil, pushPreview: FleetDecision? = nil) {
+       muted: String? = nil, openChat: FleetOpenChat? = nil, scannedAt: String? = nil, pushPreview: FleetDecision? = nil,
+       conversation: FleetConversation? = nil) {
+    self.conversation = conversation
     self.key = key
     self.title = title
     self.workspace = workspace
@@ -168,6 +239,7 @@ struct FleetThreadDetail: Decodable, Equatable {
     muted = try? c.decodeIfPresent(String.self, forKey: .muted)
     openChat = try? c.decodeIfPresent(FleetOpenChat.self, forKey: .openChat)
     scannedAt = try? c.decodeIfPresent(String.self, forKey: .scannedAt)
+    conversation = try? c.decodeIfPresent(FleetConversation.self, forKey: .conversation)
   }
 
   /// The route's `{ thread }` body.
@@ -333,6 +405,19 @@ enum FleetThreadOutcome {
     let shown = detail.isEmpty ? nil : String(detail.prefix(300))
     switch delivery?.status {
     case "sent": return FleetNote(text: "Pushed. Sent to the agent.", isError: false)
+    case "queued": return FleetNote(text: shown ?? "Saved. It goes once the Mac can type.", isError: false)
+    case "dry-run": return FleetNote(text: "Dry run, nothing sent.", isError: false)
+    case "blocked": return FleetNote(text: "Not sent: \(shown ?? "blocked")", isError: true)
+    default: return FleetNote(text: "Not sent: \(shown ?? "the send failed")", isError: true)
+    }
+  }
+
+  /// A typed reply: POST /fleet/api/send, or a question's { reply }.
+  static func reply(_ delivery: FleetDelivery?) -> FleetNote {
+    let detail = delivery?.detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let shown = detail.isEmpty ? nil : String(detail.prefix(300))
+    switch delivery?.status {
+    case "sent": return FleetNote(text: "Sent to the agent.", isError: false)
     case "queued": return FleetNote(text: shown ?? "Saved. It goes once the Mac can type.", isError: false)
     case "dry-run": return FleetNote(text: "Dry run, nothing sent.", isError: false)
     case "blocked": return FleetNote(text: "Not sent: \(shown ?? "blocked")", isError: true)

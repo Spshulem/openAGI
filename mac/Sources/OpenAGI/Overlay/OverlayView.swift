@@ -183,12 +183,14 @@ struct OverlayView: View {
     .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
   }
 
-  // An opened Watching row or question card: its detail lands, its Push now
+  // The detail screen of a question or In progress thread: its chat lands, its Push now
   // or Mute runs and leaves a note, each a height change.
   private func fleetDetailWatchers<V: View>(_ content: V) -> some View {
     content
-    .onChange(of: fleet.expandedThread) { _, _ in onContentChange() }
-    .onChange(of: fleet.expandedQuestions) { _, _ in onContentChange() }
+    .onChange(of: fleet.openItem) { _, _ in onContentChange() }
+    .onChange(of: fleet.drafts) { _, _ in onContentChange() }
+    .onChange(of: fleet.replyInFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.replyNotes) { _, _ in onContentChange() }
     .onChange(of: fleet.details) { _, _ in onContentChange() }
     .onChange(of: fleet.detailLoading) { _, _ in onContentChange() }
     .onChange(of: fleet.threadInFlight) { _, _ in onContentChange() }

@@ -723,6 +723,15 @@ export function clampTail(value, max) {
   return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
 }
 
+// clampText with the lines kept: spaces collapse, newlines (and one blank
+// line between blocks) stay, so a multi-line message still reads as written.
+export function clampTextLines(value, max) {
+  const text = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!max || text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
 // clampTail with the lines kept: spaces collapse, newlines (and one blank
 // line between blocks) stay, so lists and sections can still be read.
 export function clampTailLines(value, max) {

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
-import { FleetSupervisor, autoApproveLabel, groupQuestions, judgeAskKey, judgeCacheKey } from "../src/fleet/supervisor.js";
+import { FleetSupervisor, autoApproveLabel, canReplyTo, groupQuestions, judgeAskKey, judgeCacheKey, riskyQuestion } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { DEADLINE_MARGIN_MS, restartMaxMs } from "../src/fleet/ui-delivery.js";
@@ -144,7 +144,8 @@ test("a throwing source is recorded and the tick completes", async (t) => {
 
 test("an owner answer to an agent question is delivered even in observe", async (t) => {
   const asking = makeThread({ lastAgentText: "Ready. Want me to merge with --admin or wait for Nikhil's approval?", prRefs: [] });
-  const { supervisor, delivered, notified } = fixture(t, { threads: [asking], prs: new Map() });
+  // A merge ask is risky: its answer goes only typed into the agent's app.
+  const { supervisor, delivered, notified } = fixture(t, { threads: [asking], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
   await supervisor.tick({ reason: "test" });
   const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
   assert.ok(question, "agent question raised");
@@ -152,6 +153,7 @@ test("an owner answer to an agent question is delivered even in observe", async 
   const result = await supervisor.answerQuestion(question.id, question.options[0]);
   assert.equal(result.question.status, "answered");
   assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].route, "computer-use");
   assert.match(delivered[0].message, /^Owner answer: /);
   assert.equal(await supervisor.answerQuestion(question.id, "yes"), null);
 });
@@ -1791,7 +1793,7 @@ test("review keeps a live question and rewords it in place on the same outreach 
   let now = NOW;
   let title = "acme: admin merge or wait for Nikhil?";
   const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "agent waits on the owner", title, options: ["admin merge", "wait for Nikhil"] })));
-  const { supervisor, delivered } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel, notifier: undefined } });
+  const { supervisor, delivered } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, delivery: "computer-use", deps: { runModel: model.runModel, notifier: undefined, uiDriver: readyDriver() } });
   const outreach = fakeOutreach();
   supervisor.runtime = { outreach };
   await supervisor.tick();
@@ -1944,7 +1946,8 @@ test("an owner answer in flight wins over a review that closes the question", as
     answering = holder.answerQuestion(entries[0].id, entries[0].options[0]);
     return entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "moot" }));
   });
-  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel, executor } });
+  // A merge ask is risky: its answer goes only typed into the app.
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, delivery: "computer-use", deps: { runModel: model.runModel, executor, uiDriver: readyDriver() } });
   holder = supervisor;
   await supervisor.tick();
   while (!release) await new Promise((resolve) => setImmediate(resolve));
@@ -2639,7 +2642,8 @@ test("a kept answer that cannot be sent within a day goes back to the owner", as
 });
 
 test("only a typing wait keeps an answer: a CLI fallback that fails leaves the question open", async (t) => {
-  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  // Not a risky ask: a risky one never takes the CLI fallback.
+  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Run the e2e suite?", options: ["yes", "no"] } } });
   const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }), appRunning: async () => true };
   const { supervisor } = fixture(t, {
     mode: "auto", delivery: "computer-use-first", threads: [asking],
@@ -3463,7 +3467,8 @@ test("judge wait: nothing sent, no attempt spent, no cooldown", async (t) => {
 
 test("judge ask-owner: an agent-ask question whose answer is relayed to the agent", async (t) => {
   const judge = fakeJudge({ action: "ask-owner", reason: "needs your merge call", question: { title: "Merge with --admin?", body: "Agent asks: --admin or wait for Nikhil.", options: ["merge --admin", "wait for Nikhil"] } });
-  const { supervisor, delivered } = fixture(t, { mode: "auto", deps: { judge } });
+  // A merge ask: its answer goes only typed into the app.
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deps: { judge, uiDriver: readyDriver() } });
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 0);
   const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
@@ -3840,7 +3845,7 @@ test("a cached verdict is read again when the PR facts it saw change", () => {
 test("an owner answer during the review holds a judged nudge already decided", async (t) => {
   let clock = NOW;
   const thread = makeThread();
-  let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Merge now?", body: "b", options: ["merge", "wait"] } };
+  let verdict = { action: "ask-owner", reason: "needs a call", question: { title: "Run e2e now?", body: "b", options: ["run", "wait"] } };
   const judge = fakeJudge(() => verdict);
   const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], now: () => clock, deps: { judge } });
   await supervisor.tick({ reason: "test" });
@@ -3852,7 +3857,7 @@ test("an owner answer during the review holds a judged nudge already decided", a
   verdict = { action: "send", reason: "CI red", message: "verification is red. Fix it." };
   const review = supervisor.reviewOpenQuestions.bind(supervisor);
   supervisor.reviewOpenQuestions = async (args) => {
-    await supervisor.answerQuestion(question.id, "merge");
+    await supervisor.answerQuestion(question.id, "run");
     return review(args);
   };
   clock += 20 * MIN;
@@ -4995,4 +5000,226 @@ test("contextual post-merge exception still rejects a PR settled since review", 
   assert.equal(await supervisor.prSettledBeforeSend(thread, makePr(), decision), "#7 merged since the scan");
   assert.equal(await supervisor.prSettledBeforeSend(thread, merged, { ...decision, judged: false }), "#7 merged");
   assert.equal(await supervisor.prSettledBeforeSend(thread, merged, decision), null);
+});
+
+// ─── owner replies and risky asks ─────────────────────────────────────────
+
+const PLAIN_ASK = "Should I email the customer about the outage?";
+const plainAsking = (overrides = {}) => makeThread({ lastAgentText: PLAIN_ASK, prRefs: [], ...overrides });
+const agentAsk = (supervisor) => supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+
+test("canReply: one thread's own ask, a stuck thread or a ready ask; never a card, a prompt, a group or no thread", () => {
+  assert.equal(canReplyTo({ kind: "agent-ask", threadKey: "codex:t1" }), true);
+  assert.equal(canReplyTo({ kind: "stuck", threadKey: "codex:t1" }), true);
+  assert.equal(canReplyTo({ kind: "ready", threadKey: "codex:t1", threadKeys: ["codex:t1"] }), true);
+  for (const question of [
+    { kind: "agent-card", threadKey: "codex:t1" },
+    { kind: "prompt", threadKey: "codex:t1" },
+    { kind: "limit", threadKey: "codex:t1" },
+    { kind: "infra", threadKey: "codex:t1" },
+    { kind: "agent-ask", threadKey: null },
+    { kind: "stuck", threadKey: "codex:t1", threadKeys: ["codex:t1", "codex:t2"] },
+    { kind: "limit", threadKey: null, threadKeys: ["codex:t1", "codex:t2"] }
+  ]) assert.equal(canReplyTo(question), false, JSON.stringify(question));
+  assert.equal(riskyQuestion({ kind: "agent-ask", title: "Merge PR #7?" }), true);
+  assert.equal(riskyQuestion({ kind: "agent-ask", title: "Add the e2e suite?" }), false);
+});
+
+test("the state's questions carry canReply", async (t) => {
+  const { supervisor } = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  assert.ok(ask, "agent question raised");
+  assert.equal(ask.canReply, true);
+  assert.equal(ask.risky, false);
+  supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: ["codex:t1", "codex:t2"] });
+  assert.equal(supervisor.getState().questions.find((q) => q.kind === "limit").canReply, false);
+});
+
+test("a reply goes to the asking thread as Owner says and closes the question", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  const result = await supervisor.replyQuestion(ask.id, "  Keep it for a follow-up.\nShip this one.  ");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(result.question.status, "answered");
+  assert.equal(result.question.answer, "Keep it for a follow-up. Ship this one.");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].thread.key, "codex:t1");
+  assert.equal(delivered[0].route, "codex-exec");
+  assert.equal(delivered[0].message, "Owner says: Keep it for a follow-up.\nShip this one.");
+  assert.equal(supervisor.getState().questions.some((q) => q.id === ask.id), false);
+  assert.equal(await supervisor.replyQuestion(ask.id, "again"), null, "closed");
+});
+
+test("a blocked or failed reply leaves the question open", async (t) => {
+  for (const status of ["blocked", "failed"]) {
+    const { supervisor } = fixture(t, { threads: [plainAsking()], prs: new Map(), deliverStatus: status });
+    await supervisor.tick({ reason: "test" });
+    const ask = agentAsk(supervisor);
+    const result = await supervisor.replyQuestion(ask.id, "Follow-up.");
+    assert.equal(result.delivery.status, status);
+    assert.equal(result.question.status, "open");
+    assert.ok(agentAsk(supervisor));
+  }
+});
+
+test("a reply is refused for a question that takes none, and for empty or overlong words", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: ["codex:t1", "codex:t2"] });
+  assert.equal(await supervisor.replyQuestion(group.id, "added it"), null);
+  const ask = agentAsk(supervisor);
+  assert.equal(await supervisor.replyQuestion(ask.id, "   "), null);
+  assert.equal(await supervisor.replyQuestion(ask.id, "x".repeat(2001)), null);
+  assert.equal(delivered.length, 0);
+});
+
+test("a reply to a stuck thread never applies the stop option", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const stuck = supervisor.store.upsertQuestion({ kind: "stuck", dedupeKey: "stuck:codex:t1", threadKey: "codex:t1", title: "Stuck?", options: ["keep going", "stop"] });
+  const result = await supervisor.replyQuestion(stuck.id, "stop");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.at(-1).message, "Owner says: stop");
+  assert.equal(supervisor.store.mutedUntil("codex:t1"), null, "not muted");
+});
+
+test("a risky answer or reply is never relayed or resumed: blocked on a CLI Mac, approve it in the chat", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [asking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  assert.equal(ask.risky, true);
+  const answered = await supervisor.answerQuestion(ask.id, ask.options[0]);
+  assert.equal(answered.delivery.status, "blocked");
+  assert.match(answered.delivery.detail, /approve it in the chat/);
+  assert.equal(answered.question.status, "open");
+  const replied = await supervisor.replyQuestion(ask.id, "Merge it.");
+  assert.equal(replied.delivery.status, "blocked");
+  assert.match(replied.delivery.detail, /approve it in the chat/);
+  assert.equal(replied.question.status, "open");
+  assert.equal(delivered.length, 0, "no codex exec, relay or resume");
+});
+
+test("a risky reply is typed into the app when it can be", async (t) => {
+  const thread = asking({ writerLocked: true, meta: { originator: "Codex Desktop" } });
+  const { supervisor, delivered } = fixture(t, { threads: [thread], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  const result = await supervisor.replyQuestion(ask.id, "Wait for Nikhil.");
+  assert.equal(result.delivery.status, "sent");
+  assert.deepEqual(delivered.map((d) => [d.route, d.message]), [["computer-use", "Owner says: Wait for Nikhil."]]);
+});
+
+test("a risky answer waits for typing instead of the CLI fallback, then is typed", async (t) => {
+  const driver = { ready: false, readiness: async () => ({ ready: driver.ready, detail: driver.ready ? null : "screen locked" }) };
+  const thread = asking({ meta: { originator: "codex_exec" } });
+  const { supervisor, delivered } = fixture(t, { threads: [thread], prs: new Map(), delivery: "computer-use-first", deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  const result = await supervisor.replyQuestion(ask.id, "Wait for Nikhil's approval.");
+  assert.equal(result.delivery.status, "queued");
+  assert.equal(result.question.status, "answered");
+  assert.equal(supervisor.store.queuedAnswers()[0].pendingDelivery.typedOnly, true);
+  assert.equal(supervisor.store.queuedAnswers()[0].pendingDelivery.message, "Owner says: Wait for Nikhil's approval.");
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0, "codex exec is not used while the screen is locked");
+  driver.ready = true;
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((d) => [d.route, d.message, d.typedOnly]), [["computer-use", "Owner says: Wait for Nikhil's approval.", true]]);
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a long queued reply keeps all its words", async (t) => {
+  const thread = makeThread({ lastAgentText: PLAIN_ASK, prRefs: [], writerLocked: true, meta: { originator: "Codex Desktop" } });
+  const { supervisor } = fixture(t, { threads: [thread], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await supervisor.tick({ reason: "test" });
+  const words = "word ".repeat(300).trim();
+  const result = await supervisor.replyQuestion(agentAsk(supervisor).id, words);
+  assert.equal(result.delivery.status, "queued");
+  assert.equal(supervisor.store.queuedAnswers()[0].pendingDelivery.message, "Owner says: " + words);
+  assert.equal(supervisor.store.queuedAnswers()[0].pendingDelivery.typedOnly, undefined);
+});
+
+test("the Mac capability routes a reply through to replyQuestion", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const ask = agentAsk(supervisor);
+  const capability = createFleetCapability(supervisor);
+  const res = await capability.invoke("request", { method: "POST", path: "/fleet/api/questions/" + ask.id, body: { reply: "Follow-up PR." } });
+  assert.equal(res.response.status, 200);
+  assert.equal(res.response.body.delivery.status, "sent");
+  assert.equal(delivered.at(-1).message, "Owner says: Follow-up PR.");
+  assert.equal(res.state.questions.some((q) => q.id === ask.id), false);
+});
+
+test("a long multi-line reply reopens when its background send fails after launch", async (t) => {
+  const { supervisor } = fixture(t, { threads: [plainAsking()], prs: new Map(), deps: { executor: backgroundExecutor(() => false) } });
+  await supervisor.tick();
+  const ask = agentAsk(supervisor);
+  const words = "Email them.\n\n" + "Say sorry and give the timeline. ".repeat(20);
+  const result = await supervisor.replyQuestion(ask.id, words);
+  assert.equal(result.question.status, "answered");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.store.question(ask.id).status, "open", "the clamped stored answer still matches");
+});
+
+test("risky answers ask the executor for typed-only delivery, immediate and queued", async (t) => {
+  const driver = { ready: true, readiness: async () => ({ ready: driver.ready, detail: driver.ready ? null : "screen locked" }) };
+  const thread = asking({ writerLocked: true, meta: { originator: "Codex Desktop" } });
+  const { supervisor, delivered } = fixture(t, { threads: [thread], prs: new Map(), delivery: "computer-use", deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  await supervisor.replyQuestion(agentAsk(supervisor).id, "Wait.");
+  assert.equal(delivered.at(-1).typedOnly, true);
+  const plain = fixture(t, { threads: [plainAsking({ writerLocked: true, meta: { originator: "Codex Desktop" } })], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await plain.supervisor.tick({ reason: "test" });
+  await plain.supervisor.replyQuestion(agentAsk(plain.supervisor).id, "Yes.");
+  assert.equal(plain.delivered.at(-1).typedOnly, undefined);
+});
+
+test("a send to a thread with an open risky ask goes only typed into its app", async (t) => {
+  // CLI Mac: blocked, nothing relayed or resumed.
+  const cli = fixture(t, { threads: [asking()], prs: new Map() });
+  await cli.supervisor.tick({ reason: "test" });
+  assert.equal(agentAsk(cli.supervisor).risky, true);
+  const blocked = await cli.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(blocked.delivery.status, "blocked");
+  assert.match(blocked.delivery.detail, /approve it in the chat/);
+  assert.equal(cli.delivered.length, 0);
+  // A live peer would be a relay: refused too.
+  const peer = fixture(t, { threads: [asking({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" } })], prs: new Map() });
+  await peer.supervisor.tick({ reason: "test" });
+  assert.equal(agentAsk(peer.supervisor).risky, true);
+  assert.equal((await peer.supervisor.sendOwnerMessage("claude:c1", "Merge it.")).delivery.status, "blocked");
+  assert.equal(peer.delivered.length, 0, "no peer relay");
+  // Computer-use-first with the screen locked: no codex exec fallback.
+  const first = fixture(t, { threads: [asking({ meta: { originator: "codex_exec" } })], prs: new Map(), delivery: "computer-use-first", deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await first.supervisor.tick({ reason: "test" });
+  const waits = await first.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(waits.delivery.status, "blocked");
+  assert.match(waits.delivery.detail, /once the Mac can type, or approve it in the chat/);
+  assert.equal(first.delivered.length, 0);
+  // Typed into the app when it can be, and typed-only there.
+  const typed = fixture(t, { threads: [asking({ writerLocked: true, meta: { originator: "Codex Desktop" } })], prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await typed.supervisor.tick({ reason: "test" });
+  const sent = await typed.supervisor.sendOwnerMessage("codex:t1", "Merge it.");
+  assert.equal(sent.delivery.status, "sent");
+  assert.deepEqual(typed.delivered.map((d) => [d.route, d.typedOnly]), [["computer-use", true]]);
+  // No risky ask open: the usual route.
+  const plain = fixture(t, { threads: [plainAsking()], prs: new Map() });
+  await plain.supervisor.tick({ reason: "test" });
+  assert.equal((await plain.supervisor.sendOwnerMessage("codex:t1", "Email them.")).delivery.status, "sent");
+  assert.equal(plain.delivered[0].route, "codex-exec");
+});
+
+test("a risky answer kept for typing keeps later sends to its thread typed-only", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [asking({ meta: { originator: "codex_exec" } })], prs: new Map(), delivery: "computer-use-first", deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await supervisor.tick({ reason: "test" });
+  const queued = await supervisor.replyQuestion(agentAsk(supervisor).id, "Wait for Nikhil.");
+  assert.equal(queued.delivery.status, "queued");
+  assert.equal(agentAsk(supervisor), undefined, "the question is closed");
+  const later = await supervisor.sendOwnerMessage("codex:t1", "Actually, merge it now.");
+  assert.equal(later.delivery.status, "blocked");
+  assert.match(later.delivery.detail, /approve it in the chat/);
+  assert.equal(delivered.length, 0, "no codex exec fallback");
 });

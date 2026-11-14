@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { REMEDIES, suggestionPlan } from "./remedies.js";
-import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
+import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
 import { defaultPreferences, normalizePreferences } from "./preferences.js";
@@ -422,10 +422,14 @@ export class FleetStore {
 
   // The owner answered, but the answer could not be typed yet: the question
   // is answered (off the owner's list) and its message waits to be sent.
-  queueAnswer(id, answer, message) {
+  // typedOnly: a risky ask's, sent only typed into the app. messageMax: an
+  // owner's reply keeps all its words. The kept message keeps its line
+  // breaks, as an immediate send would.
+  queueAnswer(id, answer, message, { typedOnly = false, messageMax = this.limits.bodyMax } = {}) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
-    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampTextLines(message, Math.max(this.limits.bodyMax, messageMax)), since: iso(this.now()),
+      ...(typedOnly ? { typedOnly: true } : {}) } });
   }
 
   queuedAnswers() {

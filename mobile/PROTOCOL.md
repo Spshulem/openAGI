@@ -240,7 +240,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | GET | `/fleet/api/state` | fleet supervisor state, see "Fleet supervisor routes" below |
 | POST | `/fleet/api/scan` | no body; runs a scan and returns state (can take ~100s) |
 | POST | `/fleet/api/mode` | body `{"mode": "observe"\|"propose"\|"auto"}`; returns state |
-| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}` or `{"dismiss": true}` |
+| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}`, `{"reply": "<1-2000 chars>"}` (only when the question's `canReply` is true) or `{"dismiss": true}` |
+| POST | `/fleet/api/send` | body `{"threadKey": "<row key>", "message": "<1-2000 chars>", "queue"?: true}`; the owner's own message to one thread |
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
@@ -271,6 +272,15 @@ listed path are refused with `401`. Shapes are the daemon's
   is `404` (`409` only when it closed during the request): treat both as
   "already closed" and refresh. An answer that relays to a live session can
   take up to ~190s.
+- A reply (`{"reply"}`) goes to the asking thread as `Owner says: <text>`.
+  `delivery.status` `sent` or `queued` (kept until the Mac can type) closes
+  the question; `blocked` or `failed` leaves it open with `delivery.detail`.
+  `409` when the question's `canReply` is false. `canReply` is true only for
+  a single-thread `agent-ask`, `stuck` or `ready` question. A `risky`
+  question's answer or reply is only typed into the agent's app, never
+  relayed or resumed; without a way to type it is `blocked` ("approve it in
+  the chat").
+- `POST /fleet/api/send` → `{delivery, state}`.
 - `POST /fleet/api/actions/:id/send` → `{action, delivery, state}`; `409` when
   the action is not a proposed one (for example after leaving propose mode),
   `404` when the id is unknown.

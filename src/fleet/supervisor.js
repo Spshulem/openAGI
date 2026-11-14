@@ -466,6 +466,31 @@ const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
 // a delete, a merge.
 const RISKY_ASK = /\b(?:prod(?:uction)?|releas(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?|delet(?:e|es|ed|ing|ion)|destroy|wipe|merg(?:e|es|ed|ing)|force[- ]push|rewrite (?:git )?history)\b|--admin\b/i;
 const MUTE_HOURS_DEFAULT = 24;
+// The asks the owner may answer in their own words: one thread's own
+// question, a stuck thread, a ready-to-merge ask. Not a card only the app
+// takes, a permission prompt, or a group.
+const REPLY_KINDS = new Set(["agent-ask", "stuck", "ready"]);
+export const REPLY_MAX = 2000;
+
+// questionView's risky flag: a release, deploy, delete or merge ask.
+export function riskyQuestion(question) {
+  const text = [question?.title, question?.body, ...(question?.options ?? [])].filter(Boolean).join(" ");
+  return Boolean(question?.mergeAsk) || question?.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question?.kind) && RISKY_ASK.test(text));
+}
+
+export function canReplyTo(question) {
+  return typeof question?.threadKey === "string" && Boolean(question.threadKey) && REPLY_KINDS.has(question.kind)
+    && !((question.threadKeys ?? []).length > 1);
+}
+
+// A risky answer or reply is typed into the agent's app as the owner's,
+// never relayed or resumed: an agent refused a relayed "yes".
+const RISKY_NO_ROUTE = "risky ask: it is only typed into the agent's app, and this Mac cannot type into it; approve it in the chat";
+const RISKY_WAITS = "risky ask: it is only typed into the agent's app";
+// Whether the Mac can type into this thread's app later (not a CLI-only Mac).
+function typesLater(thread, deliveryState) {
+  return Boolean(uiTargetFor(thread)) && ["computer-use", "computer-use-first"].includes(deliveryState?.mode);
+}
 
 // Delivery that failed only because typing into the app has to wait (a
 // strict computer-use Mac that cannot type now, or a typed send held back by
@@ -490,6 +515,11 @@ const QUEUED_ANSWER_MS = 24 * 60 * 60_000;
 function ownerDelivery(answer) {
   // Options are fixed strings chosen by policy, never agent text.
   return `Owner answer: ${answer}. Continue with that.`;
+}
+
+// The owner's own words, typed or spoken: a reply to a question.
+function ownerReply(text) {
+  return `Owner says: ${text}`;
 }
 
 // "retry" on a logged-out / disk-full question means the owner fixed it.
@@ -947,7 +977,6 @@ export class FleetSupervisor {
     const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
     const options = question.options ?? [];
     const inApp = question.kind === "agent-card" || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
-    const text = [question.title, question.body, ...options].filter(Boolean).join(" ");
     return {
       ...question,
       askedAt: question.agentAskedAt ?? question.createdAt ?? null,
@@ -955,7 +984,9 @@ export class FleetSupervisor {
       answerIn: inApp ? "agent app" : "here",
       openChat,
       ...(chats.length ? { chats } : {}),
-      risky: Boolean(question.mergeAsk) || question.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
+      risky: riskyQuestion(question),
+      // Takes the owner's own words (POST questions/:id { reply }).
+      canReply: canReplyTo(question)
     };
   }
 
@@ -1192,11 +1223,13 @@ export class FleetSupervisor {
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
+      // A risky answer waits for typing, never a relay or resume.
+      if (pending.typedOnly && route !== "computer-use") continue;
       if ((contacted.uiStalled || deferUi) && route === "computer-use") continue;
       // Failed tries are bounded too, like the send loop's.
       if (tries >= budget * 2) continue;
       tries += 1;
-      const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
+      const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer", ...(pending.typedOnly ? { typedOnly: true } : {}) });
       if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
@@ -1617,31 +1650,14 @@ export class FleetSupervisor {
       // fixed a login/disk blocker, is an explicit instruction: every mode.
       const retry = question.kind === "infra" && answer === "retry";
       if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
-        const thread = this.lastThreads.get(question.threadKey);
-        const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
-        const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
         const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
-        if (!thread || !route) {
-          delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
-        } else {
-          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-          if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
-          if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
-          // Starts the cooldown but does not spend the no-progress nudge budget.
-          this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling });
+        if (sent.queued) {
+          this.resolveOutreach(question, answer, "acted");
+          this.applyOverride(question, answer);
+          return { question: sent.queued, delivery: sent.delivery };
         }
-        // The owner decided; only the typing has to wait (secure input, a
-        // locked screen, the owner at the keyboard). Keep the answer and send
-        // it once the Mac can type, instead of handing the question back.
-        if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, route, deliveryState, delivery)) {
-          // A tick may have closed the question meanwhile; only a stored answer is "saved".
-          const queued = this.store.queueAnswer(id, answer, message);
-          if (queued) {
-            this.resolveOutreach(question, answer, "acted");
-            this.applyOverride(question, answer);
-            return { question: queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
-          }
-        }
+        delivery = sent.delivery;
       }
       // A background resume can fail while the others are still sending;
       // the group closes only once every thread has it.
@@ -1670,6 +1686,73 @@ export class FleetSupervisor {
     }
   }
 
+  // The owner's answer or reply to the one thread that asked. A risky ask
+  // goes only typed into its app. When only the typing has to wait (secure
+  // input, a locked screen, the owner at the keyboard) the words are kept
+  // and sent once the Mac can type, instead of handing the question back:
+  // { queued } is the question, closed with them.
+  async deliverToAsker(question, answer, message, { deadlineAt = null, startedAt = Date.now(), settling = [], queueMax } = {}) {
+    const thread = this.lastThreads.get(question.threadKey);
+    const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
+    const risky = riskyQuestion(question);
+    const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    const route = risky && chosen !== "computer-use" ? null : chosen;
+    let delivery;
+    if (!thread || !route) {
+      const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
+        : typesLater(thread, deliveryState) ? RISKY_WAITS : RISKY_NO_ROUTE;
+      delivery = { status: "blocked", route: null, detail };
+    } else {
+      delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt, ...(risky ? { typedOnly: true } : {}) });
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+      if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
+      // Starts the cooldown but does not spend the no-progress nudge budget.
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    }
+    const waits = typingWaits(thread, route, deliveryState, delivery) || (risky && !route && typesLater(thread, deliveryState));
+    if (thread && delivery.status !== "sent" && waits) {
+      // A tick may have closed the question meanwhile; only a stored answer is "saved".
+      const queued = this.store.queueAnswer(question.id, answer, message, { typedOnly: risky, ...(queueMax ? { messageMax: queueMax } : {}) });
+      if (queued) return { queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
+    }
+    return { delivery };
+  }
+
+  // The owner's own words to the agent that asked ("Owner says: ..."), for
+  // a question canReplyTo allows. Sent or kept for when the Mac can type
+  // closes it; blocked or failed leaves it open. null: closed, or no reply.
+  async replyQuestion(id, reply, { deadlineAt = null } = {}) {
+    const startedAt = Date.now();
+    const text = String(reply ?? "").trim();
+    if (!text || text.length > REPLY_MAX || this.answering.has(id)) return null;
+    const question = this.store.question(id);
+    if (!question || question.status !== "open" || !canReplyTo(question)) return null;
+    this.answering.add(id);
+    this.ownerAnsweredAt.set(question.threadKey, this.now());
+    try {
+      const settling = [];
+      const message = ownerReply(text);
+      const sent = await this.deliverToAsker(question, text, message, { deadlineAt, startedAt, settling, queueMax: message.length });
+      // A free reply is no option: no override (a "stop" typed to a stuck
+      // thread must not mute it).
+      if (sent.queued) {
+        this.resolveOutreach(question, "reply", "acted");
+        return { question: sent.queued, delivery: sent.delivery };
+      }
+      if (sent.delivery.status !== "sent") {
+        return { question: this.store.question(id), delivery: sent.delivery };
+      }
+      const answered = this.store.answerQuestion(id, text);
+      this.resolveOutreach(question, "reply", "acted");
+      // The store keeps the reply clamped; a failed background send reopens
+      // the question only while that stored answer stands.
+      this.reopenIfUndelivered(id, settling, answered?.answer ?? text);
+      return { question: answered ?? this.store.question(id), delivery: sent.delivery };
+    } finally {
+      this.answering.delete(id);
+    }
+  }
+
   // A background resume reports its exit only later, one thread at a time.
   // Attached after the answer was recorded, so even an instant failure finds
   // the final state; a newer, different answer from the owner stands.
@@ -1692,16 +1775,25 @@ export class FleetSupervisor {
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const thread = this.lastThreads.get(threadKey);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
-    const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    // A thread with an open risky ask hears the owner only typed into its
+    // app, as an answer to that ask would be.
+    // A risky answer kept for typing still counts: its question is closed,
+    // but the agent has not heard it yet.
+    const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
+    const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
+      || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
+    const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    const route = risky && chosen !== "computer-use" ? null : chosen;
     if (!thread || !route) {
-      const detail = this.noRouteDetail(thread, deliveryState);
+      const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
+        : typesLater(thread, deliveryState) ? `${RISKY_WAITS}; send it again once the Mac can type, or approve it in the chat` : RISKY_NO_ROUTE;
       const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
       return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
     }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
