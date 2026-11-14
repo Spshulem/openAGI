@@ -34,6 +34,8 @@ final class ChatConversation {
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
+    var focusedCardID: String?
+    private(set) var composerFocusRequest = 0
     private(set) var composerRevision = 0
     private(set) var historyStatus: HistoryStatus = .unknown
     private(set) var isRefreshingHistory = false
@@ -125,18 +127,25 @@ final class ChatConversation {
         await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id)
     }
 
+    func requestComposerFocus() {
+        composerFocusRequest += 1
+    }
+
     private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
         var sawTerminalFrame = false
         var openedStream = false
         do {
             let stream = try await client.sendMessageStreaming(
-                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments, conversationId: conversationID
+                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey,
+                attachments: attachments, conversationId: conversationID, focusedCardId: focusedCardID
             )
             openedStream = true
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
                 case .delta(let frame):
+                    // The working line stays under the text received so far
+                    // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
                         messages[index].text = frame.text
                     } else {
@@ -150,10 +159,15 @@ final class ChatConversation {
                         messages[index].text = "(no reply)"
                     }
                     messages[index].isStreaming = false
+                    messages[index].activity = nil
                 case .failure(let frame):
                     sawTerminalFrame = true
                     fail(replyID, text: (frame.error ?? "OpenAGI couldn't finish.") + " Check the conversation before sending again.")
-                case .status, .session:
+                case .status(let frame):
+                    if messages[index].isStreaming, let label = frame.activityLabel {
+                        messages[index].activity = label
+                    }
+                case .session:
                     break
                 }
             }
@@ -184,6 +198,7 @@ final class ChatConversation {
         guard let index = messages.firstIndex(where: { $0.id == replyID }) else { return }
         messages[index].text = text
         messages[index].isStreaming = false
+        messages[index].activity = nil
         messages[index].isFailed = true
         messages[index].retrySafe = retrySafe
     }
@@ -274,6 +289,7 @@ final class ChatConversation {
     func forget() {
         draft = ""
         draftAttachments = []
+        focusedCardID = nil
         composerRevision += 1
         forgotten = true
         messages = []

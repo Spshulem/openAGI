@@ -1,10 +1,16 @@
 import type { AudioSource } from '../even/audio-source'
 import type { InboxItem } from './proactive'
 
-export interface VoiceFocus { view: 'supervisor'; questionId?: string; threadKey?: string }
-export function supervisorVoiceFocus(item?: Pick<InboxItem, 'id' | 'supervisor' | 'questionId' | 'threadKey'> | null): VoiceFocus {
-  return { view: 'supervisor', ...(item?.supervisor && item.questionId ? { questionId: item.questionId } : {}),
-    ...(item?.threadKey ? { threadKey: item.threadKey } : {}) }
+export interface VoiceFocus { view: 'supervisor'; cardId?: string; questionId?: string; threadKey?: string; prRef?: string }
+export function supervisorVoiceFocus(item?: Pick<InboxItem, 'id' | 'supervisor' | 'cardId' | 'questionId' | 'threadKey' | 'prRef'> | null): VoiceFocus {
+  if (!item?.supervisor) return { view: 'supervisor' }
+  return {
+    view: 'supervisor',
+    ...(item.cardId ? { cardId: item.cardId } : {}),
+    ...(item.questionId ? { questionId: item.questionId } : {}),
+    ...(item.threadKey ? { threadKey: item.threadKey } : {}),
+    ...(item.prRef ? { prRef: item.prRef } : {}),
+  }
 }
 
 export type VoiceState = 'idle' | 'connecting' | 'listening' | 'waiting' | 'replying'

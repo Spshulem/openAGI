@@ -4,6 +4,7 @@
 
 import fs from "node:fs";
 import { DEFAULTS, clampText } from "./contracts.js";
+import { isSuppressedByQuietCadence } from "./preferences.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const PUSH_TIMEOUT_MS = 5_000;
@@ -132,9 +133,17 @@ export function createNotifier({
     // The stored copy knows what earlier ticks already sent.
     const latest = store?.question?.(question.id) ?? question;
     if (latest.status && latest.status !== "open") return { outreachId: null, pushed: false, skipped: "closed" };
+    if (isSuppressedByQuietCadence(latest, store?.preferences?.())) {
+      return { outreachId: null, pushed: false, skipped: "quiet-cadence" };
+    }
     const at = current();
     const outreachId = latest.outreachId ?? postOutreach(latest);
-    if (outreachId) refreshOutreach(outreachId, latest);
+    if (outreachId) {
+      if (latest.outreachId) {
+        try { runtime?.outreach?.reopen?.(outreachId); } catch { /* best-effort */ }
+      }
+      refreshOutreach(outreachId, latest);
+    }
     const result = allowPush ? await push(latest, at) : skip("suggestion-cap");
     if (store && ((outreachId && outreachId !== latest.outreachId) || result.pushed)) {
       store.markQuestionNotified?.(latest.id, { outreachId, pushedAt: result.pushed ? at.toISOString() : undefined });
