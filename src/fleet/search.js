@@ -6,11 +6,11 @@
 
 import { clampText, openChatFor, redactSecrets } from "./contracts.js";
 
-const normalize = (text) =>
-  String(text ?? "")
-    .normalize("NFKD")
-    .replace(/\p{M}/gu, "")
-    .toLowerCase();
+function normalize(text) {
+  const raw = String(text ?? "");
+  const decomposed = typeof raw.normalize === "function" ? raw.normalize("NFKD") : raw;
+  return decomposed.replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
 
 const bounded = (text, size = 8000) => redactSecrets(String(text ?? "")).slice(-size);
 
@@ -24,7 +24,7 @@ const ROUTING_STOP_WORDS = new Set([
 
 function tokenize(text) {
   return normalize(text)
-    .split(/[^a-z0-9_./#-]+/u)
+    .split(/[^a-z0-9_./#-]+/)
     .map((t) => t.replace(/^[./#-]+|[./#-]+$/g, ""))
     .filter((t) => t.length >= 2);
 }

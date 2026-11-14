@@ -173,3 +173,22 @@ test("natural assent ('yeah, go for it') executes fleet_act_card on an owner tur
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("fleet search avoids ICU property escapes so nodejs-mobile (--without-intl) parses cleanly", () => {
+  for (const file of ["search.js", "cards.js", "preferences.js", "intent-resolver.js"]) {
+    const source = fs.readFileSync(new URL(`../src/fleet/${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /\\[pP]\{/, `${file} must not use Unicode property escapes unsupported on nodejs-mobile`);
+  }
+  const hits = searchFleet(
+    {
+      snapshot: {
+        threads: [
+          { key: "paseo:auth-sso", title: "Cafe SSO callback redirect fix", repo: "acme/auth", state: "running" }
+        ]
+      }
+    },
+    { query: "Café sso callback" }
+  );
+  assert.ok(hits.results.length >= 1);
+  assert.equal(hits.results[0].key, "paseo:auth-sso");
+});
