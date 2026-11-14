@@ -69,6 +69,11 @@ export class ChannelManager {
     if (!channel || !text) throw new Error("deliver requires channel and text");
     appendJsonLine(this.eventsPath, { at: nowIso(), op: "deliver", channel, target, text: String(text).slice(0, 400) });
     let result;
+    // Only paired chats may receive messages; send_message must not reach an
+    // arbitrary chat id.
+    if (channel === "telegram" && !this.telegram.pairing.isAllowed(String(target))) {
+      throw new Error("Telegram chat is not paired.");
+    }
     if (channel === "telegram") result = await this.telegram.sendMessage(target, text);
     else if (channel === "sendblue") result = await this.sendblue.sendMessage(target, text);
     else if (channel === "sendblue-group") result = await this.sendblue.sendMessage(target, text, { group: true });
@@ -120,6 +125,9 @@ export class TelegramChannel {
     this.statePath = path.join(this.dir, "state.json");
     this.eventsPath = path.join(this.dir, "events.jsonl");
     this.pollTimer = null;
+    // Telegram retries a webhook delivery it did not see acknowledged, so a
+    // slow turn can arrive twice. Recent update ids are skipped.
+    this.seenUpdates = new Set();
     ensureDir(this.dir);
     this.state = readJsonFile(this.statePath, { offset: 0 });
     // Pairing security: only chats that completed "/pair <code>" may talk to
@@ -137,6 +145,11 @@ export class TelegramChannel {
   }
 
   async handleUpdate(update) {
+    if (Number.isSafeInteger(update?.update_id)) {
+      if (this.seenUpdates.has(update.update_id)) return { ignored: true, reason: "duplicate-update" };
+      this.seenUpdates.add(update.update_id);
+      if (this.seenUpdates.size > 1000) this.seenUpdates.delete(this.seenUpdates.values().next().value);
+    }
     appendJsonLine(this.eventsPath, { at: nowIso(), update });
     const message = update.message ?? update.edited_message;
     const text = message?.text ?? message?.caption;
