@@ -47,12 +47,20 @@ public struct FleetState: Decodable, Sendable, Equatable {
     public var snapshot: FleetSnapshot?
     public var questions: [FleetQuestion]
     public var actions: [FleetAction]
+    public var cards: [SupervisorCard]
+    public var preferences: SupervisorPreferences?
+    public var autonomy: SupervisorAutonomy?
+    public var activeSummary: SupervisorActiveSummary?
+    public var catchUpSummary: String?
 
     public var lastErrorText: String? { lastError?.fleetText }
 
     public init(mode: String? = nil, enabled: Bool = false, running: Bool = false, lastTickAt: Date? = nil,
                 lastError: JSONValue? = nil, snapshot: FleetSnapshot? = nil,
-                questions: [FleetQuestion] = [], actions: [FleetAction] = []) {
+                questions: [FleetQuestion] = [], actions: [FleetAction] = [],
+                cards: [SupervisorCard] = [], preferences: SupervisorPreferences? = nil,
+                autonomy: SupervisorAutonomy? = nil, activeSummary: SupervisorActiveSummary? = nil,
+                catchUpSummary: String? = nil) {
         self.mode = mode
         self.enabled = enabled
         self.running = running
@@ -61,10 +69,16 @@ public struct FleetState: Decodable, Sendable, Equatable {
         self.snapshot = snapshot
         self.questions = questions
         self.actions = actions
+        self.cards = cards
+        self.preferences = preferences
+        self.autonomy = autonomy
+        self.activeSummary = activeSummary
+        self.catchUpSummary = catchUpSummary
     }
 
     private enum CodingKeys: String, CodingKey {
         case mode, enabled, running, lastTickAt, lastError, snapshot, questions, actions
+        case cards, preferences, autonomy, activeSummary, catchUpSummary
     }
 
     public init(from decoder: Decoder) throws {
@@ -77,6 +91,11 @@ public struct FleetState: Decodable, Sendable, Equatable {
         snapshot = c.lenient(FleetSnapshot.self, .snapshot)
         questions = c.lenientList(FleetQuestion.self, .questions)
         actions = c.lenientList(FleetAction.self, .actions)
+        cards = c.lenientList(SupervisorCard.self, .cards)
+        preferences = c.lenient(SupervisorPreferences.self, .preferences)
+        autonomy = c.lenient(SupervisorAutonomy.self, .autonomy)
+        activeSummary = c.lenient(SupervisorActiveSummary.self, .activeSummary)
+        catchUpSummary = c.lenient(String.self, .catchUpSummary)
     }
 }
 
@@ -472,4 +491,362 @@ public struct FleetThreadDetail: Decodable, Sendable {
     public let lastOwnerAt: Date?
     public let scannedAt: Date?
     public let activityTruncated: Bool?
+}
+
+// MARK: - Supervisor Duet Cards, Progressive Preferences & Search
+
+public struct SupervisorCardAction: Decodable, Sendable, Equatable {
+    public var op: String
+    public var label: String
+    public var value: String?
+    public var destructive: Bool
+
+    public init(op: String, label: String, value: String? = nil, destructive: Bool = false) {
+        self.op = op
+        self.label = label
+        self.value = value
+        self.destructive = destructive
+    }
+
+    private enum CodingKeys: String, CodingKey { case op, label, value, destructive }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        op = c.lenient(String.self, .op) ?? ""
+        label = c.lenient(String.self, .label) ?? ""
+        value = c.lenient(String.self, .value)
+        destructive = c.lenient(Bool.self, .destructive) ?? false
+    }
+}
+
+public struct SupervisorTimelineItem: Decodable, Sendable, Equatable, Identifiable {
+    public var at: Date?
+    public var label: String
+    public var detail: String?
+
+    public var id: String { "\(label)-\(detail ?? "")-\(at?.timeIntervalSince1970 ?? 0)" }
+
+    public init(at: Date? = nil, label: String, detail: String? = nil) {
+        self.at = at
+        self.label = label
+        self.detail = detail
+    }
+
+    private enum CodingKeys: String, CodingKey { case at, label, detail }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        at = c.lenient(Date.self, .at)
+        label = c.lenient(String.self, .label) ?? ""
+        detail = c.lenient(String.self, .detail)
+    }
+}
+
+public struct SupervisorResource: Decodable, Sendable, Equatable, Identifiable {
+    public var kind: String
+    public var label: String
+    public var url: String?
+    public var threadKey: String?
+
+    public var id: String { "\(kind)-\(label)-\(url ?? threadKey ?? "")" }
+
+    public init(kind: String, label: String, url: String? = nil, threadKey: String? = nil) {
+        self.kind = kind
+        self.label = label
+        self.url = url
+        self.threadKey = threadKey
+    }
+
+    private enum CodingKeys: String, CodingKey { case kind, label, url, threadKey }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = c.lenient(String.self, .kind) ?? ""
+        label = c.lenient(String.self, .label) ?? ""
+        url = c.lenient(String.self, .url)
+        threadKey = c.lenient(String.self, .threadKey)
+    }
+}
+
+public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var questionId: String?
+    public var kind: String?
+    public var kindLabel: String?
+    public var slice: String?
+    public var headline: String
+    public var summary: String?
+    public var recommendation: String?
+    public var threadKey: String?
+    public var threadKeys: [String]
+    public var repo: String?
+    public var branch: String?
+    public var workspace: String?
+    public var prRef: String?
+    public var prUrl: String?
+    public var prNumber: Int?
+    public var headSha: String?
+    public var ciState: String?
+    public var mergeState: String?
+    public var noticedAt: Date?
+    public var risky: Bool
+    public var options: [String]
+    public var primaryAction: SupervisorCardAction?
+    public var secondaryAction: SupervisorCardAction?
+    public var timeline: [SupervisorTimelineItem]
+    public var resources: [SupervisorResource]
+
+    public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
+                slice: String? = nil, headline: String, summary: String? = nil, recommendation: String? = nil,
+                threadKey: String? = nil, threadKeys: [String] = [], repo: String? = nil, branch: String? = nil,
+                workspace: String? = nil, prRef: String? = nil, prUrl: String? = nil, prNumber: Int? = nil,
+                headSha: String? = nil, ciState: String? = nil, mergeState: String? = nil, noticedAt: Date? = nil,
+                risky: Bool = false, options: [String] = [], primaryAction: SupervisorCardAction? = nil,
+                secondaryAction: SupervisorCardAction? = nil, timeline: [SupervisorTimelineItem] = [],
+                resources: [SupervisorResource] = []) {
+        self.id = id
+        self.questionId = questionId
+        self.kind = kind
+        self.kindLabel = kindLabel
+        self.slice = slice
+        self.headline = headline
+        self.summary = summary
+        self.recommendation = recommendation
+        self.threadKey = threadKey
+        self.threadKeys = threadKeys
+        self.repo = repo
+        self.branch = branch
+        self.workspace = workspace
+        self.prRef = prRef
+        self.prUrl = prUrl
+        self.prNumber = prNumber
+        self.headSha = headSha
+        self.ciState = ciState
+        self.mergeState = mergeState
+        self.noticedAt = noticedAt
+        self.risky = risky
+        self.options = options
+        self.primaryAction = primaryAction
+        self.secondaryAction = secondaryAction
+        self.timeline = timeline
+        self.resources = resources
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, questionId, kind, kindLabel, slice, headline, summary, recommendation
+        case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
+        case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction
+        case timeline, resources
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? ""
+        questionId = c.lenient(String.self, .questionId)
+        kind = c.lenient(String.self, .kind)
+        kindLabel = c.lenient(String.self, .kindLabel)
+        slice = c.lenient(String.self, .slice)
+        headline = c.lenient(String.self, .headline) ?? "Needs review"
+        summary = c.lenient(String.self, .summary)
+        recommendation = c.lenient(String.self, .recommendation)
+        threadKey = c.lenient(String.self, .threadKey)
+        threadKeys = c.lenientList(String.self, .threadKeys)
+        repo = c.lenient(String.self, .repo)
+        branch = c.lenient(String.self, .branch)
+        workspace = c.lenient(String.self, .workspace)
+        prRef = c.lenient(String.self, .prRef)
+        prUrl = c.lenient(String.self, .prUrl)
+        prNumber = c.lenient(Int.self, .prNumber)
+        headSha = c.lenient(String.self, .headSha)
+        ciState = c.lenient(String.self, .ciState)
+        mergeState = c.lenient(String.self, .mergeState)
+        noticedAt = c.lenient(Date.self, .noticedAt)
+        risky = c.lenient(Bool.self, .risky) ?? false
+        options = c.lenientList(String.self, .options)
+        primaryAction = c.lenient(SupervisorCardAction.self, .primaryAction)
+        secondaryAction = c.lenient(SupervisorCardAction.self, .secondaryAction)
+        timeline = c.lenientList(SupervisorTimelineItem.self, .timeline)
+        resources = c.lenientList(SupervisorResource.self, .resources)
+    }
+}
+
+public struct SupervisorPreferences: Decodable, Sendable, Equatable {
+    public var mergePolicy: String
+    public var cadence: String
+    public var autoSlices: [String]
+
+    public init(mergePolicy: String = "manual_confirm", cadence: String = "balanced", autoSlices: [String] = []) {
+        self.mergePolicy = mergePolicy
+        self.cadence = cadence
+        self.autoSlices = autoSlices
+    }
+
+    private enum CodingKeys: String, CodingKey { case mergePolicy, cadence, autoSlices }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mergePolicy = c.lenient(String.self, .mergePolicy) ?? "manual_confirm"
+        cadence = c.lenient(String.self, .cadence) ?? "balanced"
+        autoSlices = c.lenientList(String.self, .autoSlices)
+    }
+}
+
+public struct SupervisorAutonomousAction: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var slice: String?
+    public var summary: String?
+    public var threadKey: String?
+    public var at: Date?
+    public var vetoed: Bool
+
+    public init(id: String, slice: String? = nil, summary: String? = nil, threadKey: String? = nil,
+                at: Date? = nil, vetoed: Bool = false) {
+        self.id = id
+        self.slice = slice
+        self.summary = summary
+        self.threadKey = threadKey
+        self.at = at
+        self.vetoed = vetoed
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, slice, summary, threadKey, at, vetoed }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? ""
+        slice = c.lenient(String.self, .slice)
+        summary = c.lenient(String.self, .summary)
+        threadKey = c.lenient(String.self, .threadKey)
+        at = c.lenient(Date.self, .at)
+        vetoed = c.lenient(Bool.self, .vetoed) ?? false
+    }
+}
+
+public struct SupervisorAutonomy: Decodable, Sendable, Equatable {
+    public var handledCount: Int
+    public var totalDecisions: Int
+    public var autonomousPercent: Int
+    public var recentActions: [SupervisorAutonomousAction]
+
+    public init(handledCount: Int = 0, totalDecisions: Int = 0, autonomousPercent: Int = 0,
+                recentActions: [SupervisorAutonomousAction] = []) {
+        self.handledCount = handledCount
+        self.totalDecisions = totalDecisions
+        self.autonomousPercent = autonomousPercent
+        self.recentActions = recentActions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case handledCount, totalDecisions, autonomousPercent, recentActions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        handledCount = c.lenient(Int.self, .handledCount) ?? 0
+        totalDecisions = c.lenient(Int.self, .totalDecisions) ?? 0
+        autonomousPercent = c.lenient(Int.self, .autonomousPercent) ?? 0
+        recentActions = c.lenientList(SupervisorAutonomousAction.self, .recentActions)
+    }
+}
+
+public struct SupervisorActiveSummary: Decodable, Sendable, Equatable {
+    public var running: Int
+    public var waitingCi: Int
+    public var needsYou: Int
+    public var total: Int
+
+    public init(running: Int = 0, waitingCi: Int = 0, needsYou: Int = 0, total: Int = 0) {
+        self.running = running
+        self.waitingCi = waitingCi
+        self.needsYou = needsYou
+        self.total = total
+    }
+
+    private enum CodingKeys: String, CodingKey { case running, waitingCi, needsYou, total }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        running = c.lenient(Int.self, .running) ?? 0
+        waitingCi = c.lenient(Int.self, .waitingCi) ?? 0
+        needsYou = c.lenient(Int.self, .needsYou) ?? 0
+        total = c.lenient(Int.self, .total) ?? 0
+    }
+}
+
+public struct FleetCardActResult: Decodable, Sendable, Equatable {
+    public var ok: Bool
+    public var status: String?
+    public var message: String?
+    public var delivery: FleetDelivery?
+    public var state: FleetState?
+
+    public init(ok: Bool = false, status: String? = nil, message: String? = nil,
+                delivery: FleetDelivery? = nil, state: FleetState? = nil) {
+        self.ok = ok
+        self.status = status
+        self.message = message
+        self.delivery = delivery
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey { case ok, status, message, delivery, state }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = c.lenient(Bool.self, .ok) ?? false
+        status = c.lenient(String.self, .status)
+        message = c.lenient(String.self, .message)
+        delivery = c.lenient(FleetDelivery.self, .delivery)
+        state = c.lenient(FleetState.self, .state)
+    }
+}
+
+public struct FleetSearchHit: Decodable, Sendable, Equatable, Identifiable {
+    public var key: String
+    public var title: String?
+    public var workspace: String?
+    public var repo: String?
+    public var branch: String?
+    public var state: String?
+    public var health: String?
+    public var snippet: String?
+    public var prRef: String?
+    public var score: Double?
+    public var live: Bool
+
+    public var id: String { key }
+
+    private enum CodingKeys: String, CodingKey {
+        case key, title, workspace, repo, branch, state, health, snippet, prRef, score, live
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = c.lenient(String.self, .key) ?? ""
+        title = c.lenient(String.self, .title)
+        workspace = c.lenient(String.self, .workspace)
+        repo = c.lenient(String.self, .repo)
+        branch = c.lenient(String.self, .branch)
+        state = c.lenient(String.self, .state)
+        health = c.lenient(String.self, .health)
+        snippet = c.lenient(String.self, .snippet)
+        prRef = c.lenient(String.self, .prRef)
+        score = c.lenient(Double.self, .score)
+        live = c.lenient(Bool.self, .live) ?? false
+    }
+}
+
+public struct FleetSearchResponse: Decodable, Sendable, Equatable {
+    public var query: String?
+    public var results: [FleetSearchHit]
+    public var total: Int
+
+    private enum CodingKeys: String, CodingKey { case query, results, total }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        query = c.lenient(String.self, .query)
+        results = c.lenientList(FleetSearchHit.self, .results)
+        total = c.lenient(Int.self, .total) ?? results.count
+    }
 }

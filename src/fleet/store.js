@@ -12,6 +12,7 @@ import { REMEDIES, suggestionPlan } from "./remedies.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
+import { defaultPreferences, normalizePreferences } from "./preferences.js";
 
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
@@ -77,7 +78,8 @@ function emptyState() {
     diagnosis: {},
     fixLocks: {},
     fixCommands: {},
-    selfSessions: []
+    selfSessions: [],
+    preferences: defaultPreferences()
   };
 }
 
@@ -671,6 +673,16 @@ export class FleetStore {
     this._save();
   }
 
+  preferences() {
+    return normalizePreferences(this.state.preferences);
+  }
+
+  savePreferences(next) {
+    this.state.preferences = normalizePreferences(next);
+    this._save();
+    return this.preferences();
+  }
+
   // ─── infra escalations and outages ──────────────────────────────────────
 
   recordEscalation(key, at) {
@@ -1194,7 +1206,8 @@ export class FleetStore {
       fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
       suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
-      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
+      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
+      preferences: normalizePreferences(raw.preferences)
     };
   }
 

@@ -80,12 +80,17 @@ export class OpenAGIG2App {
   private actionIndex = 0
   private actionTarget: InboxItem | null = null
   private voiceTarget: InboxItem | null = null
-  private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null }
+  private lastPingedSupervisor: InboxItem | null = null
+  private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null; this.lastPingedSupervisor = null }
   private showNotice(item: InboxItem): void {
     this.clearNotice()
-    const label = item.supervisor ? 'Supervisor question' : item.reminder ? 'Reminder suggested' : /^Follow up:/i.test(item.title) ? 'Follow-up suggested' : item.category === 'memory' ? 'Action identified' : item.category === 'highlight' ? 'Lifelog' : 'Update from main'
-    this.renderer.notice?.(label, plainAnswer(item.title))
-    this.noticeTimer = setTimeout(() => { this.noticeTimer = null; if (['home', 'ambient'].includes(this.mode) && this.foregroundActive && !this.exited) this.showHome() }, 4500)
+    const label = item.supervisor
+      ? (item.cardKind === 'pr_ready' ? 'PR ready · Supervisor' : item.cardKind === 'blocked' ? 'Agent blocked · Supervisor' : item.cardKind === 'preference' ? 'Preference · Supervisor' : 'Supervisor question')
+      : item.reminder ? 'Reminder suggested' : /^Follow up:/i.test(item.title) ? 'Follow-up suggested' : item.category === 'memory' ? 'Action identified' : item.category === 'highlight' ? 'Lifelog' : 'Update from main'
+    const detail = item.supervisor && item.pmBrief ? `${plainAnswer(item.title)}\n${plainAnswer(item.pmBrief)}` : plainAnswer(item.title)
+    this.renderer.notice?.(label, detail)
+    if (item.supervisor) this.lastPingedSupervisor = { ...item }
+    this.noticeTimer = setTimeout(() => { this.noticeTimer = null; this.lastPingedSupervisor = null; if (['home', 'ambient'].includes(this.mode) && this.foregroundActive && !this.exited) this.showHome() }, 4500)
   }
   // Every ignored gesture gets visible feedback instead of silence.
   private flash(title: string, detail: string): void { this.renderer.flash?.(title, detail); this.phone.activity?.(`${title}: ${detail}`) }
@@ -293,7 +298,10 @@ export class OpenAGIG2App {
   }
   private showInboxItem(): void {
     const item = this.inboxItems[this.inboxIndex]; if (!item) return
-    this.mode = 'inbox'; this.pages = paginateText(plainAnswer(`${item.title}\n\n${item.summary}`), 220); this.page = 0
+    this.mode = 'inbox'
+    const body = item.supervisor && item.pmBrief && item.pmBrief !== item.summary ? `${item.pmBrief}\n\n${item.summary}` : item.summary
+    this.pages = paginateText(plainAnswer(`${item.title}\n\n${body}`), 220); this.page = 0
+    this.renderer.supervisorCard?.(item.supervisor && item.pmBrief ? plainAnswer(item.pmBrief) : null)
     this.renderer.inboxList?.(plainAnswer(item.title), this.inboxIndex + 1, this.inboxItems.length)
   }
   private showInboxPage(): void {
@@ -303,7 +311,7 @@ export class OpenAGIG2App {
     this.actionTarget = { id: '', title: 'Lifelog', summary: '', category: '', important: false, seen: true, action: '' }
     this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction()
   }
-  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer'; value?: string }[] {
+  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer' | 'act-card'; value?: string; cardOp?: 'primary' | 'fix_ci' | 'defer' }[] {
     const item = this.actionTarget
     // An empty target is the Lifelog controls list (swipe down in Lifelog).
     if (item && !item.id) {
@@ -311,10 +319,22 @@ export class OpenAGIG2App {
         this.ambientRunning && !this.lifelogUserPaused ? { label: 'Pause listening', op: 'pause' as const } : { label: 'Resume listening', op: 'resume' as const },
         { label: 'Recent answers', op: 'recent' }]
     }
+    const primaryCard = item?.supervisor && item.cardId && (item.action === 'act-fleet-card' || item.cardKind === 'pr_ready' || item.cardKind === 'preference')
+      ? [{ label: item.cardKind === 'pr_ready' ? `${item.primaryLabel || 'Merge PR'}${item.prRef ? ` (${item.prRef})` : ''}` : (item.primaryLabel || 'Approve'), op: 'act-card' as const, cardOp: 'primary' as const }]
+      : []
+    const fixCiCard = item?.supervisor && item.cardId && item.ciState === 'failing'
+      ? [{ label: 'Have agent fix CI', op: 'act-card' as const, cardOp: 'fix_ci' as const }]
+      : []
+    const deferCard = item?.supervisor && item.cardId
+      ? [{ label: 'Hold off / Defer', op: 'act-card' as const, cardOp: 'defer' as const }]
+      : []
     // A supervisor question is answered with one of its own fixed choices.
-    const answers = item?.supervisor ? (item.options ?? []).map(value => ({ label: `Answer: ${value}`, op: 'answer' as const, value })) : []
-    return [...answers,
+    const answers = item?.supervisor
+      ? (item.options ?? []).filter(value => !primaryCard.length || value.toLowerCase() !== (item.primaryLabel ?? '').toLowerCase()).map(value => ({ label: `Answer: ${value}`, op: 'answer' as const, value }))
+      : []
+    return [...primaryCard, ...fixCiCard, ...answers,
       { label: 'Talk about this item', op: 'talk' },
+      ...deferCard,
       ...(item?.action === 'complete-task' ? [{ label: 'Complete task on main', op: 'complete-task' as const }] : []),
       ...(item?.action === 'accept-task' && !item.reminder ? [{ label: 'Add as my task', op: 'accept-task' as const }] : []),
       ...(item?.id ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : [])]
@@ -331,6 +351,14 @@ export class OpenAGIG2App {
     if (action.op === 'mark') { await this.markMoment(); return }
     if (this.mode !== 'inbox-confirm') { this.mode = 'inbox-confirm'; this.showInboxAction(); return }
     this.navigationBusy = true
+    if (action.op === 'act-card') {
+      try {
+        const result = await this.proactive.actCard(target.id, action.cardOp ?? 'primary')
+        if (this.exited || !this.foregroundActive) return
+        this.mode = 'message'; this.renderer.message(result.ok ? 'Done' : 'Action halted', result.detail || (result.ok ? action.label : 'Check PR or session state.'))
+      } finally { this.navigationBusy = false }
+      return
+    }
     if (action.op === 'answer') {
       try {
         const result = await this.proactive.answer(target.id, action.value ?? '')
@@ -360,7 +388,8 @@ export class OpenAGIG2App {
     if (!status) { this.mode = 'message'; this.renderer.message('Supervisor unavailable', 'Main could not read the supervisor. Check the Mac running it.'); return }
     const c = status.counts
     const lines = status.threads.map(t => `${t.health === 'red' ? '●' : '○'} ${t.name}: ${t.reason || t.state}`)
-    const text = `${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.needsYou} question${status.needsYou === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
+    const summaryLine = status.catchUpSummary ? `${status.catchUpSummary}\n` : ''
+    const text = `${summaryLine}${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.cardsCount ?? status.needsYou} item${(status.cardsCount ?? status.needsYou) === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
     this.pages = paginateText(plainAnswer(text), 220); this.page = 0; this.mode = 'status'
     this.renderer.fleetStatus(this.pages[0] ?? '', 0, this.pages.length)
   }
@@ -591,6 +620,7 @@ export class OpenAGIG2App {
     this.lastTapAt = Date.now()
     // Talk and Lifelog recordings follow the review setting.
     if (!this.askStarting && !this.microphoneOpening && this.mode !== 'listening') this.cancelHold()
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.clearNotice()
     if (this.mode === 'ambient' && this.activeCue) {
       const cue = this.activeCue; this.clearCue(); this.mode = 'cue'; this.pages = paginateText(plainAnswer(`${cue.title}\n\n${cue.detail}`), 260); this.page = 0; this.showCuePage(); return
@@ -619,6 +649,7 @@ export class OpenAGIG2App {
   holdStart(): boolean {
     if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
     if (this.navigationBusy || this.microphoneOpening || this.askStarting || this.requestController) return false
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.pushToTalk = true; this.releasePending = false; this.lastTapAt = Date.now(); this.clearNotice()
     void this.startAsk().then(() => { if (this.releasePending) { this.releasePending = false; void this.releaseToSend() } })
     return true
@@ -945,11 +976,15 @@ export class OpenAGIG2App {
   }
   private startSupervisorVoice(): void {
     if (!this.store.snapshot().nodeToken) return
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.clearNotice()
     this.renderer.autoSend?.(true)
     if (this.mode.startsWith('inbox')) {
       const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]
       this.voiceTarget = selected?.id ? { ...selected } : null
+    } else if (!this.voiceTarget && this.mode === 'home') {
+      const lead = this.proactive.items.find(i => i.supervisor && i.cardId)
+      if (lead) this.voiceTarget = { ...lead }
     }
     if (!this.supervisorVoice) this.supervisorVoice = this.voiceFactory({
       state: state => {
@@ -1228,7 +1263,12 @@ export class OpenAGIG2App {
   private renderHome(items = this.proactive.items): void {
     const state = this.store.snapshot()
     this.renderer.autoSend?.(state.homeMode === 'supervisor' || state.autoSend)
-    if (state.homeMode === 'supervisor') this.renderer.supervisorHome(items.filter(i => i.supervisor).length)
+    if (state.homeMode === 'supervisor') {
+      const supItems = items.filter(i => i.supervisor)
+      const lead = supItems[0]
+      this.renderer.supervisorLead?.(lead?.pmBrief ? `${plainAnswer(lead.title)}\n${plainAnswer(lead.pmBrief)}` : null)
+      this.renderer.supervisorHome(supItems.length)
+    }
     else if (state.homeMode === 'lifelog') this.renderer.lifelogHome?.(this.lifelogState === 'off' ? 'starting' : this.lifelogState, this.lifelogDetail)
     else this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined))
   }

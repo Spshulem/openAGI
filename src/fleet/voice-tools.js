@@ -14,6 +14,7 @@ export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough
 // send nudges in Auto mode, so voice uses the read-only fleet_status.
 export const VOICE_SESSION_TOOLS = Object.freeze([
   "fleet_status", "fleet_thread", "fleet_screen", "fleet_send_message", "fleet_answer_question", "fleet_click", "fleet_app",
+  "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   ...VOICE_TOOL_NAMES
 ]);
 const SCOPES = ["questions", "blocked", "fixes", "suggestions", "all"];

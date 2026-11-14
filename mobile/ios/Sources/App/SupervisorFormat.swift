@@ -249,6 +249,111 @@ enum SupervisorFormat {
         return minutes <= 0 ? "just now" : RelativeTime.compact(minutes: minutes) + " ago"
     }
 
+    // Duet card deck: uses the daemon's enriched `cards` when present, or
+    // synthesizes equivalent cards from `questions` + `snapshot.threads` when
+    // connected to an older daemon or UI test fixture.
+    static func resolvedCards(_ state: FleetState) -> [SupervisorCard] {
+        let cards = state.cards.filter { !$0.id.isEmpty }
+        if !cards.isEmpty { return cards }
+        let threads = state.snapshot?.threads ?? []
+        return state.questions.filter { !$0.id.isEmpty }.map { question in
+            let keys = threadKeys(question)
+            let primaryKey = question.threadKey ?? keys.first
+            let thread = primaryKey.flatMap { key in threads.first(where: { $0.key == key }) }
+            let options = answerOptions(question)
+            let isReady = question.kind == "ready"
+            let primary: SupervisorCardAction? = if isReady {
+                SupervisorCardAction(op: "merge", label: "Merge PR")
+            } else if let first = options.first {
+                SupervisorCardAction(op: "answer", label: capitalizedFirst(first), value: first)
+            } else {
+                nil
+            }
+            return SupervisorCard(
+                id: "question:\(question.id)",
+                questionId: question.id,
+                kind: isReady ? "pr_ready" : "agent_decision",
+                kindLabel: isReady ? "PR ready" : "Needs your decision",
+                headline: nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
+                summary: nonBlank(question.body),
+                threadKey: primaryKey,
+                threadKeys: keys,
+                repo: thread?.repo,
+                branch: thread?.branch,
+                workspace: thread?.workspace,
+                prRef: question.prRef ?? thread?.pr?.ref,
+                prUrl: thread?.pr?.url,
+                ciState: thread?.pr?.ci?.state,
+                noticedAt: question.createdAt,
+                options: options,
+                primaryAction: primary,
+                secondaryAction: SupervisorCardAction(op: "defer", label: "Later")
+            )
+        }
+    }
+
+    // Compact toolbar pill: "2 running · 1 CI", "3 watched", or "0 active".
+    static func activePill(_ state: FleetState) -> String {
+        let running: Int
+        let waitingCi: Int
+        let total: Int
+        if let summary = state.activeSummary {
+            running = summary.running
+            waitingCi = summary.waitingCi
+            total = summary.total
+        } else {
+            let threads = (state.snapshot?.threads ?? []).filter { $0.state != "excluded" && $0.state != "done" }
+            running = threads.filter { $0.state == "running" || $0.state == "local-verify" }.count
+            waitingCi = threads.filter { $0.state == "waiting-ci" }.count
+            total = threads.count
+        }
+        var parts: [String] = []
+        if running > 0 { parts.append("\(running) running") }
+        if waitingCi > 0 { parts.append("\(waitingCi) CI") }
+        if !parts.isEmpty { return parts.joined(separator: " · ") }
+        return total > 0 ? "\(total) watched" : "0 active"
+    }
+
+    static func autonomyLine(_ autonomy: SupervisorAutonomy?) -> String? {
+        guard let autonomy, autonomy.handledCount > 0 else { return nil }
+        let noun = autonomy.handledCount == 1 ? "decision" : "decisions"
+        return "Handled \(autonomy.handledCount) routine \(noun) · \(autonomy.autonomousPercent)% autonomous"
+    }
+
+    static func cardActNote(_ result: FleetCardActResult) -> Note {
+        let message = nonBlank(result.message)
+        switch result.status {
+        case "merged":
+            return Note(text: message ?? "Merged pull request.", isAlert: false)
+        case "queued_auto_merge", "ci_pending_watch":
+            return Note(text: message ?? "Watching CI — will ping when green.", isAlert: false)
+        case "merge_blocked", "ci_failed", "sha_changed", "not_mergeable":
+            return Note(text: message ?? "Merge halted safely — check PR status first.", isAlert: true)
+        case "deferred", "dismissed":
+            return Note(text: message ?? "Saved for later.", isAlert: false)
+        case "preference_saved":
+            return Note(text: message ?? "Preference updated.", isAlert: false)
+        default:
+            if !result.ok, let message { return Note(text: message, isAlert: true) }
+            return deliveryNote(result.delivery, fallback: message ?? "Sent to the agent.")
+        }
+    }
+
+    static func cadenceLabel(_ cadence: String) -> String {
+        switch cadence {
+        case "quiet_until_ready": return "Quiet until ready"
+        case "detailed": return "Detailed updates"
+        default: return "Balanced"
+        }
+    }
+
+    static func mergePolicyLabel(_ policy: String) -> String {
+        switch policy {
+        case "queue_when_green": return "Queue merge when CI passes (after tap)"
+        default: return "Confirm only when CI is green"
+        }
+    }
+
     private static func prRefParts(_ ref: String) -> (repo: String, number: String)? {
         guard ref.range(of: #"^[\w.-]+/[\w.-]+#\d+$"#, options: .regularExpression) != nil,
               let hash = ref.lastIndex(of: "#") else { return nil }

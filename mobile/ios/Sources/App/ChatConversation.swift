@@ -34,6 +34,8 @@ final class ChatConversation {
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
+    var focusedCardID: String?
+    private(set) var composerFocusRequest = 0
     private(set) var composerRevision = 0
     private(set) var historyStatus: HistoryStatus = .unknown
     private(set) var isRefreshingHistory = false
@@ -125,12 +127,17 @@ final class ChatConversation {
         await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id)
     }
 
+    func requestComposerFocus() {
+        composerFocusRequest += 1
+    }
+
     private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
         var sawTerminalFrame = false
         var openedStream = false
         do {
             let stream = try await client.sendMessageStreaming(
-                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments, conversationId: conversationID
+                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey,
+                attachments: attachments, conversationId: conversationID, focusedCardId: focusedCardID
             )
             openedStream = true
             for try await event in stream {
@@ -282,6 +289,7 @@ final class ChatConversation {
     func forget() {
         draft = ""
         draftAttachments = []
+        focusedCardID = nil
         composerRevision += 1
         forgotten = true
         messages = []

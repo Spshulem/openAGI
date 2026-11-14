@@ -85,4 +85,49 @@ final class SupervisorFormatTests: XCTestCase {
         XCTAssertEqual(LifelogFormat.meta(moment, calendar: calendar), "3:40 PM – 3:52 PM · Spencer's G2")
         XCTAssertEqual(LifelogFormat.errorCopy(.notFound).headline, "Update OpenAGI on your main.")
     }
+
+    func testResolvedCardsSynthesizesFallbackFromLegacyQuestionsAndPrefersEnrichedCards() {
+        let legacy = FleetState(
+            snapshot: FleetSnapshot(threads: [
+                FleetThread(key: "codex:fixture", title: "Synthetic review thread", workspace: "Demo workspace", state: "needs-human"),
+                FleetThread(key: "claude:run", state: "running"),
+                FleetThread(key: "paseo:ci", state: "waiting-ci"),
+            ]),
+            questions: [
+                FleetQuestion(id: "context-fixture", title: "Review the synthetic request",
+                              body: "Read the recent activity before choosing a response.",
+                              options: ["yes", "no", "open thread"], kind: "agent-ask", threadKey: "codex:fixture")
+            ]
+        )
+        let synthesized = SupervisorFormat.resolvedCards(legacy)
+        XCTAssertEqual(synthesized.count, 1)
+        XCTAssertEqual(synthesized[0].id, "question:context-fixture")
+        XCTAssertEqual(synthesized[0].questionId, "context-fixture")
+        XCTAssertEqual(synthesized[0].workspace, "Demo workspace")
+        XCTAssertEqual(synthesized[0].options, ["yes", "no"])
+        XCTAssertEqual(SupervisorFormat.activePill(legacy), "1 running · 1 CI")
+
+        let enrichedCard = SupervisorCard(
+            id: "pr:Spshulem/openAGI#283",
+            kind: "pr_ready",
+            kindLabel: "PR ready",
+            headline: "Merge PR #283",
+            primaryAction: SupervisorCardAction(op: "merge", label: "Merge PR")
+        )
+        let enriched = FleetState(
+            cards: [enrichedCard],
+            autonomy: SupervisorAutonomy(handledCount: 4, totalDecisions: 5, autonomousPercent: 80),
+            activeSummary: SupervisorActiveSummary(running: 2, waitingCi: 0, needsYou: 1, total: 3)
+        )
+        XCTAssertEqual(SupervisorFormat.resolvedCards(enriched), [enrichedCard])
+        XCTAssertEqual(SupervisorFormat.activePill(enriched), "2 running")
+        XCTAssertEqual(SupervisorFormat.autonomyLine(enriched.autonomy), "Handled 4 routine decisions · 80% autonomous")
+        XCTAssertEqual(
+            SupervisorFormat.cardActNote(FleetCardActResult(ok: true, status: "ci_pending_watch", message: "CI still running — watching.")),
+            .init(text: "CI still running — watching.", isAlert: false)
+        )
+        XCTAssertTrue(
+            SupervisorFormat.cardActNote(FleetCardActResult(ok: false, status: "ci_failed", message: "Checks failed.")).isAlert
+        )
+    }
 }

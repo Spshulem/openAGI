@@ -8,7 +8,14 @@ import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const CARD_ID_PATTERN = /^[A-Za-z0-9:_-]{1,120}$/;
 const ANSWER_MAX = 200;
+
+function pathCardId(segment) {
+  let id;
+  try { id = decodeURIComponent(segment); } catch { return null; }
+  return CARD_ID_PATTERN.test(id) ? id : null;
+}
 const SEND_MAX = 2000;
 const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
@@ -116,6 +123,67 @@ export function createFleetRoute({ supervisor } = {}) {
             ...(typeof body?.fixId === "string" ? { fixId: body.fixId } : {}), clarification: body?.clarification });
           return result ? ok(result) : fail(404, "No suggestion with that id.");
         } catch { return fail(409, "Suggestion could not be applied. Check its choice, self-fix mode, locks and daily cap."); }
+      }
+      if (parts.length === 1 && parts[0] === "search") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        const query = url?.searchParams?.get("query") ?? url?.searchParams?.get("q") ?? "";
+        const limit = Number(url?.searchParams?.get("limit") ?? 20);
+        if (!query.trim() || query.length > 300 || !Number.isInteger(limit) || limit < 1 || limit > 50) {
+          return fail(400, "Pass a query of 1-300 characters and a limit of 1-50.");
+        }
+        if (typeof supervisor.searchThreads !== "function") {
+          return fail(503, "Update OpenAGI on the fleet computer to search conversations.");
+        }
+        return ok(await supervisor.searchThreads({ query, limit }));
+      }
+      if (parts.length === 1 && parts[0] === "preferences") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.updatePreferences !== "function") {
+          return fail(503, "Preferences are not available.");
+        }
+        const body = await readObject(readBody);
+        if (!body) return fail(400, "Send a JSON object of preference updates.");
+        const preferences = await supervisor.updatePreferences(body);
+        return ok({ preferences, state: state() });
+      }
+      if (parts.length === 1 && parts[0] === "route") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.routeIssue !== "function") {
+          return fail(503, "Issue routing is not available.");
+        }
+        const body = await readObject(readBody);
+        const text = typeof body?.text === "string" ? body.text.trim() : "";
+        if (!text || text.length > SEND_MAX) return fail(400, `text must be 1-${SEND_MAX} characters.`);
+        const confirmTarget = typeof body?.confirmTarget === "string" ? body.confirmTarget.trim() : null;
+        if (confirmTarget && !THREAD_KEY.test(confirmTarget)) return fail(400, "Pass a valid thread key.");
+        const result = await supervisor.routeIssue({
+          text,
+          confirmTarget,
+          autoSend: body?.autoSend === true,
+          ...sendOptions
+        });
+        return ok({ ...result, state: state() });
+      }
+      if (parts.length === 3 && parts[0] === "cards" && parts[2] === "act") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const cardId = pathCardId(parts[1]);
+        if (!cardId) return fail(400, "Bad card id.");
+        if (typeof supervisor.actCard !== "function") {
+          return fail(503, "Card actions are not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        const op = typeof body.op === "string" ? body.op.trim() : "primary";
+        const value = typeof body.value === "string" ? body.value.trim() : null;
+        if (value && value.length > ANSWER_MAX) return fail(400, "Option value is too long.");
+        const outcome = await supervisor.actCard(cardId, {
+          op,
+          value,
+          clarification: typeof body.clarification === "string" ? body.clarification : null,
+          instructions: typeof body.instructions === "string" ? body.instructions : null,
+          ...sendOptions
+        });
+        if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
+        return ok({ result: outcome, state: state() });
       }
       if (parts.length === 1 && parts[0] === "state") {
         if (method !== "GET") return fail(405, "Use GET.");

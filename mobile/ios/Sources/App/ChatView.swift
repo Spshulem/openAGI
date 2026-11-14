@@ -125,6 +125,8 @@ struct ChatConversationView: View {
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+    var topAccessory: AnyView? = nil
+    var composerAccessory: ((Bool) -> AnyView)? = nil
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
     var onHistorySelectionConsumed: () -> Void = {}
 
@@ -198,6 +200,7 @@ struct ChatConversationView: View {
         .task(id: conversation.identity) { await conversation.refresh() }
         .onDisappear { dictation.stop() }
         .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
             if !sending {
                 Task { await model.conversations.refresh() }
@@ -213,6 +216,7 @@ struct ChatConversationView: View {
 
     private var conversationContent: some View {
         VStack(spacing: 0) {
+            if let topAccessory { topAccessory }
             header
             GeometryReader { geometry in
                 messageScroll(width: geometry.size.width)
@@ -494,24 +498,28 @@ struct ChatConversationView: View {
     }
 
     private var chatHome: some View {
-        VStack(spacing: Theme.Spacing.x6) {
+        let isSupervisor = conversation.thread == .supervisor
+        let suggestions = isSupervisor ? ChatHomeSuggestion.supervisorAll : ChatHomeSuggestion.all
+        return VStack(spacing: Theme.Spacing.x6) {
             VStack(spacing: Theme.Spacing.x2) {
-                Image(systemName: "sparkles").font(.title).foregroundStyle(.tint)
+                Image(systemName: isSupervisor ? "binoculars" : "sparkles").font(.title).foregroundStyle(.tint)
                     .frame(width: 56, height: 56)
                     .background(.tint.opacity(0.12), in: .circle)
                     .accessibilityHidden(true)
-                Text("What can I take off your plate?")
+                Text(isSupervisor ? "Your coding agents, one thread" : "What can I take off your plate?")
                     .font(.title2.bold()).multilineTextAlignment(.center)
-                Text(model.isOnPhone
-                     ? "Your agent, tasks and conversations live on this iPhone."
-                     : "Ask for anything. OpenAGI works on it and checks with you before big steps.")
+                Text(isSupervisor
+                     ? emptyDetail
+                     : (model.isOnPhone
+                        ? "Your agent, tasks and conversations live on this iPhone."
+                        : "Ask for anything. OpenAGI works on it and checks with you before big steps."))
                     .font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity)
             VStack(spacing: Theme.Spacing.x2) {
-                ForEach(ChatHomeSuggestion.all) { suggestion in
+                ForEach(suggestions) { suggestion in
                     Button { conversation.draft = suggestion.prompt; composerFocused = true } label: {
                         HStack(spacing: Theme.Spacing.x3) {
                             Image(systemName: suggestion.symbol).font(.body).foregroundStyle(.tint)
@@ -542,6 +550,7 @@ struct ChatConversationView: View {
     @ViewBuilder
     private var inputBar: some View {
         VStack(spacing: 8) {
+            if let composerAccessory { composerAccessory(composerFocused) }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -992,6 +1001,15 @@ struct ChatHomeSuggestion: Identifiable {
                            detail: "Open, overdue and coming up", prompt: "Show my tasks"),
         ChatHomeSuggestion(id: "remember", symbol: "brain", title: "Remember something",
                            detail: "A fact, a preference, a promise", prompt: "Remember something for me")
+    ]
+
+    static let supervisorAll = [
+        ChatHomeSuggestion(id: "status", symbol: "bolt.horizontal.circle", title: "Catch me up",
+                           detail: "What finished, what's green, and what needs me", prompt: "Catch me up on my coding agents"),
+        ChatHomeSuggestion(id: "bug", symbol: "ladybug", title: "Route a bug report",
+                           detail: "Find the right agent session and hand off a fix", prompt: "A customer hit a bug: "),
+        ChatHomeSuggestion(id: "search", symbol: "magnifyingglass", title: "Find a session",
+                           detail: "Search across every repo, PR and transcript", prompt: "Find the session working on ")
     ]
 }
 
