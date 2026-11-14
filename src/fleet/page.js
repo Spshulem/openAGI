@@ -743,8 +743,14 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     } catch (e) {
       replying.delete(target.id);
       b.disabled = false;
+      if (e.status === 404 || e.status === 409) {
+        // Gone or closed: repaint even with the box focused, so a closed ask
+        // leaves the page. The draft is kept; the reason is said after the
+        // reload so it is not cleared by it.
+        drafts.set(target.id, area.value);
+        await load({ force: true });
+      }
       say(e.message, true);
-      if (e.status === 404 || e.status === 409) await load();
     } finally {
       replying.delete(target.id);
     }
@@ -1212,11 +1218,13 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     return Boolean(a && a.dataset && a.dataset.reply);
   }
 
-  async function load() {
+  // force: repaint even while a reply box has the focus.
+  async function load(opts) {
     void loadManagedSessions();
+    var force = Boolean(opts && opts.force === true);
     try {
       var fresh = await api('/fleet/api/state');
-      if (!typing()) render(fresh);
+      if (force || !typing()) render(fresh);
       if (errorShown) say('');
     } catch (e) {
       say(e.status ? e.message : 'Cannot reach OpenAGI. Retrying.', true);

@@ -837,6 +837,45 @@ test("a blocked reply keeps the words and says why", async () => {
   assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA")[0].value, "Merge it.", "the draft survives");
 });
 
+// PR #278 Bugbot: a 404/409 on send reloaded while the reply box still had
+// the focus, so the repaint was skipped (the closed ask stayed) and the
+// reload's success wiped the error that said why.
+test("a reply to a question that closed meanwhile removes its card and keeps saying why, even with the box focused", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: false };
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chatOf(page.el("needsList")));
+  const area = findAll(chatOf(page.el("needsList")), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Merge it.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.context.document.activeElement = area;
+  page.setState({ ...state, questions: [] });
+  page.responses.push({ status: 409, body: { error: "That question is already closed." } });
+  await findAll(chatOf(page.el("needsList")), (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  assert.equal(chatOf(page.el("needsList")), undefined, "the closed question left the page");
+  assert.equal(page.el("status").textContent, "That question is already closed.");
+  assert.match(page.el("status").className, /err/);
+});
+
+test("a reply refused with 404 while focused keeps the draft and the reason", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Rebase on main first.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.context.document.activeElement = area;
+  page.responses.push({ status: 404, body: { error: "That thread is not in the last scan." } });
+  await findAll(rowOf(page, "No plan"), (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  assert.equal(page.el("status").textContent, "That thread is not in the last scan.");
+  const again = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  assert.notEqual(again, area, "repainted despite the focus");
+  assert.equal(again.value, "Rebase on main first.", "the draft survives");
+});
+
 test("a question only the app answers has no reply box: Answer it in the app, and Open chat", async () => {
   const state = watchState();
   state.questions = [{ ...state.questions[0], kind: "agent-card", answerIn: "agent app", options: ["open thread"], canReply: false,
