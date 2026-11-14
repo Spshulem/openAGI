@@ -316,11 +316,23 @@ export class MemorySystem {
         .map(item => ({ item, score: tokenOverlapScore(correctionText(query), correctionText(`${item.content} ${(item.tags ?? []).join(" ")}`)) }))
         .filter(hit => hit.score > 0).sort((a, b) => b.score - a.score);
       const strongest = matches[0];
-      // Prefer saved facts tied for the strongest match, or when the strongest
-      // automatic match quotes that same fact. A loosely related preference must not
-      // displace a stronger match about a different fact.
+      // Condensed principles inherit protected tags. Follow their same-scope
+      // evidence so a stronger principle can still lead back to its saved fact.
+      const principleSources = new Set();
+      const lineage = [strongest?.item];
+      for (const principle of lineage) {
+        if (principle?.kind !== "principle" || !Array.isArray(principle.metadata?.sources)) continue;
+        for (const id of principle.metadata.sources) {
+          const source = this.items.get(id);
+          if (principleSources.has(id) || !source || source.metadata?.supersededBy || (source.scope ?? "main") !== scope) continue;
+          principleSources.add(id);
+          lineage.push(source);
+        }
+      }
+      // Prefer saved facts tied for the strongest match, or quoted by an
+      // automatic memory or a principle derived from that saved fact.
       const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5 && (
-        hit.score >= strongest.score || (!isProtectedMemory(strongest.item)
+        hit.score >= strongest.score || ((!isProtectedMemory(strongest.item) || principleSources.has(hit.item.id))
           && tokenOverlapScore(correctionText(hit.item.content), correctionText(strongest.item.content)) >= 0.75)
       ));
       const hits = saved.length ? saved : matches.filter(hit => !isSavedMemory(hit.item) || hit.score >= strongest.score);
