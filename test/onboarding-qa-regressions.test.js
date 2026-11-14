@@ -28,6 +28,36 @@ test("a correction replaces the saved preference even when newer summaries domin
   assert.equal(restored.items.get(corrected.item.id).metadata.supersededBy, next.item.id);
 });
 
+test("a stronger automatic fact wins over an unrelated saved preference during correction", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboarding-correction-target-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const prefix of ["Acme", "Acme weekly", "Acme weekly engineering project"]) {
+    const caseDir = path.join(dir, prefix);
+    const memory = new FileBackedMemorySystem({ dir: caseDir });
+    const preference = memory.remember({ content: `${prefix} review meeting notes should be short.`, tags: ["tool:remember", "preference"] });
+    const stale = memory.remember({ content: `${prefix} review meeting time is 3pm.`, source: "agent-host" });
+    const corrected = memory.correct({ query: `${prefix} review meeting time`, content: `${prefix} review meeting time is 4pm.` });
+    assert.deepEqual(corrected.superseded.map(item => item.id), [stale.id]);
+    assert.equal(preference.metadata.supersededBy, undefined);
+    assert.equal(stale.metadata.supersededBy, corrected.item.id);
+
+    const restored = new FileBackedMemorySystem({ dir: caseDir });
+    const recalled = restored.retrieve(`${prefix} review meeting time`, { limit: 20 });
+    assert.ok(recalled.some(({ item }) => item.id === corrected.item.id));
+    assert.ok(recalled.some(({ item }) => item.id === preference.id));
+    assert.ok(!recalled.some(({ item }) => item.id === stale.id), "the stale 3pm fact must not survive restart");
+  }
+});
+
+test("saved-memory priority does not discard a stronger earlier correction", () => {
+  const memory = new MemorySystem();
+  const preference = memory.remember({ content: "Acme review meeting notes should be short.", tags: ["tool:remember"] });
+  const previous = memory.correct({ content: "Acme review meeting time is 3pm." });
+  const corrected = memory.correct({ query: "Acme review meeting time", content: "Acme review meeting time is 4pm." });
+  assert.deepEqual(corrected.superseded.map(item => item.id), [previous.item.id]);
+  assert.equal(preference.metadata.supersededBy, undefined);
+});
+
 test("onboarding progress requires actual activity and cross-chat recall, not guide clicks", async () => {
   const memory = new MemorySystem();
   let messages = [];

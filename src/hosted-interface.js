@@ -5318,7 +5318,7 @@ async function restoreHistoryLocation() {
   const isCurrent = () => state.historyRestorationGeneration === generation && window.location.search === search;
   const requestedTab = new URLSearchParams(search).get("tab");
   const tab = VALID_TABS.has(requestedTab) ? requestedTab : "chat";
-  await switchTab(tab);
+  await switchTab(tab, { historyMode: "none" });
   if (!isCurrent()) return;
   const session = deepLinkSessionId(search);
   if (tab === "chat" && session) {
@@ -5717,15 +5717,26 @@ newBtn.addEventListener("click", async () => {
   }
 });
 
-async function switchTab(tab) {
+function showSidebar(yes) {
+  sidebar.style.display = yes ? "" : "none";
+  document.querySelector(".body").classList.toggle("no-sidebar", !yes);
+}
+
+async function switchTab(tab, { historyMode = "push" } = {}) {
   if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
   if (tab !== "activity") state.historyObserver?.disconnect();
   if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
   const tabUrl = new URL(window.location.href);
-  if (tabUrl.searchParams.get("tab") !== tab) {
+  if (historyMode !== "none" && tabUrl.searchParams.get("tab") !== tab) {
     tabUrl.searchParams.set("tab", tab);
-    for (const key of ["session", "request", "compose", "pending"]) tabUrl.searchParams.delete(key);
-    history.pushState(null, "", tabUrl);
+    // Initial URL normalization must keep incoming conversation and composer
+    // handoffs. Only a new tab navigation clears the previous tab's handoff.
+    if (historyMode === "push") {
+      for (const key of ["session", "request", "compose", "pending"]) tabUrl.searchParams.delete(key);
+      history.pushState(null, "", tabUrl);
+    } else {
+      history.replaceState(null, "", tabUrl);
+    }
   }
   state.tab = tab;
   main.dataset.tab = tab;
@@ -5738,18 +5749,12 @@ async function switchTab(tab) {
   closeNavigation();
   syncNodesAutoRefresh();
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  const body = document.querySelector(".body");
-  const showSidebar = (yes) => {
-    sidebar.style.display = yes ? "" : "none";
-    body.classList.toggle("no-sidebar", !yes);
-  };
-
   if (tab === "chat") {
-    showSidebar(true);
+    showSidebar(state.sessions.length > 0);
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
-    showSidebar(state.sessions.length > 0);
+    if (state.tab !== "chat") return;
     // A bare Chat open should look like chat history, not an unexplained blank
     // composer. Select the newest human-facing session unless the user
     // explicitly pressed + New or a specific ?session= handoff is about to be
@@ -5847,6 +5852,7 @@ async function refreshSessions() {
   // A session refresh can finish after the user has switched to another tab.
   // Keep the cached list current, but never replace another tab's sidebar.
   if (state.tab !== "chat") return sessions;
+  showSidebar(sessions.length > 0);
   sidebarList.innerHTML = "";
   if (sessions.length === 0) {
     sidebarList.innerHTML = '<li class="empty">No sessions yet</li>';
@@ -10454,7 +10460,7 @@ const initialTab = (() => {
 const initialSession = deepLinkSessionId(window.location.search);
 const initialRequest = deepLinkRequestId(window.location.search);
 (async () => {
-  await switchTab(initialTab);
+  await switchTab(initialTab, { historyMode: "replace" });
   if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession, initialRequest);
 })();
 </script>

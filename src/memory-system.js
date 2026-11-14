@@ -315,8 +315,15 @@ export class MemorySystem {
         .filter(item => !item.metadata?.supersededBy && (item.scope ?? "main") === scope)
         .map(item => ({ item, score: tokenOverlapScore(correctionText(query), correctionText(`${item.content} ${(item.tags ?? []).join(" ")}`)) }))
         .filter(hit => hit.score > 0).sort((a, b) => b.score - a.score);
-      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5);
-      const hits = saved.length ? saved : matches;
+      const strongest = matches[0];
+      // Prefer saved facts tied for the strongest match, or when the strongest
+      // automatic match quotes that same fact. A loosely related preference must not
+      // displace a stronger match about a different fact.
+      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5 && (
+        hit.score >= strongest.score || (!isProtectedMemory(strongest.item)
+          && tokenOverlapScore(correctionText(hit.item.content), correctionText(strongest.item.content)) >= 0.75)
+      ));
+      const hits = saved.length ? saved : matches.filter(hit => !isSavedMemory(hit.item) || hit.score >= strongest.score);
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
         // retrieve() already hides superseded items; corrections themselves are
