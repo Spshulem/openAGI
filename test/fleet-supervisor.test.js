@@ -280,6 +280,44 @@ test("sendProposed refuses a proposal whose thread's discovered facts changed", 
   assert.equal(delivered.length, 0);
 });
 
+test("a deferred proposal goes stale once the owner mutes its thread, and sendProposed never sends into a muted chat", async (t) => {
+  const threads = rotatingPairs().filter((thread) => thread.kind === "codex");
+  const { supervisor, delivered } = fixture(t, { mode: "propose", threads, limits: { maxThreads: 1 } });
+  await supervisor.tick({ reason: "test" });
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed" && a.threadKey === "codex:a");
+  assert.ok(proposed);
+  supervisor.store.mute("codex:a", NOW + 60 * MIN);
+  // Approved before the next scan: the mute already holds it.
+  const early = await supervisor.sendProposed(proposed.id);
+  assert.equal(early?.action.status, "stale");
+  assert.match(early.action.detail, /muted by owner/);
+  supervisor.store.updateAction(proposed.id, { status: "proposed" });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(snapshot.threads.map((row) => row.key), ["codex:b"], "codex:a was deferred");
+  assert.equal(supervisor.store.action(proposed.id).status, "stale");
+  assert.equal(await supervisor.sendProposed(proposed.id), null);
+  assert.equal(delivered.length, 0, "nothing goes into the muted chat");
+});
+
+test("a capped scan retires a group chunk whose deferred members moved into the rebuilt group", async (t) => {
+  const capped = { agentStatus: "error", prRefs: [], error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } };
+  const threads = Array.from({ length: 51 }, (_, n) => makeThread({ key: `codex:g${n}`, id: `g${n}`, cwd: `/work/g${n}`, lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN), ...capped }));
+  const { supervisor } = fixture(t, { threads, prs: new Map(), limits: { maxThreads: 1 } });
+  const keys = threads.map((thread) => thread.key);
+  const first = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "limit:group", title: "50 threads capped", options: ["wait", "added"], threadKeys: keys.slice(0, 50) });
+  const second = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "limit:group:2", title: "1 thread capped", options: ["wait", "added"], threadKeys: keys.slice(50) });
+  // The newest recovers and is read; the other 50 are deferred.
+  threads[0] = makeThread({ ...threads[0], agentStatus: "idle", error: null });
+  await supervisor.tick({ reason: "test" });
+  const rebuilt = supervisor.store.question(first.id);
+  assert.equal(rebuilt.status, "open");
+  assert.deepEqual([...rebuilt.threadKeys].sort(), keys.slice(1).sort());
+  assert.equal(supervisor.store.question(second.id).status, "resolved", "no thread is in two open groups");
+  const open = supervisor.store.openQuestions().filter((q) => String(q.dedupeKey).startsWith("limit:group"));
+  const members = open.flatMap((q) => q.threadKeys);
+  assert.equal(new Set(members).size, members.length);
+});
+
 test("a capped scan keeps a deferred thread's outage recovery until it is read", async (t) => {
   let healthy = false;
   const blocked = makeThread({ agentStatus: "aborted", error: { kind: "lb" }, prRefs: [], lastActivityAt: ago(30 * MIN), lastAgentAt: ago(30 * MIN), lastUserAt: ago(120 * MIN) });

@@ -2174,7 +2174,7 @@ export class FleetSupervisor {
     const excluded = this.lastThreads.get(action.threadKey)?.excluded ?? null;
     const held = this.store.mutedUntil(action.threadKey) || this.store.mutedUntil(action.targetKey) ? "muted by owner"
       : excluded ? `thread ${excluded}` : null;
-    const settled = movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
+    const settled = held ?? movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
@@ -3012,6 +3012,23 @@ export class FleetSupervisor {
     // older chunk not asked again whose members all sit in a chunk of the
     // same kind asked now, or were read and cleared, is superseded, so no
     // thread is in two open groups (and resumed twice).
+    if (carried.size) {
+      const kindOf = (question) => (question.threadKey ? null : Object.keys(GROUPED_KINDS).find((name) => String(question.dedupeKey ?? "").replace(/:\d+$/, "") === GROUPED_KINDS[name].dedupeKey));
+      const regrouped = new Map();
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || !asked.has(question.dedupeKey)) continue;
+        for (const key of question.threadKeys ?? []) regrouped.set(`${kind}|${key}`, true);
+      }
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || asked.has(question.dedupeKey) || !question.threadKeys?.length) continue;
+        if (!question.threadKeys.some((key) => regrouped.has(`${kind}|${key}`))) continue;
+        if (!question.threadKeys.every((key) => regrouped.has(`${kind}|${key}`) || !unknown([key]))) continue;
+        store.resolveQuestion(question.id, "regrouped: its threads moved to another group");
+        this.resolveOutreach(question, "resolved", "dismissed");
+      }
+    }
     // The supervisor reviews its own list before a new question reaches the
     // owner, so junk never pings; the main does not see it before then either.
     this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
@@ -3157,7 +3174,9 @@ export class FleetSupervisor {
     // (Storage records its own plans; they are not tick decisions.)
     // A deferred thread's stands only while what discovery shows of it is
     // what the action was made on: one that moved on is stale too.
-    const movedOn = (action) => deferred.has(action.threadKey) && threadFacts.get(action.threadKey) !== action.threadFacts;
+    // Owner policy applies to it as it would on a read: a mute ends it.
+    const movedOn = (action) => deferred.has(action.threadKey) && (threadFacts.get(action.threadKey) !== action.threadFacts
+      || Boolean(store.mutedUntil(action.threadKey) || (action.targetKey && store.mutedUntil(action.targetKey))));
     for (const action of openActions) {
       if (action.kind !== "storage" && !seenActions.has(action.id) && (!unknown([action.threadKey]) || movedOn(action))) store.updateAction(action.id, { status: "stale" });
     }
