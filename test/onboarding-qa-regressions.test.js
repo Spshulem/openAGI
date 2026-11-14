@@ -58,6 +58,42 @@ test("saved-memory priority does not discard a stronger earlier correction", () 
   assert.equal(preference.metadata.supersededBy, undefined);
 });
 
+test("corrections retire near-tied saved copies of the winning fact and preserve other preferences", t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "onboarding-saved-copies-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const strongestIsCorrection of [false, true]) {
+    for (const reverse of [false, true]) {
+      const caseDir = path.join(dir, `${strongestIsCorrection}-${reverse}`);
+      const memory = new FileBackedMemorySystem({ dir: caseDir });
+      const facts = ["Acme weekly meeting time is 3pm.", "Acme weekly team meeting time is 3pm."];
+      if (reverse) facts.reverse();
+      const stale = facts.map(content => strongestIsCorrection && content.includes("team")
+        ? memory.correct({ content }).item
+        : memory.remember({ content, tags: ["tool:remember"] }));
+      const preference = memory.remember({ content: "Acme weekly team meeting notes should be short.", tags: ["tool:remember", "preference"] });
+      const corrected = memory.correct({ query: "Acme weekly team meeting time", content: "Acme weekly team meeting time is 4pm." });
+      assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set(stale.map(item => item.id)));
+      assert.equal(preference.metadata.supersededBy, undefined);
+
+      const restored = new FileBackedMemorySystem({ dir: caseDir });
+      const recalled = restored.retrieve("Acme weekly team meeting time", { limit: 20 });
+      assert.ok(recalled.some(({ item }) => item.id === corrected.item.id));
+      assert.ok(recalled.some(({ item }) => item.id === preference.id));
+      assert.ok(!recalled.some(({ item }) => stale.some(previous => previous.id === item.id)), "no saved 3pm copy survives a restart");
+    }
+  }
+});
+
+test("near-tied saved copies remain correction targets for queries with unmatched details", () => {
+  for (const extra of ["location owner agenda date schedule", "location owner agenda date schedule room"]) {
+    const memory = new MemorySystem();
+    const stale = ["Acme weekly meeting time is 3pm.", "Acme weekly team meeting time is 3pm."]
+      .map(content => memory.remember({ content, tags: ["tool:remember"] }));
+    const corrected = memory.correct({ query: "Acme weekly team meeting time " + extra, content: "Acme weekly team meeting time is 4pm." });
+    assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set(stale.map(item => item.id)));
+  }
+});
+
 test("onboarding progress requires actual activity and cross-chat recall, not guide clicks", async () => {
   const memory = new MemorySystem();
   let messages = [];
