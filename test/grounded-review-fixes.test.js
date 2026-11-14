@@ -185,3 +185,12 @@ test("a second agent attempt after a reopen is graded on its own", () => {
   assert.equal(second.groundedFate, null);
   assert.equal(rt.outcomes.outcomes.get(first.id).groundedFate, "reopened");
 });
+
+test("a backfilled acceptance keeps its original time for the stall deadline", () => {
+  const rt = setup();
+  const acceptedAt = new Date(Date.now() - 40 * DAY).toISOString();
+  rt.tasks.add({ title: "Old and open", sourceMeta: { suggestionId: "prop_old" } }, { source: "suggestion", queue: "user" });
+  rt.grounded.onSuggestionResolved({ id: "prop_old", proposedAt: acceptedAt, resolvedAt: acceptedAt }, "accepted");
+  rt.grounded.sweep({ now: new Date() });
+  assert.equal(rt.outcomes.byWorkRef("work-suggestion", "prop_old").groundedFate, "accepted-stalled");
+});

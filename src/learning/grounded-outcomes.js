@@ -124,7 +124,12 @@ export class GroundedOutcomes {
       if (UPGRADABLE_FATES.has(fate) && this.linkedTask(suggestion.id)?.status === "completed") {
         return this._ground(outcome, "accepted-done", { source: "suggestion" });
       }
-      return this._ground(outcome, fate, { source: "suggestion" });
+      // Keep when it was accepted (it may be historical, during backfill):
+      // the stall deadline runs from then, not from when it was graded.
+      const detail = UPGRADABLE_FATES.has(fate)
+        ? { acceptedAt: Number.isFinite(Date.parse(suggestion.resolvedAt)) ? suggestion.resolvedAt : new Date().toISOString() }
+        : null;
+      return this._ground(outcome, fate, { source: "suggestion", detail });
     });
   }
 
@@ -192,7 +197,7 @@ export class GroundedOutcomes {
             count("accepted-done");
           }
         } else if (outcome.kind === "work-suggestion" && (outcome.groundedFate === "accepted" || outcome.groundedFate === "auto-accepted")
-            && t - Date.parse(outcome.groundedAt) >= SUGGESTION_STALLED_DAYS * DAY_MS) {
+            && t - Date.parse(outcome.metadata?.groundedDetail?.acceptedAt ?? outcome.groundedAt) >= SUGGESTION_STALLED_DAYS * DAY_MS) {
           // Only suggestions that became a task can stall. A skill, an MCP
           // connection or saved knowledge is done when accepted and keeps that grade.
           const task = this.linkedTask(outcome.refId);
