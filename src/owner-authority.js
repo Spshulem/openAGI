@@ -64,8 +64,13 @@ const TO_RECIPIENT = String.raw`(?:${NAMED_RECIPIENT}|(?!${NOT_NAME})[\w-]+(?:['
 
 export const INTENT_FAMILIES = Object.freeze({
   approve: {
-    verbs: "click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer",
-    tools: ["fleet_click", "fleet_answer_question"]
+    pattern: [
+      String.raw`(?:click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer|defer|dismiss|skip|veto)\b`,
+      String.raw`(?:merge|ship)\s+(?:it|this|that|the\s+(?:pr|pull request|[\w-]+\s+one)|pr\b|#\d+)`,
+      String.raw`(?:go for it|go ahead|do it|looks good|sounds good|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current)\b`,
+      String.raw`don['’]?t do that\b`
+    ].join("|"),
+    tools: ["fleet_click", "fleet_answer_question", "fleet_act_card", "fleet_preferences"]
   },
   // Messaging needs a recipient, so "write a summary of these results", "tell
   // if this site is legit" or "write a twitter thread" never lets read text
@@ -78,9 +83,10 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`message\s+${NOT_TOLD}(?!(?:received|sent|delivered|read|history|log|box|board)\b)\w`,
       String.raw`(?:reply|respond|write back|answer back)\s+to\s+(?!(?:me|us)\b)\w`,
       String.raw`(?:send|write|reply|respond|answer)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
-      String.raw`(?:forward|pass along)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
+      String.raw`(?:forward|pass along|route)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
       String.raw`(?:in|on)\s+${NAMED_RECIPIENT}\s*[,;:]?\s*(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:send|forward)\s+(?:it|this|that|these)\b`,
       String.raw`(?:ask|answer)\s+${NAMED_RECIPIENT}`,
+      String.raw`(?:have|get)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:fix|solve|patch|debug|investigate|repair|handle)\b`,
       String.raw`(?:send|write|reply|respond|answer)\s+(?:back\s+)?(?:to|in|on|into)\s+${NAMED_RECIPIENT}`,
       String.raw`ask\s+(?!(?:me|us|you|yourself|a|an|the|some|any|questions?|them|everyone|people|this|that)\b)[\w-]+\s+to\b`,
       String.raw`send\s+(?!${NOT_NAME}|(?:over|out|back|off|email|emails|messages?|texts?)\b)[\w-]+(?:\s*[:,]|\s+(?:yes|no|yep|nope|ok|okay|sure|go ahead|continue|proceed|approved?|stop|keep going|do it|ship it|lgtm|thanks|thank you|(?:a|the)\s+(?:message|note|reply))\b)`
@@ -155,8 +161,9 @@ export function ownerIntentText(text) {
 
 const YES_PHRASES = [
   "click approve", "click allow", "click yes", "click it", "press approve", "tap approve",
+  "go for it", "ship it", "merge it", "looks good", "sounds good",
   "go ahead", "do it", "send it", "run it", "yes please",
-  "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "approve", "approved", "confirm", "confirmed", "proceed", "allow"
+  "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "approve", "approved", "confirm", "confirmed", "proceed", "allow", "lgtm"
 ].map((phrase) => phrase.split(" "));
 const NO_PHRASES = [
   "do not allow", "don't allow", "dont allow", "do not", "don't", "dont", "no", "nope", "cancel", "deny", "denied", "reject", "stop"

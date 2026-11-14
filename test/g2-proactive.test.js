@@ -403,3 +403,96 @@ test("a long-lived supervisor question stays on the glasses past 200 newer resol
   // The orphan, which nothing refreshes, still ages out.
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), [live.id]);
 });
+
+test("supervisor PM cards surface concise brief + actFleetCard halts on failing preflight and dismisses on success", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  const at = new Date(now()).toISOString();
+  outreach.push({
+    id: "o-pr",
+    status: "unseen",
+    createdAt: at,
+    sourceRef: { kind: "fleet", id: "fq_pr" },
+    title: "PR #88 ready",
+    summary: "Auth token refresh fix",
+    needsDecision: true,
+    actions: ["dismiss"]
+  });
+  const acted = [];
+  let allowMerge = false;
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  runtime.outreach.resolve = (id, decision, opts) => {
+    const found = outreach.find(i => i.id === id);
+    if (found) found.status = opts.status;
+  };
+  runtime.fleetSupervisor = {
+    getState: () => ({
+      mode: "propose",
+      lastTickAt: at,
+      catchUpSummary: "2 sessions need you: 1 PR ready, 1 preference.",
+      questions: [{ id: "fq_pr", threadKey: "codex:auth" }],
+      cards: [
+        {
+          id: "q:fq_pr",
+          kind: "pr_ready",
+          questionId: "fq_pr",
+          threadKey: "codex:auth",
+          headline: "PR #88 ready to merge",
+          summary: "Auth token refresh passes unit tests",
+          recommendation: "Merge PR #88",
+          prRef: "acme/api#88",
+          ciState: "passing",
+          primaryAction: { action: "merge_pr", label: "Merge PR" },
+          updatedAt: at
+        },
+        {
+          id: "pref:cadence:quiet_until_ready",
+          kind: "preference",
+          headline: "Ping less on routine steps?",
+          summary: "You deferred 3 routine checks in a row",
+          recommendation: "Switch to Quiet until PR ready",
+          primaryAction: { action: "preference", label: "Quiet until ready" },
+          updatedAt: at
+        }
+      ],
+      snapshot: { threads: [] }
+    }),
+    actCard: async (cardId, payload) => {
+      acted.push([cardId, payload.op]);
+      if (!allowMerge && cardId === "q:fq_pr") {
+        return { ok: false, status: "ci_failing", detail: "CI check lint failed; PR left open" };
+      }
+      return { ok: true, status: "merged", detail: "Merged acme/api#88 via squash" };
+    }
+  };
+  call({ op: "configure", settings: { supervisorOnly: true } });
+  const feed = call({ op: "feed" }).items;
+  assert.equal(feed.length, 2);
+  const prItem = feed.find(i => i.id === "o-pr");
+  assert.equal(prItem.cardId, "q:fq_pr");
+  assert.equal(prItem.cardKind, "pr_ready");
+  assert.equal(prItem.primaryLabel, "Merge PR");
+  assert.equal(prItem.prRef, "acme/api#88");
+  assert.match(prItem.pmBrief, /Rec: Merge PR #88/);
+  assert.equal(prItem.action, "act-fleet-card");
+
+  const prefItem = feed.find(i => i.id === "card:pref:cadence:quiet_until_ready");
+  assert.ok(prefItem);
+  assert.equal(prefItem.primaryLabel, "Quiet until ready");
+
+  // Failing preflight keeps the card open on the glasses.
+  const blocked = await store.actFleetCard("one", { id: "o-pr", cardOp: "primary" });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.status, "ci_failing");
+  assert.ok(call({ op: "feed" }).items.some(i => i.id === "o-pr"));
+
+  // Green preflight merges and removes the item from the glasses feed.
+  allowMerge = true;
+  const merged = await store.actFleetCard("one", { id: "o-pr", cardOp: "primary" });
+  assert.equal(merged.ok, true);
+  assert.equal(call({ op: "feed" }).items.some(i => i.id === "o-pr"), false);
+  assert.deepEqual(acted, [["q:fq_pr", "primary"], ["q:fq_pr", "primary"]]);
+
+  const status = store.fleetStatus();
+  assert.equal(status.cardsCount, 2);
+  assert.match(status.catchUpSummary, /2 sessions need you/);
+});

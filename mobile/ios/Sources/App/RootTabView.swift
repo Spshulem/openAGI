@@ -65,7 +65,7 @@ struct RootTabView: View {
 
     var body: some View {
         WorkspaceWithChat(chatPaneOpen: $chatPaneOpen,
-                          showsChatPane: model.selectedTab != .chat,
+                          showsChatPane: model.selectedTab != .chat && model.selectedTab != .supervisor,
                           content: nativeTabs)
         .tint(Theme.live)
         .environment(model)
@@ -139,7 +139,7 @@ struct RootTabView: View {
             }.badge(model.inboxBadgeCount)
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) { ChatView() }
             Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
-                SupervisorView(showsInlineChat: false)
+                SupervisorView()
             }
         }
         // iOS 27.1 places the system tab and navigation bars around Duo's

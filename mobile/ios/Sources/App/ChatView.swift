@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var thread: ConversationThread = .agent
@@ -54,15 +55,22 @@ struct ChatView: View {
         .task { await model.conversations.refresh() }
     }
 
+    // Unfolded like a book, the conversation list fills the leading page
+    // and the conversation, composer included, the trailing one, so neither
+    // runs across the fold.
     private var conversationSplitView: some View {
-        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
-            ConversationBrowser(thread: $thread) { message in
-                selectedMessage = message
-                compactColumn = .detail
+        GeometryReader { geometry in
+            let page = ChatBookPages.sidebarWidth(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                                                  size: geometry.size, rightToLeft: layoutDirection == .rightToLeft)
+            NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+                ConversationBrowser(thread: $thread) { message in
+                    selectedMessage = message
+                    compactColumn = .detail
+                }
+                .navigationSplitViewColumnWidth(min: page ?? 220, ideal: page ?? 270, max: page ?? 320)
+            } detail: {
+                conversationNavigation
             }
-            .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
-        } detail: {
-            conversationNavigation
         }
     }
 
@@ -117,6 +125,8 @@ struct ChatConversationView: View {
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+    var topAccessory: AnyView? = nil
+    var composerAccessory: ((Bool) -> AnyView)? = nil
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
     var onHistorySelectionConsumed: () -> Void = {}
 
@@ -132,6 +142,8 @@ struct ChatConversationView: View {
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
     @State private var reviewingApproval: PendingAction?
+    // Cards put away in this chat. The approval stays in the Inbox.
+    @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
@@ -188,6 +200,7 @@ struct ChatConversationView: View {
         .task(id: conversation.identity) { await conversation.refresh() }
         .onDisappear { dictation.stop() }
         .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
             if !sending {
                 Task { await model.conversations.refresh() }
@@ -203,6 +216,7 @@ struct ChatConversationView: View {
 
     private var conversationContent: some View {
         VStack(spacing: 0) {
+            if let topAccessory { topAccessory }
             header
             GeometryReader { geometry in
                 messageScroll(width: geometry.size.width)
@@ -266,7 +280,8 @@ struct ChatConversationView: View {
                         messageItemView(item, width: width)
                     }
                     ForEach(raisedApprovals) { action in
-                        ChatApprovalCard(action: action) { reviewingApproval = action }
+                        ChatApprovalCard(action: action, onReview: { reviewingApproval = action },
+                                         onHide: { hiddenApprovals.insert(action.id) })
                             .padding(.top, Theme.Spacing.x3)
                     }
                     Color.clear.frame(height: 1)
@@ -281,8 +296,11 @@ struct ChatConversationView: View {
             }
             .accessibilityIdentifier("chat-history")
             .scrollPosition($scrollPosition)
+            // Long histories open at the newest line. No bottom anchor for
+            // .alignment: with a history about one screen tall it fed a
+            // layout loop with the keyboard's safe area (the app hung as the
+            // keyboard rose). A short chat reads from the top.
             .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(.bottom, for: .alignment)
             .onScrollPhaseChange { _, phase in
                 userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
             }
@@ -307,7 +325,14 @@ struct ChatConversationView: View {
                 else if userIsScrolling { isPinnedToBottom = false }
             }
             .onChange(of: raisedApprovals.map(\.id)) { _, ids in
-                if !ids.isEmpty && (isPinnedToBottom || isBottomVisible) { scrollToLatest() }
+                guard !ids.isEmpty && (isPinnedToBottom || isBottomVisible) else { return }
+                scrollToLatest()
+                // A new card's height is only known after it lays out; settle
+                // on the real end once it has.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(150))
+                    scrollToLatest()
+                }
             }
             .onChange(of: messages) { old, new in
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
@@ -469,27 +494,32 @@ struct ChatConversationView: View {
                                     // phone chats under other session ids; keep
                                     // showing every recent approval there.
                                     scopedToSession: conversation.historyStatus != .needsUpdate)
+            .filter { !hiddenApprovals.contains($0.id) }
     }
 
     private var chatHome: some View {
-        VStack(spacing: Theme.Spacing.x6) {
+        let isSupervisor = conversation.thread == .supervisor
+        let suggestions = isSupervisor ? ChatHomeSuggestion.supervisorAll : ChatHomeSuggestion.all
+        return VStack(spacing: Theme.Spacing.x6) {
             VStack(spacing: Theme.Spacing.x2) {
-                Image(systemName: "sparkles").font(.title).foregroundStyle(.tint)
+                Image(systemName: isSupervisor ? "binoculars" : "sparkles").font(.title).foregroundStyle(.tint)
                     .frame(width: 56, height: 56)
                     .background(.tint.opacity(0.12), in: .circle)
                     .accessibilityHidden(true)
-                Text("What can I take off your plate?")
+                Text(isSupervisor ? "Your coding agents, one thread" : "What can I take off your plate?")
                     .font(.title2.bold()).multilineTextAlignment(.center)
-                Text(model.isOnPhone
-                     ? "Your agent, tasks and conversations live on this iPhone."
-                     : "Ask for anything. OpenAGI works on it and checks with you before big steps.")
+                Text(isSupervisor
+                     ? emptyDetail
+                     : (model.isOnPhone
+                        ? "Your agent, tasks and conversations live on this iPhone."
+                        : "Ask for anything. OpenAGI works on it and checks with you before big steps."))
                     .font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity)
             VStack(spacing: Theme.Spacing.x2) {
-                ForEach(ChatHomeSuggestion.all) { suggestion in
+                ForEach(suggestions) { suggestion in
                     Button { conversation.draft = suggestion.prompt; composerFocused = true } label: {
                         HStack(spacing: Theme.Spacing.x3) {
                             Image(systemName: suggestion.symbol).font(.body).foregroundStyle(.tint)
@@ -520,6 +550,7 @@ struct ChatConversationView: View {
     @ViewBuilder
     private var inputBar: some View {
         VStack(spacing: 8) {
+            if let composerAccessory { composerAccessory(composerFocused) }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -567,7 +598,9 @@ struct ChatConversationView: View {
     }
 
     private var composerLayout: ComposerLayout {
-        ComposerLayout(prefersSeparateControls: dynamicTypeSize >= .xxLarge,
+        // One line, like Messages, up to the accessibility sizes. Duo's
+        // larger default text used to stack the controls under the field.
+        ComposerLayout(prefersSeparateControls: dynamicTypeSize.isAccessibilitySize,
                        rightToLeft: layoutDirection == .rightToLeft)
     }
 
@@ -898,6 +931,7 @@ struct ChatWorkingLine: View {
 struct ChatApprovalCard: View {
     let action: PendingAction
     let onReview: () -> Void
+    var onHide: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
@@ -911,19 +945,44 @@ struct ChatApprovalCard: View {
                 Text(reason)
                     .font(Theme.Typography.secondary)
                     .foregroundStyle(Theme.muted)
-                    .lineLimit(4)
+                    .lineLimit(5)
             }
-            Button("Review", action: onReview)
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.capsule)
-                .padding(.top, Theme.Spacing.x1)
+            // Two equal pills, the decision on the trailing side. Hide only
+            // puts the card away here; the approval waits in the Inbox.
+            HStack(spacing: Theme.Spacing.x3) {
+                Button(action: onHide) {
+                    Text("Hide").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
+                        .contentShape(Capsule())
+                }
+                .foregroundStyle(Theme.ink)
+                .accessibilityIdentifier("chat-approval-hide-\(action.id)")
+                Button(action: onReview) {
+                    Text("Review").font(.body.weight(.semibold)).frame(maxWidth: .infinity, minHeight: 48)
+                        .foregroundStyle(Color(uiColor: .systemBackground))
+                        .background(Theme.ink, in: Capsule())
+                        .contentShape(Capsule())
+                }
                 .accessibilityIdentifier("chat-approval-review-\(action.id)")
+            }
+            .buttonStyle(.plain)
+            .padding(.top, Theme.Spacing.x2)
         }
-        .padding(Theme.Spacing.x4)
+        .padding(Theme.Spacing.x5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.surface, in: .rect(cornerRadius: 20, style: .continuous))
+        .background(Theme.surface, in: .rect(cornerRadius: 24, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat-approval-\(action.id)")
+    }
+}
+
+// The sidebar width that puts the split view's own divider on a vertical
+// fold: the leading page's width, or nil when there is no such fold.
+enum ChatBookPages {
+    static func sidebarWidth(division: CGRect?, size: CGSize, rightToLeft: Bool) -> CGFloat? {
+        guard let fold = division, fold.height > fold.width, fold.minX > 0, fold.maxX < size.width else { return nil }
+        return rightToLeft ? size.width - fold.maxX : fold.minX
     }
 }
 
@@ -942,6 +1001,15 @@ struct ChatHomeSuggestion: Identifiable {
                            detail: "Open, overdue and coming up", prompt: "Show my tasks"),
         ChatHomeSuggestion(id: "remember", symbol: "brain", title: "Remember something",
                            detail: "A fact, a preference, a promise", prompt: "Remember something for me")
+    ]
+
+    static let supervisorAll = [
+        ChatHomeSuggestion(id: "status", symbol: "bolt.horizontal.circle", title: "Catch me up",
+                           detail: "What finished, what's green, and what needs me", prompt: "Catch me up on my coding agents"),
+        ChatHomeSuggestion(id: "bug", symbol: "ladybug", title: "Route a bug report",
+                           detail: "Find the right agent session and hand off a fix", prompt: "A customer hit a bug: "),
+        ChatHomeSuggestion(id: "search", symbol: "magnifyingglass", title: "Find a session",
+                           detail: "Search across every repo, PR and transcript", prompt: "Find the session working on ")
     ]
 }
 
