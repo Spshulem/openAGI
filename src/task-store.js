@@ -256,9 +256,14 @@ export class TaskStore {
   }
 
   complete(id, via = "manual", { byAgent = false, signal = null } = {}) {
+    // Grading follows a real transition only: completing an already
+    // completed task must not credit the agent with someone else's work.
+    const wasCompleted = this.tasks.get(id)?.status === "completed";
     const next = this.update(id, { status: "completed", completedVia: via });
-    if (next && byAgent) this.runtime?.grounded?.onAgentTaskCompleted?.(next, signal);
-    if (next?.sourceMeta?.suggestionId) this.runtime?.grounded?.onSuggestionTaskCompleted?.(next.sourceMeta.suggestionId);
+    if (next && !wasCompleted) {
+      if (byAgent) this.runtime?.grounded?.onAgentTaskCompleted?.(next, signal);
+      if (next.sourceMeta?.suggestionId) this.runtime?.grounded?.onSuggestionTaskCompleted?.(next.sourceMeta.suggestionId);
+    }
     // Story 2: completing a task records an outcome with the lineage
     // back to the proactive-suggestion that proposed it (when present).
     // Aggregator can then report "this proposal led to N completed tasks".

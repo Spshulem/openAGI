@@ -174,6 +174,8 @@ export class OutcomeStore {
     const outcome = this.outcomes.get(id);
     const score = clampScore(qualityScore);
     if (!outcome || score === null) return null;
+    // A rating from the owner is a grounded grade by definition.
+    this.ground(id, { score, source: "explicit-rating", fate: "rated" });
     if (!outcome.resolved) return this.resolve(id, score, "explicit-rating", note);
 
     const previousQualityScore = outcome.qualityScore;

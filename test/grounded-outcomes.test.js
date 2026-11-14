@@ -132,6 +132,8 @@ test("sweep grades ignored drafts and stalled suggestions once", () => {
   const d = saveDraft(rt);
   const sug = { id: "stall", proposedAt: new Date().toISOString() };
   rt.grounded.onSuggestionResolved(sug, "accepted");
+  // Only a suggestion that became a task can stall.
+  rt.tasks.add({ title: "Still open", sourceMeta: { suggestionId: "stall" } }, { source: "suggestion", queue: "user" });
   const later = new Date(Date.now() + 31 * DAY);
   const first = rt.grounded.sweep({ now: later });
   assert.equal(first.byFate["ignored-undelivered"], 1);

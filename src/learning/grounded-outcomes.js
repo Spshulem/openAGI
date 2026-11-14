@@ -20,6 +20,9 @@ export const FATES = {
   "ignored-delivered": { score: 0.2, weak: true },
   "ignored-undelivered": { score: null, weak: false },
   accepted: { score: 0.7, weak: false },
+  // A task created automatically from a suggestion: no owner vote yet, so no
+  // grade until the task is done (accepted-done) or stalls (accepted-stalled).
+  "auto-accepted": { score: null, weak: false },
   "accepted-done": { score: 1.0, weak: false },
   "accepted-stalled": { score: 0.5, weak: false },
   rejected: { score: 0.0, weak: false },
@@ -32,7 +35,8 @@ export const FATES = {
   "rated-down": { score: 0.15, weak: false }
 };
 
-const SUGGESTION_STATUS_FATES = { accepted: "accepted", rejected: "rejected", dismissed: "dismissed" };
+const SUGGESTION_STATUS_FATES = { accepted: "accepted", "auto-accepted": "auto-accepted", rejected: "rejected", dismissed: "dismissed" };
+const UPGRADABLE_FATES = new Set(["accepted", "auto-accepted", "accepted-stalled"]);
 
 export function editedDraftScore(similarity) {
   return 0.4 + 0.6 * Math.max(0, Math.min(1, similarity));
@@ -114,14 +118,28 @@ export class GroundedOutcomes {
         return this._ground(outcome, fate, { source: "suggestion" });
       }
       const fate = SUGGESTION_STATUS_FATES[status];
-      return fate ? this._ground(outcome, fate, { source: "suggestion" }) : null;
+      if (!fate) return null;
+      // Resolved after its task was already done (e.g. graded by backfill):
+      // the completion already happened, so grade it as done now.
+      if (UPGRADABLE_FATES.has(fate) && this.linkedTask(suggestion.id)?.status === "completed") {
+        return this._ground(outcome, "accepted-done", { source: "suggestion" });
+      }
+      return this._ground(outcome, fate, { source: "suggestion" });
     });
+  }
+
+  /** The task created from a suggestion, if any (newest first). */
+  linkedTask(suggestionId) {
+    if (!suggestionId) return null;
+    const tasks = this.runtime?.tasks?.list?.({ limit: 100000 }) ?? [];
+    return tasks.filter((t) => t?.sourceMeta?.suggestionId === suggestionId)
+      .sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")))[0] ?? null;
   }
 
   onSuggestionTaskCompleted(suggestionId) {
     return this._safe(() => {
       const outcome = this.outcomes.byWorkRef("work-suggestion", suggestionId);
-      if (!outcome || !["accepted", "accepted-stalled"].includes(outcome.groundedFate)) return null;
+      if (!outcome || !UPGRADABLE_FATES.has(outcome.groundedFate)) return null;
       return this._ground(outcome, "accepted-done", { source: "suggestion" });
     });
   }
@@ -162,10 +180,15 @@ export class GroundedOutcomes {
         count(fate);
       }
       for (const outcome of [...this.outcomes.outcomes.values()]) {
-        if (outcome.kind === "work-suggestion" && outcome.groundedFate === "accepted"
+        if (outcome.kind === "work-suggestion" && (outcome.groundedFate === "accepted" || outcome.groundedFate === "auto-accepted")
             && t - Date.parse(outcome.groundedAt) >= SUGGESTION_STALLED_DAYS * DAY_MS) {
-          this._ground(outcome, "accepted-stalled", { source: "suggestion" });
-          count("accepted-stalled");
+          // Only suggestions that became a task can stall. A skill, an MCP
+          // connection or saved knowledge is done when accepted and keeps that grade.
+          const task = this.linkedTask(outcome.refId);
+          if (!task) continue;
+          const fate = task.status === "completed" ? "accepted-done" : "accepted-stalled";
+          this._ground(outcome, fate, { source: "suggestion" });
+          count(fate);
         } else if (outcome.kind === "work-task" && !outcome.groundedFate) {
           const task = this.runtime?.tasks?.get?.(outcome.refId);
           if (task?.status === "completed" && task.completedAt

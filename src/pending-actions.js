@@ -448,7 +448,28 @@ function serializableContext(ctx) {
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
     // Audit only: a replayed record is plain data and never owner authority.
-    authority: authorityRecord(ctx.__owner)
+    authority: authorityRecord(ctx.__owner),
+    // Grading provenance only (ids and numbers, no authority): lets work a
+    // replayed tool produces be linked to the turn that asked for it.
+    ...(ctx.__signal ? { __signal: signalRecord(ctx.__signal) } : {})
+  };
+}
+
+const SIGNAL_DIMENSIONS = ["environment", "company", "evidence", "memory", "uncertainty", "risk", "novelty", "repetition"];
+
+function signalRecord(signal) {
+  const text = (v, n) => (typeof v === "string" && v ? v.slice(0, n) : null);
+  const dims = {};
+  for (const key of SIGNAL_DIMENSIONS) {
+    const v = signal?.scrutinyDimensions?.[key];
+    if (typeof v === "number" && Number.isFinite(v)) dims[key] = v;
+  }
+  return {
+    id: text(signal?.id, 100),
+    scrutinyAction: text(signal?.scrutinyAction, 20),
+    scrutinyScore: typeof signal?.scrutinyScore === "number" && Number.isFinite(signal.scrutinyScore) ? signal.scrutinyScore : null,
+    scrutinyDimensions: Object.keys(dims).length ? dims : null,
+    specialistId: text(signal?.specialistId, 100)
   };
 }
 
