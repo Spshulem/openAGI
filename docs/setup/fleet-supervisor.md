@@ -56,6 +56,23 @@ The page choice is saved and wins over the env value.
 Questions reach you in every mode. Your answer to an agent's own question is
 sent to that thread in every mode, when a route exists.
 
+## Scan coverage
+
+Each scan evaluates at most 150 eligible threads by default. A quarter of the
+slots keep the most recently active chats visible; the remaining slots rotate
+through the least recently scanned chats. Quiet conversations therefore receive
+fresh checks even when newer conversations keep changing. Open permission cards
+are still included beyond that limit. Excluded or unavailable histories remain
+excluded, and every nudge still passes the existing policy and delivery checks.
+
+`GET /fleet/api/state` reports `snapshot.counts.eligible`, `inScope`, and
+`deferred`: available threads, threads evaluated in this scan, and available
+threads waiting for another scan. `threads` also includes excluded discoveries,
+so it is not the review backlog. Rotation starts over when the supervisor
+restarts. The model review and send limits are separate: being scanned does not
+mean a nudge was sent or its task completed. Quiet hours limit phone pushes,
+not background conversation review.
+
 ## Env vars
 
 | Var | Default | Means |

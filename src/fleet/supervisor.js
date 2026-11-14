@@ -187,8 +187,8 @@ function emptyBb3() {
 // thread at once), so they collapse into one line each. Identical titles
 // (the same BuildBot3 problem seen by a thread and by infra) collapse too.
 const GROUPED_KINDS = Object.freeze({
-  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
-  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
+  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} thread${n === 1 ? "" : "s"} capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
+  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open ${n === 1 ? "it" : "them"}?`, body: (labels) => `No live session to message: ${labels}.` },
   // Always one question, even for one thread, so the owner's answer holds
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
@@ -337,6 +337,13 @@ function activityMark(thread) {
   return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
 }
 
+// What a source's own listing says about a thread, before any git, PR or
+// screen read adds to it: a proposal made on these facts is only still
+// meant while they hold (a deferred thread is not reassessed).
+function discoveredFacts(thread) {
+  return shortHash(JSON.stringify([activityMark(thread), thread?.prRefs ?? [], thread?.branch ?? null, thread?.lastUserText ?? null]));
+}
+
 // The button auto-approve clicks, first match: the narrowest grant that keeps
 // the same card from coming back in that chat. Never "Always allow", which
 // grants it to every chat for good.
@@ -398,12 +405,14 @@ export function groupQuestions(asks, byKey) {
   for (const [kind, list, part] of chunks) {
     const spec = GROUPED_KINDS[kind];
     const minSize = spec.minSize ?? 2;
-    if (list.length === 1 && minSize > 1) out.push(single(list[0]));
-    if (!list.length || list.length < minSize) continue;
+    if (list.length === 1 && minSize > 1 && !list[0].carried) out.push(single(list[0]));
+    // Carried members alone (see act) still rewrite their open group, so
+    // members reassessed this scan and no longer asked drop out of it.
+    if (!list.length || (list.length < minSize && !list.every((decision) => decision.carried))) continue;
     const threads = list.map((decision) => byKey.get(decision.threadKey)).filter(Boolean);
     // A delivery failure names its reason, so the owner knows what to fix.
     const labels = kind === "deliver"
-      ? list.map((decision) => `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`).join(", ")
+      ? list.map((decision) => (decision.carried ? threadLabel(byKey.get(decision.threadKey)) : `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`)).join(", ")
       : threads.map(threadLabel).join(", ");
     const resets = threads.map((thread) => thread.error?.resetAt).filter(Boolean).sort();
     out.push({
@@ -568,6 +577,9 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.lastPrs = new Map();
+    // threadKey -> scan ordinal. Activity alone must not keep quiet chats
+    // outside the scan forever when a fleet is larger than maxThreads.
+    this.scopeReadAt = new Map();
     // threadKey -> { classified, pr } and the infra and manager the last scan
     // read: what the owner's Push now decides from (pushNow).
     this.lastItems = new Map();
@@ -1161,7 +1173,7 @@ export class FleetSupervisor {
   // never send on their own). A thread its source could not show this tick
   // (the scan failed, or hit its cap) keeps its time; one that no longer
   // waits drops it, so the age is always that of a nudge still waiting.
-  trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config }) {
+  trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config, deferred = new Set() }) {
     if (mode !== "auto" || delivery.ready !== false) { this.uiBlockedSince.clear(); this.store.setUiBlockedSince(this.uiBlockedSince); return; }
     const now = new Set(decisions.filter((decision) => decision?.uiBlocked).map((decision) => decision.threadKey));
     const seen = new Set(threads.map((thread) => thread.key));
@@ -1169,6 +1181,8 @@ export class FleetSupervisor {
       // infra:bb3 and infra:lb belong to their probes, not a thread source.
       const [kind, probe] = String(key).split(":");
       if (kind === "infra") return Boolean(sourceErrors[probe]);
+      // Rotated out of a capped scan: not reassessed, so still waiting.
+      if (deferred.has(key)) return true;
       const capped = threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads;
       return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
     };
@@ -2152,7 +2166,15 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
-    const settled = action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null;
+    // The thread moved on since this was proposed (a deferred thread's
+    // proposal outlives the scan that made it): its message is stale.
+    const facts = this.lastThreadFacts?.get(action.threadKey);
+    const movedOn = action.threadFacts && facts && facts !== action.threadFacts ? "the thread moved on since the proposal" : null;
+    // The owner muted it or it left supervision since: nothing goes in.
+    const excluded = this.lastThreads.get(action.threadKey)?.excluded ?? null;
+    const held = this.store.mutedUntil(action.threadKey) || this.store.mutedUntil(action.targetKey) ? "muted by owner"
+      : excluded ? `thread ${excluded}` : null;
+    const settled = held ?? movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
@@ -2232,6 +2254,7 @@ export class FleetSupervisor {
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
+    const threadFacts = new Map(threads.map((thread) => [thread.key, discoveredFacts(thread)]));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
     // With migration discovery unavailable, legacy identities are not safe to resume.
     if (config.paseo?.enabled && sourceErrors.paseo) {
@@ -2250,7 +2273,17 @@ export class FleetSupervisor {
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
     // An older thread past the cap still has its open card asked: the Codex
     // source kept it for that card alone.
-    const inScope = [...ranked.slice(0, config.limits.maxThreads), ...ranked.slice(config.limits.maxThreads).filter(hasCard)];
+    const selected = this.selectScanScope(ranked, threads, sourceErrors);
+    const selectedKeys = new Set(selected.map((thread) => thread.key));
+    const inScope = [...selected, ...ranked.filter((thread) => !selectedKeys.has(thread.key) && hasCard(thread))];
+    // Every thread this scan reads counts as scanned, card overflow too, so
+    // a carded thread never also wins a quiet thread's rotation slot.
+    for (const thread of inScope) this.scopeReadAt.set(thread.key, this.tickCount);
+    // Eligible threads this capped scan did not read: their conditions were
+    // not reassessed, so nothing they hold (a group seat, a proposal, a
+    // remembered outage, a blocked-UI clock) is cleared on their account.
+    const scopeKeys = new Set(inScope.map((thread) => thread.key));
+    const deferred = new Set(ranked.filter((thread) => !scopeKeys.has(thread.key)).map((thread) => thread.key));
     // An automation or no-repo thread's open question card still needs the
     // owner. It is decided (asked) with the rest, but never read for git or
     // PRs, and classify gives it nothing to nudge.
@@ -2258,7 +2291,7 @@ export class FleetSupervisor {
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     resolveCreatedPrs(inScope);
-    await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
+    await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors, ranked);
     await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
     // An open question's PR is read too, even once its thread moved to
@@ -2349,7 +2382,7 @@ export class FleetSupervisor {
     // How long a nudge has waited on computer use, for telling the owner.
     // The live mode: the owner may have left Auto while this tick scanned.
     const queuedWaits = this.store.queuedAnswers().map((question) => ({ threadKey: question.threadKey, uiBlocked: true }));
-    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config });
+    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config, deferred });
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
     infraDecisions.push(...this.unreadableDecisions(started, threads));
@@ -2366,8 +2399,10 @@ export class FleetSupervisor {
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
+    this.lastThreadFacts = threadFacts;
     // Each thread's PR as this scan read it, for a proposal sent later.
-    this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
+    // A deferred thread keeps the last read, for its proposal still open.
+    this.lastPrs = new Map([...[...this.lastPrs].filter(([key]) => deferred.has(key)), ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])]);
     const decisionFor = effectiveDecisions(decisions);
     this.lastItems = new Map(items.map((item) => {
       const current = decisionFor.get(item.thread.key);
@@ -2389,8 +2424,8 @@ export class FleetSupervisor {
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
-    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started, deferred });
 
     const finished = this.now();
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null });
@@ -2401,6 +2436,29 @@ export class FleetSupervisor {
     }
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
     return snapshot;
+  }
+
+  // Keep a quarter of the slots for the most recently active conversations;
+  // rotate the rest through the least recently scanned. A busy top page can
+  // no longer starve older work. Selection changes no eligibility or send
+  // policy, and permission cards still bypass the cap in _tick, which
+  // stamps every thread read in scopeReadAt.
+  selectScanScope(ranked, threads, sourceErrors) {
+    const present = new Set(threads.map((thread) => thread.key));
+    for (const key of this.scopeReadAt.keys()) {
+      if (!present.has(key) && !sourceErrors[key.split(":", 1)[0]]) this.scopeReadAt.delete(key);
+    }
+    const limit = this.config.limits.maxThreads;
+    const recent = ranked.slice(0, Math.floor(limit / 4));
+    const recentKeys = new Set(recent.map((thread) => thread.key));
+    // Stable sort preserves newest-first order among never-scanned or
+    // equally recent rows, including the first scan after a restart.
+    const rotated = ranked.filter((thread) => !recentKeys.has(thread.key))
+      .sort((a, b) => (this.scopeReadAt.get(a.key) ?? 0) - (this.scopeReadAt.get(b.key) ?? 0));
+    const selected = [...recent, ...rotated.slice(0, limit - recent.length)];
+    // Display order stays newest first even when selection rotates.
+    const keys = new Set(selected.map((thread) => thread.key));
+    return ranked.filter((thread) => keys.has(thread.key));
   }
 
   // The judge reads the chat before an automatic nudge goes out: send its
@@ -2571,7 +2629,7 @@ export class FleetSupervisor {
   // held back is retried next tick; a wait means the owner or a recent nudge
   // already has the thread. A thread hidden by a failed source waits up to
   // RECOVERY_HOLD_MS for that source.
-  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now() } = {}) {
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now(), deferred = new Set() } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -2586,7 +2644,8 @@ export class FleetSupervisor {
           .map((decision) => decision.threadKey));
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
-        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
+        // A thread a capped scan deferred gets its resume once it is read.
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
       }
     }
   }
@@ -2621,7 +2680,8 @@ export class FleetSupervisor {
     return results;
   }
 
-  async resolvePrRefs(inScope, localGit, config, run, sourceErrors) {
+  // eligible: every discovered thread the scan could read, deferred ones too.
+  async resolvePrRefs(inScope, localGit, config, run, sourceErrors, eligible = inScope) {
     if (this.skip.github) return;
     const find = this.deps.findPrForBranch ?? github.findPrForBranch;
     const now = this.now();
@@ -2649,10 +2709,26 @@ export class FleetSupervisor {
     // has one branch at a time, and every chat there records it: its PR is
     // none of theirs in particular. 21 Codex chats in one clone were all told
     // to finish its open PR. Such a chat's PR is only one it linked itself.
-    // Counted by checkout root, so chats in two of its subfolders share it.
-    const checkoutOf = (thread) => (thread.cwd ? localGit.get(thread.cwd)?.root ?? path.resolve(thread.cwd) : null);
-    const perCheckout = new Map();
+    // Counted by checkout root, so chats in two of its subfolders share it,
+    // and over every eligible chat: one a capped scan deferred still shares
+    // it. Its git was not read this scan, so the root last read for its
+    // folder stands in; never a containing folder's root (a nested worktree
+    // is its own checkout).
+    this.gitRoots ??= new Map();
+    const eligibleKeys = new Set([...inScope, ...eligible].map((thread) => thread.key));
+    for (const key of this.gitRoots.keys()) if (!eligibleKeys.has(key)) this.gitRoots.delete(key);
     for (const thread of inScope) {
+      const root = thread.cwd ? localGit.get(thread.cwd)?.root : null;
+      if (root) this.gitRoots.set(thread.key, { cwd: thread.cwd, root });
+    }
+    const scopeKeys = new Set(inScope.map((thread) => thread.key));
+    const checkoutOf = (thread) => {
+      if (!thread.cwd) return null;
+      const known = scopeKeys.has(thread.key) ? null : this.gitRoots.get(thread.key);
+      return localGit.get(thread.cwd)?.root ?? (known?.cwd === thread.cwd ? known.root : null) ?? path.resolve(thread.cwd);
+    };
+    const perCheckout = new Map();
+    for (const thread of new Set([...inScope, ...eligible])) {
       const checkout = checkoutOf(thread);
       if (checkout) perCheckout.set(checkout, (perCheckout.get(checkout) ?? 0) + 1);
     }
@@ -2814,13 +2890,14 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set(), threadFacts = new Map() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
-    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
+    // A thread a capped scan deferred was not reassessed either.
+    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || deferred.has(key));
     // With no settled read remembered (a fresh start), an unread PR cannot
     // tell a merge that settled an ask from a live one: an ask the
     // supervisor already closed waits for GitHub instead of coming back.
@@ -2845,7 +2922,18 @@ export class FleetSupervisor {
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
-    for (const fields of groupQuestions(asks, byKey)) {
+    // A grouped question's member that a capped scan deferred keeps its seat
+    // until it is read again: the group is rebuilt with it, not without it.
+    const decidedKeys = new Set(decisions.map((decision) => decision.threadKey));
+    const carried = new Map();
+    for (const question of deferred.size ? store.openQuestions() : []) {
+      const kind = Object.keys(GROUPED_KINDS).find((name) => String(question.dedupeKey ?? "").replace(/:\d+$/, "") === GROUPED_KINDS[name].dedupeKey);
+      if (!kind || question.threadKey) continue;
+      for (const key of question.threadKeys ?? []) {
+        if (deferred.has(key) && !decidedKeys.has(key)) carried.set(key, { threadKey: key, action: "ask-user", playbook: null, carried: true, question: { kind, options: GROUPED_KINDS[kind].options } });
+      }
+    }
+    for (const fields of groupQuestions([...asks, ...carried.values()], byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
       // is until that source reads again.
@@ -2920,6 +3008,27 @@ export class FleetSupervisor {
       }
       toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
     }
+    // Rebuilt with its carried members, a group can need fewer chunks: an
+    // older chunk not asked again whose members all sit in a chunk of the
+    // same kind asked now, or were read and cleared, is superseded, so no
+    // thread is in two open groups (and resumed twice).
+    if (carried.size) {
+      const kindOf = (question) => (question.threadKey ? null : Object.keys(GROUPED_KINDS).find((name) => String(question.dedupeKey ?? "").replace(/:\d+$/, "") === GROUPED_KINDS[name].dedupeKey));
+      const regrouped = new Map();
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || !asked.has(question.dedupeKey)) continue;
+        for (const key of question.threadKeys ?? []) regrouped.set(`${kind}|${key}`, true);
+      }
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || asked.has(question.dedupeKey) || !question.threadKeys?.length) continue;
+        if (!question.threadKeys.some((key) => regrouped.has(`${kind}|${key}`))) continue;
+        if (!question.threadKeys.every((key) => regrouped.has(`${kind}|${key}`) || !unknown([key]))) continue;
+        store.resolveQuestion(question.id, "regrouped: its threads moved to another group");
+        this.resolveOutreach(question, "resolved", "dismissed");
+      }
+    }
     // The supervisor reviews its own list before a new question reaches the
     // owner, so junk never pings; the main does not see it before then either.
     this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
@@ -2988,6 +3097,7 @@ export class FleetSupervisor {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
         head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
+        threadFacts: threadFacts.get(decision.threadKey) ?? null,
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
@@ -3062,8 +3172,13 @@ export class FleetSupervisor {
 
     // A planned/proposed action the policy no longer wants is stale.
     // (Storage records its own plans; they are not tick decisions.)
+    // A deferred thread's stands only while what discovery shows of it is
+    // what the action was made on: one that moved on is stale too.
+    // Owner policy applies to it as it would on a read: a mute ends it.
+    const movedOn = (action) => deferred.has(action.threadKey) && (threadFacts.get(action.threadKey) !== action.threadFacts
+      || Boolean(store.mutedUntil(action.threadKey) || (action.targetKey && store.mutedUntil(action.targetKey))));
     for (const action of openActions) {
-      if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
+      if (action.kind !== "storage" && !seenActions.has(action.id) && (!unknown([action.threadKey]) || movedOn(action))) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
     // decided again this tick without asking. An agent's own ask and a
@@ -3292,7 +3407,9 @@ export class FleetSupervisor {
       mode,
       counts: {
         threads: threads.length,
+        eligible: threads.filter((thread) => !thread.excluded).length,
         inScope: inScope.length,
+        deferred: Math.max(0, threads.filter((thread) => !thread.excluded).length - inScope.length),
         sources,
         byState,
         byWatch,
