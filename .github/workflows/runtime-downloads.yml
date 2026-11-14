@@ -10,6 +10,7 @@ on:
       - 'scripts/smoke-runtime.mjs'
       - 'test/get-started.test.js'
       - 'test/runtime-downloads.test.js'
+      - 'test/runtime-smoke.test.js'
       - 'test/atomic-write.test.js'
       - 'docs/INSTALL.md'
       - 'docs/GETTING_STARTED.md'
@@ -58,7 +59,7 @@ jobs:
           cache: npm
       - run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Check onboarding and packaging
-        run: node --test test/get-started.test.js test/runtime-downloads.test.js test/atomic-write.test.js
+        run: node --test test/get-started.test.js test/runtime-downloads.test.js test/runtime-smoke.test.js test/atomic-write.test.js
       - name: Include matching Node.js and third-party notices
         shell: bash
         run: curl --fail --location --retry 2 https://raw.githubusercontent.com/nodejs/node/v22.21.1/LICENSE --output "$RUNNER_TEMP/node-LICENSE"
@@ -72,9 +73,6 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then NODE_BINARY=./node/node.exe; else NODE_BINARY=./node/node; fi
           "$NODE_BINARY" --input-type=module -e 'await import("./src/index.js"); await import("./src/get-started.js"); console.log("Packaged runtime loads")'
           "$NODE_BINARY" bin/openagi.js help
-      - name: Verify real startup, setup, and dashboard on the target OS
-        shell: bash
-        run: node scripts/smoke-runtime.mjs "$RUNNER_TEMP/openagi-runtime/OpenAGI"
       - name: Archive
         shell: bash
         env:
@@ -87,6 +85,32 @@ jobs:
             tar -czf "dist-downloads/$DOWNLOAD_NAME" -C "$RUNNER_TEMP/openagi-runtime" OpenAGI
           fi
           node --input-type=module -e 'import fs from "node:fs"; import {createHash} from "node:crypto"; const p="dist-downloads/"+process.env.DOWNLOAD_NAME; fs.writeFileSync(p+".sha256", createHash("sha256").update(fs.readFileSync(p)).digest("hex")+"  "+process.env.DOWNLOAD_NAME+"\n")'
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.12'
+      - name: Verify strict Linux extraction and relocated dependency CLI
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DOWNLOAD_NAME: OpenAGI-${{ matrix.name }}.${{ matrix.extension }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tarfile
+          destination = pathlib.Path(os.environ["RUNNER_TEMP"]) / "relocated runtime"
+          with tarfile.open(pathlib.Path("dist-downloads") / os.environ["DOWNLOAD_NAME"]) as archive:
+              archive.extractall(destination, filter="data")
+          PY
+          RUNTIME_DIR="$RUNNER_TEMP/relocated runtime/OpenAGI"
+          "$RUNTIME_DIR/node/node" "$RUNTIME_DIR/node_modules/.bin/semver" 1.2.3
+      - name: Verify real startup, setup, and dashboard on the target OS
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            node scripts/smoke-runtime.mjs "$RUNNER_TEMP/relocated runtime/OpenAGI"
+          else
+            node scripts/smoke-runtime.mjs "$RUNNER_TEMP/openagi-runtime/OpenAGI"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.name }}
