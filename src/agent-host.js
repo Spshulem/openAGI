@@ -16,6 +16,8 @@ import { GET_STARTED_GUIDANCE } from "./get-started.js";
 // scoped allowlist (selected at propagation from the bounded scope).
 const SPECIALIST_CORE_TOOLS = [
   "recall", "remember",
+  // A routed owner turn must still be able to set up or change a schedule.
+  "schedule_message", "list_cron_jobs", "update_cron_job", "cancel_cron_job",
   "list_tasks", "agent_pick_next", "complete_task", "move_task", "save_draft"
 ];
 
@@ -107,7 +109,9 @@ export class AgentHost {
     // Auto-task detection — if the user said "remind me to X" / "todo: X" /
     // "I need to X", create a task in the user queue without requiring them
     // to invoke add_task. Best-effort; failures don't block the chat reply.
-    if (!ephemeral && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
+    // A scheduled prompt was already captured when it was created; scanning it
+    // again on every fire would add the same task each time.
+    if (!ephemeral && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot" && input.origin !== "cron") {
       const detected = detectTaskInChat(text);
       if (detected) {
         try {
@@ -182,7 +186,7 @@ export class AgentHost {
     // The authenticated owner's instruction is the decision: the zero-memory
     // panel's ask/watch/ignore still gets recorded (outcomes, audit) but does
     // not gate the owner's own turn.
-    const toolPolicy = principal ? "full"
+    const toolPolicy = principal || options.ownerSchedule === true ? "full"
       : verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
     const toolRegistry = this.runtime.tools;
     let tools = toolPolicy === "none"
@@ -320,6 +324,8 @@ export class AgentHost {
         // provenance it cannot attribute the action that actually executed.
         origin: input.origin ?? channel,
         scheduledJobId: metadata.scheduledJobId ?? null,
+        scheduledJobName: metadata.scheduledJobName ?? null,
+        ...(options.ownerSchedule === true ? { ownerSchedule: true } : {}),
         agentId,
         sessionId,
         runtime: this.runtime,

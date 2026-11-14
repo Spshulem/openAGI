@@ -53,6 +53,7 @@ import { SpecialistRouter } from "./specialist-router.js";
 import { TunnelWatcher } from "./tunnel-watcher.js";
 import { VectorStore } from "./vector-store.js";
 import { OutreachStore } from "./outreach-store.js";
+import { describeSchedule } from "./scheduled-prompt.js";
 import { OutreachMapper } from "./outreach-mapper.js";
 import { loadOutreachConfig } from "./outreach-config.js";
 import { surfaceStalledTasks } from "./outreach-stalled.js";
@@ -1331,31 +1332,95 @@ export class AbiRuntime {
     // Persist consumption before spending or delivering. A failed one-shot
     // stays paused for inspection, not retried forever as a recurring job.
     if (input.oneShot) this.cron.enableJob(job.id, false);
-    const result = await this.agentHost.handleMessage({
-      channel: input.channel ?? "cron",
-      from: input.target ?? "cron",
-      agentId: input.agentId ?? "main",
-      sessionId: input.sessionId,
-      text: input.prompt ?? "(empty scheduled prompt)",
-      metadata: { scheduledJobId: job.id, scheduledJobName: job.name },
-      origin: "cron"
-    });
-    if (this.channels && input.channel && input.target) {
-      try {
-        await this.channels.deliver({
-          channel: input.channel,
-          target: input.target,
-          text: result.reply
-        });
-        result.delivered = { channel: input.channel, target: input.target };
-      } catch (error) {
-        result.deliveryError = error.message;
-      }
+    // The model has no clock of its own, and the stored prompt alone reads
+    // like the owner typing it now. Say what this run is and when it fired.
+    const firedAt = new Date();
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const header = `[Scheduled run "${job.name}", ${describeSchedule(job)}. Now: ${firedAt.toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" })} (${zone}). Do the task now and reply with the result.]`;
+    let result;
+    try {
+      result = await this.agentHost.handleMessage({
+        channel: input.channel ?? "cron",
+        from: input.target ?? "cron",
+        agentId: input.agentId ?? "main",
+        sessionId: input.sessionId,
+        text: `${header}\n\n${input.prompt ?? "(empty scheduled prompt)"}`,
+        metadata: { scheduledJobId: job.id, scheduledJobName: job.name },
+        origin: "cron"
+      }, {
+        // Set only from the stored job, which only an owner turn can mark
+        // (scheduled-prompt.js). It lifts the scrutiny throttle so the owner's
+        // routine can read and run skills; it is not owner authority, so
+        // approval-gated tools still queue for the owner.
+        ownerSchedule: input.createdBy === "owner"
+      });
+    } catch (error) {
+      this.noticeScheduledRun(job, `Scheduled run failed: ${error?.message ?? error}`);
+      throw error;
     }
+    await this.deliverScheduledResult(job, result);
     if (input.oneShot) {
       this.cron.removeJob(job.id);
     }
     return result;
+  }
+
+  // An approval card raised by a scheduled run gets approved later, after the
+  // run already replied. Run one more turn in the same session so the routine
+  // finishes and its report still goes out.
+  async resumeScheduledRun(action, invokeResult) {
+    if (!this.agentHost) return null;
+    const context = action.context ?? {};
+    const job = this.cron?.listJobs().find(row => row.id === context.scheduledJobId)
+      ?? { id: context.scheduledJobId, name: context.scheduledJobName ?? "Scheduled run", input: {} };
+    const input = { channel: context.channel, target: context.from, agentId: context.agentId ?? undefined, ...job.input };
+    const outcome = invokeResult?.ok
+      ? `It ran. Result: ${JSON.stringify(invokeResult.result ?? null).slice(0, 2000)}`
+      : `It failed: ${String(invokeResult?.error ?? "unknown error").slice(0, 500)}`;
+    const result = await this.agentHost.handleMessage({
+      channel: input.channel ?? "cron",
+      from: input.target ?? "cron",
+      agentId: input.agentId ?? "main",
+      sessionId: context.sessionId,
+      text: `[Scheduled run "${job.name}" update: the owner approved "${action.summary}". ${outcome}]\n\nFinish the scheduled task and reply with the result.`,
+      metadata: { scheduledJobId: job.id, scheduledJobName: job.name, approvalActionId: action.id },
+      origin: "cron"
+    }, { ownerSchedule: context.ownerSchedule === true || input.createdBy === "owner" });
+    await this.deliverScheduledResult({ ...job, input }, result);
+    return result;
+  }
+
+  async deliverScheduledResult(job, result) {
+    const input = job.input ?? {};
+    if (this.channels && input.channel && input.target) {
+      try {
+        const sent = await this.channels.deliver({
+          channel: input.channel,
+          target: input.target,
+          text: result.reply
+        });
+        // "local" and "cron" have no outbound transport and say so. Do not
+        // report those as delivered.
+        if (sent?.delivered === false) result.deliveryError = sent.reason ?? `channel ${input.channel} has no outbound transport`;
+        else result.delivered = { channel: input.channel, target: input.target };
+      } catch (error) {
+        result.deliveryError = error.message;
+      }
+    }
+    // Whatever could not be sent still reaches the owner's feed (Mac
+    // notification, phone), instead of sitting unread in a session.
+    if (!result.delivered) this.noticeScheduledRun(job, result.reply);
+  }
+
+  noticeScheduledRun(job, text) {
+    try {
+      this.outreach?.append({
+        type: "scheduled-run",
+        sourceRef: { kind: "cron", id: job.id },
+        title: job.name ?? "Scheduled run",
+        summary: String(text ?? "").slice(0, 2000)
+      });
+    } catch { /* the run result stays in its session */ }
   }
 
   reconcilePrincipleVectors() {

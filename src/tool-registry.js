@@ -1,6 +1,6 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
-import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
+import { describeSchedule, parseScheduleDays, scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
 import { intentCovers, isOwnerPrincipal } from "./owner-authority.js";
 import { argsDigest } from "./pending-actions.js";
 
@@ -502,14 +502,15 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "schedule_message",
-    description: "Schedule a future prompt. Choose exactly one timing field: delaySeconds for a one-time reminder, intervalSeconds for explicit recurrence (minimum 5 minutes), or dailyAt. Do not turn a one-time reminder into a recurring check-in. Identical schedules are reused. Scheduled reminders cannot create more schedules.",
+    description: "Schedule a future prompt. Choose exactly one timing field: delaySeconds for a one-time reminder, intervalSeconds for explicit recurrence (minimum 5 minutes), or dailyAt (add days for weekdays or specific days). Each run is a full agent turn with tools and skills, so the prompt can be a routine like 'search my inbox for invoices, run my triage skill, and summarize'. Do not turn a one-time reminder into a recurring check-in. Identical schedules are reused. Scheduled reminders cannot create more schedules. Tell the user the returned schedule and next run time.",
     parameters: {
       type: "object",
       properties: {
         prompt: { type: "string", description: "The prompt the agent should run when this fires." },
         delaySeconds: { type: "integer", minimum: 30, description: "One-shot: fire this many seconds from now." },
         intervalSeconds: { type: "integer", minimum: 300, description: "Recurring: fire every N seconds, only when the user requested recurrence." },
-        dailyAt: { type: "string", description: "Recurring HH:MM (24h) daily fire time, e.g. '09:00'." },
+        dailyAt: { type: "string", description: "Recurring HH:MM (24h) fire time in the daemon's local time zone, e.g. '09:00'." },
+        days: { type: "string", description: "With dailyAt only: weekdays, weekends, daily, or comma-separated day names like mon,wed,fri. Omit for every day." },
         channel: { type: "string", description: "Channel to deliver to: local, telegram. Defaults to the originating channel." },
         target: { type: "string", description: "Channel target (phone number, chat id, etc). Defaults to the originating sender." },
         name: { type: "string", description: "Optional human-readable name." }
@@ -521,8 +522,14 @@ export function registerCoreTools(registry, runtime) {
       if (!runtime.cron) throw new Error("Cron scheduler is not available.");
       const spec = scheduledPromptSpec(args, context);
       const existing = runtime.cron.listJobs().find(job => sameScheduledPrompt(job, spec));
-      if (existing) return { id: existing.id, name: existing.name, nextRunAt: existing.nextRunAt, task: existing.task,
-        reused: true, enabled: existing.enabled, note: existing.enabled ? 'This reminder already exists.' : 'This reminder is paused; it was not re-enabled.' };
+      if (existing && !existing.enabled && isScheduleOwner(context)) {
+        // The owner asking for the same schedule again is the clearest
+        // instruction to turn it back on.
+        const resumed = runtime.cron.enableJob(existing.id, true);
+        return scheduleSummary(resumed, { reused: true, note: "This schedule was paused; it is running again." });
+      }
+      if (existing) return scheduleSummary(existing, { reused: true,
+        note: existing.enabled ? "This schedule already exists." : "This schedule is paused; only the owner can resume it." });
       const job = {
         id: args.id ?? createId("job"),
         name: args.name ?? `prompt-${nowIso()}`,
@@ -532,7 +539,7 @@ export function registerCoreTools(registry, runtime) {
         ...spec
       };
       const created = runtime.cron.addJob(job);
-      return { id: created.id, name: created.name, nextRunAt: created.nextRunAt, task: created.task };
+      return scheduleSummary(created);
     }
   });
 
@@ -865,21 +872,77 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_cron_jobs",
     sideEffects: false,
-    description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks).",
+    description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks). Owner only.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
-    handler: async () => runtime.cron.listJobs()
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      return runtime.cron.listJobs().map(job => ({ ...job, schedule: describeSchedule(job) }));
+    }
   });
 
   registry.register({
     name: "cancel_cron_job",
-    description: "Remove a scheduled cron job by id. Use list_cron_jobs first to find the id.",
+    description: "Remove a scheduled cron job by id. Use list_cron_jobs first to find the id. Owner only; use update_cron_job to pause instead.",
     parameters: {
       type: "object",
       properties: { id: { type: "string" } },
       required: ["id"],
       additionalProperties: false
     },
-    handler: async (args) => ({ id: args.id, removed: runtime.cron.removeJob(args.id) })
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      return { id: args.id, removed: runtime.cron.removeJob(args.id) };
+    }
+  });
+
+  registry.register({
+    name: "update_cron_job",
+    description: "Pause, resume, or change a scheduled prompt by id: its prompt, dailyAt time, days, or interval. Use list_cron_jobs first to find the id. Owner only.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        enabled: { type: "boolean", description: "false pauses the schedule, true resumes it." },
+        prompt: { type: "string", description: "New prompt text for a scheduled prompt." },
+        dailyAt: { type: "string", description: "New HH:MM (24h) fire time." },
+        days: { type: "string", description: "weekdays, weekends, daily, or day names like mon,wed. Requires a dailyAt schedule." },
+        intervalSeconds: { type: "integer", minimum: 300, description: "New recurring interval for an interval schedule." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      if (!runtime.cron) throw new Error("Cron scheduler is not available.");
+      const job = runtime.cron.listJobs().find(row => row.id === args.id);
+      if (!job) throw new Error(`Unknown cron job: ${args.id}`);
+      const patch = {};
+      if (args.prompt !== undefined) {
+        if (job.task !== "prompt") throw new Error("Only scheduled prompts have editable prompt text.");
+        const prompt = String(args.prompt).trim();
+        if (!prompt || prompt.length > 4000) throw new Error("Provide a prompt of 1-4000 characters.");
+        patch.input = { ...job.input, prompt };
+      }
+      if (args.dailyAt !== undefined) {
+        if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(args.dailyAt)) throw new Error("dailyAt must be HH:MM in 24-hour time.");
+        if (job.intervalMs) throw new Error("This is an interval schedule; change intervalSeconds instead.");
+        patch.dailyAt = args.dailyAt;
+      }
+      if (args.days !== undefined) {
+        if (!(patch.dailyAt ?? job.dailyAt)) throw new Error("days only applies to a dailyAt schedule.");
+        patch.days = parseScheduleDays(args.days);
+      }
+      if (args.intervalSeconds !== undefined) {
+        if (!job.intervalMs || job.input?.oneShot) throw new Error("Only recurring interval schedules have an interval.");
+        if (!Number.isSafeInteger(args.intervalSeconds) || args.intervalSeconds < 300 || args.intervalSeconds > 365 * 86400) {
+          throw new Error("Use a recurring interval of at least 5 minutes, up to one year.");
+        }
+        patch.intervalMs = args.intervalSeconds * 1000;
+      }
+      let updated = Object.keys(patch).length ? runtime.cron.updateJob(args.id, patch) : job;
+      if (args.enabled !== undefined) updated = runtime.cron.enableJob(args.id, args.enabled);
+      return scheduleSummary(updated);
+    }
   });
 
   registry.register({
@@ -1347,4 +1410,25 @@ export function summarizeRegisterMcpServer(args = {}) {
     return `Register http MCP '${name}' → ${args.url ?? "(no url)"} (auth=${auth})`;
   }
   return `Register MCP '${name}' (${transport})`;
+}
+
+// Schedules hold the owner's routines, prompts and recipients. Only the
+// owner's own turn, or a card the owner approved, may read or change them.
+function isScheduleOwner(context) {
+  return isOwnerPrincipal(context?.__owner) || context?.__confirmed === true;
+}
+
+function requireScheduleOwner(context) {
+  if (!isScheduleOwner(context)) throw new Error("Only the owner can view or change schedules.");
+}
+
+function scheduleSummary(job, extra = {}) {
+  const next = job.nextRunAt ? new Date(job.nextRunAt) : null;
+  return {
+    id: job.id, name: job.name, task: job.task, enabled: job.enabled,
+    schedule: describeSchedule(job),
+    nextRunAt: job.nextRunAt,
+    ...(next ? { nextRunLocal: next.toLocaleString("en-US", { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }) } : {}),
+    ...extra
+  };
 }

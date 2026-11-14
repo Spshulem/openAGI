@@ -447,6 +447,12 @@ function serializableContext(ctx) {
     from: ctx.from ?? null,
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Lets an approval resume the scheduled run that raised it.
+    ...(typeof ctx.scheduledJobId === "string" ? { scheduledJobId: ctx.scheduledJobId.slice(0, 200) } : {}),
+    ...(typeof ctx.scheduledJobName === "string" ? { scheduledJobName: ctx.scheduledJobName.slice(0, 200) } : {}),
+    // Server-built record of how the run was allowed to act. A one-shot job
+    // is gone by the time its card is approved, so the resume reads it here.
+    ...(ctx.ownerSchedule === true ? { ownerSchedule: true } : {}),
     // Audit only: a replayed record is plain data and never owner authority.
     authority: authorityRecord(ctx.__owner)
   };
