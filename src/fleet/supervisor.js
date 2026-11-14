@@ -1434,7 +1434,22 @@ export class FleetSupervisor {
       rows = read?.status === "read" ? read.rows ?? [] : [];
     } catch { /* unread: only cards already seen are approved */ }
     const marked = new Set(rows.map(identityToken).filter(Boolean));
-    const waiting = codex.filter((thread) => this.livePrompt(thread) || marked.has(identityToken(uiTargetFor(thread).title)));
+    // A sidebar row is labelled with what Codex shows: the thread's title, or
+    // its first message. The names come from uiIdentity, like every other
+    // check of what is on screen, so a name another thread can show (a
+    // shared title or first message) proves nothing and is skipped. A label
+    // still claimed by two threads here binds to neither.
+    const all = threads ?? [...this.lastThreads.values()];
+    const names = new Map();
+    const claims = new Map();
+    for (const thread of codex) {
+      const identity = uiIdentity(thread, uiTargetFor(thread), all);
+      const own = identity.ambiguous ? [] : [...new Set([...(identity.tokens ?? []), ...(identity.altTokens ?? [])])];
+      names.set(thread.key, own);
+      for (const name of own) claims.set(name, (claims.get(name) ?? 0) + 1);
+    }
+    const shown = (thread) => names.get(thread.key).some((name) => marked.has(name) && claims.get(name) === 1);
+    const waiting = codex.filter((thread) => this.livePrompt(thread) || shown(thread));
     for (const thread of waiting.slice(0, AUTO_APPROVE_MAX_THREADS)) {
       if (!allowed(thread)) continue;
       if (!this.livePrompt(thread)) {

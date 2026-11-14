@@ -2913,6 +2913,33 @@ test("auto-approve: a Codex chat the sidebar marks awaiting approval gets Allow 
   }
 });
 
+test("auto-approve matches sidebar rows by the names Codex shows, first message included, and never binds a shared label", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Deny"], stateId: "0123456789abcdef" };
+  const reads = [];
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["please fix the flaky upload test", "Update the release docs"] }),
+    inspect: async (request) => { reads.push(request.target.threadId); return { status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }; },
+    clickLabel: async (request) => { clicks.push(request.target.threadId); return { status: "sent", detail: "clicked Allow once in Codex" }; }
+  };
+  const codexMeta = (extra = {}) => ({ originator: "Codex Desktop", ...extra });
+  // Shown in the sidebar by its first message, not its catalog title.
+  const byFirstMessage = makeThread({ key: "codex:t1", id: "t1", title: "Refactor auth", agentStatus: "running", prRefs: [],
+    meta: codexMeta({ firstMessageTitle: "please fix the flaky upload test" }) });
+  // Two threads either of which can show "Update the release docs": one by
+  // its title, the other by its first message. Neither is approved from it.
+  const titled = makeThread({ key: "codex:t2", id: "t2", title: "Update the release docs", cwd: "/work/t2", agentStatus: "running", prRefs: [], meta: codexMeta() });
+  const twin = makeThread({ key: "codex:t3", id: "t3", title: "Ship v2", cwd: "/work/t3", agentStatus: "running", prRefs: [],
+    meta: codexMeta({ firstMessageTitle: "Update the release docs" }) });
+  const { supervisor } = fixture(t, { threads: [byFirstMessage, titled, twin], prs: new Map(), mode: "auto", delivery: "computer-use",
+    env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.deepEqual(clicks, ["t1"], "the first-message row approves its thread");
+  assert.ok(reads.includes("t1"));
+  assert.ok(!clicks.includes("t2") && !clicks.includes("t3"), "an ambiguous label approves neither thread");
+});
+
 test("autoApproveLabel picks the narrowest grant and never Always allow", () => {
   assert.equal(autoApproveLabel(["Allow once", "Allow this conversation", "Always allow", "Deny"]), "Allow this conversation");
   assert.equal(autoApproveLabel(["Allow once", "Deny"]), "Allow once");

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
+import { DEFAULTS, UI_APPS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   screenSummary, composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController, approvalRows
@@ -2175,6 +2175,35 @@ test("a read that brings the app forward puts the owner's app back", async (t) =
   assert.equal(read.status, "read", read.detail);
   assert.deepEqual(probe.activated, ["com.google.Chrome"]);
   assert.equal(probe.front, "com.google.Chrome");
+});
+
+test("the Codex sidebar read never leaves Codex in front of an owner working in another app", async (t) => {
+  const codexTarget = { ...UI_APPS.codex };
+  const raise = (probe) => ({ onCall: (name) => { if (name === "get_app_state") probe.front = "com.openai.codex"; } });
+  // Owner typing in Chrome: no read at all, so Codex cannot come forward.
+  const busy = fakeProbe({ front: "com.google.Chrome", idle: 2_000 });
+  const here = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: busy, transportOptions: raise(busy) });
+  const blocked = await here.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(blocked.status, "blocked");
+  assert.match(blocked.detail, /owner at the keyboard/);
+  assert.deepEqual(names(here.calls()), [], "no read under the owner");
+  assert.equal(busy.front, "com.google.Chrome");
+  assert.deepEqual(busy.activated, []);
+
+  // Owner away: the read may raise Codex, and their app goes back after.
+  const away = fakeProbe({ front: "com.google.Chrome" });
+  const idle = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: away, transportOptions: raise(away) });
+  const read = await idle.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(read.status, "read", read.detail);
+  assert.equal(away.front, "com.google.Chrome");
+  assert.deepEqual(away.activated, ["com.google.Chrome"]);
+
+  // Owner already in Codex: reading it moves nothing.
+  const inCodex = fakeProbe({ front: "com.openai.codex", idle: 2_000 });
+  const same = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: inCodex });
+  const seen = await same.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(seen.status, "read", seen.detail);
+  assert.deepEqual(inCodex.activated, []);
 });
 
 test("clickLabel clicks one card button through accessibility and confirms the card is gone", async (t) => {

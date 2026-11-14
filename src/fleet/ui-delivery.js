@@ -1659,10 +1659,18 @@ export function createUiDriver({
       const front = await probeNow(ctx, "frontApp");
       if (front === null) return outcome(ctx, "blocked", "front app unknown");
       if (SCREEN_SAVER_APPS.has(front)) return outcome(ctx, "blocked", "screen saver on");
+      // A read can bring Codex forward. With the owner at the keyboard in
+      // another app it would land in front of them, and restoreFront would
+      // then see them "using Codex" and leave it there: only read while they
+      // are away, or while Codex is already the app in front.
+      if (!ownerAway(await probeNow(ctx, "idleMs"))) {
+        sawOwner(ctx);
+        if (front !== target.bundleId) return outcome(ctx, "blocked", `owner at the keyboard in another app; not reading ${target.name}`);
+      }
       ctx.frontBefore = front;
       ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
       // A read can bring the app forward: the owner's app goes back after.
-      ctx.activated = true;
+      if (front !== target.bundleId) ctx.activated = true;
       const state = await readState(ctx, signal);
       return outcome(ctx, "read", `read ${target.name}`, { rows: approvalRows(state, target.bundleId) });
     }));
