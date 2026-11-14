@@ -180,6 +180,31 @@ test("a single-slot scan rotates and leaves excluded threads and deferred questi
   assert.equal(delivered.length, 0, "Observe stays read-only");
 });
 
+// A thread past the cap with an open permission card is read anyway
+// (card overflow). That read counts as a scan, so the card thread does not
+// also win a rotation slot it never needed (PR #279 review).
+test("a card-overflow thread is stamped as scanned and never takes a quiet thread's rotation slot", async (t) => {
+  const quiet = [0, 1, 2].map((n) => makeThread({
+    key: `codex:quiet${n}`, id: `quiet${n}`, cwd: `/work/quiet${n}`, prRefs: [],
+    lastActivityAt: ago((60 + 2 * n) * MIN), lastAgentAt: ago((60 + 2 * n) * MIN)
+  }));
+  const carded = makeThread({
+    key: "codex:carded", id: "carded", cwd: "/work/carded", prRefs: [], agentStatus: "running",
+    lastActivityAt: ago(61 * MIN), lastAgentAt: ago(61 * MIN),
+    meta: { pendingCard: { app: "codex", cardId: "turn-card", count: 1, items: [{ index: 0, itemId: "call_card:0", header: null, question: "Allow the command?", options: [], multiSelect: false, freeText: true, at: ago(61 * MIN) }] } }
+  });
+  const { supervisor } = fixture(t, { threads: [...quiet, carded], prs: new Map(), limits: { maxThreads: 1 } });
+  const rotated = [];
+  for (let scan = 0; scan < 3; scan++) {
+    const snapshot = await supervisor.tick({ reason: "test" });
+    const keys = snapshot.threads.map((row) => row.key);
+    assert.ok(keys.includes("codex:carded"), "the card is read every scan");
+    assert.equal(snapshot.counts.inScope, 2, "one rotation slot plus the card overflow");
+    rotated.push(...keys.filter((key) => key !== "codex:carded"));
+  }
+  assert.deepEqual(rotated, quiet.map((thread) => thread.key), "every quiet thread gets the slot in three scans");
+});
+
 // Two Codex and two Claude chats, two slots: each scan reads one pair and
 // defers the other. A deferred chat was not reassessed, so nothing it holds
 // is cleared on its account (PR #279 review).

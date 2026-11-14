@@ -2099,6 +2099,9 @@ export class FleetSupervisor {
     const selected = this.selectScanScope(ranked, threads, sourceErrors);
     const selectedKeys = new Set(selected.map((thread) => thread.key));
     const inScope = [...selected, ...ranked.filter((thread) => !selectedKeys.has(thread.key) && hasCard(thread))];
+    // Every thread this scan reads counts as scanned, card overflow too, so
+    // a carded thread never also wins a quiet thread's rotation slot.
+    for (const thread of inScope) this.scopeReadAt.set(thread.key, this.tickCount);
     // Eligible threads this capped scan did not read: their conditions were
     // not reassessed, so nothing they hold (a group seat, a proposal, a
     // remembered outage, a blocked-UI clock) is cleared on their account.
@@ -2257,7 +2260,8 @@ export class FleetSupervisor {
   // Keep a quarter of the slots for the most recently active conversations;
   // rotate the rest through the least recently scanned. A busy top page can
   // no longer starve older work. Selection changes no eligibility or send
-  // policy, and permission cards still bypass the cap in _tick.
+  // policy, and permission cards still bypass the cap in _tick, which
+  // stamps every thread read in scopeReadAt.
   selectScanScope(ranked, threads, sourceErrors) {
     const present = new Set(threads.map((thread) => thread.key));
     for (const key of this.scopeReadAt.keys()) {
@@ -2271,7 +2275,6 @@ export class FleetSupervisor {
     const rotated = ranked.filter((thread) => !recentKeys.has(thread.key))
       .sort((a, b) => (this.scopeReadAt.get(a.key) ?? 0) - (this.scopeReadAt.get(b.key) ?? 0));
     const selected = [...recent, ...rotated.slice(0, limit - recent.length)];
-    for (const thread of selected) this.scopeReadAt.set(thread.key, this.tickCount);
     // Display order stays newest first even when selection rotates.
     const keys = new Set(selected.map((thread) => thread.key));
     return ranked.filter((thread) => keys.has(thread.key));
