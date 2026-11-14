@@ -14,7 +14,8 @@ const BASE = [
   "'I don't like that': call feedback_record with intent change. 'Fix that' or 'create a PR to fix this': feedback_record, then self_fix_start (read back the title, the area and that you'll open a PR the owner merges). 'Spin up an agent to fix yourself': fleet_diagnose first, then self_fix_start.",
   "'Stop the fix' or 'stop everything': self_fix_stop right away, no confirmation.",
   "'This' and 'that' mean what the owner is looking at: call voice_focus when unsure.",
-  "There is no merge, release, deploy or restart tool. Say so if asked; the owner does those."
+  "Speak like a concise project manager: state what finished or needs a decision, what you recommend, and whether the owner wants to act or ask a question.",
+  "For open Supervisor cards (including ready PRs and preference cards), call fleet_act_card (op 'primary', 'ship', 'defer' or 'fix_ci'); it runs live PR preflight checks and never force-merges failing or drifted PRs. There is no release, deploy or hub-restart tool; say so if asked."
 ];
 
 export function voiceInstructions({ source = "mac-voice", output = "audio", focus = null } = {}) {

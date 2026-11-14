@@ -41,6 +41,9 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     }
     private static let chats = OSAllocatedUnfairLock(initialState: [String: [ChatLine]]())
     private static let namedChats = OSAllocatedUnfairLock(initialState: [String: String]())
+    // --ui-chat-redesign: when a turn raised its approval, so it shows under
+    // the reply that asked for it.
+    private static let raisedApprovalAt = OSAllocatedUnfairLock<String?>(initialState: nil)
     private static let modelFailures = OSAllocatedUnfairLock(initialState: ProcessInfo.processInfo.arguments.contains("--ui-model-first-fails") ? 1 : 0)
     private static let date = "2026-10-18T12:00:00.000Z"
 
@@ -97,7 +100,21 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             }
             let delta = String(data: try! JSONSerialization.data(withJSONObject: ["text": reply, "reset": false]), encoding: .utf8)!
             let final = String(data: try! JSONSerialization.data(withJSONObject: ["reply": reply]), encoding: .utf8)!
-            let stream = "event: delta\ndata: \(delta)\n\nevent: final\ndata: \(final)\n\n"
+            var stream = "event: delta\ndata: \(delta)\n\nevent: final\ndata: \(final)\n\n"
+            let arguments = ProcessInfo.processInfo.arguments
+            if arguments.contains("--ui-chat-redesign") {
+                Self.raisedApprovalAt.withLock { $0 = at }
+                stream = "event: status\ndata: {\"stage\":\"tool\",\"tool\":\"fleet_status\"}\n\n" + stream
+            }
+            if arguments.contains("--ui-chat-working") {
+                // A turn still running: the tool hop has started, nothing more yet.
+                let status = "event: status\ndata: {\"stage\":\"tool\",\"tool\":\"fleet_status\"}\n\n"
+                guard let url = request.url, let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                                                                         headerFields: ["Content-Type": "text/event-stream"]) else { return }
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: Data(status.utf8))
+                return
+            }
             deliver(status: 200, data: Data(stream.utf8), contentType: "text/event-stream")
             return
         }
@@ -179,6 +196,14 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             finish(object: ["mode": "observe", "enabled": false, "running": false,
                             "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],
                             "questions": [["id": "context-fixture", "title": "Review the synthetic request", "body": "Read the recent activity before choosing a response.", "kind": "agent-ask", "threadKey": "codex:fixture", "options": ["yes", "no", "open thread"], "createdAt": Self.date]]])
+        case "/fleet/api/search":
+            finish(object: ["query": "synthetic", "totalIndexed": 1,
+                            "results": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human", "health": "red", "snippet": "The synthetic change is ready for your review.", "live": true]]])
+        case "/fleet/api/preferences":
+            finish(object: ["ok": true, "preferences": ["mergePolicy": "manual_confirm", "cadence": "balanced", "autoSlices": []],
+                            "state": ["mode": "observe", "enabled": false, "running": false,
+                                      "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],
+                                      "questions": [["id": "context-fixture", "title": "Review the synthetic request", "body": "Read the recent activity before choosing a response.", "kind": "agent-ask", "threadKey": "codex:fixture", "options": ["yes", "no", "open thread"], "createdAt": Self.date]]]])
         case "/fleet/api/threads/codex:fixture":
             finish(object: ["thread": ["key": "codex:fixture", "scannedAt": Self.date,
                                        "lastOwnerMessage": ["text": "Explain the synthetic change before I decide.", "at": Self.date],
@@ -208,6 +233,10 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                 finish(object: ["thread": thread, "messages": rows + sent])
                 return
             }
+            if ProcessInfo.processInfo.arguments.contains("--ui-empty-chat") {
+                finish(object: ["thread": thread, "messages": sent])
+                return
+            }
             if ProcessInfo.processInfo.arguments.contains("--ui-long-chat") {
                 finish(object: ["thread": "agent", "messages": [
                     ["id": "history-one", "role": "user", "text": "yes", "at": Self.date],
@@ -235,6 +264,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                      "nodeName": "Demo computer", "nodeId": "synthetic-computer"],
                             "reason": "Computer access is required to review the demo workspace.",
                             "status": "pending", "createdAt": date], at: 0)
+        }
+        if let raised = raisedApprovalAt.withLock({ $0 }) {
+            actions.insert(["id": "raised-approval", "toolName": "send_email",
+                            "summary": "Send Alex the QA access follow-up",
+                            "reason": "You promised Alex an update on QA access. The draft recaps both workflows and keeps enablement pending until you confirm.",
+                            "context": ["sessionId": "devices:agent:main"],
+                            "status": "pending", "createdAt": raised], at: 0)
         }
         let decided = decidedActions.withLock { $0 }
         return actions.filter { !decided.contains($0["id"] as? String ?? "") }

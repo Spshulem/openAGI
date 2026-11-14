@@ -593,6 +593,44 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('routes outreach-backed merge_ready cards through preflight actCard instead of raw answer', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  try {
+    const actCard = vi.spyOn(f.app.proactive, 'actCard').mockResolvedValue({ ok: true, status: 'merged', detail: 'Merged acme/api#88 via squash' })
+    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, detail: 'typed' })
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    Object.assign(f.renderer, { supervisorHome: vi.fn() })
+    f.app.proactive.items = [{
+      id: 'o-pr-88',
+      title: 'PR #88 ready',
+      summary: 'Auth token refresh fix',
+      category: 'approvals',
+      action: 'answer-fleet',
+      seen: false,
+      important: true,
+      supervisor: true,
+      options: ['merged', 'later'],
+      cardId: 'q:fq_pr',
+      cardKind: 'merge_ready',
+      primaryLabel: 'Merge PR',
+      prRef: 'acme/api#88',
+      ciState: 'passing',
+    }]
+    const tap = async () => { f.app.tap(); await vi.advanceTimersByTimeAsync(500) }
+    await f.app.configureHomeMode('supervisor')
+    f.app.scrollUp()
+    await tap(); await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#88)', 'PR #88 ready', false)
+    await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#88)', 'PR #88 ready', true)
+    await tap()
+    expect(actCard).toHaveBeenCalledWith('o-pr-88', 'primary')
+    expect(answer).not.toHaveBeenCalled()
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Done', 'Merged acme/api#88 via squash')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('keeps Supervisor home through inbox refreshes and shows status on its own page', async () => {
   const f = await fixture()
   try {

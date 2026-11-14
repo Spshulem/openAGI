@@ -7,6 +7,8 @@ export class OpenAGIGlassesRenderer {
   private sendOnStop = true
   private pendingInbox = 0
   private who = 'Agent'
+  private supLead: string | null = null
+  private supCard: string | null = null
   private flashTimer: ReturnType<typeof setTimeout> | undefined
   private stopHint(): string { return this.sendOnStop ? 'Tap: stop and send' : 'Tap: stop and review' }
   private inboxLine(): string { return this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\n` : '' }
@@ -22,6 +24,9 @@ export class OpenAGIGlassesRenderer {
   autoSend(enabled: boolean): void { this.sendOnStop = enabled }
   /** Who answers in this mode: the agent, or the supervisor. */
   speaker(name: string): void { this.who = name }
+  /** Concise PM card brief shown on Supervisor home and in the Supervisor deck. */
+  supervisorLead(brief: string | null): void { this.supLead = brief }
+  supervisorCard(brief: string | null): void { this.supCard = brief }
   private latest: [string, boolean, (boolean | G2DisplayPhase)?] = ['', false]
   constructor(private readonly surface: AgentsDisplaySurface) {}
   requestExit(): Promise<boolean> { return this.surface.requestExit() }
@@ -53,7 +58,13 @@ export class OpenAGIGlassesRenderer {
   checkingCue(): void { this.show('Checking the conversation…', false, 'checking') }
   unpaired(): void { this.show('OpenAGI\n\n1. Install OpenAGI on your computer.\n2. On your phone, open Agents setup.\n3. Check your server and enter its code.\n\nDouble-tap: exit', true) }
   pairing(): void { this.show('Agents\n\nPair OpenAGI or add\nan agent URL + token\non the phone screen.', true) }
-  supervisorHome(questions: number): void { this.show(`Supervisor\n\nTap: talk, tap again to send\nHold: talk, let go to send\nSwipe up: questions (${questions})\nSwipe down: thread status\nDouble-tap: exit`, true) }
+  supervisorHome(questions: number): void {
+    if (questions > 0 && this.supLead) {
+      this.show(`Supervisor (${questions})\n\n${this.supLead.slice(0, 180)}\n\nTap/Hold: talk · Swipe up: act\nSwipe down: status · Double-tap: exit`, true)
+      return
+    }
+    this.show(`Supervisor\n\nTap: talk, tap again to send\nHold: talk, let go to send\nSwipe up: questions (${questions})\nSwipe down: thread status\nDouble-tap: exit`, true)
+  }
   home(device?: string): void { this.show(`Talk${device ? ` · ${device}` : ''}\n\nTap: talk to agent\nTap again: ${this.sendOnStop ? 'send' : 'review'}\n\n${this.inboxLine()}Swipe down: Recent\nDouble-tap: exit`, true) }
   lifelogHome(state: LifelogHomeState, detail = ''): void {
     const title = state === 'consent' ? 'Lifelog · needs consent' : state === 'paused' ? 'Lifelog paused' : state === 'waiting' ? 'Lifelog · waiting' : 'Lifelog · starting'
@@ -66,7 +77,14 @@ export class OpenAGIGlassesRenderer {
   inbox(text: string, item: number, total: number, page: number, pages: number): void {
     this.show(`Inbox ${item}/${total}\n\n${text}\n\nPage ${page}/${pages} · Swipe: read\nTap: actions · Double-tap: list`, true)
   }
-  inboxList(title: string, item: number, total: number): void { this.show(`Inbox ${item}/${total}\n\n${title.slice(0, 180)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
+  inboxList(title: string, item: number, total: number): void {
+    const brief = this.supCard; this.supCard = null
+    if (brief) {
+      this.show(`Supervisor ${item}/${total}\n\n${title.slice(0, 90)}\n${brief.slice(0, 140)}\n\nTap: open · Hold: talk · Swipe: next`, true)
+      return
+    }
+    this.show(`Inbox ${item}/${total}\n\n${title.slice(0, 180)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true)
+  }
   notice(label: string, title: string): void { this.show(`${label}\n\n${title.slice(0, 150)}`, false) }
   inboxAction(label: string, title: string, confirming = false): void { this.show(`${confirming ? 'Confirm: ' : ''}${label}\n\n${title.slice(0, 160)}\n\n${confirming ? 'Tap: confirm · Double-tap: cancel' : 'Swipe: choose · Tap: select\nDouble-tap: back'}`, true) }
   listening(): void { this.liveWords = ''; this.show(`${this.who}\n\n${this.stopHint()}\nMaximum 30 seconds.`, true, 'listening') }

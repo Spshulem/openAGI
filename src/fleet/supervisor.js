@@ -23,6 +23,10 @@ import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
+import { buildSupervisorDeck } from "./cards.js";
+import { executeSafePrMerge } from "./intent-resolver.js";
+import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
+import { buildBugDispatchMessage, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -846,6 +850,17 @@ export class FleetSupervisor {
     return this.running;
   }
 
+  emitFleet(reason = "update") {
+    try {
+      const snap = this.store.snapshot;
+      this.runtime?.events?.emit?.("fleet", {
+        at: snap?.at ?? new Date(this.now()).toISOString(),
+        reason,
+        counts: snap?.counts ?? null
+      });
+    } catch { /* listeners never break a mutation */ }
+  }
+
   getState() {
     const store = this.store;
     const open = store.openQuestions().filter((question) => {
@@ -859,7 +874,8 @@ export class FleetSupervisor {
     const snapshot = this.liveSnapshot(withHealth(store.snapshot), open);
     const rows = new Map((snapshot?.threads ?? []).map((row) => [row?.key, row]));
     const questions = open.map((question) => this.questionView(question, rows));
-    return {
+    const actions = store.actions(50);
+    const baseState = {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
       running: Boolean(this.running),
@@ -870,7 +886,7 @@ export class FleetSupervisor {
       fixes: store.fixes(),
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
-      actions: store.actions(50),
+      actions,
       suggestions: store.suggestions(),
       diagnosis: structuredClone(store.state.diagnosis),
       settings: {
@@ -897,6 +913,8 @@ export class FleetSupervisor {
         }
       }
     };
+    const deck = buildSupervisorDeck(baseState, { preferences: store.preferences(), now: this.now() });
+    return { ...baseState, ...deck };
   }
 
   // The last scan's rows brought up to now. Watching follows the questions
@@ -963,6 +981,7 @@ export class FleetSupervisor {
       }
     }
     if (mode === "observe") this.selfFixHub.stop("all").catch(() => {});
+    this.emitFleet("mode-changed");
     return saved;
   }
 
@@ -971,17 +990,23 @@ export class FleetSupervisor {
     if (!question || question.status !== "open") return null;
     if (question.kind === "suggestion") {
       this.respondSuggestion(question.meta?.suggestionId, "Not now").catch(() => {});
+      this.emitFleet("question-dismissed");
       return this.store.question(id);
     }
     // A storage ask comes back every tick, and a dismissal holds while it is
     // asked: one dismiss would mute it for good. It counts as Later (24 h).
     if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
       this.resolveOutreach(question, "Later", "acted");
-      return this.store.answerQuestion(id, "Later");
+      const closed = this.store.answerQuestion(id, "Later");
+      this.emitFleet("question-dismissed");
+      return closed;
     }
+    this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "dismiss", question, answer: "dismiss", now: this.now() }));
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
-    return this.store.dismissQuestion(id);
+    const dismissed = this.store.dismissQuestion(id);
+    this.emitFleet("question-dismissed");
+    return dismissed;
   }
 
   // The owner's feedback and the self-fix requests it leads to: stored here,
@@ -1049,6 +1074,7 @@ export class FleetSupervisor {
       kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: id, status: "done",
       reason: clampText(`owner reopened: ${question.title}`, 300)
     });
+    this.emitFleet("question-reopened");
     return question;
   }
 
@@ -1581,9 +1607,11 @@ export class FleetSupervisor {
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
+      this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "answer", question, answer, now: this.now() }));
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
       this.reopenIfUndelivered(id, settling, answer);
+      this.emitFleet("question-answered");
       return { question: answered, delivery };
     } finally {
       this.answering.delete(id);
@@ -1713,6 +1741,223 @@ export class FleetSupervisor {
   // step and why, its open questions, and what opens its chat. Built from
   // the last scan's row (kept across a restart), with this process's own
   // read of the chat when it has one. null: not in the last scan.
+  searchThreads(options) {
+    return searchFleet(this.getState(), options, this.lastThreads);
+  }
+
+  updatePreferences(patch = {}) {
+    const prev = this.store.preferences();
+    const next = applyPreferencePatch(prev, patch, { now: this.now() });
+    this.store.savePreferences(next);
+    if (next.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && isSuppressedByQuietCadence(q, next)) {
+          this.resolveOutreach(q, "resolved", "dismissed");
+        }
+      }
+    } else if (prev.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && !isSuppressedByQuietCadence(q, next)) {
+          this.reopenOutreach(q);
+        }
+      }
+    }
+    this.store.recordAction({
+      kind: "preference",
+      playbook: "owner-preference",
+      threadKey: null,
+      status: "done",
+      by: "owner",
+      reason: clampText(`owner updated preferences: ${patch?.choice || JSON.stringify(Object.keys(patch ?? {}))}`, 200)
+    });
+    this.emitFleet("preferences-updated");
+    return this.getState().preferences;
+  }
+
+  async routeIssue({ text, confirmTarget = null, autoSend = false, deadlineAt = null } = {}) {
+    if (confirmTarget) {
+      const cleanKey = String(confirmTarget).trim();
+      const message = String(text ?? "").trim();
+      const sent = await this.sendOwnerMessage(cleanKey, message, { deadlineAt });
+      this.emitFleet("issue-routed");
+      return {
+        action: "dispatched",
+        dispatched: sent?.delivery?.status === "sent",
+        targetKey: cleanKey,
+        delivery: sent?.delivery ?? null
+      };
+    }
+    const routed = await routeCustomerIssue({
+      text,
+      state: this.getState(),
+      cachedThreads: this.lastThreads,
+      runModel: this.deps.routeModel ?? null
+    });
+    if (autoSend === true && routed.action === "auto_dispatch" && routed.primary?.key) {
+      const sent = await this.sendOwnerMessage(routed.primary.key, routed.suggestedMessage, { deadlineAt });
+      this.emitFleet("issue-routed");
+      return {
+        ...routed,
+        dispatched: sent?.delivery?.status === "sent",
+        delivery: sent?.delivery ?? null
+      };
+    }
+    return { ...routed, dispatched: false, delivery: null };
+  }
+
+  async actCard(cardId, { op = "primary", value = null, clarification = null, instructions = null, deadlineAt = null } = {}) {
+    const id = String(cardId ?? "").trim();
+    if (!id) return null;
+
+    if (op === "veto") {
+      const preferences = this.updatePreferences({
+        vetoActionId: typeof value === "string" && value.startsWith("auto_") ? value : null,
+        vetoSlice: typeof value === "string" && !value.startsWith("auto_") ? value : (id.startsWith("pref:slice:") ? id.slice("pref:slice:".length) : null)
+      });
+      return { ok: true, kind: "veto", status: "reverted", detail: "Reverted automatic slice back to manual confirmation.", preferences };
+    }
+
+    if (id.startsWith("pref:") || op === "preference") {
+      const prefCard = (this.getState().cards ?? []).find((c) => c.id === id) ?? null;
+      const normOp = String(op ?? "primary").toLowerCase();
+      const isDefer = normOp === "defer" || normOp === "dismiss";
+      const actionObj = isDefer ? null : (normOp === "secondary" ? prefCard?.secondaryAction : prefCard?.primaryAction);
+      const choice = typeof value === "string" && value
+        ? value
+        : (isDefer
+            ? `keep:${id}`
+            : (actionObj?.value ?? (normOp === "secondary" ? `keep:${id}` : id.replace(/^pref:/, ""))));
+      const preferences = this.updatePreferences({ choice });
+      return { ok: true, kind: "preference", status: "updated", detail: choice.startsWith("keep:") ? "Kept current default." : "Updated Supervisor preference.", preferences };
+    }
+
+    const currentState = this.getState();
+    const card = (currentState.cards ?? []).find((c) => c.id === id || c.questionId === id) ?? null;
+    const questionId = card?.questionId ?? id;
+    const question = this.store.question(questionId);
+    if (!question || question.status !== "open") return null;
+
+    const normalizedOp = String(op ?? "primary").toLowerCase();
+    const resolvedAction = normalizedOp === "secondary" ? card?.secondaryAction : (normalizedOp === "primary" ? card?.primaryAction : null);
+    const effectiveOp = normalizedOp === "primary" || normalizedOp === "secondary"
+      ? (resolvedAction?.op ?? "answer")
+      : normalizedOp;
+    const effectiveValue = value ?? resolvedAction?.value ?? null;
+
+    if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {
+      const dismissed = this.dismissQuestion(question.id);
+      return { ok: Boolean(dismissed), kind: "defer", status: "dismissed", question: dismissed, delivery: null };
+    }
+
+    if (effectiveOp === "fix_ci") {
+      const targetKey = card?.threadKey ?? question.threadKey ?? null;
+      if (!targetKey) return { ok: false, kind: "fix_ci", status: "blocked", detail: "No coding session is linked to this PR." };
+      const prLabel = card?.prRef ?? question.prRef ?? "the pull request";
+      const fixPrompt = `Checks or mergeability failed on ${prLabel}. Please inspect the failing checks or rebase conflicts, fix them in scope, and push an updated commit.`;
+      const sent = await this.sendOwnerMessage(targetKey, fixPrompt, { deadlineAt });
+      this.emitFleet("card-fix-ci");
+      return {
+        ok: sent?.delivery?.status === "sent",
+        kind: "fix_ci",
+        status: sent?.delivery?.status ?? "blocked",
+        detail: sent?.delivery?.detail ?? (sent?.delivery?.status === "sent" ? `Asked ${targetKey} to fix ${prLabel}.` : "Could not reach coding session."),
+        delivery: sent?.delivery ?? null
+      };
+    }
+
+    if (effectiveOp === "merge" || effectiveOp === "ship") {
+      const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
+      const prefs = this.store.preferences();
+      const mergeOutcome = await executeSafePrMerge({
+        prRef,
+        expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
+        mergePolicy: prefs.mergePolicy,
+        ghBin: this.config.bins?.gh ?? "gh",
+        run: this.deps.run ?? runCommand
+      });
+
+      if (mergeOutcome.status === "merged" || mergeOutcome.status === "already_merged") {
+        const markOption = (question.options ?? []).find((opt) => /^(?:merged|yes|done)$/i.test(opt)) ?? null;
+        if (markOption) {
+          this.store.answerQuestion(question.id, markOption);
+        } else {
+          this.store.resolveQuestion(question.id, `merged ${prRef}`);
+        }
+        this.resolveOutreach(question, "merged", "acted");
+        this.store.recordAction({
+          kind: "pr-merge",
+          playbook: "owner-merge",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        this.emitFleet("pr-merged");
+        return { ok: true, kind: "merge", ...mergeOutcome };
+      }
+
+      if (mergeOutcome.status === "watching_ci") {
+        if (mergeOutcome.promptPreference) {
+          this.store.savePreferences(recordPreferenceSignal(prefs, { type: "ci_merge_attempt", prRef, now: this.now() }));
+        }
+        this.store.recordAction({
+          kind: "pr-watch",
+          playbook: "owner-merge-watch",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        this.emitFleet("pr-watching-ci");
+        return { ok: true, kind: "merge", ...mergeOutcome };
+      }
+
+      if (mergeOutcome.status === "queued_when_green") {
+        this.store.recordAction({
+          kind: "pr-merge-queued",
+          playbook: "owner-merge",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        this.emitFleet("pr-merge-queued");
+        return { ok: true, kind: "merge", ...mergeOutcome };
+      }
+
+      this.store.recordAction({
+        kind: "pr-merge",
+        playbook: "owner-merge",
+        threadKey: question.threadKey ?? null,
+        status: "blocked",
+        by: "owner",
+        reason: mergeOutcome.detail
+      });
+      this.emitFleet("pr-merge-halted");
+      return { ok: false, kind: "merge", ...mergeOutcome };
+    }
+
+    if (question.kind === "self-fix" && effectiveValue === "Request changes" && typeof instructions === "string" && instructions.trim()) {
+      const fix = await this.reviseFix(question.meta?.fixId, instructions);
+      this.emitFleet("self-fix-revised");
+      return fix
+        ? { ok: true, kind: "answer", status: "sent", fix, delivery: { status: "sent", detail: "Changes sent to fixer." } }
+        : { ok: false, kind: "answer", status: "blocked", detail: "No fix with that id." };
+    }
+
+    const answerOption = effectiveValue ?? (question.options ?? []).find((opt) => opt !== "dismiss") ?? null;
+    if (!answerOption) return { ok: false, kind: "answer", status: "blocked", detail: "No answer option available." };
+    const result = await this.answerQuestion(question.id, answerOption, { deadlineAt, clarification });
+    if (!result) return { ok: false, kind: "answer", status: "closed", detail: "Question already closed." };
+    return {
+      ok: !result.delivery || ["sent", "queued"].includes(result.delivery.status),
+      kind: "answer",
+      status: result.delivery?.status ?? "done",
+      detail: result.delivery?.detail ?? null,
+      ...result
+    };
+  }
+
   async threadConversation(threadKey) {
     const thread = this.lastThreads.get(threadKey)
       ?? this.getState().snapshot?.threads?.find((row) => row.key === threadKey);
@@ -1723,9 +1968,10 @@ export class FleetSupervisor {
 
   threadDetail(threadKey) {
     const state = this.getState();
-    const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey);
-    if (!row) return null;
     const thread = this.lastThreads.get(threadKey) ?? null;
+    const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey)
+      ?? (thread ? { ...thread, state: thread.excluded || thread.agentStatus || "unknown", openChat: openChatFor(thread) } : null);
+    if (!row) return null;
     const reply = thread ? agentReply(thread) : { text: row.lastAgentText ?? "", at: row.lastAgentAt ?? null };
     return {
       key: row.key, kind: row.kind, title: row.title ?? null, workspace: row.workspace ?? null, repo: row.repo ?? null, branch: row.branch ?? null,
@@ -1807,12 +2053,14 @@ export class FleetSupervisor {
   muteThread(threadKey, { hours = MUTE_HOURS_DEFAULT } = {}) {
     const until = this.store.mute(threadKey, this.now() + hours * 60 * MIN);
     this.store.recordAction({ kind: "mute", playbook: "owner-mute", threadKey, status: "done", reason: `owner: mute for ${hours} h`, by: "owner" });
+    this.emitFleet("thread-muted");
     return { until };
   }
 
   unmuteThread(threadKey) {
     const was = this.store.unmute(threadKey);
     if (was) this.store.recordAction({ kind: "unmute", playbook: "owner-mute", threadKey, status: "done", reason: "owner: unmute", by: "owner" });
+    this.emitFleet("thread-unmuted");
     return { until: null };
   }
 
@@ -2516,6 +2764,7 @@ export class FleetSupervisor {
     // One app thread can back two fleet threads (a Conductor session and the
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
+    const autoAnsweredThreads = new Set();
 
     // A Codex question card is asked beside the thread's own decision.
     const asks = decisions.flatMap((decision) => [
@@ -2538,8 +2787,66 @@ export class FleetSupervisor {
       // The head it is asked at: a move past it settles the ask (settledAsk).
       const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
       asked.add(question.dedupeKey);
-      // The owner already answered or dismissed this one; stay quiet.
+      // The owner (or an earlier automatic slice) already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
+      // Progressive preference slices: ONLY when the owner explicitly made a
+      // safe routine slice automatic (never merges or risky asks) and mode is auto.
+      if (this.mode === "auto" && fields.kind === "agent-ask" && fields.threadKey && !fields.mergeAsk && !store.mutedUntil(fields.threadKey)) {
+        const slice = classifyQuestionSlice(fields);
+        const prefs = store.preferences();
+        const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
+        const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
+        const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
+        const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
+        if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
+          const delivery = await this.executor.deliver({ thread: targetThread, message: ownerDelivery(autoChoice), route, playbook: "owner-answer" });
+          if (delivery.status === "sent") {
+            sends += 1;
+            attempted.add(targetThread.key);
+            autoAnsweredThreads.add(targetThread.key);
+            if (uiKey) typedInto.add(uiKey);
+            store.answerQuestion(question.id, autoChoice);
+            this.resolveOutreach(question, autoChoice, "acted");
+            store.recordNudge(targetThread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: "owner-answer" });
+            const { prefs: updatedPrefs, record: autoRecord } = recordAutonomousSliceAction(prefs, {
+              slice,
+              threadKey: targetThread.key,
+              summary: clampText(`${fields.title} -> ${autoChoice}`, 160),
+              now: started
+            });
+            store.savePreferences(updatedPrefs);
+            const actionRecord = store.recordAction({
+              kind: "nudge",
+              playbook: `auto-slice:${slice}`,
+              threadKey: targetThread.key,
+              route: delivery.route ?? route,
+              status: "sent",
+              reason: clampText(`autonomous preference (${slice}): ${fields.title}`, 240),
+              at
+            });
+            if (delivery.done) {
+              this.reopenIfUndelivered(
+                question.id,
+                [delivery.done.then((reached) => {
+                  if (reached) return null;
+                  const latestPrefs = store.preferences();
+                  const entry = latestPrefs.autonomousActions.find((a) => a.id === autoRecord.id);
+                  if (entry) {
+                    entry.reverted = true;
+                    store.savePreferences(latestPrefs);
+                  }
+                  if (actionRecord?.id) {
+                    store.updateAction(actionRecord.id, { status: "failed", detail: "background delivery failed" });
+                  }
+                  return targetThread.key;
+                })],
+                autoChoice
+              );
+            }
+            continue;
+          }
+        }
+      }
       toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
     }
     // The supervisor reviews its own list before a new question reaches the
@@ -2555,9 +2862,11 @@ export class FleetSupervisor {
       // close) waits for the next review; a failed review lets all out.
       this.awaitingReview = new Set([...this.awaitingReview].filter((id) => unsettled.has(id)));
     }
+    const notifyPrefs = store.preferences();
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
       if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      if (isSuppressedByQuietCadence(question, notifyPrefs)) continue;
       const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
       if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
@@ -2582,6 +2891,7 @@ export class FleetSupervisor {
     sends += restartedNow.sent;
     for (const key of restartedNow.uiKeys) typedInto.add(key);
     for (const key of restartedNow.threads) answeredNow.threads.add(key);
+    for (const key of autoAnsweredThreads) answeredNow.threads.add(key);
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.

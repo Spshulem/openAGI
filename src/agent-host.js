@@ -61,10 +61,16 @@ export class AgentHost {
     // A brief selection is a reference, not client-authored prompt text. Resolve
     // it against the live store before it reaches the model, and persist only
     // the normalized form so the dashboard handoff keeps the same context.
-    const briefContext = isolatedContext ? null : resolveBriefContext(this.runtime, input.metadata?.briefContext);
+    const focusedCardId = boundedText(input.metadata?.focusedCardId, 120);
+    const briefContext = isolatedContext
+      ? null
+      : (resolveBriefContext(this.runtime, input.metadata?.briefContext)
+        ?? (input.metadata?.thread === "supervisor" ? resolveFleetContext(this.runtime, focusedCardId) : null));
     const metadata = { ...(input.metadata ?? {}) };
     delete metadata.attachments;
     if (isolatedContext) delete metadata.screenContext;
+    if (focusedCardId) metadata.focusedCardId = focusedCardId;
+    else delete metadata.focusedCardId;
     // A request id is transport correlation data, not arbitrary conversation
     // metadata. Bound and normalize it once so the user and terminal assistant
     // records carry the same safe value even when two clients use one session.
@@ -894,6 +900,8 @@ function resolveFleetContext(runtime, id) {
 
   const question = id ? questions.find((q) => q.id === id) : null;
   const questionTitle = question ? boundedText(question.title, 500) : "";
+  const cards = Array.isArray(state.cards) ? state.cards : [];
+  const matchedCard = id ? cards.find((c) => c && (c.id === id || c.questionId === id)) ?? null : null;
   if (question && questionTitle) {
     return {
       kind: "fleet",
@@ -907,7 +915,38 @@ function resolveFleetContext(runtime, id) {
         threadKey: typeof question.threadKey === "string" ? question.threadKey : null,
         prRef: typeof question.prRef === "string" ? question.prRef : null,
         reviewReason: typeof question.reviewReason === "string" ? question.reviewReason : null,
-        askContext: boundedText(question.askContext, 1_500) || null
+        askContext: boundedText(question.askContext, 1_500) || null,
+        ...(matchedCard ? {
+          card: {
+            id: matchedCard.id,
+            headline: boundedText(matchedCard.headline, 200),
+            recommendation: boundedText(matchedCard.recommendation, 240) || null,
+            primaryAction: matchedCard.primaryAction ?? null,
+            secondaryAction: matchedCard.secondaryAction ?? null,
+            ciState: matchedCard.ciState ?? null
+          }
+        } : {}),
+        guidance: "Act like a concise project manager: resolve natural replies ('yeah, go for it', 'ship it', 'hold off') directly via fleet_act_card without demanding magic keywords."
+      }), 6_000),
+      resolvedFromStore: true
+    };
+  }
+
+  if (matchedCard && matchedCard.headline) {
+    return {
+      kind: "fleet",
+      entityRef: { kind: "fleet", id: matchedCard.id },
+      title: boundedText(matchedCard.headline, 500),
+      summary: boundedText(matchedCard.summary, 1_000),
+      content: boundedText(JSON.stringify({
+        card: {
+          id: matchedCard.id,
+          kind: matchedCard.kind,
+          primaryAction: matchedCard.primaryAction ?? null,
+          secondaryAction: matchedCard.secondaryAction ?? null
+        },
+        preferences: state.preferences ?? null,
+        guidance: "Use fleet_act_card or fleet_preferences when the owner accepts or declines this progressive preference card."
       }), 6_000),
       resolvedFromStore: true
     };
@@ -923,12 +962,33 @@ function resolveFleetContext(runtime, id) {
     threadKey: typeof q.threadKey === "string" ? q.threadKey : null,
     kind: typeof q.kind === "string" ? q.kind : null
   }));
+  const listedCards = cards.slice(0, FLEET_OVERVIEW_QUESTIONS).map((c) => ({
+    id: c.id,
+    kind: c.kind,
+    headline: boundedText(c.headline, 120),
+    primaryAction: c.primaryAction ?? null,
+    secondaryAction: c.secondaryAction ?? null,
+    threadKey: c.threadKey ?? null,
+    prRef: c.prRef ?? null
+  }));
   return {
     kind: "fleet",
     entityRef: null,
     title: "Coding-agent supervisor",
     summary: `mode ${mode} · last scan ${lastScan} · ${questions.length} open`,
-    content: boundedText(JSON.stringify({ openQuestions: listed }), 6_000),
+    content: boundedText(JSON.stringify({
+      openQuestions: listed,
+      ...(listedCards.length ? { cards: listedCards } : {}),
+      ...(state.catchUpSummary ? { catchUpSummary: boundedText(state.catchUpSummary, 240) } : {}),
+      ...(state.preferences ? {
+        preferences: {
+          mergePolicy: state.preferences.mergePolicy ?? "manual_confirm",
+          cadence: state.preferences.cadence ?? "balanced",
+          autoSlices: state.preferences.autoSlices ?? {}
+        }
+      } : {}),
+      guidance: "Act like a concise project manager: resolve natural replies ('yeah, go for it', 'ship it', 'hold off') directly via fleet_act_card without demanding magic keywords; route bug reports via fleet_route_issue then fleet_send_message."
+    }), 6_000),
     resolvedFromStore: true
   };
 }
