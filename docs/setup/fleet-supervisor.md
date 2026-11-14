@@ -72,6 +72,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
 | `OPENAGI_FLEET_BACKGROUND_ROUTES` | none | `codex-exec`, `peer-relay`, or both: routes an app send may take while you are at the Mac. See [While you work](#while-you-work) |
+| `OPENAGI_FLEET_AUTO_APPROVE` | none | `codex`: in Auto mode, click Allow on the approval cards Codex raises (it can ask even with full access). The chats its sidebar marks "Awaiting approval" are opened when you are away, and each card gets the narrowest grant shown ("Allow this conversation", then "Allow once"), never "Always allow" |
 | `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
 | `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |

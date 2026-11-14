@@ -27,7 +27,7 @@ import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { buildBugDispatchMessage, routeCustomerIssue, searchFleet } from "./search.js";
-import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -335,6 +335,24 @@ const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 // What changes when a thread moves: its newest agent or owner text and state.
 function activityMark(thread) {
   return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
+}
+
+// The button auto-approve clicks, first match: the narrowest grant that keeps
+// the same card from coming back in that chat. Never "Always allow", which
+// grants it to every chat for good.
+const AUTO_APPROVE_LABELS = ["allow this conversation", "allow for this session", "allow for session", "allow once", "approve once", "approve", "allow", "yes, allow", "yes"];
+// Chats approved per scan, and cards in a row per chat (a command can raise
+// another right after).
+const AUTO_APPROVE_MAX_THREADS = 5;
+const AUTO_APPROVE_MAX_CARDS = 3;
+
+export function autoApproveLabel(buttons) {
+  const shown = (buttons ?? []).map((label) => ({ label, key: String(label ?? "").trim().toLowerCase() }));
+  for (const want of AUTO_APPROVE_LABELS) {
+    const hit = shown.find((button) => button.key === want);
+    if (hit) return hit.label;
+  }
+  return null;
 }
 
 function threadLabel(thread) {
@@ -1397,7 +1415,7 @@ export class FleetSupervisor {
 
   // Clicks one button of the thread's permission card (or its one Resume
   // button) by exact label; stateId pins the card the owner saw.
-  async clickThread(threadKey, label, { stateId = null, deadlineAt = null, thread = null } = {}) {
+  async clickThread(threadKey, label, { stateId = null, deadlineAt = null, thread = null, auto = false } = {}) {
     const found = this.uiThread(threadKey, thread);
     if (found.error) return { delivery: { status: "blocked", route: null, detail: found.error }, prompt: null };
     if (typeof found.driver.clickLabel !== "function") return { delivery: { status: "blocked", route: null, detail: "clicking unavailable on this Mac" }, prompt: null };
@@ -1408,8 +1426,8 @@ export class FleetSupervisor {
       result = { status: "failed", detail: clampText(redactSecrets(`computer use failed: ${error?.message ?? error}; nothing confirmed`), 200) };
     }
     this.noteUiResult(found.thread, result);
-    this.store.recordAction({ kind: "click", playbook: "owner-click", threadKey: found.thread.key, route: "computer-use", status: result?.status ?? "failed",
-      reason: clampText(`owner: click ${label}`, 300), detail: clampText(result?.detail ?? "", 200), at: new Date(this.now()).toISOString() });
+    this.store.recordAction({ kind: "click", playbook: auto ? "auto-approve" : "owner-click", threadKey: found.thread.key, route: "computer-use", status: result?.status ?? "failed",
+      reason: clampText(`${auto ? "auto-approve" : "owner"}: click ${label}`, 300), detail: clampText(result?.detail ?? "", 200), at: new Date(this.now()).toISOString() });
     return { delivery: { status: result?.status ?? "failed", route: "computer-use", detail: result?.detail ?? null, ...(result?.code ? { code: result.code } : {}) }, prompt: result?.prompt ?? null };
   }
 
@@ -1429,6 +1447,56 @@ export class FleetSupervisor {
     if (["sent", "read"].includes(result.status) || card || READ_THE_APP.test(String(result.detail ?? ""))) this.unreadable.delete(target.app);
     if (card?.stateId && Array.isArray(card.buttons)) this.prompts.set(thread.key, { text: clampText(card.text ?? "", 300), buttons: card.buttons.slice(0, 6), stateId: card.stateId, at });
     else if (["sent", "read"].includes(result.status)) this.prompts.delete(thread.key);
+  }
+
+  // Auto-approve (OPENAGI_FLEET_AUTO_APPROVE=codex): Codex can raise approval
+  // cards even with full access on. One read of its sidebar finds the chats
+  // marked "Awaiting approval"; each is opened (never under the owner) and
+  // its card's Allow clicked, before any of them becomes a question.
+  async approveCodexCards(inScope, threads, started) {
+    const driver = this.uiDriver;
+    if (typeof driver?.attention !== "function" || typeof driver?.clickLabel !== "function") return;
+    // Only while Auto holds and the thread is not muted, checked again before
+    // each read and click: the owner can switch mode or mute mid-pass.
+    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key);
+    const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived && allowed(thread));
+    if (!codex.length) return;
+    let rows = [];
+    try {
+      const read = await driver.attention({ target: UI_APPS.codex, evidenceName: `attention-codex-${started}` });
+      rows = read?.status === "read" ? read.rows ?? [] : [];
+    } catch { /* unread: only cards already seen are approved */ }
+    const marked = new Set(rows.map(identityToken).filter(Boolean));
+    // A sidebar row is labelled with what Codex shows: the thread's title, or
+    // its first message. The names come from uiIdentity, like every other
+    // check of what is on screen, so a name another thread can show (a
+    // shared title or first message) proves nothing and is skipped. A label
+    // still claimed by two threads here binds to neither.
+    const all = threads ?? [...this.lastThreads.values()];
+    const names = new Map();
+    const claims = new Map();
+    for (const thread of codex) {
+      const identity = uiIdentity(thread, uiTargetFor(thread), all);
+      const own = identity.ambiguous ? [] : [...new Set([...(identity.tokens ?? []), ...(identity.altTokens ?? [])])];
+      names.set(thread.key, own);
+      for (const name of own) claims.set(name, (claims.get(name) ?? 0) + 1);
+    }
+    const shown = (thread) => names.get(thread.key).some((name) => marked.has(name) && claims.get(name) === 1);
+    const waiting = codex.filter((thread) => this.livePrompt(thread) || shown(thread));
+    for (const thread of waiting.slice(0, AUTO_APPROVE_MAX_THREADS)) {
+      if (!allowed(thread)) continue;
+      if (!this.livePrompt(thread)) {
+        try { await this.screenThread(thread.key, { thread, threads, navigate: true }); } catch { continue; }
+      }
+      for (let clicks = 0; clicks < AUTO_APPROVE_MAX_CARDS; clicks += 1) {
+        const card = this.livePrompt(thread);
+        const label = card ? autoApproveLabel(card.buttons) : null;
+        if (!label || !allowed(thread)) break;
+        const clicked = await this.clickThread(thread.key, label, { stateId: card.stateId, thread, auto: true });
+        if (clicked.delivery.status !== "sent") break;
+        if (!clicked.prompt) this.prompts.delete(thread.key);
+      }
+    }
   }
 
   // A read of this thread found no card, the thread has not moved since, and
@@ -2209,6 +2277,9 @@ export class FleetSupervisor {
     const mutedKeys = store.mutedKeys();
     // Computer-use readiness, once per tick; the driver re-checks at each send.
     const delivery = await this.probeDelivery();
+    if (!deferUi && this.mode === "auto" && delivery.ready === true && config.autoApprove?.includes("codex")) {
+      try { await this.approveCodexCards(inScope, threads, started); } catch { /* best-effort: cards left are asked about below */ }
+    }
     // One thread waiting on a permission card whose buttons are not known
     // yet gets one screen read per tick, so its question offers them.
     // Never in Observe (it drives nothing); in Propose only a thread already

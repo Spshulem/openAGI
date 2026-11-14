@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
-import { FleetSupervisor, canReplyTo, groupQuestions, judgeAskKey, judgeCacheKey, riskyQuestion } from "../src/fleet/supervisor.js";
+import { FleetSupervisor, autoApproveLabel, canReplyTo, groupQuestions, judgeAskKey, judgeCacheKey, riskyQuestion } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { DEADLINE_MARGIN_MS, restartMaxMs } from "../src/fleet/ui-delivery.js";
@@ -2875,6 +2875,80 @@ test("a thread waiting on a permission card: one screen read, its buttons as opt
   assert.equal(clicks[0].stateId, "0123456789abcdef");
   assert.ok(supervisor.getState().actions.some((action) => action.kind === "click" && action.status === "sent"));
   assert.equal(supervisor.livePrompt(waiting), null, "the clicked card is forgotten");
+});
+
+test("auto-approve: a Codex chat the sidebar marks awaiting approval gets Allow clicked, no question", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Allow this conversation", "Always allow", "Deny"], stateId: "0123456789abcdef" };
+  const reads = [];
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["Fix billing", "Something else"] }),
+    inspect: async (request) => { reads.push(request); return { status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }; },
+    clickLabel: async (request) => { clicks.push(request); return { status: "sent", detail: "clicked Allow this conversation in Codex" }; }
+  };
+  const thread = makeThread({ agentStatus: "running", prRefs: [], meta: { originator: "Codex Desktop" } });
+  const { supervisor } = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].navigate, true);
+  assert.equal(clicks.length, 1);
+  assert.equal(clicks[0].label, "Allow this conversation");
+  assert.equal(clicks[0].stateId, "0123456789abcdef");
+  assert.ok(supervisor.getState().actions.some((action) => action.playbook === "auto-approve" && action.status === "sent"));
+  assert.equal(supervisor.getState().questions.filter((q) => q.kind === "prompt").length, 0);
+  // A muted thread is never approved, nor one after the owner leaves Auto.
+  clicks.length = 0;
+  const muted = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  muted.supervisor.muteThread(thread.key);
+  await muted.supervisor.tick();
+  assert.equal(clicks.length, 0, "muted");
+  const switching = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" },
+    deps: { uiDriver: { ...driver, attention: async () => { switching.supervisor.setMode("observe"); return { status: "read", rows: ["Fix billing"] }; } } } });
+  await switching.supervisor.tick();
+  assert.equal(clicks.length, 0, "mode left Auto mid-pass");
+  // Off unless listed, and never outside Auto.
+  for (const [mode, env] of [["auto", {}], ["propose", { OPENAGI_FLEET_AUTO_APPROVE: "codex" }]]) {
+    const off = { ...driver, attention: async () => { throw new Error("read"); }, clickLabel: async (request) => { clicks.push(request); return { status: "sent" }; } };
+    clicks.length = 0;
+    const other = fixture(t, { threads: [thread], prs: new Map(), mode, delivery: "computer-use", env, deps: { uiDriver: off } });
+    await other.supervisor.tick();
+    assert.equal(clicks.length, 0, `${mode} ${JSON.stringify(env)}`);
+  }
+});
+
+test("auto-approve matches sidebar rows by the names Codex shows, first message included, and never binds a shared label", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Deny"], stateId: "0123456789abcdef" };
+  const reads = [];
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["please fix the flaky upload test", "Update the release docs"] }),
+    inspect: async (request) => { reads.push(request.target.threadId); return { status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }; },
+    clickLabel: async (request) => { clicks.push(request.target.threadId); return { status: "sent", detail: "clicked Allow once in Codex" }; }
+  };
+  const codexMeta = (extra = {}) => ({ originator: "Codex Desktop", ...extra });
+  // Shown in the sidebar by its first message, not its catalog title.
+  const byFirstMessage = makeThread({ key: "codex:t1", id: "t1", title: "Refactor auth", agentStatus: "running", prRefs: [],
+    meta: codexMeta({ firstMessageTitle: "please fix the flaky upload test" }) });
+  // Two threads either of which can show "Update the release docs": one by
+  // its title, the other by its first message. Neither is approved from it.
+  const titled = makeThread({ key: "codex:t2", id: "t2", title: "Update the release docs", cwd: "/work/t2", agentStatus: "running", prRefs: [], meta: codexMeta() });
+  const twin = makeThread({ key: "codex:t3", id: "t3", title: "Ship v2", cwd: "/work/t3", agentStatus: "running", prRefs: [],
+    meta: codexMeta({ firstMessageTitle: "Update the release docs" }) });
+  const { supervisor } = fixture(t, { threads: [byFirstMessage, titled, twin], prs: new Map(), mode: "auto", delivery: "computer-use",
+    env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.deepEqual(clicks, ["t1"], "the first-message row approves its thread");
+  assert.ok(reads.includes("t1"));
+  assert.ok(!clicks.includes("t2") && !clicks.includes("t3"), "an ambiguous label approves neither thread");
+});
+
+test("autoApproveLabel picks the narrowest grant and never Always allow", () => {
+  assert.equal(autoApproveLabel(["Allow once", "Allow this conversation", "Always allow", "Deny"]), "Allow this conversation");
+  assert.equal(autoApproveLabel(["Allow once", "Deny"]), "Allow once");
+  assert.equal(autoApproveLabel(["Always allow", "Deny"]), null);
+  assert.equal(autoApproveLabel(["Approve", "Decline"]), "Approve");
 });
 
 test("a click the app refuses leaves the prompt question open", async (t) => {
