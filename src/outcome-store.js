@@ -9,6 +9,14 @@ import { resolveDataDir } from "./data-dir.js";
 
 const SNAPSHOT_LIMIT = 2000; // keep last N resolved + all pending
 
+// Work outcomes stand for a piece of the system's own work (a draft, a
+// suggestion, a task it completed). They are graded later, by what happened
+// to the work, through ground(). They stay unresolved so they are never
+// evicted from the snapshot before their final grade, are skipped by the
+// heuristic resolveSweep, and are excluded from quality aggregates.
+export const WORK_KINDS = ["work-draft", "work-suggestion", "work-task"];
+const WORK_KIND_SET = new Set(WORK_KINDS);
+
 export class OutcomeStore {
   constructor(options = {}) {
     this.dir = options.dir ?? path.join(resolveDataDir(), "outcomes");
@@ -35,6 +43,13 @@ export class OutcomeStore {
       resolved: false,
       qualityScore: null,
       source: null,
+      // Grounded grade: from what happened to the work afterwards, never
+      // assigned by the system to itself. Independent of qualityScore.
+      groundedScore: null,
+      groundedSource: null,
+      groundedFate: null,
+      groundedWeak: false,
+      groundedAt: null,
       at: input.at ?? nowIso(),
       resolvedAt: null,
       metadata: input.metadata ?? {}
@@ -43,6 +58,97 @@ export class OutcomeStore {
     appendJsonLine(this.eventsPath, { op: "record", outcome });
     this.persist();
     return outcome;
+  }
+
+  /**
+   * Record one piece of the system's own work so it can be graded later.
+   * `signal` carries the scrutiny decision of the turn that produced it
+   * (see the __signal tool context in agent-host.js); it may be null.
+   */
+  recordWork({ kind, refId, at = undefined, signal = null, sessionId = null, agentId = "main", specialistId = null, metadata = {} } = {}) {
+    if (!WORK_KIND_SET.has(kind)) throw new Error(`recordWork: unknown work kind ${kind}`);
+    return this.record({
+      kind,
+      refId: refId ?? null,
+      at,
+      sessionId,
+      agentId,
+      signalId: signal?.id ?? null,
+      scrutinyAction: signal?.scrutinyAction ?? null,
+      scrutinyDimensions: signal?.scrutinyDimensions ?? null,
+      metadata: {
+        ...metadata,
+        specialistId: specialistId ?? signal?.specialistId ?? null,
+        scrutinyScore: signal?.scrutinyScore ?? null,
+        qualityEligible: false
+      }
+    });
+  }
+
+  /**
+   * Set the grounded grade of an outcome. May be called repeatedly; the latest
+   * call wins. Never touches qualityScore, resolved or source.
+   */
+  ground(id, { score, source, fate, weak = false, detail = null, at = nowIso() } = {}) {
+    const outcome = this.outcomes.get(id);
+    if (!outcome) return null;
+    const previous = typeof outcome.groundedScore === "number" ? outcome.groundedScore : null;
+    const grounded = score === null || score === undefined ? null : clampScore(score);
+    outcome.groundedScore = grounded;
+    outcome.groundedSource = source ?? null;
+    outcome.groundedFate = fate ?? null;
+    outcome.groundedWeak = Boolean(weak);
+    outcome.groundedAt = at;
+    if (detail) outcome.metadata = { ...outcome.metadata, groundedDetail: detail };
+    appendJsonLine(this.eventsPath, {
+      op: "ground",
+      id,
+      groundedScore: grounded,
+      groundedSource: outcome.groundedSource,
+      fate: outcome.groundedFate,
+      weak: outcome.groundedWeak,
+      detail: detail ?? null,
+      at
+    });
+    if (this.onGrounded) this.onGrounded(outcome, previous);
+    this.persist();
+    return outcome;
+  }
+
+  /** Newest outcome of a work kind for one piece of work, or null. */
+  byWorkRef(kind, refId) {
+    if (!refId) return null;
+    let best = null;
+    for (const o of this.outcomes.values()) {
+      if (o.kind !== kind || o.refId !== refId) continue;
+      if (!best || o.at > best.at) best = o;
+    }
+    return best;
+  }
+
+  /** Coverage of grounded grades over work outcomes in a window. */
+  groundedStats({ windowDays = 28, now = new Date() } = {}) {
+    const tNow = now instanceof Date ? now.getTime() : new Date(now).getTime();
+    const cutoff = tNow - windowDays * 86_400_000;
+    const stats = { total: 0, graded: 0, weak: 0, ungraded: 0, byFate: {}, byKind: {}, perWeek: [] };
+    const weeks = new Map();
+    for (const o of this.outcomes.values()) {
+      if (!WORK_KIND_SET.has(o.kind)) continue;
+      const t = new Date(o.at).getTime();
+      if (!(t >= cutoff)) continue;
+      stats.total += 1;
+      stats.byKind[o.kind] = (stats.byKind[o.kind] ?? 0) + 1;
+      if (typeof o.groundedScore !== "number") { stats.ungraded += 1; continue; }
+      stats.graded += 1;
+      if (o.groundedWeak) stats.weak += 1;
+      if (o.groundedFate) stats.byFate[o.groundedFate] = (stats.byFate[o.groundedFate] ?? 0) + 1;
+      if (!o.groundedWeak) {
+        const weekStart = isoWeekStart(new Date(o.groundedAt ?? o.at));
+        weeks.set(weekStart, (weeks.get(weekStart) ?? 0) + 1);
+      }
+    }
+    stats.perWeek = [...weeks.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([weekStart, graded]) => ({ weekStart, graded }));
+    return stats;
   }
 
   resolve(id, qualityScore, source = "system-inferred", note = null) {
@@ -209,6 +315,8 @@ export class OutcomeStore {
     const resolutions = [];
     const tNow = now instanceof Date ? now.getTime() : new Date(now).getTime();
     for (const o of this.pending()) {
+      // Work outcomes are graded by ground(), never by these heuristics.
+      if (WORK_KIND_SET.has(o.kind)) continue;
       const age = tNow - new Date(o.at).getTime();
       let score = null;
       let source = null;
@@ -332,6 +440,13 @@ export function scoreFromToolCalls(toolCalls) {
   if (failed === 0) return 0.7;
   if (failed === calls.length) return 0.1;
   return 0.45;
+}
+
+function isoWeekStart(date) {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = d.getUTCDay() || 7; // Monday = 1 ... Sunday = 7
+  d.setUTCDate(d.getUTCDate() - (day - 1));
+  return d.toISOString().slice(0, 10);
 }
 
 function clampScore(s) {
