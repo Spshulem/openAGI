@@ -2702,6 +2702,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           + (id === "backlog-triage" ? "?source=main" : "");
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
+        // Optional { input: {...} } overrides the job's input for this run only
+        // (for example { "input": { "apply": true } } on grounded-backfill).
+        // The stored job is unchanged; no body means a normal run.
+        let runInput = null;
+        try {
+          const body = await readJsonLimited(req, 64 * 1024);
+          if (body && typeof body.input === "object" && body.input !== null && !Array.isArray(body.input)) runInput = body.input;
+        } catch {
+          return sendJson(res, 400, { error: "invalid JSON body" });
+        }
 
         // Grace window: a job that finishes fast returns its result inline
         // (what the dashboard wants); anything slower gets a 202 + runId. The
@@ -2709,7 +2719,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const requested = Number.parseInt(url.searchParams.get("wait") ?? "", 10);
         const graceMs = Math.min(Number.isFinite(requested) && requested >= 0 ? requested : 1500, 10_000);
 
-        const started = runtime.cron.runJobNow((j) => runtime.runJobTask(j), id, {
+        const started = runtime.cron.runJobNow((j) => runtime.runJobTask(runInput ? { ...j, input: { ...(j.input ?? {}), ...runInput } } : j), id, {
           source: "manual",
           onTimeout: (timedOutJob, timeoutMs) => {
             events.emit("cron-job-timeout", {

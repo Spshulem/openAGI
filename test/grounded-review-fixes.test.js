@@ -100,3 +100,61 @@ test("an auto-created suggestion task grades the suggestion when it gets done", 
   rt.tasks.complete(task.id, "manual");
   assert.equal(rt.outcomes.byWorkRef("work-suggestion", "prop_auto").groundedFate, "accepted-done");
 });
+
+test("completing a suggestion's task through update() (the PATCH route) grades it done", () => {
+  const rt = setup();
+  rt.grounded.onSuggestionResolved({ id: "prop_patch", proposedAt: new Date().toISOString() }, "accepted");
+  const task = rt.tasks.add({ title: "Edit-completed", sourceMeta: { suggestionId: "prop_patch" } }, { source: "suggestion", queue: "user" });
+  rt.tasks.update(task.id, { status: "completed" });
+  assert.equal(rt.outcomes.byWorkRef("work-suggestion", "prop_patch").groundedFate, "accepted-done");
+});
+
+test("a stalled suggestion whose task gets done later is regraded done by the sweep", () => {
+  const rt = setup();
+  rt.grounded.onSuggestionResolved({ id: "prop_late", proposedAt: new Date().toISOString() }, "accepted");
+  const task = rt.tasks.add({ title: "Late", sourceMeta: { suggestionId: "prop_late" } }, { source: "suggestion", queue: "user" });
+  rt.grounded.sweep({ now: new Date(Date.now() + 31 * DAY) });
+  assert.equal(rt.outcomes.byWorkRef("work-suggestion", "prop_late").groundedFate, "accepted-stalled");
+  task.status = "completed";                                   // completed with no hook running
+  rt.grounded.sweep({ now: new Date(Date.now() + 32 * DAY) });
+  assert.equal(rt.outcomes.byWorkRef("work-suggestion", "prop_late").groundedFate, "accepted-done");
+});
+
+test("backfill keeps automatic task creation apart from an owner acceptance", async () => {
+  const { createDurableRuntime, DeterministicModelProvider } = await import("../src/index.js");
+  const runtime = createDurableRuntime({ dataDir: tmp("openagi-backfill-auto-"), modelProvider: new DeterministicModelProvider(), autoConnectMcp: false });
+  fs.writeFileSync(path.join(runtime.proactiveObserver.suggestDir, "prop_auto2.json"), JSON.stringify({
+    id: "prop_auto2", status: "accepted", taskAutoCreated: true, category: "task", title: "auto", proposedAt: "2026-07-01T10:00:00.000Z"
+  }));
+  runtime.tasks.add({ title: "Auto, still open", sourceMeta: { suggestionId: "prop_auto2" } }, { source: "suggestion", queue: "user" });
+  const report = await runtime.runJobTask({ id: "grounded-backfill", task: "grounded-backfill", input: { apply: true } });
+  assert.deepEqual(report.suggestions.byFate, { "auto-accepted": 1 });
+  const o = runtime.outcomes.byWorkRef("work-suggestion", "prop_auto2");
+  assert.equal(o.groundedFate, "auto-accepted");
+  assert.equal(o.groundedScore, null);
+});
+
+test("POST /cron/:id/run passes { input } to that run only", async () => {
+  const { createDurableRuntime, createHostedInterface, DeterministicModelProvider } = await import("../src/index.js");
+  const runtime = createDurableRuntime({ dataDir: tmp("openagi-manual-input-"), modelProvider: new DeterministicModelProvider(), autoConnectMcp: false });
+  fs.writeFileSync(path.join(runtime.proactiveObserver.suggestDir, "prop_r.json"), JSON.stringify({
+    id: "prop_r", status: "rejected", category: "task", title: "r", proposedAt: "2026-07-01T10:00:00.000Z"
+  }));
+  const app = createHostedInterface(runtime, { port: 0, authToken: "manual-run-token" });
+  const { url } = await app.listen();
+  const run = (body) => fetch(`${url}/cron/grounded-backfill/run?wait=5000`, {
+    method: "POST", headers: { "content-type": "application/json", authorization: "Bearer manual-run-token" }, body
+  }).then(async (r) => ({ status: r.status, json: await r.json() }));
+  try {
+    const dry = await run("{}");
+    assert.equal(dry.status, 200);
+    assert.equal(dry.json.result.dryRun, true);
+    const applied = await run(JSON.stringify({ input: { apply: true } }));
+    assert.equal(applied.json.result.dryRun, false);
+    assert.equal(runtime.outcomes.byWorkRef("work-suggestion", "prop_r").groundedFate, "rejected");
+    assert.deepEqual(runtime.cron.listJobs().find((j) => j.id === "grounded-backfill").input ?? {}, {}, "stored job unchanged");
+    assert.equal((await run("{not json")).status, 400);
+  } finally {
+    await app.close();
+  }
+});

@@ -19,7 +19,7 @@ import { safeJoinOrNull } from "./path-guard.js";
 const ENVELOPE_FIELDS = [
   "id", "proposedAt", "category", "title", "rationale", "status",
   "draftBody", "taskQueue", "taskBucket", "mcpId", "mcpRegister",
-  "context", "resolvedAt", "note", "source",
+  "context", "resolvedAt", "note", "source", "taskAutoCreated",
   // Backlog triage keeps pending rows in the feed but records that they were
   // already reviewed. Carry the audit block through normalization so a later
   // bounded pass can prefer untouched rows instead of judging the same oldest

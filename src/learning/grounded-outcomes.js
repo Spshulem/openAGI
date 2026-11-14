@@ -180,7 +180,13 @@ export class GroundedOutcomes {
         count(fate);
       }
       for (const outcome of [...this.outcomes.outcomes.values()]) {
-        if (outcome.kind === "work-suggestion" && (outcome.groundedFate === "accepted" || outcome.groundedFate === "auto-accepted")
+        if (outcome.kind === "work-suggestion" && outcome.groundedFate === "accepted-stalled") {
+          // A stalled suggestion whose task got done later, by any route.
+          if (this.linkedTask(outcome.refId)?.status === "completed") {
+            this._ground(outcome, "accepted-done", { source: "suggestion" });
+            count("accepted-done");
+          }
+        } else if (outcome.kind === "work-suggestion" && (outcome.groundedFate === "accepted" || outcome.groundedFate === "auto-accepted")
             && t - Date.parse(outcome.groundedAt) >= SUGGESTION_STALLED_DAYS * DAY_MS) {
           // Only suggestions that became a task can stall. A skill, an MCP
           // connection or saved knowledge is done when accepted and keeps that grade.
@@ -213,13 +219,15 @@ export class GroundedOutcomes {
       const bump = (bucket, fate) => { bucket.byFate[fate] = (bucket.byFate[fate] ?? 0) + 1; };
       for (const s of listAllSuggestions(this.runtime, { status: null }) ?? []) {
         if (!s?.id || !s.status || s.status === "pending") continue;
-        const fate = s.status === "auto-dismissed"
+        // An "accepted" status written by automatic task creation is not an owner vote.
+        const status = s.status === "accepted" && s.taskAutoCreated ? "auto-accepted" : s.status;
+        const fate = status === "auto-dismissed"
           ? (this.delivered("suggestion", s.id) ? "silence-delivered" : "silence-undelivered")
-          : SUGGESTION_STATUS_FATES[s.status];
+          : SUGGESTION_STATUS_FATES[status];
         if (!fate) continue;
         if (already("work-suggestion", s.id)) { report.skipped += 1; continue; }
         bump(report.suggestions, fate);
-        if (apply) this.onSuggestionResolved(s, s.status);
+        if (apply) this.onSuggestionResolved(s, status);
       }
       for (const d of this.runtime?.drafts?.list?.({ status: null }) ?? []) {
         if (!["approved", "discarded", "sent"].includes(d.status)) continue;
