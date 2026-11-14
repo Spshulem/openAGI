@@ -37,6 +37,7 @@ export async function executeSafePrMerge({
   prRef,
   expectedHeadSha = null,
   mergePolicy = "manual_confirm",
+  ownerConfirmed = false,
   ghBin = "gh",
   run = runCommand
 } = {}) {
@@ -50,7 +51,7 @@ export async function executeSafePrMerge({
     [
       "pr", "view", String(parsed.number),
       "--repo", parsed.repo,
-      "--json", "state,isDraft,mergeStateStatus,mergeable,headRefOid,statusCheckRollup,url"
+      "--json", "state,isDraft,mergeStateStatus,mergeable,reviewDecision,headRefOid,statusCheckRollup,url"
     ],
     { timeoutMs: 25_000 }
   );
@@ -161,7 +162,15 @@ export async function executeSafePrMerge({
     };
   }
 
-  if (mergeState === "BLOCKED" || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
+  const reviewDecision = String(view.reviewDecision ?? "").toUpperCase();
+  const hasNonEmptyGreenRollup = Array.isArray(view.statusCheckRollup) && view.statusCheckRollup.length > 0;
+  const ownerOverrideEligible = ownerConfirmed === true
+    && mergeState === "BLOCKED"
+    && mergeable === "MERGEABLE"
+    && reviewDecision === "REVIEW_REQUIRED"
+    && hasNonEmptyGreenRollup;
+
+  if ((mergeState === "BLOCKED" && !ownerOverrideEligible) || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
     return {
       status: "halted",
       reason: "blocked",
@@ -184,6 +193,31 @@ export async function executeSafePrMerge({
       detail: `Merged ${prRef} via squash.`
     };
   }
+
+  if (ownerOverrideEligible || (ownerConfirmed === true && mergeable === "MERGEABLE" && hasNonEmptyGreenRollup && reviewDecision === "REVIEW_REQUIRED")) {
+    const adminRes = await run(
+      ghBin,
+      ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--admin", "--squash", ...headArgs],
+      { timeoutMs: 30_000 }
+    );
+    if (adminRes.code === 0) {
+      return {
+        status: "merged",
+        prRef,
+        headRefOid: liveSha || null,
+        url: view.url ?? null,
+        adminOverride: true,
+        detail: `Merged ${prRef} via squash (owner-confirmed branch protection override).`
+      };
+    }
+    return {
+      status: "halted",
+      reason: "gh_merge_failed",
+      prRef,
+      detail: clampText(redactSecrets(adminRes.stderr || adminRes.stdout || mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection or admin permissions)."), 220)
+    };
+  }
+
   return {
     status: "halted",
     reason: "gh_merge_failed",

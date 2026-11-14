@@ -283,8 +283,8 @@ export function registerFleetTools(registry, supervisor) {
       type: "object",
       properties: {
         cardId: { type: "string", minLength: 1, maxLength: 120 },
-        op: { type: "string", enum: ["primary", "secondary", "defer", "dismiss", "fix_ci", "merge", "answer", "open_chat", "preference", "veto", "ship"] },
-        value: { type: "string", maxLength: 200 },
+        op: { type: "string", enum: ["primary", "secondary", "defer", "dismiss", "fix_ci", "merge", "merge_and_deploy", "answer", "reply", "open_chat", "preference", "veto", "ship"] },
+        value: { type: "string", maxLength: MESSAGE_MAX },
         clarification: { type: "string", maxLength: MESSAGE_MAX },
         instructions: { type: "string", maxLength: MESSAGE_MAX }
       },
@@ -398,14 +398,17 @@ function fleetCardTarget(supervisor, args = {}) {
     : rawOp;
   const resolvedValue = explicitValue
     ?? (actionObj?.value != null ? String(actionObj.value).trim() : null)
+    ?? (resolvedOp === "merge" || resolvedOp === "ship" || resolvedOp === "merge_and_deploy" ? (card?.prRef ?? question?.prRef ?? null) : null)
     ?? (resolvedOp === "answer" ? (question?.options ?? []).find((opt) => opt !== "dismiss") ?? null : null);
   const actionLabel = resolvedOp === "defer" || resolvedOp === "dismiss"
     ? "Defer"
     : resolvedOp === "fix_ci"
       ? clip(actionObj?.label || "Ask coding session to fix CI", 60)
-      : resolvedOp === "merge" || resolvedOp === "ship"
-        ? clip(actionObj?.label || `Merge ${card?.prRef ?? resolvedValue ?? "PR"}`, 60)
-        : clip(resolvedValue || actionObj?.label || resolvedOp, 60);
+      : resolvedOp === "merge_and_deploy"
+        ? clip(`Merge & deploy ${card?.prRef ?? resolvedValue ?? "PR"}`, 60)
+        : resolvedOp === "merge" || resolvedOp === "ship"
+          ? clip(actionObj?.label || `Merge ${card?.prRef ?? resolvedValue ?? "PR"}`, 60)
+          : clip(resolvedValue || actionObj?.label || resolvedOp, 60);
   return {
     cardId: card?.id ?? question.id,
     op: resolvedOp,

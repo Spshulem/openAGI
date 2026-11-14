@@ -74,18 +74,26 @@ function isQuestionLiveForDeck(question, row, prefs) {
   return true;
 }
 
+function cleanWorkspaceName(workspace) {
+  const raw = typeof workspace === "string" ? workspace.trim() : "";
+  if (!raw || /^wks_[0-9a-f]+$/i.test(raw)) return null;
+  return raw;
+}
+
 function buildActionsForQuestion(question, row, prRef) {
   const options = Array.isArray(question.options) ? question.options.filter(Boolean) : [];
   const ciState = row?.pr?.ci?.state ?? null;
   const mergeState = row?.pr?.mergeState ?? null;
+  const appOnlyCard = question.answerIn === "agent app" || (question.kind === "agent-card" && question.answerIn !== "here");
 
-  if (question.answerIn === "agent app" || question.kind === "agent-card") {
+  if (appOnlyCard) {
     const chatLabel = question.openChat?.app
       ? `Open in ${question.openChat.app.charAt(0).toUpperCase() + question.openChat.app.slice(1)}`
       : "Open in app";
     return {
       primaryAction: { op: "open_chat", label: chatLabel, value: options.includes("open thread") ? "open thread" : "opened", destructive: false },
-      secondaryAction: { op: "defer", label: "Later", value: "dismiss", destructive: false }
+      secondaryAction: { op: "defer", label: "Later", value: "dismiss", destructive: false },
+      extraActions: []
     };
   }
 
@@ -93,22 +101,29 @@ function buildActionsForQuestion(question, row, prRef) {
     if (ciState === "FAILURE" || ciState === "ERROR" || mergeState === "DIRTY") {
       return {
         primaryAction: { op: "fix_ci", label: mergeState === "DIRTY" ? "Have agent rebase" : "Have agent fix CI", value: "fix_ci", destructive: false },
-        secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false }
+        secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false },
+        extraActions: []
       };
     }
     if (ciState === "PENDING" || ciState === "IN_PROGRESS") {
       return {
         primaryAction: { op: "merge", label: "Watch CI", value: prRef, destructive: false },
-        secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false }
+        secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false },
+        extraActions: []
       };
+    }
+    const extraActions = [];
+    if (question.threadKey || row?.key) {
+      extraActions.push({ op: "merge_and_deploy", label: "Merge & Deploy", value: prRef, destructive: false });
     }
     return {
       primaryAction: { op: "merge", label: "Merge PR", value: prRef, destructive: false },
-      secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false }
+      secondaryAction: { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false },
+      extraActions
     };
   }
 
-  const realOptions = options.filter((opt) => opt !== "dismiss");
+  const realOptions = options.filter((opt) => !["dismiss", "open thread"].includes(String(opt).toLowerCase()));
   const first = realOptions[0] ?? null;
   const second = realOptions[1] ?? null;
   const primaryAction = first
@@ -124,7 +139,25 @@ function buildActionsForQuestion(question, row, prRef) {
     ? { op: "answer", label: humanOptionLabel(second), value: second, destructive: /^(?:delete|destroy|wipe)$/i.test(second) }
     : { op: "defer", label: "Later", value: options.includes("later") ? "later" : "dismiss", destructive: false };
 
-  return { primaryAction, secondaryAction };
+  const extraActions = realOptions
+    .slice(2, 4)
+    .filter((opt) => !["later", "dismiss"].includes(opt.toLowerCase()))
+    .map((opt) => ({
+      op: "answer",
+      label: humanOptionLabel(opt),
+      value: opt,
+      destructive: /^(?:delete|destroy|wipe)$/i.test(opt)
+    }));
+  if (second && !["later", "dismiss"].includes(second.toLowerCase())) {
+    extraActions.push({
+      op: "defer",
+      label: "Later",
+      value: options.includes("later") ? "later" : "dismiss",
+      destructive: false
+    });
+  }
+
+  return { primaryAction, secondaryAction, extraActions };
 }
 
 function buildRecommendation(question, row, prRef, prefs) {
@@ -241,7 +274,7 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
   const prRef = question.prRef ?? row?.pr?.ref ?? null;
   const parsedPr = parsePrRef(prRef);
   const { kind, kindLabel, rank } = classifyCardKind(question);
-  const { primaryAction, secondaryAction } = buildActionsForQuestion(question, row, prRef);
+  const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef);
 
   return {
     id: question.id,
@@ -256,7 +289,7 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     threadKeys: question.threadKeys ?? (primaryKey ? [primaryKey] : []),
     repo: row?.repo ?? parsedPr?.repo ?? null,
     branch: row?.branch ?? null,
-    workspace: row?.workspace ?? null,
+    workspace: cleanWorkspaceName(row?.workspace),
     prRef: prRef ?? null,
     prUrl: row?.pr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null),
     prNumber: parsedPr?.number ?? null,
@@ -269,6 +302,7 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     options: Array.isArray(question.options) ? [...question.options] : [],
     primaryAction,
     secondaryAction,
+    extraActions,
     timeline: buildTimeline(question, row, actions),
     resources: buildResources(question, row, prRef),
     openChat: question.openChat ?? row?.openChat ?? null
@@ -287,22 +321,29 @@ export function buildActiveSummary(snapshot, liveCards = []) {
     const group = row.watch?.group ?? null;
     const isRunning = row.agentStatus === "running" || row.state === "running" || group === "working";
     const isCi = row.state === "waiting-ci" || group === "waiting" || row.pr?.ci?.state === "PENDING";
+    const isAttention = row.requiresAttention === true;
     const isBlocked = row.health === "red" || group === "you" || group === "blocked";
     if (isRunning) running += 1;
     else if (isCi) waitingCi += 1;
     else if (isBlocked) blocked += 1;
     else quiet += 1;
 
-    if (isRunning || isCi || isBlocked || group === "push") {
+    if (isRunning || isCi || isBlocked || isAttention || group === "push") {
       activeThreads.push({
         key: row.key,
         kind: row.kind ?? null,
-        title: row.title || row.workspace || row.key,
+        title: row.title || cleanWorkspaceName(row.workspace) || row.key,
         repo: row.repo ?? null,
         branch: row.branch ?? null,
         state: row.state ?? "unknown",
         health: row.health ?? "gray",
+        watchGroup: group,
+        requiresAttention: isAttention,
+        attentionReason: row.attentionReason ?? null,
+        pushAvailable: Boolean(row.pushPreview),
+        muted: Boolean(row.muted),
         reason: row.reason ?? null,
+        lastAgentText: row.lastAgentText ? clampText(redactSecrets(row.lastAgentText), 220) : null,
         prRef: row.pr?.ref ?? null,
         ciState: row.pr?.ci?.state ?? null,
         lastActivityAt: row.lastActivityAt ?? null,
@@ -318,7 +359,7 @@ export function buildActiveSummary(snapshot, liveCards = []) {
     needsYou: liveCards.filter((c) => c.kind !== "preference").length,
     blocked,
     quiet,
-    activeThreads: activeThreads.slice(0, 30)
+    activeThreads: activeThreads.slice(0, 60)
   };
 }
 

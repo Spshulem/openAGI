@@ -1,12 +1,95 @@
 // Native Paseo reads. Never creates/imports/reloads an agent or changes its mode.
-import { SUPERVISOR_PREFIX, clampText, redactSecrets, parsePrRef } from "../contracts.js";
+import os from "node:os";
+import { SUPERVISOR_PREFIX, clampText, cleanCardItem, redactSecrets, parsePrRef } from "../contracts.js";
 import { classifyErrorText } from "../errors.js";
+
+const CODE_PATH_OWNERS = new Set(["src", "app", "packages", "apps", "lib", "test", "tests", "server", "client", "docs", "scripts"]);
+
+function isLocalPaseoHost(hostname) {
+  const clean = String(hostname ?? "").replace(/^\[|\]$/g, "").toLowerCase();
+  if (["localhost", "127.0.0.1", "::1"].includes(clean)) return true;
+  try {
+    for (const entries of Object.values(os.networkInterfaces())) {
+      for (const entry of entries ?? []) {
+        if (String(entry?.address ?? "").toLowerCase() === clean) return true;
+      }
+    }
+  } catch { /* ignore interface probe errors */ }
+  return false;
+}
+
+function extractPaseoPrRefs(messages, title = "") {
+  const refs = [];
+  const repos = [];
+  const pushRef = (repo, num) => {
+    const cleanRepo = String(repo ?? "").trim();
+    const cleanNum = String(num ?? "").trim();
+    const [owner] = cleanRepo.split("/");
+    if (!owner || CODE_PATH_OWNERS.has(owner.toLowerCase()) || !/^\d+$/.test(cleanNum)) return;
+    repos.push(cleanRepo);
+    const ref = `${cleanRepo}#${cleanNum}`;
+    if (!refs.includes(ref)) refs.push(ref);
+  };
+  for (const entry of messages.slice().reverse()) {
+    const body = String(entry.item?.text ?? "");
+    for (const m of body.matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)) {
+      pushRef(m[1], m[2]);
+    }
+    for (const m of body.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+(\d+)[^\n]{0,120}?--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/g)) {
+      pushRef(m[2], m[1]);
+    }
+    for (const m of body.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+(\d+)\b/g)) {
+      pushRef(m[1], m[2]);
+    }
+    for (const m of body.matchAll(/(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)\b/g)) {
+      pushRef(m[1], m[2]);
+    }
+    for (const m of body.matchAll(/--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/g)) {
+      const [owner] = m[1].split("/");
+      if (owner && !CODE_PATH_OWNERS.has(owner.toLowerCase())) repos.push(m[1]);
+    }
+  }
+  const uniqueRepos = [...new Set(repos)];
+  if (uniqueRepos.length === 1) {
+    for (const m of String(title ?? "").matchAll(/(?:^|\s|\bPR\s*)#(\d+)\b/gi)) {
+      pushRef(uniqueRepos[0], m[1]);
+    }
+  }
+  return refs.slice(0, 8);
+}
+
+function extractPaseoPendingCard(agent) {
+  const rawQuestions = agent?.persistence?.metadata?.asyncQuestions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
+  const unresolved = rawQuestions.filter((q) => q && typeof q === "object" && q.resolution == null && String(q.question ?? "").trim());
+  if (!unresolved.length) return null;
+  const items = unresolved.map((q, index) => cleanCardItem({
+    index,
+    itemId: String(q.id ?? index),
+    header: q.header ?? null,
+    question: q.question ?? "",
+    options: Array.isArray(q.options)
+      ? q.options.map((opt) => (typeof opt === "string" ? opt : opt?.label ?? opt?.value ?? "")).filter(Boolean)
+      : [],
+    multiSelect: Boolean(q.multiSelect),
+    freeText: q.freeText !== false,
+    at: q.askedAt ?? q.createdAt ?? agent.updatedAt ?? null
+  }));
+  if (!items.length) return null;
+  return {
+    app: "paseo",
+    cardId: String(unresolved[0].id ?? `paseo-${agent.id}`),
+    at: items[0].at ?? agent.updatedAt ?? null,
+    count: rawQuestions.length,
+    items
+  };
+}
 
 export async function withPaseo(config, operation, factory) {
   const settings = config.paseo ?? {};
   const url = new URL(settings.url ?? "ws://127.0.0.1:6767/ws");
   if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password) throw new Error("Invalid Paseo endpoint");
-  if (url.protocol === "ws:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("Remote Paseo endpoints require wss");
+  if (url.protocol === "ws:" && !isLocalPaseoHost(url.hostname)) throw new Error("Remote Paseo endpoints require wss");
   // The embedded mobile daemon omits desktop integrations. Load the SDK only
   // when Paseo is actually used, so disabled integrations cannot break boot.
   factory ??= (await import("@getpaseo/client")).createPaseoClient;
@@ -57,14 +140,15 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const supervisor = users.findLast(e => e.item.text?.startsWith(SUPERVISOR_PREFIX));
   const assistant = messages.findLast(e => e.item.type === "assistant_message");
   const aliases = [];
-  const source = agent.labels?.["migration.source"], sourceId = agent.labels?.["migration.sourceId"];
-  if (["codex", "claude", "conductor", "antigravity"].includes(source) && sourceId) aliases.push(`${source}:${sourceId}`);
+  const rawSource = String(agent.labels?.["migration.source"] ?? "").trim().toLowerCase();
+  const sourceId = agent.labels?.["migration.sourceId"];
+  if (["codex", "claude", "conductor", "antigravity"].includes(rawSource) && sourceId) aliases.push(`${rawSource}:${sourceId}`);
   const nativeId = agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId;
-  if (["codex", "claude"].includes(agent.provider) && nativeId) aliases.push(`${agent.provider}:${nativeId}`);
+  const rawProvider = String(agent.provider ?? "").trim().toLowerCase();
+  if (["codex", "claude", "antigravity"].includes(rawProvider) && nativeId) aliases.push(`${rawProvider}:${nativeId}`);
   const text = redactSecrets(assistant?.item.text ?? "").slice(-8000);
-  const prRefs = [...new Set(messages.slice().reverse().flatMap(e =>
-    [...String(e.item.text ?? "").matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)].map(m => `${m[1]}#${m[2]}`)
-  ))].slice(0, 8);
+  const prRefs = extractPaseoPrRefs(messages, agent.title ?? "");
+  const pendingCard = extractPaseoPendingCard(agent);
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
@@ -82,6 +166,8 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: Boolean(agent.pendingPermissions?.length),
+      requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
+      ...(pendingCard ? { pendingCard } : {}),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,
       conversation: messages.filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX)).map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
   };
@@ -123,8 +209,11 @@ export function createPaseoSource({ factory } = {}) {
       const live = new Set(inventory.map(r => r.key));
       for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
       const candidates = inventory.filter(({ agent: a, key }) => !a.archivedAt && ["idle", "error"].includes(a.status)
-        && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) => (cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0));
-      const budget = Math.min(24, Math.max(1, config.paseo.historyPerScan ?? 12));
+        && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) =>
+          ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
+          || (Number(Boolean(b.agent.requiresAttention)) - Number(Boolean(a.agent.requiresAttention)))
+          || ((Date.parse(b.agent.updatedAt ?? "") || 0) - (Date.parse(a.agent.updatedAt ?? "") || 0)));
+      const budget = Math.min(80, Math.max(1, config.paseo.historyPerScan ?? 48));
       for (let offset = 0; offset < Math.min(budget, candidates.length); offset += 4) {
         signal.throwIfAborted();
         await Promise.all(candidates.slice(offset, Math.min(offset + 4, budget)).map(async row => {
@@ -134,7 +223,7 @@ export function createPaseoSource({ factory } = {}) {
             // A single slow imported history must not discard the entire fleet.
             let historyTimer;
             const history = await Promise.race([
-              api.agents.ref(a.id).timeline.refetch({ direction: "tail", limit: 12 }),
+              api.agents.ref(a.id).timeline.refetch({ direction: "tail", limit: 80 }),
               new Promise((_, reject) => { historyTimer = setTimeout(() => reject(new Error("History timed out")), config.paseo.historyTimeoutMs ?? 3000); })
             ]).finally(() => clearTimeout(historyTimer));
             signal.throwIfAborted();
@@ -142,6 +231,7 @@ export function createPaseoSource({ factory } = {}) {
             // Cache bounded messages and provider errors, never tool output or
             // images. Dropping error items hides failures from the next scan.
             const entries = history.entries.filter(e => ["user_message", "assistant_message", "error"].includes(e.item?.type))
+              .slice(-24)
               .map(e => ({ timestamp: e.timestamp, item: e.item.type === "error"
                 ? { type: "error", message: redactSecrets(e.item.message ?? "").slice(0, 8000) }
                 : { type: e.item.type, text: redactSecrets(e.item.text ?? "").slice(-8000) } }));

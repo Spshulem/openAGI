@@ -319,6 +319,33 @@ function envNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function resolveLocalPaseoDefaults(home, env = process.env) {
+  const paseoHome = String(env.PASEO_HOME ?? "").trim() || path.join(home, ".paseo");
+  let listen = null;
+  let tlsEnabled = false;
+  let password = undefined;
+  try {
+    const pidInfo = JSON.parse(fs.readFileSync(path.join(paseoHome, "paseo.pid"), "utf8"));
+    if (typeof pidInfo?.listen === "string" && pidInfo.listen.trim()) listen = pidInfo.listen.trim();
+  } catch { /* optional */ }
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(paseoHome, "config.json"), "utf8"));
+    tlsEnabled = Boolean(cfg?.tls?.enabled);
+  } catch { /* optional */ }
+  try {
+    const rawPw = fs.readFileSync(path.join(paseoHome, "pilot-password"), "utf8").trim();
+    if (rawPw) password = rawPw;
+  } catch { /* optional */ }
+  let url = "ws://127.0.0.1:6767/ws";
+  if (listen) {
+    const normalized = listen.startsWith(":")
+      ? `127.0.0.1${listen}`
+      : listen.replace(/^0\.0\.0\.0:/, "127.0.0.1:");
+    url = `${tlsEnabled ? "wss" : "ws"}://${normalized}/ws`;
+  }
+  return { url, password };
+}
+
 // Single place that turns env + explicit overrides into the config every
 // unit receives. Overrides win over env; env wins over defaults.
 export function resolveFleetConfig(env = process.env, overrides = {}) {
@@ -409,15 +436,18 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     },
     // Antigravity conversations: read, and sent to with agentapi, unless
     // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
-    paseo: {
-      enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
-      only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
-      pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
-      url: env.OPENAGI_PASEO_URL || "ws://127.0.0.1:6767/ws",
-      password: env.OPENAGI_PASEO_PASSWORD,
-      serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
-      ...overrides.paseo
-    },
+    paseo: (() => {
+      const localPaseo = resolveLocalPaseoDefaults(home, env);
+      return {
+        enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
+        only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
+        pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
+        url: env.OPENAGI_PASEO_URL || localPaseo.url,
+        password: env.OPENAGI_PASEO_PASSWORD ?? localPaseo.password,
+        serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
+        ...overrides.paseo
+      };
+    })(),
     antigravity: {
       enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
     },

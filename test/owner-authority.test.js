@@ -143,3 +143,12 @@ test("explicit forwarding and a recipient before the send instruction express me
 test("an acknowledgement is not assent", () => {
   for (const text of ["ok thanks", "ok thank you", "thanks", "yes thank you"]) assert.equal(matchConfirmation(text), null, text);
 });
+
+test("natural casual owner approvals like 'Sure sounds fine' cover card and question actions without code friction", () => {
+  for (const text of ["Sure sounds fine", "sounds fine", "looks fine", "fine with me", "works for me", "sure, do that", "merge and deploy"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_act_card"), true, text);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_answer_question"), true, text);
+  }
+  assert.deepEqual(matchConfirmation("Sure sounds fine"), { decision: "approve", code: null });
+  assert.deepEqual(matchConfirmation("Works for me"), { decision: "approve", code: null });
+});

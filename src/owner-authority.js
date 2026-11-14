@@ -47,7 +47,7 @@ export function authorityRecord(principal) {
 // never count, so "what is the Claude agent doing?" or "what did codex say?"
 // names no action. A family with nouns also needs one of them somewhere in
 // the text ("open Safari", not just "open").
-const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|yes|yeah|yep|so|let's|lets|go ahead and|(?:can|could|would|will) you|(?:want|need) you to)\b)\s*(?:(?:please|just|now|also)\s+)*`;
+const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|sure|yes|yeah|yep|so|let's|lets|go ahead and|(?:can|could|would|will) you|(?:want|need) you to)\b)\s*(?:(?:please|just|now|also)\s+)*`;
 
 const ARTICLES = String.raw`(?:(?:a|an|the|my|another|new|up)\s+)*`;
 const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|sessions?|runs?|tasks?))`;
@@ -66,8 +66,8 @@ export const INTENT_FAMILIES = Object.freeze({
   approve: {
     pattern: [
       String.raw`(?:click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer|defer|dismiss|skip|veto)\b`,
-      String.raw`(?:merge|ship)\s+(?:it|this|that|the\s+(?:pr|pull request|[\w-]+\s+one)|pr\b|#\d+)`,
-      String.raw`(?:go for it|go ahead|do it|looks good|sounds good|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current)\b`,
+      String.raw`(?:merge|ship)\s+(?:it|this|that|the\s+(?:pr|pull request|[\w-]+\s+one)|pr\b|#\d+|and\s+deploy\b)`,
+      String.raw`(?:go for it|go ahead|do (?:it|that)|looks (?:good|fine)|sounds (?:good|fine)|fine (?:with|by) me|works for me|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current)\b`,
       String.raw`don['’]?t do that\b`
     ].join("|"),
     tools: ["fleet_click", "fleet_answer_question", "fleet_act_card", "fleet_preferences"]
@@ -161,8 +161,9 @@ export function ownerIntentText(text) {
 
 const YES_PHRASES = [
   "click approve", "click allow", "click yes", "click it", "press approve", "tap approve",
-  "go for it", "ship it", "merge it", "looks good", "sounds good",
-  "go ahead", "do it", "send it", "run it", "yes please",
+  "fine with me", "fine by me", "works for me",
+  "go for it", "ship it", "merge it", "looks good", "looks fine", "sounds good", "sounds fine",
+  "go ahead", "do it", "do that", "send it", "run it", "yes please",
   "yes", "yeah", "yep", "yup", "ok", "okay", "sure", "approve", "approved", "confirm", "confirmed", "proceed", "allow", "lgtm"
 ].map((phrase) => phrase.split(" "));
 const NO_PHRASES = [
