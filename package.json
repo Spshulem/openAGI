@@ -22,7 +22,7 @@
     "build-mac-app": "./scripts/build-mac-app.sh",
     "docker:build": "docker build -t openagi:local .",
     "docker:run": "docker run --rm -p 43210:43210 -v openagi-data:/data openagi:local",
-    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test": "node --test --test-concurrency=1 --import ./test/support/hermetic-env.js test/*.test.js",
     "qa:capabilities": "node qa/run.mjs",
     "cli": "node bin/openagi.js"
   },
