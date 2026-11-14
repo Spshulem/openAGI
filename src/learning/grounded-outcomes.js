@@ -1,3 +1,4 @@
+import { listAllSuggestions } from "../suggestion-feed.js";
 import { editSimilarity } from "./edit-similarity.js";
 
 // Grades the system's own work by what happened to it afterwards: a draft
@@ -176,6 +177,36 @@ export class GroundedOutcomes {
       }
     });
     return result;
+  }
+
+  /**
+   * Grade work resolved before grading existed. Dry run unless apply is true.
+   * Skips anything that already has a grounded grade, so repeated runs are safe.
+   */
+  backfill({ apply = false } = {}) {
+    const report = { dryRun: !apply, suggestions: { byFate: {} }, drafts: { byFate: {} }, skipped: 0 };
+    this._safe(() => {
+      const already = (kind, id) => Boolean(this.outcomes.byWorkRef(kind, id)?.groundedFate);
+      const bump = (bucket, fate) => { bucket.byFate[fate] = (bucket.byFate[fate] ?? 0) + 1; };
+      for (const s of listAllSuggestions(this.runtime, { status: null }) ?? []) {
+        if (!s?.id || !s.status || s.status === "pending") continue;
+        const fate = s.status === "auto-dismissed"
+          ? (this.delivered("suggestion", s.id) ? "silence-delivered" : "silence-undelivered")
+          : SUGGESTION_STATUS_FATES[s.status];
+        if (!fate) continue;
+        if (already("work-suggestion", s.id)) { report.skipped += 1; continue; }
+        bump(report.suggestions, fate);
+        if (apply) this.onSuggestionResolved(s, s.status);
+      }
+      for (const d of this.runtime?.drafts?.list?.({ status: null }) ?? []) {
+        if (!["approved", "discarded", "sent"].includes(d.status)) continue;
+        if (already("work-draft", d.id)) { report.skipped += 1; continue; }
+        const fate = d.status === "discarded" ? "discarded" : d.editedAt ? "approved-edited" : d.status;
+        bump(report.drafts, fate);
+        if (apply) this.onDraftResolved(d, d.status);
+      }
+    });
+    return report;
   }
 
   delivered(kind, id) {

@@ -336,6 +336,22 @@ export class AbiRuntime {
       // nightly miner (which reads a 28-day window) and off every other slot, so
       // retention never shares a tick with another job.
       this.cron.addJob({
+        id: "grounded-sweep",
+        name: "Daily grading of drafts, suggestions and agent tasks by what happened",
+        enabled: true,
+        task: "grounded-sweep",
+        dailyAt: "04:45"
+      });
+      // Manual only: run it from the dashboard or POST /cron/grounded-backfill/run
+      // with input { apply: true }. Without apply it reports what it would grade.
+      this.cron.addJob({
+        id: "grounded-backfill",
+        name: "One-time grading of work resolved before grading existed (manual)",
+        enabled: false,
+        task: "grounded-backfill",
+        dailyAt: "04:50"
+      });
+      this.cron.addJob({
         id: "observation-retention",
         name: "Daily observation retention — prune expired capture, reclaim disk",
         enabled: true,
@@ -845,6 +861,12 @@ export class AbiRuntime {
         setTimeout(() => process.exit(0), 500);
       }
       return result;
+    }
+    if (job.task === "grounded-sweep") {
+      return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };
+    }
+    if (job.task === "grounded-backfill") {
+      return this.grounded?.backfill({ apply: job.input?.apply === true }) ?? { skipped: true, reason: "grading unavailable" };
     }
     if (job.task === "observation-retention") {
       const { pruneObservations } = await import("./observation-retention.js");
