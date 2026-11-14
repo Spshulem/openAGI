@@ -87,7 +87,9 @@ const NEED_YOU_PATTERNS = [
   /\byour call\b/i,
   /\bwhich (?:one|option|do you|would you)\b/i,
   /\bplease confirm\b/i,
-  /\b(?:blocked|waiting) on you\b/i,
+  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bwaiting (?:on|for)\W{0,3}(?:you|your|the owner)\b/i,
+  /\b(?:once|when|until) you (?:give|say|approve|confirm)\b/i,
+  /\bwithout your (?:go|approval|ok|okay|confirmation|sign-?off)\b/i,
   /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
   /(?<!\b(?:not|no longer|never)\s+)\bstill need your\b/i,
   /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i

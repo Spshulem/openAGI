@@ -493,8 +493,16 @@ function cardIntent(ctx, card) {
   const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
+  const rawChoices = card.app === "paseo" && item.options.length > 0 && !item.multiSelect
+    ? item.options.slice(0, 3)
+    : [];
+  const clampedChoices = rawChoices.map((opt) => clampText(opt, 40));
+  const needsNumberPrefix = rawChoices.some((opt, idx) => opt.length > 40 || clampedChoices.indexOf(clampedChoices[idx]) !== idx);
+  const inlineOptions = rawChoices.length > 0
+    ? [...rawChoices.map((opt, idx) => (needsNumberPrefix ? clampText(`${idx + 1}. ${opt}`, 40) : opt)), "open thread"]
+    : ["open thread"];
   const question = {
-    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),

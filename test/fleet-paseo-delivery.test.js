@@ -281,3 +281,20 @@ test('another delivery cannot send while turn confirmation is pending', async t 
   assert.equal((await pending).status, 'sent');
   assert.equal(f.sent.length, 1);
 });
+
+test('owner-initiated Paseo sends steer active turns and updated revisions while still blocking closed or permission-locked chats', async t => {
+  const f = setup(t, { status: 'running', activeTurn: { turnId: 'turn-1' }, updatedAt: '2026-01-02T00:00:00Z' });
+  const autoBlocked = await deliverPaseo(f.args);
+  assert.equal(autoBlocked.status, 'blocked', 'automatic nudges remain blocked on running chats');
+  assert.equal(f.sent.length, 0);
+
+  const ownerSteered = await deliverPaseo({ ...f.args, base: { messageHash: 'owner-1', playbook: 'owner-answer' } });
+  assert.equal(ownerSteered.status, 'sent', 'owner answers steer active Paseo chats');
+  assert.equal(f.sent.length, 1);
+
+  const closed = setup(t, { status: 'closed' });
+  assert.equal((await deliverPaseo({ ...closed.args, base: { messageHash: 'owner-2', playbook: 'owner-message' } })).status, 'blocked');
+
+  const permLocked = setup(t, { pendingPermissions: [{}] });
+  assert.equal((await deliverPaseo({ ...permLocked.args, base: { messageHash: 'owner-3', playbook: 'owner-message' } })).status, 'blocked');
+});

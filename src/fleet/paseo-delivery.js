@@ -128,10 +128,15 @@ async function waitForPaseoTurn(ref, receipt, signal, save) {
   }
 }
 
-function ineligibleAgent(agent, thread) {
-  if (!agent || agent.archivedAt || agent.status !== "idle" || agent.activeTurn) return "Paseo chat is active, closed, or unavailable";
+const OWNER_PLAYBOOKS = new Set(["owner-message", "owner-answer"]);
+
+function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
+  if (!agent || agent.archivedAt || agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
+  if (!ownerInitiated && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (ownerInitiated && !["idle", "running", "error"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
-  if (agent.cwd !== thread.meta.paseoCwd || agent.workspaceId !== thread.meta.workspaceId || agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
+  if (agent.cwd !== thread.meta.paseoCwd || agent.workspaceId !== thread.meta.workspaceId) return "Paseo chat changed; scan again before sending";
+  if (!ownerInitiated && agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
   return null;
 }
 
@@ -141,6 +146,7 @@ function ineligibleAgent(agent, thread) {
 // is unsupported: its public API does not offer an atomic idle-only send.
 export async function deliverPaseo({ config, thread, text, store, actionId, base, factory }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
+  const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   if (!config?.paseo?.enabled || thread?.kind !== "paseo" || thread.excluded) return blocked("Paseo delivery is not enabled for this chat");
   if (!store?.dir) return blocked("Paseo delivery needs durable storage");
   const digest = createHash("sha256").update(thread.key).digest("hex");
@@ -161,20 +167,22 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         if (!confirmed) return blocked("Previous delivery has no confirmed turn; no automatic resend");
         writeJsonAtomic(file, { ...previous, pending: false });
         // This receipt belongs to an older action, not the current proposal.
-        return blocked("Previous Paseo turn confirmed; reassess the conversation before another send");
+        if (!ownerInitiated) return blocked("Previous Paseo turn confirmed; reassess the conversation before another send");
       }
-      if (previous?.messageHash === base.messageHash && previous?.activityAt === thread.meta.updatedAt) return blocked("This nudge was already delivered for this chat revision");
+      if (!ownerInitiated && previous?.messageHash === base?.messageHash && previous?.activityAt === thread.meta.updatedAt) {
+        return blocked("This nudge was already delivered for this chat revision");
+      }
       await ref.refresh();
       signal.throwIfAborted();
       const agent = ref.current();
-      const preflight = ineligibleAgent(agent, thread);
+      const preflight = ineligibleAgent(agent, thread, { ownerInitiated });
       if (preflight) return blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
       // refetch updates the SDK handle; check both snapshots so a newer event
       // or an unavailable baseline cannot be hidden by the other snapshot.
-      const changed = ineligibleAgent(baseline.agent, thread) || ineligibleAgent(ref.current(), thread);
+      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated }) || ineligibleAgent(ref.current(), thread, { ownerInitiated });
       if (changed) return blocked(changed);
       const messageId = randomUUID();
       const cursor = timelineCursor(baseline);

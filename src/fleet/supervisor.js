@@ -488,7 +488,10 @@ export function riskyQuestion(question) {
 }
 
 export function canReplyTo(question) {
-  return typeof question?.threadKey === "string" && Boolean(question.threadKey) && REPLY_KINDS.has(question.kind)
+  const isPaseoCard = question?.kind === "agent-card"
+    && (question?.meta?.app === "paseo" || String(question?.threadKey ?? "").startsWith("paseo:"));
+  return typeof question?.threadKey === "string" && Boolean(question.threadKey)
+    && (REPLY_KINDS.has(question.kind) || isPaseoCard)
     && !((question.threadKeys ?? []).length > 1);
 }
 
@@ -988,7 +991,10 @@ export class FleetSupervisor {
     const openChat = question.threadKey ? chatOf(question.threadKey) : null;
     const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
     const options = question.options ?? [];
-    const inApp = question.kind === "agent-card" || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
+    const paseoInlineCard = question.kind === "agent-card"
+      && (openChat?.app === "paseo" || question.meta?.app === "paseo")
+      && options.some((option) => !APP_ONLY_OPTIONS.has(option));
+    const inApp = (question.kind === "agent-card" && !paseoInlineCard) || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
     return {
       ...question,
       askedAt: question.agentAskedAt ?? question.createdAt ?? null,
@@ -1625,10 +1631,12 @@ export class FleetSupervisor {
       return result ? { question: this.store.question(id), delivery: null, fix: result.fix,
         ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}) } : null;
     }
-    // A question card is answered in the app itself. Until the supervisor
-    // can click it there, "open thread" is the only answer and it relays
-    // nothing; anything else is refused.
-    if (question.kind === "agent-card" && answer !== "open thread") return null;
+    // A question card is answered in the app itself unless Paseo exposed
+    // inline choices that can steer the Paseo agent directly.
+    const paseoCardAnswer = question.kind === "agent-card"
+      && (question.meta?.app === "paseo" || String(question.threadKey ?? "").startsWith("paseo:"))
+      && answer !== "open thread";
+    if (question.kind === "agent-card" && answer !== "open thread" && !paseoCardAnswer) return null;
     this.answering.add(id);
     if (question.threadKey) this.ownerAnsweredAt.set(question.threadKey, this.now());
     try {
@@ -1663,8 +1671,24 @@ export class FleetSupervisor {
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
       const retry = question.kind === "infra" && answer === "retry";
-      if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
-        const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
+      if ((question.kind === "agent-ask" || paseoCardAnswer || retry) && question.threadKey && answer !== "open thread") {
+        let deliveredChoice = answer;
+        if (paseoCardAnswer && Array.isArray(question.meta?.labels) && question.meta.labels.length > 0) {
+          if (question.meta.labels.includes(answer)) {
+            deliveredChoice = answer;
+          } else {
+            const numbered = /^([1-4])\.\s/.exec(String(answer ?? ""));
+            const byIndex = numbered ? question.meta.labels[Number(numbered[1]) - 1] : null;
+            if (typeof byIndex === "string" && byIndex.trim()) {
+              deliveredChoice = byIndex;
+            } else {
+              const prefix = String(answer ?? "").replace(/…$/, "").trim();
+              const matches = prefix ? question.meta.labels.filter((label) => label.startsWith(prefix)) : [];
+              if (matches.length === 1) deliveredChoice = matches[0];
+            }
+          }
+        }
+        const message = retry ? RETRY_DELIVERY : ownerDelivery(deliveredChoice);
         const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling });
         if (sent.queued) {
           this.resolveOutreach(question, answer, "acted");
@@ -1710,7 +1734,7 @@ export class FleetSupervisor {
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const risky = riskyQuestion(question);
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-    const route = risky && chosen !== "computer-use" ? null : chosen;
+    const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     let delivery;
     if (!thread || !route) {
       const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
@@ -1797,7 +1821,7 @@ export class FleetSupervisor {
     const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
       || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-    const route = risky && chosen !== "computer-use" ? null : chosen;
+    const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     if (!thread || !route) {
       const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
         : typesLater(thread, deliveryState) ? `${RISKY_WAITS}; send it again once the Mac can type, or approve it in the chat` : RISKY_NO_ROUTE;
@@ -1920,7 +1944,11 @@ export class FleetSupervisor {
     if (!question || question.status !== "open") return null;
 
     const normalizedOp = String(op ?? "primary").toLowerCase();
-    const resolvedAction = normalizedOp === "secondary" ? card?.secondaryAction : (normalizedOp === "primary" ? card?.primaryAction : null);
+    const resolvedAction = normalizedOp === "secondary"
+      ? card?.secondaryAction
+      : normalizedOp === "primary"
+        ? card?.primaryAction
+        : (card?.extraActions ?? []).find((a) => a.op === normalizedOp && (value == null || a.value === value)) ?? null;
     const effectiveOp = normalizedOp === "primary" || normalizedOp === "secondary"
       ? (resolvedAction?.op ?? "answer")
       : normalizedOp;
@@ -1947,13 +1975,15 @@ export class FleetSupervisor {
       };
     }
 
-    if (effectiveOp === "merge" || effectiveOp === "ship") {
+    if (effectiveOp === "merge" || effectiveOp === "ship" || effectiveOp === "merge_and_deploy") {
       const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
       const prefs = this.store.preferences();
       const mergeOutcome = await executeSafePrMerge({
         prRef,
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
+        ownerConfirmed: true,
+        config: this.config,
         ghBin: this.config.bins?.gh ?? "gh",
         run: this.deps.run ?? runCommand
       });
@@ -1968,14 +1998,28 @@ export class FleetSupervisor {
         this.resolveOutreach(question, "merged", "acted");
         this.store.recordAction({
           kind: "pr-merge",
-          playbook: "owner-merge",
+          playbook: effectiveOp === "merge_and_deploy" ? "owner-merge-deploy" : "owner-merge",
           threadKey: question.threadKey ?? null,
           status: "done",
           by: "owner",
           reason: mergeOutcome.detail
         });
-        this.emitFleet("pr-merged");
-        return { ok: true, kind: "merge", ...mergeOutcome };
+        let deployDelivery = null;
+        if (effectiveOp === "merge_and_deploy") {
+          const targetKey = card?.threadKey ?? question.threadKey ?? null;
+          if (targetKey) {
+            const deployPrompt = `Owner merged ${prRef}. Proceed with any post-merge deployment and live smoke verification in scope, and report back once healthy.`;
+            const sent = await this.sendOwnerMessage(targetKey, deployPrompt, { deadlineAt });
+            deployDelivery = sent?.delivery ?? null;
+          }
+        }
+        this.emitFleet(effectiveOp === "merge_and_deploy" ? "pr-merged-deploy" : "pr-merged");
+        const detail = deployDelivery?.status === "sent"
+          ? `${mergeOutcome.detail} Notified coding session to run post-merge deploy & verification.`
+          : deployDelivery
+            ? `${mergeOutcome.detail} (Post-merge session ping blocked: ${deployDelivery.detail ?? "check chat"}.)`
+            : mergeOutcome.detail;
+        return { ok: true, kind: effectiveOp === "merge_and_deploy" ? "merge_and_deploy" : "merge", ...mergeOutcome, detail, ...(deployDelivery ? { deployDelivery } : {}) };
       }
 
       if (mergeOutcome.status === "watching_ci") {
@@ -2025,6 +2069,32 @@ export class FleetSupervisor {
       return fix
         ? { ok: true, kind: "answer", status: "sent", fix, delivery: { status: "sent", detail: "Changes sent to fixer." } }
         : { ok: false, kind: "answer", status: "blocked", detail: "No fix with that id." };
+    }
+
+    if (effectiveOp === "reply") {
+      const replyText = String(effectiveValue ?? "").trim();
+      if (!replyText) return { ok: false, kind: "reply", status: "blocked", detail: "Enter a reply to send." };
+      if (canReplyTo(question)) {
+        const replied = await this.replyQuestion(question.id, replyText, { deadlineAt });
+        if (!replied) return { ok: false, kind: "reply", status: "closed", detail: "Question already closed." };
+        return {
+          ok: !replied.delivery || ["sent", "queued"].includes(replied.delivery.status),
+          kind: "reply",
+          status: replied.delivery?.status ?? "done",
+          detail: replied.delivery?.detail ?? "Delivered reply to coding session.",
+          ...replied
+        };
+      }
+      const targetKey = card?.threadKey ?? question.threadKey ?? null;
+      if (!targetKey) return { ok: false, kind: "reply", status: "blocked", detail: "No coding session is linked to this card." };
+      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt });
+      return {
+        ok: sent?.delivery?.status === "sent",
+        kind: "reply",
+        status: sent?.delivery?.status ?? "blocked",
+        detail: sent?.delivery?.detail ?? (sent?.delivery?.status === "sent" ? "Delivered reply to coding session." : "Could not deliver reply."),
+        delivery: sent?.delivery ?? null
+      };
     }
 
     const answerOption = effectiveValue ?? (question.options ?? []).find((opt) => opt !== "dismiss") ?? null;
@@ -3390,6 +3460,8 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        requiresAttention: Boolean(thread.meta?.requiresAttention),
+        attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).
         openChat: openChatFor(thread),
         watch

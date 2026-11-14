@@ -7,12 +7,61 @@
 //   3. Halts immediately on drift, conflict, or red CI so nothing broken merges.
 
 import { clampText, parsePrRef, redactSecrets, runCommand } from "./contracts.js";
+import { requiredChecksFor } from "./sources/github.js";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
 const PENDING_STATUSES = new Set(["IN_PROGRESS", "QUEUED", "WAITING", "PENDING", "REQUESTED"]);
 const PENDING_STATES = new Set(["PENDING", "EXPECTED"]);
+const GREEN_CONCLUSIONS = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+const GREEN_STATES = new Set(["SUCCESS"]);
+
+function rollupPassesConfiguredGates(rollup, repo, config) {
+  const required = requiredChecksFor(repo, config);
+  if (!required.length) return true;
+  const list = Array.isArray(rollup) ? rollup : [];
+  return required.every(({ name }) => {
+    const matches = list.filter((item) => item && (item.name === name || item.context === name));
+    if (!matches.length) return false;
+    return matches.some((item) => {
+      const state = String(item.state ?? "").toUpperCase();
+      const status = String(item.status ?? "").toUpperCase();
+      const conclusion = String(item.conclusion ?? "").toUpperCase();
+      if (state) return GREEN_STATES.has(state);
+      return status === "COMPLETED" && GREEN_CONCLUSIONS.has(conclusion);
+    });
+  });
+}
+
+async function verifyRequiredBranchChecks(run, ghBin, parsed) {
+  const res = await run(
+    ghBin,
+    ["pr", "checks", String(parsed.number), "--repo", parsed.repo, "--required", "--json", "name,state,bucket"],
+    { timeoutMs: 15_000 }
+  );
+  if (res.code !== 0) {
+    const combined = `${res.stderr ?? ""}\n${res.stdout ?? ""}`;
+    if (/no required checks/i.test(combined)) return { ok: true };
+    return {
+      ok: false,
+      detail: clampText(redactSecrets(res.stderr || res.stdout || "Required branch checks have not all completed and passed."), 220)
+    };
+  }
+  let checks;
+  try {
+    checks = JSON.parse(res.stdout || "[]");
+  } catch {
+    return { ok: false, detail: "Could not parse required branch checks before admin merge override." };
+  }
+  if (!Array.isArray(checks)) return { ok: false, detail: "Unexpected required checks payload from GitHub." };
+  const incomplete = checks.filter((c) => !["pass", "skipping"].includes(String(c?.bucket ?? "").toLowerCase()));
+  if (incomplete.length > 0) {
+    const names = incomplete.map((c) => c?.name || "required check").slice(0, 3).join(", ");
+    return { ok: false, detail: `Required check(s) not yet passing (${names}). Merge halted safely.` };
+  }
+  return { ok: true };
+}
 
 function summarizeRollup(rollup) {
   const list = Array.isArray(rollup) ? rollup : [];
@@ -37,6 +86,8 @@ export async function executeSafePrMerge({
   prRef,
   expectedHeadSha = null,
   mergePolicy = "manual_confirm",
+  ownerConfirmed = false,
+  config = null,
   ghBin = "gh",
   run = runCommand
 } = {}) {
@@ -50,7 +101,7 @@ export async function executeSafePrMerge({
     [
       "pr", "view", String(parsed.number),
       "--repo", parsed.repo,
-      "--json", "state,isDraft,mergeStateStatus,mergeable,headRefOid,statusCheckRollup,url"
+      "--json", "state,isDraft,mergeStateStatus,mergeable,reviewDecision,headRefOid,statusCheckRollup,url"
     ],
     { timeoutMs: 25_000 }
   );
@@ -161,7 +212,17 @@ export async function executeSafePrMerge({
     };
   }
 
-  if (mergeState === "BLOCKED" || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
+  const reviewDecision = String(view.reviewDecision ?? "").toUpperCase();
+  const hasNonEmptyGreenRollup = Array.isArray(view.statusCheckRollup) && view.statusCheckRollup.length > 0;
+  const configuredGatesGreen = rollupPassesConfiguredGates(view.statusCheckRollup, parsed.repo, config);
+  const ownerOverrideEligible = ownerConfirmed === true
+    && mergeState === "BLOCKED"
+    && mergeable === "MERGEABLE"
+    && reviewDecision === "REVIEW_REQUIRED"
+    && hasNonEmptyGreenRollup
+    && configuredGatesGreen;
+
+  if ((mergeState === "BLOCKED" && !ownerOverrideEligible) || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
     return {
       status: "halted",
       reason: "blocked",
@@ -184,6 +245,40 @@ export async function executeSafePrMerge({
       detail: `Merged ${prRef} via squash.`
     };
   }
+
+  if (ownerOverrideEligible || (ownerConfirmed === true && mergeable === "MERGEABLE" && hasNonEmptyGreenRollup && configuredGatesGreen && reviewDecision === "REVIEW_REQUIRED")) {
+    const reqVerification = await verifyRequiredBranchChecks(run, ghBin, parsed);
+    if (!reqVerification.ok) {
+      return {
+        status: "halted",
+        reason: "blocked",
+        prRef,
+        detail: reqVerification.detail
+      };
+    }
+    const adminRes = await run(
+      ghBin,
+      ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--admin", "--squash", ...headArgs],
+      { timeoutMs: 30_000 }
+    );
+    if (adminRes.code === 0) {
+      return {
+        status: "merged",
+        prRef,
+        headRefOid: liveSha || null,
+        url: view.url ?? null,
+        adminOverride: true,
+        detail: `Merged ${prRef} via squash (owner-confirmed branch protection override).`
+      };
+    }
+    return {
+      status: "halted",
+      reason: "gh_merge_failed",
+      prRef,
+      detail: clampText(redactSecrets(adminRes.stderr || adminRes.stdout || mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection or admin permissions)."), 220)
+    };
+  }
+
   return {
     status: "halted",
     reason: "gh_merge_failed",

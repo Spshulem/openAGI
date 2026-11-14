@@ -791,3 +791,238 @@ test("fleet_act_card pins the concrete resolved operation in queued approval arg
     cleanup();
   }
 });
+
+test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge_and_deploy, and inline Paseo choice cards", async () => {
+  // 1. REVIEW_REQUIRED + green checks: halts without ownerConfirmed, succeeds via --admin fallback when ownerConfirmed
+  const calls = [];
+  const runReviewProtected = async (cmd, args) => {
+    calls.push([cmd, ...args]);
+    if (args[0] === "pr" && args[1] === "view") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          state: "OPEN",
+          isDraft: false,
+          mergeStateStatus: "BLOCKED",
+          mergeable: "MERGEABLE",
+          reviewDecision: "REVIEW_REQUIRED",
+          headRefOid: "abc9599def",
+          statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
+          url: "https://github.com/acme/webapp/pull/9599"
+        }),
+        stderr: ""
+      };
+    }
+    if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) {
+      return {
+        code: 0,
+        stdout: JSON.stringify([{ name: "test", state: "SUCCESS", bucket: "pass" }]),
+        stderr: ""
+      };
+    }
+    if (args[0] === "pr" && args[1] === "merge" && !args.includes("--admin")) {
+      return { code: 1, stdout: "", stderr: "X Pull request #9599 is not mergeable: the base branch policy prohibits the merge." };
+    }
+    if (args[0] === "pr" && args[1] === "merge" && args.includes("--admin")) {
+      return { code: 0, stdout: "Merged", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  };
+
+  const haltedUnconfirmed = await executeSafePrMerge({
+    prRef: "acme/webapp#9599",
+    expectedHeadSha: "abc9599",
+    ownerConfirmed: false,
+    run: runReviewProtected
+  });
+  assert.equal(haltedUnconfirmed.status, "halted");
+  assert.equal(calls.length, 1);
+
+  const mergedOwner = await executeSafePrMerge({
+    prRef: "acme/webapp#9599",
+    expectedHeadSha: "abc9599",
+    ownerConfirmed: true,
+    run: runReviewProtected
+  });
+  assert.equal(mergedOwner.status, "merged");
+  assert.equal(mergedOwner.adminOverride, true);
+  assert.ok(calls.at(-1).includes("--admin") && calls.at(-1).includes("--match-head-commit") && calls.at(-1).includes("abc9599def"));
+
+  // CHANGES_REQUESTED must still halt even with ownerConfirmed: true!
+  const changesRequested = await executeSafePrMerge({
+    prRef: "acme/webapp#9599",
+    ownerConfirmed: true,
+    run: async () => ({
+      code: 0,
+      stdout: JSON.stringify({
+        state: "OPEN",
+        isDraft: false,
+        mergeStateStatus: "BLOCKED",
+        mergeable: "MERGEABLE",
+        reviewDecision: "CHANGES_REQUESTED",
+        headRefOid: "abc9599def",
+        statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }]
+      }),
+      stderr: ""
+    })
+  });
+  assert.equal(changesRequested.status, "halted");
+
+  // Missing/expected required check must halt BEFORE --admin even when rollup has an optional green check!
+  let adminAttempted = false;
+  const unpostedRequired = await executeSafePrMerge({
+    prRef: "acme/webapp#9599",
+    ownerConfirmed: true,
+    run: async (_cmd, args) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            state: "OPEN",
+            isDraft: false,
+            mergeStateStatus: "BLOCKED",
+            mergeable: "MERGEABLE",
+            reviewDecision: "REVIEW_REQUIRED",
+            headRefOid: "abc9599def",
+            statusCheckRollup: [{ name: "optional-lint", status: "COMPLETED", conclusion: "SUCCESS" }]
+          }),
+          stderr: ""
+        };
+      }
+      if (args[0] === "pr" && args[1] === "merge" && !args.includes("--admin")) {
+        return { code: 1, stdout: "", stderr: "blocked by branch protection" };
+      }
+      if (args[0] === "pr" && args[1] === "checks" && args.includes("--required")) {
+        return {
+          code: 8,
+          stdout: JSON.stringify([{ name: "required-e2e", state: "EXPECTED", bucket: "pending" }]),
+          stderr: ""
+        };
+      }
+      if (args.includes("--admin")) adminAttempted = true;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+  });
+  assert.equal(unpostedRequired.status, "halted");
+  assert.equal(adminAttempted, false);
+
+  // 2. merge_and_deploy + Paseo inline choice card delivery on risky production choice
+  const delivered = [];
+  const { supervisor, cleanup } = tempSupervisor({
+    ghRun: runReviewProtected
+  });
+  try {
+    await supervisor.setMode("auto");
+    supervisor._executor = {
+      deliver: async (payload) => {
+        delivered.push(payload);
+        return { status: "sent", route: "paseo-send", detail: "Paseo message and turn confirmed" };
+      }
+    };
+    const paseoRow = {
+      key: "paseo:host1.agent-5560",
+      kind: "paseo",
+      id: "agent-5560",
+      title: "Success pages — consolidation #5560",
+      workspace: "wks_a508e158846503a9",
+      repo: "acme/webapp",
+      agentStatus: "running",
+      state: "needs-human",
+      health: "red",
+      requiresAttention: true,
+      attentionReason: "async_question",
+      pr: { ref: "acme/webapp#9599", state: "OPEN", head: "abc9599def", ci: { state: "SUCCESS", failing: [], pending: [] }, mergeState: "BLOCKED" },
+      openChat: { app: "paseo", url: null, label: "Success pages (Paseo)", serverId: "host1", agentId: "agent-5560" },
+      meta: { serverId: "host1", workspaceId: "wks_a508e158846503a9", paseoCwd: "/work/repo", updatedAt: "2026-11-14T20:00:00Z" }
+    };
+    supervisor.lastThreads.set(paseoRow.key, paseoRow);
+    supervisor.store.recordSnapshot({
+      at: "2026-11-14T20:01:00.000Z",
+      counts: { threads: 1, inScope: 1 },
+      threads: [paseoRow],
+      sourceErrors: {}
+    });
+
+    const cardQ = supervisor.store.upsertQuestion({
+      dedupeKey: "card:paseo:host1.agent-5560:aq-1",
+      kind: "agent-card",
+      threadKey: paseoRow.key,
+      title: "Success pages: Where should we deploy?",
+      body: "1. Staging only 2. Staging, then production",
+      options: ["Staging only", "Staging, then production", "open thread"],
+      meta: { app: "paseo", cardId: "aq-1" }
+    });
+    const prQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ready:acme/webapp#9599",
+      kind: "ready",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9599",
+      askedHead: "abc9599",
+      title: "webapp #9599 ready to merge",
+      body: "All checks passed.",
+      options: ["merged", "later"]
+    });
+
+    const state = supervisor.getState();
+    const inlineCard = state.cards.find((c) => c.id === cardQ.id);
+    assert.equal(inlineCard.answerIn, "here");
+    assert.equal(inlineCard.workspace, null, "opaque wks_* workspace ids are hidden");
+    assert.equal(inlineCard.primaryAction.op, "answer");
+    assert.equal(inlineCard.primaryAction.value, "Staging only");
+    assert.equal(inlineCard.secondaryAction.op, "answer");
+    assert.equal(inlineCard.secondaryAction.value, "Staging, then production");
+
+    // Clicking secondary option ("Staging, then production", which matches RISKY_ASK) delivers via paseo-send!
+    const answered = await supervisor.actCard(cardQ.id, { op: "secondary" });
+    assert.equal(answered.ok, true);
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0].message, /Staging, then production/);
+
+    // Merge & Deploy card action merges via ownerConfirmed override AND pings coding session!
+    const readyCard = supervisor.getState().cards.find((c) => c.id === prQ.id);
+    assert.ok(readyCard.extraActions.some((a) => a.op === "merge_and_deploy"));
+    const shipped = await supervisor.actCard(prQ.id, { op: "merge_and_deploy" });
+    assert.equal(shipped.ok, true);
+    assert.equal(shipped.kind, "merge_and_deploy");
+    assert.equal(delivered.length, 2);
+    assert.match(delivered[1].message, /post-merge deployment/i);
+
+    // Freeform inline reply on an open Paseo card closes the question and delivers Owner says: ...
+    const followupQ = supervisor.store.upsertQuestion({
+      dedupeKey: "card:paseo:host1.agent-5560:aq-2",
+      kind: "agent-card",
+      threadKey: paseoRow.key,
+      title: "Success pages: Any extra rollout instructions?",
+      body: "1. Default rollout 2. Custom rollout",
+      options: ["Default rollout", "Custom rollout", "open thread"],
+      meta: { app: "paseo", cardId: "aq-2" }
+    });
+    const replied = await supervisor.actCard(followupQ.id, {
+      op: "reply",
+      value: "Roll out to staging first and ping me once smoke checks pass."
+    });
+    assert.equal(replied.ok, true);
+    assert.equal(replied.kind, "reply");
+    assert.equal(delivered.length, 3);
+    assert.match(delivered[2].message, /Roll out to staging first/);
+
+    // Long (>40 char) Paseo choices sharing a 39-char prefix stay distinct and deliver the full untruncated label
+    const longOptA = "Deploy to staging environment first and run full regression suite";
+    const longOptB = "Deploy to staging environment first and skip regression suite";
+    const longCardQ = supervisor.store.upsertQuestion({
+      dedupeKey: "card:paseo:host1.agent-5560:aq-long",
+      kind: "agent-card",
+      threadKey: paseoRow.key,
+      title: "Success pages: Rollout verification mode?",
+      body: `1. ${longOptA} 2. ${longOptB}`,
+      options: [`1. ${longOptA.slice(0, 36)}…`, `2. ${longOptB.slice(0, 36)}…`, "open thread"],
+      meta: { app: "paseo", cardId: "aq-long", labels: [longOptA, longOptB] }
+    });
+    const longAnswered = await supervisor.actCard(longCardQ.id, { op: "secondary" });
+    assert.equal(longAnswered.ok, true);
+    assert.equal(delivered.length, 4);
+    assert.ok(delivered[3].message.includes(longOptB), `expected full untruncated choice in "${delivered[3].message}"`);
+  } finally {
+    cleanup();
+  }
+});

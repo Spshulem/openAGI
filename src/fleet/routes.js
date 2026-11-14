@@ -187,7 +187,8 @@ export function createFleetRoute({ supervisor } = {}) {
         const body = (await readObject(readBody)) ?? {};
         const op = typeof body.op === "string" ? body.op.trim() : "primary";
         const value = typeof body.value === "string" ? body.value.trim() : null;
-        if (value && value.length > ANSWER_MAX) return fail(400, "Option value is too long.");
+        const maxLen = op.toLowerCase() === "reply" ? REPLY_MAX : ANSWER_MAX;
+        if (value && value.length > maxLen) return fail(400, "Option value is too long.");
         const outcome = await supervisor.actCard(cardId, {
           op,
           value,
