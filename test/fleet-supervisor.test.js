@@ -269,6 +269,39 @@ test("a capped scan keeps a deferred thread's outage recovery until it is read",
   assert.ok(delivered.some((d) => d.thread.key === "codex:t1" && d.playbook === "infra-recovered"));
 });
 
+test("a capped scan drops reassessed members from a group it keeps for one deferred member", async (t) => {
+  const capped = { agentStatus: "error", prRefs: [], error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } };
+  const threads = ["a", "b"].map((id, n) => makeThread({ key: `codex:${id}`, id, cwd: `/work/${id}`, lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN), ...capped }));
+  const { supervisor } = fixture(t, { threads, prs: new Map(), limits: { maxThreads: 1 } });
+  const group = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "limit:group", title: "2 threads capped", options: ["wait", "added"], threadKeys: ["codex:a", "codex:b"] });
+  // codex:a is read again with its limit cleared; codex:b is deferred.
+  threads[0] = makeThread({ ...threads[0], agentStatus: "idle", error: null });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(snapshot.threads.map((row) => row.key), ["codex:a"]);
+  const kept = supervisor.store.question(group.id);
+  assert.equal(kept.status, "open");
+  assert.deepEqual(kept.threadKeys, ["codex:b"], "the cleared member leaves the group");
+  assert.match(kept.title, /^1 thread capped/);
+});
+
+test("a deferred nested worktree is its own checkout, not its parent's", async (t) => {
+  const looked = [];
+  const parent = makeThread({ key: "codex:p", id: "p", cwd: "/work/app", branch: "feature/app", prRefs: [], lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN) });
+  const nested = makeThread({ key: "codex:w", id: "w", cwd: "/work/app/.worktrees/task", branch: "feature/task", prRefs: [], lastActivityAt: ago(61 * MIN), lastAgentAt: ago(61 * MIN) });
+  const { supervisor } = fixture(t, {
+    threads: [parent, nested], prs: new Map(), limits: { maxThreads: 1 },
+    deps: {
+      readLocalGit: async (cwd) => ({ head: HEAD, branch: cwd === "/work/app" ? "feature/app" : "feature/task", root: cwd, upstream: null, ahead: 0, remote: "acme/app" }),
+      findPrForBranch: async (repo, branch) => { looked.push(branch); return null; }
+    }
+  });
+  // Scan 1 reads the parent with the worktree deferred and never read;
+  // scan 3 reads it again with the worktree's own root known.
+  for (let scan = 0; scan < 3; scan++) await supervisor.tick({ reason: "test" });
+  assert.ok(looked.includes("feature/app"), "the parent's branch is looked up");
+  assert.ok(looked.includes("feature/task"));
+});
+
 test("a capped scan counts a deferred chat when deciding whether a checkout is shared", async (t) => {
   const looked = [];
   const clone = ["a", "b"].map((id, n) => makeThread({ key: `codex:${id}`, id, cwd: "/work/clone", branch: "feature/canvas", prRefs: [], lastActivityAt: ago((60 + n) * MIN), lastAgentAt: ago((60 + n) * MIN) }));

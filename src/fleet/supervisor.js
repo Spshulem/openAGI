@@ -187,8 +187,8 @@ function emptyBb3() {
 // thread at once), so they collapse into one line each. Identical titles
 // (the same BuildBot3 problem seen by a thread and by infra) collapse too.
 const GROUPED_KINDS = Object.freeze({
-  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
-  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
+  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} thread${n === 1 ? "" : "s"} capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
+  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open ${n === 1 ? "it" : "them"}?`, body: (labels) => `No live session to message: ${labels}.` },
   // Always one question, even for one thread, so the owner's answer holds
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
@@ -380,9 +380,10 @@ export function groupQuestions(asks, byKey) {
   for (const [kind, list, part] of chunks) {
     const spec = GROUPED_KINDS[kind];
     const minSize = spec.minSize ?? 2;
-    // A carried member alone (see act) keeps its open group as it stands.
     if (list.length === 1 && minSize > 1 && !list[0].carried) out.push(single(list[0]));
-    if (!list.length || list.length < minSize) continue;
+    // Carried members alone (see act) still rewrite their open group, so
+    // members reassessed this scan and no longer asked drop out of it.
+    if (!list.length || (list.length < minSize && !list.every((decision) => decision.carried))) continue;
     const threads = list.map((decision) => byKey.get(decision.threadKey)).filter(Boolean);
     // A delivery failure names its reason, so the owner knows what to fix.
     const labels = kind === "deliver"
@@ -2530,12 +2531,21 @@ export class FleetSupervisor {
     // to finish its open PR. Such a chat's PR is only one it linked itself.
     // Counted by checkout root, so chats in two of its subfolders share it,
     // and over every eligible chat: one a capped scan deferred still shares
-    // it (its git was not read, so a known root holding its folder stands in).
-    const roots = [...new Set([...localGit.values()].map((git) => git?.root).filter(Boolean))];
+    // it. Its git was not read this scan, so the root last read for its
+    // folder stands in; never a containing folder's root (a nested worktree
+    // is its own checkout).
+    this.gitRoots ??= new Map();
+    const eligibleKeys = new Set([...inScope, ...eligible].map((thread) => thread.key));
+    for (const key of this.gitRoots.keys()) if (!eligibleKeys.has(key)) this.gitRoots.delete(key);
+    for (const thread of inScope) {
+      const root = thread.cwd ? localGit.get(thread.cwd)?.root : null;
+      if (root) this.gitRoots.set(thread.key, { cwd: thread.cwd, root });
+    }
+    const scopeKeys = new Set(inScope.map((thread) => thread.key));
     const checkoutOf = (thread) => {
       if (!thread.cwd) return null;
-      const cwd = path.resolve(thread.cwd);
-      return localGit.get(thread.cwd)?.root ?? roots.find((root) => cwd === root || cwd.startsWith(root + path.sep)) ?? cwd;
+      const known = scopeKeys.has(thread.key) ? null : this.gitRoots.get(thread.key);
+      return localGit.get(thread.cwd)?.root ?? (known?.cwd === thread.cwd ? known.root : null) ?? path.resolve(thread.cwd);
     };
     const perCheckout = new Map();
     for (const thread of new Set([...inScope, ...eligible])) {
