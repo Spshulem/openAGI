@@ -121,7 +121,7 @@ export class OutcomeStore {
     let best = null;
     for (const o of this.outcomes.values()) {
       if (o.kind !== kind || o.refId !== refId) continue;
-      if (!best || o.at > best.at) best = o;
+      if (!best || o.at >= best.at) best = o; // ties: the later-recorded one wins
     }
     return best;
   }

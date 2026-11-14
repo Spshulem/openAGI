@@ -146,8 +146,13 @@ export class GroundedOutcomes {
 
   // ── agent-completed tasks ─────────────────────────────────────────────
   onAgentTaskCompleted(task, signal = null) {
-    return this._safe(() => this.outcomes.byWorkRef("work-task", task.id)
-      ?? this.outcomes.recordWork({ kind: "work-task", refId: task.id, signal, metadata: { byAgent: true } }));
+    return this._safe(() => {
+      // One outcome per attempt: an earlier attempt that was already graded
+      // (for example reopened) keeps its grade, and this attempt starts fresh.
+      const open = this.outcomes.byWorkRef("work-task", task.id);
+      if (open && !open.groundedFate) return open;
+      return this.outcomes.recordWork({ kind: "work-task", refId: task.id, signal, metadata: { byAgent: true } });
+    });
   }
 
   onTaskReopened(task) {
@@ -196,9 +201,10 @@ export class GroundedOutcomes {
           this._ground(outcome, fate, { source: "suggestion" });
           count(fate);
         } else if (outcome.kind === "work-task" && !outcome.groundedFate) {
+          // Measured from the agent's own completion (when this outcome was
+          // recorded): a task's completedAt survives reopening and can be older.
           const task = this.runtime?.tasks?.get?.(outcome.refId);
-          if (task?.status === "completed" && task.completedAt
-              && t - Date.parse(task.completedAt) >= TASK_HELD_DAYS * DAY_MS) {
+          if (task?.status === "completed" && t - Date.parse(outcome.at) >= TASK_HELD_DAYS * DAY_MS) {
             this._ground(outcome, "held", { source: "task" });
             count("held");
           }

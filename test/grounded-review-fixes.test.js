@@ -158,3 +158,30 @@ test("POST /cron/:id/run passes { input } to that run only", async () => {
     await app.close();
   }
 });
+
+test("held is measured from the agent's completion, not an older owner completion", () => {
+  const rt = setup();
+  const task = rt.tasks.add({ title: "Owner first" }, { source: "chat", queue: "user" });
+  rt.tasks.complete(task.id, "manual");
+  rt.tasks.get(task.id).completedAt = new Date(Date.now() - 10 * DAY).toISOString();   // the owner's old completion
+  rt.tasks.update(task.id, { status: "pending" });
+  rt.tasks.complete(task.id, "agent", { byAgent: true });
+  rt.grounded.sweep({ now: new Date(Date.now() + 1 * DAY) });
+  assert.equal(rt.outcomes.byWorkRef("work-task", task.id).groundedFate, null, "not held after one day");
+  rt.grounded.sweep({ now: new Date(Date.now() + 8 * DAY) });
+  assert.equal(rt.outcomes.byWorkRef("work-task", task.id).groundedFate, "held");
+});
+
+test("a second agent attempt after a reopen is graded on its own", () => {
+  const rt = setup();
+  const task = rt.tasks.add({ title: "Twice" }, { source: "agent", queue: "agent" });
+  rt.tasks.complete(task.id, "agent", { byAgent: true });
+  const first = rt.outcomes.byWorkRef("work-task", task.id);
+  rt.tasks.update(task.id, { status: "pending" });
+  assert.equal(first.groundedFate, "reopened");
+  rt.tasks.complete(task.id, "agent", { byAgent: true });
+  const second = rt.outcomes.byWorkRef("work-task", task.id);
+  assert.notEqual(second.id, first.id);
+  assert.equal(second.groundedFate, null);
+  assert.equal(rt.outcomes.outcomes.get(first.id).groundedFate, "reopened");
+});
