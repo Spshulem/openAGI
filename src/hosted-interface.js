@@ -1945,7 +1945,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // so its platform is checked here.
       if (sharedHistoryRoute) {
         res.setHeader("Cache-Control", "no-store");
-        if (requestNodeId && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestNodeId && !ownerProxyRoute && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
         if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
@@ -1960,7 +1960,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
         res.setHeader("Cache-Control", "no-store");
-        if (requestNodeId && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
         try {
@@ -2019,6 +2019,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 200, await g2Proactive.screenContext(nodeId, body.id));
           }
           if (body.op === "answer") return sendG2NodeJson(res, 200, await g2Proactive.answerFleet(nodeId, body));
+          if (body.op === "act-card") return sendG2NodeJson(res, 200, await g2Proactive.actFleetCard(nodeId, body));
           if (body.op === "fleet-status") return sendG2NodeJson(res, 200, g2Proactive.fleetStatus());
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
         } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
@@ -2150,10 +2151,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
+          }
+          if (body.focusedCardId !== undefined && (typeof body.focusedCardId !== "string" || !/^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId))) {
+            return sendJson(res, 400, { error: "focusedCardId must be a valid card id" });
           }
           if (typeof body.text !== "string" || !body.text.trim()
               || body.text.includes("\0") || Buffer.byteLength(body.text, "utf8") > 64 * 1024) {
@@ -2181,8 +2185,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // Shared threads are for paired devices (phones here; a G2 joins
             // through /nodes/g2/experience). Generic nodes, such as the
             // iMessage bridge, stay in their own node-scoped conversations.
-            if (requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "shared threads are for paired phones and G2" });
-            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name)); }
+            if (requestEnrollment?.platform !== MOBILE_PLATFORM && !ownerProxyRoute) return sendJson(res, 403, { error: "shared threads are for paired phones and owner proxies" });
+            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment?.name)); }
             catch (error) {
               if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
               throw error;
@@ -2190,6 +2194,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           } else {
             if (body.conversationId !== undefined) return sendJson(res, 400, { error: "conversationId requires a thread" });
             body = bindScopedNodeMessage(body, requestNodeId);
+          }
+        }
+        // An owner UI such as Paseo joins the same named shared thread as
+        // paired devices. Resolve its identity here, never in the client.
+        if (!requestNodeId && body?.thread !== undefined) {
+          try {
+            const safeFocusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
+              ? body.focusedCardId
+              : undefined;
+            body = {
+              ...body,
+              sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
+              metadata: { ...body.metadata, thread: body.thread, ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}) }
+            };
+          } catch (error) {
+            if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+            throw error;
           }
         }
         // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
@@ -2211,7 +2232,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // decides.)
         const principal = !requestNodeId
           ? (relayedSender(body?.from) ? null : ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner"))
-          : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
+          : ownerProxyRoute ? ownerPrincipal("owner", requestNodeId)
+            : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
         // Opt-in streaming keeps the existing JSON contract untouched. The
         // same auth and Origin gates above protect both forms; this is a direct
         // response stream, not a broadcast that another signed-in client can
@@ -4104,6 +4126,9 @@ function acceptsEventStream(req) {
 // owner-approved computer-use lease is inherited.
 function bindSharedThreadMessage(body, requestNodeId, sourceName) {
   const conversationNamespace = createHash("sha256").update(`thread:${body.thread}`, "utf8").digest("base64url");
+  const focusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
+    ? body.focusedCardId
+    : undefined;
   return {
     text: body.text,
     ...(body.attachments?.length ? { attachments: body.attachments } : {}),
@@ -4111,7 +4136,7 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
     sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
-    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread }
+    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread, ...(focusedCardId ? { focusedCardId } : {}) }
   };
 }
 

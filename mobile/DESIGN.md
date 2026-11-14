@@ -182,6 +182,13 @@ labels at all.
   opens the same approval detail the Inbox uses (Approve and Deny live
   there, with their full result handling). Only approvals created since the
   owner's latest message appear; the rest stay in the Inbox.
+- **Duo.** The cover screen keeps the composer on one line beside the
+  trailing control rail (it splits onto two rows only at accessibility text
+  sizes or under about 300 points). Unfolded like a book, the conversation
+  list fills the leading page and the conversation with its composer the
+  trailing page, so nothing runs across the fold. Approval cards end in two
+  equal pills: **Hide** (puts the card away here; the approval stays in the
+  Inbox) and **Review** (filled).
 - **Empty chat:** centred — one question ("What can I take off your
   plate?"), one `muted` line, and three starting points as cards (icon,
   title, one line). A tap fills the composer; it never sends.

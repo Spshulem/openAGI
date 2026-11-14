@@ -146,3 +146,26 @@ it('an answer drops a feed read that started before it and fetches a fresh one',
   expect(f.api.proactive.mock.calls.filter(([b]) => b.op === 'feed').length).toBe(2)
   f.client.stop()
 })
+
+it('actCard keeps a halted preflight card open and removes it once merged', async () => {
+  vi.useFakeTimers(); const f = fixture()
+  const prCard = { id: 'o-pr', cardId: 'q:fq_pr', cardKind: 'pr_ready', title: 'PR #88 ready', summary: 'CI green', important: true, seen: false, action: 'act-fleet-card', category: 'approvals', supervisor: true, primaryLabel: 'Merge PR' }
+  let merged = false
+  const proactive = f.api.proactive as unknown as { mockImplementation: (fn: (body: { op: string }) => Promise<unknown>) => void }
+  proactive.mockImplementation((body: { op: string }) => {
+    if (body.op === 'act-card') {
+      if (!merged) return Promise.resolve({ ok: false, status: 'ci_failing', detail: 'CI failing; halted' })
+      return Promise.resolve({ ok: true, status: 'merged', detail: 'Merged PR #88' })
+    }
+    return Promise.resolve({ settings: { enabled: false, supervisorOnly: true }, quiet: false, items: merged ? [] : [prCard] })
+  })
+  f.client.start(); await vi.advanceTimersByTimeAsync(1)
+  const halted = await f.client.actCard('o-pr', 'primary')
+  expect(halted.ok).toBe(false)
+  expect(f.client.items).toHaveLength(1)
+  merged = true
+  const done = await f.client.actCard('o-pr', 'primary')
+  expect(done.ok).toBe(true)
+  expect(f.client.items).toEqual([])
+  f.client.stop()
+})

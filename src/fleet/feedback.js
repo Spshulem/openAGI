@@ -18,7 +18,7 @@ export const FIX_AREAS = Object.freeze(["policy", "classify", "ui-delivery", "ju
 // queued until the runner (P3) picks a request up; stop marks it abandoned.
 export const FIX_STATES = Object.freeze(["queued", "preflight", "brief", "worktree", "coding", "tests", "guard", "pr", "awaiting-review", "fixing-findings", "replay", "owner-ask", "done", "failed", "abandoned"]);
 // What the owner is looking at: the on-screen focus a voice client sends.
-export const TARGET_FIELDS = Object.freeze(["view", "threadKey", "questionId", "actionId", "prRef", "fixId", "suggestionId"]);
+export const TARGET_FIELDS = Object.freeze(["view", "cardId", "threadKey", "questionId", "actionId", "prRef", "fixId", "suggestionId"]);
 
 export const UTTERANCE_MAX = 1000;
 const TEXT_MAX = 2000;
