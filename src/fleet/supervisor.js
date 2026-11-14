@@ -337,6 +337,13 @@ function activityMark(thread) {
   return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
 }
 
+// What a source's own listing says about a thread, before any git, PR or
+// screen read adds to it: a proposal made on these facts is only still
+// meant while they hold (a deferred thread is not reassessed).
+function discoveredFacts(thread) {
+  return shortHash(JSON.stringify([activityMark(thread), thread?.prRefs ?? [], thread?.branch ?? null, thread?.lastUserText ?? null]));
+}
+
 function threadLabel(thread) {
   if (!thread) return "?";
   const ref = thread.prRefs?.[0] ?? "";
@@ -1999,7 +2006,11 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
-    const settled = action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null;
+    // The thread moved on since this was proposed (a deferred thread's
+    // proposal outlives the scan that made it): its message is stale.
+    const facts = this.lastThreadFacts?.get(action.threadKey);
+    const movedOn = action.threadFacts && facts && facts !== action.threadFacts ? "the thread moved on since the proposal" : null;
+    const settled = movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
@@ -2079,6 +2090,7 @@ export class FleetSupervisor {
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
+    const threadFacts = new Map(threads.map((thread) => [thread.key, discoveredFacts(thread)]));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
     // With migration discovery unavailable, legacy identities are not safe to resume.
     if (config.paseo?.enabled && sourceErrors.paseo) {
@@ -2220,6 +2232,7 @@ export class FleetSupervisor {
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
+    this.lastThreadFacts = threadFacts;
     // Each thread's PR as this scan read it, for a proposal sent later.
     // A deferred thread keeps the last read, for its proposal still open.
     this.lastPrs = new Map([...[...this.lastPrs].filter(([key]) => deferred.has(key)), ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])]);
@@ -2244,7 +2257,7 @@ export class FleetSupervisor {
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started, deferred });
 
     const finished = this.now();
@@ -2710,7 +2723,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set(), threadFacts = new Map() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -2896,6 +2909,7 @@ export class FleetSupervisor {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
         head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
+        threadFacts: threadFacts.get(decision.threadKey) ?? null,
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
@@ -2970,8 +2984,11 @@ export class FleetSupervisor {
 
     // A planned/proposed action the policy no longer wants is stale.
     // (Storage records its own plans; they are not tick decisions.)
+    // A deferred thread's stands only while what discovery shows of it is
+    // what the action was made on: one that moved on is stale too.
+    const movedOn = (action) => deferred.has(action.threadKey) && threadFacts.get(action.threadKey) !== action.threadFacts;
     for (const action of openActions) {
-      if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
+      if (action.kind !== "storage" && !seenActions.has(action.id) && (!unknown([action.threadKey]) || movedOn(action))) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
     // decided again this tick without asking. An agent's own ask and a

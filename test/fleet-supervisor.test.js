@@ -252,6 +252,34 @@ test("a capped scan keeps a deferred thread's proposal open and sendable", async
   assert.equal(delivered.length, 1);
 });
 
+test("a deferred proposal goes stale when discovery shows its thread moved on", async (t) => {
+  const threads = rotatingPairs();
+  const prs = new Map([["acme/app#7", makePr()], ["acme/app#8", makePr({ ref: "acme/app#8", number: 8, url: "https://github.com/acme/app/pull/8" })]]);
+  const { supervisor, delivered } = fixture(t, { mode: "propose", threads, prs, limits: { maxThreads: 2 } });
+  await supervisor.tick({ reason: "test" });
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed" && a.threadKey === "codex:a");
+  assert.ok(proposed);
+  // The owner moved codex:a on to PR #8 and it is running again.
+  threads[0] = makeThread({ ...threads[0], agentStatus: "running", prRefs: ["acme/app#8"], lastUserText: "Switch to #8 and finish the migration.", lastUserAt: ago(0), lastActivityAt: ago(0) });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.ok(!snapshot.threads.some((row) => row.key === "codex:a"), "codex:a was deferred");
+  assert.equal(supervisor.store.action(proposed.id).status, "stale");
+  await supervisor.sendProposed(proposed.id);
+  assert.equal(delivered.length, 0, "the #7 instructions never reach the #8 conversation");
+});
+
+test("sendProposed refuses a proposal whose thread's discovered facts changed", async (t) => {
+  const threads = rotatingPairs();
+  const { supervisor, delivered } = fixture(t, { mode: "propose", threads, limits: { maxThreads: 2 } });
+  await supervisor.tick({ reason: "test" });
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed" && a.threadKey === "codex:a");
+  supervisor.lastThreadFacts = new Map([...(supervisor.lastThreadFacts ?? []), ["codex:a", "changed"]]);
+  const result = await supervisor.sendProposed(proposed.id);
+  assert.equal(result.action.status, "stale");
+  assert.match(result.action.detail, /moved on/);
+  assert.equal(delivered.length, 0);
+});
+
 test("a capped scan keeps a deferred thread's outage recovery until it is read", async (t) => {
   let healthy = false;
   const blocked = makeThread({ agentStatus: "aborted", error: { kind: "lb" }, prRefs: [], lastActivityAt: ago(30 * MIN), lastAgentAt: ago(30 * MIN), lastUserAt: ago(120 * MIN) });
