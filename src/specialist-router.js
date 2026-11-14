@@ -8,7 +8,7 @@ const DEFAULT_THRESHOLD = 0.55;
 export class SpecialistRouter {
   constructor(options = {}) {
     this.threshold = options.threshold ?? Number.parseFloat(process.env.OPENAGI_ROUTING_THRESHOLD ?? String(DEFAULT_THRESHOLD));
-    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "live"; // live | shadow | off
+    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "shadow"; // live | shadow | off
     this.minActivations = options.minActivations ?? 1;
     this.vectorStore = options.vectorStore ?? null;
     this.semanticWeight = options.semanticWeight ?? 0.4;
@@ -77,13 +77,22 @@ export class SpecialistRouter {
   }
 }
 
+// Tags every chat signal carries. They say nothing about what a specialist is
+// for, so they never count as a match.
+const GENERIC_TAGS = new Set([
+  "message", "signal", "main", "general", "adaptation-review", "specialization-candidate",
+  "local", "sms", "telegram", "g2", "overlay", "autopilot", "cron", "imessage", "email", "web", "voice"
+]);
+const informative = (tags) => new Set([...tags].map((t) => String(t).toLowerCase()).filter((t) => t && !GENERIC_TAGS.has(t)));
+
 function scoreMatch(text, tags, specialist) {
   const scopeText = `${specialist.boundedScope ?? ""} ${specialist.name ?? ""} ${specialist.parentGoal ?? ""}`;
-  const scopeTags = new Set([
+  const scopeTags = informative([
     specialist.metadata?.domain ?? "",
     specialist.metadata?.taskType ?? "",
     ...(specialist.metadata?.tags ?? [])
-  ].filter(Boolean).map((t) => t.toLowerCase()));
+  ]);
+  tags = informative(tags);
 
   const textScore = tokenOverlapScore(text, scopeText);
 
@@ -107,12 +116,15 @@ function scoreMatch(text, tags, specialist) {
   // quality moves routing — proven specialists attract more work, struggling
   // ones repel it before the retirement sweep catches them. ±0.15 swing.
   let qualityAdjust = 0;
-  if ((specialist.outcomeSamples ?? 0) >= 3 && typeof specialist.meanOutcomeQuality === "number") {
-    qualityAdjust = (specialist.meanOutcomeQuality - 0.5) * 0.3;
+  if ((specialist.groundedSamples ?? 0) >= 3 && typeof specialist.groundedMean === "number") {
+    qualityAdjust = (specialist.groundedMean - 0.5) * 0.3;
   }
 
   // Both signals weight equally; bonus when both fire (corroboration is itself a match signal).
-  const baseScore = textScore * 0.5 + tagScore * 0.5;
+  // With informative tags on both sides, text and tags weigh equally.
+  // Otherwise the scope text is the only evidence and carries the full weight.
+  const bothTagged = tags.size > 0 && scopeTags.size > 0;
+  const baseScore = bothTagged ? textScore * 0.5 + tagScore * 0.5 : textScore;
   const corroborationBonus = textScore > 0.1 && tagScore > 0.1 ? 0.1 : 0;
   const combined = baseScore + corroborationBonus + activationBoost + qualityAdjust - recencyPenalty;
 

@@ -179,6 +179,13 @@ export class AbiRuntime {
         this.propagation.recordOutcomeQuality?.(specialistId, outcome.qualityScore);
       }
     };
+    // Grounded grades (what happened to the work) feed the specialist's quality.
+    this.outcomes.onGrounded = (outcome, previous) => {
+      const specialistId = outcome.metadata?.specialistId;
+      if (specialistId && typeof outcome.groundedScore === "number") {
+        this.propagation.recordGroundedQuality?.(specialistId, outcome.groundedScore, previous);
+      }
+    };
     this.outcomes.onFeedback = (outcome, previous) => {
       const specialistId = outcome.metadata?.specialistId;
       if (specialistId && typeof outcome.qualityScore === "number") {
