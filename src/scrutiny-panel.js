@@ -4,7 +4,7 @@ import { DirectionalAdaptiveScrutiny } from "./directional-adaptive-scrutiny.js"
 // or forces 'ask' when they disagree completely. This is the "diverse + extreme +
 // conflicting" scrutiny the thesis describes.
 
-const JUDGE_CONFIGS = {
+export const JUDGE_CONFIGS = {
   cautious: {
     style: "cautious",
     weights: { environment: 0.18, company: 0.22, evidence: 0.32, memory: 0.13, uncertainty: 0.15 },
