@@ -228,7 +228,7 @@ final class SupervisorFormatTests: XCTestCase {
             card: SupervisorCard(id: "fq_red", kind: "ci_failed", kindLabel: "CI Failed", headline: "#9899", ciState: "FAILURE")
         )
         XCTAssertEqual(failedBadge.health, .red)
-        XCTAssertEqual(failedBadge.label, "CI Failed · CI red")
+        XCTAssertEqual(failedBadge.label, "CI Failed · CI failing")
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
