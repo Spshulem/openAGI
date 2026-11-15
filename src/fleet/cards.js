@@ -39,8 +39,17 @@ function humanOptionLabel(option) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function classifyCardKind(question) {
-  if (question.kind === "ready" || question.mergeAsk) {
+function isMergeReadyQuestion(question, row, prRef) {
+  if (!prRef || !parsePrRef(prRef)) return false;
+  const isDraftAsk = Boolean(row?.pr?.isDraft) || /\bmark\s+draft\b/i.test(String(question.title ?? ""));
+  if (isDraftAsk) return false;
+  if (question.kind === "ready" || question.mergeAsk) return true;
+  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "") : "";
+  return /\b(?:approve and merge|merge now|approve merge|merge pr|ship pr)\b/i.test(`${question.title ?? ""} ${firstOpt}`);
+}
+
+function classifyCardKind(question, row = null, prRef = null) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     return { kind: "merge_ready", kindLabel: "PR Ready", rank: 0 };
   }
   if (["prompt", "agent-ask", "agent-card", "self-fix"].includes(question.kind)) {
@@ -97,7 +106,7 @@ function buildActionsForQuestion(question, row, prRef) {
     };
   }
 
-  if ((question.kind === "ready" || question.mergeAsk) && prRef && parsePrRef(prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     if (ciState === "FAILURE" || ciState === "ERROR" || mergeState === "DIRTY") {
       return {
         primaryAction: { op: "fix_ci", label: mergeState === "DIRTY" ? "Have agent rebase" : "Have agent fix CI", value: "fix_ci", destructive: false },
@@ -165,7 +174,7 @@ function buildRecommendation(question, row, prRef, prefs) {
     return clampText(redactSecrets(question.reviewReason), 220);
   }
   const ci = row?.pr?.ci?.state ?? null;
-  if ((question.kind === "ready" || question.mergeAsk) && prRef) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
@@ -273,8 +282,12 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
   const prRef = question.prRef ?? row?.pr?.ref ?? null;
   const parsedPr = parsePrRef(prRef);
-  const { kind, kindLabel, rank } = classifyCardKind(question);
+  const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef);
+  const rawTitle = String(question.title ?? "");
+  const cleanTitle = row?.title && /^wks_[0-9a-f]+:/i.test(rawTitle)
+    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${row.title}:`)
+    : rawTitle;
 
   return {
     id: question.id,
@@ -282,7 +295,7 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     kind,
     kindLabel,
     rank,
-    headline: clampText(redactSecrets(question.title), 140),
+    headline: clampText(redactSecrets(cleanTitle), 140),
     summary: buildSummary(question, row),
     recommendation: buildRecommendation(question, row, prRef, prefs),
     threadKey: primaryKey,

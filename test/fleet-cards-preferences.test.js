@@ -1022,6 +1022,38 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     assert.equal(longAnswered.ok, true);
     assert.equal(delivered.length, 4);
     assert.ok(delivered[3].message.includes(longOptB), `expected full untruncated choice in "${delivered[3].message}"`);
+
+    // Judge-reworded merge ask surfaces Merge PR, draft ask surfaces Mark ready, and wks_* headline uses thread title
+    const judgeMergeQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:judge-merge-9599",
+      kind: "agent-ask",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9599",
+      mergeAsk: false,
+      title: "webapp #9599: approve and merge?",
+      options: ["approve merge", "not now"]
+    });
+    const draftAskQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:draft-9793",
+      kind: "agent-ask",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9793",
+      mergeAsk: true,
+      title: "webapp #9793: mark draft ready to merge?",
+      options: ["mark ready", "wait"]
+    });
+    const wksPromptQ = supervisor.store.upsertQuestion({
+      dedupeKey: "prompt:wks-prompt",
+      kind: "prompt",
+      threadKey: paseoRow.key,
+      title: "wks_a508e158846503a9: waiting on a prompt. Open it?",
+      options: ["opened", "later"]
+    });
+    const nextCards = supervisor.getState().cards;
+    assert.equal(nextCards.find((c) => c.id === judgeMergeQ.id).primaryAction.op, "merge");
+    assert.equal(nextCards.find((c) => c.id === draftAskQ.id).primaryAction.op, "answer");
+    assert.equal(nextCards.find((c) => c.id === draftAskQ.id).primaryAction.value, "mark ready");
+    assert.match(nextCards.find((c) => c.id === wksPromptQ.id).headline, /^Success pages — consolidation #5560:/);
   } finally {
     cleanup();
   }

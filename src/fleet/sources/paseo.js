@@ -154,7 +154,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
-    cwd: null, workspace: agent.workspaceId, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
+    cwd: null, workspace: /^wks_[0-9a-f]+$/i.test(String(agent.workspaceId ?? "")) ? null : agent.workspaceId, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
     agentStatus: agent.pendingPermissions?.length ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status : "unknown",
     archived: Boolean(agent.archivedAt),
