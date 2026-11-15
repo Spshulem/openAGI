@@ -217,11 +217,18 @@ final class SupervisorFormatTests: XCTestCase {
             ciState: "SUCCESS"
         )
         let badge = SupervisorFormat.statusBadge(
-            thread: FleetThread(key: "paseo:srv_4x2crHynU7yi.2ba43988"),
+            thread: FleetThread(key: "paseo:srv_4x2crHynU7yi.2ba43988", state: "ready-needs-human"),
             card: readyCard
         )
         XCTAssertEqual(badge.health, .green)
         XCTAssertEqual(badge.label, "PR Ready · CI passing")
+
+        let failedBadge = SupervisorFormat.statusBadge(
+            thread: FleetThread(key: "paseo:srv_4x2crHynU7yi.red1", state: "waiting-ci"),
+            card: SupervisorCard(id: "fq_red", kind: "ci_failed", kindLabel: "CI Failed", headline: "#9899", ciState: "FAILURE")
+        )
+        XCTAssertEqual(failedBadge.health, .red)
+        XCTAssertEqual(failedBadge.label, "CI Failed · CI red")
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601

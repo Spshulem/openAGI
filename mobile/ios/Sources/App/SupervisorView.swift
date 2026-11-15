@@ -156,7 +156,7 @@ struct SupervisorView: View {
                 question: question,
                 questionIsOpen: isOpenQuestion || isOpenCard,
                 questionBusy: busyQuestionID != nil || busyCardID != nil,
-                questionNote: question.flatMap { q in questionNote?.id == q.id ? questionNote?.note : nil },
+                questionNote: (question?.id ?? card?.questionId ?? card?.id).flatMap { id in questionNote?.id == id ? questionNote?.note : nil },
                 onAnswer: { answer in
                     if let question {
                         Task { await decide(question, answer: answer) }
@@ -174,6 +174,9 @@ struct SupervisorView: View {
                 card: card,
                 onCardPrimary: { targetCard, action in
                     Task { await act(targetCard, action: action) }
+                },
+                onCardReply: { targetCard, text in
+                    await act(targetCard, action: SupervisorCardAction(op: "reply", label: "Reply", value: text))
                 }
             )
         }
@@ -482,7 +485,6 @@ struct SupervisorView: View {
         let threads = state?.snapshot?.threads ?? []
         let key = card.threadKey ?? card.threadKeys.first
         let question = card.questionId.flatMap { qid in state?.questions.first(where: { $0.id == qid }) }
-        let fallbackState = (card.kind == "merge_ready" || card.kind == "pr_ready") ? "ready-needs-human" : "needs-human"
         let fallbackPR: FleetPR? = (card.prRef != nil || card.prUrl != nil || card.prContext != nil)
             ? FleetPR(
                 ref: card.prContext?.ref ?? card.prRef,
@@ -505,7 +507,6 @@ struct SupervisorView: View {
                     workspace: SupervisorFormat.cleanWorkspace(card.workspace),
                     repo: card.repo,
                     branch: card.branch,
-                    state: fallbackState,
                     pr: fallbackPR,
                     lastAgentText: card.agentSummary
                 )
@@ -516,7 +517,6 @@ struct SupervisorView: View {
                 thread: FleetThread(
                     key: "fleet:\(question.id)",
                     title: card.sessionTitle ?? card.headline,
-                    state: fallbackState,
                     pr: fallbackPR,
                     lastAgentText: card.agentSummary
                 ),
@@ -600,46 +600,55 @@ struct SupervisorView: View {
         }
     }
 
-    private func act(_ card: SupervisorCard, action: SupervisorCardAction) async {
-        guard busyCardID == nil && busyQuestionID == nil else { return }
+    @discardableResult
+    private func act(_ card: SupervisorCard, action: SupervisorCardAction) async -> Bool {
+        guard busyCardID == nil && busyQuestionID == nil else { return false }
         busyCardID = card.id
         statusNote = nil
         defer { busyCardID = nil }
 
+        let noteTargetID = card.questionId ?? card.id
         let daemonHasCards = !(state?.cards.isEmpty ?? true)
         do {
             let result = try await model.client.fleetActCard(id: card.id, op: action.op, value: action.value)
             let note = SupervisorFormat.cardActNote(result)
             statusNote = note
-            if let qid = card.questionId { questionNote = (qid, note) }
+            questionNote = (noteTargetID, note)
             if let fresh = result.state {
                 accept(nextSequence(), fresh)
             } else {
                 await refresh()
             }
+            return !note.isAlert
         } catch DaemonError.notFound where !daemonHasCards && card.questionId != nil {
             // Older daemon fallback: translate card action to legacy /fleet/api/questions/:id.
             if let qid = card.questionId, let q = state?.questions.first(where: { $0.id == qid }) {
                 busyCardID = nil
                 if action.op == "defer" || action.op == "dismiss" {
-                    await decide(q, answer: nil)
+                    return await decide(q, answer: nil)
                 } else {
-                    await decide(q, answer: action.value ?? SupervisorFormat.answerOptions(q).first)
+                    return await decide(q, answer: action.value ?? SupervisorFormat.answerOptions(q).first)
                 }
             }
+            return false
         } catch let error as DaemonError {
             let note = SupervisorFormat.failureNote(error)
             statusNote = note
-            if let qid = card.questionId { questionNote = (qid, note) }
+            questionNote = (noteTargetID, note)
             if error == .conflict || error == .notFound { await refresh() }
+            return false
         } catch {
-            statusNote = .init(text: "Can't reach OpenAGI.", isAlert: true)
+            let note = SupervisorFormat.Note(text: "Can't reach OpenAGI.", isAlert: true)
+            statusNote = note
+            questionNote = (noteTargetID, note)
+            return false
         }
     }
 
     // answer == nil is a dismissal.
-    private func decide(_ question: FleetQuestion, answer: String?) async {
-        guard busyQuestionID == nil else { return }
+    @discardableResult
+    private func decide(_ question: FleetQuestion, answer: String?) async -> Bool {
+        guard busyQuestionID == nil else { return false }
         busyQuestionID = question.id
         questionNote = nil
         defer { busyQuestionID = nil }
@@ -656,15 +665,18 @@ struct SupervisorView: View {
             questionNote = (question.id, note)
             statusNote = note
             if let fresh = result.state { accept(nextSequence(), fresh) } else { await refresh() }
+            return !note.isAlert
         } catch let error as DaemonError {
             let note = SupervisorFormat.failureNote(error)
             questionNote = (question.id, note)
             statusNote = note
             if error == .conflict || error == .notFound { await refresh() }
+            return false
         } catch {
             let note = SupervisorFormat.Note(text: "Can't reach OpenAGI.", isAlert: true)
             questionNote = (question.id, note)
             statusNote = note
+            return false
         }
     }
 
@@ -1387,6 +1399,7 @@ private struct ThreadDetailSheet: View {
     var onDefer: () -> Void = {}
     var card: SupervisorCard? = nil
     var onCardPrimary: (SupervisorCard, SupervisorCardAction) -> Void = { _, _ in }
+    var onCardReply: ((SupervisorCard, String) async -> Bool)? = nil
 
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -1564,9 +1577,19 @@ private struct ThreadDetailSheet: View {
                                     Button("Send to session") {
                                         let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
-                                        onCardPrimary(card, SupervisorCardAction(op: "reply", label: "Reply", value: trimmed))
-                                        replyText = ""
-                                        replyOpen = false
+                                        if let onCardReply {
+                                            Task {
+                                                let delivered = await onCardReply(card, trimmed)
+                                                if delivered {
+                                                    replyText = ""
+                                                    replyOpen = false
+                                                }
+                                            }
+                                        } else {
+                                            onCardPrimary(card, SupervisorCardAction(op: "reply", label: "Reply", value: trimmed))
+                                            replyText = ""
+                                            replyOpen = false
+                                        }
                                     }
                                     .buttonStyle(.borderedProminent)
                                     .disabled(questionBusy || replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

@@ -88,17 +88,21 @@ enum SupervisorFormat {
     }
 
     static func statusBadge(thread: FleetThread, card: SupervisorCard? = nil) -> (health: FleetHealth, label: String) {
-        if let state = nonBlank(thread.state) {
-            let health = FleetHealth.of(thread)
-            return (health, "\(healthLabel(health)) · \(stateLabel(state))")
-        }
-        let ciRaw = card?.ciState ?? thread.pr?.ci?.state
+        let ciRaw = card?.ciState ?? card?.prContext?.ciState ?? thread.pr?.ci?.state
         let ci = ciRaw.flatMap { ciLabel(FleetCI(state: $0)) }
-        if card?.kind == "ci_failed" || ["FAILURE", "ERROR"].contains(ciRaw?.uppercased() ?? "") {
+        if card?.kind == "ci_failed" || (card != nil && ["FAILURE", "ERROR"].contains(ciRaw?.uppercased() ?? "")) {
             return (.red, [card?.kindLabel ?? "CI Failed", ci].compactMap { $0 }.joined(separator: " · "))
         }
         if card?.kind == "merge_ready" || card?.kind == "pr_ready" {
             return (.green, [card?.kindLabel ?? "PR Ready", ci].compactMap { $0 }.joined(separator: " · "))
+        }
+        if let state = nonBlank(thread.state) {
+            let rawHealth = FleetHealth.of(thread)
+            let health = (rawHealth == .gray && card != nil) ? .yellow : rawHealth
+            return (health, "\(healthLabel(health)) · \(stateLabel(state))")
+        }
+        if ["FAILURE", "ERROR"].contains(ciRaw?.uppercased() ?? "") {
+            return (.red, [card?.kindLabel ?? "CI Failed", ci].compactMap { $0 }.joined(separator: " · "))
         }
         if let kindLabel = nonBlank(card?.kindLabel) {
             return (.yellow, [kindLabel, ci].compactMap { $0 }.joined(separator: " · "))

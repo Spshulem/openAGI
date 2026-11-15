@@ -53,27 +53,31 @@ const CODE_PATH_OWNERS = new Set(["src", "app", "packages", "apps", "lib", "test
 function extractTranscriptPrRefs(text) {
   const seen = [];
   const raw = String(text ?? "");
-  const add = (repo, num) => {
-    const cleanRepo = String(repo ?? "").trim();
+  const rawMatches = [];
+  const collect = (index, repo, num) => {
+    const cleanRepo = String(repo ?? "").trim().replace(/\.git$/i, "");
     const cleanNum = String(num ?? "").trim();
-    const [owner] = cleanRepo.split("/");
+    const owner = cleanRepo.split("/")[0] ?? "";
     if (!owner || CODE_PATH_OWNERS.has(owner.toLowerCase()) || !/^\d+$/.test(cleanNum)) return;
-    const ref = `${cleanRepo}#${cleanNum}`;
+    rawMatches.push({ index: Number.isFinite(index) ? index : 0, ref: `${cleanRepo}#${cleanNum}` });
+  };
+  for (const m of raw.matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+(\d+)[^\n]{0,120}?--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/g)) {
+    collect(m.index, m[2], m[1]);
+  }
+  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+(\d+)\b/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  for (const m of raw.matchAll(/(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)\b/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  rawMatches.sort((a, b) => a.index - b.index);
+  for (const { ref } of rawMatches) {
     const existingIdx = seen.indexOf(ref);
     if (existingIdx !== -1) seen.splice(existingIdx, 1);
     seen.push(ref);
-  };
-  for (const m of raw.matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)) {
-    add(m[1], m[2]);
-  }
-  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+(\d+)[^\n]{0,120}?--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/g)) {
-    add(m[2], m[1]);
-  }
-  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+(\d+)\b/g)) {
-    add(m[1], m[2]);
-  }
-  for (const m of raw.matchAll(/(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)\b/g)) {
-    add(m[1], m[2]);
   }
   return seen.reverse().slice(0, 8);
 }
@@ -674,19 +678,21 @@ def read_head_tail(fp, head_b=131072, tail_b=393216):
 
 def extract_prs(txt):
     seen = []
+    hits = []
     skip = {"src", "app", "packages", "apps", "lib", "test", "tests", "server", "client", "docs", "scripts"}
     for m in re.finditer(r"https://github\\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\\d+)", txt):
         r, n = m.group(1), m.group(2)
         if r.split("/")[0].lower() not in skip:
-            ref = r + "#" + n
-            if ref in seen: seen.remove(ref)
-            seen.append(ref)
+            hits.append((m.start(), r + "#" + n))
     for m in re.finditer(r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\\d+)\\b", txt):
         r, n = m.group(1), m.group(2)
         if r.split("/")[0].lower() not in skip:
-            ref = r + "#" + n
-            if ref in seen: seen.remove(ref)
-            seen.append(ref)
+            hits.append((m.start(), r + "#" + n))
+    hits.sort(key=lambda x: x[0])
+    for _, ref in hits:
+        if ref in seen:
+            seen.remove(ref)
+        seen.append(ref)
     seen.reverse()
     return seen[:8]
 

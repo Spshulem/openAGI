@@ -1345,6 +1345,82 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     const redCard = supervisor.getState().cards.find((c) => c.id === redQ.id);
     assert.equal(redCard.kind, "ci_failed");
     assert.equal(redCard.kindLabel, "CI Failed");
+
+    // When a session moves to PR #20 while an earlier question for PR #10 remains open,
+    // card metadata stays bound to PR #10 instead of mixing PR #20's head/title.
+    const movedKey = "paseo:srv_4x2crHynU7yi.multi-pr";
+    const pr10 = { ref: "buildbetter-app/buildbetter#10", url: "https://github.com/buildbetter-app/buildbetter/pull/10", number: 10, title: "PR Ten Auth", bodySummary: "PR 10 summary", headOid: "1010101010abcdef", state: "OPEN", ci: { state: "SUCCESS" }, additions: 10, deletions: 2, changedFiles: 1 };
+    const pr20 = { ref: "buildbetter-app/buildbetter#20", url: "https://github.com/buildbetter-app/buildbetter/pull/20", number: 20, title: "PR Twenty Billing", bodySummary: "PR 20 summary", headOid: "2020202020abcdef", state: "OPEN", ci: { state: "PENDING" }, additions: 99, deletions: 12, changedFiles: 5 };
+    supervisor.lastPrs = new Map([[movedKey, pr20], [pr10.ref, pr10], [pr20.ref, pr20]]);
+    supervisor.store.recordSnapshot({
+      at: new Date().toISOString(),
+      reason: "moved-pr",
+      durationMs: 5,
+      mode: "propose",
+      counts: { threads: 1, eligible: 1, inScope: 1, deferred: 0, sources: {}, byState: {}, byWatch: {}, needsYou: 1, actions: 0 },
+      threads: [{ key: movedKey, kind: "paseo", title: "Multi PR Session", pr: { ref: pr20.ref, title: pr20.title, head: "2020202020", ci: { state: "PENDING" } } }],
+      infra: {},
+      infraDecisions: [],
+      sourceErrors: {}
+    });
+    const q10 = supervisor.store.upsertQuestion({
+      dedupeKey: "ready:pr10",
+      kind: "ready",
+      threadKey: movedKey,
+      prRef: pr10.ref,
+      title: "buildbetter #10 ready",
+      options: ["approved", "later"],
+      askedHead: pr10.headOid
+    });
+    const card10 = supervisor.getState().cards.find((c) => c.id === q10.id);
+    assert.equal(card10.prRef, pr10.ref);
+    assert.equal(card10.prContext?.title, "PR Ten Auth");
+    assert.equal(card10.headSha, "1010101010");
+    assert.equal(card10.ciState, "SUCCESS");
+
+    // Superseding an agent-ask with a thin snapshot preserves saved PR & conversation context,
+    // and syntheticPaseoThread restores workspaceId for saved-question delivery preflight.
+    const supKey = "paseo:srv_4x2crHynU7yi.sup1";
+    supervisor.store.upsertQuestion({
+      dedupeKey: "ask:sup:1",
+      kind: "agent-ask",
+      threadKey: supKey,
+      prRef: pr10.ref,
+      title: "Ship PR #10?",
+      body: "Ready to ship?",
+      options: ["yes", "no"],
+      askContext: "Ready to ship PR #10?",
+      agentAskedAt: "2026-11-15T08:00:00.000Z",
+      contextSnapshot: {
+        threadTitle: "Saved Session",
+        paseoCwd: "/workspace/bb",
+        paseoWorkspaceId: "wks_saved123",
+        paseoHasWorkspaceId: true,
+        recentMessages: [{ role: "assistant", text: "Earlier turn", at: "2026-11-15T08:00:00Z" }],
+        pr: { ref: pr10.ref, title: "PR Ten Auth", bodySummary: "Rich body", additions: 10, deletions: 2, changedFiles: 1 }
+      }
+    });
+    const sup2 = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:sup:2",
+      kind: "agent-ask",
+      threadKey: supKey,
+      prRef: pr10.ref,
+      title: "Ship PR #10 now?",
+      body: "Updated question?",
+      options: ["yes", "no"],
+      agentAskedAt: "2026-11-15T08:05:00.000Z",
+      contextSnapshot: {
+        threadTitle: "Saved Session",
+        paseoCwd: "/workspace/bb",
+        recentMessages: [],
+        pr: null
+      }
+    });
+    assert.equal(sup2.contextSnapshot?.pr?.bodySummary, "Rich body", "thin supersede preserves saved PR context");
+    assert.equal(sup2.contextSnapshot?.recentMessages?.length, 1, "thin supersede preserves saved recentMessages");
+    supervisor.config.paseo = { enabled: true };
+    const synth = supervisor.syntheticPaseoThread(supKey, sup2);
+    assert.equal(synth.meta.workspaceId, "wks_saved123", "synthetic Paseo thread restores workspaceId for delivery preflight");
   } finally {
     cleanup();
   }

@@ -371,30 +371,34 @@ export function buildSupervisorCard(
   const snap = question.contextSnapshot && typeof question.contextSnapshot === "object" ? question.contextSnapshot : null;
   const prRef = question.prRef ?? row?.pr?.ref ?? snap?.pr?.ref ?? thread?.prRefs?.[0] ?? null;
   const parsedPr = parsePrRef(prRef);
-  const livePr = (primaryKey ? prsByKey.get(primaryKey) : null) ?? (prRef ? prsByKey.get(prRef) : null) ?? null;
+  const matchesPrRef = (candidate) => Boolean(candidate && (!prRef || !candidate.ref || candidate.ref === prRef));
+  const threadKeyedPr = primaryKey ? prsByKey.get(primaryKey) : null;
+  const livePr = (prRef ? prsByKey.get(prRef) : null) ?? (matchesPrRef(threadKeyedPr) ? threadKeyedPr : null) ?? null;
+  const rowPr = matchesPrRef(row?.pr) ? row.pr : null;
+  const snapPr = matchesPrRef(snap?.pr) ? snap.pr : null;
 
   const pickNum = (...vals) => vals.find((v) => Number.isFinite(v)) ?? null;
-  const prTitle = clampText(redactSecrets(livePr?.title || row?.pr?.title || snap?.pr?.title || ""), 180) || null;
-  const rawPrBody = livePr?.bodySummary ?? row?.pr?.bodySummary ?? snap?.pr?.bodySummary ?? null;
+  const prTitle = clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null;
+  const rawPrBody = livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null;
   const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(rawPrBody), 900) : null;
-  const additions = pickNum(livePr?.additions, row?.pr?.additions, snap?.pr?.additions);
-  const deletions = pickNum(livePr?.deletions, row?.pr?.deletions, snap?.pr?.deletions);
-  const changedFiles = pickNum(livePr?.changedFiles, row?.pr?.changedFiles, snap?.pr?.changedFiles);
-  const files = (livePr?.files?.length ? livePr.files : (row?.pr?.files?.length ? row.pr.files : (snap?.pr?.files ?? []))).slice(0, 12);
-  const rawGates = livePr?.gates?.length ? livePr.gates : (row?.pr?.gates?.length ? row.pr.gates : (snap?.pr?.gates ?? []));
+  const additions = pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
+  const deletions = pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
+  const changedFiles = pickNum(livePr?.changedFiles, rowPr?.changedFiles, snapPr?.changedFiles);
+  const files = (livePr?.files?.length ? livePr.files : (rowPr?.files?.length ? rowPr.files : (snapPr?.files ?? []))).slice(0, 12);
+  const rawGates = livePr?.gates?.length ? livePr.gates : (rowPr?.gates?.length ? rowPr.gates : (snapPr?.gates ?? []));
   const gates = Array.isArray(rawGates)
     ? rawGates.slice(0, 4).map((g) => ({ label: String(g?.label || g?.name || ""), state: g?.state ?? null })).filter((g) => g.label)
     : [];
-  const rawQa = livePr?.qa ?? row?.pr?.qa ?? snap?.pr?.qa ?? null;
+  const rawQa = livePr?.qa ?? rowPr?.qa ?? snapPr?.qa ?? null;
   const qa = rawQa ? { required: rawQa.required ?? null, freshOnHead: rawQa.freshOnHead ?? null } : null;
-  const ciState = livePr?.ci?.state ?? row?.pr?.ci?.state ?? snap?.pr?.ciState ?? null;
-  const mergeState = livePr?.mergeState ?? row?.pr?.mergeState ?? snap?.pr?.mergeState ?? null;
+  const ciState = livePr?.ci?.state ?? rowPr?.ci?.state ?? snapPr?.ciState ?? null;
+  const mergeState = livePr?.mergeState ?? rowPr?.mergeState ?? snapPr?.mergeState ?? null;
   const headSha = (livePr?.headOid ? String(livePr.headOid).slice(0, 10) : null)
-    ?? row?.pr?.head
-    ?? snap?.pr?.head
+    ?? rowPr?.head
+    ?? snapPr?.head
     ?? question.askedHead
     ?? null;
-  const prUrl = livePr?.url ?? row?.pr?.url ?? snap?.pr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
+  const prUrl = livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
@@ -408,8 +412,8 @@ export function buildSupervisorCard(
     ciState,
     mergeState,
     head: headSha,
-    unresolvedThreads: livePr?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? snap?.pr?.unresolvedThreads ?? 0,
-    failingChecks: livePr?.ci?.failing ?? row?.pr?.ci?.failing ?? snap?.pr?.failingChecks ?? []
+    unresolvedThreads: livePr?.unresolvedThreads ?? rowPr?.unresolvedThreads ?? snapPr?.unresolvedThreads ?? 0,
+    failingChecks: livePr?.ci?.failing ?? rowPr?.ci?.failing ?? snapPr?.failingChecks ?? []
   } : null;
 
   const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
@@ -445,6 +449,8 @@ export function buildSupervisorCard(
     }));
 
   const prContext = prMeta ? {
+    ref: prRef,
+    url: prUrl,
     title: prTitle,
     bodySummary: prBodySummary,
     additions,
@@ -452,7 +458,8 @@ export function buildSupervisorCard(
     changedFiles,
     files,
     gates,
-    qa
+    qa,
+    ciState
   } : null;
 
   const openChat = resolveOpenChat(question, row, primaryKey, sessionTitle);

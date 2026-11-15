@@ -502,9 +502,9 @@ test("collectArchiveThreads indexes linked Claude JSONL transcripts, migration.s
     fs.writeFileSync(
       path.join(loginClaudeDir, "e204e9e9-269f-42f6-aba2-c8fd367f8f0e.jsonl"),
       [
-        JSON.stringify({ type: "user", message: { role: "user", content: "Implement ChatGPT login options." } }),
+        JSON.stringify({ type: "user", message: { role: "user", content: "Implement ChatGPT login options (follow-up to buildbetter-app/buildbetter#9044)." } }),
         ...Array.from({ length: 40 }, () => middlePadding),
-        JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Opened https://github.com/buildbetter-app/buildbetter/pull/9044 first, then shipped https://github.com/buildbetter-app/buildbetter/pull/9885 for ChatGPT login." } })
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Compared against buildbetter-app/buildbetter#9044 first, then shipped https://github.com/buildbetter-app/buildbetter/pull/9885 for ChatGPT login." } })
       ].join("\n") + "\n"
     );
 

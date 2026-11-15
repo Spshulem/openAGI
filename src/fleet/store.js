@@ -312,13 +312,29 @@ export class FleetStore {
     // while the ask stays open.
     const origin = { askContext: clampTail(redactSecrets(askContext), ASK_CONTEXT_MAX) || null, agentAskedAt: agentAskedAt ?? null };
     const cleanContext = isObject(contextSnapshot) ? structuredClone(contextSnapshot) : null;
-    const mergeContext = (prev, next) => {
-      if (!next) return prev ?? undefined;
+    const mergeContext = (prev, next, expectedPrRef = null) => {
+      if (!next && !isObject(prev)) return undefined;
+      const keepPrevPr = isObject(prev?.pr)
+        && (!expectedPrRef || !prev.pr.ref || prev.pr.ref === expectedPrRef)
+        && (!next?.pr?.ref || !prev.pr.ref || prev.pr.ref === next.pr.ref);
+      if (!isObject(next)) {
+        if (!isObject(prev)) return undefined;
+        return keepPrevPr ? prev : { ...prev, pr: null };
+      }
       if (!isObject(prev)) return next;
+      const nextClean = Object.fromEntries(
+        Object.entries(next).filter(([k, v]) => k !== "pr" && v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))
+      );
+      const nextPrClean = isObject(next.pr)
+        ? Object.fromEntries(Object.entries(next.pr).filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0)))
+        : null;
+      const mergedPr = nextPrClean
+        ? { ...(keepPrevPr ? prev.pr : {}), ...nextPrClean }
+        : (keepPrevPr ? prev.pr : null);
       return {
         ...prev,
-        ...Object.fromEntries(Object.entries(next).filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))),
-        pr: next.pr ? { ...(isObject(prev.pr) ? prev.pr : {}), ...Object.fromEntries(Object.entries(next.pr).filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))) } : (prev.pr ?? null)
+        ...nextClean,
+        pr: mergedPr
       };
     };
     const fields = {
@@ -347,7 +363,7 @@ export class FleetStore {
       // Asking again does not push its expiry back (liveSinceMs).
       Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
       if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
-      if (cleanContext) existing.contextSnapshot = mergeContext(existing.contextSnapshot, cleanContext);
+      if (cleanContext) existing.contextSnapshot = mergeContext(existing.contextSnapshot, cleanContext, fields.prRef);
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
@@ -377,13 +393,13 @@ export class FleetStore {
     // The agent asks again in a newer message while its last ask is still
     // open: one question per agent, so the open one takes the new ask in
     // place (same id, same outreach copy, no second push).
-    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now, cleanContext);
+    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now, cleanContext, mergeContext);
     if (superseded) return superseded;
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
       keepReviewWording(resolved, fields);
-      const mergedSnap = mergeContext(resolved.contextSnapshot, cleanContext);
+      const mergedSnap = mergeContext(resolved.contextSnapshot, cleanContext, fields.prRef);
       Object.assign(resolved, fields, origin.askContext ? origin : {}, mergedSnap ? { contextSnapshot: mergedSnap } : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
         reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
@@ -1048,7 +1064,7 @@ export class FleetStore {
   // PR) keeps its push and its expiry; a different one is put to the owner
   // anew, with its own day and push (milan: a new decision 23 h into an old
   // ask would expire an hour later, never pushed, then stay quiet a day).
-  _supersedeAgentAsk(key, fields, origin, head, now, contextSnapshot = null) {
+  _supersedeAgentAsk(key, fields, origin, head, now, contextSnapshot = null, mergeContext = null) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
     const askedAt = toMs(origin.agentAskedAt, null);
     if (askedAt === null) return null;
@@ -1064,8 +1080,11 @@ export class FleetStore {
     const body = norm(fields.body);
     const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
       || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
+    const mergedSnap = typeof mergeContext === "function"
+      ? mergeContext(older.contextSnapshot, contextSnapshot, fields.prRef)
+      : (contextSnapshot ?? older.contextSnapshot);
     Object.assign(older, fields, origin, {
-      ...(contextSnapshot ? { contextSnapshot } : {}),
+      ...(mergedSnap ? { contextSnapshot: mergedSnap } : {}),
       dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
       ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })

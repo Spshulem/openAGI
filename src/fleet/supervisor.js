@@ -490,6 +490,8 @@ function buildQuestionContextSnapshot(thread, pr) {
     branch: thread?.branch ?? pr?.headRef ?? null,
     provider: thread?.meta?.provider ?? thread?.kind ?? null,
     paseoCwd: thread?.meta?.paseoCwd ?? null,
+    paseoWorkspaceId: thread?.meta?.workspaceId ?? null,
+    paseoHasWorkspaceId: Boolean(thread?.meta && Object.prototype.hasOwnProperty.call(thread.meta, "workspaceId") && thread.meta.workspaceId !== undefined),
     serverId: thread?.meta?.serverId ?? null,
     aliases: Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases.slice(0, 4) : [],
     agentSummary: clampTailLines(redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || ""), 1600) || null,
@@ -1834,6 +1836,9 @@ export class FleetSupervisor {
       lastAgentFull: snap?.agentSummary ?? "",
       meta: {
         serverId: parsed.serverId,
+        ...(snap?.paseoHasWorkspaceId
+          ? { workspaceId: snap.paseoWorkspaceId ?? null }
+          : (typeof snap?.paseoWorkspaceId === "string" ? { workspaceId: snap.paseoWorkspaceId } : {})),
         provider: snap?.provider ?? "paseo",
         paseoCwd: snap?.paseoCwd ?? null,
         aliases: Array.isArray(snap?.aliases) ? snap.aliases : [],
@@ -3227,8 +3232,10 @@ export class FleetSupervisor {
       // The head it is asked at: a move past it settles the ask (settledAsk).
       const askThread = fields.threadKey ? (byKey.get(fields.threadKey) ?? this.knownThreads.get(fields.threadKey) ?? null) : null;
       const askPrRef = fields.prRef ?? askThread?.prRefs?.[0] ?? null;
-      const itemPr = items.find((item) => (askPrRef && item?.pr?.ref === askPrRef) || (fields.threadKey && item?.thread?.key === fields.threadKey))?.pr ?? null;
-      const askPr = (askPrRef ? prs.get(askPrRef) : null) ?? itemPr ?? (fields.threadKey ? this.lastPrs.get(fields.threadKey) : null) ?? null;
+      const matchesAskPr = (candidate) => Boolean(candidate && (!askPrRef || !candidate.ref || candidate.ref === askPrRef));
+      const itemPr = items.find((item) => (askPrRef && item?.pr?.ref === askPrRef) || (!askPrRef && fields.threadKey && item?.thread?.key === fields.threadKey))?.pr ?? null;
+      const lastThreadPr = fields.threadKey ? this.lastPrs.get(fields.threadKey) : null;
+      const askPr = (askPrRef ? prs.get(askPrRef) : null) ?? (matchesAskPr(itemPr) ? itemPr : null) ?? (matchesAskPr(lastThreadPr) ? lastThreadPr : null) ?? null;
       const contextSnapshot = buildQuestionContextSnapshot(askThread, askPr);
       const question = store.upsertQuestion({ ...fields, askedHead: askPr?.headOid ?? (fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null), contextSnapshot });
       asked.add(question.dedupeKey);
