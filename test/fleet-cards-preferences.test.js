@@ -1616,6 +1616,27 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     assert.equal(multiPartCard.recentMessages.length, 2, "dead file:// image-only message is stripped from recentMessages");
     assert.ok(multiPartCard.recentMessages.every((m) => !m.text.includes("file:///tmp/")));
 
+    // Leading short question followed by 1KB+ of implementation details preserves the actual question in summary
+    const leadingAskThread = {
+      key: "paseo:srv_bb3.prod-mig",
+      kind: "paseo",
+      title: "Production DB Migration",
+      lastAgentFull: `Should I deploy the production migration?\n\nImplementation notes:\n${"Added backfill batching and zero-downtime index creation.\n".repeat(24)}`
+    };
+    const leadingAskCard = buildSupervisorCard(
+      {
+        id: "q_leading_ask",
+        status: "open",
+        kind: "agent-ask",
+        threadKey: leadingAskThread.key,
+        title: "Production DB Migration: wants a prod step. OK?",
+        body: "Should I deploy the production migration?",
+        options: ["approve", "later"]
+      },
+      { threadsByKey: new Map([[leadingAskThread.key, leadingAskThread]]) }
+    );
+    assert.match(leadingAskCard.summary, /Should I deploy the production migration\?/, "summary must anchor around question.body rather than taking only the tail");
+
     // Prose action-item asks with "tell me which to approve" (no question mark) classify as needs-human
     const { classifyThread: classifyForProse } = await import("../src/fleet/classify.js");
     const proseClassified = classifyForProse({

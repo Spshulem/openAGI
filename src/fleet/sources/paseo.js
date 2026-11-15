@@ -197,11 +197,16 @@ export function createPaseoSource({ factory } = {}) {
     return withPaseo(config, async (client, signal, meta = {}) => {
       const directory = await client.hosts.list();
       const explicitIds = Array.isArray(config.paseo.serverIds) ? config.paseo.serverIds.filter(Boolean) : [];
-      const autoIds = explicitIds.length || config.paseo.autoHosts === false
-        ? []
-        : (directory.hosts ?? [])
-            .filter((h) => h?.serverId && h.enabled && h.status === "online")
-            .map((h) => h.serverId);
+      const autoHostsOn = !explicitIds.length && config.paseo.autoHosts !== false;
+      const enabledHosts = (directory.hosts ?? []).filter((h) => h?.serverId && h.enabled);
+      const autoIds = autoHostsOn
+        ? enabledHosts.filter((h) => h.status === "online").map((h) => h.serverId)
+        : [];
+      const unknownHostIds = new Set(
+        autoHostsOn
+          ? enabledHosts.filter((h) => h.status !== "online").map((h) => h.serverId)
+          : []
+      );
       const explicitSet = new Set([directory.self.serverId, ...explicitIds]);
       const ids = [...new Set([directory.self.serverId, ...explicitIds, ...autoIds])];
       const inventory = [];
@@ -224,10 +229,16 @@ export function createPaseoSource({ factory } = {}) {
           }
         } catch (err) {
           if (isRequiredHost || signal.aborted) throw err;
+          unknownHostIds.add(id);
         }
       }
       const live = new Set(inventory.map(r => r.key));
-      for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
+      const urlPrefix = `${config.paseo.url ?? "local"}:`;
+      for (const key of cache.keys()) {
+        if (live.has(key)) continue;
+        const retainedUnknown = [...unknownHostIds].some((hid) => key.startsWith(`${urlPrefix}${hid}:`));
+        if (!retainedUnknown) cache.delete(key);
+      }
       const candidates = inventory.filter(({ agent: a, key }) => !a.archivedAt && ["idle", "error"].includes(a.status)
         && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) =>
           ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
@@ -268,11 +279,18 @@ export function createPaseoSource({ factory } = {}) {
         }));
       }
       signal.throwIfAborted();
-      return inventory.map(({ agent: a, id, key }) => {
+      const out = inventory.map(({ agent: a, id, key }) => {
         const history = cache.get(key);
         const known = ["running", "initializing", "closed"].includes(a.status) || (history?.stamp === a.updatedAt);
         return paseoThread(a, id, known ? history?.entries ?? [] : [], known);
       });
+      if (unknownHostIds.size > 0) {
+        Object.defineProperty(out, "unknownThreadPrefixes", {
+          value: [...unknownHostIds].map((hid) => `paseo:${hid}.`),
+          enumerable: false
+        });
+      }
+      return out;
     }, factory);
   };
 }

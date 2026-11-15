@@ -264,6 +264,28 @@ function formatDiffSummary(prMeta) {
   return [counts, files].filter(Boolean).join(" · ") || null;
 }
 
+function expandFragmentFromAgent(rawBody, cleanAgent, maxLen = 440) {
+  const bodyAnchor = rawBody.slice(0, Math.min(28, rawBody.length));
+  if (!bodyAnchor) return null;
+  const anchorIdx = cleanAgent.lastIndexOf(bodyAnchor);
+  if (anchorIdx === -1) return null;
+  const availBefore = anchorIdx;
+  const availAfter = Math.max(0, cleanAgent.length - (anchorIdx + rawBody.length));
+  const half = Math.max(0, Math.floor((maxLen - rawBody.length) / 2));
+  let takeBefore = Math.min(availBefore, half);
+  let takeAfter = Math.min(availAfter, half);
+  if (takeBefore < half) {
+    takeAfter = Math.min(availAfter, Math.max(0, maxLen - rawBody.length - takeBefore));
+  } else if (takeAfter < half) {
+    takeBefore = Math.min(availBefore, Math.max(0, maxLen - rawBody.length - takeAfter));
+  }
+  const start = Math.max(0, anchorIdx - takeBefore);
+  const end = Math.min(cleanAgent.length, anchorIdx + rawBody.length + takeAfter);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < cleanAgent.length ? "…" : "";
+  return `${prefix}${cleanAgent.slice(start, end).trim()}${suffix}`;
+}
+
 function buildSummary(question, row, { headline = "", prMeta = null, agentSummary = null } = {}) {
   const parts = [];
   if (prMeta?.title && !String(headline).includes(prMeta.title) && !String(question.title ?? "").includes(prMeta.title)) {
@@ -275,22 +297,21 @@ function buildSummary(question, row, { headline = "", prMeta = null, agentSummar
   const mechanicalBody = isMechanicalReadyBody(question.body);
   const rawBody = stripAttachmentMarkdown(question.body);
   const cleanAgent = agentSummary ? stripAttachmentMarkdown(agentSummary) : "";
-  const bodyAnchor = rawBody.slice(0, Math.min(28, rawBody.length));
-  const bodyIsFragment = Boolean(
+  const expandedFragment = (
     rawBody
     && cleanAgent
     && cleanAgent.length > rawBody.length + 40
     && (rawBody.length < 140 || /^(?:\d+[.)]|[a-c][.)]|[-*•])\s/i.test(rawBody))
-    && bodyAnchor
-    && cleanAgent.includes(bodyAnchor)
-  );
+  )
+    ? expandFragmentFromAgent(rawBody, cleanAgent, 430)
+    : null;
 
   if (question.card) {
     parts.push(question.card);
   } else if (prMeta?.bodySummary) {
     parts.push(clampText(prMeta.bodySummary, 320));
-  } else if (bodyIsFragment) {
-    parts.push(clampTailLines(cleanAgent, 440));
+  } else if (expandedFragment) {
+    parts.push(expandedFragment);
   } else if (rawBody && !mechanicalBody) {
     parts.push(rawBody);
   } else if (cleanAgent) {
@@ -303,8 +324,8 @@ function buildSummary(question, row, { headline = "", prMeta = null, agentSummar
     parts.push(stripAttachmentMarkdown(row.lastAgentText));
   }
   const joined = parts.filter(Boolean).join(" — ");
-  if (bodyIsFragment && parts.length === 1) {
-    return clampTailLines(redactSecrets(joined), 460);
+  if (expandedFragment && parts.length === 1) {
+    return clampTextLines(redactSecrets(joined), 460);
   }
   return clampText(redactSecrets(joined || row?.reason || "Waiting for your decision."), 460);
 }

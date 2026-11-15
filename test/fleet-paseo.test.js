@@ -48,11 +48,81 @@ test("registered hosts preserve distinct same-ID chats; unavailable hosts fail c
   assert.equal(new Set(rows.map(t => t.key)).size, 2);
   await assert.rejects(hostApi(m.client, "unregistered"), /unavailable/);
 
-  // Auto-discovered host disconnecting mid-scan does not fail self discovery
+  // Auto-discovered host disconnecting mid-scan does not fail self discovery and preserves open remote questions
   const flaky = mock([agent("local-chat")], { remote: [agent("remote-chat")] });
-  flaky.client.hosts.client = async () => ({ agents: { list: async () => { throw new Error("remote host went to sleep"); } } });
-  const survived = await createPaseoSource(flaky)({ paseo: { enabled: true } });
+  let remoteFail = true;
+  const realRemoteClient = flaky.client.hosts.client;
+  flaky.client.hosts.client = async (...args) => {
+    if (remoteFail) return { agents: { list: async () => { throw new Error("remote host went to sleep"); } } };
+    return realRemoteClient(...args);
+  };
+  const flakySource = createPaseoSource(flaky);
+  const survived = await flakySource({ paseo: { enabled: true } });
   assert.deepEqual(survived.map(t => t.key), ["paseo:local.local-chat"]);
+  assert.deepEqual(survived.unknownThreadPrefixes, ["paseo:remote."]);
+
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { FleetSupervisor } = await import("../src/fleet/supervisor.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-unknown-host-"));
+  try {
+    let remoteOnline = true;
+    const remoteAskAgent = agent("remote-ask", { updatedAt: "2026-01-02T00:00:00Z" });
+    const dynClient = {
+      agents: {
+        list: async () => ({ entries: [{ agent: agent("local-ok") }], pageInfo: { hasMore: false } }),
+        ref: (id) => ({ timeline: { refetch: async () => ({ agent: agent(id), entries: [{ item: { type: "assistant_message", text: "Completed." }, timestamp: "2026-01-01T00:00:00Z" }] }) } })
+      },
+      connect: async () => {},
+      close: async () => {},
+      hosts: {
+        list: async () => ({
+          self: { serverId: "local" },
+          hosts: [{ serverId: "remote", enabled: true, status: remoteOnline ? "online" : "offline" }]
+        }),
+        client: async () => ({
+          agents: {
+            list: async () => ({ entries: [{ agent: remoteAskAgent }], pageInfo: { hasMore: false } }),
+            ref: () => ({
+              timeline: {
+                refetch: async () => ({
+                  agent: remoteAskAgent,
+                  entries: [{ item: { type: "assistant_message", text: "Should I run the production migration?" }, timestamp: "2026-01-02T00:00:00Z" }]
+                })
+              }
+            })
+          }
+        })
+      }
+    };
+    const dynSource = createPaseoSource({ factory: () => dynClient });
+    const sup = new FleetSupervisor({
+      dataDir: tmpDir,
+      config: resolveFleetConfig({}, {
+        enabled: true,
+        mode: "observe",
+        paseo: { enabled: true, only: true, historyPerScan: 10 },
+        review: { enabled: false },
+        storage: { enabled: false }
+      }),
+      deps: {
+        listPaseoThreads: (cfg) => dynSource(cfg),
+        run: async () => ({ code: 1, stdout: "", stderr: "" })
+      }
+    });
+    await sup.tick("scan-1");
+    const openAfterOnline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOnline.length, 1, "remote Paseo host ask opens a question when online");
+
+    remoteOnline = false;
+    await sup.tick("scan-2");
+    const openAfterOffline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOffline.length, 1, "transiently offline auto-discovered host must not resolve open question as left the scan");
+    assert.ok(sup.getState().snapshot?.threads?.some((r) => r.key === "paseo:remote.remote-ask"), "snapshot retains warm row while optional host is offline");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 test("failed histories remain excluded, permissions remain owner-blocked, closed stays closed", async () => {
   const m = mock([agent("a")], { failHistory: true });
