@@ -1054,6 +1054,20 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     assert.equal(nextCards.find((c) => c.id === draftAskQ.id).primaryAction.op, "answer");
     assert.equal(nextCards.find((c) => c.id === draftAskQ.id).primaryAction.value, "mark ready");
     assert.match(nextCards.find((c) => c.id === wksPromptQ.id).headline, /^Success pages — consolidation #5560:/);
+
+    // Structured Paseo choice cards mentioning 'Merge PR' in title keep their native choice actions
+    const structuredChoiceQ = supervisor.store.upsertQuestion({
+      dedupeKey: "card:paseo:host1.agent-5560:aq-choice-merge",
+      kind: "agent-card",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9599",
+      title: "Success pages: Merge PR now or deploy to staging first?",
+      options: ["Deploy to staging first", "Merge PR now", "open thread"],
+      meta: { app: "paseo", cardId: "aq-choice-merge", labels: ["Deploy to staging first", "Merge PR now"] }
+    });
+    const structuredChoiceCard = supervisor.getState().cards.find((c) => c.id === structuredChoiceQ.id);
+    assert.equal(structuredChoiceCard.primaryAction.op, "answer");
+    assert.equal(structuredChoiceCard.primaryAction.value, "Deploy to staging first");
   } finally {
     cleanup();
   }

@@ -44,8 +44,9 @@ function isMergeReadyQuestion(question, row, prRef) {
   const isDraftAsk = Boolean(row?.pr?.isDraft) || /\bmark\s+draft\b/i.test(String(question.title ?? ""));
   if (isDraftAsk) return false;
   if (question.kind === "ready" || question.mergeAsk) return true;
-  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "") : "";
-  return /\b(?:approve and merge|merge now|approve merge|merge pr|ship pr)\b/i.test(`${question.title ?? ""} ${firstOpt}`);
+  if (question.kind !== "agent-ask") return false;
+  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
+  return /^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt);
 }
 
 function classifyCardKind(question, row = null, prRef = null) {
