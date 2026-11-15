@@ -4,6 +4,7 @@
 // so Android, push extensions, and older clients stay 100% compatible.
 
 import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
+import { asksToMergePr } from "./policy.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
@@ -41,13 +42,15 @@ function humanOptionLabel(option) {
 
 function isMergeReadyQuestion(question, row, prRef) {
   if (!prRef || !parsePrRef(prRef)) return false;
-  const isDraftAsk = Boolean(row?.pr?.isDraft) || /\bmark\s+draft\b/i.test(String(question.title ?? ""));
+  const isDraftAsk = Boolean(row?.pr?.isDraft)
+    || (Array.isArray(row?.blockers) && row.blockers.includes("draft"))
+    || /\bdraft\b/i.test(`${question.title ?? ""} ${question.body ?? ""}`);
   if (isDraftAsk) return false;
   if (question.kind === "ready" || question.mergeAsk) return true;
   if (question.kind !== "agent-ask") return false;
   const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
-  if (/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship pr)$/i.test(firstOpt)) return true;
-  return /^ship(?: it)?$/i.test(firstOpt) && /\bmerge\b/i.test(String(question.title ?? ""));
+  if (!/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt)) return false;
+  return asksToMergePr(`${question.title ?? ""} ${question.body ?? ""}`);
 }
 
 function classifyCardKind(question, row = null, prRef = null) {

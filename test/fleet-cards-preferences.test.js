@@ -1082,6 +1082,62 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     const deployShipCard = supervisor.getState().cards.find((c) => c.id === deployShipAskQ.id);
     assert.equal(deployShipCard.primaryAction.op, "answer");
     assert.equal(deployShipCard.primaryAction.value, "ship it");
+
+    // Branch-update asks ("Merge main into this branch before continuing?") stay answer cards
+    const branchUpdateAskQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:branch-update-9599",
+      kind: "agent-ask",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9599",
+      mergeAsk: false,
+      title: "Merge main into this branch before continuing?",
+      options: ["merge", "wait"]
+    });
+    const branchUpdateCard = supervisor.getState().cards.find((c) => c.id === branchUpdateAskQ.id);
+    assert.equal(branchUpdateCard.primaryAction.op, "answer");
+    assert.equal(branchUpdateCard.primaryAction.value, "merge");
+
+    // Snapshot-generated draft PR rows preserve isDraft and keep "approve and merge?" as an answer action
+    const draftThread = {
+      key: "paseo:host1.agent-draft",
+      kind: "paseo",
+      title: "Draft feature #9801",
+      agentStatus: "idle",
+      live: true,
+      prRefs: ["acme/webapp#9801"],
+      meta: { app: "paseo", conversationId: "agent-draft" }
+    };
+    const draftSnap = supervisor.buildSnapshot({
+      reason: "test",
+      started: 1000,
+      finished: 1050,
+      mode: "auto",
+      threads: [draftThread],
+      inScope: [draftThread],
+      items: [{
+        thread: draftThread,
+        classified: { state: "needs-human", reason: "draft pr", blockers: ["draft"] },
+        pr: { ref: "acme/webapp#9801", url: "https://github.com/acme/webapp/pull/9801", state: "OPEN", isDraft: true, title: "Draft PR", ci: { state: "SUCCESS" }, unresolvedThreads: 0, mergeState: "DRAFT", headOid: "deadbeef00" }
+      }],
+      decisions: [],
+      infra: {},
+      sourceErrors: {},
+      manager: null
+    });
+    assert.equal(draftSnap.threads[0].pr.isDraft, true);
+    supervisor.store.recordSnapshot(draftSnap);
+    const snapshotDraftAskQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:snapshot-draft-9801",
+      kind: "agent-ask",
+      threadKey: draftThread.key,
+      prRef: "acme/webapp#9801",
+      mergeAsk: false,
+      title: "webapp #9801: approve and merge?",
+      options: ["approve merge", "not now"]
+    });
+    const snapshotDraftCard = supervisor.getState().cards.find((c) => c.id === snapshotDraftAskQ.id);
+    assert.equal(snapshotDraftCard.primaryAction.op, "answer");
+    assert.equal(snapshotDraftCard.primaryAction.value, "approve merge");
   } finally {
     cleanup();
   }

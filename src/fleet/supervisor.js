@@ -26,7 +26,7 @@ import { localDay } from "./diagnose.js";
 import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
-import { buildBugDispatchMessage, routeCustomerIssue, searchFleet } from "./search.js";
+import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -1847,8 +1847,20 @@ export class FleetSupervisor {
   // step and why, its open questions, and what opens its chat. Built from
   // the last scan's row (kept across a restart), with this process's own
   // read of the chat when it has one. null: not in the last scan.
-  searchThreads(options) {
-    return searchFleet(this.getState(), options, this.lastThreads);
+  async searchThreads(options = {}) {
+    const tmpRoot = os.tmpdir();
+    const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
+    const useDisk = options?.includeDisk === true || (options?.includeDisk !== false && (!inTempTestDir || Boolean(options?.homeDir)));
+    let threads = this.lastThreads;
+    if (useDisk && typeof options?.query === "string" && options.query.trim()) {
+      const archives = await collectArchiveThreads({
+        query: options.query,
+        homeDir: options.homeDir ?? os.homedir(),
+        includeRemotePaseoHosts: options.includeRemotePaseoHosts ?? Boolean(this.config?.paseo?.enabled)
+      });
+      threads = mergeThreadsWithArchives(this.lastThreads, archives);
+    }
+    return searchFleet(this.getState(), { natural: true, ...options }, threads);
   }
 
   updatePreferences(patch = {}) {
@@ -1893,10 +1905,15 @@ export class FleetSupervisor {
         delivery: sent?.delivery ?? null
       };
     }
+    const tmpRoot = os.tmpdir();
+    const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
+    const archives = !inTempTestDir
+      ? await collectArchiveThreads({ query: String(text ?? "").slice(0, 300), includeRemotePaseoHosts: Boolean(this.config?.paseo?.enabled) })
+      : new Map();
     const routed = await routeCustomerIssue({
       text,
       state: this.getState(),
-      cachedThreads: this.lastThreads,
+      cachedThreads: mergeThreadsWithArchives(this.lastThreads, archives),
       runModel: this.deps.routeModel ?? null
     });
     if (autoSend === true && routed.action === "auto_dispatch" && routed.primary?.key) {
@@ -3444,7 +3461,7 @@ export class FleetSupervisor {
         reason: clampText(classified.reason, 160),
         blockers: (classified.blockers ?? []).slice(0, 6),
         pr: pr
-          ? { ref: pr.ref, url: pr.url, state: pr.state, title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
+          ? { ref: pr.ref, url: pr.url, state: pr.state, isDraft: Boolean(pr.isDraft), title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
         lastActivityAt: thread.lastActivityAt ?? null,
         lastAgentText: clampTail(redactSecrets(thread.lastAgentText), 600),
