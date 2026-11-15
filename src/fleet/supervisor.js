@@ -2713,7 +2713,7 @@ export class FleetSupervisor {
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, unknownPrefixes, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
-    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started, deferred });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, unknownPrefixes, mode, now: started, deferred });
 
     const finished = this.now();
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
@@ -2917,7 +2917,7 @@ export class FleetSupervisor {
   // held back is retried next tick; a wait means the owner or a recent nudge
   // already has the thread. A thread hidden by a failed source waits up to
   // RECOVERY_HOLD_MS for that source.
-  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now(), deferred = new Set() } = {}) {
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), unknownPrefixes = [], mode = "observe", now = this.now(), deferred = new Set() } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -2933,7 +2933,7 @@ export class FleetSupervisor {
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
         // A thread a capped scan deferred gets its resume once it is read.
-        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && (unknownKinds.has(key.split(":")[0]) || unknownPrefixes.some((p) => key.startsWith(p))))));
       }
     }
   }
@@ -3225,10 +3225,10 @@ export class FleetSupervisor {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
       // is until that source reads again.
-      const spec = unknownKinds.size ? GROUPED_KINDS[fields.kind] : null;
+      const spec = (unknownKinds.size || unknownPrefixes.length) ? GROUPED_KINDS[fields.kind] : null;
       const covers = (q) => (fields.threadKeys ? true : (q.threadKeys ?? []).includes(fields.threadKey));
       const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
-      const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
+      const open = sameChoices ? store.openQuestions().find((q) => String(q.dedupeKey ?? "").replace(/:\d+$/, "") === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       // The head it is asked at: a move past it settles the ask (settledAsk).

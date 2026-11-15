@@ -68,11 +68,16 @@ test("registered hosts preserve distinct same-ID chats; unavailable hosts fail c
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-unknown-host-"));
   try {
     let remoteOnline = true;
-    const remoteAskAgent = agent("remote-ask", { updatedAt: "2026-01-02T00:00:00Z" });
+    const recentIso = new Date().toISOString();
+    const capMsg = "Individual quota reached. Resets in 24h.";
+    const localLim1 = agent("local-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const localLim2 = agent("local-lim-2", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteLim = agent("remote-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteAskAgent = agent("remote-ask", { updatedAt: recentIso });
     const dynClient = {
       agents: {
-        list: async () => ({ entries: [{ agent: agent("local-ok") }], pageInfo: { hasMore: false } }),
-        ref: (id) => ({ timeline: { refetch: async () => ({ agent: agent(id), entries: [{ item: { type: "assistant_message", text: "Completed." }, timestamp: "2026-01-01T00:00:00Z" }] }) } })
+        list: async () => ({ entries: [{ agent: agent("local-ok") }, { agent: localLim1 }, { agent: localLim2 }], pageInfo: { hasMore: false } }),
+        ref: (id) => ({ timeline: { refetch: async () => ({ agent: id === "local-lim-1" ? localLim1 : id === "local-lim-2" ? localLim2 : agent(id), entries: [{ item: { type: "assistant_message", text: "Completed." }, timestamp: "2026-01-01T00:00:00Z" }] }) } })
       },
       connect: async () => {},
       close: async () => {},
@@ -83,12 +88,14 @@ test("registered hosts preserve distinct same-ID chats; unavailable hosts fail c
         }),
         client: async () => ({
           agents: {
-            list: async () => ({ entries: [{ agent: remoteAskAgent }], pageInfo: { hasMore: false } }),
-            ref: () => ({
+            list: async () => ({ entries: [{ agent: remoteAskAgent }, { agent: remoteLim }], pageInfo: { hasMore: false } }),
+            ref: (id) => ({
               timeline: {
                 refetch: async () => ({
-                  agent: remoteAskAgent,
-                  entries: [{ item: { type: "assistant_message", text: "Should I run the production migration?" }, timestamp: "2026-01-02T00:00:00Z" }]
+                  agent: id === "remote-lim-1" ? remoteLim : remoteAskAgent,
+                  entries: id === "remote-lim-1"
+                    ? [{ item: { type: "assistant_message", text: "Working." }, timestamp: "2026-01-01T00:00:00Z" }]
+                    : [{ item: { type: "assistant_message", text: "Should I run the production migration?" }, timestamp: "2026-01-02T00:00:00Z" }]
                 })
               }
             })
@@ -114,11 +121,15 @@ test("registered hosts preserve distinct same-ID chats; unavailable hosts fail c
     await sup.tick("scan-1");
     const openAfterOnline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
     assert.equal(openAfterOnline.length, 1, "remote Paseo host ask opens a question when online");
+    const groupAfterOnline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.equal(groupAfterOnline?.threadKeys?.length, 3, "three-member limit:group includes both local and remote members");
 
     remoteOnline = false;
     await sup.tick("scan-2");
     const openAfterOffline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
     assert.equal(openAfterOffline.length, 1, "transiently offline auto-discovered host must not resolve open question as left the scan");
+    const groupAfterOffline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.deepEqual(groupAfterOffline?.threadKeys?.includes("paseo:remote.remote-lim-1"), true, "three-member limit:group retains remote member while optional host is offline");
     assert.ok(sup.getState().snapshot?.threads?.some((r) => r.key === "paseo:remote.remote-ask"), "snapshot retains warm row while optional host is offline");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
