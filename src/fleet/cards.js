@@ -46,7 +46,8 @@ function isMergeReadyQuestion(question, row, prRef) {
   if (question.kind === "ready" || question.mergeAsk) return true;
   if (question.kind !== "agent-ask") return false;
   const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
-  return /^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt);
+  if (/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship pr)$/i.test(firstOpt)) return true;
+  return /^ship(?: it)?$/i.test(firstOpt) && /\bmerge\b/i.test(String(question.title ?? ""));
 }
 
 function classifyCardKind(question, row = null, prRef = null) {
@@ -70,7 +71,8 @@ function classifyCardKind(question, row = null, prRef = null) {
 function isQuestionLiveForDeck(question, row, prefs) {
   if (!question || question.status !== "open") return false;
   if (row?.muted) return false;
-  if (row?.pr?.state && SETTLED_PR.has(row.pr.state) && (question.kind === "ready" || question.mergeAsk)) {
+  const prRef = question.prRef ?? row?.prRef ?? null;
+  if (row?.pr?.state && SETTLED_PR.has(row.pr.state) && (question.kind === "ready" || question.mergeAsk || isMergeReadyQuestion(question, row, prRef))) {
     return false;
   }
   if (question.kind === "agent-ask" && !question.mergeAsk && row) {

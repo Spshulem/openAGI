@@ -1068,6 +1068,20 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     const structuredChoiceCard = supervisor.getState().cards.find((c) => c.id === structuredChoiceQ.id);
     assert.equal(structuredChoiceCard.primaryAction.op, "answer");
     assert.equal(structuredChoiceCard.primaryAction.value, "Deploy to staging first");
+
+    // Non-merge shipping asks ("Deploy the preview build to staging?" with ["ship it", "wait"]) stay answer cards
+    const deployShipAskQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:deploy-preview-9599",
+      kind: "agent-ask",
+      threadKey: paseoRow.key,
+      prRef: "acme/webapp#9599",
+      mergeAsk: false,
+      title: "Deploy the preview build to staging?",
+      options: ["ship it", "wait"]
+    });
+    const deployShipCard = supervisor.getState().cards.find((c) => c.id === deployShipAskQ.id);
+    assert.equal(deployShipCard.primaryAction.op, "answer");
+    assert.equal(deployShipCard.primaryAction.value, "ship it");
   } finally {
     cleanup();
   }
