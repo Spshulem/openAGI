@@ -198,4 +198,88 @@ final class SupervisorFormatTests: XCTestCase {
         XCTAssertEqual(hits.first?.snippet, "Added refresh retry")
         XCTAssertTrue(hits.first?.live == true)
     }
+
+    func testFormatsOpaqueKeysFiltersWorkspaceIdsAndDecodesRichCardContext() throws {
+        XCTAssertEqual(
+            SupervisorFormat.name(FleetThread(key: "paseo:srv_4x2crHynU7yi.2ba43988-ba6b-4f7d-b8df-a8feb2378572")),
+            "Paseo session · 2ba43988"
+        )
+        XCTAssertEqual(
+            SupervisorFormat.name(FleetThread(key: "paseo:srv_4x2crHynU7yi.2ba43988", title: "Mobile Auth Fix", workspace: "wks_9f8e7d6c")),
+            "Mobile Auth Fix"
+        )
+
+        let readyCard = SupervisorCard(
+            id: "fq_9869",
+            kind: "merge_ready",
+            kindLabel: "PR Ready",
+            headline: "#9869 · fix(auth): retry expired mobile session tokens",
+            ciState: "SUCCESS"
+        )
+        let badge = SupervisorFormat.statusBadge(
+            thread: FleetThread(key: "paseo:srv_4x2crHynU7yi.2ba43988", state: "ready-needs-human"),
+            card: readyCard
+        )
+        XCTAssertEqual(badge.health, .green)
+        XCTAssertEqual(badge.label, "PR Ready · CI passing")
+
+        let failedBadge = SupervisorFormat.statusBadge(
+            thread: FleetThread(key: "paseo:srv_4x2crHynU7yi.red1", state: "waiting-ci"),
+            card: SupervisorCard(id: "fq_red", kind: "ci_failed", kindLabel: "CI Failed", headline: "#9899", ciState: "FAILURE")
+        )
+        XCTAssertEqual(failedBadge.health, .red)
+        XCTAssertEqual(failedBadge.label, "CI Failed · CI failing")
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let richCardJSON = Data("""
+        {
+          "id": "fq_207632e8558d4641",
+          "questionId": "fq_207632e8558d4641",
+          "kind": "merge_ready",
+          "kindLabel": "PR Ready",
+          "headline": "#9869 · fix(auth): retry expired mobile session tokens",
+          "sessionTitle": "Fix mobile auth token refresh & drawer",
+          "summary": "+142 / -38 · 4 files — Fixes silent token expiry on resume.",
+          "agentSummary": "Implemented token refresh retry and verified drawer state.",
+          "threadKey": "paseo:srv_4x2crHynU7yi.2ba43988-ba6b-4f7d-b8df-a8feb2378572",
+          "prRef": "buildbetter-app/buildbetter#9869",
+          "prUrl": "https://github.com/buildbetter-app/buildbetter/pull/9869",
+          "ciState": "SUCCESS",
+          "options": ["approved", "later"],
+          "primaryAction": {"op": "merge", "label": "Merge PR"},
+          "extraActions": [{"op": "merge_and_deploy", "label": "Merge & Deploy"}],
+          "prContext": {
+            "ref": "buildbetter-app/buildbetter#9869",
+            "url": "https://github.com/buildbetter-app/buildbetter/pull/9869",
+            "title": "fix(auth): retry expired mobile session tokens",
+            "bodySummary": "Fixes silent token expiry on resume.",
+            "additions": 142,
+            "deletions": 38,
+            "changedFiles": 4,
+            "files": ["src/auth/refresh.ts", "src/ui/Drawer.tsx"],
+            "gates": [{"label": "UI QA", "state": "missing"}],
+            "ciState": "SUCCESS"
+          },
+          "recentMessages": [
+            {"role": "user", "text": "Ship the mobile auth token refresh fix", "at": "2026-11-15T08:00:00Z"},
+            {"role": "assistant", "text": "Implemented token refresh retry.", "at": "2026-11-15T08:15:00Z"}
+          ],
+          "openChat": {
+            "app": "paseo",
+            "serverId": "srv_4x2crHynU7yi",
+            "agentId": "2ba43988-ba6b-4f7d-b8df-a8feb2378572"
+          }
+        }
+        """.utf8)
+        let card = try decoder.decode(SupervisorCard.self, from: richCardJSON)
+        XCTAssertEqual(card.sessionTitle, "Fix mobile auth token refresh & drawer")
+        XCTAssertEqual(card.agentSummary, "Implemented token refresh retry and verified drawer state.")
+        XCTAssertEqual(card.extraActions.map(\.label), ["Merge & Deploy"])
+        XCTAssertEqual(SupervisorFormat.diffStatLine(card.prContext), "+142 / -38 · 4 files")
+        XCTAssertEqual(card.prContext?.files.count, 2)
+        XCTAssertEqual(card.prContext?.gates.first?.label, "UI QA")
+        XCTAssertEqual(card.recentMessages.count, 2)
+        XCTAssertEqual(card.openChat?.serverId, "srv_4x2crHynU7yi")
+    }
 }

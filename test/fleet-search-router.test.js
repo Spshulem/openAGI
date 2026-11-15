@@ -447,3 +447,97 @@ test("SSH archive command is shell-safe, artifacts retain late matches past 6KB,
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("collectArchiveThreads indexes linked Claude JSONL transcripts, migration.source-agent-id, PR refs, and 2-term natural queries", async () => {
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-claude-archive-"));
+  try {
+    const paseoAgentsDir = path.join(fakeHome, ".paseo", "agents", "bb3");
+    fs.mkdirSync(paseoAgentsDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeHome, ".paseo", "server-id"), "srv_bb3\n");
+
+    // 1. Migrated Antigravity -> Claude session in Paseo ("Growth workspace build — Data Room & Metrics (Antigravity)")
+    const growthCwd = "/home/dev/paseo/migrated/mac/Users/shooby/Dev/revops";
+    const growthSlug = "-home-dev-paseo-migrated-mac-Users-shooby-Dev-revops";
+    const growthClaudeDir = path.join(fakeHome, ".claude", "projects", growthSlug);
+    fs.mkdirSync(growthClaudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(paseoAgentsDir, "98ae7f6f-c6aa-4c78-88ee-7be9aaf51b26.json"),
+      JSON.stringify({
+        id: "98ae7f6f-c6aa-4c78-88ee-7be9aaf51b26",
+        provider: "claude",
+        cwd: growthCwd,
+        title: "Growth workspace build — Data Room & Metrics (Antigravity)",
+        status: "idle",
+        updatedAt: "2026-11-14T04:00:00.000Z",
+        labels: { "migration.source-agent-id": "81c55047-2f5d-4ac8-b5fa-e297caabd56c" },
+        persistence: { sessionId: "b0f5cf2b-07e5-4af1-b2f1-5c97164e85b4" }
+      })
+    );
+    fs.writeFileSync(
+      path.join(growthClaudeDir, "b0f5cf2b-07e5-4af1-b2f1-5c97164e85b4.jsonl"),
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "Build out the BuildBetter growth section with Data Room and Metrics." } }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Shipped the BuildBetter Growth section behind growth_workspace flag." }] } })
+      ].join("\n") + "\n"
+    );
+
+    // 2. ChatGPT login session whose PR #9885 is recorded in the tail of its linked Claude transcript
+    const loginCwd = "/home/dev/paseo/migrated/mac/Users/shooby/Dev/bbapp/.conductor/bilbao";
+    const loginSlug = "-home-dev-paseo-migrated-mac-Users-shooby-Dev-bbapp--conductor-bilbao";
+    const loginClaudeDir = path.join(fakeHome, ".claude", "projects", loginSlug);
+    fs.mkdirSync(loginClaudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(paseoAgentsDir, "ccb8d08f-8a42-44e9-88b9-8140a6188137.json"),
+      JSON.stringify({
+        id: "ccb8d08f-8a42-44e9-88b9-8140a6188137",
+        provider: "claude",
+        cwd: loginCwd,
+        title: "ChatGPT Credits Login Options",
+        status: "idle",
+        updatedAt: "2026-11-14T06:00:00.000Z",
+        persistence: { sessionId: "e204e9e9-269f-42f6-aba2-c8fd367f8f0e" }
+      })
+    );
+    const middlePadding = JSON.stringify({ type: "assistant", message: { role: "assistant", content: "working... ".repeat(400) } });
+    fs.writeFileSync(
+      path.join(loginClaudeDir, "e204e9e9-269f-42f6-aba2-c8fd367f8f0e.jsonl"),
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "Implement ChatGPT login options (follow-up to buildbetter-app/buildbetter#9044)." } }),
+        ...Array.from({ length: 40 }, () => middlePadding),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Compared against buildbetter-app/buildbetter#9044 first, then shipped https://github.com/buildbetter-app/buildbetter/pull/9885 for ChatGPT login." } })
+      ].join("\n") + "\n"
+    );
+
+    // Query 1: full natural sentence for growth section
+    const q1 = "which chat, i believe it was an antigravity chat, built the buildbetter growth section";
+    const arch1 = await collectArchiveThreads({ query: q1, homeDir: fakeHome });
+    const merged1 = mergeThreadsWithArchives(new Map(), arch1);
+    const res1 = searchFleet({ snapshot: { threads: [] } }, { query: q1, natural: true, limit: 10 }, merged1);
+    assert.ok(res1.results.length >= 1);
+    assert.equal(res1.results[0].key, "paseo:srv_bb3.98ae7f6f-c6aa-4c78-88ee-7be9aaf51b26");
+
+    // Also test 2-word natural query ("growth section") when title only has "Growth" and transcript has "section"
+    const resShort = searchFleet({ snapshot: { threads: [] } }, { query: "growth section", natural: true, limit: 10 }, merged1);
+    assert.equal(resShort.results[0]?.key, "paseo:srv_bb3.98ae7f6f-c6aa-4c78-88ee-7be9aaf51b26");
+
+    // Query 2: ChatGPT login -> merges extracted PR #9885 onto live Paseo thread that had prRefs: []
+    const q2 = "what about the one that shipped chatgpt login";
+    const liveMap = new Map([
+      ["paseo:srv_bb3.ccb8d08f-8a42-44e9-88b9-8140a6188137", {
+        key: "paseo:srv_bb3.ccb8d08f-8a42-44e9-88b9-8140a6188137",
+        kind: "paseo",
+        title: "ChatGPT Credits Login Options",
+        prRefs: [],
+        lastAgentText: "Done."
+      }]
+    ]);
+    const arch2 = await collectArchiveThreads({ query: q2, homeDir: fakeHome });
+    const merged2 = mergeThreadsWithArchives(liveMap, arch2);
+    const res2 = searchFleet({ snapshot: { threads: [] } }, { query: q2, natural: true, limit: 10 }, merged2);
+    assert.ok(res2.results.length >= 1);
+    assert.equal(res2.results[0].key, "paseo:srv_bb3.ccb8d08f-8a42-44e9-88b9-8140a6188137");
+    assert.equal(res2.results[0].prRef, "buildbetter-app/buildbetter#9885");
+  } finally {
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+  }
+});

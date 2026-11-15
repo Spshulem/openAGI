@@ -48,6 +48,202 @@ export function extractQueryTerms(query, { natural = false } = {}) {
   return { rawTerms, effectiveTerms, useNaturalSubset };
 }
 
+const CODE_PATH_OWNERS = new Set(["src", "app", "packages", "apps", "lib", "test", "tests", "server", "client", "docs", "scripts"]);
+
+function extractTranscriptPrRefs(text) {
+  const seen = [];
+  const raw = String(text ?? "");
+  const rawMatches = [];
+  const collect = (index, repo, num) => {
+    const cleanRepo = String(repo ?? "").trim().replace(/\.git$/i, "");
+    const cleanNum = String(num ?? "").trim();
+    const owner = cleanRepo.split("/")[0] ?? "";
+    if (!owner || CODE_PATH_OWNERS.has(owner.toLowerCase()) || !/^\d+$/.test(cleanNum)) return;
+    rawMatches.push({ index: Number.isFinite(index) ? index : 0, ref: `${cleanRepo}#${cleanNum}` });
+  };
+  for (const m of raw.matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+(\d+)[^\n]{0,120}?--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/g)) {
+    collect(m.index, m[2], m[1]);
+  }
+  for (const m of raw.matchAll(/\bgh\s+pr\s+(?:view|checks|merge|edit|diff|ready)\s+--repo[=\s]+([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\s+(\d+)\b/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  for (const m of raw.matchAll(/(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#(\d+)\b/g)) {
+    collect(m.index, m[1], m[2]);
+  }
+  rawMatches.sort((a, b) => a.index - b.index);
+  for (const { ref } of rawMatches) {
+    const existingIdx = seen.indexOf(ref);
+    if (existingIdx !== -1) seen.splice(existingIdx, 1);
+    seen.push(ref);
+  }
+  return seen.reverse().slice(0, 8);
+}
+
+function readBoundedHeadTail(filePath, headBytes = 131072, tailBytes = 393216) {
+  let fd = null;
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size === 0) return "";
+    if (st.size <= headBytes + tailBytes) {
+      return fs.readFileSync(filePath, "utf8");
+    }
+    fd = fs.openSync(filePath, "r");
+    const headBuf = Buffer.alloc(headBytes);
+    const hRead = fs.readSync(fd, headBuf, 0, headBytes, 0);
+    const tailBuf = Buffer.alloc(tailBytes);
+    const tRead = fs.readSync(fd, tailBuf, 0, tailBytes, Math.max(0, st.size - tailBytes));
+    return `${headBuf.subarray(0, hRead).toString("utf8")}\n${tailBuf.subarray(0, tRead).toString("utf8")}`;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+}
+
+function extractReadableJsonlLines(rawSample) {
+  const out = [];
+  for (const line of String(rawSample ?? "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (obj?.type === "user" || obj?.type === "assistant") {
+        const content = obj.message?.content;
+        if (typeof content === "string" && content.trim()) {
+          out.push(content.trim().slice(0, 3000));
+        } else if (Array.isArray(content)) {
+          for (const block of content) {
+            if (typeof block?.text === "string" && block.text.trim()) {
+              out.push(block.text.trim().slice(0, 3000));
+            } else if (block?.type === "tool_result" && typeof block.content === "string" && /github\.com\/[^\s]+\/pull\/\d+|#\d+/.test(block.content)) {
+              out.push(block.content.trim().slice(0, 1500));
+            }
+          }
+        }
+      } else if (obj?.type === "event_msg" && typeof obj.payload?.message === "string") {
+        out.push(obj.payload.message.trim().slice(0, 3000));
+      }
+    } catch {
+      if (/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/.test(trimmed)) {
+        out.push(trimmed.slice(0, 1500));
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+function resolveClaudeTranscriptPath(homeDir, cwd, sessionId) {
+  if (!sessionId || !/^[A-Za-z0-9_.-]+$/.test(sessionId)) return null;
+  if (cwd) {
+    const slug = String(cwd).replace(/[^A-Za-z0-9_-]/g, "-");
+    const direct = path.join(homeDir, ".claude", "projects", slug, `${sessionId}.jsonl`);
+    if (fs.existsSync(direct)) return direct;
+  }
+  const projectsRoot = path.join(homeDir, ".claude", "projects");
+  try {
+    for (const d of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      const candidate = path.join(projectsRoot, d.name, `${sessionId}.jsonl`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function scanRecentClaudeTranscripts(homeDir, contentTerms, paseoCatalog, maxRecentFiles = 40) {
+  const results = new Map();
+  if (!contentTerms.length) return results;
+  const projectsRoot = path.join(homeDir, ".claude", "projects");
+  const candidates = [];
+  try {
+    for (const dir of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+      if (!dir.isDirectory()) continue;
+      const dirPath = path.join(projectsRoot, dir.name);
+      let files = [];
+      try { files = fs.readdirSync(dirPath, { withFileTypes: true }); } catch { continue; }
+      for (const f of files) {
+        if (!f.isFile() || !f.name.endsWith(".jsonl")) continue;
+        const fp = path.join(dirPath, f.name);
+        try {
+          const st = fs.statSync(fp);
+          if (st.size > 0) candidates.push({ fp, sid: f.name.slice(0, -6), mtimeMs: st.mtimeMs });
+        } catch { /* ignore */ }
+      }
+    }
+  } catch {
+    return results;
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const { fp, sid, mtimeMs } of candidates.slice(0, maxRecentFiles)) {
+    const rawSample = readBoundedHeadTail(fp, 32768, 98304);
+    if (!rawSample) continue;
+    const lowerRaw = normalize(rawSample);
+    if (!contentTerms.some((t) => lowerRaw.includes(t))) continue;
+    const cleanText = extractReadableJsonlLines(rawSample) || rawSample.slice(-12000);
+    const lowerClean = normalize(cleanText);
+    if (!contentTerms.some((t) => lowerClean.includes(t))) continue;
+    const excerpt = extractArtifactExcerpt(cleanText, lowerClean, contentTerms, 8000);
+    const prRefs = extractTranscriptPrRefs(rawSample);
+    const linked = paseoCatalog.byNativeId.get(sid) ?? null;
+    if (linked) {
+      const key = `paseo:${linked.serverId}.${linked.id}`;
+      results.set(key, {
+        key,
+        kind: "paseo",
+        id: linked.id,
+        title: clampText(linked.title, 120),
+        workspace: linked.workspaceName || (linked.cwd ? path.basename(linked.cwd) : null),
+        repo: prRefs[0]?.split("#")[0] ?? inferRepoFromPath(linked.cwd),
+        branch: null,
+        prRefs,
+        agentStatus: linked.archived ? "closed" : linked.status,
+        state: linked.archived ? "archived" : linked.status,
+        live: linked.status === "running",
+        lastActivityAt: linked.updatedAt ?? new Date(mtimeMs).toISOString(),
+        lastAgentText: redactSecrets(excerpt).slice(-600),
+        lastAgentFull: redactSecrets(excerpt),
+        meta: {
+          serverId: linked.serverId,
+          provider: linked.provider || "claude",
+          paseoCwd: linked.cwd,
+          aliases: [`claude:${sid}`],
+          conversation: [{ role: "assistant", text: redactSecrets(excerpt) }]
+        }
+      });
+    } else {
+      const key = `claude:${sid}`;
+      results.set(key, {
+        key,
+        kind: "claude",
+        id: sid,
+        title: clampText(`Claude session ${sid.slice(0, 8)}`, 120),
+        workspace: null,
+        repo: prRefs[0]?.split("#")[0] ?? null,
+        branch: null,
+        prRefs,
+        agentStatus: "idle",
+        state: "idle",
+        live: false,
+        lastActivityAt: new Date(mtimeMs).toISOString(),
+        lastAgentText: redactSecrets(excerpt).slice(-600),
+        lastAgentFull: redactSecrets(excerpt),
+        meta: {
+          provider: "claude",
+          file: fp,
+          aliases: [`claude:${sid}`],
+          conversation: [{ role: "assistant", text: redactSecrets(excerpt) }]
+        }
+      });
+    }
+  }
+  return results;
+}
+
 function buildRows(state, cachedThreads = new Map()) {
   const byKey = new Map((state?.snapshot?.threads ?? []).filter((row) => row?.key).map((row) => [row.key, row]));
   // Discovery and archive indexes see more sessions than the 60-row Auto shortlist;
@@ -68,7 +264,8 @@ function buildRows(state, cachedThreads = new Map()) {
 function buildRowDocument(row, state, cachedThreads = new Map()) {
   const cached = cachedThreads?.get?.(row.key) ?? null;
   const title = bounded(row.title || row.workspace || row.key, 300);
-  const prRef = row.pr?.ref ?? cached?.prRefs?.[0] ?? "";
+  const allPrRefs = [...new Set([row.pr?.ref, ...(row.prRefs ?? []), ...(cached?.prRefs ?? [])].filter(Boolean))];
+  const prRef = allPrRefs[0] ?? "";
   const prTitle = bounded(row.pr?.title ?? "", 200);
   const provider = cached?.meta?.provider ?? row.provider ?? row.kind ?? "";
   const aliases = Array.isArray(cached?.meta?.aliases) ? cached.meta.aliases.join(" ") : "";
@@ -90,7 +287,7 @@ function buildRowDocument(row, state, cachedThreads = new Map()) {
     row.workspace ?? "",
     row.repo ?? "",
     row.branch ?? "",
-    prRef,
+    allPrRefs.join(" "),
     prTitle,
     provider,
     aliases,
@@ -203,11 +400,13 @@ function readLocalPaseoCatalog(homeDir) {
           updatedAt: raw.updatedAt ?? raw.lastActivityAt ?? raw.createdAt ?? null,
           sessionId: raw.persistence?.sessionId ?? raw.runtimeInfo?.sessionId ?? null,
           handoffSource: raw.labels?.handoff_source ?? null,
-          migrationSourceId: raw.labels?.["migration.sourceId"] ?? null
+          migrationSourceId: raw.labels?.["migration.sourceId"] ?? null,
+          migrationAgentId: raw.labels?.["migration.source-agent-id"] ?? null,
+          workspaceName: raw.labels?.["migration.conductorWorkspaceName"] ?? null
         };
         agents.push(entry);
         const isHistoryCopy = /^history copy\b/i.test(entry.title);
-        for (const nativeId of [entry.sessionId, entry.handoffSource, entry.migrationSourceId]) {
+        for (const nativeId of [entry.sessionId, entry.handoffSource, entry.migrationSourceId, entry.migrationAgentId]) {
           if (!nativeId || typeof nativeId !== "string") continue;
           const prev = byNativeId.get(nativeId);
           if (!prev || (prev.isHistoryCopy && !isHistoryCopy)) {
@@ -445,7 +644,7 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
 }
 
 const SSH_ARCHIVE_SEARCH_PY = `
-import base64, glob, json, os, shutil, sqlite3, sys, tempfile
+import base64, glob, json, os, re, shutil, sqlite3, sys, tempfile
 
 payload = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 terms = [str(t).lower() for t in payload.get("terms", []) if str(t).strip()]
@@ -462,6 +661,41 @@ if os.path.exists(sid_file):
     except Exception:
         pass
 
+def read_head_tail(fp, head_b=131072, tail_b=393216):
+    try:
+        sz = os.path.getsize(fp)
+        if sz <= 0:
+            return ""
+        with open(fp, "rb") as f:
+            if sz <= head_b + tail_b:
+                return f.read().decode("utf-8", "ignore")
+            h = f.read(head_b).decode("utf-8", "ignore")
+            f.seek(max(0, sz - tail_b))
+            t = f.read().decode("utf-8", "ignore")
+            return h + "\\n" + t
+    except Exception:
+        return ""
+
+def extract_prs(txt):
+    seen = []
+    hits = []
+    skip = {"src", "app", "packages", "apps", "lib", "test", "tests", "server", "client", "docs", "scripts"}
+    for m in re.finditer(r"https://github\\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\\d+)", txt):
+        r, n = m.group(1), m.group(2)
+        if r.split("/")[0].lower() not in skip:
+            hits.append((m.start(), r + "#" + n))
+    for m in re.finditer(r"(?<![A-Za-z0-9_./:-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\\d+)\\b", txt):
+        r, n = m.group(1), m.group(2)
+        if r.split("/")[0].lower() not in skip:
+            hits.append((m.start(), r + "#" + n))
+    hits.sort(key=lambda x: x[0])
+    for _, ref in hits:
+        if ref in seen:
+            seen.remove(ref)
+        seen.append(ref)
+    seen.reverse()
+    return seen[:8]
+
 by_native = {}
 paseo_agents = []
 for p in glob.glob(os.path.join(home, ".paseo", "agents", "*", "*.json")):
@@ -470,21 +704,23 @@ for p in glob.glob(os.path.join(home, ".paseo", "agents", "*", "*.json")):
         if not isinstance(raw, dict) or not raw.get("id"):
             continue
         title = (raw.get("title") or "Paseo chat").strip()
+        labels = raw.get("labels") or {}
+        pers = raw.get("persistence") or {}
         entry = {
             "id": raw["id"],
             "serverId": server_id,
             "title": title,
             "provider": str(raw.get("provider") or "paseo").lower(),
             "cwd": raw.get("cwd"),
+            "sessionId": pers.get("sessionId"),
+            "workspaceName": labels.get("migration.conductorWorkspaceName"),
             "archived": bool(raw.get("archivedAt")),
             "status": str(raw.get("status") or "idle"),
             "updatedAt": raw.get("updatedAt") or raw.get("lastActivityAt") or raw.get("createdAt"),
             "isHistoryCopy": title.lower().startswith("history copy")
         }
         paseo_agents.append(entry)
-        labels = raw.get("labels") or {}
-        pers = raw.get("persistence") or {}
-        for nid in (pers.get("sessionId"), labels.get("handoff_source"), labels.get("migration.sourceId")):
+        for nid in (pers.get("sessionId"), labels.get("handoff_source"), labels.get("migration.sourceId"), labels.get("migration.source-agent-id")):
             if isinstance(nid, str) and nid:
                 prev = by_native.get(nid)
                 if not prev or (prev["isHistoryCopy"] and not entry["isHistoryCopy"]):
@@ -586,13 +822,32 @@ matched_paseo = []
 for pa in paseo_agents:
     if pa["id"] in seen_paseo_ids:
         continue
-    hay = (pa["title"] + " " + (pa["cwd"] or "") + " " + pa["provider"]).lower()
+    hay = (pa["title"] + " " + (pa["cwd"] or "") + " " + (pa.get("workspaceName") or "") + " " + pa["provider"]).lower()
     cnt = sum(1 for t in content_terms if t in hay) if content_terms else 0
     if cnt > 0:
         matched_paseo.append((cnt, pa))
 matched_paseo.sort(key=lambda x: -x[0])
-for _, pa in matched_paseo[:20]:
-    out.append({"cid": None, "rec": None, "paseo": pa})
+for _, pa in matched_paseo[:16]:
+    rec = None
+    sid = pa.get("sessionId")
+    cwd = pa.get("cwd") or ""
+    if isinstance(sid, str) and sid and cwd:
+        slug = re.sub("[^A-Za-z0-9_-]", "-", cwd)
+        cf = os.path.join(home, ".claude", "projects", slug, sid + ".jsonl")
+        if os.path.isfile(cf):
+            sample = read_head_tail(cf)
+            if sample:
+                prs = extract_prs(sample)
+                low = sample.lower()
+                wins = []
+                for t in content_terms:
+                    pos = low.find(t)
+                    if pos != -1:
+                        wins.append(sample[max(0, pos - 800):min(len(sample), pos + len(t) + 1200)])
+                    if len(wins) >= 3:
+                        break
+                rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [("\\n...\\n".join(wins))[:6000]] if wins else [sample[-4000:]], "prRefs": prs}
+    out.append({"cid": sid, "rec": rec, "paseo": pa})
 print(json.dumps(out[:40]))
 `.trim();
 
@@ -645,14 +900,16 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
           const sid = linked.serverId || fallbackServerId;
           const key = `paseo:${sid}.${linked.id}`;
           const combinedText = redactSecrets((rec?.chunks ?? []).join("\n\n")).slice(-24000);
+          const prRefs = Array.isArray(rec?.prRefs) ? rec.prRefs.slice(0, 8) : [];
           out.set(key, {
             key,
             kind: "paseo",
             id: linked.id,
             title: clampText(linked.title || rec?.title || "Paseo chat", 120),
-            workspace: linked.cwd ? path.basename(linked.cwd) : null,
-            repo: inferRepoFromPath(linked.cwd),
+            workspace: linked.workspaceName || (linked.cwd ? path.basename(linked.cwd) : null),
+            repo: prRefs[0]?.split("#")[0] ?? inferRepoFromPath(linked.cwd),
             branch: null,
+            prRefs,
             agentStatus: linked.archived ? "closed" : (linked.status || "idle"),
             state: linked.archived ? "archived" : (linked.status || "idle"),
             live: linked.status === "running",
@@ -663,7 +920,7 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
               serverId: sid,
               provider: linked.provider || "paseo",
               paseoCwd: linked.cwd ?? null,
-              aliases: cid ? [`antigravity:${cid}`] : [],
+              aliases: cid ? [`${linked.provider || "antigravity"}:${cid}`] : [],
               conversation: combinedText ? [{ role: "assistant", text: combinedText }] : []
             }
           });
@@ -736,36 +993,60 @@ export async function collectArchiveThreads({
 
   const contentTerms = effectiveTerms.filter((t) => !PROVIDER_TERMS.has(t));
   if (contentTerms.length > 0) {
+    const matchedMeta = [];
     for (const entry of paseoCatalog.agents) {
       const key = `paseo:${entry.serverId}.${entry.id}`;
       if (archiveThreads.has(key)) continue;
-      const hay = normalize(`${entry.title} ${entry.cwd ?? ""} ${entry.provider}`);
-      if (contentTerms.some((t) => hay.includes(t))) {
-        archiveThreads.set(key, {
-          key,
-          kind: "paseo",
-          id: entry.id,
-          title: clampText(entry.title, 120),
-          workspace: entry.cwd ? path.basename(entry.cwd) : null,
-          repo: inferRepoFromPath(entry.cwd),
-          branch: null,
-          agentStatus: entry.archived ? "closed" : entry.status,
-          state: entry.archived ? "archived" : entry.status,
-          live: entry.status === "running",
-          lastActivityAt: entry.updatedAt ?? null,
-          lastAgentText: "",
-          lastAgentFull: "",
-          meta: {
-            serverId: entry.serverId,
-            provider: entry.provider,
-            paseoCwd: entry.cwd,
-            aliases: [entry.sessionId, entry.handoffSource, entry.migrationSourceId]
-              .filter(Boolean)
-              .map((id) => `${entry.provider}:${id}`),
-            conversation: []
+      const hay = normalize(`${entry.title} ${entry.cwd ?? ""} ${entry.workspaceName ?? ""} ${entry.provider}`);
+      const hitCount = contentTerms.filter((t) => hay.includes(t)).length;
+      if (hitCount > 0) matchedMeta.push({ hitCount, entry, key });
+    }
+    matchedMeta.sort((a, b) => b.hitCount - a.hitCount || String(b.entry.updatedAt ?? "").localeCompare(String(a.entry.updatedAt ?? "")));
+    for (const [idx, { entry, key }] of matchedMeta.entries()) {
+      let prRefs = [];
+      let combinedText = "";
+      if (idx < 16 && entry.sessionId) {
+        const cf = resolveClaudeTranscriptPath(homeDir, entry.cwd, entry.sessionId);
+        if (cf) {
+          const sample = readBoundedHeadTail(cf);
+          if (sample) {
+            prRefs = extractTranscriptPrRefs(sample);
+            const cleanText = extractReadableJsonlLines(sample) || sample.slice(-12000);
+            const lowerClean = normalize(cleanText);
+            combinedText = redactSecrets(extractArtifactExcerpt(cleanText, lowerClean, contentTerms, 8000));
           }
-        });
+        }
       }
+      archiveThreads.set(key, {
+        key,
+        kind: "paseo",
+        id: entry.id,
+        title: clampText(entry.title, 120),
+        workspace: entry.workspaceName || (entry.cwd ? path.basename(entry.cwd) : null),
+        repo: prRefs[0]?.split("#")[0] ?? inferRepoFromPath(entry.cwd),
+        branch: null,
+        prRefs,
+        agentStatus: entry.archived ? "closed" : entry.status,
+        state: entry.archived ? "archived" : entry.status,
+        live: entry.status === "running",
+        lastActivityAt: entry.updatedAt ?? null,
+        lastAgentText: combinedText.slice(-600),
+        lastAgentFull: combinedText,
+        meta: {
+          serverId: entry.serverId,
+          provider: entry.provider,
+          paseoCwd: entry.cwd,
+          aliases: [entry.sessionId, entry.handoffSource, entry.migrationSourceId, entry.migrationAgentId]
+            .filter(Boolean)
+            .map((id) => `${entry.provider}:${id}`),
+          conversation: combinedText ? [{ role: "assistant", text: combinedText }] : []
+        }
+      });
+    }
+
+    const recentClaude = scanRecentClaudeTranscripts(homeDir, contentTerms, paseoCatalog, 40);
+    for (const [key, thread] of recentClaude) {
+      if (!archiveThreads.has(key)) archiveThreads.set(key, thread);
     }
   }
 
@@ -782,10 +1063,13 @@ export function mergeThreadsWithArchives(liveThreads = new Map(), archiveThreads
       continue;
     }
     const archText = arch?.lastAgentFull || arch?.lastAgentText || "";
-    if (!archText) continue;
+    const mergedPrRefs = [...new Set([...(existing.prRefs ?? []), ...(arch?.prRefs ?? [])])];
+    if (!archText && mergedPrRefs.length === (existing.prRefs ?? []).length) continue;
     merged.set(key, {
       ...existing,
-      lastAgentFull: existing.lastAgentFull ? `${archText}\n${existing.lastAgentFull}` : archText,
+      prRefs: mergedPrRefs,
+      repo: existing.repo ?? arch?.repo ?? null,
+      lastAgentFull: archText ? (existing.lastAgentFull ? `${archText}\n${existing.lastAgentFull}` : archText) : existing.lastAgentFull,
       meta: {
         ...(existing.meta ?? {}),
         provider: existing.meta?.provider ?? arch.meta?.provider,
@@ -823,8 +1107,13 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
     const minRequired = useNaturalSubset && effectiveTerms.length >= 2
       ? Math.max(2, Math.ceil(effectiveTerms.length * 0.45))
       : effectiveTerms.length;
+    const strongTwoTermPartial = useNaturalSubset
+      && effectiveTerms.length === 2
+      && matchedTerms === 1
+      && contentMatchedTerms >= 1
+      && effectiveTerms.some((t) => !PROVIDER_TERMS.has(t) && t.length >= 4 && (doc.normTitle.includes(t) || doc.normMeta.includes(t) || score >= 2.2));
 
-    if (!allRawMatch && !(useNaturalSubset && matchedTerms >= minRequired)) continue;
+    if (!allRawMatch && !(useNaturalSubset && matchedTerms >= minRequired) && !strongTwoTermPartial) continue;
     // Never match solely on a provider name like "antigravity" when the query also has subject terms.
     if (nonProviderCount > 0 && contentMatchedTerms === 0) continue;
 
@@ -840,6 +1129,7 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
 
     const liveBonus = doc.row.live || doc.row.agentStatus === "running" ? 1.5 : 0;
     const exactBonus = allRawMatch ? 6 : 0;
+    const coverageBonus = matchedTerms > 1 ? matchedTerms * 2.5 : 0;
 
     matches.push({
       key: doc.row.key,
@@ -852,7 +1142,7 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
       lastActivityAt: doc.row.lastActivityAt ?? null,
       snippet: bounded(snippetLine, 500),
       openChat: doc.row.openChat ?? null,
-      score: score + exactBonus + liveBonus,
+      score: score + exactBonus + liveBonus + coverageBonus,
       matchedTerms
     });
   }

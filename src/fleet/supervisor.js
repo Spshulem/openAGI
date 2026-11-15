@@ -11,7 +11,7 @@ import { readThreadConversation, unavailableConversation } from "./conversation.
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
@@ -466,6 +466,66 @@ function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
 }
 
+const KNOWN_CACHE_MAX = 600;
+
+function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
+  if (!key || !value) return;
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > max) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function buildQuestionContextSnapshot(thread, pr) {
+  if (!thread && !pr) return null;
+  const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
+  const workspace = rawWorkspace && !/^wks_[0-9a-f]+$/i.test(rawWorkspace) ? clampText(rawWorkspace, 80) : null;
+  return {
+    threadTitle: clampText(redactSecrets(thread?.title ?? ""), 140) || null,
+    workspace,
+    repo: thread?.repo ?? pr?.repo ?? null,
+    branch: thread?.branch ?? pr?.headRef ?? null,
+    provider: thread?.meta?.provider ?? thread?.kind ?? null,
+    paseoCwd: thread?.meta?.paseoCwd ?? null,
+    paseoWorkspaceId: thread?.meta?.workspaceId ?? null,
+    paseoHasWorkspaceId: Boolean(thread?.meta && Object.prototype.hasOwnProperty.call(thread.meta, "workspaceId") && thread.meta.workspaceId !== undefined),
+    serverId: thread?.meta?.serverId ?? null,
+    aliases: Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases.slice(0, 4) : [],
+    agentSummary: clampTailLines(redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || ""), 1600) || null,
+    lastUserText: clampTailLines(redactSecrets(thread?.lastUserText || ""), 600) || null,
+    lastUserAt: thread?.lastUserAt ?? null,
+    lastAgentAt: thread?.lastAgentAt ?? null,
+    recentMessages: (thread?.meta?.conversation ?? []).slice(-4).map((m) => ({
+      role: m.role === "user" ? "user" : "assistant",
+      text: clampTailLines(redactSecrets(m.text ?? ""), 700),
+      at: m.at ?? null
+    })),
+    pr: pr ? {
+      ref: pr.ref,
+      url: pr.url,
+      number: pr.number,
+      title: clampText(redactSecrets(pr.title ?? ""), 180) || null,
+      bodySummary: pr.bodySummary ?? null,
+      state: pr.state ?? null,
+      isDraft: Boolean(pr.isDraft),
+      head: String(pr.headOid ?? "").slice(0, 10) || null,
+      mergeState: pr.mergeState ?? null,
+      ciState: pr.ci?.state ?? null,
+      failingChecks: (pr.ci?.failing ?? []).slice(0, 4),
+      unresolvedThreads: pr.unresolvedThreads ?? 0,
+      additions: Number.isFinite(pr.additions) ? pr.additions : null,
+      deletions: Number.isFinite(pr.deletions) ? pr.deletions : null,
+      changedFiles: Number.isFinite(pr.changedFiles) ? pr.changedFiles : null,
+      files: Array.isArray(pr.files) ? pr.files.slice(0, 12) : [],
+      gates: Array.isArray(pr.gates) ? pr.gates.slice(0, 4).map((g) => ({ label: g.label || g.name, state: g.state ?? null })) : [],
+      qa: pr.qa ? { required: pr.qa.required ?? null, freshOnHead: pr.qa.freshOnHead ?? null } : null
+    } : null
+  };
+}
+
 // How much of the agent's last message a thread's detail shows.
 const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
@@ -579,6 +639,8 @@ export class FleetSupervisor {
     this.lastTickAt = null;
     this.lastError = null;
     this.lastThreads = new Map();
+    this.knownThreads = new Map();
+    this.knownRows = new Map();
     this.lastPrs = new Map();
     // threadKey -> scan ordinal. Activity alone must not keep quiet chats
     // outside the scan forever when a fleet is larger than maxThreads.
@@ -905,7 +967,8 @@ export class FleetSupervisor {
     // while no tick runs.
     this.closeExpired();
     const snapshot = this.liveSnapshot(withHealth(store.snapshot), open);
-    const rows = new Map((snapshot?.threads ?? []).map((row) => [row?.key, row]));
+    for (const r of snapshot?.threads ?? []) if (r?.key) setBounded(this.knownRows, r.key, r);
+    const rows = new Map([...this.knownRows, ...(snapshot?.threads ?? []).map((row) => [row?.key, row])]);
     const questions = open.map((question) => this.questionView(question, rows));
     const actions = store.actions(50);
     const baseState = {
@@ -946,7 +1009,13 @@ export class FleetSupervisor {
         }
       }
     };
-    const deck = buildSupervisorDeck(baseState, { preferences: store.preferences(), now: this.now() });
+    const deck = buildSupervisorDeck(baseState, {
+      preferences: store.preferences(),
+      now: this.now(),
+      threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
+      prsByKey: this.lastPrs,
+      knownRows: this.knownRows
+    });
     return { ...baseState, ...deck };
   }
 
@@ -985,8 +1054,22 @@ export class FleetSupervisor {
   // button. A group names each of its chats.
   questionView(question, rows) {
     const chatOf = (key) => {
-      const thread = this.lastThreads.get(key);
-      return (thread ? openChatFor(thread) : rows.get(key)?.openChat) ?? null;
+      const thread = this.lastThreads.get(key) ?? this.knownThreads.get(key);
+      const fromThread = (thread ? openChatFor(thread) : rows.get(key)?.openChat) ?? null;
+      if (fromThread) return fromThread;
+      const parsed = parsePaseoThreadKey(key);
+      if (parsed) {
+        const snapTitle = question.contextSnapshot?.threadTitle;
+        return {
+          app: "paseo",
+          url: null,
+          label: `${snapTitle || "Paseo chat"} (Paseo)`,
+          serverId: parsed.serverId,
+          agentId: parsed.agentId,
+          note: "Open this existing chat on its Paseo host."
+        };
+      }
+      return null;
     };
     const openChat = question.threadKey ? chatOf(question.threadKey) : null;
     const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
@@ -1729,8 +1812,45 @@ export class FleetSupervisor {
   // input, a locked screen, the owner at the keyboard) the words are kept
   // and sent once the Mac can type, instead of handing the question back:
   // { queued } is the question, closed with them.
+  syntheticPaseoThread(threadKey, question = null) {
+    if (!this.config.paseo?.enabled) return null;
+    const parsed = parsePaseoThreadKey(threadKey);
+    if (!parsed) return null;
+    const snap = question?.contextSnapshot ?? null;
+    return {
+      key: threadKey,
+      kind: "paseo",
+      id: parsed.agentId,
+      title: snap?.threadTitle || "Paseo chat",
+      workspace: snap?.workspace ?? null,
+      repo: snap?.repo ?? null,
+      branch: snap?.branch ?? null,
+      agentStatus: "idle",
+      archived: false,
+      excluded: null,
+      lastActivityAt: snap?.lastAgentAt ?? question?.createdAt ?? null,
+      lastUserAt: snap?.lastUserAt ?? null,
+      lastUserText: snap?.lastUserText ?? "",
+      lastAgentAt: snap?.lastAgentAt ?? null,
+      lastAgentText: (snap?.agentSummary ?? "").slice(-600),
+      lastAgentFull: snap?.agentSummary ?? "",
+      meta: {
+        serverId: parsed.serverId,
+        ...(snap?.paseoHasWorkspaceId
+          ? { workspaceId: snap.paseoWorkspaceId ?? null }
+          : (typeof snap?.paseoWorkspaceId === "string" ? { workspaceId: snap.paseoWorkspaceId } : {})),
+        provider: snap?.provider ?? "paseo",
+        paseoCwd: snap?.paseoCwd ?? null,
+        aliases: Array.isArray(snap?.aliases) ? snap.aliases : [],
+        conversation: Array.isArray(snap?.recentMessages) ? snap.recentMessages : []
+      }
+    };
+  }
+
   async deliverToAsker(question, answer, message, { deadlineAt = null, startedAt = Date.now(), settling = [], queueMax } = {}) {
-    const thread = this.lastThreads.get(question.threadKey);
+    const thread = this.lastThreads.get(question.threadKey)
+      ?? this.knownThreads.get(question.threadKey)
+      ?? this.syntheticPaseoThread(question.threadKey, question);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const risky = riskyQuestion(question);
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
@@ -1811,13 +1931,16 @@ export class FleetSupervisor {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
-    const thread = this.lastThreads.get(threadKey);
+    const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
+    const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
+    const thread = this.lastThreads.get(threadKey)
+      ?? this.knownThreads.get(threadKey)
+      ?? (matchingOpen ? this.syntheticPaseoThread(threadKey, matchingOpen) : null);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     // A thread with an open risky ask hears the owner only typed into its
     // app, as an answer to that ask would be.
     // A risky answer kept for typing still counts: its question is closed,
     // but the agent has not heard it yet.
-    const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
     const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
       || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
@@ -1851,14 +1974,14 @@ export class FleetSupervisor {
     const tmpRoot = os.tmpdir();
     const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
     const useDisk = options?.includeDisk === true || (options?.includeDisk !== false && (!inTempTestDir || Boolean(options?.homeDir)));
-    let threads = this.lastThreads;
+    let threads = new Map([...this.knownThreads, ...this.lastThreads]);
     if (useDisk && typeof options?.query === "string" && options.query.trim()) {
       const archives = await collectArchiveThreads({
         query: options.query,
         homeDir: options.homeDir ?? os.homedir(),
         includeRemotePaseoHosts: options.includeRemotePaseoHosts ?? Boolean(this.config?.paseo?.enabled)
       });
-      threads = mergeThreadsWithArchives(this.lastThreads, archives);
+      threads = mergeThreadsWithArchives(threads, archives);
     }
     return searchFleet(this.getState(), { natural: true, ...options }, threads);
   }
@@ -2128,8 +2251,26 @@ export class FleetSupervisor {
   }
 
   async threadConversation(threadKey) {
+    const state = this.getState();
+    const matchingQ = state.questions.find((q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey)) ?? null;
     const thread = this.lastThreads.get(threadKey)
-      ?? this.getState().snapshot?.threads?.find((row) => row.key === threadKey);
+      ?? this.knownThreads.get(threadKey)
+      ?? state.snapshot?.threads?.find((row) => row.key === threadKey)
+      ?? this.knownRows.get(threadKey)
+      ?? (matchingQ ? this.syntheticPaseoThread(threadKey, matchingQ) ?? {
+        key: threadKey,
+        kind: String(threadKey ?? "").split(":")[0] || "unknown",
+        id: String(threadKey ?? "").split(":").slice(1).join(":"),
+        lastUserText: matchingQ.contextSnapshot?.lastUserText ?? "",
+        lastUserAt: matchingQ.contextSnapshot?.lastUserAt ?? null,
+        lastAgentFull: matchingQ.contextSnapshot?.agentSummary ?? matchingQ.askContext ?? "",
+        lastAgentAt: matchingQ.contextSnapshot?.lastAgentAt ?? matchingQ.askedAt ?? null,
+        meta: {
+          paseoCwd: matchingQ.contextSnapshot?.paseoCwd ?? null,
+          aliases: matchingQ.contextSnapshot?.aliases ?? [],
+          conversation: matchingQ.contextSnapshot?.recentMessages ?? []
+        }
+      } : null);
     if (!thread) return null;
     try { return await readThreadConversation(thread, this.config); }
     catch { return unavailableConversation(thread); }
@@ -2137,21 +2278,69 @@ export class FleetSupervisor {
 
   threadDetail(threadKey) {
     const state = this.getState();
-    const thread = this.lastThreads.get(threadKey) ?? null;
+    const thread = this.lastThreads.get(threadKey) ?? this.knownThreads.get(threadKey) ?? null;
+    const matchingQuestions = state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+    const snap = matchingQuestions[0]?.contextSnapshot ?? null;
     const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey)
-      ?? (thread ? { ...thread, state: thread.excluded || thread.agentStatus || "unknown", openChat: openChatFor(thread) } : null);
+      ?? this.knownRows.get(threadKey)
+      ?? (thread ? {
+        ...thread,
+        state: thread.excluded || thread.agentStatus || "idle",
+        health: thread.error ? "red" : (matchingQuestions.length ? "yellow" : "gray"),
+        openChat: openChatFor(thread)
+      } : null)
+      ?? (matchingQuestions.length ? {
+        key: threadKey,
+        kind: String(threadKey ?? "").split(":")[0] || "paseo",
+        title: snap?.threadTitle ?? matchingQuestions[0]?.chatLabel?.replace(/\s*\([^)]*\)$/, "") ?? matchingQuestions[0]?.title ?? null,
+        workspace: snap?.workspace ?? null,
+        repo: snap?.repo ?? parsePrRef(matchingQuestions[0]?.prRef)?.repo ?? null,
+        branch: snap?.branch ?? null,
+        agentStatus: "idle",
+        live: false,
+        state: matchingQuestions[0]?.kind === "ready" ? "ready-needs-human" : "needs-human",
+        health: "yellow",
+        reason: matchingQuestions[0]?.title ?? null,
+        blockers: [],
+        error: null,
+        lastAgentText: snap?.agentSummary ?? matchingQuestions[0]?.askContext ?? matchingQuestions[0]?.body ?? "",
+        lastAgentAt: snap?.lastAgentAt ?? matchingQuestions[0]?.askedAt ?? null,
+        lastOwnerAt: snap?.lastUserAt ?? null,
+        lastActivityAt: snap?.lastAgentAt ?? matchingQuestions[0]?.askedAt ?? matchingQuestions[0]?.createdAt ?? null,
+        pr: snap?.pr ? {
+          ref: snap.pr.ref,
+          url: snap.pr.url,
+          state: snap.pr.state,
+          isDraft: Boolean(snap.pr.isDraft),
+          title: snap.pr.title,
+          bodySummary: snap.pr.bodySummary ?? null,
+          additions: snap.pr.additions ?? null,
+          deletions: snap.pr.deletions ?? null,
+          changedFiles: snap.pr.changedFiles ?? null,
+          files: snap.pr.files ?? [],
+          ci: snap.pr.ciState ? { state: snap.pr.ciState, failing: snap.pr.failingChecks ?? [], pending: [] } : null,
+          unresolvedThreads: snap.pr.unresolvedThreads ?? 0,
+          mergeState: snap.pr.mergeState ?? null,
+          head: snap.pr.head ?? null
+        } : (matchingQuestions[0]?.prRef ? { ref: matchingQuestions[0].prRef, url: null, state: "OPEN" } : null),
+        openChat: matchingQuestions[0]?.openChat ?? null
+      } : null);
     if (!row) return null;
-    const reply = thread ? agentReply(thread) : { text: row.lastAgentText ?? "", at: row.lastAgentAt ?? null };
+    const reply = thread
+      ? agentReply(thread)
+      : { text: row.lastAgentText || snap?.agentSummary || matchingQuestions[0]?.askContext || "", at: row.lastAgentAt ?? snap?.lastAgentAt ?? null };
+    const ownerAt = thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? snap?.lastUserAt ?? null);
+    const ownerText = thread && ownerAt ? (thread.lastUserText ?? "") : (snap?.lastUserText ?? "");
     return {
-      key: row.key, kind: row.kind, title: row.title ?? null, workspace: row.workspace ?? null, repo: row.repo ?? null, branch: row.branch ?? null,
+      key: row.key, kind: row.kind, title: row.title ?? snap?.threadTitle ?? null, workspace: row.workspace ?? snap?.workspace ?? null, repo: row.repo ?? snap?.repo ?? null, branch: row.branch ?? snap?.branch ?? null,
       app: row.app ?? null, agentStatus: row.agentStatus ?? null, live: Boolean(row.live), state: row.state ?? null, health: row.health ?? null,
       reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
       lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
-      lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
-      lastOwnerMessage: thread && ownerSpokeAt(thread)
-        ? { text: clampTail(redactSecrets(thread.lastUserText ?? ""), DETAIL_EXCERPT_MAX), at: ownerSpokeAt(thread) }
+      lastOwnerAt: ownerAt,
+      lastOwnerMessage: ownerAt && ownerText
+        ? { text: clampTail(redactSecrets(ownerText), DETAIL_EXCERPT_MAX), at: ownerAt }
         : null,
-      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (thread && ownerSpokeAt(thread) ? String(thread.lastUserText ?? "").length > DETAIL_EXCERPT_MAX : false),
+      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (ownerAt ? String(ownerText).length > DETAIL_EXCERPT_MAX : false),
       lastActivityAt: row.lastActivityAt ?? null,
       pr: row.pr ?? null,
       watch: row.watch ?? null,
@@ -2160,8 +2349,8 @@ export class FleetSupervisor {
       pushing: row.pushing === true,
       ...(row.prompt ? { prompt: row.prompt } : {}),
       muted: row.muted ?? null,
-      questions: state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey)),
-      openChat: row.openChat ?? null,
+      questions: matchingQuestions,
+      openChat: row.openChat ?? matchingQuestions[0]?.openChat ?? null,
       scannedAt: state.snapshot?.at ?? null
     };
   }
@@ -2485,11 +2674,21 @@ export class FleetSupervisor {
       .filter((decision) => !mutedKeys.has(decision.threadKey) || decision.action === "none");
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
-    this.lastThreads = byKey;
+    const mergedLastThreads = new Map(byKey);
+    for (const [key, prev] of this.lastThreads) {
+      if (prev?.kind && sourceErrors[prev.kind] && !mergedLastThreads.has(key)) mergedLastThreads.set(key, prev);
+    }
+    this.lastThreads = mergedLastThreads;
+    for (const [key, thread] of mergedLastThreads) setBounded(this.knownThreads, key, thread);
     this.lastThreadFacts = threadFacts;
     // Each thread's PR as this scan read it, for a proposal sent later.
     // A deferred thread keeps the last read, for its proposal still open.
-    this.lastPrs = new Map([...[...this.lastPrs].filter(([key]) => deferred.has(key)), ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])]);
+    const nextPrs = new Map([
+      ...[...this.lastPrs].filter(([key]) => deferred.has(key) || (this.lastThreads.get(key)?.kind && sourceErrors[this.lastThreads.get(key).kind])),
+      ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])
+    ]);
+    for (const [ref, pr] of prs) if (ref && pr) nextPrs.set(ref, pr);
+    this.lastPrs = nextPrs;
     const decisionFor = effectiveDecisions(decisions);
     this.lastItems = new Map(items.map((item) => {
       const current = decisionFor.get(item.thread.key);
@@ -2515,7 +2714,7 @@ export class FleetSupervisor {
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started, deferred });
 
     const finished = this.now();
-    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null });
+    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
     try { await this.diagnoseTick(); } catch (error) {
@@ -3031,7 +3230,14 @@ export class FleetSupervisor {
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       // The head it is asked at: a move past it settles the ask (settledAsk).
-      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
+      const askThread = fields.threadKey ? (byKey.get(fields.threadKey) ?? this.knownThreads.get(fields.threadKey) ?? null) : null;
+      const askPrRef = fields.prRef ?? askThread?.prRefs?.[0] ?? null;
+      const matchesAskPr = (candidate) => Boolean(candidate && (!askPrRef || !candidate.ref || candidate.ref === askPrRef));
+      const itemPr = items.find((item) => (askPrRef && item?.pr?.ref === askPrRef) || (!askPrRef && fields.threadKey && item?.thread?.key === fields.threadKey))?.pr ?? null;
+      const lastThreadPr = fields.threadKey ? this.lastPrs.get(fields.threadKey) : null;
+      const askPr = (askPrRef ? prs.get(askPrRef) : null) ?? (matchesAskPr(itemPr) ? itemPr : null) ?? (matchesAskPr(lastThreadPr) ? lastThreadPr : null) ?? null;
+      const contextSnapshot = buildQuestionContextSnapshot(askThread, askPr);
+      const question = store.upsertQuestion({ ...fields, askedHead: askPr?.headOid ?? (fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null), contextSnapshot });
       asked.add(question.dedupeKey);
       // The owner (or an earlier automatic slice) already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
@@ -3435,7 +3641,7 @@ export class FleetSupervisor {
     return { ...watch, since: new Date(since).toISOString() };
   }
 
-  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null }) {
+  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null, previous = null }) {
     const byState = {};
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
@@ -3461,7 +3667,24 @@ export class FleetSupervisor {
         reason: clampText(classified.reason, 160),
         blockers: (classified.blockers ?? []).slice(0, 6),
         pr: pr
-          ? { ref: pr.ref, url: pr.url, state: pr.state, isDraft: Boolean(pr.isDraft), title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
+          ? {
+              ref: pr.ref,
+              url: pr.url,
+              state: pr.state,
+              isDraft: Boolean(pr.isDraft),
+              title: clampText(pr.title, 100),
+              bodySummary: pr.bodySummary ?? null,
+              additions: pr.additions ?? null,
+              deletions: pr.deletions ?? null,
+              changedFiles: pr.changedFiles ?? null,
+              files: Array.isArray(pr.files) ? pr.files.slice(0, 12) : [],
+              gates: Array.isArray(pr.gates) ? pr.gates.slice(0, 4).map((g) => ({ label: g.label || g.name, state: g.state ?? null })) : [],
+              qa: pr.qa ? { required: pr.qa.required ?? null, freshOnHead: pr.qa.freshOnHead ?? null } : null,
+              ci: pr.ci,
+              unresolvedThreads: pr.unresolvedThreads,
+              mergeState: pr.mergeState,
+              head: String(pr.headOid ?? "").slice(0, 10)
+            }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
         lastActivityAt: thread.lastActivityAt ?? null,
         lastAgentText: clampTail(redactSecrets(thread.lastAgentText), 600),
@@ -3484,21 +3707,49 @@ export class FleetSupervisor {
         watch
       };
     });
+    const rowKeys = new Set(rows.map((r) => r.key));
+    let carriedCount = 0;
+    if (Array.isArray(previous?.threads) && Object.keys(sourceErrors ?? {}).length > 0) {
+      for (const prevRow of previous.threads) {
+        if (!prevRow?.key || !prevRow.kind || !sourceErrors[prevRow.kind] || rowKeys.has(prevRow.key)) continue;
+        rowKeys.add(prevRow.key);
+        rows.push(prevRow);
+        carriedCount += 1;
+        if (prevRow.state) byState[prevRow.state] = (byState[prevRow.state] ?? 0) + 1;
+        if (prevRow.watch?.group) {
+          byWatch[prevRow.watch.group] = (byWatch[prevRow.watch.group] ?? 0) + 1;
+          seen.add(prevRow.key);
+        }
+      }
+    }
+    for (const r of rows) setBounded(this.knownRows, r.key, r);
     for (const key of this.watchSince.keys()) if (!seen.has(key)) this.watchSince.delete(key);
     const infraDecisions = decisions.filter((decision) => decision.threadKey.startsWith("infra:"))
       .map((decision) => ({ key: decision.threadKey, action: decision.action, reason: clampText(decision.reason, 200), notBefore: decision.notBefore ?? null }));
     const sources = Object.fromEntries(THREAD_KINDS.map((kind) => [kind, 0]));
     for (const thread of threads) sources[thread.kind] = (sources[thread.kind] ?? 0) + 1;
+    if (carriedCount > 0 && previous?.counts?.sources) {
+      for (const kind of THREAD_KINDS) {
+        if (sourceErrors?.[kind] && sources[kind] === 0 && Number.isFinite(previous.counts.sources[kind])) {
+          sources[kind] = previous.counts.sources[kind];
+        }
+      }
+    }
+    const eligibleCount = threads.filter((thread) => !thread.excluded).length + carriedCount;
+    const inScopeCount = inScope.length + carriedCount;
+    const totalThreads = carriedCount > 0
+      ? Math.max(threads.length + carriedCount, Object.values(sources).reduce((s, n) => s + (n || 0), 0))
+      : threads.length;
     return {
       at: new Date(finished).toISOString(),
       reason,
       durationMs: finished - started,
       mode,
       counts: {
-        threads: threads.length,
-        eligible: threads.filter((thread) => !thread.excluded).length,
-        inScope: inScope.length,
-        deferred: Math.max(0, threads.filter((thread) => !thread.excluded).length - inScope.length),
+        threads: totalThreads,
+        eligible: eligibleCount,
+        inScope: inScopeCount,
+        deferred: Math.max(0, eligibleCount - inScopeCount),
         sources,
         byState,
         byWatch,

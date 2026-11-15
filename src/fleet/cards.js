@@ -3,7 +3,7 @@
 // from the fleet supervisor's state. Existing FleetState fields remain intact
 // so Android, push extensions, and older clients stay 100% compatible.
 
-import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
+import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { asksToMergePr } from "./policy.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
@@ -53,9 +53,23 @@ function isMergeReadyQuestion(question, row, prRef) {
   return asksToMergePr(`${question.title ?? ""} ${question.body ?? ""}`);
 }
 
-function classifyCardKind(question, row = null, prRef = null) {
+function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
+  const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
+  const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
   if (isMergeReadyQuestion(question, row, prRef)) {
+    if (ciState === "FAILURE" || ciState === "ERROR") {
+      return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
+    }
+    if (mergeState === "DIRTY") {
+      return { kind: "ci_failed", kindLabel: "Needs Rebase", rank: 1 };
+    }
+    if (ciState === "PENDING" || ciState === "IN_PROGRESS") {
+      return { kind: "merge_ready", kindLabel: "Checks Running", rank: 0 };
+    }
     return { kind: "merge_ready", kindLabel: "PR Ready", rank: 0 };
+  }
+  if (question.kind === "stuck" && (ciState === "FAILURE" || ciState === "ERROR")) {
+    return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
   }
   if (["prompt", "agent-ask", "agent-card", "self-fix"].includes(question.kind)) {
     return { kind: "approval", kindLabel: "Needs Decision", rank: 1 };
@@ -95,10 +109,10 @@ function cleanWorkspaceName(workspace) {
   return raw;
 }
 
-function buildActionsForQuestion(question, row, prRef) {
+function buildActionsForQuestion(question, row, prRef, prMeta = null) {
   const options = Array.isArray(question.options) ? question.options.filter(Boolean) : [];
-  const ciState = row?.pr?.ci?.state ?? null;
-  const mergeState = row?.pr?.mergeState ?? null;
+  const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
+  const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
   const appOnlyCard = question.answerIn === "agent app" || (question.kind === "agent-card" && question.answerIn !== "here");
 
   if (appOnlyCard) {
@@ -175,20 +189,23 @@ function buildActionsForQuestion(question, row, prRef) {
   return { primaryAction, secondaryAction, extraActions };
 }
 
-function buildRecommendation(question, row, prRef, prefs) {
+function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
   if (question.reviewReason) {
     return clampText(redactSecrets(question.reviewReason), 220);
   }
-  const ci = row?.pr?.ci?.state ?? null;
+  const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   if (isMergeReadyQuestion(question, row, prRef)) {
     if (ci === "FAILURE" || ci === "ERROR") {
-      const failing = (row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
+      const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
     }
-    if (ci === "PENDING") {
+    if (prMeta?.mergeState === "DIRTY" || row?.pr?.mergeState === "DIRTY") {
+      return "Pull request has merge conflicts with the base branch. Have the coding session rebase before merging.";
+    }
+    if (ci === "PENDING" || ci === "IN_PROGRESS") {
       return "Checks are still running. Auto-merge is off by default—tap Watch CI to get pinged when green.";
     }
-    const threads = Number(row?.pr?.unresolvedThreads ?? 0);
+    const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
     return `CI green${threads === 0 ? " · 0 unresolved review threads" : ` · ${threads} review thread(s)`}. Manual confirm required (${prefs.mergePolicy === "manual_confirm" ? "auto-merge off" : "queue after tap"}).`;
   }
   if (row?.reason) {
@@ -197,13 +214,37 @@ function buildRecommendation(question, row, prRef, prefs) {
   return null;
 }
 
-function buildSummary(question, row) {
+function isMechanicalReadyBody(text) {
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+\s+at\s+[0-9a-f]{7,40}:\s*CI\s+/i.test(String(text ?? "").trim());
+}
+
+function formatDiffSummary(prMeta) {
+  if (!prMeta) return null;
+  const hasCounts = Number.isFinite(prMeta.additions) && Number.isFinite(prMeta.deletions);
+  const counts = hasCounts ? `+${prMeta.additions} / -${prMeta.deletions}` : null;
+  const files = Number.isFinite(prMeta.changedFiles) && prMeta.changedFiles > 0
+    ? `${prMeta.changedFiles} file${prMeta.changedFiles === 1 ? "" : "s"}`
+    : null;
+  return [counts, files].filter(Boolean).join(" · ") || null;
+}
+
+function buildSummary(question, row, { headline = "", prMeta = null, agentSummary = null } = {}) {
   const parts = [];
-  if (row?.pr?.title && !String(question.title ?? "").includes(row.pr.title)) {
-    parts.push(row.pr.title);
+  if (prMeta?.title && !String(headline).includes(prMeta.title) && !String(question.title ?? "").includes(prMeta.title)) {
+    parts.push(prMeta.title);
   }
+  const diffStat = formatDiffSummary(prMeta);
+  if (diffStat) parts.push(diffStat);
+
+  const mechanicalBody = isMechanicalReadyBody(question.body);
   if (question.card) {
     parts.push(question.card);
+  } else if (prMeta?.bodySummary) {
+    parts.push(clampText(prMeta.bodySummary, 320));
+  } else if (question.body && !mechanicalBody) {
+    parts.push(question.body);
+  } else if (agentSummary) {
+    parts.push(clampText(agentSummary, 320));
   } else if (question.body) {
     parts.push(question.body);
   } else if (question.askContext) {
@@ -212,57 +253,94 @@ function buildSummary(question, row) {
     parts.push(row.lastAgentText);
   }
   const joined = parts.filter(Boolean).join(" — ");
-  return clampText(redactSecrets(joined || row?.reason || "Waiting for your decision."), 360);
+  return clampText(redactSecrets(joined || row?.reason || "Waiting for your decision."), 460);
 }
 
-function buildTimeline(question, row, actions = []) {
-  const timeline = [];
+function buildTimeline(question, row, actions = [], prMeta = null) {
+  const raw = [];
   const threadKey = question.threadKey ?? null;
   const relevant = threadKey
-    ? actions.filter((a) => a && a.threadKey === threadKey && ["sent", "done", "proposed", "blocked"].includes(a.status)).slice(0, 3).reverse()
+    ? actions.filter((a) => a && a.threadKey === threadKey && ["sent", "done", "proposed", "blocked"].includes(a.status)).slice(0, 4).reverse()
     : [];
   for (const act of relevant) {
-    timeline.push({
+    raw.push({
       at: act.at ?? null,
       label: act.playbook ? `Playbook: ${act.playbook}` : (act.kind ?? "Update"),
       detail: clampText(redactSecrets(act.reason || act.detail || act.message || act.status), 160)
     });
   }
-  if (row?.pr?.ci?.state) {
-    timeline.push({
+  const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
+  if (ciState) {
+    const ref = prMeta?.ref ?? row?.pr?.ref ?? question.prRef ?? null;
+    const head = prMeta?.head ?? row?.pr?.head ?? null;
+    raw.push({
       at: question.updatedAt ?? question.createdAt ?? null,
-      label: `GitHub CI: ${row.pr.ci.state}`,
-      detail: row.pr.ref ? `${row.pr.ref}${row.pr.head ? ` @ ${row.pr.head}` : ""}` : "Pull request checks"
+      label: `GitHub CI: ${ciState}`,
+      detail: ref ? `${ref}${head ? ` @ ${head}` : ""}` : "Pull request checks"
     });
   }
-  timeline.push({
+  raw.push({
     at: question.askedAt ?? question.createdAt ?? null,
     label: question.kind === "ready" ? "Ready for review" : "Needs your call",
     detail: clampText(redactSecrets(question.title), 160)
   });
   if (question.reviewedAt && question.reviewReason) {
-    timeline.push({
+    raw.push({
       at: question.reviewedAt,
       label: "Scrutinizer verified",
       detail: clampText(redactSecrets(question.reviewReason), 160)
     });
   }
+  const timeline = [];
+  const seenEntries = new Set();
+  for (const item of raw) {
+    const sig = `${item.label}\0${item.detail ?? ""}`;
+    if (seenEntries.has(sig)) continue;
+    seenEntries.add(sig);
+    timeline.push(item);
+  }
   return timeline;
 }
 
-function buildResources(question, row, prRef) {
+function resolveOpenChat(question, row, primaryKey, sessionTitle) {
+  const existing = question.openChat ?? row?.openChat ?? null;
+  const parsedPaseo = parsePaseoThreadKey(primaryKey);
+  if (existing) {
+    if (parsedPaseo && (!existing.serverId || !existing.agentId)) {
+      return { ...existing, app: existing.app ?? "paseo", serverId: existing.serverId ?? parsedPaseo.serverId, agentId: existing.agentId ?? parsedPaseo.agentId };
+    }
+    return existing;
+  }
+  if (parsedPaseo) {
+    return {
+      app: "paseo",
+      url: null,
+      label: `${sessionTitle || "Paseo chat"} (Paseo)`,
+      serverId: parsedPaseo.serverId,
+      agentId: parsedPaseo.agentId,
+      note: "Open this existing chat on its Paseo host."
+    };
+  }
+  return null;
+}
+
+function buildResources(question, row, prRef, { openChat = null, sessionTitle = null, prUrlOverride = null } = {}) {
   const resources = [];
   const threadKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
+  const parsedPaseo = parsePaseoThreadKey(threadKey);
+  const serverId = openChat?.serverId ?? parsedPaseo?.serverId ?? null;
+  const agentId = openChat?.agentId ?? parsedPaseo?.agentId ?? null;
   if (threadKey) {
     resources.push({
       kind: "conversation",
-      label: question.chatLabel || row?.title || row?.workspace || "Agent conversation",
+      label: question.chatLabel || sessionTitle || cleanWorkspaceName(row?.workspace) || "Agent conversation",
       url: null,
-      threadKey
+      threadKey,
+      ...(serverId && agentId ? { serverId, agentId } : {})
     });
   }
   const parsedPr = parsePrRef(prRef);
-  const prUrl = row?.pr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
+  const prUrl = prUrlOverride ?? row?.pr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
   if (prUrl || prRef) {
     resources.push({
       kind: "pr",
@@ -271,29 +349,120 @@ function buildResources(question, row, prRef) {
       threadKey: null
     });
   }
-  const openChat = question.openChat ?? row?.openChat ?? null;
-  if (openChat?.url || openChat?.app) {
+  if (openChat?.url) {
     resources.push({
       kind: "app",
       label: openChat.label ? `Open ${openChat.label}` : `Open in ${openChat.app ?? "app"}`,
-      url: openChat.url ?? null,
-      threadKey
+      url: openChat.url,
+      threadKey,
+      ...(serverId && agentId ? { serverId, agentId } : {})
     });
   }
   return resources;
 }
 
-export function buildSupervisorCard(question, { rowsByKey = new Map(), actions = [], prefs = normalizePreferences(null) } = {}) {
+export function buildSupervisorCard(
+  question,
+  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null) } = {}
+) {
   const primaryKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
-  const prRef = question.prRef ?? row?.pr?.ref ?? null;
+  const thread = primaryKey ? threadsByKey.get(primaryKey) ?? null : null;
+  const snap = question.contextSnapshot && typeof question.contextSnapshot === "object" ? question.contextSnapshot : null;
+  const prRef = question.prRef ?? row?.pr?.ref ?? snap?.pr?.ref ?? thread?.prRefs?.[0] ?? null;
   const parsedPr = parsePrRef(prRef);
-  const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef);
-  const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef);
+  const matchesPrRef = (candidate) => Boolean(candidate && (!prRef || !candidate.ref || candidate.ref === prRef));
+  const threadKeyedPr = primaryKey ? prsByKey.get(primaryKey) : null;
+  const livePr = (prRef ? prsByKey.get(prRef) : null) ?? (matchesPrRef(threadKeyedPr) ? threadKeyedPr : null) ?? null;
+  const rowPr = matchesPrRef(row?.pr) ? row.pr : null;
+  const snapPr = matchesPrRef(snap?.pr) ? snap.pr : null;
+
+  const pickNum = (...vals) => vals.find((v) => Number.isFinite(v)) ?? null;
+  const prTitle = clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null;
+  const rawPrBody = livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null;
+  const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(rawPrBody), 900) : null;
+  const additions = pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
+  const deletions = pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
+  const changedFiles = pickNum(livePr?.changedFiles, rowPr?.changedFiles, snapPr?.changedFiles);
+  const files = (livePr?.files?.length ? livePr.files : (rowPr?.files?.length ? rowPr.files : (snapPr?.files ?? []))).slice(0, 12);
+  const rawGates = livePr?.gates?.length ? livePr.gates : (rowPr?.gates?.length ? rowPr.gates : (snapPr?.gates ?? []));
+  const gates = Array.isArray(rawGates)
+    ? rawGates.slice(0, 4).map((g) => ({ label: String(g?.label || g?.name || ""), state: g?.state ?? null })).filter((g) => g.label)
+    : [];
+  const rawQa = livePr?.qa ?? rowPr?.qa ?? snapPr?.qa ?? null;
+  const qa = rawQa ? { required: rawQa.required ?? null, freshOnHead: rawQa.freshOnHead ?? null } : null;
+  const ciState = livePr?.ci?.state ?? rowPr?.ci?.state ?? snapPr?.ciState ?? null;
+  const mergeState = livePr?.mergeState ?? rowPr?.mergeState ?? snapPr?.mergeState ?? null;
+  const headSha = (livePr?.headOid ? String(livePr.headOid).slice(0, 10) : null)
+    ?? rowPr?.head
+    ?? snapPr?.head
+    ?? question.askedHead
+    ?? null;
+  const prUrl = livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
+  const prMeta = prRef ? {
+    ref: prRef,
+    title: prTitle,
+    bodySummary: prBodySummary,
+    additions,
+    deletions,
+    changedFiles,
+    files,
+    gates,
+    qa,
+    ciState,
+    mergeState,
+    head: headSha,
+    unresolvedThreads: livePr?.unresolvedThreads ?? rowPr?.unresolvedThreads ?? snapPr?.unresolvedThreads ?? 0,
+    failingChecks: livePr?.ci?.failing ?? rowPr?.ci?.failing ?? snapPr?.failingChecks ?? []
+  } : null;
+
+  const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
+  const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef, prMeta);
+  const sessionTitle = clampText(redactSecrets(row?.title || thread?.title || snap?.threadTitle || ""), 120) || null;
+
   const rawTitle = String(question.title ?? "");
-  const cleanTitle = row?.title && /^wks_[0-9a-f]+:/i.test(rawTitle)
-    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${row.title}:`)
+  let cleanTitle = sessionTitle && /^wks_[0-9a-f]+:/i.test(rawTitle)
+    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${sessionTitle}:`)
     : rawTitle;
+  if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*needs\s+approve\.?|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
+    cleanTitle = `#${parsedPr.number} · ${prTitle}`;
+  }
+  const headline = clampText(redactSecrets(cleanTitle), 140);
+
+  const rawAgentSummary = thread?.lastAgentFull || row?.lastAgentText || question.askContext || snap?.agentSummary || "";
+  const agentSummary = clampTailLines(redactSecrets(rawAgentSummary), 1600) || null;
+
+  const rawMessages = Array.isArray(thread?.meta?.conversation) && thread.meta.conversation.length
+    ? thread.meta.conversation.slice(-4)
+    : (Array.isArray(snap?.recentMessages) && snap.recentMessages.length
+        ? snap.recentMessages.slice(-4)
+        : [
+            ...((thread?.lastUserText || snap?.lastUserText) ? [{ role: "user", text: thread?.lastUserText || snap?.lastUserText, at: thread?.lastUserAt ?? snap?.lastUserAt ?? null }] : []),
+            ...((thread?.lastAgentFull || row?.lastAgentText || snap?.agentSummary) ? [{ role: "assistant", text: thread?.lastAgentFull || row?.lastAgentText || snap?.agentSummary, at: thread?.lastAgentAt ?? row?.lastAgentAt ?? snap?.lastAgentAt ?? null }] : [])
+          ]);
+  const recentMessages = rawMessages
+    .filter((m) => m && typeof m.text === "string" && m.text.trim())
+    .map((m) => ({
+      role: m.role === "user" ? "user" : "assistant",
+      text: clampTailLines(redactSecrets(m.text), 700),
+      at: m.at ?? null
+    }));
+
+  const prContext = prMeta ? {
+    ref: prRef,
+    url: prUrl,
+    title: prTitle,
+    bodySummary: prBodySummary,
+    additions,
+    deletions,
+    changedFiles,
+    files,
+    gates,
+    qa,
+    ciState
+  } : null;
+
+  const openChat = resolveOpenChat(question, row, primaryKey, sessionTitle);
 
   return {
     id: question.id,
@@ -301,20 +470,24 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     kind,
     kindLabel,
     rank,
-    headline: clampText(redactSecrets(cleanTitle), 140),
-    summary: buildSummary(question, row),
-    recommendation: buildRecommendation(question, row, prRef, prefs),
+    headline,
+    sessionTitle,
+    summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
+    recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
+    agentSummary,
+    prContext,
+    recentMessages,
     threadKey: primaryKey,
     threadKeys: question.threadKeys ?? (primaryKey ? [primaryKey] : []),
-    repo: row?.repo ?? parsedPr?.repo ?? null,
-    branch: row?.branch ?? null,
-    workspace: cleanWorkspaceName(row?.workspace),
+    repo: row?.repo ?? thread?.repo ?? snap?.repo ?? parsedPr?.repo ?? null,
+    branch: row?.branch ?? thread?.branch ?? snap?.branch ?? livePr?.headRef ?? null,
+    workspace: cleanWorkspaceName(row?.workspace ?? thread?.workspace ?? snap?.workspace),
     prRef: prRef ?? null,
-    prUrl: row?.pr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null),
+    prUrl,
     prNumber: parsedPr?.number ?? null,
-    headSha: row?.pr?.head ?? question.askedHead ?? null,
-    ciState: row?.pr?.ci?.state ?? null,
-    mergeState: row?.pr?.mergeState ?? null,
+    headSha,
+    ciState,
+    mergeState,
     noticedAt: question.askedAt ?? question.createdAt ?? null,
     answerIn: question.answerIn ?? "here",
     risky: Boolean(question.risky),
@@ -322,9 +495,9 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     primaryAction,
     secondaryAction,
     extraActions,
-    timeline: buildTimeline(question, row, actions),
-    resources: buildResources(question, row, prRef),
-    openChat: question.openChat ?? row?.openChat ?? null
+    timeline: buildTimeline(question, row, actions, prMeta),
+    resources: buildResources(question, row, prRef, { openChat, sessionTitle, prUrlOverride: prUrl }),
+    openChat
   };
 }
 
@@ -463,16 +636,21 @@ export function buildCatchUpSummary(cards = [], activeSummary = null) {
   return "All clear—no coding sessions need you right now.";
 }
 
-export function buildSupervisorDeck(state, { preferences = null, now = Date.now() } = {}) {
+export function buildSupervisorDeck(
+  state,
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map() } = {}
+) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
-  const rowsByKey = new Map((snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+  const rowsByKey = new Map();
+  for (const [k, r] of knownRows ?? []) if (k && r) rowsByKey.set(k, r);
+  for (const r of snapshot?.threads ?? []) if (r?.key) rowsByKey.set(r.key, r);
   const actions = Array.isArray(state?.actions) ? state.actions : [];
   const questions = Array.isArray(state?.questions) ? state.questions : [];
 
   const questionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, actions, prefs }))
+    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
 
   const prefCards = buildProgressivePreferenceCards(prefs, { now });

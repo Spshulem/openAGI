@@ -456,7 +456,8 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       criticalGb: envNumber(env.OPENAGI_FLEET_STORAGE_CRITICAL_GB, STORAGE_DEFAULTS.criticalGb),
       sdLowGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_LOW_GB, STORAGE_DEFAULTS.sdLowGb),
       sdReserveGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_RESERVE_GB, STORAGE_DEFAULTS.sdReserveGb),
-      dataMount: DEFAULT_DATA_MOUNT,
+      dataMount: String(env.OPENAGI_FLEET_STORAGE_DATA ?? "").trim()
+        || (fs.existsSync(DEFAULT_DATA_MOUNT) ? DEFAULT_DATA_MOUNT : (fs.existsSync(home) ? home : "/")),
       sdMount: String(env.OPENAGI_FLEET_STORAGE_SD ?? "").trim() || DEFAULT_SD_MOUNT,
       ...(overrides.storage ?? {}),
       enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
@@ -626,7 +627,17 @@ export function openChatFor(thread) {
   if (!thread?.kind) return null;
   const name = (value) => clampText(value, CHAT_NAME_MAX);
   const title = name(thread.title);
-  if (thread.kind === "paseo") return { app: "paseo", url: null, label: `${title || "untitled chat"} (Paseo)`, serverId: thread.meta?.serverId, agentId: thread.id, note: "Open this existing chat on its Paseo host." };
+  if (thread.kind === "paseo") {
+    const parsed = parsePaseoThreadKey(thread.key);
+    return {
+      app: "paseo",
+      url: null,
+      label: `${title || "untitled chat"} (Paseo)`,
+      serverId: thread.meta?.serverId ?? parsed?.serverId,
+      agentId: thread.id ?? parsed?.agentId,
+      note: "Open this existing chat on its Paseo host."
+    };
+  }
   const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
   const target = uiTargetFor(thread);
   if (target?.app === "conductor") {
@@ -818,6 +829,15 @@ export function redactSecrets(value) {
 
 export function threadKey(kind, id) {
   return `${kind}:${id}`;
+}
+
+export function parsePaseoThreadKey(key) {
+  const raw = String(key ?? "").trim();
+  if (!raw.startsWith("paseo:")) return null;
+  const rest = raw.slice("paseo:".length);
+  const dot = rest.indexOf(".");
+  if (dot <= 0 || dot >= rest.length - 1) return null;
+  return { serverId: rest.slice(0, dot), agentId: rest.slice(dot + 1) };
 }
 
 export function prRefKey(repo, number) {

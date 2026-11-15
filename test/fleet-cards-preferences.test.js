@@ -1142,3 +1142,286 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     cleanup();
   }
 });
+
+test("rich decision context survives rotation via contextSnapshot, deduplicates timeline, marks CI failures, and preserves warm rows on transient source error", async () => {
+  const { supervisor, cleanup } = tempSupervisor();
+  try {
+    const richThread = {
+      key: "paseo:srv_4x2crHynU7yi.2ba43988-ba6b-4f7d-b8df-a8feb2378572",
+      kind: "paseo",
+      title: "Fix mobile auth token refresh & drawer",
+      workspace: "amman",
+      repo: "buildbetter-app/buildbetter",
+      branch: "spencer/mobile-auth-9869",
+      agentStatus: "idle",
+      live: true,
+      lastAgentText: "Implemented token refresh retry, added unit tests, and verified drawer state.",
+      prRefs: ["buildbetter-app/buildbetter#9869"],
+      meta: {
+        app: "paseo",
+        serverId: "srv_4x2crHynU7yi",
+        conversationId: "2ba43988-ba6b-4f7d-b8df-a8feb2378572",
+        conversation: [
+          { role: "user", text: "Ship the mobile auth token refresh fix", at: "2026-11-15T08:00:00Z" },
+          { role: "assistant", text: "Implemented token refresh retry, added unit tests, and verified drawer state.", at: "2026-11-15T08:15:00Z" }
+        ]
+      }
+    };
+    const richPr = {
+      ref: "buildbetter-app/buildbetter#9869",
+      url: "https://github.com/buildbetter-app/buildbetter/pull/9869",
+      state: "OPEN",
+      isDraft: false,
+      title: "fix(auth): retry expired mobile session tokens cleanly",
+      bodySummary: "Fixes silent token expiry on resume and adds regression coverage for the mobile drawer.",
+      additions: 142,
+      deletions: 38,
+      changedFiles: 4,
+      files: ["src/auth/refresh.ts", "src/ui/Drawer.tsx", "src/auth/refresh.test.ts", "src/api/client.ts"],
+      gates: [{ label: "UI QA", state: "missing" }],
+      qa: { required: true, freshOnHead: false },
+      ci: { state: "SUCCESS" },
+      unresolvedThreads: 0,
+      mergeState: "CLEAN",
+      headOid: "76e835bf61"
+    };
+
+    const warmSnap = supervisor.buildSnapshot({
+      reason: "test",
+      started: 1000,
+      finished: 1050,
+      mode: "propose",
+      threads: [richThread],
+      inScope: [richThread],
+      items: [{
+        thread: richThread,
+        classified: { state: "ready-to-merge", reason: "PR green, review required", blockers: ["review-required"] },
+        pr: richPr
+      }],
+      decisions: [],
+      infra: {},
+      sourceErrors: {},
+      manager: null
+    });
+    supervisor.store.recordSnapshot(warmSnap);
+    supervisor.lastThreads = new Map([[richThread.key, richThread]]);
+
+    await supervisor.act([
+      {
+        action: "ask-user",
+        threadKey: richThread.key,
+        playbook: "merge-ready",
+        reason: "not ready: UI QA missing",
+        question: {
+          dedupeKey: "ready:buildbetter-app/buildbetter#9869",
+          kind: "ready",
+          threadKey: richThread.key,
+          prRef: richPr.ref,
+          title: "buildbetter #9869 ready. Needs approve.",
+          body: "buildbetter-app/buildbetter#9869 at 76e835bf61: CI green, 0 open threads, review required.",
+          options: ["approved", "later"]
+        }
+      }
+    ], {
+      mode: "propose",
+      byKey: new Map([[richThread.key, richThread]]),
+      manager: null,
+      started: 1000,
+      config: supervisor.config,
+      items: [{ thread: richThread, classified: { state: "ready-to-merge" }, pr: richPr }],
+      skipReview: false
+    });
+    // Record two identical done decisions to verify timeline deduplication
+    supervisor.store.recordAction({
+      threadKey: richThread.key,
+      action: "nudge",
+      playbook: "merge-ready",
+      reason: "not ready: UI QA missing",
+      status: "done"
+    });
+    supervisor.store.recordAction({
+      threadKey: richThread.key,
+      action: "nudge",
+      playbook: "merge-ready",
+      reason: "not ready: UI QA missing",
+      status: "done"
+    });
+
+    const cardLive = supervisor.getState().cards.find((c) => c.prRef === richPr.ref);
+    assert.ok(cardLive);
+    assert.match(cardLive.headline, /#9869 · fix\(auth\): retry expired mobile session tokens cleanly/);
+    assert.equal(cardLive.sessionTitle, "Fix mobile auth token refresh & drawer");
+    assert.match(cardLive.agentSummary, /Implemented token refresh retry/);
+    assert.equal(cardLive.prContext?.additions, 142);
+    assert.equal(cardLive.prContext?.deletions, 38);
+    assert.equal(cardLive.prContext?.changedFiles, 4);
+    assert.match(cardLive.prContext?.bodySummary ?? "", /Fixes silent token expiry/);
+    assert.equal(cardLive.recentMessages?.length, 2);
+    assert.equal(cardLive.openChat?.serverId, "srv_4x2crHynU7yi");
+    assert.equal(cardLive.openChat?.agentId, "2ba43988-ba6b-4f7d-b8df-a8feb2378572");
+    const agentRes = cardLive.resources.find((r) => r.kind === "conversation");
+    assert.equal(agentRes?.serverId, "srv_4x2crHynU7yi");
+    assert.equal(agentRes?.agentId, "2ba43988-ba6b-4f7d-b8df-a8feb2378572");
+    const mergeReadyEntries = cardLive.timeline.filter((t) => t.label.includes("Playbook: merge-ready") && t.detail === "not ready: UI QA missing");
+    assert.equal(mergeReadyEntries.length, 1, "duplicate timeline rows must be collapsed");
+
+    // Simulate transient Paseo timeout on next scan: warm rows are carried forward instead of wiping to 0
+    const transientErrSnap = supervisor.buildSnapshot({
+      reason: "test-timeout",
+      started: 2000,
+      finished: 2050,
+      mode: "propose",
+      threads: [],
+      inScope: [],
+      items: [],
+      decisions: [],
+      infra: {},
+      sourceErrors: { paseo: "Paseo request timed out." },
+      manager: null,
+      previous: warmSnap
+    });
+    assert.equal(transientErrSnap.threads.length, 1, "warm Paseo row preserved on transient source error");
+    assert.equal(transientErrSnap.counts.inScope, 1);
+
+    // Even if snapshot threads and in-memory maps are completely empty (e.g., cold restart before scan),
+    // question.contextSnapshot preserves rich PR context, sessionTitle, recentMessages, and threadDetail/threadConversation!
+    supervisor.lastThreads.clear();
+    supervisor.knownThreads.clear();
+    supervisor.knownRows.clear();
+    supervisor.store.recordSnapshot({
+      at: new Date().toISOString(),
+      reason: "empty",
+      durationMs: 5,
+      mode: "propose",
+      counts: { threads: 0, eligible: 0, inScope: 0, deferred: 0, sources: {}, byState: {}, byWatch: {}, needsYou: 1, actions: 0 },
+      threads: [],
+      infra: {},
+      infraDecisions: [],
+      sourceErrors: {}
+    });
+
+    const cardAfterRestart = supervisor.getState().cards.find((c) => c.prRef === richPr.ref);
+    assert.ok(cardAfterRestart);
+    assert.equal(cardAfterRestart.sessionTitle, "Fix mobile auth token refresh & drawer");
+    assert.equal(cardAfterRestart.prContext?.additions, 142);
+    assert.match(cardAfterRestart.prContext?.bodySummary ?? "", /Fixes silent token expiry/);
+    assert.equal(cardAfterRestart.recentMessages?.length, 2);
+
+    const fallbackDetail = supervisor.threadDetail(richThread.key);
+    assert.ok(fallbackDetail, "threadDetail falls back to saved contextSnapshot instead of returning null/404");
+    assert.equal(fallbackDetail.title, "Fix mobile auth token refresh & drawer");
+    assert.match(fallbackDetail.lastAgentMessage?.text ?? "", /Implemented token refresh retry/);
+    const fallbackConvo = await supervisor.threadConversation(richThread.key);
+    assert.ok(fallbackConvo, "threadConversation falls back to saved contextSnapshot messages");
+    assert.equal(fallbackConvo.messages.length, 2);
+    assert.equal(supervisor.threadDetail("codex:nonexistent-xyz"), null, "genuinely unknown thread still returns null");
+
+    // Failing CI PR gets kind === "ci_failed" ("CI Failed") instead of "merge_ready"
+    const redRow = {
+      key: "paseo:srv_4x2crHynU7yi.red1",
+      kind: "paseo",
+      title: "Fix flaky webhook test",
+      pr: { ref: "buildbetter-app/buildbetter#9899", url: "https://github.com/buildbetter-app/buildbetter/pull/9899", state: "OPEN", ci: { state: "FAILURE" }, mergeState: "BLOCKED" }
+    };
+    supervisor.store.recordSnapshot({
+      at: new Date().toISOString(),
+      reason: "red",
+      durationMs: 5,
+      mode: "propose",
+      counts: { threads: 1, eligible: 1, inScope: 1, deferred: 0, sources: {}, byState: {}, byWatch: {}, needsYou: 2, actions: 0 },
+      threads: [redRow],
+      infra: {},
+      infraDecisions: [],
+      sourceErrors: {}
+    });
+    const redQ = supervisor.store.upsertQuestion({
+      dedupeKey: "stuck:red-9899",
+      kind: "stuck",
+      threadKey: redRow.key,
+      prRef: "buildbetter-app/buildbetter#9899",
+      title: "buildbetter #9899 CI failed",
+      options: ["fix ci", "later"]
+    });
+    const redCard = supervisor.getState().cards.find((c) => c.id === redQ.id);
+    assert.equal(redCard.kind, "ci_failed");
+    assert.equal(redCard.kindLabel, "CI Failed");
+
+    // When a session moves to PR #20 while an earlier question for PR #10 remains open,
+    // card metadata stays bound to PR #10 instead of mixing PR #20's head/title.
+    const movedKey = "paseo:srv_4x2crHynU7yi.multi-pr";
+    const pr10 = { ref: "buildbetter-app/buildbetter#10", url: "https://github.com/buildbetter-app/buildbetter/pull/10", number: 10, title: "PR Ten Auth", bodySummary: "PR 10 summary", headOid: "1010101010abcdef", state: "OPEN", ci: { state: "SUCCESS" }, additions: 10, deletions: 2, changedFiles: 1 };
+    const pr20 = { ref: "buildbetter-app/buildbetter#20", url: "https://github.com/buildbetter-app/buildbetter/pull/20", number: 20, title: "PR Twenty Billing", bodySummary: "PR 20 summary", headOid: "2020202020abcdef", state: "OPEN", ci: { state: "PENDING" }, additions: 99, deletions: 12, changedFiles: 5 };
+    supervisor.lastPrs = new Map([[movedKey, pr20], [pr10.ref, pr10], [pr20.ref, pr20]]);
+    supervisor.store.recordSnapshot({
+      at: new Date().toISOString(),
+      reason: "moved-pr",
+      durationMs: 5,
+      mode: "propose",
+      counts: { threads: 1, eligible: 1, inScope: 1, deferred: 0, sources: {}, byState: {}, byWatch: {}, needsYou: 1, actions: 0 },
+      threads: [{ key: movedKey, kind: "paseo", title: "Multi PR Session", pr: { ref: pr20.ref, title: pr20.title, head: "2020202020", ci: { state: "PENDING" } } }],
+      infra: {},
+      infraDecisions: [],
+      sourceErrors: {}
+    });
+    const q10 = supervisor.store.upsertQuestion({
+      dedupeKey: "ready:pr10",
+      kind: "ready",
+      threadKey: movedKey,
+      prRef: pr10.ref,
+      title: "buildbetter #10 ready",
+      options: ["approved", "later"],
+      askedHead: pr10.headOid
+    });
+    const card10 = supervisor.getState().cards.find((c) => c.id === q10.id);
+    assert.equal(card10.prRef, pr10.ref);
+    assert.equal(card10.prContext?.title, "PR Ten Auth");
+    assert.equal(card10.headSha, "1010101010");
+    assert.equal(card10.ciState, "SUCCESS");
+
+    // Superseding an agent-ask with a thin snapshot preserves saved PR & conversation context,
+    // and syntheticPaseoThread restores workspaceId for saved-question delivery preflight.
+    const supKey = "paseo:srv_4x2crHynU7yi.sup1";
+    supervisor.store.upsertQuestion({
+      dedupeKey: "ask:sup:1",
+      kind: "agent-ask",
+      threadKey: supKey,
+      prRef: pr10.ref,
+      title: "Ship PR #10?",
+      body: "Ready to ship?",
+      options: ["yes", "no"],
+      askContext: "Ready to ship PR #10?",
+      agentAskedAt: "2026-11-15T08:00:00.000Z",
+      contextSnapshot: {
+        threadTitle: "Saved Session",
+        paseoCwd: "/workspace/bb",
+        paseoWorkspaceId: "wks_saved123",
+        paseoHasWorkspaceId: true,
+        recentMessages: [{ role: "assistant", text: "Earlier turn", at: "2026-11-15T08:00:00Z" }],
+        pr: { ref: pr10.ref, title: "PR Ten Auth", bodySummary: "Rich body", additions: 10, deletions: 2, changedFiles: 1 }
+      }
+    });
+    const sup2 = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:sup:2",
+      kind: "agent-ask",
+      threadKey: supKey,
+      prRef: pr10.ref,
+      title: "Ship PR #10 now?",
+      body: "Updated question?",
+      options: ["yes", "no"],
+      agentAskedAt: "2026-11-15T08:05:00.000Z",
+      contextSnapshot: {
+        threadTitle: "Saved Session",
+        paseoCwd: "/workspace/bb",
+        recentMessages: [],
+        pr: null
+      }
+    });
+    assert.equal(sup2.contextSnapshot?.pr?.bodySummary, "Rich body", "thin supersede preserves saved PR context");
+    assert.equal(sup2.contextSnapshot?.recentMessages?.length, 1, "thin supersede preserves saved recentMessages");
+    supervisor.config.paseo = { enabled: true };
+    const synth = supervisor.syntheticPaseoThread(supKey, sup2);
+    assert.equal(synth.meta.workspaceId, "wks_saved123", "synthetic Paseo thread restores workspaceId for delivery preflight");
+  } finally {
+    cleanup();
+  }
+});
