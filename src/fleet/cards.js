@@ -4,6 +4,7 @@
 // so Android, push extensions, and older clients stay 100% compatible.
 
 import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
+import { asksToMergePr } from "./policy.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
@@ -39,8 +40,21 @@ function humanOptionLabel(option) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function classifyCardKind(question) {
-  if (question.kind === "ready" || question.mergeAsk) {
+function isMergeReadyQuestion(question, row, prRef) {
+  if (!prRef || !parsePrRef(prRef)) return false;
+  const isDraftAsk = Boolean(row?.pr?.isDraft)
+    || (Array.isArray(row?.blockers) && row.blockers.includes("draft"))
+    || /\bdraft\b/i.test(`${question.title ?? ""} ${question.body ?? ""}`);
+  if (isDraftAsk) return false;
+  if (question.kind === "ready" || question.mergeAsk) return true;
+  if (question.kind !== "agent-ask") return false;
+  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
+  if (!/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt)) return false;
+  return asksToMergePr(`${question.title ?? ""} ${question.body ?? ""}`);
+}
+
+function classifyCardKind(question, row = null, prRef = null) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     return { kind: "merge_ready", kindLabel: "PR Ready", rank: 0 };
   }
   if (["prompt", "agent-ask", "agent-card", "self-fix"].includes(question.kind)) {
@@ -60,7 +74,8 @@ function classifyCardKind(question) {
 function isQuestionLiveForDeck(question, row, prefs) {
   if (!question || question.status !== "open") return false;
   if (row?.muted) return false;
-  if (row?.pr?.state && SETTLED_PR.has(row.pr.state) && (question.kind === "ready" || question.mergeAsk)) {
+  const prRef = question.prRef ?? row?.prRef ?? null;
+  if (row?.pr?.state && SETTLED_PR.has(row.pr.state) && (question.kind === "ready" || question.mergeAsk || isMergeReadyQuestion(question, row, prRef))) {
     return false;
   }
   if (question.kind === "agent-ask" && !question.mergeAsk && row) {
@@ -97,7 +112,7 @@ function buildActionsForQuestion(question, row, prRef) {
     };
   }
 
-  if ((question.kind === "ready" || question.mergeAsk) && prRef && parsePrRef(prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     if (ciState === "FAILURE" || ciState === "ERROR" || mergeState === "DIRTY") {
       return {
         primaryAction: { op: "fix_ci", label: mergeState === "DIRTY" ? "Have agent rebase" : "Have agent fix CI", value: "fix_ci", destructive: false },
@@ -165,7 +180,7 @@ function buildRecommendation(question, row, prRef, prefs) {
     return clampText(redactSecrets(question.reviewReason), 220);
   }
   const ci = row?.pr?.ci?.state ?? null;
-  if ((question.kind === "ready" || question.mergeAsk) && prRef) {
+  if (isMergeReadyQuestion(question, row, prRef)) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
@@ -273,8 +288,12 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
   const prRef = question.prRef ?? row?.pr?.ref ?? null;
   const parsedPr = parsePrRef(prRef);
-  const { kind, kindLabel, rank } = classifyCardKind(question);
+  const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef);
+  const rawTitle = String(question.title ?? "");
+  const cleanTitle = row?.title && /^wks_[0-9a-f]+:/i.test(rawTitle)
+    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${row.title}:`)
+    : rawTitle;
 
   return {
     id: question.id,
@@ -282,7 +301,7 @@ export function buildSupervisorCard(question, { rowsByKey = new Map(), actions =
     kind,
     kindLabel,
     rank,
-    headline: clampText(redactSecrets(question.title), 140),
+    headline: clampText(redactSecrets(cleanTitle), 140),
     summary: buildSummary(question, row),
     recommendation: buildRecommendation(question, row, prRef, prefs),
     threadKey: primaryKey,

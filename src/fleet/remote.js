@@ -12,6 +12,7 @@ import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
 import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
+import { rankCombinedSearchResults, searchFleet } from './search.js';
 
 const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|preferences|route|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
@@ -157,12 +158,15 @@ export class RemoteFleetSupervisor {
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
+      const rawMsg = String(error?.message ?? '');
+      const unsupportedRoute = (reached && status === 404 && /unknown fleet route/i.test(rawMsg))
+        || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
       const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
-      const nonOutage404 = missingThread || closedCard;
-      if (!nonOutage404 && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      const nonOutageError = missingThread || closedCard || unsupportedRoute;
+      if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(nonOutage404 ? error.message : this.state.lastError), { reached, status });
+      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
     }
   }
   refresh() {
@@ -243,7 +247,71 @@ export class RemoteFleetSupervisor {
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
-  async searchThreads(options = {}) { return this.request('GET', '/fleet/api/search', options); }
+  async searchThreads(options = {}) {
+    const limit = Number.isInteger(options?.limit) ? options.limit : 20;
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    const fetchLimit = peerNodes.length > 0 ? Math.min(50, Math.max(limit, 30)) : limit;
+    const fetchOptions = { ...options, limit: fetchLimit };
+    let primaryRes;
+    try {
+      primaryRes = await this.request('GET', '/fleet/api/search', fetchOptions);
+    } catch (error) {
+      if (error.unsupportedRoute || error.status === 404) {
+        if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
+        if (this.questionsAuthoritative) this.state.lastError = null;
+        primaryRes = searchFleet(this.getState(), { natural: true, ...fetchOptions });
+      } else {
+        throw error;
+      }
+    }
+
+    if (peerNodes.length === 0) {
+      return {
+        ...primaryRes,
+        results: (primaryRes?.results ?? []).slice(0, limit)
+      };
+    }
+
+    const peerLists = await Promise.all(peerNodes.slice(0, 4).map(async (peer) => {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path: '/fleet/api/search', body: fetchOptions },
+          { timeoutMs: 6000 }
+        );
+        if (res?.response?.status === 200 && Array.isArray(res.response.body?.results)) {
+          return res.response.body.results;
+        }
+      } catch { /* fall through to state search for older node versions */ }
+      try {
+        const stateRes = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path: '/fleet/api/state' },
+          { timeoutMs: 6000 }
+        );
+        if (stateRes?.state) {
+          return searchFleet(stateRes.state, { natural: true, ...fetchOptions, includeScores: true }).scoredResults
+            ?? searchFleet(stateRes.state, { natural: true, ...fetchOptions }).results;
+        }
+      } catch { /* peer offline or unreachable */ }
+      return [];
+    }));
+
+    const ranked = rankCombinedSearchResults(
+      [...(primaryRes?.results ?? []), ...peerLists.flat()],
+      options?.query ?? ''
+    );
+    return {
+      ...primaryRes,
+      results: ranked.slice(0, limit),
+      total: ranked.length
+    };
+  }
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async routeIssue(input = {}) {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
@@ -266,8 +334,37 @@ export class RemoteFleetSupervisor {
     try {
       return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
     } catch (error) {
-      if (error.status === 404) return null;
-      throw error;
+      const legacyRouteMissing = Boolean(error.unsupportedRoute) || /unknown fleet route|unsupported fleet request/i.test(String(error?.message ?? ''));
+      if (error.status === 404 && !legacyRouteMissing) return null;
+      if (!legacyRouteMissing) throw error;
+      if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
+      if (this.questionsAuthoritative) this.state.lastError = null;
+      const qid = String(cardId ?? '').replace(/^question:/, '');
+      const curState = this.getState();
+      const card = (curState.cards ?? []).find((c) => c.id === cardId || c.id === qid || c.questionId === qid) ?? null;
+      const openQ = (curState.questions ?? []).find((q) => q.id === qid) ?? null;
+      if (!openQ) return null;
+      const op = String(input?.op ?? 'primary').toLowerCase();
+      if (op === 'defer' || op === 'dismiss') {
+        const question = await this.dismissQuestion(qid);
+        return { ok: true, kind: 'defer', status: 'dismissed', question, delivery: null };
+      }
+      if (op === 'reply') {
+        const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
+        const replyText = typeof input?.value === 'string' ? input.value.trim() : '';
+        if (!threadKey || !replyText) return null;
+        const sent = await this.sendOwnerMessage(threadKey, replyText);
+        if (sent?.delivery?.status === 'sent') await this.dismissQuestion(qid).catch(() => {});
+        return { ok: sent?.delivery?.status === 'sent', kind: 'reply', status: sent?.delivery?.status ?? 'blocked', detail: sent?.delivery?.detail ?? null, delivery: sent?.delivery ?? null };
+      }
+      const chosen = typeof input?.value === 'string' && input.value
+        ? input.value
+        : op === 'secondary'
+          ? card?.secondaryAction?.value
+          : (card?.primaryAction?.value ?? (openQ.options ?? []).find((opt) => opt !== 'dismiss'));
+      if (!chosen) return null;
+      const res = await this.answerQuestion(qid, chosen, { clarification: input?.clarification ?? null });
+      return res ? { ok: res.delivery?.status !== 'blocked', kind: 'answer', status: res.delivery?.status ?? 'done', detail: res.delivery?.detail ?? null, ...res } : null;
     }
   }
   async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }

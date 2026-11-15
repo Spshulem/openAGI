@@ -1416,7 +1416,8 @@ export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
   const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
-    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
+    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
+    || (thread.kind === "paseo" ? fact(stripTags(thread.title), 36) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
   return place || `${kindName(thread.kind)} chat`;
 }
