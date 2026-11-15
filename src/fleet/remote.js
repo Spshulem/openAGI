@@ -280,7 +280,7 @@ export class RemoteFleetSupervisor {
           'fleet-supervisor',
           'request',
           { method: 'GET', path: '/fleet/api/search', body: fetchOptions },
-          { timeoutMs: 6000 }
+          { timeoutMs: 28000 }
         );
         if (res?.response?.status === 200 && Array.isArray(res.response.body?.results)) {
           return res.response.body.results;
