@@ -95,11 +95,13 @@ export async function withPaseo(config, operation, factory) {
   factory ??= (await import("@getpaseo/client")).createPaseoClient;
   const client = factory({ url: url.href, password: settings.password, reconnect: { enabled: false }, connectTimeoutMs: 5000 });
   const abort = new AbortController();
+  const totalTimeoutMs = settings.timeoutMs ?? 60000;
+  const scanStartedAt = Date.now();
   let timer;
   try {
     return await Promise.race([
-      (async () => { await client.connect(); abort.signal.throwIfAborted(); return operation(client, abort.signal); })(),
-      new Promise((_, reject) => { timer = setTimeout(() => { abort.abort(); reject(new Error("Paseo request timed out")); }, settings.timeoutMs ?? 20000); })
+      (async () => { await client.connect(); abort.signal.throwIfAborted(); return operation(client, abort.signal, { startedAt: scanStartedAt, timeoutMs: totalTimeoutMs }); })(),
+      new Promise((_, reject) => { timer = setTimeout(() => { abort.abort(); reject(new Error("Paseo request timed out")); }, totalTimeoutMs); })
     ]);
   } finally { clearTimeout(timer); abort.abort(); await client.close(); }
 }
@@ -149,12 +151,18 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const text = redactSecrets(assistant?.item.text ?? "").slice(-8000);
   const prRefs = extractPaseoPrRefs(messages, agent.title ?? "");
   const pendingCard = extractPaseoPendingCard(agent);
+  const rawWorkspace = String(agent.workspaceId ?? "").trim();
+  const conductorWorkspace = String(agent.labels?.["migration.conductorWorkspaceName"] ?? "").trim()
+    || (/\/\.conductor\/([^/]+)/.exec(String(agent.cwd ?? ""))?.[1] ?? "");
+  const cleanWorkspace = rawWorkspace && !/^wks_[0-9a-f]+$/i.test(rawWorkspace)
+    ? clampText(rawWorkspace, 80)
+    : (conductorWorkspace ? clampText(conductorWorkspace, 80) : null);
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
-    cwd: null, workspace: /^wks_[0-9a-f]+$/i.test(String(agent.workspaceId ?? "")) ? null : agent.workspaceId, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
+    cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
     agentStatus: agent.pendingPermissions?.length ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status : "unknown",
     archived: Boolean(agent.archivedAt),
@@ -186,7 +194,7 @@ export function createPaseoSource({ factory } = {}) {
   };
   async function scan(config) {
     if (!config.paseo?.enabled) return [];
-    return withPaseo(config, async (client, signal) => {
+    return withPaseo(config, async (client, signal, meta = {}) => {
       const directory = await client.hosts.list();
       const ids = [...new Set([directory.self.serverId, ...(config.paseo.serverIds ?? [])])];
       const inventory = [];
@@ -213,17 +221,17 @@ export function createPaseoSource({ factory } = {}) {
           ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
           || (Number(Boolean(b.agent.requiresAttention)) - Number(Boolean(a.agent.requiresAttention)))
           || ((Date.parse(b.agent.updatedAt ?? "") || 0) - (Date.parse(a.agent.updatedAt ?? "") || 0)));
-      const startedAt = Date.now();
-      const totalTimeoutMs = config.paseo.timeoutMs ?? 20000;
+      const scanStartedAt = meta.startedAt ?? Date.now();
+      const totalTimeoutMs = meta.timeoutMs ?? config.paseo.timeoutMs ?? 60000;
       const perHistoryMs = config.paseo.historyTimeoutMs ?? 3000;
-      const historyDeadline = startedAt + Math.max(0, totalTimeoutMs - Math.min(1500, Math.floor(totalTimeoutMs * 0.2)));
+      const historyDeadline = scanStartedAt + Math.max(0, totalTimeoutMs - Math.min(3500, Math.floor(totalTimeoutMs * 0.2)));
       const budget = Math.min(80, Math.max(1, config.paseo.historyPerScan ?? 48));
       for (let offset = 0; offset < Math.min(budget, candidates.length); offset += 4) {
         signal.throwIfAborted();
         if (offset > 0 && Date.now() >= historyDeadline) break;
         const batchTimeoutMs = offset > 0
           ? Math.max(10, Math.min(perHistoryMs, historyDeadline - Date.now()))
-          : Math.min(perHistoryMs, Math.max(20, Math.floor(totalTimeoutMs * 0.75)));
+          : Math.min(perHistoryMs, Math.max(20, historyDeadline - Date.now()));
         await Promise.all(candidates.slice(offset, Math.min(offset + 4, budget)).map(async row => {
           const { api, agent: a, key } = row;
           cache.set(key, { attempted: Date.now() });

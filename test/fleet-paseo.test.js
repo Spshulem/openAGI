@@ -343,6 +343,29 @@ test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, g
     const slowSource = createPaseoSource(slowMock);
     const slowRows = await slowSource({ paseo: { enabled: true, timeoutMs: 160, historyTimeoutMs: 35, historyPerScan: 48 } });
     assert.equal(slowRows.length, 36);
+
+    // Opaque wks_* workspaceId extracts human conductor workspace name, and connect latency shares scanStartedAt budget cleanly
+    const migratedWorkspaceThread = paseoThread(
+      agent("cond-ws", {
+        workspaceId: "wks_9f8e7d6c5b4a",
+        cwd: "/home/dev/paseo/migrated/mac/Users/shooby/Dev/bbapp/.conductor/bilbao",
+        labels: { "migration.conductorWorkspaceName": "bilbao" }
+      }),
+      "local",
+      []
+    );
+    assert.equal(migratedWorkspaceThread.workspace, "bilbao");
+
+    const delayedConnectMock = mock(Array.from({ length: 20 }, (_, idx) => agent(`dc-${idx}`)));
+    delayedConnectMock.client.agents.ref = () => ({ timeline: { refetch: () => new Promise(() => {}) } });
+    const origConnect = delayedConnectMock.connect;
+    delayedConnectMock.connect = async (...args) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return origConnect(...args);
+    };
+    const delayedSource = createPaseoSource(delayedConnectMock);
+    const delayedRows = await delayedSource({ paseo: { enabled: true, timeoutMs: 180, historyTimeoutMs: 120, historyPerScan: 20 } });
+    assert.equal(delayedRows.length, 20);
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }

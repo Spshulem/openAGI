@@ -385,12 +385,29 @@ export class RemoteFleetSupervisor {
 
   // A thread the computer's last scan does not have is null, not an outage.
   async threadDetail(threadKey) {
+    const path = `/fleet/api/threads/${encodeURIComponent(threadKey)}`;
     try {
-      return (await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}`)).thread ?? null;
+      return (await this.request('GET', path)).thread ?? null;
     } catch (error) {
-      if (error.status === 404) return null;
-      throw error;
+      if (error.status !== 404) throw error;
     }
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    for (const peer of peerNodes.slice(0, 4)) {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path },
+          { timeoutMs: 15000 }
+        );
+        if (res?.response?.status === 200 && res.response.body?.thread) {
+          return res.response.body.thread;
+        }
+      } catch { /* try next peer */ }
+    }
+    return null;
   }
   async pushNow(threadKey) {
     const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/push`);
