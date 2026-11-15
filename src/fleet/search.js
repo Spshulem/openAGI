@@ -225,11 +225,18 @@ function buildFtsMatchExpressions(terms) {
     .filter((t) => !PROVIDER_TERMS.has(t))
     .map((t) => t.replace(/[^a-z0-9_]/gi, ""))
     .filter((t) => t.length >= 2)
-    .slice(0, 8);
+    .slice(0, 6);
   if (safe.length === 0) return [];
   const quoted = safe.map((t) => `"${t}"*`);
   if (quoted.length === 1) return [quoted[0]];
-  return [quoted.join(" AND "), quoted.join(" OR ")];
+  if (quoted.length === 2) return [quoted.join(" AND "), quoted.join(" OR ")];
+  const pairs = [];
+  for (let i = 0; i < quoted.length; i++) {
+    for (let j = i + 1; j < quoted.length; j++) {
+      pairs.push(`(${quoted[i]} AND ${quoted[j]})`);
+    }
+  }
+  return [quoted.join(" AND "), pairs.join(" OR "), quoted.join(" OR ")];
 }
 
 async function queryAntigravitySummaryDb(dbPath, terms) {
@@ -256,7 +263,7 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
       let rows = [];
       try {
         rows = db.prepare(
-          "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 2000) AS user_body, substr(agent_body, 1, 4000) AS agent_body FROM conversations_fts WHERE conversations_fts MATCH ? LIMIT 45"
+          "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 2000) AS user_body, substr(agent_body, 1, 4000) AS agent_body FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 45"
         ).all(expr);
       } catch { rows = []; }
       for (const r of rows) {
@@ -409,7 +416,7 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
   }
 
   const key = `antigravity:${cid}`;
-  const cleanWorkspace = String(info.workspace ?? "").replace(/^file:\/\//, "").split(/[,\s]+/)[0] || null;
+  const cleanWorkspace = String(info.workspace ?? "").replace(/^[\s["']+|[\s\]"']+$/g, "").replace(/^file:\/\//, "").split(/[,\s"'\]]+/)[0] || null;
   const repo = inferRepoFromPath(cleanWorkspace);
   const combinedText = redactSecrets(info.chunks.join("\n\n")).slice(-24000);
   return [
@@ -487,10 +494,14 @@ for p in glob.glob(os.path.join(home, ".paseo", "agents", "*", "*.json")):
 
 hits = {}
 if safe_fts:
-    exprs = ['"' + safe_fts[0] + '"*'] if len(safe_fts) == 1 else [
-        " AND ".join('"' + t + '"*' for t in safe_fts),
-        " OR ".join('"' + t + '"*' for t in safe_fts),
-    ]
+    quoted = ['"' + t + '"*' for t in safe_fts[:6]]
+    if len(quoted) == 1:
+        exprs = [quoted[0]]
+    elif len(quoted) == 2:
+        exprs = [" AND ".join(quoted), " OR ".join(quoted)]
+    else:
+        pairs = ["(" + quoted[i] + " AND " + quoted[j] + ")" for i in range(len(quoted)) for j in range(i + 1, len(quoted))]
+        exprs = [" AND ".join(quoted), " OR ".join(pairs), " OR ".join(quoted)]
     for rel_db in (".gemini/antigravity/conversation_summaries.db", ".gemini/antigravity-cli/conversation_summaries.db"):
         src = os.path.join(home, rel_db)
         if not os.path.exists(src):
@@ -506,7 +517,7 @@ if safe_fts:
                 for expr in exprs:
                     try:
                         rows = cur.execute(
-                            "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 1500), substr(agent_body, 1, 3000) FROM conversations_fts WHERE conversations_fts MATCH ? LIMIT 35",
+                            "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 1500), substr(agent_body, 1, 3000) FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 35",
                             (expr,),
                         ).fetchall()
                     except Exception:
@@ -523,11 +534,16 @@ if safe_fts:
         except Exception:
             pass
 
+brain_scanned = 0
 for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
+    if len(hits) >= 12 or brain_scanned >= 120:
+        break
     root = os.path.join(home, rel_brain)
     if not os.path.isdir(root):
         continue
     for d in os.listdir(root):
+        if brain_scanned >= 120:
+            break
         cdir = os.path.join(root, d)
         if not os.path.isdir(cdir):
             continue
@@ -535,9 +551,10 @@ for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
             tdir = os.path.join(cdir, sub) if sub else cdir
             if not os.path.isdir(tdir):
                 continue
-            for fn in os.listdir(tdir)[:12]:
+            for fn in os.listdir(tdir)[:8]:
                 if not fn.endswith(".md"):
                     continue
+                brain_scanned += 1
                 fp = os.path.join(tdir, fn)
                 try:
                     if os.path.getsize(fp) > 512 * 1024:
@@ -559,13 +576,24 @@ for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
                     pass
 
 out = []
+seen_paseo_ids = set()
 for cid, rec in list(hits.items())[:25]:
-    out.append({"cid": cid, "rec": rec, "paseo": by_native.get(cid)})
+    linked_pa = by_native.get(cid)
+    if linked_pa and linked_pa.get("id"):
+        seen_paseo_ids.add(linked_pa["id"])
+    out.append({"cid": cid, "rec": rec, "paseo": linked_pa})
+matched_paseo = []
 for pa in paseo_agents:
+    if pa["id"] in seen_paseo_ids:
+        continue
     hay = (pa["title"] + " " + (pa["cwd"] or "") + " " + pa["provider"]).lower()
-    if content_terms and any(t in hay for t in content_terms):
-        out.append({"cid": None, "rec": None, "paseo": pa})
-print(json.dumps(out[:35]))
+    cnt = sum(1 for t in content_terms if t in hay) if content_terms else 0
+    if cnt > 0:
+        matched_paseo.append((cnt, pa))
+matched_paseo.sort(key=lambda x: -x[0])
+for _, pa in matched_paseo[:20]:
+    out.append({"cid": None, "rec": None, "paseo": pa})
+print(json.dumps(out[:40]))
 `.trim();
 
 async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFileAsync) {
@@ -591,14 +619,21 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
   const scriptB64 = Buffer.from(SSH_ARCHIVE_SEARCH_PY, "utf8").toString("base64");
   const payloadB64 = Buffer.from(JSON.stringify({ terms }), "utf8").toString("base64");
   const remoteCmd = `python3 -c 'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' ${scriptB64} ${payloadB64}`;
+  const ctlDir = path.join(homeDir, ".ssh", "openagi-cm");
+  try {
+    fs.mkdirSync(ctlDir, { recursive: true, mode: 0o700 });
+  } catch { /* optional multiplexing dir */ }
+  const sshControlArgs = fs.existsSync(ctlDir)
+    ? ["-o", "ControlMaster=auto", "-o", `ControlPath=${path.join(ctlDir, "%C")}`, "-o", "ControlPersist=30m"]
+    : [];
 
   const out = new Map();
   await Promise.all(sshTargets.slice(0, 3).map(async ({ host, serverId: fallbackServerId }) => {
     try {
       const { stdout } = await execFileImpl(
         "ssh",
-        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", host, remoteCmd],
-        { timeout: 4000, maxBuffer: 2 * 1024 * 1024 }
+        ["-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", ...sshControlArgs, host, remoteCmd],
+        { timeout: 25000, maxBuffer: 2 * 1024 * 1024 }
       );
       const items = JSON.parse(String(stdout ?? "[]"));
       if (!Array.isArray(items)) return;

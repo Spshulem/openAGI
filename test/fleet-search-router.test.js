@@ -385,8 +385,8 @@ test("SSH archive command is shell-safe, artifacts retain late matches past 6KB,
       homeDir: dir,
       includeRemotePaseoHosts: true,
       execFileImpl: async (_bin, args) => {
-        // Simulate OpenSSH concatenating remote args after host with spaces and passing to /bin/sh -c
-        capturedRemoteCmd = args.slice(5).join(" ");
+        // Simulate OpenSSH concatenating remote command after host and passing to /bin/sh -c
+        capturedRemoteCmd = args.at(-1);
         return await realExecFile("/bin/sh", ["-c", capturedRemoteCmd], {
           env: { ...process.env, HOME: dir },
           timeout: 4000
