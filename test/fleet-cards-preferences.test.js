@@ -1510,6 +1510,125 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
       { rowsByKey: new Map([[nonDraftFeatureRow.key, nonDraftFeatureRow]]) }
     );
     assert.equal(convertToDraftCard.primaryAction.op, "answer", "explicit draft-status request stays an answer action");
+
+    // Ready-for-review descriptive prose on non-draft PR keeps Merge PR action
+    const descriptiveReadyCard = buildSupervisorCard(
+      {
+        id: "q_desc_ready_review",
+        status: "open",
+        kind: "agent-ask",
+        threadKey: nonDraftFeatureRow.key,
+        prRef: "acme/webapp#9910",
+        mergeAsk: true,
+        title: "Approve and merge PR #9910?",
+        body: "The implementation is ready for review. All CI checks passed.",
+        options: ["merge", "later"]
+      },
+      { rowsByKey: new Map([[nonDraftFeatureRow.key, nonDraftFeatureRow]]) }
+    );
+    assert.equal(descriptiveReadyCard.kind, "merge_ready");
+    assert.equal(descriptiveReadyCard.primaryAction.op, "merge", "descriptive 'ready for review' prose must not suppress Merge PR");
+
+    // <system_instruction> titles are sanitized across ownerLabel, card sessionTitle, openChat, resources, and activeSummary,
+    // and "<repo> #<num> ready. Merge?" headlines upgrade to "#<num> · <prTitle>"
+    const sysPromptPaseo = paseoThread(
+      {
+        id: "ag-sys-1",
+        workspaceId: "san-jose",
+        title: "<system_instruction> You are working inside Conductor, a Mac app that runs parallel coding agents",
+        cwd: "/Users/shooby/.conductor/san-jose",
+        status: "idle",
+        updatedAt: "2026-11-15T11:00:00.000Z"
+      },
+      "srv_bb3"
+    );
+    assert.equal(ownerLabel(sysPromptPaseo, null, null), "san-jose", "ownerLabel strips <system_instruction> prompt text");
+
+    const readyDotMergeCard = buildSupervisorCard(
+      {
+        id: "q_ready_dot_merge",
+        status: "open",
+        kind: "ready",
+        threadKey: sysPromptPaseo.key,
+        prRef: "acme/ai-seo#12",
+        title: "AI-SEO #12 ready. Merge?",
+        body: "acme/ai-seo#12 at a1b2c3d: CI pass.",
+        options: ["merged", "later"]
+      },
+      {
+        rowsByKey: new Map([[sysPromptPaseo.key, {
+          key: sysPromptPaseo.key,
+          kind: "paseo",
+          title: sysPromptPaseo.title,
+          workspace: "san-jose",
+          pr: {
+            ref: "acme/ai-seo#12",
+            state: "OPEN",
+            isDraft: false,
+            title: "Add discovery-gap dashboard",
+            bodySummary: "Adds /growth/discovery gap analysis.",
+            ci: { state: "SUCCESS", failing: [], pending: [] },
+            mergeState: "CLEAN"
+          },
+          openChat: { app: "paseo", label: `${sysPromptPaseo.title} (Paseo)`, serverId: "srv_bb3", agentId: "ag-sys-1" }
+        }]])
+      }
+    );
+    assert.equal(readyDotMergeCard.headline, "#12 · Add discovery-gap dashboard");
+    assert.equal(readyDotMergeCard.sessionTitle, "san-jose");
+    assert.ok(!String(readyDotMergeCard.openChat?.label ?? "").includes("system_instruction"));
+    assert.equal(readyDotMergeCard.resources[0]?.label, "san-jose");
+
+    // Multi-part decision ask with fragmentary question.body preserves full agentSummary choices and strips dead file:// attachments
+    const multiPartThread = {
+      key: "paseo:srv_bb3.yt-seo",
+      kind: "paseo",
+      title: "YouTube SEO",
+      lastAgentFull: [
+        "Before I start executing, confirm two choices:",
+        "1. LinkedIn: (a) ship the 3 founder posts as drafted, or (b) hold until Tuesday?",
+        "2. SEO batch: OK to build these 6?",
+        "- Competitor comparison matrix",
+        "- Pricing teardown guide"
+      ].join("\n"),
+      meta: {
+        conversation: [
+          { role: "user", text: "![Image](file:///tmp/paseo-attachments-qGRFiR/shot1.png)", at: "2026-11-15T09:00:00Z" },
+          { role: "user", text: "Plan the LinkedIn & SEO rollout.", at: "2026-11-15T09:01:00Z" },
+          { role: "assistant", text: "1. LinkedIn: (a) ship, (b) hold?\n2. SEO batch: OK to build these 6?", at: "2026-11-15T09:02:00Z" }
+        ]
+      }
+    };
+    const multiPartCard = buildSupervisorCard(
+      {
+        id: "q_multi_part",
+        status: "open",
+        kind: "agent-ask",
+        threadKey: multiPartThread.key,
+        title: "YouTube SEO: LinkedIn plan & SEO batch OK?",
+        body: "2. SEO batch: OK to build these 6?",
+        options: ["open thread", "later"]
+      },
+      { threadsByKey: new Map([[multiPartThread.key, multiPartThread]]) }
+    );
+    assert.match(multiPartCard.summary, /1\. LinkedIn:/, "summary preserves item 1 when question.body only captured trailing item 2");
+    assert.match(multiPartCard.summary, /Competitor comparison matrix/, "summary preserves bullet details from agentSummary");
+    assert.equal(multiPartCard.recentMessages.length, 2, "dead file:// image-only message is stripped from recentMessages");
+    assert.ok(multiPartCard.recentMessages.every((m) => !m.text.includes("file:///tmp/")));
+
+    // Prose action-item asks with "tell me which to approve" (no question mark) classify as needs-human
+    const { classifyThread: classifyForProse } = await import("../src/fleet/classify.js");
+    const proseClassified = classifyForProse({
+      key: "paseo:srv_bb3.prose-ask",
+      kind: "paseo",
+      id: "prose-ask",
+      agentStatus: "idle",
+      lastUserAt: "2026-11-15T08:00:00Z",
+      lastAgentAt: "2026-11-15T08:05:00Z",
+      lastAgentText: "To put it live:\n1. Review the seven articles on the preview and tell me which to approve.\n2. Upgrade your personal Vercel team to Pro.",
+      lastAgentFull: "To put it live:\n1. Review the seven articles on the preview and tell me which to approve.\n2. Upgrade your personal Vercel team to Pro."
+    });
+    assert.equal(proseClassified.state, "needs-human");
   } finally {
     cleanup();
   }

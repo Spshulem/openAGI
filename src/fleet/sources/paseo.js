@@ -196,22 +196,34 @@ export function createPaseoSource({ factory } = {}) {
     if (!config.paseo?.enabled) return [];
     return withPaseo(config, async (client, signal, meta = {}) => {
       const directory = await client.hosts.list();
-      const ids = [...new Set([directory.self.serverId, ...(config.paseo.serverIds ?? [])])];
+      const explicitIds = Array.isArray(config.paseo.serverIds) ? config.paseo.serverIds.filter(Boolean) : [];
+      const autoIds = explicitIds.length || config.paseo.autoHosts === false
+        ? []
+        : (directory.hosts ?? [])
+            .filter((h) => h?.serverId && h.enabled && h.status === "online")
+            .map((h) => h.serverId);
+      const explicitSet = new Set([directory.self.serverId, ...explicitIds]);
+      const ids = [...new Set([directory.self.serverId, ...explicitIds, ...autoIds])];
       const inventory = [];
       for (const id of ids) {
         signal.throwIfAborted();
-        const api = await hostApi(client, id, directory);
-        let cursor;
-        const seen = new Set();
-        for (let page = 0; page < 20; page++) {
-          signal.throwIfAborted();
-          const result = await api.agents.list({ filter: { includeArchived: false, includeBackground: true },
-            sort: [{ key: "updated_at", direction: "desc" }], page: { limit: 100, ...(cursor ? { cursor } : {}) } });
-          for (const { agent } of result.entries) inventory.push({ agent, id, api, key: `${config.paseo.url ?? "local"}:${id}:${agent.id}` });
-          if (!result.pageInfo.hasMore) break;
-          cursor = result.pageInfo.nextCursor;
-          if (!cursor || seen.has(cursor) || page === 19) throw new Error("Paseo inventory incomplete; narrow configured hosts");
-          seen.add(cursor);
+        const isRequiredHost = explicitSet.has(id);
+        try {
+          const api = await hostApi(client, id, directory);
+          let cursor;
+          const seen = new Set();
+          for (let page = 0; page < 20; page++) {
+            signal.throwIfAborted();
+            const result = await api.agents.list({ filter: { includeArchived: false, includeBackground: true },
+              sort: [{ key: "updated_at", direction: "desc" }], page: { limit: 100, ...(cursor ? { cursor } : {}) } });
+            for (const { agent } of result.entries) inventory.push({ agent, id, api, key: `${config.paseo.url ?? "local"}:${id}:${agent.id}` });
+            if (!result.pageInfo.hasMore) break;
+            cursor = result.pageInfo.nextCursor;
+            if (!cursor || seen.has(cursor) || page === 19) throw new Error("Paseo inventory incomplete; narrow configured hosts");
+            seen.add(cursor);
+          }
+        } catch (err) {
+          if (isRequiredHost || signal.aborted) throw err;
         }
       }
       const live = new Set(inventory.map(r => r.key));

@@ -258,24 +258,75 @@ function buildRows(state, cachedThreads = new Map()) {
       });
     }
   }
+  for (const card of state?.cards ?? []) {
+    const key = card?.threadKey ?? card?.threadKeys?.[0] ?? null;
+    if (!key || byKey.has(key) || card.kind === "preference") continue;
+    byKey.set(key, {
+      key,
+      kind: key.split(":")[0] || "unknown",
+      title: card.sessionTitle || card.headline || key,
+      workspace: card.workspace ?? null,
+      repo: card.repo ?? null,
+      branch: card.branch ?? null,
+      pr: card.prContext ? {
+        ref: card.prContext.ref ?? card.prRef ?? null,
+        title: card.prContext.title ?? null,
+        bodySummary: card.prContext.bodySummary ?? null
+      } : (card.prRef ? { ref: card.prRef, title: null } : null),
+      prRefs: card.prRef ? [card.prRef] : [],
+      state: card.kind === "merge_ready" ? "ready-needs-human" : "needs-human",
+      live: false,
+      lastActivityAt: card.noticedAt ?? null,
+      lastAgentText: card.agentSummary || card.summary || "",
+      openChat: card.openChat ?? null
+    });
+  }
+  for (const q of state?.questions ?? []) {
+    const key = q?.threadKey ?? q?.threadKeys?.[0] ?? null;
+    if (!key || byKey.has(key) || q?.status !== "open") continue;
+    const snap = q.contextSnapshot ?? null;
+    byKey.set(key, {
+      key,
+      kind: key.split(":")[0] || "unknown",
+      title: snap?.threadTitle || q.title || key,
+      workspace: snap?.workspace ?? null,
+      repo: snap?.repo ?? null,
+      branch: snap?.branch ?? null,
+      pr: snap?.pr ?? (q.prRef ? { ref: q.prRef } : null),
+      prRefs: q.prRef ? [q.prRef] : [],
+      state: q.kind === "ready" ? "ready-needs-human" : "needs-human",
+      live: false,
+      lastActivityAt: q.askedAt ?? q.createdAt ?? null,
+      lastAgentText: q.askContext || snap?.agentSummary || q.body || "",
+      openChat: q.openChat ?? null
+    });
+  }
   return [...byKey.values()];
 }
 
 function buildRowDocument(row, state, cachedThreads = new Map()) {
   const cached = cachedThreads?.get?.(row.key) ?? null;
+  const matchingCards = (state?.cards ?? []).filter(
+    (c) => c && c.kind !== "preference" && (c.threadKey === row.key || c.threadKeys?.includes?.(row.key))
+  );
   const title = bounded(row.title || row.workspace || row.key, 300);
-  const allPrRefs = [...new Set([row.pr?.ref, ...(row.prRefs ?? []), ...(cached?.prRefs ?? [])].filter(Boolean))];
+  const cardPrRefs = matchingCards.map((c) => c.prRef ?? c.prContext?.ref).filter(Boolean);
+  const allPrRefs = [...new Set([row.pr?.ref, ...(row.prRefs ?? []), ...(cached?.prRefs ?? []), ...cardPrRefs].filter(Boolean))];
   const prRef = allPrRefs[0] ?? "";
-  const prTitle = bounded(row.pr?.title ?? "", 200);
+  const prTitle = bounded(row.pr?.title || matchingCards.find((c) => c.prContext?.title)?.prContext?.title || "", 200);
+  const prBody = bounded(row.pr?.bodySummary || matchingCards.find((c) => c.prContext?.bodySummary)?.prContext?.bodySummary || "", 4000);
   const provider = cached?.meta?.provider ?? row.provider ?? row.kind ?? "";
   const aliases = Array.isArray(cached?.meta?.aliases) ? cached.meta.aliases.join(" ") : "";
   const context = [
+    prTitle,
+    prBody,
     cached?.lastUserText,
     cached?.lastAgentFull || row.lastAgentText,
     ...(cached?.meta?.conversation ?? []).slice(-60).map((m) => m?.text),
     ...(state?.questions ?? [])
       .filter((q) => q?.threadKey === row.key || q?.threadKeys?.includes(row.key))
-      .map((q) => `${q.title ?? ""}\n${q.body ?? ""}`)
+      .map((q) => `${q.title ?? ""}\n${q.body ?? ""}`),
+    ...matchingCards.map((c) => `${c.headline ?? ""}\n${c.summary ?? ""}\n${c.agentSummary ?? ""}`)
   ]
     .filter(Boolean)
     .map((text) => bounded(text))
@@ -303,6 +354,7 @@ function buildRowDocument(row, state, cachedThreads = new Map()) {
     cached,
     title,
     prRef: prRef || null,
+    prTitle: prTitle || null,
     context,
     metadata,
     normTitle,
@@ -521,19 +573,36 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
 }
 
 function extractArtifactExcerpt(text, lower, contentTerms, maxLen = 6000) {
+  if (!text || text.length <= maxLen) return String(text ?? "");
   const rawLower = text.toLowerCase();
-  const windows = [];
-  for (const term of contentTerms) {
+  const hits = [];
+  for (const term of contentTerms.slice(0, 6)) {
+    if (!term) continue;
     const rawIdx = rawLower.indexOf(term);
     const idx = rawIdx !== -1 ? rawIdx : lower.indexOf(term);
     if (idx === -1) continue;
-    const start = Math.max(0, idx - 1200);
-    const end = Math.min(text.length, idx + term.length + 1800);
-    windows.push(text.slice(start, end));
-    if (windows.length >= 4) break;
+    hits.push({ idx, end: Math.min(text.length, idx + term.length) });
   }
-  if (windows.length === 0) return text.slice(0, maxLen);
-  return windows.join("\n…\n").slice(0, maxLen);
+  if (hits.length === 0) return text.slice(0, maxLen);
+  hits.sort((a, b) => a.idx - b.idx);
+  const sep = "\n…\n";
+  const sepBudget = Math.max(0, hits.length - 1) * sep.length;
+  const perHitBudget = Math.max(120, Math.floor((maxLen - sepBudget) / hits.length));
+  const prePad = Math.floor(perHitBudget * 0.4);
+  const intervals = [];
+  for (const hit of hits) {
+    const termLen = Math.max(1, hit.end - hit.idx);
+    const postPad = Math.max(40, perHitBudget - prePad - termLen);
+    const start = Math.max(0, hit.idx - prePad);
+    const end = Math.min(text.length, hit.end + postPad);
+    const prev = intervals.at(-1);
+    if (prev && start <= prev.end + 24) {
+      prev.end = Math.max(prev.end, end);
+    } else {
+      intervals.push({ start, end });
+    }
+  }
+  return intervals.map(({ start, end }) => text.slice(start, end)).join(sep).slice(0, maxLen);
 }
 
 function scanAntigravityBrainDocs(homeDir, terms, existingMap = new Map()) {
@@ -728,16 +797,33 @@ def read_head_tail(fp, head_b=131072, tail_b=393216):
 def excerpt(txt, max_len=4500):
     if not txt:
         return ""
+    if len(txt) <= max_len:
+        return txt
     low = txt.lower()
-    q_terms = content_terms or terms
-    wins = []
+    q_terms = (content_terms or terms)[:6]
+    hits = []
     for t in q_terms:
+        if not t:
+            continue
         pos = low.find(t)
         if pos != -1:
-            wins.append(txt[max(0, pos - 900):min(len(txt), pos + len(t) + 1300)])
-        if len(wins) >= 4:
-            break
-    return ("\\n...\\n".join(wins))[:max_len] if wins else txt[:max_len]
+            hits.append((pos, min(len(txt), pos + len(t))))
+    if not hits:
+        return txt[:max_len]
+    hits.sort(key=lambda x: x[0])
+    sep = "\\n...\\n"
+    per_hit = max(120, (max_len - max(0, len(hits) - 1) * len(sep)) // len(hits))
+    pre_pad = int(per_hit * 0.4)
+    intervals = []
+    for s_idx, e_idx in hits:
+        post_pad = max(40, per_hit - pre_pad - max(1, e_idx - s_idx))
+        st = max(0, s_idx - pre_pad)
+        en = min(len(txt), e_idx + post_pad)
+        if intervals and st <= intervals[-1][1] + 24:
+            intervals[-1][1] = max(intervals[-1][1], en)
+        else:
+            intervals.append([st, en])
+    return sep.join(txt[st:en] for st, en in intervals)[:max_len]
 
 def extract_prs(txt):
     seen = []
@@ -1201,6 +1287,7 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
       repo: doc.row.repo ?? null,
       branch: doc.row.branch ?? null,
       prRef: doc.prRef,
+      prTitle: doc.prTitle ?? null,
       live: Boolean(doc.row.live || doc.row.agentStatus === "running"),
       state: doc.row.state ?? "unknown",
       lastActivityAt: doc.row.lastActivityAt ?? null,
@@ -1230,8 +1317,9 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
 }
 
 export function rankCombinedSearchResults(rows = [], query = "") {
-  const weights = { title: 4.5, workspace: 2.5, repo: 2.5, branch: 2.5, pr: 3, text: 1.5 };
-  const { qLower, effectiveTerms } = extractQueryTerms(query, { natural: true });
+  const weights = { title: 4.5, prTitle: 3.5, workspace: 2.5, repo: 2.5, branch: 2.5, pr: 3, text: 1.5 };
+  const qLower = normalize(String(query ?? "").trim());
+  const { effectiveTerms } = extractQueryTerms(query, { natural: true });
   const contentTerms = effectiveTerms.filter((t) => !PROVIDER_TERMS.has(t));
   const terms = contentTerms.length > 0 ? contentTerms : effectiveTerms;
   const byKey = new Map();
@@ -1239,6 +1327,7 @@ export function rankCombinedSearchResults(rows = [], query = "") {
     if (!row?.key) continue;
     const fields = {
       title: normalize(row.title),
+      prTitle: normalize(row.prTitle),
       workspace: normalize(row.workspace),
       repo: normalize(row.repo),
       branch: normalize(row.branch),
@@ -1255,7 +1344,7 @@ export function rankCombinedSearchResults(rows = [], query = "") {
         score += hit;
       }
       if (qLower && qLower.length >= 3) {
-        if (fields.title.includes(qLower) || fields.pr.includes(qLower) || fields.branch.includes(qLower)) score += 6;
+        if (fields.title.includes(qLower) || fields.prTitle.includes(qLower) || fields.pr.includes(qLower) || fields.branch.includes(qLower)) score += 6;
         else if (fields.text.includes(qLower)) score += 4;
       }
       if (row.live) score += 0.4;

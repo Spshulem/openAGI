@@ -798,6 +798,97 @@ test("RemoteFleetSupervisor legacy reply fallback preserves reopenIfUndelivered 
     // When ALL nodes (primary + peers) are offline, searchThreads still throws the primary outage error
     peerOnline = false;
     await assert.rejects(() => remoteMulti.searchThreads({ query: "quasar_billing_webhook" }), /unavailable/i);
+
+    // 3. Multi-term excerpt budget & interval merging: 3 terms across a 20KB document (two adjacent + one far at the tail)
+    // survive both local JS and remote SSH Python excerpts and pass strict AND searchFleet matching
+    const multiDir = path.join(dir, "multi-term-home");
+    const multiBrain = path.join(multiDir, ".gemini", "antigravity-cli", "brain", "cid_three_terms");
+    fs.mkdirSync(multiBrain, { recursive: true });
+    const fillerA = "x".repeat(1500);
+    const fillerB = "y".repeat(90);
+    const fillerC = "z".repeat(16500);
+    fs.writeFileSync(
+      path.join(multiBrain, "notes.md"),
+      `${fillerA} alpha_token_one ${fillerB} beta_token_two ${fillerC} gamma_token_three trailing\n`,
+      "utf8"
+    );
+    const multiPaseo = path.join(multiDir, ".paseo");
+    fs.mkdirSync(multiPaseo, { recursive: true });
+    fs.writeFileSync(
+      path.join(multiPaseo, "hosts.json"),
+      JSON.stringify([{ serverId: "srv_multi_py", label: "Remote", connection: "ssh://remote-box", enabled: true }]),
+      "utf8"
+    );
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const realExecFile = promisify(execFile);
+
+    const localThreeArch = await collectArchiveThreads({
+      query: "alpha_token_one beta_token_two gamma_token_three",
+      homeDir: multiDir,
+      includeRemotePaseoHosts: false
+    });
+    const strictLocal = searchFleet(
+      { snapshot: { threads: [] } },
+      { query: "alpha_token_one beta_token_two gamma_token_three", natural: false },
+      mergeThreadsWithArchives(new Map(), localThreeArch)
+    );
+    assert.equal(strictLocal.results.length, 1, "JS extractArtifactExcerpt must merge overlapping windows and retain 3rd late term");
+
+    const emptyLocalHome = path.join(dir, "empty-home");
+    fs.mkdirSync(path.join(emptyLocalHome, ".paseo"), { recursive: true });
+    fs.writeFileSync(
+      path.join(emptyLocalHome, ".paseo", "hosts.json"),
+      JSON.stringify([{ serverId: "srv_multi_py", label: "Remote", connection: "ssh://remote-box", enabled: true }]),
+      "utf8"
+    );
+    const remoteThreeArch = await collectArchiveThreads({
+      query: "alpha_token_one beta_token_two gamma_token_three",
+      homeDir: emptyLocalHome,
+      includeRemotePaseoHosts: true,
+      execFileImpl: async (_bin, args) => realExecFile("/bin/sh", ["-c", args.at(-1)], { env: { ...process.env, HOME: multiDir }, timeout: 5000 })
+    });
+    const strictRemote = searchFleet(
+      { snapshot: { threads: [] } },
+      { query: "alpha_token_one beta_token_two gamma_token_three", natural: false },
+      mergeThreadsWithArchives(new Map(), remoteThreeArch)
+    );
+    assert.equal(strictRemote.results.length, 1, "Python SSH excerpt() must also merge overlapping windows and retain 3rd late term");
+
+    // 4. Open PR cards aged out of snapshot.threads are searchable by PR title and PR bodySummary and survive rankCombinedSearchResults
+    const cardState = {
+      snapshot: { threads: [] },
+      questions: [],
+      cards: [
+        {
+          id: "fq_cal_backfill",
+          kind: "merge_ready",
+          threadKey: "paseo:srv_bb3.cal1",
+          sessionTitle: "Staging One-Minute Search",
+          headline: "#9637 · fix(calendar-worker): renew visibility during attendee CRM backfills",
+          summary: "+65 / -6 · 2 files — Renews SQS visibility timeout during large attendee CRM backfills.",
+          repo: "buildbetter-app/buildbetter",
+          prRef: "buildbetter-app/buildbetter#9637",
+          prContext: {
+            ref: "buildbetter-app/buildbetter#9637",
+            title: "fix(calendar-worker): renew visibility during attendee CRM backfills",
+            bodySummary: "Prevents duplicate worker execution during long calendar backfill batches."
+          }
+        }
+      ]
+    };
+    const calHits = searchFleet(cardState, { query: "calendar backfill", natural: true });
+    assert.equal(calHits.results[0]?.key, "paseo:srv_bb3.cal1");
+    assert.equal(calHits.results[0]?.prRef, "buildbetter-app/buildbetter#9637");
+    const { rankCombinedSearchResults } = await import("../src/fleet/search.js");
+    const reranked = rankCombinedSearchResults(
+      [
+        { key: "paseo:other", title: "Unrelated session", snippet: "nothing", state: "idle" },
+        calHits.results[0]
+      ],
+      "calendar worker"
+    );
+    assert.equal(reranked[0]?.key, "paseo:srv_bb3.cal1", "rankCombinedSearchResults scores prTitle & phrase matches properly");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

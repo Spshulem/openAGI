@@ -1417,7 +1417,7 @@ export function ownerLabel(thread, prNumber, repo) {
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
   const rawWorkspace = /^wks_[0-9a-f]+$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
   const rawPaseoTitle = thread.kind === "paseo" ? stripTags(thread.title) : "";
-  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
+  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+|you are working inside conductor\b.*)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
   const place = fact(rawWorkspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
     || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
     || cleanPaseoTitle
@@ -1448,7 +1448,9 @@ function ownerExcerpt(text, max) {
 }
 
 function stripTags(text) {
-  return String(text ?? "").replace(/<[^>]{0,200}>/g, " ");
+  return String(text ?? "")
+    .replace(/<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:<\/(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)/gi, " ")
+    .replace(/<[^>]{0,200}>/g, " ");
 }
 
 function question(ctx, title, body, options, dedupeKey, kind) {

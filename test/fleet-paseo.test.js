@@ -42,9 +42,17 @@ test("pagination includes background chats; bounded history makes fair progress 
 });
 test("registered hosts preserve distinct same-ID chats; unavailable hosts fail closed", async () => {
   const m = mock([agent("same")], { remote: [agent("same")] });
+  const autoRows = await createPaseoSource(m)({ paseo: { enabled: true } });
+  assert.equal(new Set(autoRows.map(t => t.key)).size, 2, "online enabled registered hosts are auto-discovered by default");
   const rows = await createPaseoSource(m)({ paseo: { enabled: true, serverIds: ["remote"] } });
   assert.equal(new Set(rows.map(t => t.key)).size, 2);
   await assert.rejects(hostApi(m.client, "unregistered"), /unavailable/);
+
+  // Auto-discovered host disconnecting mid-scan does not fail self discovery
+  const flaky = mock([agent("local-chat")], { remote: [agent("remote-chat")] });
+  flaky.client.hosts.client = async () => ({ agents: { list: async () => { throw new Error("remote host went to sleep"); } } });
+  const survived = await createPaseoSource(flaky)({ paseo: { enabled: true } });
+  assert.deepEqual(survived.map(t => t.key), ["paseo:local.local-chat"]);
 });
 test("failed histories remain excluded, permissions remain owner-blocked, closed stays closed", async () => {
   const m = mock([agent("a")], { failHistory: true });
