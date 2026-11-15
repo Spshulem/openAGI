@@ -347,9 +347,102 @@ test("RemoteFleetSupervisor falls back on legacy 0.0.72 nodes for actCard (Later
     assert.equal(deferRes?.ok, true);
     assert.deepEqual(dismissed, ["q_legacy_1"]);
 
-    const searchRes = await remote.searchThreads({ query: "buildbetter growth workspace", limit: 10 });
-    assert.ok(searchRes.results.some((r) => r.key === "paseo:mac.growth1"), "expected peer Mac node state search result");
-    assert.ok(searchRes.results.some((r) => r.key === "paseo:bb3.seo1"), "expected primary BB3 search result");
+    const searchRes = await remote.searchThreads({ query: "buildbetter growth workspace", limit: 1 });
+    assert.equal(searchRes.results.length, 1);
+    assert.equal(searchRes.results[0].key, "paseo:mac.growth1", "expected higher-scoring peer Mac hit to beat primary with limit: 1");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SSH archive command is shell-safe, artifacts retain late matches past 6KB, existingOnly omits archive-only targets, and thrown Unsupported fleet request falls back", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-archive-codex-"));
+  try {
+    const brainDir = path.join(dir, ".gemini", "antigravity-cli", "brain", "cid_late_match_01");
+    fs.mkdirSync(brainDir, { recursive: true });
+    const padding = "filler line without target terms.\n".repeat(260); // > 8KB
+    fs.writeFileSync(
+      path.join(brainDir, "walkthrough.md"),
+      `${padding}\nImplemented xylophone_telemetry_pipeline in revops.\n`,
+      "utf8"
+    );
+
+    const paseoDir = path.join(dir, ".paseo");
+    fs.mkdirSync(paseoDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(paseoDir, "hosts.json"),
+      JSON.stringify([{ serverId: "srv_remote_test", label: "Remote Mac", connection: "ssh://spencer-mac", enabled: true }]),
+      "utf8"
+    );
+
+    let capturedRemoteCmd = null;
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const realExecFile = promisify(execFile);
+
+    const archives = await collectArchiveThreads({
+      query: "xylophone_telemetry_pipeline",
+      homeDir: dir,
+      includeRemotePaseoHosts: true,
+      execFileImpl: async (_bin, args) => {
+        // Simulate OpenSSH concatenating remote args after host with spaces and passing to /bin/sh -c
+        capturedRemoteCmd = args.slice(5).join(" ");
+        return await realExecFile("/bin/sh", ["-c", capturedRemoteCmd], {
+          env: { ...process.env, HOME: dir },
+          timeout: 4000
+        });
+      }
+    });
+
+    assert.ok(capturedRemoteCmd && capturedRemoteCmd.startsWith("python3 -c "), "expected single shell-safe python3 bootstrap command");
+    assert.ok(archives.has("antigravity:cid_late_match_01"));
+
+    const liveMap = new Map([
+      ["paseo:srv_local.live1", { key: "paseo:srv_local.live1", title: "Live chat", state: "running", live: true, lastAgentText: "working" }]
+    ]);
+    const dispatchMerged = mergeThreadsWithArchives(liveMap, archives, { existingOnly: true });
+    assert.equal(dispatchMerged.has("antigravity:cid_late_match_01"), false, "existingOnly must exclude archive-only non-dispatchable threads");
+
+    const fullMerged = mergeThreadsWithArchives(liveMap, archives);
+    const found = searchFleet({ snapshot: { threads: [] } }, { query: "xylophone_telemetry_pipeline", natural: true }, fullMerged);
+    assert.equal(found.results[0]?.key, "antigravity:cid_late_match_01");
+
+    // Verify RemoteFleetSupervisor handles thrown 'Unsupported fleet request' (where reached=false, status=null)
+    const answered = [];
+    const runtime = {
+      nodeCapabilities: {
+        list: () => [{ nodeId: "legacy-0072" }],
+        async dispatch(_nodeId, _cap, _op, payload) {
+          if (payload.path.startsWith("/fleet/api/cards/") || payload.path === "/fleet/api/search") {
+            throw new Error("Unsupported fleet request");
+          }
+          if (payload.path === "/fleet/api/questions/q_thrown_1") {
+            answered.push(payload.body);
+            return {
+              response: { status: 200, body: { question: { id: "q_thrown_1", status: "answered" }, delivery: { status: "sent" } } },
+              state: { mode: "observe", questions: [], actions: [], snapshot: { threads: [{ key: "paseo:mac.a1", title: "Expiring links", state: "idle", lastAgentText: "Allow expiring public links?" }] } }
+            };
+          }
+          return {
+            response: { status: 200, body: {} },
+            state: {
+              mode: "observe",
+              questions: [{ id: "q_thrown_1", kind: "agent-ask", title: "Allow expiring links?", threadKey: "paseo:mac.a1", options: ["allow", "deny"] }],
+              actions: [],
+              snapshot: { threads: [{ key: "paseo:mac.a1", title: "Expiring links", state: "idle", lastAgentText: "Allow expiring public links?" }] }
+            }
+          };
+        }
+      }
+    };
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "legacy-0072", dataDir: dir });
+    const actRes = await remote.actCard("q_thrown_1", { op: "answer", value: "allow" });
+    assert.equal(actRes?.ok, true);
+    assert.deepEqual(answered, [{ answer: "allow" }]);
+    assert.equal(remote.getState().lastError ?? null, null);
+
+    const fallbackSearch = await remote.searchThreads({ query: "expiring public links" });
+    assert.equal(fallbackSearch.results[0]?.key, "paseo:mac.a1");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

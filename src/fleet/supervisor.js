@@ -1913,7 +1913,7 @@ export class FleetSupervisor {
     const routed = await routeCustomerIssue({
       text,
       state: this.getState(),
-      cachedThreads: mergeThreadsWithArchives(this.lastThreads, archives),
+      cachedThreads: mergeThreadsWithArchives(this.lastThreads, archives, { existingOnly: true }),
       runModel: this.deps.routeModel ?? null
     });
     if (autoSend === true && routed.action === "auto_dispatch" && routed.primary?.key) {

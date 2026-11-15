@@ -309,6 +309,20 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
   return byConv;
 }
 
+function extractArtifactExcerpt(text, lower, contentTerms, maxLen = 6000) {
+  const windows = [];
+  for (const term of contentTerms) {
+    const idx = lower.indexOf(term);
+    if (idx === -1) continue;
+    const start = Math.max(0, idx - 1200);
+    const end = Math.min(text.length, idx + term.length + 1800);
+    windows.push(text.slice(start, end));
+    if (windows.length >= 3) break;
+  }
+  if (windows.length === 0) return text.slice(0, maxLen);
+  return windows.join("\n…\n").slice(0, maxLen);
+}
+
 function scanAntigravityBrainDocs(homeDir, terms, existingMap = new Map()) {
   const contentTerms = terms.filter((t) => !PROVIDER_TERMS.has(t));
   if (contentTerms.length === 0) return existingMap;
@@ -351,7 +365,7 @@ function scanAntigravityBrainDocs(homeDir, terms, existingMap = new Map()) {
             chunks: []
           };
           if (cur.chunks.length < 8) {
-            cur.chunks.push(text.slice(0, 6000));
+            cur.chunks.push(extractArtifactExcerpt(text, lower, contentTerms, 6000));
           }
           existingMap.set(cid, cur);
         } catch { /* ignore */ }
@@ -424,9 +438,9 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
 }
 
 const SSH_ARCHIVE_SEARCH_PY = `
-import glob, json, os, shutil, sqlite3, sys, tempfile
+import base64, glob, json, os, shutil, sqlite3, sys, tempfile
 
-payload = json.loads(sys.argv[1])
+payload = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 terms = [str(t).lower() for t in payload.get("terms", []) if str(t).strip()]
 content_terms = [t for t in terms if t not in ("antigravity", "claude", "codex", "conductor", "paseo")]
 safe_fts = ["".join(ch for ch in t if ch.isalnum() or ch == "_") for t in content_terms]
@@ -533,7 +547,14 @@ for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
                     if content_terms and any(t in low for t in content_terms):
                         rec = hits.setdefault(d, {"id": d, "title": "", "workspace": "", "updatedAt": None, "chunks": []})
                         if len(rec["chunks"]) < 6:
-                            rec["chunks"].append(txt[:5000])
+                            wins = []
+                            for t in content_terms:
+                                pos = low.find(t)
+                                if pos != -1:
+                                    wins.append(txt[max(0, pos - 1000):min(len(txt), pos + len(t) + 1500)])
+                                if len(wins) >= 3:
+                                    break
+                            rec["chunks"].append(("\\n...\\n".join(wins))[:5000] if wins else txt[:5000])
                 except Exception:
                     pass
 
@@ -567,12 +588,16 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
     sshTargets.push({ host: rawHost, serverId: h.serverId || "remote", label: h.label || rawHost });
   }
 
+  const scriptB64 = Buffer.from(SSH_ARCHIVE_SEARCH_PY, "utf8").toString("base64");
+  const payloadB64 = Buffer.from(JSON.stringify({ terms }), "utf8").toString("base64");
+  const remoteCmd = `python3 -c 'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode())' ${scriptB64} ${payloadB64}`;
+
   const out = new Map();
   await Promise.all(sshTargets.slice(0, 3).map(async ({ host, serverId: fallbackServerId }) => {
     try {
       const { stdout } = await execFileImpl(
         "ssh",
-        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", host, "python3", "-c", SSH_ARCHIVE_SEARCH_PY, JSON.stringify({ terms })],
+        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", host, remoteCmd],
         { timeout: 4000, maxBuffer: 2 * 1024 * 1024 }
       );
       const items = JSON.parse(String(stdout ?? "[]"));
@@ -712,13 +737,13 @@ export async function collectArchiveThreads({
   return archiveThreads;
 }
 
-export function mergeThreadsWithArchives(liveThreads = new Map(), archiveThreads = new Map()) {
+export function mergeThreadsWithArchives(liveThreads = new Map(), archiveThreads = new Map(), { existingOnly = false } = {}) {
   if (!archiveThreads || archiveThreads.size === 0) return liveThreads ?? new Map();
   const merged = new Map(liveThreads ?? []);
   for (const [key, arch] of archiveThreads) {
     const existing = merged.get(key);
     if (!existing) {
-      merged.set(key, arch);
+      if (!existingOnly) merged.set(key, arch);
       continue;
     }
     const archText = arch?.lastAgentFull || arch?.lastAgentText || "";
@@ -813,6 +838,54 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
     coverage: { threads: rows.length, withContext },
     scope: "Supervisor scan, cached recent messages, and local/Paseo Antigravity FTS5 & artifact archives."
   };
+}
+
+export function rankCombinedSearchResults(rows = [], query = "") {
+  const weights = { title: 4.5, workspace: 2.5, repo: 2.5, branch: 2.5, pr: 3, text: 1.5 };
+  const { qLower, effectiveTerms } = extractQueryTerms(query, { natural: true });
+  const contentTerms = effectiveTerms.filter((t) => !PROVIDER_TERMS.has(t));
+  const terms = contentTerms.length > 0 ? contentTerms : effectiveTerms;
+  const byKey = new Map();
+  for (const row of rows) {
+    if (!row?.key) continue;
+    const fields = {
+      title: normalize(row.title),
+      workspace: normalize(row.workspace),
+      repo: normalize(row.repo),
+      branch: normalize(row.branch),
+      pr: normalize(row.prRef),
+      text: normalize(row.snippet)
+    };
+    let score = typeof row.score === "number" && Number.isFinite(row.score) ? row.score : 0;
+    if (score === 0 && terms.length > 0) {
+      for (const term of terms) {
+        let hit = 0;
+        for (const [field, weight] of Object.entries(weights)) {
+          if ((fields[field] ?? "").includes(term)) hit += weight;
+        }
+        score += hit;
+      }
+      if (qLower && qLower.length >= 3) {
+        if (fields.title.includes(qLower) || fields.pr.includes(qLower) || fields.branch.includes(qLower)) score += 6;
+        else if (fields.text.includes(qLower)) score += 4;
+      }
+      if (row.live) score += 0.4;
+      if (!["done", "excluded", "archived"].includes(row.state)) score += 0.3;
+    }
+    const prev = byKey.get(row.key);
+    if (!prev || score > prev.score) {
+      const { score: _omit, ...cleanRow } = row;
+      byKey.set(row.key, { score, row: cleanRow });
+    }
+  }
+  return [...byKey.values()]
+    .sort(
+      (a, b) =>
+        b.score - a.score
+        || String(b.row.lastActivityAt ?? "").localeCompare(String(a.row.lastActivityAt ?? ""))
+        || a.row.key.localeCompare(b.row.key)
+    )
+    .map((entry) => entry.row);
 }
 
 export function buildBugDispatchMessage(issueText) {
