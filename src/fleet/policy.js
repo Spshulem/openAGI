@@ -1415,9 +1415,13 @@ function agentLabel(thread) {
 export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
-  const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
+  const rawWorkspace = /^wks_[0-9a-f]+$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
+  const rawPaseoTitle = thread.kind === "paseo" ? stripTags(thread.title) : "";
+  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
+  const place = fact(rawWorkspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
     || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
-    || (thread.kind === "paseo" ? fact(stripTags(thread.title), 36) : "");
+    || cleanPaseoTitle
+    || (thread.kind === "paseo" ? fact(String(thread.meta?.paseoCwd ?? "").replace(/\/+$/, "").split("/").pop(), 30) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
   return place || `${kindName(thread.kind)} chat`;
 }

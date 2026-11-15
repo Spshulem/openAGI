@@ -40,23 +40,34 @@ function humanOptionLabel(option) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function isMergeReadyQuestion(question, row, prRef) {
+const DRAFT_STATUS_ACTION = /\b(?:mark|convert|turn|move|change|switch|promote|keep|leave)\b[^.?!\n]{0,28}\bdraft\b|\bdraft\s+(?:ready|to\s+ready)\b|\bready\s+for\s+review\b/i;
+const DRAFT_STATUS_OPTION = /^(?:mark\s+(?:as\s+)?(?:ready|draft)|ready\s+for\s+review|convert\s+to\s+draft|keep\s+(?:as\s+)?draft)$/i;
+const UNKNOWN_DRAFT_PR_STATE = /\b(?:still|currently)\s+(?:in\s+|a\s+)?draft\b|\bdraft\s+(?:pr|pull\s+request)\b|\b(?:pr|pull\s+request)(?:\s+#?\d+)?\s+is\s+(?:still\s+)?(?:in\s+|a\s+)?draft\b/i;
+
+function isMergeReadyQuestion(question, row, prRef, prMeta = null) {
   if (!prRef || !parsePrRef(prRef)) return false;
-  const isDraftAsk = Boolean(row?.pr?.isDraft)
-    || (Array.isArray(row?.blockers) && row.blockers.includes("draft"))
-    || /\bdraft\b/i.test(`${question.title ?? ""} ${question.body ?? ""}`);
+  const rowMatchesPr = Boolean(row?.pr && (!row.pr.ref || row.pr.ref === prRef));
+  const knownIsDraft = typeof prMeta?.isDraft === "boolean"
+    ? prMeta.isDraft
+    : (rowMatchesPr && typeof row?.pr?.isDraft === "boolean" ? row.pr.isDraft : null);
+  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
+  const askText = `${question.title ?? ""} ${question.body ?? ""}`;
+  const isDraftAsk = knownIsDraft === true
+    || (rowMatchesPr && Array.isArray(row?.blockers) && row.blockers.includes("draft"))
+    || DRAFT_STATUS_ACTION.test(askText)
+    || DRAFT_STATUS_OPTION.test(firstOpt)
+    || (knownIsDraft === null && UNKNOWN_DRAFT_PR_STATE.test(askText));
   if (isDraftAsk) return false;
   if (question.kind === "ready" || question.mergeAsk) return true;
   if (question.kind !== "agent-ask") return false;
-  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
   if (!/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt)) return false;
-  return asksToMergePr(`${question.title ?? ""} ${question.body ?? ""}`);
+  return asksToMergePr(askText);
 }
 
 function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
   const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ciState === "FAILURE" || ciState === "ERROR") {
       return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
     }
@@ -126,7 +137,7 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
     };
   }
 
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ciState === "FAILURE" || ciState === "ERROR" || mergeState === "DIRTY") {
       return {
         primaryAction: { op: "fix_ci", label: mergeState === "DIRTY" ? "Have agent rebase" : "Have agent fix CI", value: "fix_ci", destructive: false },
@@ -194,7 +205,7 @@ function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
     return clampText(redactSecrets(question.reviewReason), 220);
   }
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
@@ -399,10 +410,16 @@ export function buildSupervisorCard(
     ?? question.askedHead
     ?? null;
   const prUrl = livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
+  const isDraft = typeof livePr?.isDraft === "boolean"
+    ? livePr.isDraft
+    : (typeof rowPr?.isDraft === "boolean"
+        ? rowPr.isDraft
+        : (typeof snapPr?.isDraft === "boolean" ? snapPr.isDraft : null));
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
     bodySummary: prBodySummary,
+    isDraft,
     additions,
     deletions,
     changedFiles,
@@ -419,10 +436,11 @@ export function buildSupervisorCard(
   const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef, prMeta);
   const sessionTitle = clampText(redactSecrets(row?.title || thread?.title || snap?.threadTitle || ""), 120) || null;
+  const hasDistinctSessionTitle = Boolean(sessionTitle && !/^(?:paseo chat|wks_[0-9a-f]+)$/i.test(sessionTitle.trim()));
 
   const rawTitle = String(question.title ?? "");
-  let cleanTitle = sessionTitle && /^wks_[0-9a-f]+:/i.test(rawTitle)
-    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${sessionTitle}:`)
+  let cleanTitle = hasDistinctSessionTitle && /^(?:wks_[0-9a-f]+|Paseo chat):/i.test(rawTitle)
+    ? rawTitle.replace(/^(?:wks_[0-9a-f]+|Paseo chat):/i, `${sessionTitle}:`)
     : rawTitle;
   if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*needs\s+approve\.?|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
     cleanTitle = `#${parsedPr.number} · ${prTitle}`;

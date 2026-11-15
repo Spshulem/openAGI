@@ -16,6 +16,9 @@ import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
 import { executeApprovedAction } from "../src/approval-executor.js";
 import { OutreachStore } from "../src/outreach-store.js";
+import { ownerLabel } from "../src/fleet/policy.js";
+import { paseoThread } from "../src/fleet/sources/paseo.js";
+import { buildSupervisorCard } from "../src/fleet/cards.js";
 
 function tempSupervisor({ ghRun = null, executor = null, notifier = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-cards-prefs-"));
@@ -1421,6 +1424,92 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     supervisor.config.paseo = { enabled: true };
     const synth = supervisor.syntheticPaseoThread(supKey, sup2);
     assert.equal(synth.meta.workspaceId, "wks_saved123", "synthetic Paseo thread restores workspaceId for delivery preflight");
+
+    // PR #291 follow-up: Paseo threads without PR keep distinct title in ownerLabel & buildSupervisorCard,
+    // and non-draft PRs mentioning "draft" in feature names ("draft editor fixes") keep Merge PR action.
+    const paseoNoPr = paseoThread(
+      {
+        id: "ag-billing-1",
+        workspaceId: "wks_8899aabbccdd",
+        title: "Billing webhook retries",
+        cwd: "/Users/shooby/Dev/billing-service",
+        status: "waiting",
+        pendingPermissions: [{ id: "perm1" }],
+        updatedAt: "2026-11-15T10:00:00.000Z"
+      },
+      "srv_mac"
+    );
+    assert.equal(paseoNoPr.workspace, null, "opaque wks_* workspaceId is stripped");
+    assert.equal(ownerLabel(paseoNoPr, null, null), "Billing webhook retries", "ownerLabel uses Paseo chat title instead of generic Paseo chat");
+
+    const genericTitlePaseo = paseoThread(
+      {
+        id: "ag-generic-1",
+        workspaceId: "wks_8899aabbccdd",
+        title: "Paseo chat",
+        cwd: "/Users/shooby/Dev/billing-service",
+        status: "waiting",
+        updatedAt: "2026-11-15T10:00:00.000Z"
+      },
+      "srv_mac"
+    );
+    assert.equal(ownerLabel(genericTitlePaseo, null, null), "billing-service", "generic Paseo chat title falls back to paseoCwd folder");
+
+    const healedGenericCard = buildSupervisorCard(
+      {
+        id: "q_paseo_generic_prefix",
+        status: "open",
+        kind: "prompt",
+        threadKey: paseoNoPr.key,
+        title: "Paseo chat: waiting on a prompt. Open it?",
+        options: ["opened", "later"]
+      },
+      { threadsByKey: new Map([[paseoNoPr.key, paseoNoPr]]) }
+    );
+    assert.equal(healedGenericCard.headline, "Billing webhook retries: waiting on a prompt. Open it?");
+
+    const nonDraftFeatureRow = {
+      key: "paseo:srv_mac.draft-editor",
+      kind: "paseo",
+      title: "Draft editor fixes",
+      pr: {
+        ref: "acme/webapp#9910",
+        state: "OPEN",
+        isDraft: false,
+        ci: { state: "SUCCESS", failing: [], pending: [] },
+        mergeState: "CLEAN"
+      }
+    };
+    const draftFeatureMergeCard = buildSupervisorCard(
+      {
+        id: "q_draft_editor_merge",
+        status: "open",
+        kind: "agent-ask",
+        threadKey: nonDraftFeatureRow.key,
+        prRef: "acme/webapp#9910",
+        mergeAsk: true,
+        title: "Merge the draft editor fixes PR?",
+        options: ["merge", "wait"]
+      },
+      { rowsByKey: new Map([[nonDraftFeatureRow.key, nonDraftFeatureRow]]) }
+    );
+    assert.equal(draftFeatureMergeCard.kind, "merge_ready");
+    assert.equal(draftFeatureMergeCard.primaryAction.op, "merge", "non-draft PR whose feature name contains 'draft' must keep Merge PR action");
+
+    const convertToDraftCard = buildSupervisorCard(
+      {
+        id: "q_convert_to_draft",
+        status: "open",
+        kind: "agent-ask",
+        threadKey: nonDraftFeatureRow.key,
+        prRef: "acme/webapp#9910",
+        mergeAsk: true,
+        title: "Convert PR back to draft while staging bakes?",
+        options: ["convert to draft", "wait"]
+      },
+      { rowsByKey: new Map([[nonDraftFeatureRow.key, nonDraftFeatureRow]]) }
+    );
+    assert.equal(convertToDraftCard.primaryAction.op, "answer", "explicit draft-status request stays an answer action");
   } finally {
     cleanup();
   }
