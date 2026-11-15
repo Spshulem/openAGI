@@ -536,13 +536,13 @@ if safe_fts:
 
 brain_scanned = 0
 for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
-    if len(hits) >= 12 or brain_scanned >= 120:
+    if brain_scanned >= 160:
         break
     root = os.path.join(home, rel_brain)
     if not os.path.isdir(root):
         continue
     for d in os.listdir(root):
-        if brain_scanned >= 120:
+        if brain_scanned >= 160:
             break
         cdir = os.path.join(root, d)
         if not os.path.isdir(cdir):
@@ -624,7 +624,7 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
     fs.mkdirSync(ctlDir, { recursive: true, mode: 0o700 });
   } catch { /* optional multiplexing dir */ }
   const sshControlArgs = fs.existsSync(ctlDir)
-    ? ["-o", "ControlMaster=auto", "-o", `ControlPath=${path.join(ctlDir, "%C")}`, "-o", "ControlPersist=30m"]
+    ? ["-o", "ControlMaster=auto", "-S", path.join(ctlDir, "%C"), "-o", "ControlPersist=30m"]
     : [];
 
   const out = new Map();
