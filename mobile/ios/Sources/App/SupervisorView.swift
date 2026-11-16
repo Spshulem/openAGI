@@ -843,7 +843,7 @@ private struct SupervisorCardDeckView: View {
                     .accessibilityIdentifier(contextID)
             }
 
-            if !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
+            if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(Array(card.suggestedReplies.prefix(3).enumerated()), id: \.offset) { _, quickReply in
@@ -1619,10 +1619,10 @@ private struct ThreadDetailSheet: View {
                             Text(rec).font(.footnote).foregroundStyle(.secondary)
                         }
 
-                        if let suggested = card?.suggestedReplies, !suggested.isEmpty, questionIsOpen {
+                        if let card, card.canReply, !card.suggestedReplies.isEmpty, questionIsOpen {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 6) {
-                                    ForEach(Array(suggested.prefix(4).enumerated()), id: \.offset) { _, quick in
+                                    ForEach(Array(card.suggestedReplies.prefix(4).enumerated()), id: \.offset) { _, quick in
                                         Button {
                                             replyText = quick
                                             replyOpen = true

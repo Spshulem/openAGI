@@ -488,12 +488,17 @@ function cardIntent(ctx, card) {
   const head = clampText(item.header || item.question, 50);
   const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
   const extra = item.multiSelect ? " Pick any." : "";
-  const others = items.filter((other) => other !== item).map((other) => clampText(other.header || other.question, 60));
+  const others = items.filter((other) => other !== item).map((other) => {
+    const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
+      ? (other.question || other.header)
+      : (other.header || other.question);
+    return clampText(label, 60);
+  });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
   const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
-  const rawChoices = card.app === "paseo" && item.options.length > 0 && !item.multiSelect
+  const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
     ? item.options.slice(0, 3)
     : [];
   const clampedChoices = rawChoices.map((opt) => clampText(opt, 40));
@@ -506,7 +511,8 @@ function cardIntent(ctx, card) {
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
-      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options],
+      ...(card.requestId ? { paseoPermissionId: String(card.requestId) } : {})
     },
     ...(late ? { baseKey: key } : {}),
     agentAskedAt: item.at ?? null

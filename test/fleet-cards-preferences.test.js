@@ -1765,8 +1765,10 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
       }]])
     });
     assert.equal(stuckDeckCard.prContext, null, "settled MERGED PR is hidden on non-merge question cards");
+    assert.equal(stuckDeckCard.sessionTitle, null, "settled MERGED PR title must not leak into sessionTitle");
+    assert.ok(!stuckDeckCard.headline.includes("Continue onboarding"), "settled MERGED PR title must not leak into headline");
     assert.equal(stuckDeckCard.answerIn, "here", "Paseo question cards are answerable inline in Supervisor");
-    assert.ok(!stuckDeckCard.headline.startsWith("7e19bf86-"), "opaque UUID prefix is cleaned when fallback title exists");
+    assert.ok(!stuckDeckCard.headline.startsWith("7e19bf86-"), "opaque UUID prefix is stripped even without fallback session title");
 
     let capturedPermissionResponse = null;
     const permDelivery = await deliverPaseo({
@@ -1826,6 +1828,195 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
       lastAgentFull: "To put it live:\n1. Review the seven articles on the preview and tell me which to approve.\n2. Upgrade your personal Vercel team to Pro."
     });
     assert.equal(proseClassified.state, "needs-human");
+
+    // 5. PR #296 review regressions:
+    // (a) Owner Allow tap on Paseo permission card unwraps `Owner answer: Allow. Continue with that.` into behavior: "allow"
+    const toolPermAgent = {
+      id: "agent-tool-perm-1",
+      cwd: "/workspace/bb",
+      status: "idle",
+      updatedAt: "2026-11-16T03:00:00.000Z",
+      pendingPermissions: [
+        {
+          id: "perm_tool_1",
+          kind: "tool",
+          name: "bash",
+          actions: [
+            { id: "act_allow", label: "Allow", behavior: "allow" },
+            { id: "act_deny", label: "Deny", behavior: "deny" }
+          ]
+        }
+      ]
+    };
+    const toolPermThread = paseoThread(toolPermAgent, "srv_bb3", []);
+    let toolPermCaptured = null;
+    const allowRes = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: toolPermThread,
+      text: "[OpenAGI supervisor] Owner answer: Allow. Continue with that.",
+      store: supervisor.store,
+      actionId: "act_tool_allow",
+      base: { playbook: "owner-answer", messageHash: "h_allow" },
+      expectedPermissionId: "perm_tool_1",
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async (agentId, reqId, resp) => {
+          toolPermCaptured = { agentId, reqId, resp };
+        },
+        agents: { ref: () => ({ refresh: async () => {}, current: () => toolPermAgent }) }
+      })
+    });
+    assert.equal(allowRes.status, "sent");
+    assert.deepEqual(toolPermCaptured, {
+      agentId: "agent-tool-perm-1",
+      reqId: "perm_tool_1",
+      resp: { behavior: "allow", selectedActionId: "act_allow" }
+    });
+
+    // (b) Mismatched expectedPermissionId blocks instead of approving a replaced permission
+    const replacedRes = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: toolPermThread,
+      text: "[OpenAGI supervisor] Owner answer: Allow. Continue with that.",
+      store: supervisor.store,
+      actionId: "act_tool_stale",
+      base: { playbook: "owner-answer", messageHash: "h_stale" },
+      expectedPermissionId: "perm_old_gone",
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async () => { throw new Error("must not approve mismatched permission"); },
+        agents: { ref: () => ({ refresh: async () => {}, current: () => toolPermAgent }) }
+      })
+    });
+    assert.equal(replacedRes.status, "blocked");
+    assert.match(replacedRes.detail, /permission changed/i);
+
+    // (c) Consecutive question permissions reusing question id "0" get distinct itemIds
+    const secondPermThread = paseoThread({
+      ...permissionQuestionAgent,
+      pendingPermissions: [{
+        ...permissionQuestionAgent.pendingPermissions[0],
+        id: "permission-call_stuck_card_2",
+        input: { questions: [{ id: "0", header: "Question 1", question: "Which user email hit the issue?", options: [] }] }
+      }]
+    }, "srv_bb3", []);
+    assert.notEqual(
+      permThread.meta.pendingCard.items[0].itemId,
+      secondPermThread.meta.pendingCard.items[0].itemId,
+      "consecutive permissions reusing sub-question id '0' must have distinct itemIds"
+    );
+
+    // (d) Multi-question permission rejects single unnumbered answer instead of fabricating Question 2, and accepts numbered answers
+    const multiQAgent = {
+      id: "agent-multi-q",
+      cwd: "/workspace/bb",
+      status: "idle",
+      updatedAt: "2026-11-16T03:10:00.000Z",
+      pendingPermissions: [{
+        id: "perm_multi_1",
+        kind: "question",
+        name: "request_user_input_async",
+        input: {
+          questions: [
+            { id: "0", header: "Question 1", question: "Staging or production?" },
+            { id: "1", header: "Question 2", question: "Should we backfill existing rows?" }
+          ]
+        }
+      }]
+    };
+    const multiQThread = paseoThread(multiQAgent, "srv_bb3", []);
+    const partialMulti = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: multiQThread,
+      text: "Owner says: Staging only",
+      store: supervisor.store,
+      actionId: "act_multi_partial",
+      base: { playbook: "owner-answer", messageHash: "h_mp" },
+      expectedPermissionId: "perm_multi_1",
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async () => { throw new Error("must not resolve partial multi-question"); },
+        agents: { ref: () => ({ refresh: async () => {}, current: () => multiQAgent }) }
+      })
+    });
+    assert.equal(partialMulti.status, "blocked");
+    assert.match(partialMulti.detail, /2 questions/i);
+
+    let multiCaptured = null;
+    const fullMulti = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: multiQThread,
+      text: "Owner says: 1: Staging\n2: Yes, backfill last 7 days",
+      store: supervisor.store,
+      actionId: "act_multi_full",
+      base: { playbook: "owner-answer", messageHash: "h_mf" },
+      expectedPermissionId: "perm_multi_1",
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async (_aid, reqId, resp) => { multiCaptured = { reqId, resp }; },
+        agents: { ref: () => ({ refresh: async () => {}, current: () => multiQAgent }) }
+      })
+    });
+    assert.equal(fullMulti.status, "sent");
+    assert.deepEqual(multiCaptured?.resp?.updatedInput?.answers, {
+      "Question 1": "Staging",
+      "Question 2": "Yes, backfill last 7 days"
+    });
+
+    // (e) _supersedeAgentAsk clears stale reviewBrief when a newer agent ask replaces an open ask
+    const ask1 = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:paseo:srv_bb3.sup1:t1",
+      kind: "agent-ask",
+      threadKey: "paseo:srv_bb3.sup1",
+      title: "Run staging tests?",
+      body: "Should I run the staging suite?",
+      askContext: "Should I run the staging suite?",
+      agentAskedAt: "2026-11-16T01:00:00.000Z",
+      options: ["yes", "no"]
+    });
+    supervisor.store.recordReview(ask1.id, {
+      fingerprint: "fp_sup_1",
+      reason: "Staging tests are safe.",
+      category: "live",
+      brief: { context: "Staging check", whatChanged: "Nothing destructive", decision: "Run staging tests?" },
+      recommendation: "Safe to proceed.",
+      suggestedReplies: ["Yes, run staging tests"]
+    });
+    const ask2 = supervisor.store.upsertQuestion({
+      dedupeKey: "ask:paseo:srv_bb3.sup1:t2",
+      kind: "agent-ask",
+      threadKey: "paseo:srv_bb3.sup1",
+      title: "Delete production archive table?",
+      body: "Confirm dropping legacy_archive in production?",
+      askContext: "Confirm dropping legacy_archive in production?",
+      agentAskedAt: "2026-11-16T02:00:00.000Z",
+      options: ["yes", "no"]
+    });
+    assert.equal(ask2.id, ask1.id, "superseded ask reuses record id");
+    assert.equal(supervisor.store.question(ask2.id).reviewBrief, null, "superseded ask clears stale reviewBrief");
+    const supersededCard = buildSupervisorCard(supervisor.questionView(supervisor.store.question(ask2.id), new Map()));
+    assert.notEqual(supersededCard.recommendation, "Safe to proceed.");
+    assert.match(supersededCard.brief.decision, /legacy_archive/i);
+
+    // (f) Suggestion and self-fix cards without a replyable threadKey report canReply: false and suggestedReplies: []
+    const suggestionQ = supervisor.store.upsertQuestion({
+      dedupeKey: "suggestion:sg_no_reply",
+      kind: "suggestion",
+      title: "Tighten judge timeout",
+      body: "Proposed prompt improvement.",
+      options: ["Approve", "Dismiss"]
+    });
+    const suggestionCard = buildSupervisorCard(supervisor.questionView(suggestionQ, new Map()));
+    assert.equal(suggestionCard.canReply, false);
+    assert.deepEqual(suggestionCard.suggestedReplies, []);
   } finally {
     cleanup();
   }

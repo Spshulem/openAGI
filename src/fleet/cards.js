@@ -242,9 +242,16 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
   return { primaryAction, secondaryAction, extraActions };
 }
 
+function activeReviewBrief(question) {
+  return question?.reviewedAt && question?.reviewBrief && typeof question.reviewBrief === "object"
+    ? question.reviewBrief
+    : null;
+}
+
 function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
-  if (question.reviewBrief?.recommendation) {
-    return clampText(redactSecrets(question.reviewBrief.recommendation), 220);
+  const rb = activeReviewBrief(question);
+  if (rb?.recommendation) {
+    return clampText(redactSecrets(rb.recommendation), 220);
   }
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
@@ -274,7 +281,7 @@ function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
 }
 
 function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [] } = {}) {
-  const rb = question.reviewBrief && typeof question.reviewBrief === "object" ? question.reviewBrief : null;
+  const rb = activeReviewBrief(question);
   const lastUserMsg = [...recentMessages].reverse().find((m) => m.role === "user" && m.text)?.text ?? null;
   const fallbackContext = lastUserMsg
     ? `You asked: "${clampText(cleanBriefProse(lastUserMsg), 170)}"`
@@ -317,11 +324,12 @@ function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle =
   };
 }
 
-function buildSuggestedReplies(question, { kind } = {}) {
-  if (Array.isArray(question.reviewBrief?.suggestedReplies) && question.reviewBrief.suggestedReplies.length > 0) {
-    return question.reviewBrief.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
+function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
+  if (!canReply || kind === "preference") return [];
+  const rb = activeReviewBrief(question);
+  if (Array.isArray(rb?.suggestedReplies) && rb.suggestedReplies.length > 0) {
+    return rb.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
   }
-  if (kind === "preference") return [];
   if (kind === "merge_ready") {
     return [
       "Rebase on latest main and re-verify",
@@ -404,8 +412,9 @@ function buildSummary(question, row, { headline = "", prMeta = null, agentSummar
     ? expandFragmentFromAgent(rawBody, cleanAgent, 430)
     : null;
 
-  if (question.reviewBrief?.whatChanged) {
-    parts.push(clampText(question.reviewBrief.whatChanged, 380));
+  const rb = activeReviewBrief(question);
+  if (rb?.whatChanged) {
+    parts.push(clampText(rb.whatChanged, 380));
   } else if (question.card) {
     parts.push(cleanBriefProse(question.card));
   } else if (prMeta?.bodySummary) {
@@ -559,8 +568,9 @@ export function buildSupervisorCard(
   const parsedPr = parsePrRef(prRef);
 
   const pickNum = (...vals) => vals.find((v) => Number.isFinite(v)) ?? null;
-  const fallbackPrTitle = clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null;
-  const prTitle = hideSettledPr ? null : fallbackPrTitle;
+  const prTitle = hideSettledPr
+    ? null
+    : (clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null);
   const rawPrBody = hideSettledPr ? null : (livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null);
   const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(cleanBriefProse(rawPrBody)), 2200) : null;
   const additions = hideSettledPr ? null : pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
@@ -611,16 +621,20 @@ export function buildSupervisorCard(
     || cleanSessionTitle(snap?.threadTitle);
   const sessionTitle = distinctTitle
     || cleanWorkspaceName(row?.workspace ?? thread?.workspace ?? snap?.workspace)
-    || (fallbackPrTitle ? clampText(fallbackPrTitle, 90) : null)
+    || (prTitle ? clampText(prTitle, 90) : null)
     || null;
   const labelForOpaquePrefix = distinctTitle || sessionTitle;
 
   const rawTitle = String(question.title ?? "");
-  let cleanTitle = /<(?:system_instruction|system-reminder)/i.test(rawTitle)
-    ? rawTitle.replace(/^(?:<[^>]+>\s*[^:]{0,120}):/i, `${labelForOpaquePrefix || "Coding session"}:`)
-    : (labelForOpaquePrefix && LEADING_OPAQUE_PREFIX_RE.test(rawTitle)
-        ? rawTitle.replace(LEADING_OPAQUE_PREFIX_RE, `${labelForOpaquePrefix}:`)
-        : rawTitle);
+  let cleanTitle = rawTitle;
+  if (/<(?:system_instruction|system-reminder)/i.test(rawTitle)) {
+    cleanTitle = rawTitle.replace(/^(?:<[^>]+>\s*[^:]{0,120}):/i, `${labelForOpaquePrefix || "Coding session"}:`);
+  } else if (LEADING_OPAQUE_PREFIX_RE.test(rawTitle)) {
+    const rest = rawTitle.replace(LEADING_OPAQUE_PREFIX_RE, "").trim();
+    cleanTitle = labelForOpaquePrefix
+      ? (rest ? `${labelForOpaquePrefix}: ${rest}` : labelForOpaquePrefix)
+      : (rest || "Coding session");
+  }
   if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*(?:needs\s+approve\.?|merge\??)|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
     cleanTitle = `#${parsedPr.number} · ${prTitle}`;
   }
@@ -666,8 +680,14 @@ export function buildSupervisorCard(
   } : null;
 
   const openChat = resolveOpenChat(question, row, primaryKey, sessionTitle);
+  const answerIn = question.answerIn ?? "here";
+  const canReply = Boolean(primaryKey)
+    && question.canReply !== false
+    && !["suggestion", "self-fix", "preference"].includes(String(question.kind ?? ""))
+    && !((question.threadKeys ?? []).length > 1)
+    && answerIn === "here";
   const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages });
-  const suggestedReplies = buildSuggestedReplies(question, { kind });
+  const suggestedReplies = buildSuggestedReplies(question, { kind, canReply });
 
   return {
     id: question.id,
@@ -681,6 +701,7 @@ export function buildSupervisorCard(
     recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
     brief,
     suggestedReplies,
+    canReply,
     agentSummary,
     prContext,
     recentMessages,

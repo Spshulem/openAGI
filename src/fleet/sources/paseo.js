@@ -66,14 +66,16 @@ function extractPaseoPendingCard(agent) {
   if (questionPerms.length > 0) {
     const items = [];
     for (const perm of questionPerms) {
+      const permKey = String(perm.id || "perm");
       const pQuestions = Array.isArray(perm.input?.questions) ? perm.input.questions : [];
       if (pQuestions.length > 0) {
-        for (const q of pQuestions) {
+        for (let qIdx = 0; qIdx < pQuestions.length; qIdx += 1) {
+          const q = pQuestions[qIdx];
           const qText = String(q?.question ?? q?.title ?? "").trim();
           if (!qText) continue;
           items.push(cleanCardItem({
             index: items.length,
-            itemId: String(q?.id ?? items.length),
+            itemId: `${permKey}:${String(q?.id ?? qIdx)}`,
             header: q?.header ?? null,
             question: qText,
             options: Array.isArray(q?.options)
@@ -87,7 +89,7 @@ function extractPaseoPendingCard(agent) {
       } else if (String(perm.description ?? perm.input?.prompt ?? "").trim()) {
         items.push(cleanCardItem({
           index: items.length,
-          itemId: String(perm.id ?? items.length),
+          itemId: permKey,
           header: perm.title ?? null,
           question: String(perm.description ?? perm.input?.prompt ?? "").trim(),
           options: [],
@@ -113,12 +115,14 @@ function extractPaseoPendingCard(agent) {
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
   const extracted = [];
   let firstCardId = null;
+  let firstRequestId = null;
   for (const q of rawQuestions) {
     if (!q || typeof q !== "object" || q.resolution != null) continue;
     if (String(q.question ?? "").trim()) {
       firstCardId ??= String(q.id ?? `paseo-${agent.id}`);
+      if (q.requestId) firstRequestId ??= String(q.requestId);
       extracted.push({
-        id: q.id,
+        id: q.requestId ? `${q.requestId}:${q.id ?? extracted.length}` : q.id,
         header: q.header ?? null,
         question: q.question,
         options: q.options,
@@ -127,12 +131,14 @@ function extractPaseoPendingCard(agent) {
         at: q.askedAt ?? q.createdAt ?? agent.updatedAt ?? null
       });
     } else if (Array.isArray(q.item?.questions)) {
-      firstCardId ??= `permission-${String(q.item.id ?? agent.id)}`;
+      const reqId = String(q.requestId ?? (q.item.id ? `permission-${q.item.id}` : `paseo-${agent.id}`));
+      firstCardId ??= reqId;
+      if (q.requestId || q.item.id) firstRequestId ??= reqId;
       for (let idx = 0; idx < q.item.questions.length; idx += 1) {
         const sub = q.item.questions[idx];
         if (!String(sub?.title ?? "").trim()) continue;
         extracted.push({
-          id: `${q.item.id ?? "q"}_${idx}`,
+          id: `${reqId}:${idx}`,
           header: `Question ${idx + 1}`,
           question: sub.title,
           options: sub.options,
@@ -160,6 +166,7 @@ function extractPaseoPendingCard(agent) {
   return {
     app: "paseo",
     cardId: firstCardId ?? `paseo-${agent.id}`,
+    ...(firstRequestId ? { requestId: firstRequestId } : {}),
     at: items[0].at ?? agent.updatedAt ?? null,
     count: rawQuestions.length,
     items

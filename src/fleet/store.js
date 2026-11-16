@@ -91,7 +91,7 @@ function isObject(value) {
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
-  for (const [key, value] of Object.entries(meta).slice(0, 8)) {
+  for (const [key, value] of Object.entries(meta).slice(0, 12)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
   }
@@ -1097,7 +1097,7 @@ export class FleetStore {
       : (contextSnapshot ?? older.contextSnapshot);
     Object.assign(older, fields, origin, {
       ...(mergedSnap ? { contextSnapshot: mergedSnap } : {}),
-      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0, reviewBrief: null,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
       ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
     });
