@@ -485,7 +485,8 @@ function cardIntent(ctx, card) {
   const oldest = items[0];
   const item = card.app === "codex" ? items.at(-1) : items[0];
   const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
-  const head = clampText(item.header || item.question, 50);
+  const namedHeader = item.header && !/^question\s+\d+$/i.test(String(item.header).trim()) ? item.header : null;
+  const head = clampText(namedHeader || item.question, 50);
   const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
   const extra = item.multiSelect ? " Pick any." : "";
   const others = items.filter((other) => other !== item).map((other) => {
