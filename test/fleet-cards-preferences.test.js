@@ -2085,6 +2085,29 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     }, "srv_bb3", []);
     assert.equal(twoPermsThread.meta.pendingCard.requestId, "perm_sep_1");
     assert.equal(twoPermsThread.meta.pendingCard.items.length, 1);
+
+    // (j) defaultPaths finds Linux ~/.config/codex-lb/env when ~/.codex/codex-lb.env is absent, and generic ": Question 1" headline expands to the actual ask
+    const { defaultPaths } = await import("../src/fleet/contracts.js");
+    const fakeLinuxHome = fs.mkdtempSync(path.join(os.tmpdir(), "fake-linux-home-"));
+    try {
+      assert.equal(defaultPaths(fakeLinuxHome).codexLbEnvFile, path.join(fakeLinuxHome, ".codex", "codex-lb.env"));
+      fs.mkdirSync(path.join(fakeLinuxHome, ".config", "codex-lb"), { recursive: true });
+      fs.writeFileSync(path.join(fakeLinuxHome, ".config", "codex-lb", "env"), "CODEX_LB_API_KEY=linux-key\n");
+      assert.equal(defaultPaths(fakeLinuxHome).codexLbEnvFile, path.join(fakeLinuxHome, ".config", "codex-lb", "env"));
+    } finally {
+      fs.rmSync(fakeLinuxHome, { recursive: true, force: true });
+    }
+    const genericQ1Card = buildSupervisorCard({
+      id: "fq_q1_head",
+      kind: "agent-card",
+      status: "open",
+      threadKey: "paseo:srv_bb3.cli",
+      title: "BuildBetter CLI: Question 1",
+      card: "Which test email should I use for the final fresh-signup check on staging? You will need to open its verification email.",
+      options: ["open thread"]
+    });
+    assert.match(genericQ1Card.headline, /BuildBetter CLI: Which test email should I use/);
+    assert.ok(!genericQ1Card.headline.endsWith("Question 1"));
   } finally {
     cleanup();
   }

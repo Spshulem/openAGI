@@ -641,6 +641,13 @@ export function buildSupervisorCard(
       ? (rest ? `${labelForOpaquePrefix}: ${rest}` : labelForOpaquePrefix)
       : (rest || "Coding session");
   }
+  if (/:\s*Question\s+\d+(?:\s*\(\d+\s+open\))?$/i.test(cleanTitle.trim())) {
+    const askProse = cleanBriefProse(question.card || question.body || "");
+    const firstAsk = (/^([^\n]+?[.?])(?:\s|$)/.exec(askProse)?.[1] ?? askProse.split(/\n+/)[0] ?? "").trim();
+    if (firstAsk) {
+      cleanTitle = cleanTitle.replace(/:\s*Question\s+\d+(\s*\(\d+\s+open\))?$/i, (_, suffix = "") => `: ${clampText(firstAsk, 68)}${suffix || ""}`);
+    }
+  }
   if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*(?:needs\s+approve\.?|merge\??)|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
     cleanTitle = `#${parsedPr.number} · ${prTitle}`;
   }

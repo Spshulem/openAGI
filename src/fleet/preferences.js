@@ -323,6 +323,13 @@ export function buildProgressivePreferenceCards(rawPrefs, { now = Date.now() } =
       headline: "Ping less often?",
       summary: `You deferred ${prefs.streaks.dismissals} routine updates in a row. Switch default cadence to Quiet until PR ready so Supervisor only interrupts on blockers and merge-ready PRs?`,
       recommendation: "Zero-setup default is Balanced. You can change this back anytime.",
+      brief: {
+        context: `${prefs.streaks.dismissals} routine updates deferred in a row`,
+        whatChanged: "Switch default cadence to Quiet until PR ready so Supervisor only interrupts on blockers and merge-ready PRs.",
+        decision: "Choose whether to switch cadence to Quiet until ready or keep Balanced."
+      },
+      suggestedReplies: [],
+      canReply: false,
       threadKey: null,
       threadKeys: [],
       repo: null,
@@ -363,6 +370,13 @@ export function buildProgressivePreferenceCards(rawPrefs, { now = Date.now() } =
         headline: `Make "${spec.label}" automatic?`,
         summary: `You approved ${streak.approvals} in a row with 0 overrides. Want Supervisor to handle ${spec.label.toLowerCase()} automatically? PR merging remains manual-confirm.`,
         recommendation: "Safe routine slice only. Auto-merge stays off.",
+        brief: {
+          context: `${streak.approvals} consecutive approvals with 0 overrides`,
+          whatChanged: `Supervisor can handle ${spec.label.toLowerCase()} automatically while keeping PR merges manual-confirm.`,
+          decision: `Make "${spec.label}" automatic or keep asking each time?`
+        },
+        suggestedReplies: [],
+        canReply: false,
         threadKey: null,
         threadKeys: [],
         repo: null,
@@ -399,6 +413,13 @@ export function buildProgressivePreferenceCards(rawPrefs, { now = Date.now() } =
       headline: "Keep manual merge after CI finishes?",
       summary: `CI was still running on ${prefs.ciMergeWatchPrompt.prRef} when you tapped Merge. By default, Supervisor never auto-merges—it watches CI and pings you when green.`,
       recommendation: "Recommended: Keep manual confirm so new commits or flaky checks never merge unattended.",
+      brief: {
+        context: `Merge requested while CI was running on ${prefs.ciMergeWatchPrompt.prRef}`,
+        whatChanged: "By default, Supervisor watches CI and pings you when green instead of merging unattended.",
+        decision: "Keep manual merge confirmation or queue merge automatically after your tap?"
+      },
+      suggestedReplies: [],
+      canReply: false,
       threadKey: null,
       threadKeys: [],
       repo: null,

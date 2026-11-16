@@ -193,14 +193,19 @@ export const STORAGE_DEFAULTS = Object.freeze({
   scanMs: 60 * MIN, scanLowMs: 15 * MIN, scanBudgetMs: 120_000
 });
 
-export function defaultPaths(home = os.homedir()) {
+export function defaultPaths(home = os.homedir(), exists = fs.existsSync) {
+  const codexLbCandidates = [
+    path.join(home, ".codex", "codex-lb.env"),
+    path.join(home, ".config", "codex-lb", "env"),
+    path.join(home, ".config", "ccodex", "env")
+  ];
   return {
     home,
     codexHome: path.join(home, ".codex"),
     claudeHome: path.join(home, ".claude"),
     conductorDb: path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db"),
     buzzEndpointFile: path.join(home, ".claude", "buzz", "endpoint"),
-    codexLbEnvFile: path.join(home, ".codex", "codex-lb.env"),
+    codexLbEnvFile: codexLbCandidates.find((candidate) => exists(candidate)) ?? codexLbCandidates[0],
     bb3WatchState: path.join(home, ".bb3-watch-state"),
     bb3WatchGateState: path.join(home, ".bb3-watch-gate-state"),
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
