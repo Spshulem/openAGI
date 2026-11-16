@@ -91,8 +91,12 @@ function scoreWorkspaceTarget({ cwd, migrated, worktree, status, updatedAt }) {
   return score;
 }
 
+function isThreadArchived(thread) {
+  return Boolean(thread?.archived || thread?.state === "archived");
+}
+
 function normalizeSessionState(thread) {
-  if (thread?.archived) return "archived";
+  if (isThreadArchived(thread)) return "archived";
   const raw = thread?.agentStatus ?? thread?.state ?? "unknown";
   if (thread?.excluded === "closed" || raw === "closed") return "sleeping";
   if (raw === "running" || thread?.live) return "running";
@@ -234,10 +238,10 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
   const hostLabels = new Map();
 
   for (const [k, t] of supervisor?.knownThreads ?? []) {
-    if (k && t && (includeArchived || !t.archived)) byKey.set(k, t);
+    if (k && t && (includeArchived || !isThreadArchived(t))) byKey.set(k, t);
   }
   for (const [k, t] of supervisor?.lastThreads ?? []) {
-    if (k && t && (includeArchived || !t.archived)) byKey.set(k, t);
+    if (k && t && (includeArchived || !isThreadArchived(t))) byKey.set(k, t);
   }
 
   let emptyWorkspaces = [];
@@ -380,7 +384,7 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       host: hostLabel,
       provider: thread.meta?.provider ?? thread.kind,
       state: sessionState,
-      wakeable: thread.kind === "paseo" ? !thread.archived : sessionState !== "archived",
+      wakeable: sessionState !== "archived",
       prRefs: prRefs.slice(0, 4),
       lastActivityAt: thread.lastActivityAt ?? null,
       snippet: clampText(redactSecrets(thread.lastAgentText || thread.reason || ""), 220) || null,
@@ -596,7 +600,7 @@ export async function readChatTranscript(supervisor, { key, limit = 20, factory 
     prRefs: thread.prRefs ?? [],
     cwd: thread.meta?.paseoCwd ?? thread.cwd ?? null,
     status: normalizeSessionState(thread),
-    wakeable: !thread.archived,
+    wakeable: !isThreadArchived(thread),
     messageCount: messages.length,
     messages,
     openChat: thread.openChat ?? openChatFor(thread)
@@ -805,10 +809,17 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
   const matchSessionsForPr = (prRef, headRef) => {
     const linked = [];
     for (const t of allThreads) {
-      if (!t?.key || t.archived) continue;
+      if (!t?.key || isThreadArchived(t)) continue;
       const refs = t.prRefs ?? [];
       const samePr = refs.includes(prRef);
-      const sameBranch = Boolean(headRef && t.branch && t.branch === headRef && (!t.repo || t.repo.toLowerCase() === resolvedRepo.toLowerCase()));
+      const threadRepo = t.repo ?? parsePrRef(refs[0])?.repo ?? null;
+      const sameBranch = Boolean(
+        headRef &&
+        t.branch &&
+        t.branch === headRef &&
+        threadRepo &&
+        threadRepo.toLowerCase() === resolvedRepo.toLowerCase()
+      );
       if (!samePr && !sameBranch) continue;
       linked.push({
         key: t.key,

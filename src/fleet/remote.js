@@ -500,16 +500,31 @@ export class RemoteFleetSupervisor {
       const qid = cardId.replace(/^question:/, '');
       const localQuestion = this.selfFixHub.store.question(qid);
       if (localQuestion && localQuestion.status === 'open') {
-        const op = String(input?.op ?? 'primary').toLowerCase();
-        if (op === 'defer' || op === 'dismiss' || op === 'secondary') {
+        const prefs = normalizePreferences(this.state.preferences);
+        const rowsByKey = new Map((this.state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+        const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+        const localCard = buildSupervisorCard(localQuestion, { rowsByKey, actions, prefs });
+
+        const normalizedOp = String(input?.op ?? 'primary').toLowerCase();
+        const explicitValue = typeof input?.value === 'string' && input.value.trim() ? input.value.trim() : null;
+        const resolvedAction = normalizedOp === 'secondary'
+          ? localCard?.secondaryAction
+          : normalizedOp === 'primary'
+            ? localCard?.primaryAction
+            : (localCard?.extraActions ?? []).find((a) => a.op === normalizedOp && (explicitValue == null || a.value === explicitValue)) ?? null;
+        const effectiveOp = normalizedOp === 'primary' || normalizedOp === 'secondary'
+          ? (resolvedAction?.op ?? 'answer')
+          : normalizedOp;
+        const effectiveValue = explicitValue ?? resolvedAction?.value ?? null;
+
+        if (effectiveOp === 'defer' || effectiveOp === 'dismiss' || effectiveValue === 'dismiss') {
           return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(qid), delivery: null };
         }
-        if (op === 'merge' || op === 'fix_ci') {
-          return { ok: false, kind: op, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
+        if (effectiveOp === 'merge' || effectiveOp === 'fix_ci') {
+          return { ok: false, kind: effectiveOp, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
         }
-        const explicitAnswer = typeof input?.value === 'string' && input.value.trim() ? input.value.trim() : null;
-        if (op === 'reply' && !explicitAnswer) return null;
-        const answer = explicitAnswer ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
+        if (effectiveOp === 'reply' && !explicitValue) return null;
+        const answer = effectiveValue ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
         if (!answer) return null;
         const res = await this.selfFixHub.answer(qid, answer);
         return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;

@@ -798,4 +798,69 @@ test("Round 2 review regressions: migrated alias dedupe and local git origin hos
   const sharedStatus = await sup.inspectRepoStatus({ workspace: sharedName });
   assert.equal(localGitProbes, 0, "must never run local git remote probe for remote Paseo host path");
   assert.equal(sharedStatus.repo, "remote-org/shared-checkout");
+
+  // Round 3:
+  // 1) Branch-only session without repo identity must NOT link to another repo's PR on the same branch name
+  sup.lastThreads.set("claude:unrelated-branch", {
+    key: "claude:unrelated-branch",
+    kind: "claude",
+    title: "Unrelated local feature",
+    cwd: null,
+    repo: null,
+    branch: "feat/alpha-77",
+    prRefs: [],
+    agentStatus: "running",
+    lastActivityAt: "2026-11-16T16:15:00Z"
+  });
+  const alphaAfterUnrelated = await sup.inspectRepoStatus({ repo: "acme/alpha-service" });
+  assert.equal(alphaAfterUnrelated.openPrs[0].linkedSessions.length, 1, "unrelated branch without repo must not link");
+  assert.equal(alphaAfterUnrelated.openPrs[0].overlapping, false);
+
+  // 2) Archive search record (state: 'archived', agentStatus: 'closed', no archived boolean) is normalized
+  sup.recordDiscoveredThread({
+    key: "paseo:srv_remote.arch-only-99",
+    kind: "paseo",
+    title: "Old archived chat",
+    agentStatus: "closed",
+    state: "archived",
+    meta: { serverId: "srv_remote", paseoCwd: "/Users/dev/Dev/retired-project", provider: "claude" }
+  });
+  const defaultRetired = await sup.listWorkspaces({ query: "retired-project" });
+  assert.equal(defaultRetired.workspaces.length, 0, "archived search row hidden when includeArchived is false");
+  const withArchivedRetired = await sup.listWorkspaces({ query: "retired-project", includeArchived: true });
+  assert.equal(withArchivedRetired.workspaces.length, 1);
+  assert.equal(withArchivedRetired.workspaces[0].recentChats[0].state, "archived");
+  assert.equal(withArchivedRetired.workspaces[0].recentChats[0].wakeable, false);
+
+  // 3) RemoteFleetSupervisor.actCard / batchActCards resolves multi-option self-fix secondaryAction ('Request changes') instead of dismissing
+  const cap = createFleetCapability(sup);
+  const remoteSup = new RemoteFleetSupervisor({
+    runtime: {
+      nodeCapabilities: {
+        list: () => [{ nodeId: "n1" }],
+        dispatch: async (_nodeId, _capId, op, payload) => cap.invoke(op, payload)
+      }
+    },
+    nodeId: "n1",
+    dataDir: path.join(dir, "remote-r3")
+  });
+  let answeredChoice = null;
+  remoteSup.selfFixHub.answer = async (id, answer) => {
+    answeredChoice = { id, answer };
+    remoteSup.selfFixHub.store.answerQuestion(id, answer);
+    return { question: remoteSup.selfFixHub.store.question(id), delivery: { status: "sent" } };
+  };
+  const reviewQ = remoteSup.selfFixHub.store.upsertQuestion({
+    dedupeKey: "self-fix:review-pr",
+    kind: "decision",
+    title: "Self-fix PR ready",
+    body: "Review self-fix PR?",
+    options: ["Review PR", "Request changes", "Close PR"]
+  });
+  await remoteSup.refresh();
+  const secBatch = await remoteSup.batchActCards({ op: "secondary", cardIds: [reviewQ.id] });
+  assert.equal(secBatch.ok, true);
+  assert.equal(secBatch.succeeded, 1);
+  assert.deepEqual(answeredChoice, { id: reviewQ.id, answer: "Request changes" });
+  assert.equal(remoteSup.selfFixHub.store.question(reviewQ.id).status, "answered");
 });

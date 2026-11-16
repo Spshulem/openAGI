@@ -1983,14 +1983,19 @@ export class FleetSupervisor {
   recordDiscoveredThread(thread) {
     if (!thread?.key) return thread;
     const prev = this.knownThreads.get(thread.key) ?? this.lastThreads.get(thread.key) ?? null;
+    const archived = typeof thread.archived === "boolean"
+      ? thread.archived
+      : Boolean(thread.state === "archived" || prev?.archived);
     if (!prev) {
-      setBounded(this.knownThreads, thread.key, thread);
-      return thread;
+      const normalized = typeof thread.archived === "boolean" ? thread : { ...thread, archived };
+      setBounded(this.knownThreads, thread.key, normalized);
+      return normalized;
     }
     const mergedPrRefs = [...new Set([...(thread.prRefs ?? []), ...(prev.prRefs ?? [])])];
     const merged = {
       ...prev,
       ...thread,
+      archived,
       repo: thread.repo ?? prev.repo ?? null,
       branch: thread.branch ?? prev.branch ?? null,
       prRefs: mergedPrRefs,
