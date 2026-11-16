@@ -26,6 +26,7 @@ import { localDay } from "./diagnose.js";
 import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
+import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
@@ -1944,7 +1945,7 @@ export class FleetSupervisor {
     const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
     const thread = this.lastThreads.get(threadKey)
       ?? this.knownThreads.get(threadKey)
-      ?? (matchingOpen ? this.syntheticPaseoThread(threadKey, matchingOpen) : null);
+      ?? this.syntheticPaseoThread(threadKey, matchingOpen);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     // A thread with an open risky ask hears the owner only typed into its
     // app, as an answer to that ask would be.
@@ -1979,6 +1980,38 @@ export class FleetSupervisor {
   // step and why, its open questions, and what opens its chat. Built from
   // the last scan's row (kept across a restart), with this process's own
   // read of the chat when it has one. null: not in the last scan.
+  recordDiscoveredThread(thread) {
+    if (!thread?.key) return thread;
+    const prev = this.knownThreads.get(thread.key) ?? this.lastThreads.get(thread.key) ?? null;
+    const archived = typeof thread.archived === "boolean"
+      ? thread.archived
+      : Boolean(thread.state === "archived" || prev?.archived);
+    if (!prev) {
+      const normalized = typeof thread.archived === "boolean" ? thread : { ...thread, archived };
+      setBounded(this.knownThreads, thread.key, normalized);
+      return normalized;
+    }
+    const mergedPrRefs = [...new Set([...(thread.prRefs ?? []), ...(prev.prRefs ?? [])])];
+    const merged = {
+      ...prev,
+      ...thread,
+      archived,
+      repo: thread.repo ?? prev.repo ?? null,
+      branch: thread.branch ?? prev.branch ?? null,
+      prRefs: mergedPrRefs,
+      lastAgentText: thread.lastAgentText || prev.lastAgentText || "",
+      lastAgentFull: thread.lastAgentFull || prev.lastAgentFull || "",
+      meta: {
+        ...(prev.meta ?? {}),
+        ...(thread.meta ?? {}),
+        aliases: [...new Set([...(prev.meta?.aliases ?? []), ...(thread.meta?.aliases ?? [])])],
+        conversation: (thread.meta?.conversation?.length ? thread.meta.conversation : prev.meta?.conversation) ?? []
+      }
+    };
+    setBounded(this.knownThreads, thread.key, merged);
+    return merged;
+  }
+
   async searchThreads(options = {}) {
     const tmpRoot = os.tmpdir();
     const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
@@ -1990,9 +2023,32 @@ export class FleetSupervisor {
         homeDir: options.homeDir ?? os.homedir(),
         includeRemotePaseoHosts: options.includeRemotePaseoHosts ?? Boolean(this.config?.paseo?.enabled)
       });
+      for (const arch of archives.values()) {
+        this.recordDiscoveredThread(arch);
+      }
       threads = mergeThreadsWithArchives(threads, archives);
     }
     return searchFleet(this.getState(), { natural: true, ...options }, threads);
+  }
+
+  async listWorkspaces(options = {}) {
+    return listWorkspaces(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async readChatTranscript(options = {}) {
+    return readChatTranscript(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async inspectRepoStatus(options = {}) {
+    return inspectRepoStatus(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async startPaseoSession(options = {}) {
+    return startPaseoSession(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async batchActCards(options = {}) {
+    return batchActCards(this, options);
   }
 
   updatePreferences(patch = {}) {

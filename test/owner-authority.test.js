@@ -3,8 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  authorityRecord, intentCovers, intentFamilies, isOwnerPrincipal, matchConfirmation, ownerAuthorityEnabled,
-  ownerIntentText, ownerPrincipal
+  authorityRecord, intentCovers, intentFamilies, isOwnerPrincipal, matchConfirmation, matchConfirmations,
+  ownerAuthorityEnabled, ownerIntentText, ownerPrincipal
 } from "../src/owner-authority.js";
 
 test("only a minted principal passes; copies, JSON and replays never do", () => {
@@ -151,4 +151,50 @@ test("natural casual owner approvals like 'Sure sounds fine' cover card and ques
   }
   assert.deepEqual(matchConfirmation("Sure sounds fine"), { decision: "approve", code: null });
   assert.deepEqual(matchConfirmation("Works for me"), { decision: "approve", code: null });
+});
+
+test("master coordinator phrases cover fleet messaging, session creation, and batch card triage without code walls", () => {
+  const coordPhrases = [
+    "can you cordinate with the bb-recorder workspace chats and see the status if all of them are done, whats left, and cutting a new release?",
+    "hey, go find this chat, go coordinate with the BB recorder, see what's left",
+    "I want you to take this workspace and I want you to coordinate together",
+    "check in with the recorder chats on whether verification passed",
+    "follow up with the amman workspace",
+    "have the bb-recorder chats report what still needs to be tested",
+    "start a new Paseo chat in the bb-recorder workspace to prep the release",
+    "spin up a fresh session in openAGI"
+  ];
+  for (const text of coordPhrases) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, `send: ${text}`);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_start_session"), true, `start: ${text}`);
+  }
+  for (const text of ["batch through these cards", "merge all green PRs", "defer all questions", "clear the approvals queue", "use the recommended option"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_batch_cards"), true, `batch: ${text}`);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_act_card"), true, `act: ${text}`);
+  }
+  // Passive reads still never authorize coordinator mutations.
+  for (const passive of ["what's the latest?", "what did codex say?", "tell me what amman is doing", "have the agent check the news"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_start_session"), false, passive);
+  }
+});
+
+test("matchConfirmations parses multi-code and batch confirmations while rejecting bystander text", () => {
+  assert.deepEqual(matchConfirmations("yes 60, yes 19, yes 78"), { decision: "approve", codes: ["60", "19", "78"], all: false });
+  assert.deepEqual(matchConfirmations("yes 60, 19 and 78"), { decision: "approve", codes: ["60", "19", "78"], all: false });
+  assert.deepEqual(matchConfirmations("approve 42 17"), { decision: "approve", codes: ["42", "17"], all: false });
+  assert.deepEqual(matchConfirmations("no 38, 51"), { decision: "deny", codes: ["38", "51"], all: false });
+  assert.deepEqual(matchConfirmations("yes all"), { decision: "approve", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("approve all of them"), { decision: "approve", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("yes both"), { decision: "approve", codes: [], all: true, count: 2 });
+  assert.deepEqual(matchConfirmations("yes both 60 and 19"), { decision: "approve", codes: ["60", "19"], all: false });
+  assert.equal(matchConfirmations("yes both 60 19 78"), null);
+  assert.equal(matchConfirmations("yes all both"), null);
+  assert.deepEqual(matchConfirmations("deny all"), { decision: "deny", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("yes 42"), { decision: "approve", codes: ["42"], all: false });
+  // Single matchConfirmation keeps rejecting multi-code for voice safety.
+  assert.equal(matchConfirmation("yes 60, yes 19, yes 78"), null);
+  for (const bad of ["yes I think we should wait", "approve all the PRs on GitHub", "yes no 60 19", "ok thanks"]) {
+    assert.equal(matchConfirmations(bad), null, bad);
+  }
 });

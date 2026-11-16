@@ -18,6 +18,15 @@ function isLocalPaseoHost(hostname) {
   return false;
 }
 
+export function isLocalPaseoUrl(rawUrl = "ws://127.0.0.1:6767/ws") {
+  try {
+    const parsed = new URL(rawUrl ?? "ws://127.0.0.1:6767/ws");
+    return isLocalPaseoHost(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 function extractPaseoPrRefs(messages, title = "") {
   const refs = [];
   const repos = [];
@@ -396,10 +405,13 @@ export function createPaseoSource({ factory } = {}) {
         }));
       }
       signal.throwIfAborted();
+      const selfIsLocal = isLocalPaseoUrl(config.paseo?.url);
       const out = inventory.map(({ agent: a, id, key }) => {
         const history = cache.get(key);
         const known = ["running", "initializing", "closed"].includes(a.status) || (history?.stamp === a.updatedAt);
-        return paseoThread(a, id, known ? history?.entries ?? [] : [], known);
+        const row = paseoThread(a, id, known ? history?.entries ?? [] : [], known);
+        row.meta.isLocalHost = Boolean(selfIsLocal && id === directory.self?.serverId);
+        return row;
       });
       if (unknownHostIds.size > 0) {
         Object.defineProperty(out, "unknownThreadPrefixes", {

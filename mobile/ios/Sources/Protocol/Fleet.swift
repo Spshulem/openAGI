@@ -1089,3 +1089,35 @@ public struct FleetSearchResponse: Decodable, Sendable, Equatable {
         total = c.lenient(Int.self, .total) ?? results.count
     }
 }
+
+public struct FleetBatchCardsResult: Decodable, Sendable, Equatable {
+    public struct Outcome: Decodable, Sendable, Equatable {
+        public var ok: Bool
+        public var total: Int
+        public var succeeded: Int
+        public var halted: Int
+        public var detail: String?
+
+        private enum CodingKeys: String, CodingKey { case ok, total, succeeded, halted, detail }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            ok = c.lenient(Bool.self, .ok) ?? true
+            total = c.lenient(Int.self, .total) ?? 0
+            succeeded = c.lenient(Int.self, .succeeded) ?? 0
+            halted = c.lenient(Int.self, .halted) ?? 0
+            detail = c.lenient(String.self, .detail)
+        }
+    }
+
+    public var result: Outcome?
+    public var state: FleetState?
+
+    private enum CodingKeys: String, CodingKey { case result, state }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        result = c.lenient(Outcome.self, .result)
+        state = c.lenient(FleetState.self, .state)
+    }
+}

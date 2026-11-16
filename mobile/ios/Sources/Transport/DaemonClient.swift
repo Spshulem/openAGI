@@ -556,6 +556,17 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetCardActResult.self, from: data)
     }
 
+    public func fleetBatchCards(op: String, filter: String? = nil) async throws -> FleetBatchCardsResult {
+        var request = try authorizedRequest(path: "/fleet/api/cards/batch", method: "POST")
+        var body: [String: Any] = ["op": op]
+        if let filter { body["filter"] = filter }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetBatchCardsResult.self, from: data)
+    }
+
     public func fleetUpdatePreferences(cadence: String? = nil, mergePolicy: String? = nil,
                                        choice: String? = nil, vetoSlice: String? = nil,
                                        vetoActionID: String? = nil) async throws -> FleetState {

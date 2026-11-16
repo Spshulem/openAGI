@@ -18,6 +18,7 @@ struct SupervisorView: View {
     @State private var confirmAuto = false
     @State private var busyCardID: String?
     @State private var busyQuestionID: String?
+    @State private var batchBusy = false
     @State private var questionNote: (id: String, note: SupervisorFormat.Note)?
     @State private var busyActionID: String?
     @State private var actionNote: (id: String, note: SupervisorFormat.Note)?
@@ -266,6 +267,23 @@ struct SupervisorView: View {
         .accessibilityIdentifier("supervisor-active-sessions-pill")
     }
 
+    private var greenMergeableCount: Int {
+        cards.filter { c in
+            guard c.prRef != nil, c.kind == "merge_ready" || c.kind == "pr_ready" else { return false }
+            guard c.primaryAction?.op == "merge", c.primaryAction?.label == "Merge PR" else { return false }
+            let ci = (c.ciState ?? "").uppercased()
+            if ["FAILURE", "ERROR", "PENDING", "IN_PROGRESS"].contains(ci) { return false }
+            if (c.mergeState ?? "").uppercased() == "DIRTY" { return false }
+            return true
+        }.count
+    }
+
+    private var routineQuestionCount: Int {
+        cards.filter { c in
+            c.kind != "merge_ready" && c.kind != "pr_ready" && c.kind != "ci_failed"
+        }.count
+    }
+
     private var overflowMenu: some View {
         Menu {
             let isScanning = scanning || state?.running == true
@@ -273,6 +291,20 @@ struct SupervisorView: View {
                 Task { await scan() }
             }
             .disabled(isScanning)
+
+            if greenMergeableCount > 0 {
+                Button("Merge green PRs (\(greenMergeableCount))", systemImage: "arrow.triangle.merge") {
+                    Task { await batchAct(op: "merge_green", filter: "green_prs") }
+                }
+                .disabled(batchBusy || busyCardID != nil)
+            }
+
+            if routineQuestionCount >= 2 {
+                Button("Later all questions (\(routineQuestionCount))", systemImage: "clock") {
+                    Task { await batchAct(op: "defer", filter: "questions") }
+                }
+                .disabled(batchBusy || busyCardID != nil)
+            }
 
             Button("Active sessions & search", systemImage: "magnifyingglass") {
                 activeSheet = .sessions
@@ -595,6 +627,27 @@ struct SupervisorView: View {
             accept(nextSequence(), fresh)
         } catch let error as DaemonError {
             statusNote = .init(text: SupervisorFormat.errorCopy(error).headline, isAlert: true)
+        } catch {
+            statusNote = .init(text: "Can't reach OpenAGI.", isAlert: true)
+        }
+    }
+
+    private func batchAct(op: String, filter: String? = nil) async {
+        guard !batchBusy && busyCardID == nil else { return }
+        batchBusy = true
+        statusNote = nil
+        defer { batchBusy = false }
+        do {
+            let res = try await model.client.fleetBatchCards(op: op, filter: filter)
+            if let fresh = res.state {
+                accept(nextSequence(), fresh)
+            } else {
+                await refresh()
+            }
+            let detail = res.result?.detail ?? "Batch action completed."
+            statusNote = .init(text: detail, isAlert: res.result?.ok == false)
+        } catch let error as DaemonError {
+            statusNote = SupervisorFormat.failureNote(error)
         } catch {
             statusNote = .init(text: "Can't reach OpenAGI.", isAlert: true)
         }
