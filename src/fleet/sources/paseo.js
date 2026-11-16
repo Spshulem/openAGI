@@ -64,46 +64,45 @@ function extractPaseoPendingCard(agent) {
   const perms = Array.isArray(agent?.pendingPermissions) ? agent.pendingPermissions : [];
   const questionPerms = perms.filter((p) => p && typeof p === "object" && p.kind === "question");
   if (questionPerms.length > 0) {
+    const perm = questionPerms[0];
     const items = [];
-    for (const perm of questionPerms) {
-      const permKey = String(perm.id || "perm");
-      const pQuestions = Array.isArray(perm.input?.questions) ? perm.input.questions : [];
-      if (pQuestions.length > 0) {
-        for (let qIdx = 0; qIdx < pQuestions.length; qIdx += 1) {
-          const q = pQuestions[qIdx];
-          const qText = String(q?.question ?? q?.title ?? "").trim();
-          if (!qText) continue;
-          items.push(cleanCardItem({
-            index: items.length,
-            itemId: `${permKey}:${String(q?.id ?? qIdx)}`,
-            header: q?.header ?? null,
-            question: qText,
-            options: Array.isArray(q?.options)
-              ? q.options.map((opt) => (typeof opt === "string" ? opt : opt?.label ?? opt?.value ?? "")).filter(Boolean)
-              : [],
-            multiSelect: Boolean(q?.multiSelect),
-            freeText: q?.freeText !== false,
-            at: agent.updatedAt ?? null
-          }));
-        }
-      } else if (String(perm.description ?? perm.input?.prompt ?? "").trim()) {
+    const permKey = String(perm.id || "perm");
+    const pQuestions = Array.isArray(perm.input?.questions) ? perm.input.questions : [];
+    if (pQuestions.length > 0) {
+      for (let qIdx = 0; qIdx < pQuestions.length; qIdx += 1) {
+        const q = pQuestions[qIdx];
+        const qText = String(q?.question ?? q?.title ?? "").trim();
+        if (!qText) continue;
         items.push(cleanCardItem({
           index: items.length,
-          itemId: permKey,
-          header: perm.title ?? null,
-          question: String(perm.description ?? perm.input?.prompt ?? "").trim(),
-          options: [],
-          multiSelect: false,
-          freeText: true,
+          itemId: `${permKey}:${String(q?.id ?? qIdx)}`,
+          header: q?.header ?? null,
+          question: qText,
+          options: Array.isArray(q?.options)
+            ? q.options.map((opt) => (typeof opt === "string" ? opt : opt?.label ?? opt?.value ?? "")).filter(Boolean)
+            : [],
+          multiSelect: Boolean(q?.multiSelect),
+          freeText: q?.freeText !== false,
           at: agent.updatedAt ?? null
         }));
       }
+    } else if (String(perm.description ?? perm.input?.prompt ?? "").trim()) {
+      items.push(cleanCardItem({
+        index: items.length,
+        itemId: permKey,
+        header: perm.title ?? null,
+        question: String(perm.description ?? perm.input?.prompt ?? "").trim(),
+        options: [],
+        multiSelect: false,
+        freeText: true,
+        at: agent.updatedAt ?? null
+      }));
     }
     if (items.length > 0) {
       return {
         app: "paseo",
-        cardId: String(questionPerms[0].id ?? `paseo-${agent.id}`),
-        requestId: String(questionPerms[0].id ?? ""),
+        cardId: String(perm.id ?? `paseo-${agent.id}`),
+        requestId: String(perm.id ?? ""),
         at: items[0].at ?? agent.updatedAt ?? null,
         count: items.length,
         items

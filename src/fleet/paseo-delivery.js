@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { writeJsonAtomic } from "../file-utils.js";
+import { clampText, redactSecrets } from "./contracts.js";
 import { withPaseo, hostApi } from "./sources/paseo.js";
 
 const active = new Set();
@@ -268,10 +269,15 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         }
         if (!/^(?:opened|open thread)$/i.test(cleanReply)) {
           const actions = Array.isArray(targetPerm.actions) ? targetPerm.actions : [];
-          const exactAction = actions.find((a) => String(a?.label ?? "").trim().toLowerCase() === cleanReply.toLowerCase());
+          const replyLower = cleanReply.toLowerCase();
+          const exactAction = actions.find((a) => {
+            const full = redactSecrets(String(a?.label ?? "")).trim().toLowerCase();
+            const clamped = clampText(redactSecrets(String(a?.label ?? "")), 40).trim().toLowerCase();
+            return full === replyLower || clamped === replyLower;
+          });
           const isAffirmative = exactAction
             ? exactAction.behavior === "allow"
-            : /^(?:allow(?:\s+once|\s+always)?|approve|approved|yes|proceed|go ahead|ok|okay)$/i.test(cleanReply);
+            : /^(?:allow\b|approve\b|approved$|yes$|proceed$|go ahead$|ok$|okay$)/i.test(cleanReply);
           if (isAffirmative) {
             const allowAction = exactAction ?? actions.find((a) => a?.behavior === "allow");
             await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {

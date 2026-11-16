@@ -2017,6 +2017,74 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     const suggestionCard = buildSupervisorCard(supervisor.questionView(suggestionQ, new Map()));
     assert.equal(suggestionCard.canReply, false);
     assert.deepEqual(suggestionCard.suggestedReplies, []);
+
+    // (g) Truncated 40+ char Paseo permission action label matches original action and approves instead of denying
+    const longActionAgent = {
+      id: "agent-long-perm",
+      cwd: "/workspace/bb",
+      status: "idle",
+      updatedAt: "2026-11-16T03:20:00.000Z",
+      pendingPermissions: [{
+        id: "perm_long_1",
+        kind: "tool",
+        name: "bash",
+        actions: [
+          { id: "act_allow_session", label: "Allow this command for the rest of this session", behavior: "allow" },
+          { id: "act_deny_session", label: "Deny this command", behavior: "deny" }
+        ]
+      }]
+    };
+    const longActionThread = paseoThread(longActionAgent, "srv_bb3", []);
+    const truncatedLabel = longActionThread.meta.pendingPermission.actions[0].label;
+    assert.ok(truncatedLabel.length <= 40);
+    let longCaptured = null;
+    const longRes = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: longActionThread,
+      text: `[OpenAGI supervisor] Owner answer: ${truncatedLabel}. Continue with that.`,
+      store: supervisor.store,
+      actionId: "act_long_allow",
+      base: { playbook: "owner-answer", messageHash: "h_long" },
+      ownerChoice: truncatedLabel,
+      expectedPermissionId: "perm_long_1",
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async (_aid, reqId, resp) => { longCaptured = { reqId, resp }; },
+        agents: { ref: () => ({ refresh: async () => {}, current: () => longActionAgent }) }
+      })
+    });
+    assert.equal(longRes.status, "sent");
+    assert.deepEqual(longCaptured, {
+      reqId: "perm_long_1",
+      resp: { behavior: "allow", selectedActionId: "act_allow_session" }
+    });
+
+    // (h) Live CI failure overrides cached green review recommendation
+    const ciRegressedCard = buildSupervisorCard(supervisor.store.question(storedExecQ.id), {
+      prsByKey: new Map([["buildbetter-app/buildbetter#9637", {
+        ref: "buildbetter-app/buildbetter#9637",
+        state: "OPEN",
+        isDraft: false,
+        title: "fix(calendar-worker): renew visibility during attendee CRM backfills",
+        ci: { state: "FAILURE", failing: ["unit-tests"], pending: [] },
+        mergeState: "CLEAN"
+      }]])
+    });
+    assert.equal(ciRegressedCard.kind, "ci_failed");
+    assert.match(ciRegressedCard.recommendation, /CI failed/i);
+
+    // (i) Separate pending question permissions stay scoped to one permission request per card
+    const twoPermsThread = paseoThread({
+      ...permissionQuestionAgent,
+      pendingPermissions: [
+        { id: "perm_sep_1", kind: "question", input: { questions: [{ id: "0", header: "Question 1", question: "First request?" }] } },
+        { id: "perm_sep_2", kind: "question", input: { questions: [{ id: "0", header: "Question 1", question: "Second request?" }] } }
+      ]
+    }, "srv_bb3", []);
+    assert.equal(twoPermsThread.meta.pendingCard.requestId, "perm_sep_1");
+    assert.equal(twoPermsThread.meta.pendingCard.items.length, 1);
   } finally {
     cleanup();
   }

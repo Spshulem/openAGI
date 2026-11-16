@@ -249,22 +249,26 @@ function activeReviewBrief(question) {
 }
 
 function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
-  const rb = activeReviewBrief(question);
-  if (rb?.recommendation) {
-    return clampText(redactSecrets(rb.recommendation), 220);
-  }
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
-  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
+  const mergeDirty = prMeta?.mergeState === "DIRTY" || row?.pr?.mergeState === "DIRTY";
+  const mergeReadyAsk = isMergeReadyQuestion(question, row, prRef, prMeta);
+  if (mergeReadyAsk) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
     }
-    if (prMeta?.mergeState === "DIRTY" || row?.pr?.mergeState === "DIRTY") {
+    if (mergeDirty) {
       return "Pull request has merge conflicts with the base branch. Have the coding session rebase before merging.";
     }
     if (ci === "PENDING" || ci === "IN_PROGRESS") {
-      return "Checks are still running. Auto-merge is off by default—tap Watch CI to get pinged when green.";
+      return "Checks are still running. Auto-merge is off by default; tap Watch CI to get pinged when green.";
     }
+  }
+  const rb = activeReviewBrief(question);
+  if (rb?.recommendation) {
+    return clampText(redactSecrets(rb.recommendation), 220);
+  }
+  if (mergeReadyAsk) {
     const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
     const gatePass = Array.isArray(prMeta?.gates) && prMeta.gates.length > 0 && prMeta.gates.every((g) => g.state === "SUCCESS")
       ? ` · ${prMeta.gates.map((g) => g.label).join(", ")} green`
@@ -317,16 +321,18 @@ function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle =
     fallbackDecision = headline;
   }
 
+  const liveMergeBlocked = kind === "ci_failed"
+    || (kind === "merge_ready" && (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS"));
   return {
     context: rb?.context ? clampText(redactSecrets(rb.context), 240) : (fallbackContext ? redactSecrets(fallbackContext) : null),
     whatChanged: rb?.whatChanged ? clampTextLines(redactSecrets(rb.whatChanged), 520) : (fallbackWhatChanged ? redactSecrets(fallbackWhatChanged) : null),
-    decision: rb?.decision ? clampText(redactSecrets(rb.decision), 260) : redactSecrets(fallbackDecision || "Needs your decision.")
+    decision: (!liveMergeBlocked && rb?.decision) ? clampText(redactSecrets(rb.decision), 260) : redactSecrets(fallbackDecision || "Needs your decision.")
   };
 }
 
 function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
   if (!canReply || kind === "preference") return [];
-  const rb = activeReviewBrief(question);
+  const rb = kind === "ci_failed" ? null : activeReviewBrief(question);
   if (Array.isArray(rb?.suggestedReplies) && rb.suggestedReplies.length > 0) {
     return rb.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
   }

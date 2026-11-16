@@ -155,7 +155,10 @@ function questionPrRefs(question, threads) {
 export function reviewFingerprint(question, { threads = new Map(), prs = new Map() } = {}) {
   const asked = question?.askedAs ?? { title: question?.title, options: question?.options };
   const activity = questionKeys(question).map((key) => threads.get(key)?.lastActivityAt ?? null);
-  const prStates = questionPrRefs(question, threads).map((ref) => `${ref}:${prs.get(ref)?.state ?? "?"}`);
+  const prStates = questionPrRefs(question, threads).map((ref) => {
+    const pr = prs.get(ref);
+    return `${ref}:${pr?.state ?? "?"}:${pr?.ci?.state ?? ""}:${pr?.mergeState ?? ""}:${String(pr?.headOid ?? "").slice(0, 10)}`;
+  });
   return shortHash(JSON.stringify([asked.title ?? "", question?.body ?? "", asked.options ?? [], activity, prStates]));
 }
 
