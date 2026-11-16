@@ -91,7 +91,7 @@ function isObject(value) {
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
-  for (const [key, value] of Object.entries(meta).slice(0, 8)) {
+  for (const [key, value] of Object.entries(meta).slice(0, 12)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
   }
@@ -513,7 +513,7 @@ export class FleetStore {
   // The review kept an open question. A rewrite changes the same record
   // (same dedupeKey), so its outreach copy updates in place; askedAs keeps
   // the policy's wording so the next tick's ask does not undo it.
-  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null } = {}) {
+  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null, brief = null, recommendation = null, suggestedReplies = null } = {}) {
     const question = this._findQuestion(id);
     if (!question || question.status !== "open") return null;
     const now = iso(this.now());
@@ -529,9 +529,21 @@ export class FleetStore {
     }
     // Kept again with nothing changed: the supervisor checks it less often.
     const streak = fingerprint && fingerprint === question.reviewFingerprint ? (question.reviewStreak ?? 0) + 1 : 0;
+    const nextBrief = (brief && typeof brief === "object") || recommendation || (Array.isArray(suggestedReplies) && suggestedReplies.length)
+      ? {
+          context: brief?.context ? clampText(redactSecrets(brief.context), 240) : (question.reviewBrief?.context ?? null),
+          whatChanged: brief?.whatChanged ? clampText(redactSecrets(brief.whatChanged), 500) : (question.reviewBrief?.whatChanged ?? null),
+          decision: brief?.decision ? clampText(redactSecrets(brief.decision), 260) : (question.reviewBrief?.decision ?? null),
+          recommendation: recommendation ? clampText(redactSecrets(recommendation), 200) : (question.reviewBrief?.recommendation ?? null),
+          suggestedReplies: Array.isArray(suggestedReplies) && suggestedReplies.length
+            ? suggestedReplies.slice(0, 4).map((item) => clampText(redactSecrets(item), 120)).filter(Boolean)
+            : (question.reviewBrief?.suggestedReplies ?? [])
+        }
+      : (question.reviewBrief ?? null);
     Object.assign(question, {
       reviewedAt: now, reviewFingerprint: fingerprint, reviewReason: clampText(reason, 160) || null, reviewCategory: category ?? null,
-      reviewStreak: streak
+      reviewStreak: streak,
+      ...(nextBrief ? { reviewBrief: nextBrief } : {})
     });
     this._save();
     return { ...question };
@@ -1085,7 +1097,7 @@ export class FleetStore {
       : (contextSnapshot ?? older.contextSnapshot);
     Object.assign(older, fields, origin, {
       ...(mergedSnap ? { contextSnapshot: mergedSnap } : {}),
-      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0, reviewBrief: null,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
       ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
     });

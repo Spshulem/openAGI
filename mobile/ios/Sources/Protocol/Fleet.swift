@@ -721,6 +721,27 @@ public struct SupervisorRecentMessage: Decodable, Sendable, Equatable, Identifia
     }
 }
 
+public struct SupervisorCardBrief: Decodable, Sendable, Equatable {
+    public var context: String?
+    public var whatChanged: String?
+    public var decision: String?
+
+    public init(context: String? = nil, whatChanged: String? = nil, decision: String? = nil) {
+        self.context = context
+        self.whatChanged = whatChanged
+        self.decision = decision
+    }
+
+    private enum CodingKeys: String, CodingKey { case context, whatChanged, decision }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        context = c.lenient(String.self, .context)
+        whatChanged = c.lenient(String.self, .whatChanged)
+        decision = c.lenient(String.self, .decision)
+    }
+}
+
 public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var id: String
     public var questionId: String?
@@ -730,6 +751,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var headline: String
     public var sessionTitle: String?
     public var summary: String?
+    public var brief: SupervisorCardBrief?
+    public var suggestedReplies: [String]
+    public var canReply: Bool
     public var agentSummary: String?
     public var recommendation: String?
     public var threadKey: String?
@@ -757,7 +781,8 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, sessionTitle: String? = nil,
-                summary: String? = nil, agentSummary: String? = nil, recommendation: String? = nil,
+                summary: String? = nil, brief: SupervisorCardBrief? = nil, suggestedReplies: [String] = [],
+                canReply: Bool? = nil, agentSummary: String? = nil, recommendation: String? = nil,
                 threadKey: String? = nil, threadKeys: [String] = [], repo: String? = nil, branch: String? = nil,
                 workspace: String? = nil, prRef: String? = nil, prUrl: String? = nil, prNumber: Int? = nil,
                 headSha: String? = nil, ciState: String? = nil, mergeState: String? = nil, noticedAt: Date? = nil,
@@ -774,6 +799,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.headline = headline
         self.sessionTitle = sessionTitle
         self.summary = summary
+        self.brief = brief
+        self.suggestedReplies = suggestedReplies
+        self.canReply = canReply ?? (threadKey != nil && threadKeys.count <= 1 && kind != "suggestion" && kind != "preference")
         self.agentSummary = agentSummary
         self.recommendation = recommendation
         self.threadKey = threadKey
@@ -801,7 +829,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, questionId, kind, kindLabel, slice, headline, sessionTitle, summary, agentSummary, recommendation
+        case id, questionId, kind, kindLabel, slice, headline, sessionTitle, summary, brief, suggestedReplies, canReply, agentSummary, recommendation
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
         case prContext, recentMessages, timeline, resources, openChat
@@ -817,10 +845,13 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         headline = c.lenient(String.self, .headline) ?? "Needs review"
         sessionTitle = c.lenient(String.self, .sessionTitle)
         summary = c.lenient(String.self, .summary)
+        brief = c.lenient(SupervisorCardBrief.self, .brief)
+        suggestedReplies = c.lenientList(String.self, .suggestedReplies)
         agentSummary = c.lenient(String.self, .agentSummary)
         recommendation = c.lenient(String.self, .recommendation)
         threadKey = c.lenient(String.self, .threadKey)
         threadKeys = c.lenientList(String.self, .threadKeys)
+        canReply = c.lenient(Bool.self, .canReply) ?? (threadKey != nil && threadKeys.count <= 1 && kind != "suggestion" && kind != "preference")
         repo = c.lenient(String.self, .repo)
         branch = c.lenient(String.self, .branch)
         workspace = c.lenient(String.self, .workspace)

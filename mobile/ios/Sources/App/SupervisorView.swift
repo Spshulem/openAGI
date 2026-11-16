@@ -843,6 +843,29 @@ private struct SupervisorCardDeckView: View {
                     .accessibilityIdentifier(contextID)
             }
 
+            if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(Array(card.suggestedReplies.prefix(3).enumerated()), id: \.offset) { _, quickReply in
+                            Button {
+                                onAct(card, SupervisorCardAction(op: "reply", label: quickReply, value: quickReply))
+                            } label: {
+                                Text(quickReply)
+                                    .font(Theme.Typography.caption)
+                                    .foregroundStyle(Theme.ink)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Theme.canvas, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isBusy)
+                        }
+                    }
+                }
+            }
+
             // Action bar
             cardActions
         }
@@ -890,18 +913,36 @@ private struct SupervisorCardDeckView: View {
                     .foregroundStyle(Theme.muted)
                     .lineLimit(1)
             }
-            if let summary = card.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty {
+            if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
+                Text(ctx)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+            let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            if let summary = mainSummary {
                 Text(MarkdownParser.inline(summary))
                     .font(Theme.Typography.secondary)
-                    .foregroundStyle(Theme.ink.opacity(0.9))
-                    .lineLimit(4)
+                    .foregroundStyle(Theme.ink.opacity(0.92))
+                    .lineLimit(5)
+                    .multilineTextAlignment(.leading)
+            }
+            if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !decision.isEmpty,
+               decision.caseInsensitiveCompare(card.headline) != .orderedSame {
+                Text("Decision: \(decision)")
+                    .font(Theme.Typography.caption.weight(.medium))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
                     .multilineTextAlignment(.leading)
             }
             if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
                 Text(rec)
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
-                    .lineLimit(1)
+                    .lineLimit(2)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1555,11 +1596,49 @@ private struct ThreadDetailSheet: View {
                     Section("Needs your decision") {
                         let decisionTitle = trimmedNonEmpty(card?.headline) ?? trimmedNonEmpty(question?.title) ?? "Decision"
                         Text(decisionTitle).font(.headline)
-                        if let text = trimmedNonEmpty(question?.body) ?? trimmedNonEmpty(card?.summary) {
+                        if let ctx = trimmedNonEmpty(card?.brief?.context) {
+                            Text(ctx).font(.footnote).foregroundStyle(.secondary)
+                        }
+                        let preferredSummary: String? = {
+                            if let briefBody = trimmedNonEmpty(card?.brief?.whatChanged) { return briefBody }
+                            let qBody = trimmedNonEmpty(question?.body)
+                            let cSum = trimmedNonEmpty(card?.summary)
+                            if let cSum, (cSum.count) > (qBody?.count ?? 0) { return cSum }
+                            return qBody ?? cSum
+                        }()
+                        if let text = preferredSummary {
                             MarkdownContent(blocks: MarkdownParser.parse(text))
+                        }
+                        if let decisionCall = trimmedNonEmpty(card?.brief?.decision),
+                           decisionCall.caseInsensitiveCompare(decisionTitle) != .orderedSame {
+                            Text("Decision needed: \(decisionCall)")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Theme.ink)
                         }
                         if let rec = trimmedNonEmpty(card?.recommendation) {
                             Text(rec).font(.footnote).foregroundStyle(.secondary)
+                        }
+
+                        if let card, card.canReply, !card.suggestedReplies.isEmpty, questionIsOpen {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 6) {
+                                    ForEach(Array(card.suggestedReplies.prefix(4).enumerated()), id: \.offset) { _, quick in
+                                        Button {
+                                            replyText = quick
+                                            replyOpen = true
+                                        } label: {
+                                            Text(quick)
+                                                .font(.caption)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 6)
+                                                .background(Theme.canvas, in: Capsule())
+                                                .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+                                        }
+                                        .buttonStyle(.plain)
+                                        .disabled(questionBusy)
+                                    }
+                                }
+                            }
                         }
 
                         if questionIsOpen {

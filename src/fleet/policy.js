@@ -488,12 +488,17 @@ function cardIntent(ctx, card) {
   const head = clampText(item.header || item.question, 50);
   const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
   const extra = item.multiSelect ? " Pick any." : "";
-  const others = items.filter((other) => other !== item).map((other) => clampText(other.header || other.question, 60));
+  const others = items.filter((other) => other !== item).map((other) => {
+    const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
+      ? (other.question || other.header)
+      : (other.header || other.question);
+    return clampText(label, 60);
+  });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
   const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
-  const rawChoices = card.app === "paseo" && item.options.length > 0 && !item.multiSelect
+  const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
     ? item.options.slice(0, 3)
     : [];
   const clampedChoices = rawChoices.map((opt) => clampText(opt, 40));
@@ -506,7 +511,8 @@ function cardIntent(ctx, card) {
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
-      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options],
+      ...(card.requestId ? { paseoPermissionId: String(card.requestId) } : {})
     },
     ...(late ? { baseKey: key } : {}),
     agentAskedAt: item.at ?? null
@@ -547,6 +553,31 @@ function agentAskIntent(ctx) {
   const ask = classified.ask ?? {};
   if (ask.card) return cardIntent(ctx, ask.card);
   if (thread.meta?.blockedOnOwner === true) {
+    const paseoPerm = thread.kind === "paseo" ? thread.meta?.pendingPermission : null;
+    if (paseoPerm && paseoPerm.id) {
+      const permWhat = paseoPerm.command
+        ? `Run \`${paseoPerm.command}\``
+        : paseoPerm.filePath
+          ? `Modify \`${paseoPerm.filePath}\``
+          : (paseoPerm.description || paseoPerm.title || paseoPerm.name || "Approve requested tool action");
+      const permLabels = Array.isArray(paseoPerm.actions) && paseoPerm.actions.length >= 2
+        ? paseoPerm.actions.slice(0, 2).map((a) => a.label).filter(Boolean)
+        : ["Allow", "Deny"];
+      return {
+        type: "ask", reason: "blocked on a permission prompt",
+        question: {
+          ...question(
+            ctx,
+            `${ctx.facts.label}: allow ${fact(paseoPerm.name || paseoPerm.kind || "tool", 24)}?`,
+            ownerExcerpt(permWhat, ctx.limits.bodyMax),
+            [...permLabels, "later"],
+            `prompt:${thread.key}:${paseoPerm.id}`,
+            "prompt"
+          ),
+          meta: { paseoPermissionId: paseoPerm.id }
+        }
+      };
+    }
     // A card the supervisor read on screen: its own buttons are the options,
     // and a tap clicks that button (supervisor.answerQuestion). A new card is
     // a new question (its stateId is in the key).
@@ -1415,9 +1446,9 @@ function agentLabel(thread) {
 export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
-  const rawWorkspace = /^wks_[0-9a-f]+$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
+  const rawWorkspace = /^(?:wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
   const rawPaseoTitle = thread.kind === "paseo" ? stripTags(thread.title) : "";
-  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+|you are working inside conductor\b.*)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
+  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|you are working inside conductor\b.*)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
   const place = fact(rawWorkspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
     || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
     || cleanPaseoTitle

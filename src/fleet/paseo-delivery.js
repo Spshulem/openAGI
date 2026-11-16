@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { writeJsonAtomic } from "../file-utils.js";
+import { clampText, redactSecrets } from "./contracts.js";
 import { withPaseo, hostApi } from "./sources/paseo.js";
 
 const active = new Set();
@@ -130,12 +131,73 @@ async function waitForPaseoTurn(ref, receipt, signal, save) {
 
 const OWNER_PLAYBOOKS = new Set(["owner-message", "owner-answer"]);
 
+function cleanOwnerPermissionReply(raw, ownerChoice = null) {
+  if (typeof ownerChoice === "string" && ownerChoice.trim()) {
+    return ownerChoice.trim();
+  }
+  const stripped = String(raw ?? "")
+    .replace(/^\[OpenAGI supervisor\]\s*/i, "")
+    .trim();
+  const wrappedAnswer = /^Owner\s+answer:\s*([\s\S]*?)\.\s+Continue with that\.\s*$/i.exec(stripped);
+  if (wrappedAnswer) return wrappedAnswer[1].trim();
+  return stripped
+    .replace(/^Owner(?:\s+(?:says|answered|answer|replied|reply|message))?:\s*/i, "")
+    .trim();
+}
+
+function buildQuestionPermissionAnswers(perm, replyText, ownerChoice = null) {
+  const clean = cleanOwnerPermissionReply(replyText, ownerChoice);
+  const questions = Array.isArray(perm?.input?.questions) ? perm.input.questions : [];
+  if (questions.length === 0) {
+    return { answers: { "Question 1": clean } };
+  }
+  if (questions.length === 1) {
+    const key = String(questions[0]?.header || "Question 1");
+    return { answers: { [key]: clean } };
+  }
+  const rawLines = clean.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const numbered = rawLines
+    .map((line) => /^(?:Q(?:uestion)?\s*)?(\d+)[.):-]\s*(.+)$/i.exec(line))
+    .filter(Boolean);
+  const byNumber = new Map(numbered.map((m) => [Number(m[1]), m[2].trim()]));
+  const useLinePosition = byNumber.size === 0 && rawLines.length === questions.length;
+  const answers = {};
+  for (let idx = 0; idx < questions.length; idx += 1) {
+    const q = questions[idx];
+    const key = String(q?.header || `Question ${idx + 1}`);
+    const specific = byNumber.get(idx + 1) ?? (useLinePosition ? rawLines[idx] : null);
+    if (!specific) {
+      return {
+        error: `This prompt has ${questions.length} questions; reply with numbered answers (1: ..., 2: ...) so every question is answered`
+      };
+    }
+    answers[key] = specific;
+  }
+  return { answers };
+}
+
+async function respondPaseoPermission(api, ref, agentId, requestId, response) {
+  if (typeof api?.respondToPermissionAndWait === "function") {
+    await api.respondToPermissionAndWait(agentId, requestId, response, 10000);
+    return;
+  }
+  if (typeof api?.respondToPermission === "function") {
+    await api.respondToPermission(agentId, requestId, response);
+    return;
+  }
+  if (typeof ref?.respondToPermission === "function") {
+    await ref.respondToPermission({ requestId, response });
+    return;
+  }
+  throw new Error("Paseo client does not support respondToPermission");
+}
+
 function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
   if (!agent || agent.archivedAt || agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "error"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
-  if (agent.cwd !== thread.meta.paseoCwd || agent.workspaceId !== thread.meta.workspaceId) return "Paseo chat changed; scan again before sending";
+  if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) return "Paseo chat changed; scan again before sending";
   if (!ownerInitiated && agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
   return null;
 }
@@ -144,7 +206,7 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
 // Refresh immediately before dispatch; steer is preferable to interrupt if a
 // turn starts concurrently. Paseo may fall back to interruption when steering
 // is unsupported: its public API does not offer an atomic idle-only send.
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory }) {
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   if (!config?.paseo?.enabled || thread?.kind !== "paseo" || thread.excluded) return blocked("Paseo delivery is not enabled for this chat");
@@ -175,6 +237,64 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       await ref.refresh();
       signal.throwIfAborted();
       const agent = ref.current();
+      const livePerms = Array.isArray(agent?.pendingPermissions) ? agent.pendingPermissions : [];
+      const scannedPermId = expectedPermissionId
+        ?? thread?.meta?.pendingPermission?.id
+        ?? thread?.meta?.pendingCard?.requestId
+        ?? null;
+      if (ownerInitiated && expectedPermissionId && !livePerms.some((p) => p && String(p.id) === String(expectedPermissionId))) {
+        return blocked("Paseo permission changed; scan again before sending");
+      }
+      if (ownerInitiated && agent && !agent.archivedAt && agent.status !== "closed" && livePerms.length > 0) {
+        if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) {
+          return blocked("Paseo chat changed; scan again before sending");
+        }
+        if (!scannedPermId) {
+          return blocked("Paseo chat requires owner permission; scan again before sending");
+        }
+        const targetPerm = livePerms.find((p) => p && String(p.id) === String(scannedPermId));
+        if (!targetPerm) {
+          return blocked("Paseo permission changed; scan again before sending");
+        }
+        const cleanReply = cleanOwnerPermissionReply(text, ownerChoice);
+        if (!cleanReply) return blocked("Empty permission response");
+        if (targetPerm.kind === "question") {
+          const parsedAnswers = buildQuestionPermissionAnswers(targetPerm, text, ownerChoice);
+          if (parsedAnswers.error) return blocked(parsedAnswers.error);
+          await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {
+            behavior: "allow",
+            updatedInput: { answers: parsedAnswers.answers }
+          });
+          return { status: "sent", route: "paseo-send", actionId, detail: "Answered Paseo question directly" };
+        }
+        if (!/^(?:opened|open thread)$/i.test(cleanReply)) {
+          const actions = Array.isArray(targetPerm.actions) ? targetPerm.actions : [];
+          const replyLower = cleanReply.toLowerCase();
+          const exactAction = actions.find((a) => {
+            const full = redactSecrets(String(a?.label ?? "")).trim().toLowerCase();
+            const clamped = clampText(redactSecrets(String(a?.label ?? "")), 40).trim().toLowerCase();
+            return full === replyLower || clamped === replyLower;
+          });
+          const isAffirmative = exactAction
+            ? exactAction.behavior === "allow"
+            : /^(?:allow\b|approve\b|approved$|yes$|proceed$|go ahead$|ok$|okay$)/i.test(cleanReply);
+          if (isAffirmative) {
+            const allowAction = exactAction ?? actions.find((a) => a?.behavior === "allow");
+            await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {
+              behavior: "allow",
+              ...(allowAction?.id ? { selectedActionId: String(allowAction.id) } : {})
+            });
+            return { status: "sent", route: "paseo-send", actionId, detail: "Approved Paseo permission prompt" };
+          }
+          const denyAction = exactAction ?? actions.find((a) => a?.behavior === "deny");
+          await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {
+            behavior: "deny",
+            ...(denyAction?.id ? { selectedActionId: String(denyAction.id) } : {}),
+            message: cleanReply
+          });
+          return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
+        }
+      }
       const preflight = ineligibleAgent(agent, thread, { ownerInitiated });
       if (preflight) return blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: 1 });
