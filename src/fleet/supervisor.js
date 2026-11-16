@@ -2035,7 +2035,7 @@ export class FleetSupervisor {
   }
 
   async inspectRepoStatus(options = {}) {
-    return inspectRepoStatus(this, options);
+    return inspectRepoStatus(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
   }
 
   async startPaseoSession(options = {}) {

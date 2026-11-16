@@ -617,4 +617,185 @@ test("review regressions: batch filter preserves op, strict batch validation, ST
   assert.equal(remoteTranscript.key, "paseo:srv_mac.rec-sleep-3");
   assert.equal(remoteTranscript.messages.length, 3);
   assert.match(remoteTranscript.messages.at(-1).text, /acme\/recorder-app#427/);
+
+  // 7. RemoteFleetSupervisor.batchActCards processes locally owned selfFixHub cards alongside remote cards
+  const remoteQ = sup.store.upsertQuestion({
+    dedupeKey: "ask:remote-1",
+    kind: "decision",
+    threadKey: "paseo:srv_mac.rec-live-1",
+    title: "Remote question",
+    body: "Pick remote option?",
+    options: ["Option A", "later"]
+  });
+  const localQ1 = remoteSup.selfFixHub.store.upsertQuestion({
+    dedupeKey: "self-fix:1",
+    kind: "suggestion",
+    title: "Local self-fix 1",
+    body: "Apply local fix 1?",
+    options: ["Fix it", "dismiss"]
+  });
+  const localQ2 = remoteSup.selfFixHub.store.upsertQuestion({
+    dedupeKey: "self-fix:2",
+    kind: "suggestion",
+    title: "Local self-fix 2",
+    body: "Apply local fix 2?",
+    options: ["Fix it", "dismiss"]
+  });
+  await remoteSup.refresh();
+  assert.equal(remoteSup.getState().cards.length, 3);
+
+  const explicitLocalBatch = await remoteSup.batchActCards({ op: "defer", cardIds: [localQ1.id] });
+  assert.equal(explicitLocalBatch.ok, true);
+  assert.equal(explicitLocalBatch.total, 1);
+  assert.equal(explicitLocalBatch.succeeded, 1);
+  assert.equal(remoteSup.selfFixHub.store.question(localQ1.id).status, "dismissed");
+
+  const combinedFilterBatch = await remoteSup.batchActCards({ op: "defer", filter: "questions" });
+  assert.equal(combinedFilterBatch.ok, true);
+  assert.equal(combinedFilterBatch.total, 2);
+  assert.equal(combinedFilterBatch.succeeded, 2);
+  assert.equal(sup.store.question(remoteQ.id).status, "dismissed");
+  assert.equal(remoteSup.selfFixHub.store.question(localQ2.id).status, "dismissed");
+  assert.equal(remoteSup.getState().cards.length, 0);
+});
+
+test("Round 2 review regressions: migrated alias dedupe and local git origin host verification", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-coord-r2-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sharedName = "shared-checkout";
+  const sameLocalPath = path.join(dir, sharedName);
+  fs.mkdirSync(sameLocalPath, { recursive: true });
+
+  let localGitProbes = 0;
+  const aliasFactory = () => {
+    const selfAgents = [
+      {
+        id: "paseo-mig-1",
+        title: "Migrated session",
+        cwd: "/home/dev/Dev/alpha-service",
+        status: "idle",
+        provider: "codex",
+        persistence: { sessionId: "legacy-codex-1" },
+        updatedAt: "2026-11-16T16:10:00Z"
+      }
+    ];
+    const remoteAgents = [
+      {
+        id: "remote-shared-1",
+        title: "Remote session with colliding path",
+        cwd: sameLocalPath,
+        status: "idle",
+        provider: "claude",
+        updatedAt: "2026-11-16T16:12:00Z"
+      }
+    ];
+    const makeApi = (agents) => ({
+      agents: {
+        list: async () => ({ entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false } }),
+        ref: (id) => ({
+          timeline: {
+            refetch: async () => ({ agent: agents.find((a) => a.id === id), entries: [] })
+          }
+        })
+      }
+    });
+    return {
+      connect: async () => {},
+      close: async () => {},
+      ...makeApi(selfAgents),
+      hosts: {
+        list: async () => ({
+          self: { serverId: "srv_self", label: "linux-box" },
+          hosts: [{ serverId: "srv_remote", label: "remote-mac", enabled: true, status: "online" }]
+        }),
+        client: (id) => (id === "srv_remote" ? makeApi(remoteAgents) : makeApi(selfAgents))
+      }
+    };
+  };
+
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    config: resolveFleetConfig({}, {
+      enabled: true,
+      mode: "propose",
+      paseo: { enabled: true },
+      review: { enabled: false },
+      storage: { enabled: false }
+    }),
+    deps: {
+      paseoFactory: aliasFactory,
+      run: async (bin, args) => {
+        const joined = `${bin} ${args.join(" ")}`;
+        if (bin === "git" && args.includes("get-url")) {
+          localGitProbes += 1;
+          return { code: 0, stdout: "https://github.com/wrong-local-owner/shared-checkout.git\n", stderr: "" };
+        }
+        if (joined.includes("search repos shared-checkout")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([{ fullName: "remote-org/shared-checkout", updatedAt: "2026-11-16T16:00:00Z" }]),
+            stderr: ""
+          };
+        }
+        if (joined.includes("pr list --repo remote-org/shared-checkout --state open")) {
+          return { code: 0, stdout: "[]", stderr: "" };
+        }
+        if (joined.includes("pr list --repo acme/alpha-service --state open")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                number: 77,
+                title: "feat: alpha",
+                headRefName: "feat/alpha-77",
+                baseRefName: "main",
+                isDraft: false,
+                mergeStateStatus: "CLEAN",
+                reviewDecision: "APPROVED",
+                statusCheckRollup: [],
+                updatedAt: "2026-11-16T16:05:00Z",
+                url: "https://github.com/acme/alpha-service/pull/77"
+              }
+            ]),
+            stderr: ""
+          };
+        }
+        if (joined.includes("--state merged") || joined.includes("release list")) {
+          return { code: 0, stdout: "[]", stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      }
+    }
+  });
+
+  // Seed legacy migrated row alongside Paseo replacement
+  sup.lastThreads.set("codex:legacy-codex-1", {
+    key: "codex:legacy-codex-1",
+    kind: "codex",
+    title: "Migrated session",
+    cwd: "/home/dev/Dev/alpha-service",
+    repo: "acme/alpha-service",
+    branch: "feat/alpha-77",
+    prRefs: ["acme/alpha-service#77"],
+    agentStatus: "idle",
+    excluded: "paseo-migrated",
+    lastActivityAt: "2026-11-16T16:09:00Z"
+  });
+
+  const ws = await sup.listWorkspaces({ query: "alpha-service" });
+  assert.equal(ws.workspaces.length, 1);
+  assert.equal(ws.workspaces[0].counts.total, 1, "migrated legacy row collapsed into Paseo session");
+  assert.equal(ws.workspaces[0].hosts.length, 1, "no false local+Paseo multi-host count");
+  assert.equal(ws.workspaces[0].overlaps.length, 0, "no false same_pr or multi_host overlap warning");
+
+  const alphaRepo = await sup.inspectRepoStatus({ workspace: "alpha-service" });
+  assert.equal(alphaRepo.repo, "acme/alpha-service");
+  assert.equal(alphaRepo.openPrs[0].linkedSessions.length, 1, "linkedSessions collapses migrated alias");
+  assert.equal(alphaRepo.openPrs[0].overlapping, false);
+
+  // Discover remote session into knownThreads via listWorkspaces, then verify inspectRepoStatus skips local git probe
+  await sup.listWorkspaces({ query: sharedName });
+  const sharedStatus = await sup.inspectRepoStatus({ workspace: sharedName });
+  assert.equal(localGitProbes, 0, "must never run local git remote probe for remote Paseo host path");
+  assert.equal(sharedStatus.repo, "remote-org/shared-checkout");
 });

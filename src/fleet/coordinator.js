@@ -19,7 +19,7 @@ import {
 } from "./contracts.js";
 import { readThreadConversation } from "./conversation.js";
 import { collectArchiveThreads } from "./search.js";
-import { hostApi, paseoThread, withPaseo } from "./sources/paseo.js";
+import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
 
 const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
 const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
@@ -107,12 +107,59 @@ function mergeDiscoveredIntoKnown(supervisor, thread) {
   return supervisor.recordDiscoveredThread(thread);
 }
 
+// Collapses legacy Codex/Claude/Conductor/Antigravity rows that are already
+// represented by a Paseo session (either via `excluded === "paseo-migrated"`
+// or matching `meta.aliases`) so coordinator session counts, host ownership,
+// PR links, and overlap warnings never double-count one physical session.
+function collapseMigratedThreads(threads) {
+  const list = [...threads].filter((t) => t?.key);
+  const paseoByKey = new Map();
+  const aliasOwnerKey = new Map();
+
+  for (const t of list) {
+    if (t.kind !== "paseo") continue;
+    const copy = {
+      ...t,
+      prRefs: [...(t.prRefs ?? [])],
+      meta: { ...(t.meta ?? {}), aliases: [...(t.meta?.aliases ?? [])] }
+    };
+    paseoByKey.set(copy.key, copy);
+    for (const alias of copy.meta.aliases) {
+      if (alias) aliasOwnerKey.set(alias, copy.key);
+    }
+  }
+
+  const out = [];
+  for (const t of list) {
+    if (t.kind === "paseo") continue;
+    const ownerKey = aliasOwnerKey.get(t.key)
+      ?? (t.claudeSessionId ? aliasOwnerKey.get(`claude:${t.claudeSessionId}`) : null)
+      ?? (t.meta?.claudeKey ? aliasOwnerKey.get(t.meta.claudeKey) : null)
+      ?? null;
+    if (ownerKey && paseoByKey.has(ownerKey)) {
+      const owner = paseoByKey.get(ownerKey);
+      owner.prRefs = [...new Set([...(owner.prRefs ?? []), ...(t.prRefs ?? [])])];
+      owner.repo = owner.repo ?? t.repo ?? null;
+      if (!owner.branch && t.branch && owner.meta?.isLocalHost !== false) {
+        owner.branch = t.branch;
+      }
+      if (!owner.meta.aliases.includes(t.key)) owner.meta.aliases.push(t.key);
+      continue;
+    }
+    if (t.excluded === "paseo-migrated") continue;
+    out.push(t);
+  }
+
+  return [...paseoByKey.values(), ...out];
+}
+
 async function fetchPaseoHostInventory(config, { includeArchived = false, factory } = {}) {
   if (!config?.paseo?.enabled) return { hosts: [], threads: [], emptyWorkspaces: [] };
   const inventoryConfig = {
     ...config,
     paseo: { ...config.paseo, timeoutMs: Math.min(config.paseo.timeoutMs ?? 25_000, 25_000) }
   };
+  const selfIsLocal = isLocalPaseoUrl(inventoryConfig.paseo?.url);
   return withPaseo(inventoryConfig, async (client, signal) => {
     const directory = await client.hosts.list();
     const selfId = directory?.self?.serverId ?? "local";
@@ -168,6 +215,7 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
           const row = paseoThread(agent, host.serverId, [], true);
           row.meta.hostLabel = host.label;
           row.meta.rawStatus = agent.status ?? "idle";
+          row.meta.isLocalHost = Boolean(selfIsLocal && host.serverId === selfId);
           threads.push(row);
         }
         if (!res?.pageInfo?.hasMore) break;
@@ -260,12 +308,15 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     group.hostsMap.set(ws.serverId, hostBucket);
   }
 
-  for (const thread of byKey.values()) {
+  for (const thread of collapseMigratedThreads(byKey.values())) {
     if (!thread?.key) continue;
     const cwd = thread.meta?.paseoCwd ?? thread.cwd ?? null;
+    const cardRefs = [thread.key, ...(thread.meta?.aliases ?? [])]
+      .map((k) => cardPrByThread.get(k))
+      .filter(Boolean);
     const prRefs = [...new Set([
       ...(thread.prRefs ?? []),
-      ...(cardPrByThread.has(thread.key) ? [cardPrByThread.get(thread.key)] : [])
+      ...cardRefs
     ].filter(Boolean))];
     const info = deriveProjectInfo({ cwd, workspace: thread.workspace, repo: thread.repo, prRefs });
     const group = ensureGroup(info);
@@ -588,17 +639,18 @@ function summarizeStatusRollup(rollup) {
   };
 }
 
-async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin }) {
+async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin, factory }) {
   const rawRepo = typeof repo === "string" ? repo.trim().replace(/^https:\/\/github\.com\//i, "").replace(/\/+$/, "") : "";
   if (REPO_SLUG_RE.test(rawRepo)) return rawRepo;
 
   const targetName = (rawRepo || String(workspace ?? "").trim()).toLowerCase();
   if (!targetName) throw new Error("Provide repo ('owner/name') or workspace name (e.g. 'bb-recorder').");
 
-  const allThreads = [
-    ...(supervisor?.lastThreads?.values?.() ?? []),
-    ...(supervisor?.knownThreads?.values?.() ?? [])
-  ];
+  const mergedThreadMap = new Map([
+    ...(supervisor?.knownThreads ?? []),
+    ...(supervisor?.lastThreads ?? [])
+  ]);
+  const allThreads = collapseMigratedThreads(mergedThreadMap.values());
   const state = supervisor?.getState?.() ?? {};
   const candidateRepos = new Map();
   const noteRepo = (slug) => {
@@ -628,12 +680,45 @@ async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin }) 
     return [...candidateRepos.entries()].sort((a, b) => b[1] - a[1])[0][0];
   }
 
-  // Probe local checkout git remote if a matching cwd exists on this host.
+  // Probe local checkout git remote ONLY for paths verified to belong to this computer.
+  let localPaseoServerId;
+  const resolveLocalPaseoServerId = async () => {
+    if (localPaseoServerId !== undefined) return localPaseoServerId;
+    if (!supervisor?.config?.paseo?.enabled || !isLocalPaseoUrl(supervisor.config.paseo?.url)) {
+      localPaseoServerId = null;
+      return null;
+    }
+    try {
+      const probeCfg = {
+        ...supervisor.config,
+        paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 5000, 5000) }
+      };
+      localPaseoServerId = await withPaseo(probeCfg, async (client) => (await client.hosts.list())?.self?.serverId ?? null, factory);
+    } catch {
+      localPaseoServerId = null;
+    }
+    return localPaseoServerId;
+  };
+
   for (const t of allThreads) {
-    const cwd = t?.meta?.paseoCwd ?? t?.cwd ?? null;
+    const cwd = t?.kind === "paseo" ? (t?.meta?.paseoCwd ?? null) : (t?.cwd ?? null);
     if (!cwd) continue;
     const info = deriveProjectInfo({ cwd, workspace: t?.workspace });
     if (info.key !== targetName) continue;
+
+    let ownedLocally = t?.kind !== "paseo";
+    if (t?.kind === "paseo") {
+      if (t.meta?.isLocalHost === true) {
+        ownedLocally = true;
+      } else if (t.meta?.isLocalHost === false) {
+        ownedLocally = false;
+      } else if (t.meta?.serverId) {
+        const selfId = await resolveLocalPaseoServerId();
+        ownedLocally = Boolean(selfId && t.meta.serverId === selfId);
+      }
+    }
+    if (!ownedLocally) continue;
+
     try {
       if (fs.existsSync(cwd)) {
         const gitRes = await runImpl("git", ["-C", cwd, "remote", "get-url", "origin"], { timeoutMs: 4000 });
@@ -666,11 +751,11 @@ async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin }) 
   throw new Error(`Could not resolve GitHub owner/repo for "${clampText(rawRepo || workspace, 80)}". Pass repo as "owner/name".`);
 }
 
-export async function inspectRepoStatus(supervisor, { repo = null, workspace = null, limit = 15, run = null } = {}) {
+export async function inspectRepoStatus(supervisor, { repo = null, workspace = null, limit = 15, run = null, factory = null } = {}) {
   const runImpl = run ?? supervisor?.deps?.run ?? runCommand;
   const ghBin = supervisor?.config?.bins?.gh ?? "gh";
   const maxOpen = Math.min(30, Math.max(1, Number(limit) || 15));
-  const resolvedRepo = await resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin });
+  const resolvedRepo = await resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin, factory });
 
   const [openRes, mergedRes, releaseRes] = await Promise.all([
     runImpl(
@@ -710,14 +795,16 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
   try { if (mergedRes.code === 0) rawMerged = JSON.parse(mergedRes.stdout || "[]"); } catch { rawMerged = []; }
   try { if (releaseRes.code === 0) rawReleases = JSON.parse(releaseRes.stdout || "[]"); } catch { rawReleases = []; }
 
-  const allThreads = new Map([
-    ...(supervisor?.knownThreads ?? []),
-    ...(supervisor?.lastThreads ?? [])
-  ]);
+  const allThreads = collapseMigratedThreads(
+    new Map([
+      ...(supervisor?.knownThreads ?? []),
+      ...(supervisor?.lastThreads ?? [])
+    ]).values()
+  );
 
   const matchSessionsForPr = (prRef, headRef) => {
     const linked = [];
-    for (const t of allThreads.values()) {
+    for (const t of allThreads) {
       if (!t?.key || t.archived) continue;
       const refs = t.prRefs ?? [];
       const samePr = refs.includes(prRef);
@@ -987,14 +1074,11 @@ const VALID_BATCH_OPS = new Set([
 ]);
 const VALID_BATCH_FILTERS = new Set(["green_prs", "ci_failed", "questions", "non_pr", "all"]);
 
-export async function batchActCards(supervisor, {
+export function normalizeBatchCardsInput({
   op = null,
   filter = null,
-  cardIds = null,
-  value = null,
-  deadlineAt = null
+  cardIds = null
 } = {}) {
-  const openCards = Array.isArray(supervisor?.getState?.()?.cards) ? supervisor.getState().cards : [];
   const normOp = typeof op === "string" ? op.trim().toLowerCase() : "";
   if (!VALID_BATCH_OPS.has(normOp)) {
     throw new Error("Pass a valid batch op ('merge_green', 'defer', 'dismiss', 'fix_ci', 'primary', 'secondary', 'merge', 'answer', 'reply').");
@@ -1002,6 +1086,11 @@ export async function batchActCards(supervisor, {
   const normFilter = typeof filter === "string" && filter.trim() ? filter.trim().toLowerCase() : null;
   if (normFilter && !VALID_BATCH_FILTERS.has(normFilter)) {
     throw new Error("Pass a valid batch filter ('green_prs', 'ci_failed', 'questions', 'non_pr', 'all').");
+  }
+  if (cardIds !== null && cardIds !== undefined) {
+    if (!Array.isArray(cardIds) || cardIds.length === 0 || !cardIds.every((id) => typeof id === "string" && id.trim().length > 0)) {
+      throw new Error("cardIds must be a non-empty array of card ID strings.");
+    }
   }
   const explicitIds = Array.isArray(cardIds)
     ? [...new Set(cardIds.map((id) => String(id ?? "").trim()).filter(Boolean))].slice(0, 25)
@@ -1011,11 +1100,30 @@ export async function batchActCards(supervisor, {
     throw new Error("Pass explicit cardIds or a filter ('green_prs', 'ci_failed', 'questions', 'all') for batch card actions.");
   }
 
+  return {
+    normOp,
+    cardOp: normOp === "merge_green" ? "merge" : normOp,
+    normFilter,
+    explicitIds
+  };
+}
+
+export async function batchActCards(supervisor, {
+  op = null,
+  filter = null,
+  cardIds = null,
+  value = null,
+  deadlineAt = null,
+  maxCards = 25
+} = {}) {
+  const openCards = Array.isArray(supervisor?.getState?.()?.cards) ? supervisor.getState().cards : [];
+  const { normOp, cardOp, normFilter, explicitIds } = normalizeBatchCardsInput({ op, filter, cardIds });
+  const maxBatch = Math.min(25, Math.max(0, Number.isInteger(maxCards) ? maxCards : 25));
+
   let targets = explicitIds?.length
     ? explicitIds.map((id) => openCards.find((c) => c.id === id || c.questionId === id)).filter(Boolean)
     : [...openCards];
 
-  const cardOp = normOp === "merge_green" ? "merge" : normOp;
   if (normOp === "merge_green" || normFilter === "green_prs") {
     targets = targets.filter(isGreenMergeablePrCard);
   } else if (normFilter === "ci_failed" || (normOp === "fix_ci" && !explicitIds?.length)) {
@@ -1024,7 +1132,7 @@ export async function batchActCards(supervisor, {
     targets = targets.filter((c) => c.kind !== "merge_ready" && c.kind !== "pr_ready" && c.kind !== "ci_failed");
   }
 
-  targets = targets.slice(0, 25);
+  targets = targets.slice(0, maxBatch);
   if (targets.length === 0) {
     return {
       ok: true,

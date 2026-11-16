@@ -11,6 +11,7 @@ import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
 import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
+import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
@@ -354,7 +355,114 @@ export class RemoteFleetSupervisor {
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
-  async batchActCards(input = {}) { return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null; }
+  async batchActCards(input = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw new Error('Pass a JSON object body.');
+    }
+    const { cardOp, explicitIds } = normalizeBatchCardsInput(input);
+    const openLocalQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
+    if (openLocalQuestions.length === 0) {
+      return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+    }
+
+    const localById = new Map();
+    for (const q of openLocalQuestions) {
+      if (q?.id) localById.set(q.id, q);
+    }
+    const matchesLocal = (rawId) => {
+      const clean = String(rawId ?? '').trim();
+      const stripped = clean.replace(/^question:/, '');
+      return localById.has(clean) ? clean : (localById.has(stripped) ? stripped : null);
+    };
+
+    const buildLocalCards = (includeQuietSuppressed = false) => {
+      const prefs = normalizePreferences(this.state.preferences);
+      const rowsByKey = new Map((this.state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+      const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+      return openLocalQuestions
+        .filter((q) => q?.id && (includeQuietSuppressed || !isSuppressedByQuietCadence(q, prefs)))
+        .map((q) => {
+          const { rank: _rank, ...card } = buildSupervisorCard(q, { rowsByKey, actions, prefs });
+          return card;
+        });
+    };
+
+    const combineBatchResults = (remoteRes, localRes, orderedIds = null) => {
+      const remoteItems = Array.isArray(remoteRes?.results) ? remoteRes.results : [];
+      const localItems = Array.isArray(localRes?.results) ? localRes.results : [];
+      let mergedResults = [...remoteItems, ...localItems];
+      if (orderedIds?.length) {
+        const orderIndex = new Map(orderedIds.map((id, idx) => [id.replace(/^question:/, ''), idx]));
+        mergedResults = [...mergedResults].sort(
+          (a, b) => (orderIndex.get(String(a.cardId ?? '').replace(/^question:/, '')) ?? 999)
+            - (orderIndex.get(String(b.cardId ?? '').replace(/^question:/, '')) ?? 999)
+        );
+      }
+      const total = mergedResults.length;
+      if (total === 0) {
+        return {
+          ok: true,
+          op: cardOp,
+          total: 0,
+          succeeded: 0,
+          halted: 0,
+          detail: 'No open decision cards matched that batch filter.',
+          results: []
+        };
+      }
+      const succeeded = mergedResults.filter((r) => r.ok).length;
+      const halted = total - succeeded;
+      return {
+        ok: halted === 0,
+        op: cardOp,
+        total,
+        succeeded,
+        halted,
+        detail: `Processed ${total} card${total === 1 ? '' : 's'}: ${succeeded} succeeded${halted ? `, ${halted} halted` : ''}.`,
+        results: mergedResults
+      };
+    };
+
+    if (explicitIds?.length) {
+      const localIds = [];
+      const remoteIds = [];
+      for (const rawId of explicitIds) {
+        const localKey = matchesLocal(rawId);
+        if (localKey) {
+          if (!localIds.includes(localKey)) localIds.push(localKey);
+        } else {
+          remoteIds.push(rawId);
+        }
+      }
+      const remoteRes = remoteIds.length > 0
+        ? ((await this.request('POST', '/fleet/api/cards/batch', { ...input, cardIds: remoteIds })).result ?? null)
+        : null;
+      const localCards = buildLocalCards(true);
+      const localRes = localIds.length > 0
+        ? await batchActCards(
+            { getState: () => ({ cards: localCards }), actCard: (id, act) => this.actCard(id, act) },
+            { ...input, cardIds: localIds }
+          )
+        : null;
+      if (localRes?.total > 0) this.emitIfChanged();
+      return combineBatchResults(remoteRes, localRes, explicitIds);
+    }
+
+    const remoteRes = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+    const remainingSlots = Math.max(0, 25 - (remoteRes?.total ?? 0));
+    let localRes = null;
+    if (remainingSlots > 0) {
+      const visibleLocalCards = buildLocalCards(false);
+      if (visibleLocalCards.length > 0) {
+        localRes = await batchActCards(
+          { getState: () => ({ cards: visibleLocalCards }), actCard: (id, act) => this.actCard(id, act) },
+          { ...input, maxCards: remainingSlots }
+        );
+      }
+    }
+    if (localRes?.total > 0) this.emitIfChanged();
+    return combineBatchResults(remoteRes, localRes);
+  }
   async readChatTranscript({ key, limit = 20 } = {}) {
     const cleanKey = typeof key === 'string' ? key.trim() : '';
     if (!cleanKey) throw new Error('Pass a session key.');
@@ -389,15 +497,21 @@ export class RemoteFleetSupervisor {
   }
   async actCard(cardId, input = {}) {
     if (this.selfFixHub && typeof cardId === 'string') {
-      const localQuestion = this.selfFixHub.store.question(cardId);
-      if (localQuestion) {
+      const qid = cardId.replace(/^question:/, '');
+      const localQuestion = this.selfFixHub.store.question(qid);
+      if (localQuestion && localQuestion.status === 'open') {
         const op = String(input?.op ?? 'primary').toLowerCase();
-        if (op === 'defer' || op === 'dismiss') {
-          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(cardId), delivery: null };
+        if (op === 'defer' || op === 'dismiss' || op === 'secondary') {
+          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(qid), delivery: null };
         }
-        const answer = typeof input?.value === 'string' && input.value ? input.value : (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
+        if (op === 'merge' || op === 'fix_ci') {
+          return { ok: false, kind: op, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
+        }
+        const explicitAnswer = typeof input?.value === 'string' && input.value.trim() ? input.value.trim() : null;
+        if (op === 'reply' && !explicitAnswer) return null;
+        const answer = explicitAnswer ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
         if (!answer) return null;
-        const res = await this.selfFixHub.answer(cardId, answer);
+        const res = await this.selfFixHub.answer(qid, answer);
         return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;
       }
     }
