@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { searchFleet, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue } from "../src/fleet/search.js";
-import { RemoteFleetSupervisor } from "../src/fleet/remote.js";
+import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
@@ -539,5 +539,357 @@ test("collectArchiveThreads indexes linked Claude JSONL transcripts, migration.s
     assert.equal(res2.results[0].prRef, "buildbetter-app/buildbetter#9885");
   } finally {
     fs.rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("FTS message bodies retain match-centered excerpts past 4KB and remote catalog matches never erase linked conversation chunks", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const realExecFile = promisify(execFile);
+
+  const localHome = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fts-late-local-"));
+  const remoteHome = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fts-late-remote-"));
+  try {
+    // 1. Local FTS5 DB with matches after char 2500 of user_body and char 5200 of agent_body
+    const localAgDir = path.join(localHome, ".gemini", "antigravity-cli");
+    fs.mkdirSync(localAgDir, { recursive: true });
+    const localDb = new DatabaseSync(path.join(localAgDir, "conversation_summaries.db"));
+    localDb.exec(`
+      CREATE VIRTUAL TABLE conversations_fts USING fts5(
+        conversation_id UNINDEXED,
+        title,
+        workspace,
+        last_modified_time UNINDEXED,
+        user_body,
+        agent_body
+      );
+    `);
+    const userPrefix = "routine context header line without target words.\n".repeat(60); // ~3000 chars
+    const agentPrefix = "step output log line without target words.\n".repeat(130); // ~5590 chars
+    localDb.prepare(
+      "INSERT INTO conversations_fts (conversation_id, title, workspace, last_modified_time, user_body, agent_body) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(
+      "cid-late-fts-local-1",
+      "Ledger sync check",
+      "file:///Users/shooby/Dev/ledger",
+      "2026-11-15T01:00:00.000Z",
+      `${userPrefix}\nVerify idempotency_cursor_v2 handling.`,
+      `${agentPrefix}\nShipped zephyr_reconciliation_ledger fix with full backfill.`
+    );
+    localDb.close();
+
+    const qLate = "zephyr_reconciliation_ledger idempotency_cursor_v2";
+    const localArch = await collectArchiveThreads({ query: qLate, homeDir: localHome });
+    const localRes = searchFleet({ snapshot: { threads: [] } }, { query: qLate, natural: true }, mergeThreadsWithArchives(new Map(), localArch));
+    assert.equal(localRes.results[0]?.key, "antigravity:cid-late-fts-local-1", "local FTS must retain matches past 2KB/4KB prefixes");
+
+    // 2. Remote SSH Python FTS5 late-offset match + linked Paseo agent matching both FTS and catalog title ("Billing maintenance")
+    const remotePaseoAgents = path.join(remoteHome, ".paseo", "agents", "billing");
+    fs.mkdirSync(remotePaseoAgents, { recursive: true });
+    fs.writeFileSync(path.join(remoteHome, ".paseo", "server-id"), "srv_remote_mac\n");
+    fs.writeFileSync(
+      path.join(remotePaseoAgents, "pa-billing-01.json"),
+      JSON.stringify({
+        id: "pa-billing-01",
+        provider: "antigravity",
+        cwd: "/Users/shooby/Dev/billing",
+        title: "Billing maintenance",
+        status: "idle",
+        updatedAt: "2026-11-15T02:00:00.000Z",
+        persistence: { sessionId: "cid-remote-billing-01" }
+      })
+    );
+    const remoteAgDir = path.join(remoteHome, ".gemini", "antigravity-cli");
+    fs.mkdirSync(remoteAgDir, { recursive: true });
+    const remoteDb = new DatabaseSync(path.join(remoteAgDir, "conversation_summaries.db"));
+    remoteDb.exec(`
+      CREATE VIRTUAL TABLE conversations_fts USING fts5(
+        conversation_id UNINDEXED,
+        title,
+        workspace,
+        last_modified_time UNINDEXED,
+        user_body,
+        agent_body
+      );
+    `);
+    remoteDb.prepare(
+      "INSERT INTO conversations_fts (conversation_id, title, workspace, last_modified_time, user_body, agent_body) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(
+      "cid-remote-billing-01",
+      "Billing maintenance",
+      "file:///Users/shooby/Dev/billing",
+      "2026-11-15T02:00:00.000Z",
+      `${userPrefix}\nCheck billing webhook retries.`,
+      `${agentPrefix}\nFixed billing webhook retries exponential backoff on HTTP 502.`
+    );
+    remoteDb.close();
+
+    const localPaseoDir = path.join(localHome, ".paseo");
+    fs.mkdirSync(localPaseoDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(localPaseoDir, "hosts.json"),
+      JSON.stringify([{ serverId: "srv_remote_mac", label: "Mac", connection: "ssh://spencer-mac", enabled: true }])
+    );
+
+    const qRemote = "billing webhook retries";
+    const remoteArch = await collectArchiveThreads({
+      query: qRemote,
+      homeDir: localHome,
+      includeRemotePaseoHosts: true,
+      execFileImpl: async (_bin, args) => {
+        const remoteCmd = args.at(-1);
+        return await realExecFile("/bin/sh", ["-c", remoteCmd], {
+          env: { ...process.env, HOME: remoteHome },
+          timeout: 5000
+        });
+      }
+    });
+    const remoteRes = searchFleet({ snapshot: { threads: [] } }, { query: qRemote, natural: true }, mergeThreadsWithArchives(new Map(), remoteArch));
+    assert.equal(remoteRes.results[0]?.key, "paseo:srv_remote_mac.pa-billing-01", "remote FTS late match + Paseo catalog match must preserve full conversation");
+
+    // 3. Also verify JS upsertArchiveEntry preserves conversation if a payload ever emits rec chunks followed by a catalog-only rec: null duplicate
+    const dupArch = await collectArchiveThreads({
+      query: qRemote,
+      homeDir: localHome,
+      includeRemotePaseoHosts: true,
+      execFileImpl: async () => ({
+        stdout: JSON.stringify([
+          {
+            cid: "cid-dup-1",
+            rec: { id: "cid-dup-1", title: "Billing maintenance", chunks: ["Fixed billing webhook retries dead-letter queue."] },
+            paseo: { id: "pa-dup-1", serverId: "srv_remote_mac", title: "Billing maintenance", provider: "antigravity", status: "idle", updatedAt: "2026-11-15T02:00:00.000Z" }
+          },
+          {
+            cid: null,
+            rec: null,
+            paseo: { id: "pa-dup-1", serverId: "srv_remote_mac", title: "Billing maintenance", provider: "antigravity", status: "idle", updatedAt: "2026-11-15T02:00:00.000Z" }
+          }
+        ])
+      })
+    });
+    const dupEntry = dupArch.get("paseo:srv_remote_mac.pa-dup-1");
+    assert.match(dupEntry?.lastAgentFull ?? "", /billing webhook retries/);
+    const dupSearch = searchFleet({ snapshot: { threads: [] } }, { query: qRemote, natural: true }, mergeThreadsWithArchives(new Map(), dupArch));
+    assert.equal(dupSearch.results[0]?.key, "paseo:srv_remote_mac.pa-dup-1");
+  } finally {
+    fs.rmSync(localHome, { recursive: true, force: true });
+    fs.rmSync(remoteHome, { recursive: true, force: true });
+  }
+});
+
+test("RemoteFleetSupervisor legacy reply fallback preserves reopenIfUndelivered recovery, and searchThreads queries online peers when primary is offline", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-pr291-remote-"));
+  try {
+    // 1. Legacy 0.0.72 node: /fleet/api/cards/:id/act is unsupported, background CLI reply fails asynchronously -> question reopens!
+    let resolveBg;
+    const bgDone = new Promise((resolve) => { resolveBg = resolve; });
+    const legacyNode = new FleetSupervisor({
+      dataDir: path.join(dir, "legacy-node"),
+      forceMode: "auto",
+      deps: {
+        executor: {
+          deliver: async (payload) => ({
+            status: "sent",
+            route: payload.route ?? "claude-resume",
+            detail: "Spawned background CLI reply",
+            done: bgDone
+          })
+        }
+      }
+    });
+    const cliThread = {
+      key: "claude:cli-bg-1",
+      kind: "claude",
+      id: "cli-bg-1",
+      title: "CLI background thread",
+      cwd: "/tmp/repo",
+      agentStatus: "idle",
+      live: true
+    };
+    legacyNode.lastThreads.set(cliThread.key, cliThread);
+    const askQ = legacyNode.store.upsertQuestion({
+      dedupeKey: "ask:claude:cli-bg-1:1",
+      kind: "agent-ask",
+      threadKey: cliThread.key,
+      title: "Use main or staging branch?",
+      body: "Pick target branch.",
+      options: ["main", "staging"]
+    });
+    const legacyCap = createFleetCapability(legacyNode);
+    const seenPaths = [];
+    const legacyRuntime = {
+      events: { emit() {} },
+      nodeCapabilities: {
+        list: () => [{ nodeId: "legacy-0072" }],
+        async dispatch(_nodeId, _cap, op, payload) {
+          seenPaths.push(`${payload.method} ${payload.path}`);
+          if (payload.path.startsWith("/fleet/api/cards/")) {
+            throw new Error("Unsupported fleet request");
+          }
+          return legacyCap.invoke(op, payload);
+        }
+      }
+    };
+    const remoteLegacy = new RemoteFleetSupervisor({ runtime: legacyRuntime, nodeId: "legacy-0072", dataDir: path.join(dir, "hub-1") });
+    await remoteLegacy.refresh();
+    const replyRes = await remoteLegacy.actCard(askQ.id, { op: "reply", value: "Use main." });
+    assert.equal(replyRes?.ok, true);
+    assert.equal(replyRes?.kind, "reply");
+    assert.ok(seenPaths.includes(`POST /fleet/api/questions/${askQ.id}`), "legacy reply must delegate to POST /fleet/api/questions/:id");
+    assert.ok(!seenPaths.includes("POST /fleet/api/send"), "must not bypass replyQuestion via sendOwnerMessage + dismissQuestion");
+
+    // Simulate background CLI failure after initial launch -> question must reopen!
+    resolveBg(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(legacyNode.store.question(askQ.id)?.status, "open", "failed background CLI reply must reopen the question on legacy node");
+    await remoteLegacy.refresh();
+    assert.equal(remoteLegacy.getState().questions.some((q) => q.id === askQ.id), true);
+
+    // 2. Primary fleet node asleep/offline while peer node is online: searchThreads returns peer results & retains primary outage signal
+    let peerOnline = true;
+    const multiRuntime = {
+      events: { emit() {} },
+      nodeCapabilities: {
+        list(cap) {
+          if (cap !== "fleet-supervisor") return [];
+          return [{ nodeId: "mac-asleep" }, { nodeId: "bb3-online" }];
+        },
+        async dispatch(nodeId, _cap, _op, payload) {
+          if (nodeId === "mac-asleep") {
+            throw new Error("Node mac-asleep disconnected");
+          }
+          if (nodeId === "bb3-online" && peerOnline) {
+            if (payload.path === "/fleet/api/search") {
+              return {
+                response: {
+                  status: 200,
+                  body: {
+                    query: payload.body?.query,
+                    results: [
+                      {
+                        key: "paseo:bb3.quasar1",
+                        title: "Quasar billing webhook retries",
+                        repo: "acme/billing",
+                        state: "running",
+                        live: true,
+                        snippet: "Fixed quasar_billing_webhook signature verification."
+                      }
+                    ],
+                    total: 1
+                  }
+                },
+                state: { mode: "auto", questions: [], actions: [], snapshot: { threads: [] } }
+              };
+            }
+          }
+          throw new Error("Node offline");
+        }
+      }
+    };
+    const remoteMulti = new RemoteFleetSupervisor({ runtime: multiRuntime, nodeId: "mac-asleep", dataDir: path.join(dir, "hub-2") });
+    const offlinePrimarySearch = await remoteMulti.searchThreads({ query: "quasar_billing_webhook" });
+    assert.equal(offlinePrimarySearch.results.length, 1);
+    assert.equal(offlinePrimarySearch.results[0].key, "paseo:bb3.quasar1");
+    assert.equal(offlinePrimarySearch.partial, true);
+    assert.match(offlinePrimarySearch.primaryError ?? "", /unavailable/i);
+    assert.match(remoteMulti.getState().lastError ?? "", /unavailable/i, "retains primary outage indication in lastError");
+
+    // When ALL nodes (primary + peers) are offline, searchThreads still throws the primary outage error
+    peerOnline = false;
+    await assert.rejects(() => remoteMulti.searchThreads({ query: "quasar_billing_webhook" }), /unavailable/i);
+
+    // 3. Multi-term excerpt budget & interval merging: 3 terms across a 20KB document (two adjacent + one far at the tail)
+    // survive both local JS and remote SSH Python excerpts and pass strict AND searchFleet matching
+    const multiDir = path.join(dir, "multi-term-home");
+    const multiBrain = path.join(multiDir, ".gemini", "antigravity-cli", "brain", "cid_three_terms");
+    fs.mkdirSync(multiBrain, { recursive: true });
+    const fillerA = "x".repeat(1500);
+    const fillerB = "y".repeat(90);
+    const fillerC = "z".repeat(16500);
+    fs.writeFileSync(
+      path.join(multiBrain, "notes.md"),
+      `${fillerA} alpha_token_one ${fillerB} beta_token_two ${fillerC} gamma_token_three trailing\n`,
+      "utf8"
+    );
+    const multiPaseo = path.join(multiDir, ".paseo");
+    fs.mkdirSync(multiPaseo, { recursive: true });
+    fs.writeFileSync(
+      path.join(multiPaseo, "hosts.json"),
+      JSON.stringify([{ serverId: "srv_multi_py", label: "Remote", connection: "ssh://remote-box", enabled: true }]),
+      "utf8"
+    );
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const realExecFile = promisify(execFile);
+
+    const localThreeArch = await collectArchiveThreads({
+      query: "alpha_token_one beta_token_two gamma_token_three",
+      homeDir: multiDir,
+      includeRemotePaseoHosts: false
+    });
+    const strictLocal = searchFleet(
+      { snapshot: { threads: [] } },
+      { query: "alpha_token_one beta_token_two gamma_token_three", natural: false },
+      mergeThreadsWithArchives(new Map(), localThreeArch)
+    );
+    assert.equal(strictLocal.results.length, 1, "JS extractArtifactExcerpt must merge overlapping windows and retain 3rd late term");
+
+    const emptyLocalHome = path.join(dir, "empty-home");
+    fs.mkdirSync(path.join(emptyLocalHome, ".paseo"), { recursive: true });
+    fs.writeFileSync(
+      path.join(emptyLocalHome, ".paseo", "hosts.json"),
+      JSON.stringify([{ serverId: "srv_multi_py", label: "Remote", connection: "ssh://remote-box", enabled: true }]),
+      "utf8"
+    );
+    const remoteThreeArch = await collectArchiveThreads({
+      query: "alpha_token_one beta_token_two gamma_token_three",
+      homeDir: emptyLocalHome,
+      includeRemotePaseoHosts: true,
+      execFileImpl: async (_bin, args) => realExecFile("/bin/sh", ["-c", args.at(-1)], { env: { ...process.env, HOME: multiDir }, timeout: 5000 })
+    });
+    const strictRemote = searchFleet(
+      { snapshot: { threads: [] } },
+      { query: "alpha_token_one beta_token_two gamma_token_three", natural: false },
+      mergeThreadsWithArchives(new Map(), remoteThreeArch)
+    );
+    assert.equal(strictRemote.results.length, 1, "Python SSH excerpt() must also merge overlapping windows and retain 3rd late term");
+
+    // 4. Open PR cards aged out of snapshot.threads are searchable by PR title and PR bodySummary and survive rankCombinedSearchResults
+    const cardState = {
+      snapshot: { threads: [] },
+      questions: [],
+      cards: [
+        {
+          id: "fq_cal_backfill",
+          kind: "merge_ready",
+          threadKey: "paseo:srv_bb3.cal1",
+          sessionTitle: "Staging One-Minute Search",
+          headline: "#9637 · fix(calendar-worker): renew visibility during attendee CRM backfills",
+          summary: "+65 / -6 · 2 files — Renews SQS visibility timeout during large attendee CRM backfills.",
+          repo: "buildbetter-app/buildbetter",
+          prRef: "buildbetter-app/buildbetter#9637",
+          prContext: {
+            ref: "buildbetter-app/buildbetter#9637",
+            title: "fix(calendar-worker): renew visibility during attendee CRM backfills",
+            bodySummary: "Prevents duplicate worker execution during long calendar backfill batches."
+          }
+        }
+      ]
+    };
+    const calHits = searchFleet(cardState, { query: "calendar backfill", natural: true });
+    assert.equal(calHits.results[0]?.key, "paseo:srv_bb3.cal1");
+    assert.equal(calHits.results[0]?.prRef, "buildbetter-app/buildbetter#9637");
+    const { rankCombinedSearchResults } = await import("../src/fleet/search.js");
+    const reranked = rankCombinedSearchResults(
+      [
+        { key: "paseo:other", title: "Unrelated session", snippet: "nothing", state: "idle" },
+        calHits.results[0]
+      ],
+      "calendar worker"
+    );
+    assert.equal(reranked[0]?.key, "paseo:srv_bb3.cal1", "rankCombinedSearchResults scores prTitle & phrase matches properly");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

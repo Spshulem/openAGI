@@ -86,6 +86,7 @@ const NEED_YOU_PATTERNS = [
   /\bwhat I'd like from you\b/i,
   /\byour call\b/i,
   /\bwhich (?:one|option|do you|would you)\b/i,
+  /\b(?:tell|let) me (?:know )?which\b/i,
   /\bplease confirm\b/i,
   /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bwaiting (?:on|for)\W{0,3}(?:you|your|the owner)\b/i,
   /\b(?:once|when|until) you (?:give|say|approve|confirm)\b/i,

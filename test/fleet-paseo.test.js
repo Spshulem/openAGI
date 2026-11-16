@@ -42,9 +42,98 @@ test("pagination includes background chats; bounded history makes fair progress 
 });
 test("registered hosts preserve distinct same-ID chats; unavailable hosts fail closed", async () => {
   const m = mock([agent("same")], { remote: [agent("same")] });
+  const autoRows = await createPaseoSource(m)({ paseo: { enabled: true } });
+  assert.equal(new Set(autoRows.map(t => t.key)).size, 2, "online enabled registered hosts are auto-discovered by default");
   const rows = await createPaseoSource(m)({ paseo: { enabled: true, serverIds: ["remote"] } });
   assert.equal(new Set(rows.map(t => t.key)).size, 2);
   await assert.rejects(hostApi(m.client, "unregistered"), /unavailable/);
+
+  // Auto-discovered host disconnecting mid-scan does not fail self discovery and preserves open remote questions
+  const flaky = mock([agent("local-chat")], { remote: [agent("remote-chat")] });
+  let remoteFail = true;
+  const realRemoteClient = flaky.client.hosts.client;
+  flaky.client.hosts.client = async (...args) => {
+    if (remoteFail) return { agents: { list: async () => { throw new Error("remote host went to sleep"); } } };
+    return realRemoteClient(...args);
+  };
+  const flakySource = createPaseoSource(flaky);
+  const survived = await flakySource({ paseo: { enabled: true } });
+  assert.deepEqual(survived.map(t => t.key), ["paseo:local.local-chat"]);
+  assert.deepEqual(survived.unknownThreadPrefixes, ["paseo:remote."]);
+
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { FleetSupervisor } = await import("../src/fleet/supervisor.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-unknown-host-"));
+  try {
+    let remoteOnline = true;
+    const recentIso = new Date().toISOString();
+    const capMsg = "Individual quota reached. Resets in 24h.";
+    const localLim1 = agent("local-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const localLim2 = agent("local-lim-2", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteLim = agent("remote-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteAskAgent = agent("remote-ask", { updatedAt: recentIso });
+    const dynClient = {
+      agents: {
+        list: async () => ({ entries: [{ agent: agent("local-ok") }, { agent: localLim1 }, { agent: localLim2 }], pageInfo: { hasMore: false } }),
+        ref: (id) => ({ timeline: { refetch: async () => ({ agent: id === "local-lim-1" ? localLim1 : id === "local-lim-2" ? localLim2 : agent(id), entries: [{ item: { type: "assistant_message", text: "Completed." }, timestamp: "2026-01-01T00:00:00Z" }] }) } })
+      },
+      connect: async () => {},
+      close: async () => {},
+      hosts: {
+        list: async () => ({
+          self: { serverId: "local" },
+          hosts: [{ serverId: "remote", enabled: true, status: remoteOnline ? "online" : "offline" }]
+        }),
+        client: async () => ({
+          agents: {
+            list: async () => ({ entries: [{ agent: remoteAskAgent }, { agent: remoteLim }], pageInfo: { hasMore: false } }),
+            ref: (id) => ({
+              timeline: {
+                refetch: async () => ({
+                  agent: id === "remote-lim-1" ? remoteLim : remoteAskAgent,
+                  entries: id === "remote-lim-1"
+                    ? [{ item: { type: "assistant_message", text: "Working." }, timestamp: "2026-01-01T00:00:00Z" }]
+                    : [{ item: { type: "assistant_message", text: "Should I run the production migration?" }, timestamp: "2026-01-02T00:00:00Z" }]
+                })
+              }
+            })
+          }
+        })
+      }
+    };
+    const dynSource = createPaseoSource({ factory: () => dynClient });
+    const sup = new FleetSupervisor({
+      dataDir: tmpDir,
+      config: resolveFleetConfig({}, {
+        enabled: true,
+        mode: "observe",
+        paseo: { enabled: true, only: true, historyPerScan: 10 },
+        review: { enabled: false },
+        storage: { enabled: false }
+      }),
+      deps: {
+        listPaseoThreads: (cfg) => dynSource(cfg),
+        run: async () => ({ code: 1, stdout: "", stderr: "" })
+      }
+    });
+    await sup.tick("scan-1");
+    const openAfterOnline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOnline.length, 1, "remote Paseo host ask opens a question when online");
+    const groupAfterOnline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.equal(groupAfterOnline?.threadKeys?.length, 3, "three-member limit:group includes both local and remote members");
+
+    remoteOnline = false;
+    await sup.tick("scan-2");
+    const openAfterOffline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOffline.length, 1, "transiently offline auto-discovered host must not resolve open question as left the scan");
+    const groupAfterOffline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.deepEqual(groupAfterOffline?.threadKeys?.includes("paseo:remote.remote-lim-1"), true, "three-member limit:group retains remote member while optional host is offline");
+    assert.ok(sup.getState().snapshot?.threads?.some((r) => r.key === "paseo:remote.remote-ask"), "snapshot retains warm row while optional host is offline");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 test("failed histories remain excluded, permissions remain owner-blocked, closed stays closed", async () => {
   const m = mock([agent("a")], { failHistory: true });

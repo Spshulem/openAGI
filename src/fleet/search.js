@@ -258,24 +258,75 @@ function buildRows(state, cachedThreads = new Map()) {
       });
     }
   }
+  for (const card of state?.cards ?? []) {
+    const key = card?.threadKey ?? card?.threadKeys?.[0] ?? null;
+    if (!key || byKey.has(key) || card.kind === "preference") continue;
+    byKey.set(key, {
+      key,
+      kind: key.split(":")[0] || "unknown",
+      title: card.sessionTitle || card.headline || key,
+      workspace: card.workspace ?? null,
+      repo: card.repo ?? null,
+      branch: card.branch ?? null,
+      pr: card.prContext ? {
+        ref: card.prContext.ref ?? card.prRef ?? null,
+        title: card.prContext.title ?? null,
+        bodySummary: card.prContext.bodySummary ?? null
+      } : (card.prRef ? { ref: card.prRef, title: null } : null),
+      prRefs: card.prRef ? [card.prRef] : [],
+      state: card.kind === "merge_ready" ? "ready-needs-human" : "needs-human",
+      live: false,
+      lastActivityAt: card.noticedAt ?? null,
+      lastAgentText: card.agentSummary || card.summary || "",
+      openChat: card.openChat ?? null
+    });
+  }
+  for (const q of state?.questions ?? []) {
+    const key = q?.threadKey ?? q?.threadKeys?.[0] ?? null;
+    if (!key || byKey.has(key) || q?.status !== "open") continue;
+    const snap = q.contextSnapshot ?? null;
+    byKey.set(key, {
+      key,
+      kind: key.split(":")[0] || "unknown",
+      title: snap?.threadTitle || q.title || key,
+      workspace: snap?.workspace ?? null,
+      repo: snap?.repo ?? null,
+      branch: snap?.branch ?? null,
+      pr: snap?.pr ?? (q.prRef ? { ref: q.prRef } : null),
+      prRefs: q.prRef ? [q.prRef] : [],
+      state: q.kind === "ready" ? "ready-needs-human" : "needs-human",
+      live: false,
+      lastActivityAt: q.askedAt ?? q.createdAt ?? null,
+      lastAgentText: q.askContext || snap?.agentSummary || q.body || "",
+      openChat: q.openChat ?? null
+    });
+  }
   return [...byKey.values()];
 }
 
 function buildRowDocument(row, state, cachedThreads = new Map()) {
   const cached = cachedThreads?.get?.(row.key) ?? null;
+  const matchingCards = (state?.cards ?? []).filter(
+    (c) => c && c.kind !== "preference" && (c.threadKey === row.key || c.threadKeys?.includes?.(row.key))
+  );
   const title = bounded(row.title || row.workspace || row.key, 300);
-  const allPrRefs = [...new Set([row.pr?.ref, ...(row.prRefs ?? []), ...(cached?.prRefs ?? [])].filter(Boolean))];
+  const cardPrRefs = matchingCards.map((c) => c.prRef ?? c.prContext?.ref).filter(Boolean);
+  const allPrRefs = [...new Set([row.pr?.ref, ...(row.prRefs ?? []), ...(cached?.prRefs ?? []), ...cardPrRefs].filter(Boolean))];
   const prRef = allPrRefs[0] ?? "";
-  const prTitle = bounded(row.pr?.title ?? "", 200);
+  const prTitle = bounded(row.pr?.title || matchingCards.find((c) => c.prContext?.title)?.prContext?.title || "", 200);
+  const prBody = bounded(row.pr?.bodySummary || matchingCards.find((c) => c.prContext?.bodySummary)?.prContext?.bodySummary || "", 4000);
   const provider = cached?.meta?.provider ?? row.provider ?? row.kind ?? "";
   const aliases = Array.isArray(cached?.meta?.aliases) ? cached.meta.aliases.join(" ") : "";
   const context = [
+    prTitle,
+    prBody,
     cached?.lastUserText,
     cached?.lastAgentFull || row.lastAgentText,
     ...(cached?.meta?.conversation ?? []).slice(-60).map((m) => m?.text),
     ...(state?.questions ?? [])
       .filter((q) => q?.threadKey === row.key || q?.threadKeys?.includes(row.key))
-      .map((q) => `${q.title ?? ""}\n${q.body ?? ""}`)
+      .map((q) => `${q.title ?? ""}\n${q.body ?? ""}`),
+    ...matchingCards.map((c) => `${c.headline ?? ""}\n${c.summary ?? ""}\n${c.agentSummary ?? ""}`)
   ]
     .filter(Boolean)
     .map((text) => bounded(text))
@@ -303,6 +354,7 @@ function buildRowDocument(row, state, cachedThreads = new Map()) {
     cached,
     title,
     prRef: prRef || null,
+    prTitle: prTitle || null,
     context,
     metadata,
     normTitle,
@@ -442,6 +494,8 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
   if (!fs.existsSync(dbPath)) return new Map();
   const ftsQueries = buildFtsMatchExpressions(terms);
   if (ftsQueries.length === 0) return new Map();
+  const contentTerms = terms.filter((t) => !PROVIDER_TERMS.has(t));
+  const excerptTerms = contentTerms.length > 0 ? contentTerms : terms;
 
   let tmpDir = null;
   let db = null;
@@ -462,13 +516,15 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
       let rows = [];
       try {
         rows = db.prepare(
-          "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 2000) AS user_body, substr(agent_body, 1, 4000) AS agent_body FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 45"
+          "SELECT conversation_id, title, workspace, last_modified_time, user_body, agent_body FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 45"
         ).all(expr);
       } catch { rows = []; }
       for (const r of rows) {
         const cid = typeof r?.conversation_id === "string" ? r.conversation_id.trim() : "";
         if (!cid) continue;
-        const rowSig = `${cid}:${String(r.agent_body ?? "").slice(0, 80)}`;
+        const userBody = String(r.user_body ?? "");
+        const agentBody = String(r.agent_body ?? "");
+        const rowSig = `${cid}:${userBody.length}:${agentBody.length}:${userBody.slice(0, 64)}:${agentBody.slice(0, 64)}:${agentBody.slice(-64)}`;
         if (seenRows.has(rowSig)) continue;
         seenRows.add(rowSig);
         const current = byConv.get(cid) ?? {
@@ -481,8 +537,9 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
         if (!current.title && r.title) current.title = String(r.title).trim();
         if (!current.workspace && r.workspace) current.workspace = String(r.workspace).trim();
         if (!current.updatedAt && r.last_modified_time) current.updatedAt = String(r.last_modified_time);
-        if (current.chunks.length < 6) {
-          current.chunks.push(`${r.user_body ?? ""}\n${r.agent_body ?? ""}`.trim());
+        const combined = `${userBody}\n${agentBody}`.trim();
+        if (combined && current.chunks.length < 6) {
+          current.chunks.push(extractArtifactExcerpt(combined, normalize(combined), excerptTerms, 5000));
         }
         byConv.set(cid, current);
       }
@@ -516,17 +573,36 @@ async function queryAntigravitySummaryDb(dbPath, terms) {
 }
 
 function extractArtifactExcerpt(text, lower, contentTerms, maxLen = 6000) {
-  const windows = [];
-  for (const term of contentTerms) {
-    const idx = lower.indexOf(term);
+  if (!text || text.length <= maxLen) return String(text ?? "");
+  const rawLower = text.toLowerCase();
+  const hits = [];
+  for (const term of contentTerms.slice(0, 6)) {
+    if (!term) continue;
+    const rawIdx = rawLower.indexOf(term);
+    const idx = rawIdx !== -1 ? rawIdx : lower.indexOf(term);
     if (idx === -1) continue;
-    const start = Math.max(0, idx - 1200);
-    const end = Math.min(text.length, idx + term.length + 1800);
-    windows.push(text.slice(start, end));
-    if (windows.length >= 3) break;
+    hits.push({ idx, end: Math.min(text.length, idx + term.length) });
   }
-  if (windows.length === 0) return text.slice(0, maxLen);
-  return windows.join("\n…\n").slice(0, maxLen);
+  if (hits.length === 0) return text.slice(0, maxLen);
+  hits.sort((a, b) => a.idx - b.idx);
+  const sep = "\n…\n";
+  const sepBudget = Math.max(0, hits.length - 1) * sep.length;
+  const perHitBudget = Math.max(120, Math.floor((maxLen - sepBudget) / hits.length));
+  const prePad = Math.floor(perHitBudget * 0.4);
+  const intervals = [];
+  for (const hit of hits) {
+    const termLen = Math.max(1, hit.end - hit.idx);
+    const postPad = Math.max(40, perHitBudget - prePad - termLen);
+    const start = Math.max(0, hit.idx - prePad);
+    const end = Math.min(text.length, hit.end + postPad);
+    const prev = intervals.at(-1);
+    if (prev && start <= prev.end + 24) {
+      prev.end = Math.max(prev.end, end);
+    } else {
+      intervals.push({ start, end });
+    }
+  }
+  return intervals.map(({ start, end }) => text.slice(start, end)).join(sep).slice(0, maxLen);
 }
 
 function scanAntigravityBrainDocs(homeDir, terms, existingMap = new Map()) {
@@ -582,11 +658,13 @@ function scanAntigravityBrainDocs(homeDir, terms, existingMap = new Map()) {
 }
 
 function buildArchiveThreadEntry(cid, info, paseoCatalog) {
+  const cleanChunks = (info.chunks ?? []).map((c) => redactSecrets(String(c ?? "")).trim()).filter(Boolean);
+  const combinedText = cleanChunks.join("\n\n").slice(-24000);
+  const conversation = cleanChunks.map((text) => ({ role: "assistant", text }));
   const linkedPaseo = paseoCatalog.byNativeId.get(cid) ?? null;
   if (linkedPaseo) {
     const key = `paseo:${linkedPaseo.serverId}.${linkedPaseo.id}`;
     const repo = inferRepoFromPath(linkedPaseo.cwd);
-    const combinedText = redactSecrets(info.chunks.join("\n\n")).slice(-24000);
     return [
       key,
       {
@@ -608,7 +686,7 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
           provider: linkedPaseo.provider || "antigravity",
           paseoCwd: linkedPaseo.cwd,
           aliases: [`antigravity:${cid}`],
-          conversation: [{ role: "assistant", text: combinedText }]
+          conversation
         }
       }
     ];
@@ -617,7 +695,6 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
   const key = `antigravity:${cid}`;
   const cleanWorkspace = String(info.workspace ?? "").replace(/^[\s["']+|[\s\]"']+$/g, "").replace(/^file:\/\//, "").split(/[,\s"'\]]+/)[0] || null;
   const repo = inferRepoFromPath(cleanWorkspace);
-  const combinedText = redactSecrets(info.chunks.join("\n\n")).slice(-24000);
   return [
     key,
     {
@@ -637,10 +714,51 @@ function buildArchiveThreadEntry(cid, info, paseoCatalog) {
       meta: {
         provider: "antigravity",
         aliases: [`antigravity:${cid}`],
-        conversation: [{ role: "assistant", text: combinedText }]
+        conversation
       }
     }
   ];
+}
+
+function upsertArchiveEntry(map, key, next) {
+  const prev = map.get(key);
+  if (!prev) {
+    map.set(key, next);
+    return;
+  }
+  const prevFull = prev.lastAgentFull || "";
+  const nextFull = next.lastAgentFull || "";
+  const mergedFull = prevFull && nextFull
+    ? (prevFull.includes(nextFull) ? prevFull : `${prevFull}\n\n${nextFull}`.slice(-24000))
+    : (prevFull || nextFull);
+  const prRefs = [...new Set([...(prev.prRefs ?? []), ...(next.prRefs ?? [])])].slice(0, 8);
+  const seenTexts = new Set();
+  const conversation = [...(prev.meta?.conversation ?? []), ...(next.meta?.conversation ?? [])].filter((m) => {
+    const t = String(m?.text ?? "").trim();
+    if (!t || seenTexts.has(t)) return false;
+    seenTexts.add(t);
+    return true;
+  });
+  map.set(key, {
+    ...prev,
+    ...next,
+    title: prev.title && prev.title !== "Paseo chat" ? prev.title : (next.title || prev.title),
+    workspace: prev.workspace ?? next.workspace ?? null,
+    repo: prRefs[0]?.split("#")[0] ?? prev.repo ?? next.repo ?? null,
+    prRefs,
+    live: Boolean(prev.live || next.live),
+    lastActivityAt: String(next.lastActivityAt ?? "") > String(prev.lastActivityAt ?? "")
+      ? next.lastActivityAt
+      : (prev.lastActivityAt ?? next.lastActivityAt ?? null),
+    lastAgentText: mergedFull ? mergedFull.slice(-600) : (prev.lastAgentText || next.lastAgentText || ""),
+    lastAgentFull: mergedFull,
+    meta: {
+      ...(prev.meta ?? {}),
+      ...(next.meta ?? {}),
+      aliases: [...new Set([...(prev.meta?.aliases ?? []), ...(next.meta?.aliases ?? [])])],
+      conversation
+    }
+  });
 }
 
 const SSH_ARCHIVE_SEARCH_PY = `
@@ -675,6 +793,37 @@ def read_head_tail(fp, head_b=131072, tail_b=393216):
             return h + "\\n" + t
     except Exception:
         return ""
+
+def excerpt(txt, max_len=4500):
+    if not txt:
+        return ""
+    if len(txt) <= max_len:
+        return txt
+    low = txt.lower()
+    q_terms = (content_terms or terms)[:6]
+    hits = []
+    for t in q_terms:
+        if not t:
+            continue
+        pos = low.find(t)
+        if pos != -1:
+            hits.append((pos, min(len(txt), pos + len(t))))
+    if not hits:
+        return txt[:max_len]
+    hits.sort(key=lambda x: x[0])
+    sep = "\\n...\\n"
+    per_hit = max(120, (max_len - max(0, len(hits) - 1) * len(sep)) // len(hits))
+    pre_pad = int(per_hit * 0.4)
+    intervals = []
+    for s_idx, e_idx in hits:
+        post_pad = max(40, per_hit - pre_pad - max(1, e_idx - s_idx))
+        st = max(0, s_idx - pre_pad)
+        en = min(len(txt), e_idx + post_pad)
+        if intervals and st <= intervals[-1][1] + 24:
+            intervals[-1][1] = max(intervals[-1][1], en)
+        else:
+            intervals.append([st, en])
+    return sep.join(txt[st:en] for st, en in intervals)[:max_len]
 
 def extract_prs(txt):
     seen = []
@@ -729,6 +878,7 @@ for p in glob.glob(os.path.join(home, ".paseo", "agents", "*", "*.json")):
         pass
 
 hits = {}
+seen_fts_rows = set()
 if safe_fts:
     quoted = ['"' + t + '"*' for t in safe_fts[:6]]
     if len(quoted) == 1:
@@ -753,7 +903,7 @@ if safe_fts:
                 for expr in exprs:
                     try:
                         rows = cur.execute(
-                            "SELECT conversation_id, title, workspace, last_modified_time, substr(user_body, 1, 1500), substr(agent_body, 1, 3000) FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 35",
+                            "SELECT conversation_id, title, workspace, last_modified_time, user_body, agent_body FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY bm25(conversations_fts) LIMIT 35",
                             (expr,),
                         ).fetchall()
                     except Exception:
@@ -761,9 +911,22 @@ if safe_fts:
                     for cid, title, ws, lmt, ub, ab in rows:
                         if not cid:
                             continue
+                        ub_s = ub or ""
+                        ab_s = ab or ""
+                        sig = (cid, len(ub_s), len(ab_s), ub_s[:48], ab_s[:48], ab_s[-48:])
+                        if sig in seen_fts_rows:
+                            continue
+                        seen_fts_rows.add(sig)
                         rec = hits.setdefault(cid, {"id": cid, "title": title or "", "workspace": ws or "", "updatedAt": lmt, "chunks": []})
-                        if len(rec["chunks"]) < 5:
-                            rec["chunks"].append(((ub or "") + "\\n" + (ab or "")).strip())
+                        if not rec["title"] and title:
+                            rec["title"] = title
+                        if not rec["workspace"] and ws:
+                            rec["workspace"] = ws
+                        if not rec["updatedAt"] and lmt:
+                            rec["updatedAt"] = lmt
+                        combined = (ub_s + "\\n" + ab_s).strip()
+                        if combined and len(rec["chunks"]) < 6:
+                            rec["chunks"].append(excerpt(combined, 4500))
                     if len(hits) >= 12:
                         break
                 con.close()
@@ -800,14 +963,7 @@ for rel_brain in (".gemini/antigravity-cli/brain", ".gemini/antigravity/brain"):
                     if content_terms and any(t in low for t in content_terms):
                         rec = hits.setdefault(d, {"id": d, "title": "", "workspace": "", "updatedAt": None, "chunks": []})
                         if len(rec["chunks"]) < 6:
-                            wins = []
-                            for t in content_terms:
-                                pos = low.find(t)
-                                if pos != -1:
-                                    wins.append(txt[max(0, pos - 1000):min(len(txt), pos + len(t) + 1500)])
-                                if len(wins) >= 3:
-                                    break
-                            rec["chunks"].append(("\\n...\\n".join(wins))[:5000] if wins else txt[:5000])
+                            rec["chunks"].append(excerpt(txt, 5000))
                 except Exception:
                     pass
 
@@ -825,6 +981,7 @@ for pa in paseo_agents:
     hay = (pa["title"] + " " + (pa["cwd"] or "") + " " + (pa.get("workspaceName") or "") + " " + pa["provider"]).lower()
     cnt = sum(1 for t in content_terms if t in hay) if content_terms else 0
     if cnt > 0:
+        seen_paseo_ids.add(pa["id"])
         matched_paseo.append((cnt, pa))
 matched_paseo.sort(key=lambda x: -x[0])
 for _, pa in matched_paseo[:16]:
@@ -838,15 +995,7 @@ for _, pa in matched_paseo[:16]:
             sample = read_head_tail(cf)
             if sample:
                 prs = extract_prs(sample)
-                low = sample.lower()
-                wins = []
-                for t in content_terms:
-                    pos = low.find(t)
-                    if pos != -1:
-                        wins.append(sample[max(0, pos - 800):min(len(sample), pos + len(t) + 1200)])
-                    if len(wins) >= 3:
-                        break
-                rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [("\\n...\\n".join(wins))[:6000]] if wins else [sample[-4000:]], "prRefs": prs}
+                rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [excerpt(sample, 6000)], "prRefs": prs}
     out.append({"cid": sid, "rec": rec, "paseo": pa})
 print(json.dumps(out[:40]))
 `.trim();
@@ -896,12 +1045,14 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
         const linked = item?.paseo ?? null;
         const rec = item?.rec ?? null;
         const cid = item?.cid ?? null;
+        const cleanChunks = (rec?.chunks ?? []).map((c) => redactSecrets(String(c ?? "")).trim()).filter(Boolean);
+        const combinedText = cleanChunks.join("\n\n").slice(-24000);
+        const conversation = cleanChunks.map((text) => ({ role: "assistant", text }));
         if (linked?.id) {
           const sid = linked.serverId || fallbackServerId;
           const key = `paseo:${sid}.${linked.id}`;
-          const combinedText = redactSecrets((rec?.chunks ?? []).join("\n\n")).slice(-24000);
           const prRefs = Array.isArray(rec?.prRefs) ? rec.prRefs.slice(0, 8) : [];
-          out.set(key, {
+          upsertArchiveEntry(out, key, {
             key,
             kind: "paseo",
             id: linked.id,
@@ -921,13 +1072,12 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
               provider: linked.provider || "paseo",
               paseoCwd: linked.cwd ?? null,
               aliases: cid ? [`${linked.provider || "antigravity"}:${cid}`] : [],
-              conversation: combinedText ? [{ role: "assistant", text: combinedText }] : []
+              conversation
             }
           });
         } else if (cid && rec) {
           const key = `antigravity:${cid}`;
-          const combinedText = redactSecrets((rec.chunks ?? []).join("\n\n")).slice(-24000);
-          out.set(key, {
+          upsertArchiveEntry(out, key, {
             key,
             kind: "antigravity",
             id: cid,
@@ -944,7 +1094,7 @@ async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFi
             meta: {
               provider: "antigravity",
               aliases: [`antigravity:${cid}`],
-              conversation: combinedText ? [{ role: "assistant", text: combinedText }] : []
+              conversation
             }
           });
         }
@@ -988,7 +1138,7 @@ export async function collectArchiveThreads({
   const archiveThreads = new Map(remoteMap);
   for (const [cid, info] of mergedAg) {
     const [key, thread] = buildArchiveThreadEntry(cid, info, paseoCatalog);
-    archiveThreads.set(key, thread);
+    upsertArchiveEntry(archiveThreads, key, thread);
   }
 
   const contentTerms = effectiveTerms.filter((t) => !PROVIDER_TERMS.has(t));
@@ -1137,6 +1287,7 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
       repo: doc.row.repo ?? null,
       branch: doc.row.branch ?? null,
       prRef: doc.prRef,
+      prTitle: doc.prTitle ?? null,
       live: Boolean(doc.row.live || doc.row.agentStatus === "running"),
       state: doc.row.state ?? "unknown",
       lastActivityAt: doc.row.lastActivityAt ?? null,
@@ -1166,8 +1317,9 @@ export function searchFleet(state, { query, limit = 20, natural = false, include
 }
 
 export function rankCombinedSearchResults(rows = [], query = "") {
-  const weights = { title: 4.5, workspace: 2.5, repo: 2.5, branch: 2.5, pr: 3, text: 1.5 };
-  const { qLower, effectiveTerms } = extractQueryTerms(query, { natural: true });
+  const weights = { title: 4.5, prTitle: 3.5, workspace: 2.5, repo: 2.5, branch: 2.5, pr: 3, text: 1.5 };
+  const qLower = normalize(String(query ?? "").trim());
+  const { effectiveTerms } = extractQueryTerms(query, { natural: true });
   const contentTerms = effectiveTerms.filter((t) => !PROVIDER_TERMS.has(t));
   const terms = contentTerms.length > 0 ? contentTerms : effectiveTerms;
   const byKey = new Map();
@@ -1175,6 +1327,7 @@ export function rankCombinedSearchResults(rows = [], query = "") {
     if (!row?.key) continue;
     const fields = {
       title: normalize(row.title),
+      prTitle: normalize(row.prTitle),
       workspace: normalize(row.workspace),
       repo: normalize(row.repo),
       branch: normalize(row.branch),
@@ -1191,7 +1344,7 @@ export function rankCombinedSearchResults(rows = [], query = "") {
         score += hit;
       }
       if (qLower && qLower.length >= 3) {
-        if (fields.title.includes(qLower) || fields.pr.includes(qLower) || fields.branch.includes(qLower)) score += 6;
+        if (fields.title.includes(qLower) || fields.prTitle.includes(qLower) || fields.pr.includes(qLower) || fields.branch.includes(qLower)) score += 6;
         else if (fields.text.includes(qLower)) score += 4;
       }
       if (row.live) score += 0.4;

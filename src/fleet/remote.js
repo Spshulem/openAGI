@@ -253,7 +253,8 @@ export class RemoteFleetSupervisor {
       .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
     const fetchLimit = peerNodes.length > 0 ? Math.min(50, Math.max(limit, 30)) : limit;
     const fetchOptions = { ...options, limit: fetchLimit };
-    let primaryRes;
+    let primaryRes = null;
+    let primaryError = null;
     try {
       primaryRes = await this.request('GET', '/fleet/api/search', fetchOptions);
     } catch (error) {
@@ -261,8 +262,10 @@ export class RemoteFleetSupervisor {
         if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
         if (this.questionsAuthoritative) this.state.lastError = null;
         primaryRes = searchFleet(this.getState(), { natural: true, ...fetchOptions });
-      } else {
+      } else if (peerNodes.length === 0 || (error.reached && error.status === 400)) {
         throw error;
+      } else {
+        primaryError = error;
       }
     }
 
@@ -273,6 +276,7 @@ export class RemoteFleetSupervisor {
       };
     }
 
+    let peerResponded = false;
     const peerLists = await Promise.all(peerNodes.slice(0, 4).map(async (peer) => {
       try {
         const res = await this.runtime.nodeCapabilities.dispatch(
@@ -283,6 +287,7 @@ export class RemoteFleetSupervisor {
           { timeoutMs: 28000 }
         );
         if (res?.response?.status === 200 && Array.isArray(res.response.body?.results)) {
+          peerResponded = true;
           return res.response.body.results;
         }
       } catch { /* fall through to state search for older node versions */ }
@@ -295,6 +300,7 @@ export class RemoteFleetSupervisor {
           { timeoutMs: 6000 }
         );
         if (stateRes?.state) {
+          peerResponded = true;
           return searchFleet(stateRes.state, { natural: true, ...fetchOptions, includeScores: true }).scoredResults
             ?? searchFleet(stateRes.state, { natural: true, ...fetchOptions }).results;
         }
@@ -302,14 +308,33 @@ export class RemoteFleetSupervisor {
       return [];
     }));
 
+    if (primaryError && !peerResponded) {
+      throw primaryError;
+    }
+
+    let fallbackCachedResults = [];
+    if (primaryError && this.questionsAuthoritative) {
+      try {
+        fallbackCachedResults = searchFleet(this.getState(), { natural: true, ...fetchOptions, includeScores: true }).scoredResults ?? [];
+      } catch (err) {
+        if (/Query must be|Limit must be/i.test(String(err?.message ?? ''))) throw err;
+      }
+    } else if (primaryError) {
+      searchFleet({ snapshot: { threads: [] } }, { natural: true, ...fetchOptions });
+    }
+
     const ranked = rankCombinedSearchResults(
-      [...(primaryRes?.results ?? []), ...peerLists.flat()],
+      [...(primaryRes?.results ?? fallbackCachedResults), ...peerLists.flat()],
       options?.query ?? ''
     );
     return {
+      query: String(options?.query ?? '').trim(),
+      scannedAt: primaryRes?.scannedAt ?? this.state.snapshot?.at ?? null,
+      scope: primaryRes?.scope ?? 'Peer fleet search (primary fleet computer offline).',
       ...primaryRes,
       results: ranked.slice(0, limit),
-      total: ranked.length
+      total: ranked.length,
+      ...(primaryError ? { partial: true, primaryError: primaryError.message } : {})
     };
   }
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
@@ -350,12 +375,32 @@ export class RemoteFleetSupervisor {
         return { ok: true, kind: 'defer', status: 'dismissed', question, delivery: null };
       }
       if (op === 'reply') {
-        const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
         const replyText = typeof input?.value === 'string' ? input.value.trim() : '';
-        if (!threadKey || !replyText) return null;
+        if (!replyText) return { ok: false, kind: 'reply', status: 'blocked', detail: 'Enter a reply to send.' };
+        const eligibleForQuestionReply = openQ.canReply === true
+          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1));
+        if (eligibleForQuestionReply) {
+          const replied = await this.replyQuestion(qid, replyText);
+          if (!replied) return { ok: false, kind: 'reply', status: 'closed', detail: 'Question already closed.' };
+          const { state: _state, ...rest } = replied;
+          return {
+            ok: !rest.delivery || ['sent', 'queued'].includes(rest.delivery.status),
+            kind: 'reply',
+            status: rest.delivery?.status ?? 'done',
+            detail: rest.delivery?.detail ?? 'Delivered reply to coding session.',
+            ...rest
+          };
+        }
+        const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
+        if (!threadKey) return { ok: false, kind: 'reply', status: 'blocked', detail: 'No coding session is linked to this card.' };
         const sent = await this.sendOwnerMessage(threadKey, replyText);
-        if (sent?.delivery?.status === 'sent') await this.dismissQuestion(qid).catch(() => {});
-        return { ok: sent?.delivery?.status === 'sent', kind: 'reply', status: sent?.delivery?.status ?? 'blocked', detail: sent?.delivery?.detail ?? null, delivery: sent?.delivery ?? null };
+        return {
+          ok: sent?.delivery?.status === 'sent',
+          kind: 'reply',
+          status: sent?.delivery?.status ?? 'blocked',
+          detail: sent?.delivery?.detail ?? (sent?.delivery?.status === 'sent' ? 'Delivered reply to coding session.' : 'Could not deliver reply.'),
+          delivery: sent?.delivery ?? null
+        };
       }
       const chosen = typeof input?.value === 'string' && input.value
         ? input.value

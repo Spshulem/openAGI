@@ -196,26 +196,49 @@ export function createPaseoSource({ factory } = {}) {
     if (!config.paseo?.enabled) return [];
     return withPaseo(config, async (client, signal, meta = {}) => {
       const directory = await client.hosts.list();
-      const ids = [...new Set([directory.self.serverId, ...(config.paseo.serverIds ?? [])])];
+      const explicitIds = Array.isArray(config.paseo.serverIds) ? config.paseo.serverIds.filter(Boolean) : [];
+      const autoHostsOn = !explicitIds.length && config.paseo.autoHosts !== false;
+      const enabledHosts = (directory.hosts ?? []).filter((h) => h?.serverId && h.enabled);
+      const autoIds = autoHostsOn
+        ? enabledHosts.filter((h) => h.status === "online").map((h) => h.serverId)
+        : [];
+      const unknownHostIds = new Set(
+        autoHostsOn
+          ? enabledHosts.filter((h) => h.status !== "online").map((h) => h.serverId)
+          : []
+      );
+      const explicitSet = new Set([directory.self.serverId, ...explicitIds]);
+      const ids = [...new Set([directory.self.serverId, ...explicitIds, ...autoIds])];
       const inventory = [];
       for (const id of ids) {
         signal.throwIfAborted();
-        const api = await hostApi(client, id, directory);
-        let cursor;
-        const seen = new Set();
-        for (let page = 0; page < 20; page++) {
-          signal.throwIfAborted();
-          const result = await api.agents.list({ filter: { includeArchived: false, includeBackground: true },
-            sort: [{ key: "updated_at", direction: "desc" }], page: { limit: 100, ...(cursor ? { cursor } : {}) } });
-          for (const { agent } of result.entries) inventory.push({ agent, id, api, key: `${config.paseo.url ?? "local"}:${id}:${agent.id}` });
-          if (!result.pageInfo.hasMore) break;
-          cursor = result.pageInfo.nextCursor;
-          if (!cursor || seen.has(cursor) || page === 19) throw new Error("Paseo inventory incomplete; narrow configured hosts");
-          seen.add(cursor);
+        const isRequiredHost = explicitSet.has(id);
+        try {
+          const api = await hostApi(client, id, directory);
+          let cursor;
+          const seen = new Set();
+          for (let page = 0; page < 20; page++) {
+            signal.throwIfAborted();
+            const result = await api.agents.list({ filter: { includeArchived: false, includeBackground: true },
+              sort: [{ key: "updated_at", direction: "desc" }], page: { limit: 100, ...(cursor ? { cursor } : {}) } });
+            for (const { agent } of result.entries) inventory.push({ agent, id, api, key: `${config.paseo.url ?? "local"}:${id}:${agent.id}` });
+            if (!result.pageInfo.hasMore) break;
+            cursor = result.pageInfo.nextCursor;
+            if (!cursor || seen.has(cursor) || page === 19) throw new Error("Paseo inventory incomplete; narrow configured hosts");
+            seen.add(cursor);
+          }
+        } catch (err) {
+          if (isRequiredHost || signal.aborted) throw err;
+          unknownHostIds.add(id);
         }
       }
       const live = new Set(inventory.map(r => r.key));
-      for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
+      const urlPrefix = `${config.paseo.url ?? "local"}:`;
+      for (const key of cache.keys()) {
+        if (live.has(key)) continue;
+        const retainedUnknown = [...unknownHostIds].some((hid) => key.startsWith(`${urlPrefix}${hid}:`));
+        if (!retainedUnknown) cache.delete(key);
+      }
       const candidates = inventory.filter(({ agent: a, key }) => !a.archivedAt && ["idle", "error"].includes(a.status)
         && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) =>
           ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
@@ -256,11 +279,18 @@ export function createPaseoSource({ factory } = {}) {
         }));
       }
       signal.throwIfAborted();
-      return inventory.map(({ agent: a, id, key }) => {
+      const out = inventory.map(({ agent: a, id, key }) => {
         const history = cache.get(key);
         const known = ["running", "initializing", "closed"].includes(a.status) || (history?.stamp === a.updatedAt);
         return paseoThread(a, id, known ? history?.entries ?? [] : [], known);
       });
+      if (unknownHostIds.size > 0) {
+        Object.defineProperty(out, "unknownThreadPrefixes", {
+          value: [...unknownHostIds].map((hid) => `paseo:${hid}.`),
+          enumerable: false
+        });
+      }
+      return out;
     }, factory);
   };
 }

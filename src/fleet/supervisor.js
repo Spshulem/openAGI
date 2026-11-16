@@ -2529,6 +2529,8 @@ export class FleetSupervisor {
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
+    const unknownPrefixes = Array.isArray(paseoThreads?.unknownThreadPrefixes) ? paseoThreads.unknownThreadPrefixes : [];
+    const isUnknownPrefixKey = (key) => unknownPrefixes.some((prefix) => String(key ?? "").startsWith(prefix));
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
     const threadFacts = new Map(threads.map((thread) => [thread.key, discoveredFacts(thread)]));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
@@ -2549,7 +2551,7 @@ export class FleetSupervisor {
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
     // An older thread past the cap still has its open card asked: the Codex
     // source kept it for that card alone.
-    const selected = this.selectScanScope(ranked, threads, sourceErrors);
+    const selected = this.selectScanScope(ranked, threads, sourceErrors, unknownPrefixes);
     const selectedKeys = new Set(selected.map((thread) => thread.key));
     const inScope = [...selected, ...ranked.filter((thread) => !selectedKeys.has(thread.key) && hasCard(thread))];
     // Every thread this scan reads counts as scanned, card overflow too, so
@@ -2676,7 +2678,7 @@ export class FleetSupervisor {
     if (manager) byKey.set(manager.key, manager);
     const mergedLastThreads = new Map(byKey);
     for (const [key, prev] of this.lastThreads) {
-      if (prev?.kind && sourceErrors[prev.kind] && !mergedLastThreads.has(key)) mergedLastThreads.set(key, prev);
+      if (prev?.kind && (sourceErrors[prev.kind] || isUnknownPrefixKey(key)) && !mergedLastThreads.has(key)) mergedLastThreads.set(key, prev);
     }
     this.lastThreads = mergedLastThreads;
     for (const [key, thread] of mergedLastThreads) setBounded(this.knownThreads, key, thread);
@@ -2684,7 +2686,7 @@ export class FleetSupervisor {
     // Each thread's PR as this scan read it, for a proposal sent later.
     // A deferred thread keeps the last read, for its proposal still open.
     const nextPrs = new Map([
-      ...[...this.lastPrs].filter(([key]) => deferred.has(key) || (this.lastThreads.get(key)?.kind && sourceErrors[this.lastThreads.get(key).kind])),
+      ...[...this.lastPrs].filter(([key]) => deferred.has(key) || isUnknownPrefixKey(key) || (this.lastThreads.get(key)?.kind && sourceErrors[this.lastThreads.get(key).kind])),
       ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])
     ]);
     for (const [ref, pr] of prs) if (ref && pr) nextPrs.set(ref, pr);
@@ -2710,11 +2712,11 @@ export class FleetSupervisor {
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
-    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started, deferred });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, unknownPrefixes, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, unknownPrefixes, mode, now: started, deferred });
 
     const finished = this.now();
-    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
+    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
     try { await this.diagnoseTick(); } catch (error) {
@@ -2729,10 +2731,10 @@ export class FleetSupervisor {
   // no longer starve older work. Selection changes no eligibility or send
   // policy, and permission cards still bypass the cap in _tick, which
   // stamps every thread read in scopeReadAt.
-  selectScanScope(ranked, threads, sourceErrors) {
+  selectScanScope(ranked, threads, sourceErrors, unknownPrefixes = []) {
     const present = new Set(threads.map((thread) => thread.key));
     for (const key of this.scopeReadAt.keys()) {
-      if (!present.has(key) && !sourceErrors[key.split(":", 1)[0]]) this.scopeReadAt.delete(key);
+      if (!present.has(key) && !sourceErrors[key.split(":", 1)[0]] && !unknownPrefixes.some((p) => key.startsWith(p))) this.scopeReadAt.delete(key);
     }
     const limit = this.config.limits.maxThreads;
     const recent = ranked.slice(0, Math.floor(limit / 4));
@@ -2915,7 +2917,7 @@ export class FleetSupervisor {
   // held back is retried next tick; a wait means the owner or a recent nudge
   // already has the thread. A thread hidden by a failed source waits up to
   // RECOVERY_HOLD_MS for that source.
-  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now(), deferred = new Set() } = {}) {
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), unknownPrefixes = [], mode = "observe", now = this.now(), deferred = new Set() } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -2931,7 +2933,7 @@ export class FleetSupervisor {
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
         // A thread a capped scan deferred gets its resume once it is read.
-        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && (unknownKinds.has(key.split(":")[0]) || unknownPrefixes.some((p) => key.startsWith(p))))));
       }
     }
   }
@@ -3176,9 +3178,9 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set(), threadFacts = new Map() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), unknownPrefixes = [], cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set(), threadFacts = new Map() }) {
     const store = this.store;
-    const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
+    const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]) || unknownPrefixes.some((prefix) => String(key ?? "").startsWith(prefix)));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
@@ -3223,10 +3225,10 @@ export class FleetSupervisor {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
       // is until that source reads again.
-      const spec = unknownKinds.size ? GROUPED_KINDS[fields.kind] : null;
+      const spec = (unknownKinds.size || unknownPrefixes.length) ? GROUPED_KINDS[fields.kind] : null;
       const covers = (q) => (fields.threadKeys ? true : (q.threadKeys ?? []).includes(fields.threadKey));
       const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
-      const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
+      const open = sameChoices ? store.openQuestions().find((q) => String(q.dedupeKey ?? "").replace(/:\d+$/, "") === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       // The head it is asked at: a move past it settles the ask (settledAsk).
@@ -3641,7 +3643,7 @@ export class FleetSupervisor {
     return { ...watch, since: new Date(since).toISOString() };
   }
 
-  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null, previous = null }) {
+  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes = [], manager, delivery = null, storage = null, previous = null }) {
     const byState = {};
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
@@ -3709,9 +3711,10 @@ export class FleetSupervisor {
     });
     const rowKeys = new Set(rows.map((r) => r.key));
     let carriedCount = 0;
-    if (Array.isArray(previous?.threads) && Object.keys(sourceErrors ?? {}).length > 0) {
+    if (Array.isArray(previous?.threads) && (Object.keys(sourceErrors ?? {}).length > 0 || unknownPrefixes.length > 0)) {
       for (const prevRow of previous.threads) {
-        if (!prevRow?.key || !prevRow.kind || !sourceErrors[prevRow.kind] || rowKeys.has(prevRow.key)) continue;
+        const isUnknownHostRow = unknownPrefixes.some((p) => String(prevRow?.key ?? "").startsWith(p));
+        if (!prevRow?.key || !prevRow.kind || (!sourceErrors[prevRow.kind] && !isUnknownHostRow) || rowKeys.has(prevRow.key)) continue;
         rowKeys.add(prevRow.key);
         rows.push(prevRow);
         carriedCount += 1;

@@ -40,23 +40,38 @@ function humanOptionLabel(option) {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-function isMergeReadyQuestion(question, row, prRef) {
+const DRAFT_STATUS_ACTION = /\b(?:mark|convert|turn|move|change|switch|promote|set)\b[^.?!\n]{0,28}\b(?:draft|ready\s+for\s+review)\b|\b(?:keep|leave)\b[^.?!\n]{0,24}\bdraft\b|\bdraft\s+(?:ready|to\s+ready)\b/i;
+const CONVERT_TO_DRAFT_ACTION = /\b(?:mark|convert|turn|move|change|switch|set)\b[^.?!\n]{0,28}\b(?:as\s+|to\s+|into\s+|back\s+to\s+)?draft\b|\b(?:keep|leave)\b[^.?!\n]{0,24}\bdraft\b/i;
+const DRAFT_STATUS_OPTION = /^(?:mark\s+(?:as\s+)?(?:ready|draft)|ready\s+for\s+review|convert\s+to\s+draft|keep\s+(?:as\s+)?draft)$/i;
+const UNKNOWN_DRAFT_PR_STATE = /\b(?:still|currently)\s+(?:in\s+|a\s+)?draft\b|\bdraft\s+(?:pr|pull\s+request)\b|\b(?:pr|pull\s+request)(?:\s+#?\d+)?\s+is\s+(?:still\s+)?(?:in\s+|a\s+)?draft\b/i;
+
+function isMergeReadyQuestion(question, row, prRef, prMeta = null) {
   if (!prRef || !parsePrRef(prRef)) return false;
-  const isDraftAsk = Boolean(row?.pr?.isDraft)
-    || (Array.isArray(row?.blockers) && row.blockers.includes("draft"))
-    || /\bdraft\b/i.test(`${question.title ?? ""} ${question.body ?? ""}`);
+  const rowMatchesPr = Boolean(row?.pr && (!row.pr.ref || row.pr.ref === prRef));
+  const knownIsDraft = typeof prMeta?.isDraft === "boolean"
+    ? prMeta.isDraft
+    : (rowMatchesPr && typeof row?.pr?.isDraft === "boolean" ? row.pr.isDraft : null);
+  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
+  const askText = `${question.title ?? ""} ${question.body ?? ""}`;
+  const statusActionMatch = knownIsDraft === false
+    ? CONVERT_TO_DRAFT_ACTION.test(askText)
+    : DRAFT_STATUS_ACTION.test(askText);
+  const isDraftAsk = knownIsDraft === true
+    || (rowMatchesPr && Array.isArray(row?.blockers) && row.blockers.includes("draft"))
+    || statusActionMatch
+    || DRAFT_STATUS_OPTION.test(firstOpt)
+    || (knownIsDraft === null && UNKNOWN_DRAFT_PR_STATE.test(askText));
   if (isDraftAsk) return false;
   if (question.kind === "ready" || question.mergeAsk) return true;
   if (question.kind !== "agent-ask") return false;
-  const firstOpt = Array.isArray(question.options) ? String(question.options[0] ?? "").trim() : "";
   if (!/^(?:approve(?: and)? merge|merge(?: now| pr)?|ship(?: pr| it)?)$/i.test(firstOpt)) return false;
-  return asksToMergePr(`${question.title ?? ""} ${question.body ?? ""}`);
+  return asksToMergePr(askText);
 }
 
 function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
   const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ciState === "FAILURE" || ciState === "ERROR") {
       return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
     }
@@ -109,6 +124,27 @@ function cleanWorkspaceName(workspace) {
   return raw;
 }
 
+function cleanSessionTitle(raw, max = 120) {
+  let text = String(raw ?? "").trim();
+  if (!text) return null;
+  text = text
+    .replace(/<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:<\/(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)/gi, " ")
+    .replace(/<[^>]{1,120}>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text || /^(?:paseo chat|wks_[0-9a-f]+)$/i.test(text)) return null;
+  if (/^you are working inside conductor\b/i.test(text)) return null;
+  return clampText(redactSecrets(text), max) || null;
+}
+
+function stripAttachmentMarkdown(text) {
+  return String(text ?? "")
+    .replace(/!\[[^\]]*\]\(file:\/\/[^)\s]+\)/gi, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function buildActionsForQuestion(question, row, prRef, prMeta = null) {
   const options = Array.isArray(question.options) ? question.options.filter(Boolean) : [];
   const ciState = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
@@ -126,7 +162,7 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
     };
   }
 
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ciState === "FAILURE" || ciState === "ERROR" || mergeState === "DIRTY") {
       return {
         primaryAction: { op: "fix_ci", label: mergeState === "DIRTY" ? "Have agent rebase" : "Have agent fix CI", value: "fix_ci", destructive: false },
@@ -194,7 +230,7 @@ function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
     return clampText(redactSecrets(question.reviewReason), 220);
   }
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
-  if (isMergeReadyQuestion(question, row, prRef)) {
+  if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
       return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
@@ -228,6 +264,28 @@ function formatDiffSummary(prMeta) {
   return [counts, files].filter(Boolean).join(" · ") || null;
 }
 
+function expandFragmentFromAgent(rawBody, cleanAgent, maxLen = 440) {
+  const bodyAnchor = rawBody.slice(0, Math.min(28, rawBody.length));
+  if (!bodyAnchor) return null;
+  const anchorIdx = cleanAgent.lastIndexOf(bodyAnchor);
+  if (anchorIdx === -1) return null;
+  const availBefore = anchorIdx;
+  const availAfter = Math.max(0, cleanAgent.length - (anchorIdx + rawBody.length));
+  const half = Math.max(0, Math.floor((maxLen - rawBody.length) / 2));
+  let takeBefore = Math.min(availBefore, half);
+  let takeAfter = Math.min(availAfter, half);
+  if (takeBefore < half) {
+    takeAfter = Math.min(availAfter, Math.max(0, maxLen - rawBody.length - takeBefore));
+  } else if (takeAfter < half) {
+    takeBefore = Math.min(availBefore, Math.max(0, maxLen - rawBody.length - takeAfter));
+  }
+  const start = Math.max(0, anchorIdx - takeBefore);
+  const end = Math.min(cleanAgent.length, anchorIdx + rawBody.length + takeAfter);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < cleanAgent.length ? "…" : "";
+  return `${prefix}${cleanAgent.slice(start, end).trim()}${suffix}`;
+}
+
 function buildSummary(question, row, { headline = "", prMeta = null, agentSummary = null } = {}) {
   const parts = [];
   if (prMeta?.title && !String(headline).includes(prMeta.title) && !String(question.title ?? "").includes(prMeta.title)) {
@@ -237,22 +295,38 @@ function buildSummary(question, row, { headline = "", prMeta = null, agentSummar
   if (diffStat) parts.push(diffStat);
 
   const mechanicalBody = isMechanicalReadyBody(question.body);
+  const rawBody = stripAttachmentMarkdown(question.body);
+  const cleanAgent = agentSummary ? stripAttachmentMarkdown(agentSummary) : "";
+  const expandedFragment = (
+    rawBody
+    && cleanAgent
+    && cleanAgent.length > rawBody.length + 40
+    && (rawBody.length < 140 || /^(?:\d+[.)]|[a-c][.)]|[-*•])\s/i.test(rawBody))
+  )
+    ? expandFragmentFromAgent(rawBody, cleanAgent, 430)
+    : null;
+
   if (question.card) {
     parts.push(question.card);
   } else if (prMeta?.bodySummary) {
     parts.push(clampText(prMeta.bodySummary, 320));
-  } else if (question.body && !mechanicalBody) {
-    parts.push(question.body);
-  } else if (agentSummary) {
-    parts.push(clampText(agentSummary, 320));
-  } else if (question.body) {
-    parts.push(question.body);
+  } else if (expandedFragment) {
+    parts.push(expandedFragment);
+  } else if (rawBody && !mechanicalBody) {
+    parts.push(rawBody);
+  } else if (cleanAgent) {
+    parts.push(clampText(cleanAgent, 320));
+  } else if (rawBody) {
+    parts.push(rawBody);
   } else if (question.askContext) {
-    parts.push(question.askContext);
+    parts.push(stripAttachmentMarkdown(question.askContext));
   } else if (row?.lastAgentText) {
-    parts.push(row.lastAgentText);
+    parts.push(stripAttachmentMarkdown(row.lastAgentText));
   }
   const joined = parts.filter(Boolean).join(" — ");
+  if (expandedFragment && parts.length === 1) {
+    return clampTextLines(redactSecrets(joined), 460);
+  }
   return clampText(redactSecrets(joined || row?.reason || "Waiting for your decision."), 460);
 }
 
@@ -306,10 +380,13 @@ function resolveOpenChat(question, row, primaryKey, sessionTitle) {
   const existing = question.openChat ?? row?.openChat ?? null;
   const parsedPaseo = parsePaseoThreadKey(primaryKey);
   if (existing) {
+    const cleanLabel = typeof existing.label === "string" && /<(?:system_instruction|system-reminder)/i.test(existing.label)
+      ? `${sessionTitle || "Paseo chat"}${parsedPaseo ? " (Paseo)" : ""}`
+      : existing.label;
     if (parsedPaseo && (!existing.serverId || !existing.agentId)) {
-      return { ...existing, app: existing.app ?? "paseo", serverId: existing.serverId ?? parsedPaseo.serverId, agentId: existing.agentId ?? parsedPaseo.agentId };
+      return { ...existing, label: cleanLabel, app: existing.app ?? "paseo", serverId: existing.serverId ?? parsedPaseo.serverId, agentId: existing.agentId ?? parsedPaseo.agentId };
     }
-    return existing;
+    return cleanLabel !== existing.label ? { ...existing, label: cleanLabel } : existing;
   }
   if (parsedPaseo) {
     return {
@@ -330,10 +407,11 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
   const parsedPaseo = parsePaseoThreadKey(threadKey);
   const serverId = openChat?.serverId ?? parsedPaseo?.serverId ?? null;
   const agentId = openChat?.agentId ?? parsedPaseo?.agentId ?? null;
+  const cleanChatLabel = question.chatLabel ? cleanSessionTitle(question.chatLabel) : null;
   if (threadKey) {
     resources.push({
       kind: "conversation",
-      label: question.chatLabel || sessionTitle || cleanWorkspaceName(row?.workspace) || "Agent conversation",
+      label: cleanChatLabel || sessionTitle || cleanWorkspaceName(row?.workspace) || "Agent conversation",
       url: null,
       threadKey,
       ...(serverId && agentId ? { serverId, agentId } : {})
@@ -399,10 +477,16 @@ export function buildSupervisorCard(
     ?? question.askedHead
     ?? null;
   const prUrl = livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
+  const isDraft = typeof livePr?.isDraft === "boolean"
+    ? livePr.isDraft
+    : (typeof rowPr?.isDraft === "boolean"
+        ? rowPr.isDraft
+        : (typeof snapPr?.isDraft === "boolean" ? snapPr.isDraft : null));
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
     bodySummary: prBodySummary,
+    isDraft,
     additions,
     deletions,
     changedFiles,
@@ -418,35 +502,49 @@ export function buildSupervisorCard(
 
   const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef, prMeta);
-  const sessionTitle = clampText(redactSecrets(row?.title || thread?.title || snap?.threadTitle || ""), 120) || null;
+  const distinctTitle = cleanSessionTitle(row?.title)
+    || cleanSessionTitle(thread?.title)
+    || cleanSessionTitle(snap?.threadTitle);
+  const sessionTitle = distinctTitle
+    || cleanWorkspaceName(row?.workspace ?? thread?.workspace ?? snap?.workspace)
+    || null;
+  const hasDistinctSessionTitle = Boolean(distinctTitle);
 
   const rawTitle = String(question.title ?? "");
-  let cleanTitle = sessionTitle && /^wks_[0-9a-f]+:/i.test(rawTitle)
-    ? rawTitle.replace(/^wks_[0-9a-f]+:/i, `${sessionTitle}:`)
-    : rawTitle;
-  if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*needs\s+approve\.?|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
+  let cleanTitle = /<(?:system_instruction|system-reminder)/i.test(rawTitle)
+    ? rawTitle.replace(/^(?:<[^>]+>\s*[^:]{0,120}):/i, `${sessionTitle || "Coding session"}:`)
+    : (hasDistinctSessionTitle && /^(?:wks_[0-9a-f]+|Paseo chat):/i.test(rawTitle)
+        ? rawTitle.replace(/^(?:wks_[0-9a-f]+|Paseo chat):/i, `${distinctTitle}:`)
+        : rawTitle);
+  if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*(?:needs\s+approve\.?|merge\??)|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
     cleanTitle = `#${parsedPr.number} · ${prTitle}`;
   }
   const headline = clampText(redactSecrets(cleanTitle), 140);
 
-  const rawAgentSummary = thread?.lastAgentFull || row?.lastAgentText || question.askContext || snap?.agentSummary || "";
+  const rawAgentSummary = stripAttachmentMarkdown(thread?.lastAgentFull || row?.lastAgentText || question.askContext || snap?.agentSummary || "");
   const agentSummary = clampTailLines(redactSecrets(rawAgentSummary), 1600) || null;
 
-  const rawMessages = Array.isArray(thread?.meta?.conversation) && thread.meta.conversation.length
-    ? thread.meta.conversation.slice(-4)
+  const candidateMessages = Array.isArray(thread?.meta?.conversation) && thread.meta.conversation.length
+    ? thread.meta.conversation
     : (Array.isArray(snap?.recentMessages) && snap.recentMessages.length
-        ? snap.recentMessages.slice(-4)
+        ? snap.recentMessages
         : [
             ...((thread?.lastUserText || snap?.lastUserText) ? [{ role: "user", text: thread?.lastUserText || snap?.lastUserText, at: thread?.lastUserAt ?? snap?.lastUserAt ?? null }] : []),
             ...((thread?.lastAgentFull || row?.lastAgentText || snap?.agentSummary) ? [{ role: "assistant", text: thread?.lastAgentFull || row?.lastAgentText || snap?.agentSummary, at: thread?.lastAgentAt ?? row?.lastAgentAt ?? snap?.lastAgentAt ?? null }] : [])
           ]);
-  const recentMessages = rawMessages
-    .filter((m) => m && typeof m.text === "string" && m.text.trim())
-    .map((m) => ({
-      role: m.role === "user" ? "user" : "assistant",
-      text: clampTailLines(redactSecrets(m.text), 700),
-      at: m.at ?? null
-    }));
+  const recentMessages = candidateMessages
+    .map((m) => {
+      if (!m || typeof m.text !== "string") return null;
+      const cleaned = stripAttachmentMarkdown(m.text);
+      if (!cleaned) return null;
+      return {
+        role: m.role === "user" ? "user" : "assistant",
+        text: clampTailLines(redactSecrets(cleaned), 700),
+        at: m.at ?? null
+      };
+    })
+    .filter(Boolean)
+    .slice(-4);
 
   const prContext = prMeta ? {
     ref: prRef,
@@ -524,7 +622,7 @@ export function buildActiveSummary(snapshot, liveCards = []) {
       activeThreads.push({
         key: row.key,
         kind: row.kind ?? null,
-        title: row.title || cleanWorkspaceName(row.workspace) || row.key,
+        title: cleanSessionTitle(row.title) || cleanWorkspaceName(row.workspace) || (row.pr?.title ? clampText(redactSecrets(row.pr.title), 120) : null) || row.key,
         repo: row.repo ?? null,
         branch: row.branch ?? null,
         state: row.state ?? "unknown",
