@@ -8,6 +8,7 @@
 
 import crypto from "node:crypto";
 import { threadHealth } from "./classify.js";
+import { normalizeBatchCardsInput, selectBatchTargetCards } from "./coordinator.js";
 import { registerVoiceTools } from "./voice-tools.js";
 
 const SOURCE = "integration:fleet-supervisor";
@@ -424,10 +425,44 @@ export function registerFleetTools(registry, supervisor) {
     },
     prepareApprovalArgs: (args) => fleetBatchCardsTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-batch:${digest([context?.sessionId ?? null, args.op, args.filter ?? null, args.cardIds ?? null, args.value ?? null])}`,
+    approvalDedupeKey: (args, context) => `fleet-batch:${digest([context?.sessionId ?? null, args.op, args.pinnedTargets ?? args.cardIds ?? null, args.value ?? null])}`,
     summarize: (args) => args.summaryLabel,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+      if (Array.isArray(args?.pinnedTargets)) {
+        const results = [];
+        let succeeded = 0;
+        let halted = 0;
+        for (const target of args.pinnedTargets) {
+          const outcome = await supervisor.actCard(target.cardId, {
+            op: target.op,
+            ...(target.value != null ? { value: target.value } : {})
+          });
+          const itemOk = Boolean(outcome && outcome.ok !== false);
+          if (itemOk) succeeded += 1;
+          else halted += 1;
+          results.push({
+            cardId: target.cardId,
+            headline: clip(target.headline ?? target.cardId, 100),
+            prRef: target.prRef ?? null,
+            ok: itemOk,
+            status: outcome?.status ?? (outcome ? "done" : "closed"),
+            detail: clip(outcome?.detail ?? "", 180) || null
+          });
+        }
+        const total = args.pinnedTargets.length;
+        return {
+          ok: halted === 0,
+          op: args.op,
+          total,
+          succeeded,
+          halted,
+          detail: total === 0
+            ? "No open decision cards matched that batch filter."
+            : `Processed ${total} card${total === 1 ? "" : "s"}: ${succeeded} succeeded${halted ? `, ${halted} halted` : ""}.`,
+          results
+        };
+      }
       return supervisor.batchActCards({
         op: args.op,
         filter: args.filter ?? null,
@@ -458,24 +493,39 @@ function fleetStartSessionTarget(args = {}) {
 }
 
 function fleetBatchCardsTarget(supervisor, args = {}) {
-  const op = typeof args?.op === "string" ? args.op.trim().toLowerCase() : "";
-  if (!op) throw new Error("Provide a valid batch op.");
-  const filter = typeof args?.filter === "string" && args.filter.trim() ? args.filter.trim().toLowerCase() : null;
-  const cardIds = Array.isArray(args?.cardIds)
-    ? [...new Set(args.cardIds.map((id) => String(id ?? "").trim()).filter(Boolean))].slice(0, 25)
-    : null;
-  const value = typeof args?.value === "string" && args.value.trim() ? args.value.trim() : null;
-  if (!cardIds?.length && !filter && !["merge_green", "fix_ci"].includes(op)) {
-    throw new Error("Provide cardIds or filter ('green_prs', 'ci_failed', 'questions', 'all').");
+  const { normOp, cardOp, normFilter, explicitIds } = normalizeBatchCardsInput(args);
+  const explicitValue = typeof args?.value === "string" && args.value.trim() ? args.value.trim() : null;
+  const openCards = Array.isArray(readState(supervisor).cards) ? readState(supervisor).cards : [];
+  const matched = selectBatchTargetCards(openCards, { normOp, normFilter, explicitIds });
+  if (matched.length === 0) {
+    throw new Error("No open decision cards matched that batch filter.");
   }
-  const openCount = (readState(supervisor).cards ?? []).length;
-  const scopeDesc = cardIds?.length ? `${cardIds.length} specified card(s)` : (filter || op);
+  const pinnedTargets = matched.map((card) => {
+    const pinned = fleetCardTarget(supervisor, {
+      cardId: card.id,
+      op: cardOp,
+      ...(explicitValue ? { value: explicitValue } : {})
+    });
+    return {
+      cardId: pinned.cardId,
+      op: pinned.op,
+      ...(pinned.value ? { value: pinned.value } : {}),
+      ...(card.prRef ? { prRef: card.prRef } : {}),
+      headline: pinned.headline,
+      actionLabel: pinned.actionLabel
+    };
+  });
+  const preview = pinnedTargets
+    .slice(0, 3)
+    .map((t) => `${t.headline} (${t.actionLabel})`)
+    .join("; ");
+  const suffix = pinnedTargets.length > 3 ? ` +${pinnedTargets.length - 3} more` : "";
   return {
-    op,
-    ...(filter ? { filter } : {}),
-    ...(cardIds?.length ? { cardIds } : {}),
-    ...(value ? { value } : {}),
-    summaryLabel: clip(`Batch ${op} (${scopeDesc}, ${openCount} open)`, 140)
+    op: cardOp,
+    cardIds: pinnedTargets.map((t) => t.cardId),
+    pinnedTargets,
+    ...(explicitValue ? { value: explicitValue } : {}),
+    summaryLabel: clip(`Batch ${normOp} (${pinnedTargets.length} card${pinnedTargets.length === 1 ? "" : "s"}): ${preview}${suffix}`, 180)
   };
 }
 

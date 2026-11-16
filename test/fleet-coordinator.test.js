@@ -863,4 +863,130 @@ test("Round 2 review regressions: migrated alias dedupe and local git origin hos
   assert.equal(secBatch.succeeded, 1);
   assert.deepEqual(answeredChoice, { id: reviewQ.id, answer: "Request changes" });
   assert.equal(remoteSup.selfFixHub.store.question(reviewQ.id).status, "answered");
+
+  // Round 4:
+  // 1) fleet_batch_cards pins target cardIds/actions at approval preparation time so cards added later are untouched
+  const approvedQ = sup.store.upsertQuestion({
+    dedupeKey: "batch-pin:1",
+    kind: "decision",
+    title: "Card present at approval prep",
+    body: "Approve first?",
+    options: ["Yes", "later"]
+  });
+  const registry = new ToolRegistry();
+  const pending = new PendingActionStore({ dir: path.join(dir, "pending-r4") });
+  registry.bindPendingActions(pending);
+  registerFleetTools(registry, sup);
+
+  const queued = await registry.invoke("fleet_batch_cards", { op: "defer", filter: "all" }, { sessionId: "pin-test" });
+  assert.equal(queued.result.status, "awaiting_confirmation");
+
+  const lateArrivalQ = sup.store.upsertQuestion({
+    dedupeKey: "batch-pin:2",
+    kind: "decision",
+    title: "Card arrived after approval prep",
+    body: "Should NOT be touched!",
+    options: ["Yes", "later"]
+  });
+
+  const action = pending.get(queued.result.actionId);
+  const executed = await registry.invoke(action.toolName, action.args, { ...action.context, __confirmed: true });
+  assert.equal(executed.result.total, 1);
+  assert.equal(sup.store.question(approvedQ.id).status, "dismissed");
+  assert.equal(sup.store.question(lateArrivalQ.id).status, "open", "newly arrived card must remain open");
+
+  // 2) Connected live peer object on idle/waiting/error Claude/Conductor sessions does not override explicit status
+  sup.lastThreads.set("claude:peer-idle", {
+    key: "claude:peer-idle",
+    kind: "claude",
+    title: "Idle Claude with peer",
+    cwd: "/home/dev/Dev/peer-proj",
+    agentStatus: "idle",
+    live: { peerName: "peer-1", pid: 4001, status: "idle" }
+  });
+  sup.lastThreads.set("claude:peer-waiting", {
+    key: "claude:peer-waiting",
+    kind: "claude",
+    title: "Waiting Claude with peer",
+    cwd: "/home/dev/Dev/peer-proj",
+    agentStatus: "waiting",
+    live: { peerName: "peer-2", pid: 4002, status: "idle" }
+  });
+  sup.lastThreads.set("conductor:peer-err", {
+    key: "conductor:peer-err",
+    kind: "conductor",
+    title: "Errored Conductor with peer",
+    cwd: "/home/dev/Dev/peer-proj",
+    agentStatus: "error",
+    error: { kind: "other", text: "failed" },
+    live: { peerName: "peer-3", pid: 4003, status: "idle" }
+  });
+  sup.lastThreads.set("claude:peer-busy", {
+    key: "claude:peer-busy",
+    kind: "claude",
+    title: "Busy Claude with peer",
+    cwd: "/home/dev/Dev/peer-proj",
+    agentStatus: "idle",
+    live: { peerName: "peer-4", pid: 4004, status: "busy" }
+  });
+  const peerWs = await sup.listWorkspaces({ query: "peer-proj" });
+  const byKeyState = new Map(peerWs.workspaces[0].recentChats.map((s) => [s.key, s.state]));
+  assert.equal(byKeyState.get("claude:peer-idle"), "idle");
+  assert.equal(byKeyState.get("claude:peer-waiting"), "waiting");
+  assert.equal(byKeyState.get("conductor:peer-err"), "error");
+  assert.equal(byKeyState.get("claude:peer-busy"), "running");
+
+  // 3) startPaseoSession({ cwd }) prefers exact directory match across hosts over ancestor match, and rejects ambiguous multi-host exact matches
+  const createdOnHost = [];
+  const exactVsAncestorFactory = () => {
+    const selfAgents = [
+      { id: "s1", title: "Root repo", cwd: "/home/dev/nested-repo", status: "running", provider: "codex", updatedAt: "2026-11-16T16:20:00Z" },
+      { id: "s2", title: "Dup dir", cwd: "/home/dev/dup-repo", status: "idle", provider: "codex", updatedAt: "2026-11-16T16:20:00Z" }
+    ];
+    const remoteAgents = [
+      { id: "r1", title: "Subpackage", cwd: "/home/dev/nested-repo/new", status: "idle", provider: "codex", updatedAt: "2026-11-16T16:10:00Z" },
+      { id: "r2", title: "Dup dir", cwd: "/home/dev/dup-repo", status: "idle", provider: "codex", updatedAt: "2026-11-16T16:20:00Z" }
+    ];
+    const makeApi = (hostId, agents) => ({
+      providers: {
+        waitForReady: async () => ({ entries: [{ provider: "codex", status: "ready", models: [{ id: "gpt-5", isDefault: true }] }] })
+      },
+      agents: {
+        list: async () => ({ entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false } }),
+        create: async (req) => {
+          createdOnHost.push({ hostId, cwd: req.cwd });
+          return { id: "new-agt", current: () => ({ id: "new-agt", status: "running", cwd: req.cwd, title: "New", provider: "codex" }) };
+        }
+      }
+    });
+    return {
+      connect: async () => {},
+      close: async () => {},
+      ...makeApi("srv_self", selfAgents),
+      hosts: {
+        list: async () => ({
+          self: { serverId: "srv_self", label: "linux-box" },
+          hosts: [{ serverId: "srv_remote", label: "remote-mac", enabled: true, status: "online" }]
+        }),
+        client: (id) => (id === "srv_remote" ? makeApi("srv_remote", remoteAgents) : makeApi("srv_self", selfAgents))
+      }
+    };
+  };
+
+  const startedExact = await sup.startPaseoSession({
+    cwd: "/home/dev/nested-repo/new",
+    prompt: "Must pick srv_remote exact match over srv_self ancestor",
+    factory: exactVsAncestorFactory
+  });
+  assert.equal(startedExact.serverId, "srv_remote");
+  assert.deepEqual(createdOnHost, [{ hostId: "srv_remote", cwd: "/home/dev/nested-repo/new" }]);
+
+  await assert.rejects(
+    sup.startPaseoSession({
+      cwd: "/home/dev/dup-repo",
+      prompt: "Must fail closed when both hosts share exact path",
+      factory: exactVsAncestorFactory
+    }),
+    /exists on multiple Paseo hosts/
+  );
 });

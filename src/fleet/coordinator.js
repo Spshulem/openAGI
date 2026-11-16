@@ -99,10 +99,16 @@ function normalizeSessionState(thread) {
   if (isThreadArchived(thread)) return "archived";
   const raw = thread?.agentStatus ?? thread?.state ?? "unknown";
   if (thread?.excluded === "closed" || raw === "closed") return "sleeping";
-  if (raw === "running" || thread?.live) return "running";
   if (raw === "waiting" || thread?.meta?.blockedOnOwner) return "waiting";
   if (raw === "error" || thread?.error) return "error";
-  if (raw === "idle") return "idle";
+  if (raw === "running") return "running";
+  if (raw === "idle") {
+    if (thread?.kind === "claude" && thread?.live?.status === "busy") return "running";
+    return "idle";
+  }
+  if (thread?.live === true || thread?.live?.status === "busy" || thread?.live?.status === "running") {
+    return "running";
+  }
   return String(raw || "idle");
 }
 
@@ -953,36 +959,47 @@ export async function startPaseoSession(supervisor, {
     });
 
     if (resolvedCwd && !resolvedServerId) {
-      const pathMatches = (candidateCwd) =>
-        Boolean(
-          candidateCwd &&
-          (candidateCwd === resolvedCwd ||
-            candidateCwd.startsWith(`${resolvedCwd}/`) ||
-            resolvedCwd.startsWith(`${candidateCwd}/`))
-        );
-      let matchedHostId = null;
-      let matchedName = null;
+      const exactHosts = new Map();
+      const relatedHosts = new Map();
+      const noteCandidate = (hostId, rawCandidateCwd, wsName) => {
+        const cleanCandidate = typeof rawCandidateCwd === "string" ? rawCandidateCwd.trim().replace(/\/+$/, "") : "";
+        if (!hostId || !cleanCandidate) return;
+        if (cleanCandidate === resolvedCwd) {
+          if (!exactHosts.has(hostId)) exactHosts.set(hostId, wsName);
+          return;
+        }
+        if (cleanCandidate.startsWith(`${resolvedCwd}/`) || resolvedCwd.startsWith(`${cleanCandidate}/`)) {
+          if (!relatedHosts.has(hostId)) relatedHosts.set(hostId, wsName);
+        }
+      };
+
       for (const w of inventory.workspaces) {
-        const sessionHit = w.recentChats?.find((s) => s.serverId && pathMatches(s.cwd));
-        if (sessionHit?.serverId) {
-          matchedHostId = sessionHit.serverId;
-          matchedName = w.name;
-          break;
-        }
-        const hostHit = w.hosts?.find((h) => h.serverId && pathMatches(h.preferredCwd));
-        if (hostHit?.serverId) {
-          matchedHostId = hostHit.serverId;
-          matchedName = w.name;
-          break;
-        }
+        for (const s of w.recentChats ?? []) noteCandidate(s.serverId, s.cwd, w.name);
+        for (const h of w.hosts ?? []) noteCandidate(h.serverId, h.preferredCwd, w.name);
       }
-      if (!matchedHostId) {
+
+      if (exactHosts.size > 1) {
+        throw new Error(
+          `Directory "${clampText(resolvedCwd, 80)}" exists on multiple Paseo hosts (${[...exactHosts.keys()].join(", ")}). Pass serverId explicitly.`
+        );
+      }
+      if (exactHosts.size === 1) {
+        const [[hostId, wsName]] = [...exactHosts.entries()];
+        resolvedServerId = hostId;
+        workspaceLabel ??= wsName;
+      } else if (relatedHosts.size > 1) {
+        throw new Error(
+          `Directory "${clampText(resolvedCwd, 80)}" matches multiple Paseo hosts (${[...relatedHosts.keys()].join(", ")}). Pass serverId explicitly.`
+        );
+      } else if (relatedHosts.size === 1) {
+        const [[hostId, wsName]] = [...relatedHosts.entries()];
+        resolvedServerId = hostId;
+        workspaceLabel ??= wsName;
+      } else {
         throw new Error(
           `Could not determine which Paseo host owns directory "${clampText(resolvedCwd, 80)}". Pass serverId explicitly or pass workspace.`
         );
       }
-      resolvedServerId = matchedHostId;
-      workspaceLabel ??= matchedName;
     } else {
       const needle = (workspaceLabel || "").toLowerCase();
       const hasSelectedHost = (w) => !explicitServerId || Boolean(w.hosts?.some((h) => h.serverId === explicitServerId && h.preferredCwd));
@@ -1119,6 +1136,29 @@ export function normalizeBatchCardsInput({
   };
 }
 
+export function selectBatchTargetCards(openCards, {
+  normOp,
+  normFilter = null,
+  explicitIds = null,
+  maxCards = 25
+} = {}) {
+  const maxBatch = Math.min(25, Math.max(0, Number.isInteger(maxCards) ? maxCards : 25));
+  const list = Array.isArray(openCards) ? openCards : [];
+  let targets = explicitIds?.length
+    ? explicitIds.map((id) => list.find((c) => c.id === id || c.questionId === id)).filter(Boolean)
+    : [...list];
+
+  if (normOp === "merge_green" || normFilter === "green_prs") {
+    targets = targets.filter(isGreenMergeablePrCard);
+  } else if (normFilter === "ci_failed" || (normOp === "fix_ci" && !explicitIds?.length)) {
+    targets = targets.filter((c) => c.kind === "ci_failed" || c.primaryAction?.op === "fix_ci");
+  } else if (normFilter === "questions" || normFilter === "non_pr") {
+    targets = targets.filter((c) => c.kind !== "merge_ready" && c.kind !== "pr_ready" && c.kind !== "ci_failed");
+  }
+
+  return targets.slice(0, maxBatch);
+}
+
 export async function batchActCards(supervisor, {
   op = null,
   filter = null,
@@ -1129,21 +1169,7 @@ export async function batchActCards(supervisor, {
 } = {}) {
   const openCards = Array.isArray(supervisor?.getState?.()?.cards) ? supervisor.getState().cards : [];
   const { normOp, cardOp, normFilter, explicitIds } = normalizeBatchCardsInput({ op, filter, cardIds });
-  const maxBatch = Math.min(25, Math.max(0, Number.isInteger(maxCards) ? maxCards : 25));
-
-  let targets = explicitIds?.length
-    ? explicitIds.map((id) => openCards.find((c) => c.id === id || c.questionId === id)).filter(Boolean)
-    : [...openCards];
-
-  if (normOp === "merge_green" || normFilter === "green_prs") {
-    targets = targets.filter(isGreenMergeablePrCard);
-  } else if (normFilter === "ci_failed" || (normOp === "fix_ci" && !explicitIds?.length)) {
-    targets = targets.filter((c) => c.kind === "ci_failed" || c.primaryAction?.op === "fix_ci");
-  } else if (normFilter === "questions" || normFilter === "non_pr") {
-    targets = targets.filter((c) => c.kind !== "merge_ready" && c.kind !== "pr_ready" && c.kind !== "ci_failed");
-  }
-
-  targets = targets.slice(0, maxBatch);
+  const targets = selectBatchTargetCards(openCards, { normOp, normFilter, explicitIds, maxCards });
   if (targets.length === 0) {
     return {
       ok: true,
