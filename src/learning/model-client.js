@@ -42,6 +42,7 @@ export class ModelClient {
     this._token = undefined; // undefined: not read yet; null: unavailable
     this._failures = 0;
     this._openUntil = 0;
+    this._probing = false;
     this._health = null; // { value, at }
     this._healthInFlight = null;
   }
@@ -160,11 +161,21 @@ export class ModelClient {
     return this._failures >= BREAKER_FAILURES && this.now() < this._openUntil;
   }
 
+  // After the cooldown the breaker is half-open: exactly one trial request
+  // goes out, and every other caller gets null until that trial settles.
+  _admit() {
+    if (this._failures < BREAKER_FAILURES) return true;
+    if (this.now() < this._openUntil || this._probing) return false;
+    this._probing = true;
+    return true;
+  }
+
   // One request, bounded by timeoutMs. parse maps the JSON body to the
   // result, or to null when its shape is wrong. Never throws.
   async _call(method, endpoint, body, parse) {
+    if (!this.enabled() || !this._admit()) return null;
+    const probe = this._probing === true;
     try {
-      if (!this.enabled() || this._breakerOpen()) return null;
       const result = parse(await this._fetchJson(method, endpoint, body)) ?? null;
       if (result === null) throw new Error("unexpected response shape");
       this._failures = 0;
@@ -174,6 +185,8 @@ export class ModelClient {
       this._failures += 1;
       if (this._failures >= BREAKER_FAILURES) this._openUntil = this.now() + BREAKER_COOLDOWN_MS;
       return null;
+    } finally {
+      if (probe) this._probing = false;
     }
   }
 

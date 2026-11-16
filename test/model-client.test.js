@@ -271,6 +271,25 @@ test("refused, non-200, bad JSON, wrong shape and redirects all return null with
   assert.equal(await throwing.scoreSuggestion({ title: "x" }), null);
 });
 
+test("after the cooldown only one trial request goes out, however many callers arrive", async (t) => {
+  const tokenFile = writeToken(tempDir(t));
+  const stub = await startStub(t, { "POST /score/suggestion": { status: 500 } });
+  let clock = 1_000_000;
+  const client = makeClient({ url: stub.url, tokenFile, now: () => clock });
+  for (let i = 0; i < 3; i += 1) await client.scoreSuggestion({ title: "x" });
+  assert.equal(stub.requests.length, 3);
+  clock += BREAKER_COOLDOWN_MS;
+  const results = await Promise.all(Array.from({ length: 20 }, () => client.scoreSuggestion({ title: "x" })));
+  assert.equal(stub.requests.length, 4, "one probe, not twenty");
+  assert.ok(results.every((r) => r === null));
+  stub.routes["POST /score/suggestion"] = { json: { p_accept: 0.5, version: "v1" } };
+  clock += BREAKER_COOLDOWN_MS;
+  const after = await Promise.all(Array.from({ length: 5 }, () => client.scoreSuggestion({ title: "x" })));
+  assert.equal(stub.requests.length, 5, "the next cooldown again admits a single probe");
+  assert.equal(after.filter((r) => r !== null).length, 1);
+  assert.deepEqual(await client.scoreSuggestion({ title: "x" }), { pAccept: 0.5, version: "v1" }, "closed after a good probe");
+});
+
 test("the breaker opens after three consecutive failures and closes after 60 s", async (t) => {
   const tokenFile = writeToken(tempDir(t));
   const stub = await startStub(t, { "POST /score/suggestion": { status: 500 } });
