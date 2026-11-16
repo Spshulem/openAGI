@@ -149,6 +149,83 @@ export function createFleetRoute({ supervisor } = {}) {
         }
         return ok(await supervisor.searchThreads({ query, limit }));
       }
+      if (parts.length === 1 && parts[0] === "workspaces") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.listWorkspaces !== "function") {
+          return fail(503, "Workspace inventory is not available.");
+        }
+        const query = url?.searchParams?.get("query") ?? url?.searchParams?.get("q") ?? "";
+        const includeArchived = url?.searchParams?.get("includeArchived") === "true";
+        const limit = Number(url?.searchParams?.get("limit") ?? 30);
+        if (query.length > 200 || !Number.isInteger(limit) || limit < 1 || limit > 60) {
+          return fail(400, "Pass a query up to 200 characters and a limit of 1-60.");
+        }
+        return ok(await supervisor.listWorkspaces({ query, includeArchived, limit }));
+      }
+      if (parts.length === 1 && parts[0] === "repo-status") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.inspectRepoStatus !== "function") {
+          return fail(503, "Repository status inspection is not available.");
+        }
+        const repo = url?.searchParams?.get("repo") ?? "";
+        const workspace = url?.searchParams?.get("workspace") ?? "";
+        const limit = Number(url?.searchParams?.get("limit") ?? 15);
+        if ((!repo.trim() && !workspace.trim()) || repo.length > 160 || workspace.length > 160 || !Number.isInteger(limit) || limit < 1 || limit > 30) {
+          return fail(400, "Pass repo or workspace and a limit of 1-30.");
+        }
+        try {
+          return ok(await supervisor.inspectRepoStatus({ repo: repo.trim() || null, workspace: workspace.trim() || null, limit }));
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Could not inspect repository.").slice(0, 200));
+        }
+      }
+      if (parts.length === 2 && parts[0] === "sessions" && parts[1] === "start") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.startPaseoSession !== "function") {
+          return fail(503, "Starting Paseo sessions is not available.");
+        }
+        const body = await readObject(readBody);
+        const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
+        const workspace = typeof body?.workspace === "string" ? body.workspace.trim() : "";
+        const cwd = typeof body?.cwd === "string" ? body.cwd.trim() : "";
+        if (!prompt || prompt.length > 4000) return fail(400, "prompt must be 1-4000 characters.");
+        if ((!workspace && !cwd) || workspace.length > 160 || cwd.length > 400) {
+          return fail(400, "Pass workspace or cwd.");
+        }
+        try {
+          const started = await supervisor.startPaseoSession({
+            workspace: workspace || null,
+            cwd: cwd || null,
+            serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
+            title: typeof body?.title === "string" && body.title.trim() ? body.title.trim() : null,
+            provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            prompt
+          });
+          return ok({ session: started, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Could not start Paseo session.").slice(0, 220));
+        }
+      }
+      if (parts.length === 2 && parts[0] === "cards" && parts[1] === "batch") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.batchActCards !== "function") {
+          return fail(503, "Batch card actions are not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        const op = typeof body.op === "string" ? body.op.trim() : "defer";
+        const filter = typeof body.filter === "string" ? body.filter.trim() : null;
+        const cardIds = Array.isArray(body.cardIds)
+          ? body.cardIds.filter((id) => typeof id === "string" && CARD_ID_PATTERN.test(id)).slice(0, 25)
+          : null;
+        const value = typeof body.value === "string" ? body.value.trim() : null;
+        if (value && value.length > REPLY_MAX) return fail(400, "Option value is too long.");
+        try {
+          const result = await supervisor.batchActCards({ op, filter, cardIds, value, ...sendOptions });
+          return ok({ result, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Batch card action failed.").slice(0, 220));
+        }
+      }
       if (parts.length === 1 && parts[0] === "preferences") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (typeof supervisor.updatePreferences !== "function") {

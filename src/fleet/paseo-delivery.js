@@ -193,9 +193,10 @@ async function respondPaseoPermission(api, ref, agentId, requestId, response) {
 }
 
 function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
-  if (!agent || agent.archivedAt || agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
+  if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
+  if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
-  if (ownerInitiated && !["idle", "running", "error"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
+  if (ownerInitiated && !["idle", "running", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
   if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) return "Paseo chat changed; scan again before sending";
   if (!ownerInitiated && agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
@@ -209,7 +210,10 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
 export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
-  if (!config?.paseo?.enabled || thread?.kind !== "paseo" || thread.excluded) return blocked("Paseo delivery is not enabled for this chat");
+  const blockedExclusion = ownerInitiated
+    ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
+    : Boolean(thread?.excluded);
+  if (!config?.paseo?.enabled || thread?.kind !== "paseo" || blockedExclusion) return blocked("Paseo delivery is not enabled for this chat");
   if (!store?.dir) return blocked("Paseo delivery needs durable storage");
   const digest = createHash("sha256").update(thread.key).digest("hex");
   const file = path.join(store.dir, "paseo-deliveries", `${digest}.json`);

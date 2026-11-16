@@ -79,12 +79,16 @@ const EXACT = new Set([
   "GET /fleet/api/state",
   "GET /fleet/api/diagnose",
   "GET /fleet/api/search",
+  "GET /fleet/api/workspaces",
+  "GET /fleet/api/repo-status",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
   "POST /fleet/api/mode",
   "POST /fleet/api/preferences",
   "POST /fleet/api/route",
+  "POST /fleet/api/sessions/start",
+  "POST /fleet/api/cards/batch",
   // The owner's own message to one fleet thread (its chat's reply box).
   "POST /fleet/api/send",
   // Shared device threads and the read-only lifelog. Owner decision: paired

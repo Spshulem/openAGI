@@ -47,7 +47,7 @@ export function authorityRecord(principal) {
 // never count, so "what is the Claude agent doing?" or "what did codex say?"
 // names no action. A family with nouns also needs one of them somewhere in
 // the text ("open Safari", not just "open").
-const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|sure|yes|yeah|yep|so|let's|lets|go ahead and|(?:can|could|would|will) you|(?:want|need) you to)\b)\s*(?:(?:please|just|now|also)\s+)*`;
+const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|sure|yes|yeah|yep|so|let's|lets|go ahead and|help me|(?:can|could|would|will) you|(?:want|need|like|love) you to)\b)\s*(?:(?:please|pls|just|now|also|go)\s+)*`;
 
 const ARTICLES = String.raw`(?:(?:a|an|the|my|another|new|up)\s+)*`;
 const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|sessions?|runs?|tasks?))`;
@@ -57,7 +57,7 @@ const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|se
 // must end the clause, so "write a thread to summarize this" names no one.
 const NOT_TOLD = String.raw`(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who|whose|a|an|(?:them|these|those|it)\s+apart|(?:(?:the|some|any|this|that|these|those|your|my|our)\s+)?(?:difference|truth|time|story|stories|jokes?|lies?|fortunes?|tales?))\b)`;
 const NOT_NAME = String.raw`(?:me|us|my|your|our|his|her|their|them|him|it|the|a|an|this|that|these|those|some|any|everyone|everybody|someone|somebody)\b`;
-const TARGET_NOUN = String.raw`(?:${CODING_AGENT}|claude|conductor|agents?|threads?|chats?|workspaces?)\b(?!['’]s)`;
+const TARGET_NOUN = String.raw`(?:${CODING_AGENT}|paseo|claude|conductor|agents?|threads?|chats?|sessions?|workspaces?|worktrees?)\b(?!['’]s)`;
 const NAMED_RECIPIENT = String.raw`${ARTICLES}(?:(?!(?:about|of|for|on|in|from|with|regarding|to|and|that)\b)[\w-]+\s+){0,2}?${TARGET_NOUN}`;
 const CLAUSE_END = String.raw`(?=\s*(?:$|[.,;:!?\n]|(?:and|then|now|please|so|saying|with|that|too|in|on|via)\b))`;
 const TO_RECIPIENT = String.raw`(?:${NAMED_RECIPIENT}|(?!${NOT_NAME})[\w-]+(?:['’]s\s+(?:[\w-]+\s+)?${TARGET_NOUN}|${CLAUSE_END}))`;
@@ -66,11 +66,26 @@ export const INTENT_FAMILIES = Object.freeze({
   approve: {
     pattern: [
       String.raw`(?:click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer|defer|dismiss|skip|veto)\b`,
-      String.raw`(?:merge|ship)\s+(?:it|this|that|the\s+(?:pr|pull request|[\w-]+\s+one)|pr\b|#\d+|and\s+deploy\b)`,
-      String.raw`(?:go for it|go ahead|do (?:it|that)|looks (?:good|fine)|sounds (?:good|fine)|fine (?:with|by) me|works for me|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current)\b`,
+      String.raw`(?:merge|ship)\s+(?:it|this|that|all|every|green|ready|the\s+(?:pr|pull request|prs|pull requests|[\w-]+\s+one)|prs?\b|#\d+|and\s+deploy\b)`,
+      String.raw`(?:batch|triage|clear|sweep)\b[^.!?\n]{0,80}?\b(?:cards?|prs?|pull requests?|questions?|approvals?|queue)\b`,
+      String.raw`(?:go for it|go ahead|do (?:it|that)|looks (?:good|fine)|sounds (?:good|fine)|fine (?:with|by) me|works for me|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current|(?:use\s+(?:the\s+)?)?recommended(?:\s+(?:one|option))?)\b`,
       String.raw`don['’]?t do that\b`
     ].join("|"),
-    tools: ["fleet_click", "fleet_answer_question", "fleet_act_card", "fleet_preferences"]
+    tools: ["fleet_click", "fleet_answer_question", "fleet_act_card", "fleet_batch_cards", "fleet_preferences"]
+  },
+  // Master-coordinator intent: coordinating across workspaces/chats, checking
+  // in with sessions, driving a repo toward a release, or spinning up a fresh
+  // Paseo session in the right workspace. Passive questions ("what did codex
+  // say?", "what's the latest?") still match nothing here.
+  coordinate: {
+    pattern: [
+      String.raw`(?:co+rdinate|cordinate|sync(?:\s+up)?|orchestrate|align|huddle)\s+(?:together|with|across|in|on)\b(?!\s+(?:me|us|my\s+calendar)\b)`,
+      String.raw`(?:co+rdinate|cordinate)\b[^.!?\n]{0,120}?\b(?:workspaces?|chats?|threads?|sessions?|agents?|paseo|codex|claude|conductor|repos?|prs?|releases?)\b`,
+      String.raw`(?:check(?:\s+in)?|follow\s+up|work|reach\s+out)\s+with\s+${TO_RECIPIENT}`,
+      String.raw`(?:have|get|make|let)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:check(?!\s+the\s+(?:news|weather|stock|email|calendar)\b)|verify|test|finish|complete|ship|merge|rebase|update|report|sync|co+rdinate|cordinate|wrap\s+up|cut|prepare|deploy|continue|run|push)\b`,
+      String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`
+    ].join("|"),
+    tools: ["fleet_send_message", "fleet_start_session", "reply_to_coding_agent"]
   },
   // Messaging needs a recipient, so "write a summary of these results", "tell
   // if this site is legit" or "write a twitter thread" never lets read text
@@ -203,5 +218,48 @@ export function matchConfirmation(text) {
   }
   if (yes && !no) return { decision: "approve", code };
   if (no && !yes) return { decision: "deny", code };
+  return null;
+}
+
+const BATCH_WORDS = new Set(["all", "everything", "both"]);
+const MULTI_FILLER = new Set([...FILLER, "codes", "numbers", "of", "them", "these", "those", "to"]);
+
+// Typed owner confirmations can approve or deny multiple pending codes in one
+// message ("yes 60, yes 19, yes 78", "approve 60 19 78", "yes all"). Single-code
+// and codeless confirms delegate to matchConfirmation so voice/single rules hold.
+export function matchConfirmations(text) {
+  const single = matchConfirmation(text);
+  if (single) {
+    return { decision: single.decision, codes: single.code ? [single.code] : [], all: false };
+  }
+  const raw = String(text ?? "").trim().toLowerCase();
+  if (!raw || raw.length > 200) return null;
+  const words = raw.replace(/[’]/g, "'").replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
+  const codes = [];
+  let all = false;
+  let yes = 0;
+  let no = 0;
+  for (let index = 0; index < words.length;) {
+    const word = words[index];
+    if (/^\d{2,3}$/.test(word)) {
+      if (!codes.includes(word)) codes.push(word);
+      index += 1;
+      continue;
+    }
+    if (BATCH_WORDS.has(word)) {
+      all = true;
+      index += 1;
+      continue;
+    }
+    const refusal = consume(words, index, NO_PHRASES);
+    if (refusal) { no += 1; index += refusal; continue; }
+    const assent = consume(words, index, YES_PHRASES);
+    if (assent) { yes += 1; index += assent; continue; }
+    if (MULTI_FILLER.has(word)) { index += 1; continue; }
+    return null;
+  }
+  if (!all && codes.length < 2) return null;
+  if (yes && !no) return { decision: "approve", codes, all };
+  if (no && !yes) return { decision: "deny", codes, all };
   return null;
 }

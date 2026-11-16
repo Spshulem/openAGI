@@ -14,7 +14,7 @@ import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupe
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|preferences|route|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -38,6 +38,16 @@ export function createFleetCapability(supervisor) {
         if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
+      if (payload.path === '/fleet/api/workspaces') {
+        if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
+        if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/repo-status') {
+        if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
+        if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
@@ -56,7 +66,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|route|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -338,6 +348,26 @@ export class RemoteFleetSupervisor {
     };
   }
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
+  async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
+  async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
+  async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
+  async batchActCards(input = {}) { return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null; }
+  async readChatTranscript({ key, limit = 20 } = {}) {
+    const detail = await this.threadDetail(key);
+    if (!detail) throw new Error(`No session found with key "${String(key ?? '').slice(0, 120)}".`);
+    const msgs = Array.isArray(detail.conversation?.messages) ? detail.conversation.messages.slice(-limit) : [];
+    return {
+      key: detail.key,
+      kind: detail.kind,
+      title: detail.title,
+      workspace: detail.workspace ?? null,
+      repo: detail.repo ?? null,
+      status: detail.state ?? detail.agentStatus ?? 'idle',
+      messageCount: msgs.length,
+      messages: msgs,
+      openChat: detail.openChat ?? null
+    };
+  }
   async routeIssue(input = {}) {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
     return rest;

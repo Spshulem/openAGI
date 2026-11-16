@@ -282,7 +282,7 @@ test('another delivery cannot send while turn confirmation is pending', async t 
   assert.equal(f.sent.length, 1);
 });
 
-test('owner-initiated Paseo sends steer active turns and updated revisions while still blocking closed or permission-locked chats', async t => {
+test('owner-initiated Paseo sends steer active turns and wake unarchived sleeping chats while blocking archived or permission-locked chats', async t => {
   const f = setup(t, { status: 'running', activeTurn: { turnId: 'turn-1' }, updatedAt: '2026-01-02T00:00:00Z' });
   const autoBlocked = await deliverPaseo(f.args);
   assert.equal(autoBlocked.status, 'blocked', 'automatic nudges remain blocked on running chats');
@@ -293,7 +293,14 @@ test('owner-initiated Paseo sends steer active turns and updated revisions while
   assert.equal(f.sent.length, 1);
 
   const closed = setup(t, { status: 'closed' });
-  assert.equal((await deliverPaseo({ ...closed.args, base: { messageHash: 'owner-2', playbook: 'owner-message' } })).status, 'blocked');
+  closed.args.thread = paseoThread({ id: 'chat', status: 'closed', updatedAt: '2026-01-01T00:00:00Z', cwd: '/workspace/repo', workspaceId: 'workspace' }, 'host');
+  assert.equal(closed.args.thread.excluded, 'closed');
+  assert.equal((await deliverPaseo(closed.args)).status, 'blocked', 'automatic nudges never wake sleeping closed chats');
+  assert.equal((await deliverPaseo({ ...closed.args, base: { messageHash: 'owner-2', playbook: 'owner-message' } })).status, 'sent', 'owner messages wake unarchived sleeping Paseo chats');
+  assert.equal(closed.sent.length, 1);
+
+  const archived = setup(t, { status: 'closed', archivedAt: '2026-01-02T00:00:00Z' });
+  assert.equal((await deliverPaseo({ ...archived.args, base: { messageHash: 'owner-arch', playbook: 'owner-message' } })).status, 'blocked');
 
   const permLocked = setup(t, { pendingPermissions: [{}] });
   assert.equal((await deliverPaseo({ ...permLocked.args, base: { messageHash: 'owner-3', playbook: 'owner-message' } })).status, 'blocked');

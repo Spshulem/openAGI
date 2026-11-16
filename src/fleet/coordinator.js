@@ -1,0 +1,999 @@
+// Master Coordinator capabilities for FleetSupervisor:
+//   - listWorkspaces: cross-host workspace/project inventory + overlap detection
+//   - readChatTranscript: deep on-demand transcript reader (including sleeping Paseo chats)
+//   - inspectRepoStatus: live GitHub PRs, CI rollups, recent merges, releases + session cross-ref
+//   - startPaseoSession: spawns a new Paseo coding session in the right workspace & host
+//   - batchActCards: rapid multi-card triage with per-card safety preflight
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  SUPERVISOR_PREFIX,
+  clampText,
+  openChatFor,
+  parsePaseoThreadKey,
+  parsePrRef,
+  redactSecrets,
+  runCommand
+} from "./contracts.js";
+import { readThreadConversation } from "./conversation.js";
+import { collectArchiveThreads } from "./search.js";
+import { hostApi, paseoThread, withPaseo } from "./sources/paseo.js";
+
+const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
+
+function cleanName(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed || OPAQUE_ID_RE.test(trimmed)) return null;
+  return trimmed;
+}
+
+export function deriveProjectInfo({ cwd = null, workspace = null, repo = null, prRefs = [] } = {}) {
+  const resolvedRepo = (typeof repo === "string" && REPO_SLUG_RE.test(repo.trim()) ? repo.trim() : null)
+    ?? parsePrRef(prRefs?.[0])?.repo
+    ?? null;
+  const rawCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
+  const ws = cleanName(workspace);
+
+  let project = null;
+  let worktree = null;
+  const migrated = Boolean(rawCwd && rawCwd.includes("/paseo/migrated/"));
+
+  if (rawCwd) {
+    const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/.exec(rawCwd);
+    const condMatch = /\/([^/]+)\/\.conductor\/([^/]+)/.exec(rawCwd);
+    const devMatch = /(?:\/Users\/[^/]+|\/home\/[^/]+)\/(?:Dev|Developer|Code|Projects|Repos)\/([^/]+)/i.exec(rawCwd);
+    if (wtMatch) {
+      project = wtMatch[1];
+      worktree = wtMatch[2];
+    } else if (condMatch) {
+      project = condMatch[1];
+      worktree = condMatch[2];
+    } else if (devMatch) {
+      project = devMatch[1];
+    } else {
+      const base = path.basename(rawCwd);
+      if (base && base !== "." && base !== "/" && !OPAQUE_ID_RE.test(base)) {
+        project = base;
+      }
+    }
+  }
+
+  if (!project && resolvedRepo) {
+    project = resolvedRepo.split("/")[1] ?? resolvedRepo;
+  }
+  if (!project && ws) {
+    project = ws;
+  }
+
+  const label = project || ws || "unknown";
+  return {
+    key: label.toLowerCase(),
+    name: label,
+    worktree: worktree || (ws && ws.toLowerCase() !== label.toLowerCase() ? ws : null),
+    repo: resolvedRepo,
+    cwd: rawCwd,
+    migrated
+  };
+}
+
+function scoreWorkspaceTarget({ cwd, migrated, worktree, status, updatedAt }) {
+  if (!cwd) return -1000;
+  let score = 0;
+  if (!migrated) score += 40;
+  if (!worktree && !cwd.includes("/.conductor/") && !cwd.includes("/worktrees/")) score += 20;
+  if (status === "running") score += 10;
+  else if (status === "idle") score += 6;
+  const ts = Date.parse(updatedAt ?? "") || 0;
+  score += Math.min(10, Math.max(0, ts / 1e12));
+  return score;
+}
+
+function normalizeSessionState(thread) {
+  if (thread?.archived) return "archived";
+  const raw = thread?.agentStatus ?? thread?.state ?? "unknown";
+  if (thread?.excluded === "closed" || raw === "closed") return "sleeping";
+  if (raw === "running" || thread?.live) return "running";
+  if (raw === "waiting" || thread?.meta?.blockedOnOwner) return "waiting";
+  if (raw === "error" || thread?.error) return "error";
+  if (raw === "idle") return "idle";
+  return String(raw || "idle");
+}
+
+function mergeDiscoveredIntoKnown(supervisor, thread) {
+  if (!thread?.key || typeof supervisor?.recordDiscoveredThread !== "function") return thread;
+  return supervisor.recordDiscoveredThread(thread);
+}
+
+async function fetchPaseoHostInventory(config, { includeArchived = false, factory } = {}) {
+  if (!config?.paseo?.enabled) return { hosts: [], threads: [], emptyWorkspaces: [] };
+  const inventoryConfig = {
+    ...config,
+    paseo: { ...config.paseo, timeoutMs: Math.min(config.paseo.timeoutMs ?? 25_000, 25_000) }
+  };
+  return withPaseo(inventoryConfig, async (client, signal) => {
+    const directory = await client.hosts.list();
+    const selfId = directory?.self?.serverId ?? "local";
+    const selfLabel = directory?.self?.label || directory?.self?.hostname || "local";
+    const hostEntries = [
+      { serverId: selfId, label: selfLabel, status: "online" },
+      ...(directory?.hosts ?? [])
+        .filter((h) => h?.serverId && h.enabled && h.status === "online" && h.serverId !== selfId)
+        .map((h) => ({ serverId: h.serverId, label: h.label || h.hostname || h.serverId, status: "online" }))
+    ];
+
+    const threads = [];
+    const emptyWorkspaces = [];
+
+    for (const host of hostEntries) {
+      signal.throwIfAborted();
+      let api;
+      try {
+        api = await hostApi(client, host.serverId, directory);
+      } catch {
+        continue;
+      }
+
+      // Optional workspace catalog for newly created workspaces with 0 agents yet.
+      if (typeof api?.workspaces?.list === "function") {
+        try {
+          const wsRes = await api.workspaces.list({ page: { limit: 100 } });
+          for (const ws of wsRes?.entries ?? []) {
+            if (!ws?.directory || (ws.archivedAt && !includeArchived)) continue;
+            emptyWorkspaces.push({
+              serverId: host.serverId,
+              hostLabel: host.label,
+              cwd: ws.directory,
+              workspace: cleanName(ws.name) ?? null
+            });
+          }
+        } catch { /* workspaces.list is optional across daemon builds */ }
+      }
+
+      let cursor;
+      const seen = new Set();
+      for (let page = 0; page < 8; page += 1) {
+        signal.throwIfAborted();
+        const res = await api.agents.list({
+          filter: { includeArchived: Boolean(includeArchived), includeBackground: true },
+          sort: [{ key: "updated_at", direction: "desc" }],
+          page: { limit: 100, ...(cursor ? { cursor } : {}) }
+        });
+        for (const entry of res?.entries ?? []) {
+          const agent = entry?.agent ?? entry;
+          if (!agent?.id) continue;
+          if (!includeArchived && agent.archivedAt) continue;
+          const row = paseoThread(agent, host.serverId, [], true);
+          row.meta.hostLabel = host.label;
+          row.meta.rawStatus = agent.status ?? "idle";
+          threads.push(row);
+        }
+        if (!res?.pageInfo?.hasMore) break;
+        cursor = res.pageInfo.nextCursor;
+        if (!cursor || seen.has(cursor)) break;
+        seen.add(cursor);
+      }
+    }
+    return { hosts: hostEntries, threads, emptyWorkspaces };
+  }, factory);
+}
+
+export async function listWorkspaces(supervisor, { query = "", includeArchived = false, limit = 30, factory } = {}) {
+  const maxWorkspaces = Math.min(60, Math.max(1, Number(limit) || 30));
+  const byKey = new Map();
+  const hostLabels = new Map();
+
+  for (const [k, t] of supervisor?.knownThreads ?? []) {
+    if (k && t && (includeArchived || !t.archived)) byKey.set(k, t);
+  }
+  for (const [k, t] of supervisor?.lastThreads ?? []) {
+    if (k && t && (includeArchived || !t.archived)) byKey.set(k, t);
+  }
+
+  let emptyWorkspaces = [];
+  if (supervisor?.config?.paseo?.enabled) {
+    try {
+      const live = await fetchPaseoHostInventory(supervisor.config, { includeArchived, factory });
+      emptyWorkspaces = live.emptyWorkspaces ?? [];
+      for (const h of live.hosts ?? []) hostLabels.set(h.serverId, h.label);
+      for (const fresh of live.threads ?? []) {
+        const merged = mergeDiscoveredIntoKnown(supervisor, fresh);
+        byKey.set(fresh.key, merged);
+      }
+    } catch {
+      // Degrade gracefully to cached scan threads when Paseo WS is temporarily unreachable.
+    }
+  }
+
+  const state = supervisor?.getState?.() ?? {};
+  const cardPrByThread = new Map();
+  for (const c of state.cards ?? []) {
+    if (c?.threadKey && c?.prRef) cardPrByThread.set(c.threadKey, c.prRef);
+  }
+
+  const groups = new Map();
+  const ensureGroup = (info) => {
+    let group = groups.get(info.key);
+    if (!group) {
+      group = {
+        id: info.key,
+        name: info.name,
+        repo: info.repo ?? null,
+        counts: { running: 0, idle: 0, sleeping: 0, archived: 0, total: 0 },
+        hostsMap: new Map(),
+        prSessions: new Map(),
+        activeCwdSessions: new Map(),
+        candidates: [],
+        sessions: []
+      };
+      groups.set(info.key, group);
+    } else if (!group.repo && info.repo) {
+      group.repo = info.repo;
+    }
+    return group;
+  };
+
+  for (const ws of emptyWorkspaces) {
+    const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace });
+    const group = ensureGroup(info);
+    group.candidates.push({
+      serverId: ws.serverId,
+      hostLabel: ws.hostLabel,
+      cwd: ws.cwd,
+      score: scoreWorkspaceTarget({ cwd: ws.cwd, migrated: info.migrated, worktree: info.worktree, status: "idle", updatedAt: null })
+    });
+    const hostBucket = group.hostsMap.get(ws.serverId) ?? { serverId: ws.serverId, label: ws.hostLabel, count: 0, preferredCwd: ws.cwd };
+    group.hostsMap.set(ws.serverId, hostBucket);
+  }
+
+  for (const thread of byKey.values()) {
+    if (!thread?.key) continue;
+    const cwd = thread.meta?.paseoCwd ?? thread.cwd ?? null;
+    const prRefs = [...new Set([
+      ...(thread.prRefs ?? []),
+      ...(cardPrByThread.has(thread.key) ? [cardPrByThread.get(thread.key)] : [])
+    ].filter(Boolean))];
+    const info = deriveProjectInfo({ cwd, workspace: thread.workspace, repo: thread.repo, prRefs });
+    const group = ensureGroup(info);
+
+    const sessionState = normalizeSessionState(thread);
+    group.counts.total += 1;
+    if (sessionState === "archived") group.counts.archived += 1;
+    else if (sessionState === "sleeping") group.counts.sleeping += 1;
+    else if (sessionState === "running" || sessionState === "waiting") group.counts.running += 1;
+    else group.counts.idle += 1;
+
+    const serverId = thread.meta?.serverId ?? (thread.kind === "paseo" ? parsePaseoThreadKey(thread.key)?.serverId : null) ?? "local";
+    const hostLabel = thread.meta?.hostLabel ?? hostLabels.get(serverId) ?? serverId;
+
+    if (cwd && thread.kind === "paseo") {
+      const candidateScore = scoreWorkspaceTarget({
+        cwd,
+        migrated: info.migrated,
+        worktree: info.worktree,
+        status: sessionState,
+        updatedAt: thread.lastActivityAt
+      });
+      group.candidates.push({ serverId, hostLabel, cwd, score: candidateScore });
+    }
+
+    const hostEntry = group.hostsMap.get(serverId) ?? { serverId, label: hostLabel, count: 0, activeCount: 0, preferredCwd: cwd ?? null, bestScore: -Infinity };
+    hostEntry.count += 1;
+    if (sessionState === "running" || sessionState === "waiting" || sessionState === "idle") {
+      hostEntry.activeCount = (hostEntry.activeCount ?? 0) + 1;
+    }
+    if (cwd) {
+      const sc = scoreWorkspaceTarget({ cwd, migrated: info.migrated, worktree: info.worktree, status: sessionState, updatedAt: thread.lastActivityAt });
+      if (sc > hostEntry.bestScore) {
+        hostEntry.bestScore = sc;
+        hostEntry.preferredCwd = cwd;
+      }
+    }
+    group.hostsMap.set(serverId, hostEntry);
+
+    if (sessionState !== "archived") {
+      for (const ref of prRefs) {
+        const list = group.prSessions.get(ref) ?? [];
+        list.push({ key: thread.key, title: thread.title, state: sessionState, host: hostLabel });
+        group.prSessions.set(ref, list);
+      }
+      if (cwd && (sessionState === "running" || sessionState === "waiting" || sessionState === "idle")) {
+        const cwdKey = `${serverId}:${cwd}`;
+        const list = group.activeCwdSessions.get(cwdKey) ?? [];
+        list.push({ key: thread.key, title: thread.title, state: sessionState, host: hostLabel, cwd });
+        group.activeCwdSessions.set(cwdKey, list);
+      }
+    }
+
+    group.sessions.push({
+      key: thread.key,
+      kind: thread.kind,
+      title: clampText(redactSecrets(thread.title || thread.workspace || thread.key), 120),
+      workspace: info.worktree ?? cleanName(thread.workspace) ?? null,
+      cwd,
+      serverId: thread.kind === "paseo" ? serverId : null,
+      host: hostLabel,
+      provider: thread.meta?.provider ?? thread.kind,
+      state: sessionState,
+      wakeable: thread.kind === "paseo" ? !thread.archived : sessionState !== "archived",
+      prRefs: prRefs.slice(0, 4),
+      lastActivityAt: thread.lastActivityAt ?? null,
+      snippet: clampText(redactSecrets(thread.lastAgentText || thread.reason || ""), 220) || null,
+      openChat: thread.openChat ?? openChatFor(thread)
+    });
+  }
+
+  const needle = String(query ?? "").trim().toLowerCase();
+  const workspaces = [];
+
+  for (const group of groups.values()) {
+    group.sessions.sort((a, b) => {
+      const rank = (s) => (s.state === "running" || s.state === "waiting" ? 0 : s.state === "error" ? 1 : s.state === "idle" ? 2 : s.state === "sleeping" ? 3 : 4);
+      return rank(a) - rank(b) || String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? ""));
+    });
+
+    if (needle) {
+      const groupMatch = group.name.toLowerCase().includes(needle)
+        || String(group.repo ?? "").toLowerCase().includes(needle)
+        || [...group.hostsMap.values()].some((h) => String(h.preferredCwd ?? "").toLowerCase().includes(needle) || String(h.label ?? "").toLowerCase().includes(needle));
+      const matchingSessions = groupMatch
+        ? group.sessions
+        : group.sessions.filter((s) =>
+            s.title.toLowerCase().includes(needle)
+            || String(s.cwd ?? "").toLowerCase().includes(needle)
+            || String(s.workspace ?? "").toLowerCase().includes(needle)
+            || s.prRefs.some((r) => r.toLowerCase().includes(needle))
+          );
+      if (!groupMatch && matchingSessions.length === 0) continue;
+      if (!groupMatch) group.sessions = matchingSessions;
+    }
+
+    group.candidates.sort((a, b) => b.score - a.score);
+    const bestTarget = group.candidates[0] ?? null;
+
+    const overlaps = [];
+    for (const [prRef, list] of group.prSessions) {
+      if (list.length >= 2) {
+        overlaps.push({
+          kind: "same_pr",
+          target: prRef,
+          detail: `${list.length} sessions reference ${prRef}`,
+          sessions: list.slice(0, 5)
+        });
+      }
+    }
+    for (const [, list] of group.activeCwdSessions) {
+      if (list.length >= 2) {
+        overlaps.push({
+          kind: "concurrent_cwd",
+          target: list[0].cwd,
+          detail: `${list.length} loaded sessions share ${list[0].cwd} on ${list[0].host}`,
+          sessions: list.slice(0, 5)
+        });
+      }
+    }
+    const activeHosts = [...group.hostsMap.values()].filter((h) => (h.activeCount ?? 0) > 0);
+    if (activeHosts.length >= 2) {
+      overlaps.push({
+        kind: "multi_host",
+        target: group.name,
+        detail: `Loaded sessions across ${activeHosts.map((h) => h.label).join(" + ")}`,
+        sessions: []
+      });
+    }
+
+    const perWorkspaceSessions = needle ? 25 : 8;
+    workspaces.push({
+      id: group.id,
+      name: group.name,
+      repo: group.repo,
+      counts: group.counts,
+      defaultTarget: bestTarget
+        ? { serverId: bestTarget.serverId, hostLabel: bestTarget.hostLabel, cwd: bestTarget.cwd }
+        : null,
+      hosts: [...group.hostsMap.values()].map(({ bestScore: _b, ...h }) => h),
+      referencedPrs: [...group.prSessions.keys()].slice(0, 12),
+      overlaps,
+      recentChats: group.sessions.slice(0, perWorkspaceSessions),
+      latestActivityAt: group.sessions[0]?.lastActivityAt ?? null
+    });
+  }
+
+  workspaces.sort((a, b) =>
+    (b.counts.running - a.counts.running)
+    || (b.overlaps.length - a.overlaps.length)
+    || (b.counts.idle - a.counts.idle)
+    || String(b.latestActivityAt ?? "").localeCompare(String(a.latestActivityAt ?? ""))
+    || a.name.localeCompare(b.name)
+  );
+
+  return {
+    scannedAt: new Date().toISOString(),
+    query: needle || null,
+    totalWorkspaces: workspaces.length,
+    totalSessions: [...byKey.values()].length,
+    workspaces: workspaces.slice(0, maxWorkspaces)
+  };
+}
+
+export async function readChatTranscript(supervisor, { key, limit = 20, factory } = {}) {
+  const cleanKey = typeof key === "string" ? key.trim() : "";
+  if (!cleanKey) throw new Error("Pass a session key (e.g. paseo:<serverId>.<agentId>).");
+  const maxMessages = Math.min(60, Math.max(1, Number(limit) || 20));
+
+  if (cleanKey.startsWith("paseo:") && supervisor?.config?.paseo?.enabled) {
+    const parsed = parsePaseoThreadKey(cleanKey);
+    if (!parsed) throw new Error(`Invalid Paseo thread key "${clampText(cleanKey, 120)}".`);
+    try {
+      const readCfg = {
+        ...supervisor.config,
+        paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 20_000, 20_000) }
+      };
+      return await withPaseo(readCfg, async (client, signal) => {
+        const directory = await client.hosts.list();
+        const api = await hostApi(client, parsed.serverId, directory);
+        const ref = api.agents.ref(parsed.agentId);
+        const history = await ref.timeline.refetch({
+          direction: "tail",
+          limit: Math.min(160, Math.max(40, maxMessages * 4))
+        });
+        signal.throwIfAborted();
+        if (history?.error) throw new Error(String(history.error));
+        const agent = history?.agent ?? ref.current() ?? { id: parsed.agentId, status: "idle" };
+        const entries = Array.isArray(history?.entries) ? history.entries : [];
+        const freshThread = paseoThread(agent, parsed.serverId, entries, true);
+        mergeDiscoveredIntoKnown(supervisor, freshThread);
+
+        const messages = entries
+          .filter((e) => ["user_message", "assistant_message", "error"].includes(e?.item?.type))
+          .slice(-maxMessages)
+          .map((e) => {
+            if (e.item.type === "error") {
+              return {
+                role: "error",
+                text: clampText(redactSecrets(String(e.item.message ?? "")), 1200),
+                at: e.timestamp ?? null
+              };
+            }
+            const rawText = String(e.item.text ?? "");
+            const isSup = e.item.type === "user_message" && rawText.startsWith(SUPERVISOR_PREFIX);
+            return {
+              role: isSup ? "supervisor" : e.item.type === "user_message" ? "user" : "assistant",
+              text: redactSecrets(rawText).slice(-3000),
+              at: e.timestamp ?? null
+            };
+          });
+
+        return {
+          key: cleanKey,
+          kind: "paseo",
+          title: freshThread.title,
+          workspace: freshThread.workspace,
+          repo: freshThread.repo,
+          prRefs: freshThread.prRefs ?? [],
+          serverId: parsed.serverId,
+          cwd: agent.cwd ?? null,
+          status: agent.archivedAt ? "archived" : (agent.status ?? "idle"),
+          wakeable: !agent.archivedAt,
+          pendingCard: freshThread.meta?.pendingCard ?? null,
+          pendingPermission: freshThread.meta?.pendingPermission ?? null,
+          messageCount: messages.length,
+          messages,
+          openChat: openChatFor(freshThread)
+        };
+      }, factory);
+    } catch (err) {
+      // Fall back to local/cached transcript if host is temporarily offline.
+      const fallback = supervisor?.lastThreads?.get(cleanKey) ?? supervisor?.knownThreads?.get(cleanKey) ?? null;
+      if (!fallback) throw new Error(`Could not read Paseo chat "${clampText(cleanKey, 120)}": ${clampText(err?.message ?? String(err), 160)}`);
+    }
+  }
+
+  let thread = supervisor?.lastThreads?.get(cleanKey) ?? supervisor?.knownThreads?.get(cleanKey) ?? null;
+  if (!thread && cleanKey.startsWith("antigravity:")) {
+    const cid = cleanKey.slice("antigravity:".length);
+    const archives = await collectArchiveThreads({
+      query: cid,
+      homeDir: supervisor?.config?.paths?.home ?? os.homedir(),
+      includeRemotePaseoHosts: Boolean(supervisor?.config?.paseo?.enabled)
+    });
+    thread = archives.get(cleanKey) ?? null;
+    if (thread) mergeDiscoveredIntoKnown(supervisor, thread);
+  }
+  if (!thread) {
+    const conv = await supervisor?.threadConversation?.(cleanKey);
+    if (!conv) throw new Error(`No session found with key "${clampText(cleanKey, 120)}". Call fleet_workspaces or fleet_search first.`);
+    return {
+      key: cleanKey,
+      kind: cleanKey.split(":")[0] || "unknown",
+      title: cleanKey,
+      messageCount: (conv.messages ?? []).slice(-maxMessages).length,
+      messages: (conv.messages ?? []).slice(-maxMessages).map((m) => ({
+        role: m.role,
+        text: redactSecrets(String(m.text ?? "")).slice(-3000),
+        at: m.at ?? null
+      }))
+    };
+  }
+
+  const conv = await readThreadConversation(thread, supervisor.config);
+  const messages = (conv?.messages ?? []).slice(-maxMessages).map((m) => ({
+    role: m.role,
+    text: redactSecrets(String(m.text ?? "")).slice(-3000),
+    at: m.at ?? null
+  }));
+  return {
+    key: cleanKey,
+    kind: thread.kind,
+    title: thread.title ?? cleanKey,
+    workspace: thread.workspace ?? null,
+    repo: thread.repo ?? null,
+    prRefs: thread.prRefs ?? [],
+    cwd: thread.meta?.paseoCwd ?? thread.cwd ?? null,
+    status: normalizeSessionState(thread),
+    wakeable: !thread.archived,
+    messageCount: messages.length,
+    messages,
+    openChat: thread.openChat ?? openChatFor(thread)
+  };
+}
+
+function parseGitRemoteRepo(remoteUrl) {
+  const raw = String(remoteUrl ?? "").trim().replace(/\.git$/i, "");
+  const httpsMatch = /github\.com[/:]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/i.exec(raw);
+  return httpsMatch ? httpsMatch[1] : null;
+}
+
+function summarizeStatusRollup(rollup) {
+  if (!Array.isArray(rollup) || rollup.length === 0) {
+    return { ciState: "NONE", failingChecks: [], pendingChecks: [] };
+  }
+  const failing = [];
+  const pending = [];
+  for (const item of rollup) {
+    const label = String(item?.name || item?.context || "check").trim();
+    const status = String(item?.status ?? "").toUpperCase();
+    const conclusion = String(item?.conclusion ?? item?.state ?? "").toUpperCase();
+    if (["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"].includes(conclusion)) {
+      failing.push(label);
+    } else if (status && status !== "COMPLETED" && !conclusion) {
+      pending.push(label);
+    } else if (["PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED"].includes(conclusion) || ["IN_PROGRESS", "QUEUED", "PENDING"].includes(status)) {
+      pending.push(label);
+    }
+  }
+  const ciState = failing.length > 0 ? "FAILURE" : pending.length > 0 ? "PENDING" : "SUCCESS";
+  return {
+    ciState,
+    failingChecks: [...new Set(failing)].slice(0, 6),
+    pendingChecks: [...new Set(pending)].slice(0, 6)
+  };
+}
+
+async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin }) {
+  const rawRepo = typeof repo === "string" ? repo.trim().replace(/^https:\/\/github\.com\//i, "").replace(/\/+$/, "") : "";
+  if (REPO_SLUG_RE.test(rawRepo)) return rawRepo;
+
+  const targetName = (rawRepo || String(workspace ?? "").trim()).toLowerCase();
+  if (!targetName) throw new Error("Provide repo ('owner/name') or workspace name (e.g. 'bb-recorder').");
+
+  const allThreads = [
+    ...(supervisor?.lastThreads?.values?.() ?? []),
+    ...(supervisor?.knownThreads?.values?.() ?? [])
+  ];
+  const state = supervisor?.getState?.() ?? {};
+  const candidateRepos = new Map();
+  const noteRepo = (slug) => {
+    if (!slug || !REPO_SLUG_RE.test(slug)) return;
+    candidateRepos.set(slug, (candidateRepos.get(slug) ?? 0) + 1);
+  };
+
+  for (const t of allThreads) {
+    const info = deriveProjectInfo({ cwd: t?.meta?.paseoCwd ?? t?.cwd, workspace: t?.workspace, repo: t?.repo, prRefs: t?.prRefs });
+    if (info.key === targetName || String(t?.workspace ?? "").toLowerCase() === targetName) {
+      noteRepo(info.repo);
+      for (const ref of t?.prRefs ?? []) noteRepo(parsePrRef(ref)?.repo);
+    }
+    const directRepo = t?.repo ?? parsePrRef(t?.prRefs?.[0])?.repo ?? null;
+    if (directRepo && directRepo.split("/")[1]?.toLowerCase() === targetName) {
+      noteRepo(directRepo);
+    }
+  }
+  for (const c of state.cards ?? []) {
+    const cRepo = c?.repo ?? parsePrRef(c?.prRef)?.repo ?? null;
+    if (cRepo && (cRepo.split("/")[1]?.toLowerCase() === targetName || String(c?.workspace ?? "").toLowerCase() === targetName)) {
+      noteRepo(cRepo);
+    }
+  }
+
+  if (candidateRepos.size > 0) {
+    return [...candidateRepos.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  // Probe local checkout git remote if a matching cwd exists on this host.
+  for (const t of allThreads) {
+    const cwd = t?.meta?.paseoCwd ?? t?.cwd ?? null;
+    if (!cwd) continue;
+    const info = deriveProjectInfo({ cwd, workspace: t?.workspace });
+    if (info.key !== targetName) continue;
+    try {
+      if (fs.existsSync(cwd)) {
+        const gitRes = await runImpl("git", ["-C", cwd, "remote", "get-url", "origin"], { timeoutMs: 4000 });
+        if (gitRes.code === 0) {
+          const parsed = parseGitRemoteRepo(gitRes.stdout);
+          if (parsed) return parsed;
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Generic GitHub CLI lookup across authenticated orgs/user.
+  const searchRes = await runImpl(
+    ghBin,
+    ["search", "repos", targetName, "--limit", "8", "--json", "fullName,updatedAt"],
+    { timeoutMs: 10_000 }
+  );
+  if (searchRes.code === 0 && searchRes.stdout) {
+    try {
+      const items = JSON.parse(searchRes.stdout);
+      if (Array.isArray(items) && items.length > 0) {
+        const exact = items
+          .filter((it) => String(it?.fullName ?? "").split("/")[1]?.toLowerCase() === targetName)
+          .sort((a, b) => String(b?.updatedAt ?? "").localeCompare(String(a?.updatedAt ?? "")));
+        if (exact[0]?.fullName) return exact[0].fullName;
+      }
+    } catch { /* ignore */ }
+  }
+
+  throw new Error(`Could not resolve GitHub owner/repo for "${clampText(rawRepo || workspace, 80)}". Pass repo as "owner/name".`);
+}
+
+export async function inspectRepoStatus(supervisor, { repo = null, workspace = null, limit = 15, run = null } = {}) {
+  const runImpl = run ?? supervisor?.deps?.run ?? runCommand;
+  const ghBin = supervisor?.config?.bins?.gh ?? "gh";
+  const maxOpen = Math.min(30, Math.max(1, Number(limit) || 15));
+  const resolvedRepo = await resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin });
+
+  const [openRes, mergedRes, releaseRes] = await Promise.all([
+    runImpl(
+      ghBin,
+      [
+        "pr", "list", "--repo", resolvedRepo, "--state", "open", "--limit", String(maxOpen),
+        "--json", "number,title,headRefName,baseRefName,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,updatedAt,url"
+      ],
+      { timeoutMs: 15_000 }
+    ),
+    runImpl(
+      ghBin,
+      [
+        "pr", "list", "--repo", resolvedRepo, "--state", "merged", "--limit", "10",
+        "--json", "number,title,headRefName,mergedAt,url"
+      ],
+      { timeoutMs: 12_000 }
+    ),
+    runImpl(
+      ghBin,
+      [
+        "release", "list", "--repo", resolvedRepo, "--limit", "5",
+        "--json", "tagName,name,publishedAt,isDraft,isPrerelease"
+      ],
+      { timeoutMs: 10_000 }
+    ).catch(() => ({ code: 1, stdout: "[]", stderr: "" }))
+  ]);
+
+  if (openRes.code !== 0) {
+    throw new Error(`GitHub PR query failed for ${resolvedRepo}: ${clampText(redactSecrets(openRes.stderr || openRes.stdout || "gh error"), 200)}`);
+  }
+
+  let rawOpen = [];
+  let rawMerged = [];
+  let rawReleases = [];
+  try { rawOpen = JSON.parse(openRes.stdout || "[]"); } catch { rawOpen = []; }
+  try { if (mergedRes.code === 0) rawMerged = JSON.parse(mergedRes.stdout || "[]"); } catch { rawMerged = []; }
+  try { if (releaseRes.code === 0) rawReleases = JSON.parse(releaseRes.stdout || "[]"); } catch { rawReleases = []; }
+
+  const allThreads = new Map([
+    ...(supervisor?.knownThreads ?? []),
+    ...(supervisor?.lastThreads ?? [])
+  ]);
+
+  const matchSessionsForPr = (prRef, headRef) => {
+    const linked = [];
+    for (const t of allThreads.values()) {
+      if (!t?.key || t.archived) continue;
+      const refs = t.prRefs ?? [];
+      const samePr = refs.includes(prRef);
+      const sameBranch = Boolean(headRef && t.branch && t.branch === headRef && (!t.repo || t.repo.toLowerCase() === resolvedRepo.toLowerCase()));
+      if (!samePr && !sameBranch) continue;
+      linked.push({
+        key: t.key,
+        title: clampText(redactSecrets(t.title || t.workspace || t.key), 100),
+        state: normalizeSessionState(t),
+        serverId: t.meta?.serverId ?? null
+      });
+    }
+    return linked;
+  };
+
+  const openPrs = (Array.isArray(rawOpen) ? rawOpen : []).map((pr) => {
+    const ref = `${resolvedRepo}#${pr.number}`;
+    const rollup = summarizeStatusRollup(pr.statusCheckRollup);
+    const linkedSessions = matchSessionsForPr(ref, pr.headRefName);
+    const activeOwners = linkedSessions.filter((s) => ["running", "waiting", "idle"].includes(s.state));
+    return {
+      number: pr.number,
+      ref,
+      title: clampText(redactSecrets(String(pr.title ?? "")), 160),
+      url: pr.url ?? null,
+      headRef: pr.headRefName ?? null,
+      baseRef: pr.baseRefName ?? null,
+      isDraft: Boolean(pr.isDraft),
+      mergeState: pr.mergeStateStatus ?? null,
+      reviewDecision: pr.reviewDecision ?? null,
+      ciState: rollup.ciState,
+      failingChecks: rollup.failingChecks,
+      pendingChecks: rollup.pendingChecks,
+      updatedAt: pr.updatedAt ?? null,
+      linkedSessions: linkedSessions.slice(0, 6),
+      orphaned: !pr.isDraft && activeOwners.length === 0,
+      overlapping: linkedSessions.length >= 2
+    };
+  });
+
+  const recentlyMerged = (Array.isArray(rawMerged) ? rawMerged : []).map((pr) => ({
+    number: pr.number,
+    ref: `${resolvedRepo}#${pr.number}`,
+    title: clampText(redactSecrets(String(pr.title ?? "")), 160),
+    headRef: pr.headRefName ?? null,
+    mergedAt: pr.mergedAt ?? null,
+    url: pr.url ?? null
+  }));
+
+  const releases = (Array.isArray(rawReleases) ? rawReleases : []).map((rel) => ({
+    tag: rel.tagName ?? null,
+    name: clampText(redactSecrets(String(rel.name || rel.tagName || "")), 120),
+    publishedAt: rel.publishedAt ?? null,
+    isDraft: Boolean(rel.isDraft),
+    isPrerelease: Boolean(rel.isPrerelease)
+  }));
+
+  return {
+    repo: resolvedRepo,
+    checkedAt: new Date().toISOString(),
+    summary: {
+      openCount: openPrs.length,
+      greenReadyCount: openPrs.filter((p) => !p.isDraft && p.ciState === "SUCCESS" && p.mergeState !== "DIRTY").length,
+      ciFailingCount: openPrs.filter((p) => p.ciState === "FAILURE").length,
+      draftCount: openPrs.filter((p) => p.isDraft).length,
+      orphanedCount: openPrs.filter((p) => p.orphaned).length,
+      overlappingPrCount: openPrs.filter((p) => p.overlapping).length
+    },
+    openPrs,
+    recentlyMerged,
+    releases
+  };
+}
+
+async function resolvePaseoProviderSpec(api, cwd, requestedProvider = null) {
+  const raw = typeof requestedProvider === "string" ? requestedProvider.trim() : "";
+  if (raw && raw.includes("/")) return raw;
+  const preferredFamily = (raw || "codex").toLowerCase();
+
+  let snap = null;
+  if (typeof api?.providers?.waitForReady === "function") {
+    try { snap = await api.providers.waitForReady({ cwd, timeoutMs: 8000 }); } catch { snap = null; }
+  }
+  if (!snap && typeof api?.providers?.snapshot === "function") {
+    try { snap = await api.providers.snapshot({ cwd }); } catch { snap = null; }
+  }
+
+  const entries = Array.isArray(snap?.entries) ? snap.entries.filter((e) => e?.status === "ready") : [];
+  if (entries.length > 0) {
+    const picked = entries.find((e) => String(e.provider ?? "").toLowerCase() === preferredFamily)
+      ?? entries.find((e) => String(e.provider ?? "").toLowerCase() === "codex")
+      ?? entries.find((e) => String(e.provider ?? "").toLowerCase() === "claude")
+      ?? entries[0];
+    const model = picked.models?.find((m) => m?.isDefault) ?? picked.models?.[0] ?? null;
+    if (picked?.provider && model?.id) {
+      return `${picked.provider}/${model.id}`;
+    }
+  }
+  return raw || "codex";
+}
+
+export async function startPaseoSession(supervisor, {
+  workspace = null,
+  cwd = null,
+  serverId = null,
+  title = null,
+  prompt = "",
+  provider = null,
+  factory
+} = {}) {
+  if (!supervisor?.config?.paseo?.enabled) {
+    throw new Error("Paseo integration is not enabled on this supervisor.");
+  }
+  const cleanPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  if (!cleanPrompt || cleanPrompt.length > 4000) {
+    throw new Error("Prompt must be 1-4000 characters.");
+  }
+  const cleanTitle = typeof title === "string" && title.trim() ? clampText(title.trim(), 100) : null;
+
+  let resolvedServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
+  let resolvedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim() : null;
+  let workspaceLabel = cleanName(workspace);
+
+  if (!resolvedServerId || !resolvedCwd) {
+    const inventory = await listWorkspaces(supervisor, {
+      query: workspaceLabel || "",
+      includeArchived: true,
+      limit: 30,
+      factory
+    });
+    const needle = (workspaceLabel || "").toLowerCase();
+    const matched = needle
+      ? inventory.workspaces.find((w) => w.id === needle || w.name.toLowerCase() === needle || String(w.repo ?? "").toLowerCase() === needle)
+        ?? inventory.workspaces.find((w) => w.name.toLowerCase().includes(needle) || String(w.repo ?? "").toLowerCase().includes(needle))
+      : inventory.workspaces[0];
+
+    if (!matched?.defaultTarget?.cwd || !matched?.defaultTarget?.serverId) {
+      throw new Error(
+        workspaceLabel
+          ? `No Paseo workspace matching "${clampText(workspaceLabel, 80)}" was found on any online host. Call fleet_workspaces to see available workspaces.`
+          : "Pass workspace (e.g. 'bb-recorder') or explicit serverId + cwd."
+      );
+    }
+    resolvedServerId ??= matched.defaultTarget.serverId;
+    if (!resolvedCwd) {
+      const hostMatch = matched.hosts?.find((h) => h.serverId === resolvedServerId && h.preferredCwd);
+      resolvedCwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
+    }
+    workspaceLabel ??= matched.name;
+  }
+
+  const createCfg = {
+    ...supervisor.config,
+    paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 30_000, 30_000) }
+  };
+
+  const created = await withPaseo(createCfg, async (client, signal) => {
+    const directory = await client.hosts.list();
+    const api = await hostApi(client, resolvedServerId, directory);
+    const providerSpec = await resolvePaseoProviderSpec(api, resolvedCwd, provider);
+    signal.throwIfAborted();
+    const handle = await api.agents.create({
+      config: { provider: providerSpec },
+      cwd: resolvedCwd,
+      ...(cleanTitle ? { title: cleanTitle } : {}),
+      prompt: cleanPrompt
+    });
+    const snap = typeof handle?.current === "function" ? handle.current() : null;
+    const agentId = handle?.id ?? snap?.id;
+    if (!agentId) throw new Error("Paseo host did not return a created agent ID.");
+    const agentRecord = snap ?? {
+      id: agentId,
+      status: "running",
+      cwd: resolvedCwd,
+      title: cleanTitle ?? `${workspaceLabel || path.basename(resolvedCwd)} coordinator`,
+      provider: providerSpec.split("/")[0],
+      model: providerSpec.split("/")[1] ?? null,
+      updatedAt: new Date().toISOString()
+    };
+    const thread = paseoThread(agentRecord, resolvedServerId, [
+      { item: { type: "user_message", text: cleanPrompt }, timestamp: new Date().toISOString() }
+    ], true);
+    return { thread, agentId, providerSpec };
+  }, factory);
+
+  mergeDiscoveredIntoKnown(supervisor, created.thread);
+  supervisor.store?.recordAction?.({
+    kind: "session-start",
+    playbook: "owner-start-session",
+    threadKey: created.thread.key,
+    route: "paseo-create",
+    status: "sent",
+    by: "owner",
+    reason: clampText(`started Paseo session in ${workspaceLabel || resolvedCwd}: ${cleanTitle || cleanPrompt}`, 240)
+  });
+  supervisor.emitFleet?.("session-started");
+
+  return {
+    status: "started",
+    key: created.thread.key,
+    serverId: resolvedServerId,
+    agentId: created.agentId,
+    title: created.thread.title,
+    workspace: workspaceLabel ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+    cwd: resolvedCwd,
+    provider: created.providerSpec,
+    openChat: openChatFor(created.thread)
+  };
+}
+
+export function isGreenMergeablePrCard(card) {
+  if (!card?.prRef) return false;
+  if (card.kind !== "merge_ready" && card.kind !== "pr_ready") return false;
+  if (card.primaryAction?.op !== "merge" || card.primaryAction?.label !== "Merge PR") return false;
+  if (["FAILURE", "ERROR", "PENDING", "IN_PROGRESS"].includes(String(card.ciState ?? "").toUpperCase())) return false;
+  if (String(card.mergeState ?? "").toUpperCase() === "DIRTY") return false;
+  return true;
+}
+
+export async function batchActCards(supervisor, {
+  op = "defer",
+  filter = null,
+  cardIds = null,
+  value = null,
+  deadlineAt = null
+} = {}) {
+  const openCards = Array.isArray(supervisor?.getState?.()?.cards) ? supervisor.getState().cards : [];
+  const normOp = String(op ?? "defer").trim().toLowerCase();
+  const normFilter = typeof filter === "string" && filter.trim() ? filter.trim().toLowerCase() : null;
+  const explicitIds = Array.isArray(cardIds)
+    ? [...new Set(cardIds.map((id) => String(id ?? "").trim()).filter(Boolean))].slice(0, 25)
+    : null;
+
+  let targets = explicitIds?.length
+    ? explicitIds.map((id) => openCards.find((c) => c.id === id || c.questionId === id)).filter(Boolean)
+    : [...openCards];
+
+  let cardOp = normOp;
+  if (normOp === "merge_green" || normFilter === "green_prs") {
+    targets = targets.filter(isGreenMergeablePrCard);
+    cardOp = "merge";
+  } else if (normOp === "fix_ci" || normFilter === "ci_failed") {
+    targets = targets.filter((c) => c.kind === "ci_failed" || c.primaryAction?.op === "fix_ci");
+    cardOp = "fix_ci";
+  } else if (normFilter === "questions" || normFilter === "non_pr") {
+    targets = targets.filter((c) => c.kind !== "merge_ready" && c.kind !== "pr_ready" && c.kind !== "ci_failed");
+  } else if (!explicitIds?.length && !normFilter && (normOp !== "defer" && normOp !== "dismiss")) {
+    throw new Error("Pass explicit cardIds or a filter ('green_prs', 'ci_failed', 'questions', 'all') for batch card actions.");
+  }
+
+  targets = targets.slice(0, 25);
+  if (targets.length === 0) {
+    return {
+      ok: true,
+      op: cardOp,
+      total: 0,
+      succeeded: 0,
+      halted: 0,
+      detail: "No open decision cards matched that batch filter.",
+      results: []
+    };
+  }
+
+  const results = [];
+  let succeeded = 0;
+  let halted = 0;
+  for (const card of targets) {
+    const outcome = await supervisor.actCard(card.id, {
+      op: cardOp,
+      ...(value != null ? { value } : {}),
+      deadlineAt
+    });
+    const itemOk = Boolean(outcome && outcome.ok !== false);
+    if (itemOk) succeeded += 1;
+    else halted += 1;
+    results.push({
+      cardId: card.id,
+      headline: clampText(card.headline ?? card.id, 100),
+      prRef: card.prRef ?? null,
+      ok: itemOk,
+      status: outcome?.status ?? (outcome ? "done" : "closed"),
+      detail: clampText(outcome?.detail ?? "", 180) || null
+    });
+  }
+
+  return {
+    ok: halted === 0,
+    op: cardOp,
+    total: targets.length,
+    succeeded,
+    halted,
+    detail: `Processed ${targets.length} card${targets.length === 1 ? "" : "s"}: ${succeeded} succeeded${halted ? `, ${halted} halted` : ""}.`,
+    results
+  };
+}

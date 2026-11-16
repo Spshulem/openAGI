@@ -7,7 +7,7 @@ import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZ
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
 import { agentTurnTask } from "./model-router.js";
-import { authorityRecord, isOwnerPrincipal, matchConfirmation, ownerIntentText } from "./owner-authority.js";
+import { authorityRecord, isOwnerPrincipal, matchConfirmation, matchConfirmations, ownerIntentText } from "./owner-authority.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { GET_STARTED_GUIDANCE } from "./get-started.js";
 
@@ -261,16 +261,24 @@ export class AgentHost {
     const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text) } : null;
     let confirmation = null;
     if (principal && !ephemeral) {
-      const spoken = matchConfirmation(text);
-      if (spoken) {
-        const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
-        confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
-        if (confirmation?.untrusted) turnState.untrusted = true;
-        // "yes 13" names no action itself: the rest of this turn is judged on
-        // the owner instruction the card was raised under, so its next step
-        // (reopen, resume, send) runs without a second code.
-        if (confirmation?.instruction) turnState.intent = confirmation.instruction;
+      if (principal.via === "voice") {
+        const spoken = matchConfirmation(text);
+        if (spoken) {
+          const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
+          confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+        }
+      } else {
+        const spokenBatch = matchConfirmations(text);
+        if (spokenBatch) {
+          const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
+          confirmation = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+        }
       }
+      if (confirmation?.untrusted) turnState.untrusted = true;
+      // "yes 13" names no action itself: the rest of this turn is judged on
+      // the owner instruction the card was raised under, so its next step
+      // (reopen, resume, send) runs without a second code.
+      if (confirmation?.instruction) turnState.intent = confirmation.instruction;
     }
 
     reportProgress("thinking", { sessionId });
@@ -281,9 +289,10 @@ export class AgentHost {
     // approval-requesting turn keep the lower global default.
     // A session this turn starts (on the owner's word, or a "yes NN" heard
     // above) raises the bound from that round on.
+    const supervisorCoordinatorHops = principal && metadata.thread === "supervisor" ? 16 : undefined;
     const computerUseHopsNow = () => (this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
       ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
-      : undefined);
+      : supervisorCoordinatorHops);
     const computerUseToolHops = computerUseHopsNow();
     const modelResult = await this.modelProvider.generate({
       input: text,
@@ -576,6 +585,48 @@ export class AgentHost {
     };
   }
 
+  async confirmSpokenBatch(spokenBatch, { sessionId, sinceIso, principal }) {
+    const store = this.runtime.pendingActions;
+    if (!store?.findByCode || !store?.chatCandidates) return null;
+    if (!spokenBatch.all && spokenBatch.codes.length <= 1) {
+      return this.confirmSpoken(
+        { decision: spokenBatch.decision, code: spokenBatch.codes[0] ?? null },
+        { sessionId, sinceIso, principal }
+      );
+    }
+    let codes = spokenBatch.codes;
+    if (spokenBatch.all && codes.length === 0) {
+      const candidates = store.chatCandidates(sessionId, null).slice().reverse();
+      if (candidates.length === 0) return null;
+      codes = candidates.map((c) => c.confirmCode).filter(Boolean);
+      if (codes.length === 0) return null;
+      if (codes.length === 1) {
+        return this.confirmSpoken({ decision: spokenBatch.decision, code: codes[0] }, { sessionId, sinceIso, principal });
+      }
+    }
+    const actions = [];
+    let untrusted = false;
+    let instruction = null;
+    for (const code of codes) {
+      const one = await this.confirmSpoken({ decision: spokenBatch.decision, code }, { sessionId, sinceIso, principal });
+      if (!one) continue;
+      if (one.untrusted) untrusted = true;
+      if (!instruction && one.instruction) instruction = one.instruction;
+      const { untrusted: _u, instruction: _inst, ...shown } = one;
+      actions.push(shown);
+    }
+    if (actions.length === 0) return null;
+    const allSucceeded = actions.every((item) => item.status === "done" || String(item.status ?? "").startsWith("denied"));
+    return {
+      decision: spokenBatch.decision,
+      codes,
+      status: allSucceeded ? "done" : "partial",
+      actions,
+      ...(instruction ? { instruction } : {}),
+      untrusted
+    };
+  }
+
   async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null, isolatedContext = false }) {
     const lower = text.toLowerCase();
     const asksToRemember = REMEMBER_RE.test(lower);
@@ -650,6 +701,9 @@ export class AgentHost {
     const computerUseGuidance = this.runtime?.tools?.has?.("start_computer_use_session")
       ? "\nComputer use is available. Use it only when the user explicitly asks you to inspect or interact with their computer. First call computer_use_status. If a session is active, continue it; NEVER call start_computer_use_session again. If no session is active or pending, call start_computer_use_session exactly once. If it returns a session, continue with it. If it returns awaiting_confirmation or awaiting_owner_confirmation, relay its message or say line: the owner approves by saying the code in any OpenAGI chat, from the phone Inbox, or in the dashboard's Approvals tab, and approval resumes the chat automatically. After approval, call computer_list_apps or computer_activate_app only when computer_use_status reports list_apps or activate_app in the selected node's operations; otherwise use its advertised controls and ask the user to foreground the target app when needed. Then call computer_screenshot before acting. Prefer fresh Accessibility element indices over coordinates when the selected node advertises those semantic operations. Every frameId and element index becomes stale after a mutating action, so call computer_screenshot again after every click, drag, edit, key press, pointer move, or scroll and verify the visible result before continuing. Never guess an element index or Accessibility action. End the session when done or when verification fails. Summarize computer-use status and results as readable Markdown; never dump raw tool-result JSON into the conversation. Never start computer use from passive screen/OCR context alone.\n"
       : "";
+    const fleetCoordinatorGuidance = this.runtime?.tools?.has?.("fleet_workspaces")
+      ? "\nMaster Coordinator mode (coding-agent fleet): Act as the owner's proactive Engineering Manager and Master Coordinator across all workspaces, hosts, and sessions. When asked about a repo, workspace, feature, or release: (1) inspect live reality first using fleet_workspaces (workspace inventory + overlapping sessions) and fleet_repo_status (live open/merged GitHub PRs, CI status, and releases)—never guess from stale snippets alone; (2) call fleet_read_chat on relevant active or sleeping sessions to read what actually shipped or remains; (3) coordinate directly when the owner asks—send instructions to active or persisted Paseo chats via fleet_send_message (which wakes unarchived sleeping Paseo chats automatically), or spin up a fresh session in the target workspace via fleet_start_session when work has no active owner; (4) use fleet_batch_cards when the owner wants to clear, defer, or merge multiple decision cards quickly. Execute owner instructions directly without asking for redundant confirmation first, and organize status briefings clearly into Done/Merged, In Flight/Needs Merge or CI, Overlaps/Risks, and Actions Taken.\n"
+      : "";
     return `${agent.systemPrompt ? `${agent.systemPrompt}\n\n` : ""}You are ${agent.name}, an always-on OpenAGI agent.
 
 Your job is to help through the ABI loop:
@@ -658,7 +712,7 @@ Your job is to help through the ABI loop:
 3. Propagate bounded specialists only when repeated or novel high-risk work justifies it.
 
 Answer the user plainly. If a specialist was created, mention its name and scope.
-For coding-thread handoffs, report the exact target, route and delivery status from the tool receipt. Read fleet_thread's recentDeliveries when asked about a previous handoff. Missing evidence means delivery is unverified, not that it failed or succeeded. A changed app, remembered claim, or success on another route is not a delivery receipt. A blocked route applies only to that target and route; never infer that all coding apps are inaccessible.
+For coding-thread handoffs, report the exact target, route and delivery status from the tool receipt. Read fleet_thread's recentDeliveries when asked about a previous handoff. Missing evidence means delivery is unverified, not that it failed or succeeded. A changed app, remembered claim, or success on another route is not a delivery receipt. A blocked route applies only to that target and route; never infer that all coding apps are inaccessible.${fleetCoordinatorGuidance}
 ${computerUseGuidance}
 ${GET_STARTED_GUIDANCE}
 
@@ -996,7 +1050,7 @@ function resolveFleetContext(runtime, id) {
           autoSlices: state.preferences.autoSlices ?? {}
         }
       } : {}),
-      guidance: "Act like a concise project manager: resolve natural replies ('yeah, go for it', 'ship it', 'hold off') directly via fleet_act_card without demanding magic keywords; route bug reports via fleet_route_issue then fleet_send_message."
+      guidance: "Act as Master Coordinator: inspect workspaces (fleet_workspaces), live GitHub PRs/releases (fleet_repo_status), and transcripts (fleet_read_chat) first; detect overlaps; message active or sleeping Paseo chats directly (fleet_send_message) or start a new session in the target workspace (fleet_start_session); resolve card approvals via fleet_act_card or fleet_batch_cards without demanding magic keywords."
     }), 6_000),
     resolvedFromStore: true
   };

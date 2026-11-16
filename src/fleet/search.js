@@ -983,21 +983,33 @@ for pa in paseo_agents:
     if cnt > 0:
         seen_paseo_ids.add(pa["id"])
         matched_paseo.append((cnt, pa))
-matched_paseo.sort(key=lambda x: -x[0])
-for _, pa in matched_paseo[:16]:
+matched_paseo.sort(key=lambda x: (x[0], x[1].get("updatedAt") or ""), reverse=True)
+codex_files = None
+for _, pa in matched_paseo[:20]:
     rec = None
     sid = pa.get("sessionId")
     cwd = pa.get("cwd") or ""
-    if isinstance(sid, str) and sid and cwd:
-        slug = re.sub("[^A-Za-z0-9_-]", "-", cwd)
-        cf = os.path.join(home, ".claude", "projects", slug, sid + ".jsonl")
-        if os.path.isfile(cf):
-            sample = read_head_tail(cf)
-            if sample:
-                prs = extract_prs(sample)
-                rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [excerpt(sample, 6000)], "prRefs": prs}
+    if isinstance(sid, str) and sid:
+        if cwd:
+            slug = re.sub("[^A-Za-z0-9_-]", "-", cwd)
+            cf = os.path.join(home, ".claude", "projects", slug, sid + ".jsonl")
+            if os.path.isfile(cf):
+                sample = read_head_tail(cf)
+                if sample:
+                    prs = extract_prs(sample)
+                    rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [excerpt(sample, 6000)], "prRefs": prs}
+        if rec is None and re.match(r"^[A-Za-z0-9_.-]+$", sid):
+            if codex_files is None:
+                codex_files = sorted(glob.glob(os.path.join(home, ".codex", "sessions", "*", "*", "*", "*.jsonl")), reverse=True)[:400]
+            for cxf in codex_files:
+                if sid in os.path.basename(cxf):
+                    sample = read_head_tail(cxf)
+                    if sample:
+                        prs = extract_prs(sample)
+                        rec = {"id": sid, "title": pa["title"], "workspace": cwd, "updatedAt": pa.get("updatedAt"), "chunks": [excerpt(sample, 6000)], "prRefs": prs}
+                    break
     out.append({"cid": sid, "rec": rec, "paseo": pa})
-print(json.dumps(out[:40]))
+print(json.dumps(out[:45]))
 `.trim();
 
 async function queryRemotePaseoSshArchives(homeDir, terms, execFileImpl = execFileAsync) {
