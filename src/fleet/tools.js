@@ -458,13 +458,14 @@ function fleetStartSessionTarget(args = {}) {
 }
 
 function fleetBatchCardsTarget(supervisor, args = {}) {
-  const op = typeof args?.op === "string" ? args.op.trim().toLowerCase() : "defer";
+  const op = typeof args?.op === "string" ? args.op.trim().toLowerCase() : "";
+  if (!op) throw new Error("Provide a valid batch op.");
   const filter = typeof args?.filter === "string" && args.filter.trim() ? args.filter.trim().toLowerCase() : null;
   const cardIds = Array.isArray(args?.cardIds)
     ? [...new Set(args.cardIds.map((id) => String(id ?? "").trim()).filter(Boolean))].slice(0, 25)
     : null;
   const value = typeof args?.value === "string" && args.value.trim() ? args.value.trim() : null;
-  if (!cardIds?.length && !filter && !["merge_green", "defer", "dismiss", "fix_ci"].includes(op)) {
+  if (!cardIds?.length && !filter && !["merge_green", "fix_ci"].includes(op)) {
     throw new Error("Provide cardIds or filter ('green_prs', 'ci_failed', 'questions', 'all').");
   }
   const openCount = (readState(supervisor).cards ?? []).length;

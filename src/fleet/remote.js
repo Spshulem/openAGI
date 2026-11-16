@@ -14,7 +14,7 @@ import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupe
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -47,6 +47,9 @@ export function createFleetCapability(supervisor) {
         if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
         if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (/^\/fleet\/api\/threads\/[^/]+\/transcript$/.test(payload.path) && payload.body?.limit !== undefined) {
+        url.searchParams.set('limit', String(payload.body.limit));
       }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
@@ -353,20 +356,32 @@ export class RemoteFleetSupervisor {
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
   async batchActCards(input = {}) { return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null; }
   async readChatTranscript({ key, limit = 20 } = {}) {
-    const detail = await this.threadDetail(key);
-    if (!detail) throw new Error(`No session found with key "${String(key ?? '').slice(0, 120)}".`);
-    const msgs = Array.isArray(detail.conversation?.messages) ? detail.conversation.messages.slice(-limit) : [];
-    return {
-      key: detail.key,
-      kind: detail.kind,
-      title: detail.title,
-      workspace: detail.workspace ?? null,
-      repo: detail.repo ?? null,
-      status: detail.state ?? detail.agentStatus ?? 'idle',
-      messageCount: msgs.length,
-      messages: msgs,
-      openChat: detail.openChat ?? null
-    };
+    const cleanKey = typeof key === 'string' ? key.trim() : '';
+    if (!cleanKey) throw new Error('Pass a session key.');
+    const path = `/fleet/api/threads/${encodeURIComponent(cleanKey)}/transcript`;
+    try {
+      const body = await this.request('GET', path, { limit });
+      if (body?.transcript) return body.transcript;
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    for (const peer of peerNodes.slice(0, 4)) {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path, body: { limit } },
+          { timeoutMs: 15000 }
+        );
+        if (res?.response?.status === 200 && res.response.body?.transcript) {
+          return res.response.body.transcript;
+        }
+      } catch { /* try next peer */ }
+    }
+    throw new Error(`No session found with key "${cleanKey.slice(0, 120)}".`);
   }
   async routeIssue(input = {}) {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);

@@ -7,6 +7,7 @@ import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
+import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { isMobileRouteAllowed } from "../src/mobile-node.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
@@ -445,4 +446,175 @@ test("AgentHost executes multi-code ('yes 60, yes 19, yes 78') and 'yes all' con
     { principal }
   );
   assert.deepEqual(sent, ["paseo:1", "paseo:2", "paseo:3", "paseo:4", "paseo:5"]);
+
+  // 'yes both' refuses when 3 actions are pending, and succeeds when exactly 2 are pending
+  await tools.invoke("fleet_send_message", { key: "paseo:6" }, passiveCtx);
+  await tools.invoke("fleet_send_message", { key: "paseo:7" }, passiveCtx);
+  await tools.invoke("fleet_send_message", { key: "paseo:8" }, passiveCtx);
+  await host.handleMessage(
+    { sessionId, channel: "local", from: "user", text: "yes both" },
+    { principal }
+  );
+  assert.equal(sent.length, 5, "'yes both' must not approve 3 pending actions");
+  assert.match(seenTurnContexts.at(-1), /expected 2 pending actions, found 3/);
+});
+
+test("review regressions: batch filter preserves op, strict batch validation, STARTUP_FAILURE CI, host/cwd safety, and remote transcript route", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-coord-reg-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const mock = makePaseoMock();
+  // Seed workspace catalog with a migrated worktree path on srv_mac to verify live root score wins
+  const baseFactory = mock.factory;
+  const factoryWithCatalog = () => {
+    const client = baseFactory();
+    const origHostClient = client.hosts.client;
+    client.hosts.client = async (sid) => {
+      const api = await origHostClient(sid);
+      return {
+        ...api,
+        workspaces: {
+          list: async () => ({
+            entries: [
+              {
+                id: "ws-mig",
+                directory: "/home/dev/paseo/migrated/mac/Users/dev/Dev/recorder-app/.conductor/old",
+                name: "old",
+                archivedAt: null
+              }
+            ]
+          })
+        }
+      };
+    };
+    return client;
+  };
+
+  let mergeCalls = 0;
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    config: resolveFleetConfig({}, {
+      enabled: true,
+      mode: "propose",
+      paseo: { enabled: true },
+      review: { enabled: false },
+      storage: { enabled: false }
+    }),
+    deps: {
+      paseoFactory: factoryWithCatalog,
+      run: async (_bin, args) => {
+        const joined = args.join(" ");
+        if (joined.includes("pr list") && joined.includes("--state open")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify([
+              {
+                number: 500,
+                title: "chore: startup failure check",
+                headRefName: "dev/startup-fail",
+                baseRefName: "main",
+                isDraft: false,
+                mergeStateStatus: "CLEAN",
+                reviewDecision: "APPROVED",
+                statusCheckRollup: [{ name: "runner-boot", status: "COMPLETED", conclusion: "STARTUP_FAILURE" }],
+                updatedAt: "2026-11-16T16:00:00Z",
+                url: "https://github.com/acme/recorder-app/pull/500"
+              }
+            ]),
+            stderr: ""
+          };
+        }
+        if (joined.includes("pr list") && joined.includes("--state merged")) {
+          return { code: 0, stdout: "[]", stderr: "" };
+        }
+        if (joined.includes("release list")) {
+          return { code: 0, stdout: "[]", stderr: "" };
+        }
+        if (joined.includes("pr merge")) {
+          mergeCalls += 1;
+          return { code: 0, stdout: "Merged", stderr: "" };
+        }
+        return { code: 1, stdout: "", stderr: "" };
+      }
+    }
+  });
+
+  // 1. STARTUP_FAILURE is classified as FAILURE, never greenReadyCount
+  const repoStatus = await sup.inspectRepoStatus({ repo: "acme/recorder-app" });
+  assert.equal(repoStatus.openPrs[0].ciState, "FAILURE");
+  assert.deepEqual(repoStatus.openPrs[0].failingChecks, ["runner-boot"]);
+  assert.equal(repoStatus.summary.greenReadyCount, 0);
+
+  // 2. Live root directory score beats lower-scoring catalog migrated directory on srv_mac
+  const ws = await sup.listWorkspaces({ query: "recorder-app" });
+  const macHost = ws.workspaces[0].hosts.find((h) => h.serverId === "srv_mac");
+  assert.equal(macHost.preferredCwd, "/Users/dev/Dev/recorder-app");
+
+  // 3. Explicit serverId without workspace directory on that host fails closed instead of borrowing srv_mac's path
+  await assert.rejects(
+    sup.startPaseoSession({
+      workspace: "openAGI",
+      serverId: "srv_mac",
+      prompt: "Should fail closed"
+    }),
+    /no known directory on Paseo host "srv_mac"/
+  );
+
+  // 4. Cwd-only start resolves owning host when known, and rejects unknown paths instead of picking workspaces[0]
+  const cwdStarted = await sup.startPaseoSession({
+    cwd: "/Users/dev/Dev/recorder-app",
+    prompt: "Run in known Mac cwd"
+  });
+  assert.equal(cwdStarted.serverId, "srv_mac");
+  assert.equal(cwdStarted.cwd, "/Users/dev/Dev/recorder-app");
+
+  await assert.rejects(
+    sup.startPaseoSession({
+      cwd: "/nonexistent/unknown/repo",
+      prompt: "Must not guess host"
+    }),
+    /Could not determine which Paseo host owns directory/
+  );
+
+  // 5. op: "defer" with filter: "green_prs" defers without merging; malformed/unscoped HTTP batch requests return 400
+  sup.store.upsertQuestion({
+    dedupeKey: "ready:427",
+    kind: "ready",
+    threadKey: "paseo:srv_mac.rec-live-1",
+    prRef: "acme/recorder-app#427",
+    askedHead: "abc1234567",
+    title: "recorder-app #427 ready to merge",
+    body: "CI green",
+    options: ["merged", "later"],
+    contextSnapshot: {
+      pr: { ref: "acme/recorder-app#427", state: "OPEN", ciState: "SUCCESS", mergeState: "CLEAN", head: "abc1234567" }
+    }
+  });
+
+  const route = createFleetRoute({ supervisor: sup });
+  assert.equal((await route("POST", "/fleet/api/cards/batch", new URL("http://localhost/fleet/api/cards/batch"), async () => null)).status, 400);
+  assert.equal((await route("POST", "/fleet/api/cards/batch", new URL("http://localhost/fleet/api/cards/batch"), async () => ({}))).status, 400);
+  assert.equal((await route("POST", "/fleet/api/cards/batch", new URL("http://localhost/fleet/api/cards/batch"), async () => ({ op: "defer" }))).status, 400);
+  assert.equal(sup.getState().cards.length, 1, "malformed/unscoped batch calls leave cards untouched");
+
+  const deferGreen = await sup.batchActCards({ op: "defer", filter: "green_prs" });
+  assert.equal(deferGreen.ok, true);
+  assert.equal(deferGreen.op, "defer");
+  assert.equal(deferGreen.succeeded, 1);
+  assert.equal(mergeCalls, 0, "defer with filter green_prs must never execute merge");
+
+  // 6. RemoteFleetSupervisor proxies readChatTranscript over /fleet/api/threads/:key/transcript to read sleeping Paseo timelines
+  assert.equal(isMobileRouteAllowed("GET", "/fleet/api/threads/paseo%3Asrv_mac.rec-sleep-3/transcript"), true);
+  const cap = createFleetCapability(sup);
+  const remoteRuntime = {
+    nodeCapabilities: {
+      list: () => [{ nodeId: "mac-node" }],
+      dispatch: async (_nodeId, _capId, op, payload) => cap.invoke(op, payload)
+    }
+  };
+  const remoteSup = new RemoteFleetSupervisor({ runtime: remoteRuntime, nodeId: "mac-node", dataDir: path.join(dir, "remote") });
+  const remoteTranscript = await remoteSup.readChatTranscript({ key: "paseo:srv_mac.rec-sleep-3", limit: 5 });
+  assert.equal(remoteTranscript.key, "paseo:srv_mac.rec-sleep-3");
+  assert.equal(remoteTranscript.messages.length, 3);
+  assert.match(remoteTranscript.messages.at(-1).text, /acme\/recorder-app#427/);
 });

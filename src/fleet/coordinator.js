@@ -238,13 +238,25 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
   for (const ws of emptyWorkspaces) {
     const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace });
     const group = ensureGroup(info);
+    const wsScore = scoreWorkspaceTarget({ cwd: ws.cwd, migrated: info.migrated, worktree: info.worktree, status: "idle", updatedAt: null });
     group.candidates.push({
       serverId: ws.serverId,
       hostLabel: ws.hostLabel,
       cwd: ws.cwd,
-      score: scoreWorkspaceTarget({ cwd: ws.cwd, migrated: info.migrated, worktree: info.worktree, status: "idle", updatedAt: null })
+      score: wsScore
     });
-    const hostBucket = group.hostsMap.get(ws.serverId) ?? { serverId: ws.serverId, label: ws.hostLabel, count: 0, preferredCwd: ws.cwd };
+    const hostBucket = group.hostsMap.get(ws.serverId) ?? {
+      serverId: ws.serverId,
+      label: ws.hostLabel,
+      count: 0,
+      activeCount: 0,
+      preferredCwd: ws.cwd,
+      bestScore: wsScore
+    };
+    if (wsScore > (hostBucket.bestScore ?? -Infinity)) {
+      hostBucket.bestScore = wsScore;
+      hostBucket.preferredCwd = ws.cwd;
+    }
     group.hostsMap.set(ws.serverId, hostBucket);
   }
 
@@ -286,7 +298,7 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     }
     if (cwd) {
       const sc = scoreWorkspaceTarget({ cwd, migrated: info.migrated, worktree: info.worktree, status: sessionState, updatedAt: thread.lastActivityAt });
-      if (sc > hostEntry.bestScore) {
+      if (sc > (hostEntry.bestScore ?? -Infinity)) {
         hostEntry.bestScore = sc;
         hostEntry.preferredCwd = cwd;
       }
@@ -546,6 +558,11 @@ function parseGitRemoteRepo(remoteUrl) {
   return httpsMatch ? httpsMatch[1] : null;
 }
 
+const ROLLUP_FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+const ROLLUP_FAILED_STATES = new Set(["FAILURE", "ERROR"]);
+const ROLLUP_PENDING_STATUSES = new Set(["IN_PROGRESS", "QUEUED", "WAITING", "PENDING", "REQUESTED"]);
+const ROLLUP_PENDING_STATES = new Set(["PENDING", "EXPECTED"]);
+
 function summarizeStatusRollup(rollup) {
   if (!Array.isArray(rollup) || rollup.length === 0) {
     return { ciState: "NONE", failingChecks: [], pendingChecks: [] };
@@ -555,12 +572,11 @@ function summarizeStatusRollup(rollup) {
   for (const item of rollup) {
     const label = String(item?.name || item?.context || "check").trim();
     const status = String(item?.status ?? "").toUpperCase();
-    const conclusion = String(item?.conclusion ?? item?.state ?? "").toUpperCase();
-    if (["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"].includes(conclusion)) {
+    const conclusion = String(item?.conclusion ?? "").toUpperCase();
+    const state = String(item?.state ?? "").toUpperCase();
+    if (ROLLUP_FAILED_CONCLUSIONS.has(conclusion) || ROLLUP_FAILED_STATES.has(state)) {
       failing.push(label);
-    } else if (status && status !== "COMPLETED" && !conclusion) {
-      pending.push(label);
-    } else if (["PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED"].includes(conclusion) || ["IN_PROGRESS", "QUEUED", "PENDING"].includes(status)) {
+    } else if ((status && status !== "COMPLETED" && ROLLUP_PENDING_STATUSES.has(status)) || ROLLUP_PENDING_STATES.has(state) || ROLLUP_PENDING_STATES.has(conclusion)) {
       pending.push(label);
     }
   }
@@ -821,36 +837,81 @@ export async function startPaseoSession(supervisor, {
   }
   const cleanTitle = typeof title === "string" && title.trim() ? clampText(title.trim(), 100) : null;
 
-  let resolvedServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
-  let resolvedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim() : null;
+  const explicitServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
+  let resolvedServerId = explicitServerId;
+  let resolvedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   let workspaceLabel = cleanName(workspace);
+
+  if (!workspaceLabel && !resolvedCwd) {
+    throw new Error("Pass workspace (e.g. 'recorder-app') or explicit serverId + cwd.");
+  }
 
   if (!resolvedServerId || !resolvedCwd) {
     const inventory = await listWorkspaces(supervisor, {
       query: workspaceLabel || "",
       includeArchived: true,
-      limit: 30,
+      limit: 60,
       factory
     });
-    const needle = (workspaceLabel || "").toLowerCase();
-    const matched = needle
-      ? inventory.workspaces.find((w) => w.id === needle || w.name.toLowerCase() === needle || String(w.repo ?? "").toLowerCase() === needle)
-        ?? inventory.workspaces.find((w) => w.name.toLowerCase().includes(needle) || String(w.repo ?? "").toLowerCase().includes(needle))
-      : inventory.workspaces[0];
 
-    if (!matched?.defaultTarget?.cwd || !matched?.defaultTarget?.serverId) {
-      throw new Error(
-        workspaceLabel
-          ? `No Paseo workspace matching "${clampText(workspaceLabel, 80)}" was found on any online host. Call fleet_workspaces to see available workspaces.`
-          : "Pass workspace (e.g. 'bb-recorder') or explicit serverId + cwd."
-      );
+    if (resolvedCwd && !resolvedServerId) {
+      const pathMatches = (candidateCwd) =>
+        Boolean(
+          candidateCwd &&
+          (candidateCwd === resolvedCwd ||
+            candidateCwd.startsWith(`${resolvedCwd}/`) ||
+            resolvedCwd.startsWith(`${candidateCwd}/`))
+        );
+      let matchedHostId = null;
+      let matchedName = null;
+      for (const w of inventory.workspaces) {
+        const sessionHit = w.recentChats?.find((s) => s.serverId && pathMatches(s.cwd));
+        if (sessionHit?.serverId) {
+          matchedHostId = sessionHit.serverId;
+          matchedName = w.name;
+          break;
+        }
+        const hostHit = w.hosts?.find((h) => h.serverId && pathMatches(h.preferredCwd));
+        if (hostHit?.serverId) {
+          matchedHostId = hostHit.serverId;
+          matchedName = w.name;
+          break;
+        }
+      }
+      if (!matchedHostId) {
+        throw new Error(
+          `Could not determine which Paseo host owns directory "${clampText(resolvedCwd, 80)}". Pass serverId explicitly or pass workspace.`
+        );
+      }
+      resolvedServerId = matchedHostId;
+      workspaceLabel ??= matchedName;
+    } else {
+      const needle = (workspaceLabel || "").toLowerCase();
+      const hasSelectedHost = (w) => !explicitServerId || Boolean(w.hosts?.some((h) => h.serverId === explicitServerId && h.preferredCwd));
+      const exactMatch = (w) => w.id === needle || w.name.toLowerCase() === needle || String(w.repo ?? "").toLowerCase() === needle;
+      const partialMatch = (w) => w.name.toLowerCase().includes(needle) || String(w.repo ?? "").toLowerCase().includes(needle);
+      const matched = inventory.workspaces.find((w) => exactMatch(w) && hasSelectedHost(w))
+        ?? inventory.workspaces.find((w) => partialMatch(w) && hasSelectedHost(w))
+        ?? inventory.workspaces.find(exactMatch)
+        ?? inventory.workspaces.find(partialMatch);
+
+      if (!matched?.defaultTarget?.cwd || !matched?.defaultTarget?.serverId) {
+        throw new Error(
+          `No Paseo workspace matching "${clampText(workspaceLabel, 80)}" was found on any online host. Call fleet_workspaces to see available workspaces.`
+        );
+      }
+      resolvedServerId ??= matched.defaultTarget.serverId;
+      if (!resolvedCwd) {
+        const hostMatch = matched.hosts?.find((h) => h.serverId === resolvedServerId && h.preferredCwd);
+        if (explicitServerId && !hostMatch?.preferredCwd) {
+          throw new Error(
+            `Workspace "${clampText(workspaceLabel || matched.name, 80)}" has no known directory on Paseo host "${clampText(explicitServerId, 80)}".`
+          );
+        }
+        resolvedCwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
+      }
+      workspaceLabel ??= matched.name;
     }
-    resolvedServerId ??= matched.defaultTarget.serverId;
-    if (!resolvedCwd) {
-      const hostMatch = matched.hosts?.find((h) => h.serverId === resolvedServerId && h.preferredCwd);
-      resolvedCwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
-    }
-    workspaceLabel ??= matched.name;
   }
 
   const createCfg = {
@@ -921,35 +982,46 @@ export function isGreenMergeablePrCard(card) {
   return true;
 }
 
+const VALID_BATCH_OPS = new Set([
+  "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
+]);
+const VALID_BATCH_FILTERS = new Set(["green_prs", "ci_failed", "questions", "non_pr", "all"]);
+
 export async function batchActCards(supervisor, {
-  op = "defer",
+  op = null,
   filter = null,
   cardIds = null,
   value = null,
   deadlineAt = null
 } = {}) {
   const openCards = Array.isArray(supervisor?.getState?.()?.cards) ? supervisor.getState().cards : [];
-  const normOp = String(op ?? "defer").trim().toLowerCase();
+  const normOp = typeof op === "string" ? op.trim().toLowerCase() : "";
+  if (!VALID_BATCH_OPS.has(normOp)) {
+    throw new Error("Pass a valid batch op ('merge_green', 'defer', 'dismiss', 'fix_ci', 'primary', 'secondary', 'merge', 'answer', 'reply').");
+  }
   const normFilter = typeof filter === "string" && filter.trim() ? filter.trim().toLowerCase() : null;
+  if (normFilter && !VALID_BATCH_FILTERS.has(normFilter)) {
+    throw new Error("Pass a valid batch filter ('green_prs', 'ci_failed', 'questions', 'non_pr', 'all').");
+  }
   const explicitIds = Array.isArray(cardIds)
     ? [...new Set(cardIds.map((id) => String(id ?? "").trim()).filter(Boolean))].slice(0, 25)
     : null;
+
+  if (!explicitIds?.length && !normFilter && normOp !== "merge_green" && normOp !== "fix_ci") {
+    throw new Error("Pass explicit cardIds or a filter ('green_prs', 'ci_failed', 'questions', 'all') for batch card actions.");
+  }
 
   let targets = explicitIds?.length
     ? explicitIds.map((id) => openCards.find((c) => c.id === id || c.questionId === id)).filter(Boolean)
     : [...openCards];
 
-  let cardOp = normOp;
+  const cardOp = normOp === "merge_green" ? "merge" : normOp;
   if (normOp === "merge_green" || normFilter === "green_prs") {
     targets = targets.filter(isGreenMergeablePrCard);
-    cardOp = "merge";
-  } else if (normOp === "fix_ci" || normFilter === "ci_failed") {
+  } else if (normFilter === "ci_failed" || (normOp === "fix_ci" && !explicitIds?.length)) {
     targets = targets.filter((c) => c.kind === "ci_failed" || c.primaryAction?.op === "fix_ci");
-    cardOp = "fix_ci";
   } else if (normFilter === "questions" || normFilter === "non_pr") {
     targets = targets.filter((c) => c.kind !== "merge_ready" && c.kind !== "pr_ready" && c.kind !== "ci_failed");
-  } else if (!explicitIds?.length && !normFilter && (normOp !== "defer" && normOp !== "dismiss")) {
-    throw new Error("Pass explicit cardIds or a filter ('green_prs', 'ci_failed', 'questions', 'all') for batch card actions.");
   }
 
   targets = targets.slice(0, 25);

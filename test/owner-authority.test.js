@@ -186,6 +186,10 @@ test("matchConfirmations parses multi-code and batch confirmations while rejecti
   assert.deepEqual(matchConfirmations("no 38, 51"), { decision: "deny", codes: ["38", "51"], all: false });
   assert.deepEqual(matchConfirmations("yes all"), { decision: "approve", codes: [], all: true });
   assert.deepEqual(matchConfirmations("approve all of them"), { decision: "approve", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("yes both"), { decision: "approve", codes: [], all: true, count: 2 });
+  assert.deepEqual(matchConfirmations("yes both 60 and 19"), { decision: "approve", codes: ["60", "19"], all: false });
+  assert.equal(matchConfirmations("yes both 60 19 78"), null);
+  assert.equal(matchConfirmations("yes all both"), null);
   assert.deepEqual(matchConfirmations("deny all"), { decision: "deny", codes: [], all: true });
   assert.deepEqual(matchConfirmations("yes 42"), { decision: "approve", codes: ["42"], all: false });
   // Single matchConfirmation keeps rejecting multi-code for voice safety.

@@ -598,6 +598,12 @@ export class AgentHost {
     if (spokenBatch.all && codes.length === 0) {
       const candidates = store.chatCandidates(sessionId, null).slice().reverse();
       if (candidates.length === 0) return null;
+      if (Number.isInteger(spokenBatch.count) && candidates.length !== spokenBatch.count) {
+        return {
+          decision: spokenBatch.decision,
+          status: `expected ${spokenBatch.count} pending actions, found ${candidates.length}; name the exact codes`
+        };
+      }
       codes = candidates.map((c) => c.confirmCode).filter(Boolean);
       if (codes.length === 0) return null;
       if (codes.length === 1) {

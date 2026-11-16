@@ -23,6 +23,10 @@ const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
 const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);
+const BATCH_OPS = new Set([
+  "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
+]);
+const BATCH_FILTERS = new Set(["green_prs", "ci_failed", "questions", "non_pr", "all"]);
 const MUTE_HOURS_MAX = 7 * 24;
 
 // A thread key from the path: "conductor:<id>", its colon raw or %3A.
@@ -211,12 +215,28 @@ export function createFleetRoute({ supervisor } = {}) {
         if (typeof supervisor.batchActCards !== "function") {
           return fail(503, "Batch card actions are not available.");
         }
-        const body = (await readObject(readBody)) ?? {};
-        const op = typeof body.op === "string" ? body.op.trim() : "defer";
-        const filter = typeof body.filter === "string" ? body.filter.trim() : null;
-        const cardIds = Array.isArray(body.cardIds)
-          ? body.cardIds.filter((id) => typeof id === "string" && CARD_ID_PATTERN.test(id)).slice(0, 25)
-          : null;
+        const body = await readObject(readBody);
+        if (!body) return fail(400, "Send a JSON object: { op, filter?, cardIds?, value? }.");
+        const op = typeof body.op === "string" ? body.op.trim().toLowerCase() : "";
+        if (!BATCH_OPS.has(op)) return fail(400, "Pass a valid batch op.");
+        let filter = null;
+        if (body.filter !== undefined && body.filter !== null) {
+          filter = typeof body.filter === "string" ? body.filter.trim().toLowerCase() : "";
+          if (!BATCH_FILTERS.has(filter)) return fail(400, "Pass a valid batch filter.");
+        }
+        let cardIds = null;
+        if (body.cardIds !== undefined && body.cardIds !== null) {
+          if (!Array.isArray(body.cardIds) || body.cardIds.length === 0 || body.cardIds.length > 25) {
+            return fail(400, "cardIds must be an array of 1-25 valid card IDs.");
+          }
+          if (body.cardIds.some((id) => typeof id !== "string" || !CARD_ID_PATTERN.test(id))) {
+            return fail(400, "Bad card id in cardIds.");
+          }
+          cardIds = body.cardIds;
+        }
+        if (!cardIds && !filter && op !== "merge_green" && op !== "fix_ci") {
+          return fail(400, "Pass explicit cardIds or filter ('green_prs', 'ci_failed', 'questions', 'all').");
+        }
         const value = typeof body.value === "string" ? body.value.trim() : null;
         if (value && value.length > REPLY_MAX) return fail(400, "Option value is too long.");
         try {
@@ -419,6 +439,22 @@ export function createFleetRoute({ supervisor } = {}) {
           if (!thread) return fail(404, "No thread with that key in the last scan.");
           const conversation = await supervisor.threadConversation?.(threadKey);
           return ok({ thread: conversation ? { ...thread, conversation } : thread });
+        }
+        if (parts[2] === "transcript") {
+          if (method !== "GET") return fail(405, "Use GET.");
+          if (typeof supervisor.readChatTranscript !== "function") return fail(503, "Transcript reading is not available.");
+          const limit = Number(url?.searchParams?.get("limit") ?? 20);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 60) return fail(400, "limit must be 1-60.");
+          try {
+            const transcript = await supervisor.readChatTranscript({ key: threadKey, limit });
+            return ok({ transcript });
+          } catch (err) {
+            const msg = String(err?.message ?? "No session found.");
+            if (/no session found|could not read paseo chat/i.test(msg)) {
+              return fail(404, msg.slice(0, 200));
+            }
+            return fail(400, msg.slice(0, 200));
+          }
         }
         if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
         if (method !== "POST") return fail(405, "Use POST.");

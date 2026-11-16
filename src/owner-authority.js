@@ -221,12 +221,12 @@ export function matchConfirmation(text) {
   return null;
 }
 
-const BATCH_WORDS = new Set(["all", "everything", "both"]);
+const BATCH_WORDS = new Set(["all", "everything"]);
 const MULTI_FILLER = new Set([...FILLER, "codes", "numbers", "of", "them", "these", "those", "to"]);
 
 // Typed owner confirmations can approve or deny multiple pending codes in one
-// message ("yes 60, yes 19, yes 78", "approve 60 19 78", "yes all"). Single-code
-// and codeless confirms delegate to matchConfirmation so voice/single rules hold.
+// message ("yes 60, yes 19, yes 78", "approve 60 19 78", "yes all", "yes both").
+// Single-code and codeless confirms delegate to matchConfirmation so voice/single rules hold.
 export function matchConfirmations(text) {
   const single = matchConfirmation(text);
   if (single) {
@@ -237,6 +237,7 @@ export function matchConfirmations(text) {
   const words = raw.replace(/[’]/g, "'").replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
   const codes = [];
   let all = false;
+  let both = false;
   let yes = 0;
   let no = 0;
   for (let index = 0; index < words.length;) {
@@ -251,6 +252,11 @@ export function matchConfirmations(text) {
       index += 1;
       continue;
     }
+    if (word === "both") {
+      both = true;
+      index += 1;
+      continue;
+    }
     const refusal = consume(words, index, NO_PHRASES);
     if (refusal) { no += 1; index += refusal; continue; }
     const assent = consume(words, index, YES_PHRASES);
@@ -258,8 +264,13 @@ export function matchConfirmations(text) {
     if (MULTI_FILLER.has(word)) { index += 1; continue; }
     return null;
   }
-  if (!all && codes.length < 2) return null;
-  if (yes && !no) return { decision: "approve", codes, all };
-  if (no && !yes) return { decision: "deny", codes, all };
-  return null;
+  if (both && all) return null;
+  if (both && codes.length > 0 && codes.length !== 2) return null;
+  if (!all && !both && codes.length < 2) return null;
+  const decision = yes && !no ? "approve" : no && !yes ? "deny" : null;
+  if (!decision) return null;
+  if (both && codes.length === 0) {
+    return { decision, codes: [], all: true, count: 2 };
+  }
+  return { decision, codes, all };
 }
