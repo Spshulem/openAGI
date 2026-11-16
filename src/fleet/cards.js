@@ -118,9 +118,12 @@ function isQuestionLiveForDeck(question, row, prefs) {
   return true;
 }
 
+const OPAQUE_SESSION_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const LEADING_OPAQUE_PREFIX_RE = /^(?:wks_[0-9a-f]+|Paseo chat|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}):/i;
+
 function cleanWorkspaceName(workspace) {
   const raw = typeof workspace === "string" ? workspace.trim() : "";
-  if (!raw || /^wks_[0-9a-f]+$/i.test(raw)) return null;
+  if (!raw || OPAQUE_SESSION_ID_RE.test(raw)) return null;
   return raw;
 }
 
@@ -132,7 +135,7 @@ function cleanSessionTitle(raw, max = 120) {
     .replace(/<[^>]{1,120}>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!text || /^(?:paseo chat|wks_[0-9a-f]+)$/i.test(text)) return null;
+  if (!text || OPAQUE_SESSION_ID_RE.test(text)) return null;
   if (/^you are working inside conductor\b/i.test(text)) return null;
   return clampText(redactSecrets(text), max) || null;
 }
@@ -141,6 +144,17 @@ function stripAttachmentMarkdown(text) {
   return String(text ?? "")
     .replace(/!\[[^\]]*\]\(file:\/\/[^)\s]+\)/gi, " ")
     .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function cleanBriefProse(text) {
+  return stripAttachmentMarkdown(text)
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/(?:^|\n)##+\s+Words in this PR[\s\S]*?(?=\n##+\s|\s*$)/gi, "\n")
+    .replace(/(?:^|\n)\s*\|[^\n]*\|(?=\s*(?:\n|$))/g, " ")
+    .replace(/(?:^|\n)\s*---+\s*(?=\n|$)/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -191,6 +205,7 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
   const realOptions = options.filter((opt) => !["dismiss", "open thread"].includes(String(opt).toLowerCase()));
   const first = realOptions[0] ?? null;
   const second = realOptions[1] ?? null;
+  const hasOpenThread = options.some((opt) => String(opt).toLowerCase() === "open thread");
   const primaryAction = first
     ? {
         op: "answer",
@@ -198,7 +213,9 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
         value: first,
         destructive: /^(?:delete|destroy|wipe|close pr|stop)$/i.test(first)
       }
-    : { op: "defer", label: "Dismiss", value: "dismiss", destructive: false };
+    : hasOpenThread
+      ? { op: "open_chat", label: "Open chat", value: "open thread", destructive: false }
+      : { op: "defer", label: "Dismiss", value: "dismiss", destructive: false };
 
   const secondaryAction = second && !["later", "dismiss"].includes(second.toLowerCase())
     ? { op: "answer", label: humanOptionLabel(second), value: second, destructive: /^(?:delete|destroy|wipe)$/i.test(second) }
@@ -226,8 +243,8 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
 }
 
 function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
-  if (question.reviewReason) {
-    return clampText(redactSecrets(question.reviewReason), 220);
+  if (question.reviewBrief?.recommendation) {
+    return clampText(redactSecrets(question.reviewBrief.recommendation), 220);
   }
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   if (isMergeReadyQuestion(question, row, prRef, prMeta)) {
@@ -242,12 +259,93 @@ function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
       return "Checks are still running. Auto-merge is off by default—tap Watch CI to get pinged when green.";
     }
     const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
-    return `CI green${threads === 0 ? " · 0 unresolved review threads" : ` · ${threads} review thread(s)`}. Manual confirm required (${prefs.mergePolicy === "manual_confirm" ? "auto-merge off" : "queue after tap"}).`;
+    const gatePass = Array.isArray(prMeta?.gates) && prMeta.gates.length > 0 && prMeta.gates.every((g) => g.state === "SUCCESS")
+      ? ` · ${prMeta.gates.map((g) => g.label).join(", ")} green`
+      : "";
+    return `CI green${gatePass}${threads === 0 ? " · 0 open threads" : ` · ${threads} review thread(s)`}. Ready for your merge confirmation.`;
   }
-  if (row?.reason) {
+  if (parsePaseoThreadKey(question.threadKey ?? row?.key)) {
+    return "Reply right below to answer or steer this session directly without opening the chat.";
+  }
+  if (row?.reason && !/^agent asks:/i.test(row.reason)) {
     return clampText(redactSecrets(row.reason), 200);
   }
   return null;
+}
+
+function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [] } = {}) {
+  const rb = question.reviewBrief && typeof question.reviewBrief === "object" ? question.reviewBrief : null;
+  const lastUserMsg = [...recentMessages].reverse().find((m) => m.role === "user" && m.text)?.text ?? null;
+  const fallbackContext = lastUserMsg
+    ? `You asked: "${clampText(cleanBriefProse(lastUserMsg), 170)}"`
+    : (sessionTitle && !String(headline).toLowerCase().includes(sessionTitle.toLowerCase())
+        ? `Session: ${sessionTitle}`
+        : null);
+
+  let fallbackWhatChanged = null;
+  if (prMeta?.bodySummary) {
+    const cleanPr = clampTextLines(cleanBriefProse(prMeta.bodySummary), 420);
+    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 220) : "";
+    fallbackWhatChanged = cleanAgent && !cleanPr.includes(cleanAgent.slice(0, 32))
+      ? clampTextLines(`${cleanPr}\n\nLatest status: ${cleanAgent}`, 520)
+      : cleanPr;
+  } else if (agentSummary) {
+    fallbackWhatChanged = clampTailLines(cleanBriefProse(agentSummary), 440);
+  }
+
+  let fallbackDecision = null;
+  if (kind === "merge_ready") {
+    fallbackDecision = (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS")
+      ? `Checks are still running on ${prMeta?.ref ?? "this PR"}. Tap Watch CI or wait before merging.`
+      : `Confirm whether to merge ${prMeta?.ref ?? "this PR"} now, merge & deploy, or reply with changes.`;
+  } else if (kind === "ci_failed") {
+    fallbackDecision = prMeta?.mergeState === "DIRTY"
+      ? `Have the session rebase ${prMeta?.ref ?? "this PR"} onto base and re-verify, or reply with guidance.`
+      : `Have the session fix failing checks on ${prMeta?.ref ?? "this PR"}, or reply with specific instructions.`;
+  } else if (question.card) {
+    fallbackDecision = clampTextLines(cleanBriefProse(question.card), 260);
+  } else if (question.body && !isMechanicalReadyBody(question.body)) {
+    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 260);
+  } else {
+    fallbackDecision = headline;
+  }
+
+  return {
+    context: rb?.context ? clampText(redactSecrets(rb.context), 240) : (fallbackContext ? redactSecrets(fallbackContext) : null),
+    whatChanged: rb?.whatChanged ? clampTextLines(redactSecrets(rb.whatChanged), 520) : (fallbackWhatChanged ? redactSecrets(fallbackWhatChanged) : null),
+    decision: rb?.decision ? clampText(redactSecrets(rb.decision), 260) : redactSecrets(fallbackDecision || "Needs your decision.")
+  };
+}
+
+function buildSuggestedReplies(question, { kind } = {}) {
+  if (Array.isArray(question.reviewBrief?.suggestedReplies) && question.reviewBrief.suggestedReplies.length > 0) {
+    return question.reviewBrief.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
+  }
+  if (kind === "preference") return [];
+  if (kind === "merge_ready") {
+    return [
+      "Rebase on latest main and re-verify",
+      "Run a quick staging smoke check first",
+      "Hold merge for now — I'll review shortly"
+    ];
+  }
+  if (kind === "ci_failed") {
+    return [
+      "Fix the failing checks and push an updated commit",
+      "Rebase onto latest main and re-run verification"
+    ];
+  }
+  if (question.kind === "prompt") {
+    return [
+      "Allow",
+      "Skip that step and take a non-destructive approach"
+    ];
+  }
+  return [
+    "Go ahead with your recommendation",
+    "Approved — proceed with all items in scope",
+    "Hold off for now — let's adjust the plan"
+  ];
 }
 
 function isMechanicalReadyBody(text) {
@@ -306,22 +404,24 @@ function buildSummary(question, row, { headline = "", prMeta = null, agentSummar
     ? expandFragmentFromAgent(rawBody, cleanAgent, 430)
     : null;
 
-  if (question.card) {
-    parts.push(question.card);
+  if (question.reviewBrief?.whatChanged) {
+    parts.push(clampText(question.reviewBrief.whatChanged, 380));
+  } else if (question.card) {
+    parts.push(cleanBriefProse(question.card));
   } else if (prMeta?.bodySummary) {
-    parts.push(clampText(prMeta.bodySummary, 320));
+    parts.push(clampText(cleanBriefProse(prMeta.bodySummary), 360));
   } else if (expandedFragment) {
     parts.push(expandedFragment);
   } else if (rawBody && !mechanicalBody) {
     parts.push(rawBody);
   } else if (cleanAgent) {
-    parts.push(clampText(cleanAgent, 320));
+    parts.push(clampText(cleanBriefProse(cleanAgent), 340));
   } else if (rawBody) {
     parts.push(rawBody);
   } else if (question.askContext) {
-    parts.push(stripAttachmentMarkdown(question.askContext));
+    parts.push(cleanBriefProse(question.askContext));
   } else if (row?.lastAgentText) {
-    parts.push(stripAttachmentMarkdown(row.lastAgentText));
+    parts.push(cleanBriefProse(row.lastAgentText));
   }
   const joined = parts.filter(Boolean).join(" — ");
   if (expandedFragment && parts.length === 1) {
@@ -447,41 +547,45 @@ export function buildSupervisorCard(
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
   const thread = primaryKey ? threadsByKey.get(primaryKey) ?? null : null;
   const snap = question.contextSnapshot && typeof question.contextSnapshot === "object" ? question.contextSnapshot : null;
-  const prRef = question.prRef ?? row?.pr?.ref ?? snap?.pr?.ref ?? thread?.prRefs?.[0] ?? null;
-  const parsedPr = parsePrRef(prRef);
-  const matchesPrRef = (candidate) => Boolean(candidate && (!prRef || !candidate.ref || candidate.ref === prRef));
+  const candidatePrRef = question.prRef ?? row?.pr?.ref ?? snap?.pr?.ref ?? thread?.prRefs?.[0] ?? null;
+  const matchesPrRef = (candidate) => Boolean(candidate && (!candidatePrRef || !candidate.ref || candidate.ref === candidatePrRef));
   const threadKeyedPr = primaryKey ? prsByKey.get(primaryKey) : null;
-  const livePr = (prRef ? prsByKey.get(prRef) : null) ?? (matchesPrRef(threadKeyedPr) ? threadKeyedPr : null) ?? null;
+  const livePr = (candidatePrRef ? prsByKey.get(candidatePrRef) : null) ?? (matchesPrRef(threadKeyedPr) ? threadKeyedPr : null) ?? null;
   const rowPr = matchesPrRef(row?.pr) ? row.pr : null;
   const snapPr = matchesPrRef(snap?.pr) ? snap.pr : null;
+  const prState = livePr?.state ?? rowPr?.state ?? snapPr?.state ?? null;
+  const hideSettledPr = Boolean(prState && SETTLED_PR.has(prState) && question.kind !== "ready" && !question.mergeAsk);
+  const prRef = hideSettledPr ? null : candidatePrRef;
+  const parsedPr = parsePrRef(prRef);
 
   const pickNum = (...vals) => vals.find((v) => Number.isFinite(v)) ?? null;
-  const prTitle = clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null;
-  const rawPrBody = livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null;
-  const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(rawPrBody), 900) : null;
-  const additions = pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
-  const deletions = pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
-  const changedFiles = pickNum(livePr?.changedFiles, rowPr?.changedFiles, snapPr?.changedFiles);
-  const files = (livePr?.files?.length ? livePr.files : (rowPr?.files?.length ? rowPr.files : (snapPr?.files ?? []))).slice(0, 12);
-  const rawGates = livePr?.gates?.length ? livePr.gates : (rowPr?.gates?.length ? rowPr.gates : (snapPr?.gates ?? []));
+  const fallbackPrTitle = clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null;
+  const prTitle = hideSettledPr ? null : fallbackPrTitle;
+  const rawPrBody = hideSettledPr ? null : (livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null);
+  const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(cleanBriefProse(rawPrBody)), 2200) : null;
+  const additions = hideSettledPr ? null : pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
+  const deletions = hideSettledPr ? null : pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
+  const changedFiles = hideSettledPr ? null : pickNum(livePr?.changedFiles, rowPr?.changedFiles, snapPr?.changedFiles);
+  const files = hideSettledPr ? [] : (livePr?.files?.length ? livePr.files : (rowPr?.files?.length ? rowPr.files : (snapPr?.files ?? []))).slice(0, 12);
+  const rawGates = hideSettledPr ? [] : (livePr?.gates?.length ? livePr.gates : (rowPr?.gates?.length ? rowPr.gates : (snapPr?.gates ?? [])));
   const gates = Array.isArray(rawGates)
     ? rawGates.slice(0, 4).map((g) => ({ label: String(g?.label || g?.name || ""), state: g?.state ?? null })).filter((g) => g.label)
     : [];
-  const rawQa = livePr?.qa ?? rowPr?.qa ?? snapPr?.qa ?? null;
+  const rawQa = hideSettledPr ? null : (livePr?.qa ?? rowPr?.qa ?? snapPr?.qa ?? null);
   const qa = rawQa ? { required: rawQa.required ?? null, freshOnHead: rawQa.freshOnHead ?? null } : null;
-  const ciState = livePr?.ci?.state ?? rowPr?.ci?.state ?? snapPr?.ciState ?? null;
-  const mergeState = livePr?.mergeState ?? rowPr?.mergeState ?? snapPr?.mergeState ?? null;
-  const headSha = (livePr?.headOid ? String(livePr.headOid).slice(0, 10) : null)
+  const ciState = hideSettledPr ? null : (livePr?.ci?.state ?? rowPr?.ci?.state ?? snapPr?.ciState ?? null);
+  const mergeState = hideSettledPr ? null : (livePr?.mergeState ?? rowPr?.mergeState ?? snapPr?.mergeState ?? null);
+  const headSha = hideSettledPr ? null : ((livePr?.headOid ? String(livePr.headOid).slice(0, 10) : null)
     ?? rowPr?.head
     ?? snapPr?.head
     ?? question.askedHead
-    ?? null;
-  const prUrl = livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null);
-  const isDraft = typeof livePr?.isDraft === "boolean"
+    ?? null);
+  const prUrl = hideSettledPr ? null : (livePr?.url ?? rowPr?.url ?? snapPr?.url ?? (parsedPr ? `https://github.com/${parsedPr.repo}/pull/${parsedPr.number}` : null));
+  const isDraft = hideSettledPr ? null : (typeof livePr?.isDraft === "boolean"
     ? livePr.isDraft
     : (typeof rowPr?.isDraft === "boolean"
         ? rowPr.isDraft
-        : (typeof snapPr?.isDraft === "boolean" ? snapPr.isDraft : null));
+        : (typeof snapPr?.isDraft === "boolean" ? snapPr.isDraft : null)));
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
@@ -507,14 +611,15 @@ export function buildSupervisorCard(
     || cleanSessionTitle(snap?.threadTitle);
   const sessionTitle = distinctTitle
     || cleanWorkspaceName(row?.workspace ?? thread?.workspace ?? snap?.workspace)
+    || (fallbackPrTitle ? clampText(fallbackPrTitle, 90) : null)
     || null;
-  const hasDistinctSessionTitle = Boolean(distinctTitle);
+  const labelForOpaquePrefix = distinctTitle || sessionTitle;
 
   const rawTitle = String(question.title ?? "");
   let cleanTitle = /<(?:system_instruction|system-reminder)/i.test(rawTitle)
-    ? rawTitle.replace(/^(?:<[^>]+>\s*[^:]{0,120}):/i, `${sessionTitle || "Coding session"}:`)
-    : (hasDistinctSessionTitle && /^(?:wks_[0-9a-f]+|Paseo chat):/i.test(rawTitle)
-        ? rawTitle.replace(/^(?:wks_[0-9a-f]+|Paseo chat):/i, `${distinctTitle}:`)
+    ? rawTitle.replace(/^(?:<[^>]+>\s*[^:]{0,120}):/i, `${labelForOpaquePrefix || "Coding session"}:`)
+    : (labelForOpaquePrefix && LEADING_OPAQUE_PREFIX_RE.test(rawTitle)
+        ? rawTitle.replace(LEADING_OPAQUE_PREFIX_RE, `${labelForOpaquePrefix}:`)
         : rawTitle);
   if ((kind === "merge_ready" || kind === "ci_failed") && parsedPr && prTitle && /#\d+\s+ready(?:\.\s*(?:needs\s+approve\.?|merge\??)|\s+to\s+merge\??)?$/i.test(cleanTitle.trim())) {
     cleanTitle = `#${parsedPr.number} · ${prTitle}`;
@@ -561,6 +666,8 @@ export function buildSupervisorCard(
   } : null;
 
   const openChat = resolveOpenChat(question, row, primaryKey, sessionTitle);
+  const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages });
+  const suggestedReplies = buildSuggestedReplies(question, { kind });
 
   return {
     id: question.id,
@@ -572,6 +679,8 @@ export function buildSupervisorCard(
     sessionTitle,
     summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
     recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
+    brief,
+    suggestedReplies,
     agentSummary,
     prContext,
     recentMessages,

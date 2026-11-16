@@ -1637,6 +1637,182 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     );
     assert.match(leadingAskCard.summary, /Should I deploy the production migration\?/, "summary must anchor around question.body rather than taking only the tail");
 
+    // Executive decision briefs, suggested quick replies, Paseo pendingPermissions (question & tool),
+    // stale merged PR suppression on non-merge asks, UUID prefix cleanup, and inline reply resolution
+    const { deliverPaseo } = await import("../src/fleet/paseo-delivery.js");
+    const { reviewQuestions } = await import("../src/fleet/review.js");
+
+    const verdicts = await reviewQuestions({
+      questions: [
+        {
+          id: "fq_exec_1",
+          kind: "ready",
+          threadKey: "paseo:srv_bb3.cal1",
+          prRef: "buildbetter-app/buildbetter#9637",
+          title: "buildbetter #9637 ready. Needs approve.",
+          body: "buildbetter-app/buildbetter#9637 at 63c2acf6bf: CI pass.",
+          options: ["approved", "later"],
+          createdAt: "2026-11-16T01:00:00.000Z"
+        }
+      ],
+      runModel: async () => ({
+        reviews: [
+          {
+            id: "fq_exec_1",
+            decision: "keep",
+            category: "live",
+            reason: "PR #9637 is OPEN at head 63c2acf6bf.",
+            briefContext: "Fixing duplicate SQS deliveries during long attendee CRM backfills.",
+            briefSummary: "- Renews SQS visibility to 60s every 10s while backfill runs.\n- 2/2 real-SQS tests and BuildBot3 full run passed; no DB migration.",
+            briefDecision: "Merge PR #9637 now, or reply if you also want historical DLQ messages replayed.",
+            recommendation: "Safe to merge — full verification and SQS tests green with 0 open threads.",
+            suggestedReplies: ["Merge looks good — also plan a dry-run DLQ check", "Hold until staging smoke finishes"]
+          }
+        ]
+      })
+    });
+    assert.equal(verdicts[0]?.brief?.context, "Fixing duplicate SQS deliveries during long attendee CRM backfills.");
+    assert.equal(verdicts[0]?.recommendation, "Safe to merge — full verification and SQS tests green with 0 open threads.");
+    assert.deepEqual(verdicts[0]?.suggestedReplies, ["Merge looks good — also plan a dry-run DLQ check", "Hold until staging smoke finishes"]);
+
+    const storedExecQ = supervisor.store.upsertQuestion({
+      dedupeKey: "ready:exec:9637",
+      kind: "ready",
+      threadKey: "paseo:srv_bb3.cal1",
+      prRef: "buildbetter-app/buildbetter#9637",
+      title: "buildbetter #9637 ready. Needs approve.",
+      body: "buildbetter-app/buildbetter#9637 at 63c2acf6bf: CI pass.",
+      options: ["approved", "later"]
+    });
+    supervisor.store.recordReview(storedExecQ.id, {
+      fingerprint: "fp_exec_1",
+      reason: verdicts[0].reason,
+      category: "live",
+      brief: verdicts[0].brief,
+      recommendation: verdicts[0].recommendation,
+      suggestedReplies: verdicts[0].suggestedReplies
+    });
+    const execCard = buildSupervisorCard(supervisor.store.question(storedExecQ.id), {
+      prsByKey: new Map([["buildbetter-app/buildbetter#9637", {
+        ref: "buildbetter-app/buildbetter#9637",
+        state: "OPEN",
+        isDraft: false,
+        title: "fix(calendar-worker): renew visibility during attendee CRM backfills",
+        ci: { state: "SUCCESS", failing: [], pending: [] },
+        mergeState: "CLEAN"
+      }]])
+    });
+    assert.equal(execCard.brief?.context, "Fixing duplicate SQS deliveries during long attendee CRM backfills.");
+    assert.match(execCard.brief?.whatChanged ?? "", /Renews SQS visibility/);
+    assert.match(execCard.brief?.decision ?? "", /Merge PR #9637 now/);
+    assert.equal(execCard.recommendation, "Safe to merge — full verification and SQS tests green with 0 open threads.", "recommendation uses human review advice rather than internal audit reason");
+    assert.ok(!String(execCard.recommendation ?? "").includes("63c2acf6bf"), "internal SHA audit reason stays out of card.recommendation");
+    assert.deepEqual(execCard.suggestedReplies, ["Merge looks good — also plan a dry-run DLQ check", "Hold until staging smoke finishes"]);
+
+    // Paseo pendingPermissions kind === "question" (request_user_input_async) extracts actual question & answers directly via respondToPermissionAndWait,
+    // while stale MERGED PR on non-merge question is hidden and UUID prefix is cleaned
+    const permissionQuestionAgent = {
+      id: "8bcede90-cd9f-4360-bd66-8a354fd50213",
+      workspaceId: "7e19bf86-e489-4c3f-94b6-a3f9d9a33bdd",
+      title: "7e19bf86-e489-4c3f-94b6-a3f9d9a33bdd",
+      cwd: "/workspace/bb",
+      status: "idle",
+      updatedAt: "2026-11-16T02:30:00.000Z",
+      pendingPermissions: [
+        {
+          id: "permission-call_stuck_card_1",
+          provider: "codex",
+          name: "request_user_input_async",
+          kind: "question",
+          title: "Question",
+          input: {
+            questions: [
+              {
+                id: "0",
+                header: "Question 1",
+                question: "What page URL is showing this stuck card, and is it staging or production?",
+                options: [],
+                isOther: true
+              }
+            ]
+          }
+        }
+      ]
+    };
+    const permThread = paseoThread(permissionQuestionAgent, "srv_bb3", [
+      { item: { type: "assistant_message", text: "Sibling PR https://github.com/buildbetter-app/buildbetter/pull/9698 already merged." }, timestamp: "2026-11-16T02:29:00.000Z" }
+    ]);
+    assert.equal(permThread.meta.blockedOnOwner, false, "question-kind pendingPermission surfaces as pendingCard rather than opaque blockedOnOwner prompt");
+    assert.match(permThread.meta.pendingCard?.items?.[0]?.question ?? "", /What page URL is showing this stuck card/);
+
+    supervisor.lastThreads.set(permThread.key, permThread);
+    const stuckCardQ = supervisor.store.upsertQuestion({
+      dedupeKey: `card:${permThread.key}:permission-call_stuck_card_1`,
+      kind: "agent-card",
+      threadKey: permThread.key,
+      prRef: "buildbetter-app/buildbetter#9698",
+      title: "7e19bf86-e489-4c3f-94b6-a3f9d9: What page URL is showing this stuck card?",
+      card: "What page URL is showing this stuck card, and is it staging or production?",
+      options: ["open thread"]
+    });
+    const stuckDeckCard = buildSupervisorCard(supervisor.questionView(stuckCardQ, new Map()), {
+      threadsByKey: new Map([[permThread.key, permThread]]),
+      prsByKey: new Map([["buildbetter-app/buildbetter#9698", {
+        ref: "buildbetter-app/buildbetter#9698",
+        state: "MERGED",
+        title: "Continue onboarding in native Bob",
+        bodySummary: "Old 99-file merged PR body that should not clutter a new unrelated question."
+      }]])
+    });
+    assert.equal(stuckDeckCard.prContext, null, "settled MERGED PR is hidden on non-merge question cards");
+    assert.equal(stuckDeckCard.answerIn, "here", "Paseo question cards are answerable inline in Supervisor");
+    assert.ok(!stuckDeckCard.headline.startsWith("7e19bf86-"), "opaque UUID prefix is cleaned when fallback title exists");
+
+    let capturedPermissionResponse = null;
+    const permDelivery = await deliverPaseo({
+      config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+      thread: permThread,
+      text: "Owner says: Staging — https://staging.buildbetter.ai/home",
+      store: supervisor.store,
+      actionId: "act_perm_q1",
+      base: { playbook: "owner-message", messageHash: "h1" },
+      factory: () => ({
+        connect: async () => {},
+        close: async () => {},
+        hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+        respondToPermissionAndWait: async (agentId, reqId, resp) => {
+          capturedPermissionResponse = { agentId, reqId, resp };
+        },
+        agents: {
+          ref: () => ({
+            refresh: async () => {},
+            current: () => permissionQuestionAgent
+          })
+        }
+      })
+    });
+    assert.equal(permDelivery.status, "sent");
+    assert.deepEqual(capturedPermissionResponse, {
+      agentId: "8bcede90-cd9f-4360-bd66-8a354fd50213",
+      reqId: "permission-call_stuck_card_1",
+      resp: {
+        behavior: "allow",
+        updatedInput: {
+          answers: {
+            "Question 1": "Staging — https://staging.buildbetter.ai/home"
+          }
+        }
+      }
+    });
+
+    // Inline reply on an agent-card via actCard closes the question immediately on delivery
+    supervisor._executor = {
+      deliver: async () => ({ status: "sent", route: "paseo-send", detail: "Answered Paseo question directly" })
+    };
+    const inlineReplyRes = await supervisor.actCard(stuckCardQ.id, { op: "reply", value: "Staging — /home" });
+    assert.equal(inlineReplyRes?.ok, true);
+    assert.equal(supervisor.store.question(stuckCardQ.id)?.status, "answered", "inline reply on Paseo agent-card resolves question immediately");
+
     // Prose action-item asks with "tell me which to approve" (no question mark) classify as needs-human
     const { classifyThread: classifyForProse } = await import("../src/fleet/classify.js");
     const proseClassified = classifyForProse({

@@ -58,12 +58,93 @@ function extractPaseoPrRefs(messages, title = "") {
   return refs.slice(0, 8);
 }
 
+const OPAQUE_PASEO_ID = /^(?:wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+
 function extractPaseoPendingCard(agent) {
+  const perms = Array.isArray(agent?.pendingPermissions) ? agent.pendingPermissions : [];
+  const questionPerms = perms.filter((p) => p && typeof p === "object" && p.kind === "question");
+  if (questionPerms.length > 0) {
+    const items = [];
+    for (const perm of questionPerms) {
+      const pQuestions = Array.isArray(perm.input?.questions) ? perm.input.questions : [];
+      if (pQuestions.length > 0) {
+        for (const q of pQuestions) {
+          const qText = String(q?.question ?? q?.title ?? "").trim();
+          if (!qText) continue;
+          items.push(cleanCardItem({
+            index: items.length,
+            itemId: String(q?.id ?? items.length),
+            header: q?.header ?? null,
+            question: qText,
+            options: Array.isArray(q?.options)
+              ? q.options.map((opt) => (typeof opt === "string" ? opt : opt?.label ?? opt?.value ?? "")).filter(Boolean)
+              : [],
+            multiSelect: Boolean(q?.multiSelect),
+            freeText: q?.freeText !== false,
+            at: agent.updatedAt ?? null
+          }));
+        }
+      } else if (String(perm.description ?? perm.input?.prompt ?? "").trim()) {
+        items.push(cleanCardItem({
+          index: items.length,
+          itemId: String(perm.id ?? items.length),
+          header: perm.title ?? null,
+          question: String(perm.description ?? perm.input?.prompt ?? "").trim(),
+          options: [],
+          multiSelect: false,
+          freeText: true,
+          at: agent.updatedAt ?? null
+        }));
+      }
+    }
+    if (items.length > 0) {
+      return {
+        app: "paseo",
+        cardId: String(questionPerms[0].id ?? `paseo-${agent.id}`),
+        requestId: String(questionPerms[0].id ?? ""),
+        at: items[0].at ?? agent.updatedAt ?? null,
+        count: items.length,
+        items
+      };
+    }
+  }
+
   const rawQuestions = agent?.persistence?.metadata?.asyncQuestions;
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
-  const unresolved = rawQuestions.filter((q) => q && typeof q === "object" && q.resolution == null && String(q.question ?? "").trim());
-  if (!unresolved.length) return null;
-  const items = unresolved.map((q, index) => cleanCardItem({
+  const extracted = [];
+  let firstCardId = null;
+  for (const q of rawQuestions) {
+    if (!q || typeof q !== "object" || q.resolution != null) continue;
+    if (String(q.question ?? "").trim()) {
+      firstCardId ??= String(q.id ?? `paseo-${agent.id}`);
+      extracted.push({
+        id: q.id,
+        header: q.header ?? null,
+        question: q.question,
+        options: q.options,
+        multiSelect: q.multiSelect,
+        freeText: q.freeText,
+        at: q.askedAt ?? q.createdAt ?? agent.updatedAt ?? null
+      });
+    } else if (Array.isArray(q.item?.questions)) {
+      firstCardId ??= `permission-${String(q.item.id ?? agent.id)}`;
+      for (let idx = 0; idx < q.item.questions.length; idx += 1) {
+        const sub = q.item.questions[idx];
+        if (!String(sub?.title ?? "").trim()) continue;
+        extracted.push({
+          id: `${q.item.id ?? "q"}_${idx}`,
+          header: `Question ${idx + 1}`,
+          question: sub.title,
+          options: sub.options,
+          multiSelect: false,
+          freeText: true,
+          at: agent.updatedAt ?? null
+        });
+      }
+    }
+  }
+  if (!extracted.length) return null;
+  const items = extracted.map((q, index) => cleanCardItem({
     index,
     itemId: String(q.id ?? index),
     header: q.header ?? null,
@@ -73,15 +154,42 @@ function extractPaseoPendingCard(agent) {
       : [],
     multiSelect: Boolean(q.multiSelect),
     freeText: q.freeText !== false,
-    at: q.askedAt ?? q.createdAt ?? agent.updatedAt ?? null
+    at: q.at
   }));
   if (!items.length) return null;
   return {
     app: "paseo",
-    cardId: String(unresolved[0].id ?? `paseo-${agent.id}`),
+    cardId: firstCardId ?? `paseo-${agent.id}`,
     at: items[0].at ?? agent.updatedAt ?? null,
     count: rawQuestions.length,
     items
+  };
+}
+
+function extractPaseoPendingPermission(agent) {
+  const perms = Array.isArray(agent?.pendingPermissions) ? agent.pendingPermissions : [];
+  const blocking = perms.find((p) => p && typeof p === "object" && p.kind !== "question");
+  if (!blocking) return null;
+  const command = blocking.detail?.command ?? blocking.input?.command ?? blocking.input?.cmd ?? null;
+  const filePath = blocking.detail?.filePath ?? blocking.input?.file_path ?? blocking.input?.path ?? null;
+  return {
+    id: blocking.id ? String(blocking.id) : null,
+    kind: blocking.kind ? String(blocking.kind) : "tool",
+    name: blocking.name ? clampText(redactSecrets(String(blocking.name)), 80) : null,
+    title: blocking.title ? clampText(redactSecrets(String(blocking.title)), 120) : null,
+    description: blocking.description ? clampText(redactSecrets(String(blocking.description)), 280) : null,
+    command: command ? clampText(redactSecrets(String(command)), 240) : null,
+    filePath: filePath ? clampText(redactSecrets(String(filePath)), 200) : null,
+    actions: Array.isArray(blocking.actions)
+      ? blocking.actions
+          .slice(0, 4)
+          .map((a) => ({
+            id: String(a?.id ?? ""),
+            label: clampText(redactSecrets(String(a?.label ?? "")), 40),
+            behavior: a?.behavior === "deny" ? "deny" : "allow"
+          }))
+          .filter((a) => a.label)
+      : []
   };
 }
 
@@ -151,10 +259,12 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const text = redactSecrets(assistant?.item.text ?? "").slice(-8000);
   const prRefs = extractPaseoPrRefs(messages, agent.title ?? "");
   const pendingCard = extractPaseoPendingCard(agent);
+  const pendingPermission = extractPaseoPendingPermission(agent);
+  const hasBlockingPermission = Boolean(pendingPermission) || (Boolean(agent.pendingPermissions?.length) && !pendingCard);
   const rawWorkspace = String(agent.workspaceId ?? "").trim();
   const conductorWorkspace = String(agent.labels?.["migration.conductorWorkspaceName"] ?? "").trim()
     || (/\/\.conductor\/([^/]+)/.exec(String(agent.cwd ?? ""))?.[1] ?? "");
-  const cleanWorkspace = rawWorkspace && !/^wks_[0-9a-f]+$/i.test(rawWorkspace)
+  const cleanWorkspace = rawWorkspace && !OPAQUE_PASEO_ID.test(rawWorkspace)
     ? clampText(rawWorkspace, 80)
     : (conductorWorkspace ? clampText(conductorWorkspace, 80) : null);
   return {
@@ -163,7 +273,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
     cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
-    agentStatus: agent.pendingPermissions?.length ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
+    agentStatus: hasBlockingPermission ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status : "unknown",
     archived: Boolean(agent.archivedAt),
     excluded: agent.archivedAt || agent.status === "closed" ? "closed" : !historyKnown ? "history-unavailable" : null,
@@ -173,9 +283,10 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     error: currentError(agent, entries), openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
-      aliases, updatedAt: agent.updatedAt, blockedOnOwner: Boolean(agent.pendingPermissions?.length),
+      aliases, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
       requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
       ...(pendingCard ? { pendingCard } : {}),
+      ...(pendingPermission ? { pendingPermission } : {}),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,
       conversation: messages.filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX)).map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
   };
