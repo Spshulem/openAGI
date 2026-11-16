@@ -45,6 +45,7 @@ import { ComputerUseLog } from "./computer-use-log.js";
 import { ClarificationStore } from "./clarification-store.js";
 import { DraftStore } from "./draft-store.js";
 import { GroundedOutcomes } from "./learning/grounded-outcomes.js";
+import { ModelClient } from "./learning/model-client.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -163,6 +164,9 @@ export class AbiRuntime {
     });
     this.skills = options.skills ?? null;
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
+    // Optional local scoring service (src/learning/model-client.js). Inert, with
+    // no requests, files or timers, unless OPENAGI_MODEL_URL is set.
+    this.modelClient = options.modelClient ?? new ModelClient();
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // FTS5 index over the agent's own chat transcripts, so search_sessions can
