@@ -642,8 +642,8 @@ export function buildSupervisorCard(
       : (rest || "Coding session");
   }
   if (/:\s*Question\s+\d+(?:\s*\(\d+\s+open\))?$/i.test(cleanTitle.trim())) {
-    const askProse = cleanBriefProse(question.card || question.body || "");
-    const firstAsk = (/^([^\n]+?[.?])(?:\s|$)/.exec(askProse)?.[1] ?? askProse.split(/\n+/)[0] ?? "").trim();
+    const firstLine = (cleanBriefProse(question.card || question.body || "").split(/\n+/)[0] ?? "").trim();
+    const firstAsk = (/^([^?]+\?)(?:\s|$)/.exec(firstLine)?.[1] ?? firstLine).trim();
     if (firstAsk) {
       cleanTitle = cleanTitle.replace(/:\s*Question\s+\d+(\s*\(\d+\s+open\))?$/i, (_, suffix = "") => `: ${clampText(firstAsk, 68)}${suffix || ""}`);
     }

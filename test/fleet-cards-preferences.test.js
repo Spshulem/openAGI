@@ -2103,10 +2103,10 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
       status: "open",
       threadKey: "paseo:srv_bb3.cli",
       title: "BuildBetter CLI: Question 1",
-      card: "Which test email should I use for the final fresh-signup check on staging? You will need to open its verification email.",
+      card: "Should we deploy v1.2 (e.g. staging first) before fresh-signup check? You will need to open its verification email.",
       options: ["open thread"]
     });
-    assert.match(genericQ1Card.headline, /BuildBetter CLI: Which test email should I use/);
+    assert.match(genericQ1Card.headline, /Should we deploy v1\.2 \(e\.g\. staging first\)/);
     assert.ok(!genericQ1Card.headline.endsWith("Question 1"));
   } finally {
     cleanup();
