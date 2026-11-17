@@ -104,7 +104,8 @@ export class ModelClient {
         : null);
   }
 
-  // value is null when the service has no trained value head.
+  // value is null when the service has no trained value head: a valid
+  // answer, not a failure, so it does not count toward the breaker.
   async scoreSignal(payload) {
     const body = pickStrings(payload, ["text", "channel"]);
     if (!body) return null;
@@ -115,12 +116,16 @@ export class ModelClient {
   }
 
   // items: [{ id, text, tier, kind, source, novelty, risk, repetition, specificity, strength }]
+  // scores is null when the service has no trained keep head: a valid answer,
+  // not a failure, so it does not count toward the breaker.
   async keepScores(items) {
     if (!Array.isArray(items)) return null;
     const body = { items: items.map(keepItem).filter(Boolean) };
     if (body.items.length === 0) return null;
     return this._call("POST", "/memory/keep", body, (json) => {
-      if (!isPlainObject(json) || !isPlainObject(json.scores)) return null;
+      if (!isPlainObject(json)) return null;
+      if (json.scores === null) return { scores: null, version: versionOf(json.version) };
+      if (!isPlainObject(json.scores)) return null;
       const scores = Object.fromEntries(Object.entries(json.scores).filter(([, p]) => isProbability(p)));
       return { scores, version: versionOf(json.version) };
     });

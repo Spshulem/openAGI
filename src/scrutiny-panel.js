@@ -40,10 +40,26 @@ export class ScrutinyPanel {
    * { action, score, dimensions, reasons, judges, agreement, dissent }.
    */
   evaluate(args) {
+    // Overrides (including a learned score) reach every judge through args.
+    const result = this.aggregate(this.verdicts(args));
+    const learnedValue = args?.overrides?.learnedValue;
+    if (typeof learnedValue !== "number" || !Number.isFinite(learnedValue)) return result;
+    // With a learned score, also report what the rule-only panel would have scored.
+    const { learnedValue: _learned, ...ruleOverrides } = args.overrides;
+    const rule = this.aggregate(this.verdicts({ ...args, overrides: ruleOverrides }));
+    const { action, score, ...rest } = result;
+    return { action, score, ruleScore: rule.score, ...rest };
+  }
+
+  verdicts(args) {
     const verdicts = {};
     for (const [name, judge] of Object.entries(this.judges)) {
       verdicts[name] = judge.evaluate(args);
     }
+    return verdicts;
+  }
+
+  aggregate(verdicts) {
 
     const actions = Object.values(verdicts).map((v) => v.action);
     const tally = {};
