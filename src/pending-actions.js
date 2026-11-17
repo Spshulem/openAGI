@@ -84,13 +84,17 @@ export class PendingActionStore {
         if (existing.mode === "chat") this._noteOwnerIntent(existing.id, ownerIntent);
         // Asked again in the same chat: the card belongs to this turn now.
         // createdAt keeps its age; raisedAt is what "since your latest
-        // message" reads. A fresh request also gets a fresh approval window,
-        // as a new card would. A request from elsewhere changes neither.
+        // message" reads. A request from elsewhere changes neither.
         if ((existing.context?.sessionId ?? null) === (context?.sessionId ?? null)) {
           const nowMs = this.now();
           existing.raisedAt = new Date(nowMs).toISOString();
+          // A fresh window only for the very same arguments. The card keeps
+          // its original args, and some carry their own age limit (a coding
+          // reply's preparedAt): renewing past it would leave a card that
+          // looks approvable but whose tool refuses to run.
+          const sameArgs = argsDigest(toolName, existing.args, null) === argsDigest(toolName, args ?? {}, null);
           const ttl = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0 ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000) : null;
-          if (ttl && existing.expiresAt && Date.parse(existing.expiresAt) < nowMs + ttl) {
+          if (sameArgs && ttl && existing.expiresAt && Date.parse(existing.expiresAt) < nowMs + ttl) {
             existing.expiresAt = new Date(nowMs + ttl).toISOString();
           }
           this._appendJournal({ op: "raise", id: existing.id, raisedAt: existing.raisedAt, expiresAt: existing.expiresAt });

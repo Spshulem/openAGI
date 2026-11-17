@@ -59,3 +59,22 @@ test("asking again renews the approval window; a request from another chat leave
   const reloaded = new PendingActionStore({ dir, now: () => now });
   assert.equal(reloaded.get(card.id).expiresAt, "2026-11-17T10:19:50.000Z");
 });
+
+test("asking again with different arguments re-raises the card but keeps its original deadline", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-raised-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let now = Date.parse("2026-11-17T10:00:00.000Z");
+  const store = new PendingActionStore({ dir, now: () => now });
+  const ttlMs = 10 * 60 * 1000;
+  // Like reply_to_coding_agent: a fixed dedupe key, and args stamped with
+  // their own preparedAt that the handler refuses after ten minutes.
+  const ask = () => store.enqueue({ toolName: "reply_to_coding_agent", args: { text: "ship it", preparedAt: now },
+    context: { sessionId: "devices:agent:main" }, dedupeKey: "coding:reply:thread-1", ttlMs, mode: "chat", announce: false });
+  const card = ask();
+  now += 9 * 60 * 1000 + 50 * 1000;
+  ask();
+  const after = store.get(card.id);
+  assert.equal(after.raisedAt, "2026-11-17T10:09:50.000Z", "it is this turn's request again");
+  assert.equal(after.args.preparedAt, Date.parse("2026-11-17T10:00:00.000Z"), "the card keeps its original arguments");
+  assert.equal(after.expiresAt, "2026-11-17T10:10:00.000Z", "so its deadline stays with them");
+});
