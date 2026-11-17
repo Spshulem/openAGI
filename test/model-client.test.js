@@ -325,6 +325,31 @@ test("the breaker opens after three consecutive failures and closes after 60 s",
   assert.deepEqual(await client.scoreSuggestion({ title: "x" }), { pAccept: 0.2, version: null });
 });
 
+test("a service with no keep or value head answers null, which is not a failure and never opens the breaker", async (t) => {
+  const tokenFile = writeToken(tempDir(t));
+  const stub = await startStub(t, {
+    "POST /memory/keep": { json: { scores: null, version: "v4" } },
+    "POST /score/signal": { json: { value: null, version: "v4" } },
+    "POST /score/suggestion": { json: { p_accept: 0.4, version: "v4" } }
+  });
+  const client = makeClient({ url: stub.url, tokenFile });
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(await client.keepScores([{ id: `m${i}`, text: "x" }]), { scores: null, version: "v4" });
+  }
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(await client.scoreSignal({ text: "x", channel: "local" }), { value: null, version: "v4" });
+  }
+  assert.equal(client._failures, 0);
+  assert.deepEqual(await client.scoreSuggestion({ title: "x" }), { pAccept: 0.4, version: "v4" }, "the breaker stayed closed");
+  assert.equal(stub.requests.length, 7);
+
+  // Truly malformed bodies still count as failures.
+  stub.routes["POST /memory/keep"] = { json: { scores: "none" } };
+  for (let i = 0; i < 3; i += 1) assert.equal(await client.keepScores([{ id: "m1" }]), null);
+  assert.equal(await client.scoreSuggestion({ title: "x" }), null, "open after three malformed answers");
+  assert.equal(stub.requests.length, 10);
+});
+
 test("health is cached for 60 s and concurrent callers share one request", async (t) => {
   const tokenFile = writeToken(tempDir(t));
   const stub = await startStub(t, { "GET /health": { json: healthBody() } });

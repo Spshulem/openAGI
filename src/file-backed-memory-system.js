@@ -37,6 +37,19 @@ export class FileBackedMemorySystem extends MemorySystem {
     return item;
   }
 
+  setKeepScore(id, score, version = null) {
+    const item = super.setKeepScore(id, score, version);
+    // Ids and numbers only: the score never carries memory content.
+    if (item) {
+      this.persist("keep-score", {
+        id,
+        keepScore: item.metadata.keepScore,
+        version: item.metadata.keepScoreVersion
+      });
+    }
+    return item;
+  }
+
   recordRecalls(ids, options = {}) {
     const updated = super.recordRecalls(ids, options);
     if (updated.length > 0) {

@@ -46,6 +46,9 @@ import { ClarificationStore } from "./clarification-store.js";
 import { DraftStore } from "./draft-store.js";
 import { GroundedOutcomes } from "./learning/grounded-outcomes.js";
 import { ModelClient } from "./learning/model-client.js";
+import { LEARNED_HEADS, learnedModeFor } from "./learning/learned-scores.js";
+import { ClusterStats } from "./learning/cluster-stats.js";
+import { specialistExperimentVerdicts } from "./learning/specialist-experiment.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -167,6 +170,17 @@ export class AbiRuntime {
     // Optional local scoring service (src/learning/model-client.js). Inert, with
     // no requests, files or timers, unless OPENAGI_MODEL_URL is set.
     this.modelClient = options.modelClient ?? new ModelClient();
+    // Learned keep-scores for memory decay and eviction (shadow by default,
+    // nothing at all without the service). Set once the client exists.
+    const memoryMode = learnedModeFor("memory", this.modelClient);
+    if (memoryMode !== "off" && this.memory instanceof MemorySystem) {
+      this.memory.learnedMode = memoryMode;
+      this.memory.keepScoresUsable = () => this.modelClient.usable(LEARNED_HEADS.keep);
+    }
+    // Per-topic grades for need-based spawning; created on first use, and
+    // only while OPENAGI_LEARNED_PROPAGATION is not off (learnedClusterStats).
+    this.clusterStats = options.clusterStats ?? null;
+    this.learningDir = options.dataDir ? path.join(options.dataDir, "learning") : undefined;
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // FTS5 index over the agent's own chat transcripts, so search_sessions can
@@ -353,6 +367,18 @@ export class AbiRuntime {
         task: "grounded-sweep",
         dailyAt: "04:45"
       });
+      // Randomized specialist comparison: registered only while the router
+      // runs in experiment mode. Sets each specialist's experimentVerdict,
+      // which the retirement sweep acts on.
+      if (this.specialistRouter?.mode === "experiment") {
+        this.cron.addJob({
+          id: "specialist-experiment",
+          name: "Daily verdicts for the randomized specialist comparison",
+          enabled: true,
+          task: "specialist-experiment",
+          dailyAt: "04:55"
+        });
+      }
       // Manual only: run it from the dashboard or POST /cron/grounded-backfill/run
       // with input { apply: true }. Without apply it reports what it would grade.
       this.cron.addJob({
@@ -660,16 +686,39 @@ export class AbiRuntime {
       limit: 6,
       scope
     });
+    // signal.learned (agent-host messageToSignal) exists only when a learned
+    // use is on. A learned scrutiny value is passed only when it may act: a
+    // live flag and a usable head. Otherwise the rule score stands.
+    const learned = signal.learned ?? null;
+    const learnedValue = learned?.mode === "live"
+      && learnedModeFor("scrutiny", this.modelClient) === "live"
+      && this.modelClient.usable(LEARNED_HEADS.value)
+      ? (learned.value ?? null)
+      : null;
     const scrutiny = this.scrutiny.evaluate({
       signal,
       workflow,
       memories: memoryHits,
       context: this.context,
-      overrides: signal.scrutinyOverrides ?? {}
+      overrides: learned?.mode
+        ? { ...(signal.scrutinyOverrides ?? {}), learnedValue }
+        : signal.scrutinyOverrides ?? {}
     });
+    if (learned?.mode) scrutiny.shadowLearnedValue = learned.value ?? null;
 
     const parentSpecialistId = options.parentSpecialistId ?? null;
-    const propagationDecision = this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId });
+    const propagationMode = learnedModeFor("propagation", this.modelClient);
+    const clusterId = learned?.cluster ?? null;
+    const propagationDecision = propagationMode === "off"
+      ? this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId })
+      : this.propagation.shouldPropagate({
+          signal,
+          scrutiny,
+          memoryHits,
+          parentSpecialistId,
+          clusterStats: clusterId !== null ? this.clusterStatsFor(clusterId) : null,
+          learnedMode: propagationMode
+        });
     const propagated =
       options.allowPropagation !== false && propagationDecision.decision && scrutiny.action !== "ignore"
         ? this.propagation.propagate({
@@ -735,6 +784,7 @@ export class AbiRuntime {
           critical: signal.risk >= 0.85
         }
       );
+      if (memoryItem && learnedModeFor("memory", this.modelClient) !== "off") this.requestKeepScore(memoryItem);
     }
 
     const output = {
@@ -753,6 +803,16 @@ export class AbiRuntime {
         content: item.content
       }))
     };
+    // Shadow (or live) record of the need-based spawn rule beside the keyword rule.
+    if (propagationMode !== "off") {
+      output.learnedPropagation = {
+        mode: propagationMode,
+        clusterId,
+        explicitlyRequired: propagationDecision.explicitlyRequired === true,
+        ruleDecision: propagationMode === "live" ? propagationDecision.ruleDecision : propagationDecision.decision,
+        learnedDecision: propagationMode === "live" ? propagationDecision.decision : propagationDecision.learnedDecision
+      };
+    }
 
     // Ephemeral turns (setup-wizard connectivity test) leave NO trace — that
     // includes the in-memory outputs/feedback logs the dashboard reads, not
@@ -771,6 +831,72 @@ export class AbiRuntime {
     }
 
     return output;
+  }
+
+  // Ask the scoring service how likely this memory is to be recalled, and
+  // store the answer on the item. Never awaited: processSignal stays
+  // synchronous, and a missing answer leaves the item as it is.
+  requestKeepScore(item) {
+    try {
+      const memory = this.memory;
+      Promise.resolve(this.modelClient.keepScores([{
+        id: item.id,
+        text: item.content,
+        tier: item.tier,
+        kind: item.kind,
+        source: item.source,
+        novelty: item.novelty,
+        risk: item.risk,
+        repetition: item.repetition,
+        specificity: item.specificity,
+        strength: item.strength
+      }])).then((result) => {
+        if (result?.scores && Object.hasOwn(result.scores, item.id)) {
+          memory.setKeepScore?.(item.id, result.scores[item.id], result.version);
+        }
+      }).catch(() => {});
+    } catch { /* keep-scores are optional */ }
+  }
+
+  // ClusterStats while need-based spawning is on (shadow or live), else null.
+  learnedClusterStats() {
+    if (learnedModeFor("propagation", this.modelClient) === "off") return null;
+    if (!this.clusterStats) this.clusterStats = new ClusterStats({ dir: this.learningDir });
+    return this.clusterStats;
+  }
+
+  // { n, mean, overallMean } of the generalist's grounded grades for one
+  // topic over the last 30 days, for PropagationController.shouldPropagate.
+  clusterStatsFor(clusterId) {
+    try {
+      const stats = this.learnedClusterStats();
+      if (!stats || clusterId === null || clusterId === undefined) return null;
+      return { ...stats.stats(clusterId), overallMean: stats.overall().mean };
+    } catch {
+      return null;
+    }
+  }
+
+  // Daily job: verdicts of the randomized specialist comparison onto each
+  // specialist (experimentVerdict), for the retirement sweep to act on.
+  runSpecialistExperiment() {
+    const verdicts = specialistExperimentVerdicts([...(this.outcomes?.outcomes?.values?.() ?? [])]);
+    const summary = { specialists: 0, changed: 0, byVerdict: {} };
+    for (const sp of this.propagation?.list?.({ includeRetired: false }) ?? []) {
+      const result = verdicts.get(sp.id);
+      const verdict = result?.verdict ?? "undecided";
+      summary.specialists += 1;
+      summary.byVerdict[verdict] = (summary.byVerdict[verdict] ?? 0) + 1;
+      if (sp.experimentVerdict !== verdict) {
+        sp.experimentVerdict = verdict;
+        summary.changed += 1;
+      }
+      sp.experiment = result
+        ? { specialist: result.specialist, generalist: result.generalist, difference: result.difference, interval: result.interval }
+        : null;
+    }
+    if (summary.specialists > 0) this.propagation.save?.();
+    return summary;
   }
 
   async tick(now = new Date()) {
@@ -906,6 +1032,9 @@ export class AbiRuntime {
         reclaimedBytes: result.reclaim?.reclaimedBytes ?? 0
       });
       return result;
+    }
+    if (job.task === "specialist-experiment") {
+      return this.runSpecialistExperiment();
     }
     if (job.task === "retirement-sweep") {
       const retired = this.propagation.retirementSweep?.() ?? [];

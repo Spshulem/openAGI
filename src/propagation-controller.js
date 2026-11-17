@@ -34,6 +34,22 @@ function specialistMetadata(signal = {}) {
   };
 }
 
+// Need-based spawning: a topic cluster where the generalist's grounded grades
+// sit clearly below its overall mean, over enough graded work.
+// clusterStats: { n, mean, overallMean } (AbiRuntime.clusterStatsFor).
+export const CLUSTER_RULE_MIN_N = 15;
+export const CLUSTER_RULE_MARGIN = 0.1;
+export function clusterRuleFires(clusterStats) {
+  return Boolean(
+    clusterStats &&
+      Number.isFinite(clusterStats.n) &&
+      clusterStats.n >= CLUSTER_RULE_MIN_N &&
+      Number.isFinite(clusterStats.mean) &&
+      Number.isFinite(clusterStats.overallMean) &&
+      clusterStats.mean < clusterStats.overallMean - CLUSTER_RULE_MARGIN
+  );
+}
+
 export class PropagationController {
   constructor(options = {}) {
     this.specialists = new Map();
@@ -44,7 +60,11 @@ export class PropagationController {
     this.maxBreadthPerParent = options.maxBreadthPerParent ?? 5;
   }
 
-  shouldPropagate({ signal, scrutiny, memoryHits = [], parentSpecialistId = null }) {
+  // learnedMode "off" (default) is the keyword rule alone. "shadow" adds
+  // learnedDecision (explicit request or the cluster rule) and changes
+  // nothing. "live" decides by the explicit request or the cluster rule only;
+  // the keyword triggers no longer spawn, and ruleDecision keeps their answer.
+  shouldPropagate({ signal, scrutiny, memoryHits = [], parentSpecialistId = null, clusterStats = null, learnedMode = "off" }) {
     const repetition = clamp(signal.repetition ?? scrutiny?.dimensions?.repetition ?? 0);
     const risk = clamp(signal.risk ?? scrutiny?.dimensions?.risk ?? 0);
     const novelty = clamp(signal.novelty ?? scrutiny?.dimensions?.novelty ?? 0);
@@ -67,7 +87,7 @@ export class PropagationController {
       }
     }
 
-    return {
+    const result = {
       decision: !blockedBy && (explicitlyRequired || repeated || novelAndRisky || underCovered),
       repeated,
       novelAndRisky,
@@ -76,6 +96,17 @@ export class PropagationController {
       memoryCoverage,
       blockedBy
     };
+    if (learnedMode === "shadow") {
+      return { ...result, learnedDecision: explicitlyRequired || clusterRuleFires(clusterStats) };
+    }
+    if (learnedMode === "live") {
+      return {
+        ...result,
+        decision: !blockedBy && (explicitlyRequired || clusterRuleFires(clusterStats)),
+        ruleDecision: result.decision
+      };
+    }
+    return result;
   }
 
   propagate({ signal, workflow, scrutiny, tools = [], parentSpecialistId = null }) {
@@ -214,6 +245,14 @@ export class PropagationController {
         sp.status = "retired";
         sp.retiredAt = nowIso();
         sp.retirementReason = `grounded mean ${sp.groundedMean?.toFixed(2)} < ${qualityFloor}`;
+        retired.push(sp);
+        continue;
+      }
+      // The randomized comparison found the generalist does better on its work.
+      if (sp.experimentVerdict === "retire") {
+        sp.status = "retired";
+        sp.retiredAt = nowIso();
+        sp.retirementReason = "randomized comparison: the generalist did better";
         retired.push(sp);
       }
     }

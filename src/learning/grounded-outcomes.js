@@ -1,5 +1,6 @@
 import { listAllSuggestions } from "../suggestion-feed.js";
 import { editSimilarity } from "./edit-similarity.js";
+import { learnedModeFor, patchOutcomeMetadata } from "./learned-scores.js";
 
 // Grades the system's own work by what happened to it afterwards: a draft
 // approved untouched, edited, or discarded; a suggestion accepted, rejected
@@ -42,6 +43,13 @@ export function editedDraftScore(similarity) {
   return 0.4 + 0.6 * Math.max(0, Math.min(1, similarity));
 }
 
+// The randomized specialist comparison's arm, carried from the turn's signal
+// (agent-host __signal) onto the work it produced. Empty outside experiment mode.
+function routingMetadata(signal) {
+  if (typeof signal?.routingArm !== "string" || !signal.routingArm) return {};
+  return { routingCandidateId: signal.routingCandidateId ?? null, routingArm: signal.routingArm };
+}
+
 export class GroundedOutcomes {
   constructor({ runtime } = {}) {
     this.runtime = runtime ?? null;
@@ -63,13 +71,48 @@ export class GroundedOutcomes {
   _ground(outcome, fate, { source, detail = null, score } = {}) {
     if (!outcome) return null;
     const preset = FATES[fate] ?? { score: null, weak: false };
-    return this.outcomes.ground(outcome.id, {
+    const grounded = this.outcomes.ground(outcome.id, {
       score: score === undefined ? preset.score : score,
       source,
       fate,
       weak: preset.weak,
       detail
     });
+    this._recordClusterGrade(grounded);
+    return grounded;
+  }
+
+  // Need-based spawning (OPENAGI_LEARNED_PROPAGATION not off): fold the
+  // generalist's graded, not-weak work into its topic's running grade. A
+  // regrade replaces the earlier one; a grade that stops counting is removed.
+  _recordClusterGrade(outcome) {
+    try {
+      const clusterId = outcome?.metadata?.clusterId;
+      if (clusterId === null || clusterId === undefined) return;
+      const stats = this.runtime?.learnedClusterStats?.();
+      if (!stats) return;
+      const generalist = outcome.metadata.routingArm !== "specialist" && !outcome.metadata.specialistId;
+      if (generalist && typeof outcome.groundedScore === "number" && !outcome.groundedWeak) {
+        stats.record(clusterId, outcome.groundedScore, outcome.groundedAt, outcome.id);
+      } else {
+        stats.remove(outcome.id);
+      }
+    } catch { /* topic grades are optional */ }
+  }
+
+  // Need-based spawning: ask the scoring service which topic a piece of work
+  // belongs to and note it on the outcome when the answer arrives. Never
+  // awaited; nothing happens while the use is off.
+  _requestCluster(outcome, text) {
+    try {
+      const client = this.runtime?.modelClient;
+      if (!outcome || typeof text !== "string" || !text.trim()) return;
+      if (learnedModeFor("propagation", client) === "off") return;
+      Promise.resolve(client.clusterOf(text)).then((found) => {
+        if (found?.cluster === null || found?.cluster === undefined) return;
+        patchOutcomeMetadata(this.outcomes, outcome, { clusterId: found.cluster });
+      }).catch(() => {});
+    } catch { /* topic lookup is optional */ }
   }
 
   _work(kind, refId, at, signal = null) {
@@ -79,8 +122,13 @@ export class GroundedOutcomes {
 
   // ── drafts ────────────────────────────────────────────────────────────
   onDraftCreated(draft, signal = null) {
-    return this._safe(() => this.outcomes.byWorkRef("work-draft", draft.id)
-      ?? this.outcomes.recordWork({ kind: "work-draft", refId: draft.id, signal }));
+    return this._safe(() => {
+      const existing = this.outcomes.byWorkRef("work-draft", draft.id);
+      if (existing) return existing;
+      const outcome = this.outcomes.recordWork({ kind: "work-draft", refId: draft.id, signal, metadata: routingMetadata(signal) });
+      this._requestCluster(outcome, draft.title);
+      return outcome;
+    });
   }
 
   onDraftResolved(draft, status) {
@@ -103,8 +151,11 @@ export class GroundedOutcomes {
   // ── suggestions ───────────────────────────────────────────────────────
   onSuggestionProposed(suggestion) {
     return this._safe(() => {
-      const outcome = this.outcomes.byWorkRef("work-suggestion", suggestion.id)
-        ?? this.outcomes.recordWork({ kind: "work-suggestion", refId: suggestion.id, at: suggestion.proposedAt });
+      let outcome = this.outcomes.byWorkRef("work-suggestion", suggestion.id);
+      if (!outcome) {
+        outcome = this.outcomes.recordWork({ kind: "work-suggestion", refId: suggestion.id, at: suggestion.proposedAt });
+        this._requestCluster(outcome, suggestion.title);
+      }
       return outcome?.id ?? null;
     });
   }
@@ -156,7 +207,11 @@ export class GroundedOutcomes {
       // (for example reopened) keeps its grade, and this attempt starts fresh.
       const open = this.outcomes.byWorkRef("work-task", task.id);
       if (open && !open.groundedFate) return open;
-      return this.outcomes.recordWork({ kind: "work-task", refId: task.id, signal, metadata: { byAgent: true } });
+      const outcome = this.outcomes.recordWork({
+        kind: "work-task", refId: task.id, signal, metadata: { byAgent: true, ...routingMetadata(signal) }
+      });
+      this._requestCluster(outcome, task.title);
+      return outcome;
     });
   }
 

@@ -8,7 +8,10 @@ const DEFAULT_THRESHOLD = 0.55;
 export class SpecialistRouter {
   constructor(options = {}) {
     this.threshold = options.threshold ?? Number.parseFloat(process.env.OPENAGI_ROUTING_THRESHOLD ?? String(DEFAULT_THRESHOLD));
-    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "shadow"; // live | shadow | off
+    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "shadow"; // live | shadow | experiment | off
+    // experiment: a matched turn goes to the specialist with probability
+    // 0.5, so its grounded results can be compared with the generalist's.
+    this.random = typeof options.random === "function" ? options.random : Math.random;
     this.minActivations = options.minActivations ?? 1;
     this.vectorStore = options.vectorStore ?? null;
     this.semanticWeight = options.semanticWeight ?? 0.4;
@@ -57,22 +60,29 @@ export class SpecialistRouter {
   }
 
   /**
-   * Decide whether to route. Returns { mode, route, candidate, all } where:
-   * - mode: 'live' | 'shadow' | 'off'
+   * Decide whether to route. Returns { mode, route, candidate, all, arm } where:
+   * - mode: 'live' | 'shadow' | 'experiment' | 'off'
    * - route: true if the agent should hand off
    * - candidate: top specialist (or null)
+   * - arm: 'specialist' | 'generalist', only when a candidate matched
+   *   (shadow always 'generalist', live always 'specialist', experiment at random)
    */
   async decide(signalText, signalTags, specialists) {
     if (this.mode === "off") return { mode: "off", route: false, candidate: null, all: [] };
     const all = await this.search(signalText, signalTags, specialists);
     const top = all[0] ?? null;
     const matched = Boolean(top && top.score >= this.threshold);
+    const arm = !matched ? null
+      : this.mode === "live" ? "specialist"
+        : this.mode === "experiment" ? (this.random() < 0.5 ? "specialist" : "generalist")
+          : "generalist";
     return {
       mode: this.mode,
-      route: this.mode === "live" && matched,
+      route: arm === "specialist",
       candidate: matched ? top : null,
       threshold: this.threshold,
-      all
+      all,
+      ...(arm ? { arm } : {})
     };
   }
 }

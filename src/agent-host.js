@@ -10,6 +10,8 @@ import { agentTurnTask } from "./model-router.js";
 import { authorityRecord, isOwnerPrincipal, matchConfirmation, matchConfirmations, ownerIntentText } from "./owner-authority.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { GET_STARTED_GUIDANCE } from "./get-started.js";
+import { LEARNED_HEADS, learnedModeFor, patchOutcomeMetadata } from "./learning/learned-scores.js";
+import { clusterRuleFires } from "./propagation-controller.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
 // and the task queue it drains. Everything else comes from the specialist's
@@ -18,6 +20,13 @@ const SPECIALIST_CORE_TOOLS = [
   "recall", "remember",
   "list_tasks", "agent_pick_next", "complete_task", "move_task", "save_draft"
 ];
+
+// Learned scores requested for a signal that may still be in flight (see
+// messageToSignal): signal -> { settled, promise }. Kept off the signal
+// object so it never reaches a log or an API response.
+const pendingLearned = new WeakMap();
+// How much of each side of a turn the turn scorer sees.
+const LEARNED_TURN_TEXT_CHARS = 2000;
 
 export class AgentHost {
   constructor(options = {}) {
@@ -162,7 +171,7 @@ export class AgentHost {
       try { this.runtime.outcomes?.resolveByUserFollowup?.(sessionId, text); } catch { /* best effort */ }
     }
 
-    const signal = await this.messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides: input.scrutinyOverrides ?? null, isolatedContext });
+    const signal = await this.messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides: input.scrutinyOverrides ?? null, isolatedContext, ephemeral });
     const isSpecialist = agent.role === "specialist";
     const output = this.runtime.processSignal(signal, {
       scope: isSpecialist ? `specialist:${agent.id}` : "main",
@@ -355,7 +364,9 @@ export class AgentHost {
           scrutinyAction: output.scrutiny.action,
           scrutinyScore: output.scrutiny.score,
           scrutinyDimensions: output.scrutiny.dimensions,
-          specialistId: agent.role === "specialist" ? agent.id : null
+          specialistId: agent.role === "specialist" ? agent.id : null,
+          // Which arm of a randomized specialist comparison produced this turn.
+          ...(experimentArm(routing) ? { routingCandidateId: routing.candidate?.specialist?.id ?? null, routingArm: routing.arm } : {})
         },
         __subagentDepth: options.subagentDepth ?? 0,
         // Server-built per turn. The model controls only tool names and args;
@@ -411,8 +422,10 @@ export class AgentHost {
           routed: routing.route,
           candidateId: routing.candidate?.specialist?.id ?? null,
           score: routing.candidate?.score ?? null,
-          threshold: routing.threshold
-        } : null
+          threshold: routing.threshold,
+          ...(experimentArm(routing) ? { arm: routing.arm } : {})
+        } : null,
+        ...this.learnedOutcomeFields(signal, output)
       }
     }) ?? null;
 
@@ -444,6 +457,16 @@ export class AgentHost {
     assistantPersisted = true;
 
     if (outcomeRecord) outcomeRecord.refId = sessionAfter.messages.at(-1)?.id ?? null;
+    if (outcomeRecord) {
+      this.recordLearnedTurn(outcomeRecord, {
+        signal,
+        output,
+        text,
+        reply: modelResult.text,
+        provider: modelResult.provider,
+        chatTurn: outcomeRecord.kind === "agent-reply"
+      });
+    }
 
     if (!ephemeral && this.runtime.sessionIndex) {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionAfter.messages.at(-1)).catch(() => {});
@@ -633,7 +656,7 @@ export class AgentHost {
     };
   }
 
-  async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null, isolatedContext = false }) {
+  async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null, isolatedContext = false, ephemeral = false }) {
     const lower = text.toLowerCase();
     const asksToRemember = REMEMBER_RE.test(lower);
     const asksToSchedule = SCHEDULE_RE.test(lower);
@@ -695,7 +718,57 @@ export class AgentHost {
       }
     }
 
+    if (!ephemeral) await requestLearnedScores(this.runtime, signal, { text, channel });
+
     return signal;
+  }
+
+  // Learned fields for a turn's outcome metadata, from what is known now.
+  // Empty when every learned use is off, so the record is unchanged.
+  learnedOutcomeFields(signal, output) {
+    const fields = {};
+    const learned = signal?.learned;
+    if (learned?.mode) {
+      fields.learnedMode = learned.mode;
+      fields.learnedValue = learned.value ?? output?.scrutiny?.shadowLearnedValue ?? null;
+      fields.learnedVersion = learned.version ?? null;
+      fields.ruleScore = output?.scrutiny?.ruleScore ?? output?.scrutiny?.score ?? null;
+    }
+    const spawn = output?.learnedPropagation;
+    if (spawn) {
+      const clusterId = spawn.clusterId ?? learned?.cluster ?? null;
+      // The topic can arrive after the decision (shadow never waits for it):
+      // apply the same need-based rule once it is known.
+      const learnedDecision = spawn.clusterId === null && clusterId !== null && spawn.mode === "shadow"
+        ? spawn.explicitlyRequired === true || clusterRuleFires(this.runtime.clusterStatsFor?.(clusterId) ?? null)
+        : spawn.learnedDecision;
+      fields.learnedPropagation = { mode: spawn.mode, clusterId, ruleDecision: spawn.ruleDecision, learnedDecision };
+    }
+    return fields;
+  }
+
+  // After the reply: fill in learned scores that were still in flight when
+  // the outcome was written, and (chat turns, scrutiny not off) score the
+  // turn itself. Logged on the outcome only; nothing acts on turn scores.
+  // Never awaited by the turn.
+  recordLearnedTurn(outcome, { signal, output, text, reply, provider, chatTurn }) {
+    try {
+      const state = pendingLearned.get(signal);
+      if (!state && !signal?.learned?.mode) return;
+      const lateFields = state ? !state.settled : false;
+      const turnScore = chatTurn && signal?.learned?.mode
+        ? this.runtime.modelClient.scoreTurn({
+            agent_text: String(reply ?? "").slice(-LEARNED_TURN_TEXT_CHARS),
+            prev_owner_text: String(text ?? "").slice(-LEARNED_TURN_TEXT_CHARS),
+            provider: typeof provider === "string" ? provider : ""
+          })
+        : null;
+      Promise.all([state?.promise, turnScore]).then(([, turn]) => {
+        const patch = lateFields ? this.learnedOutcomeFields(signal, output) : {};
+        if (turn) patch.learnedTurn = { pStop: turn.pStop, pNudge: turn.pNudge, version: turn.version };
+        patchOutcomeMetadata(this.runtime.outcomes, outcome, patch);
+      }).catch(() => {});
+    } catch { /* logging a learned score never fails a turn */ }
   }
 
   // STATIC persona + standing instructions only — byte-identical for the same
@@ -814,6 +887,46 @@ Stay inside the bounded scope. If the user's request falls outside it, say so an
       sessions: this.store.listSessions()
     };
   }
+}
+
+// Optional learned scores for a message from the local scoring service
+// (src/learning/learned-scores.js). With no service, or both uses off,
+// nothing happens. signal.learned gets { value, version, mode } for the
+// scrutiny score and { cluster } for the topic. In shadow the requests run
+// alongside the reply and never delay it; only a live use that can act
+// (a usable value head, or live need-based spawning) waits, bounded by the
+// client's timeout. Failures leave the fields unset.
+async function requestLearnedScores(runtime, signal, { text, channel }) {
+  try {
+    const client = runtime?.modelClient;
+    const scrutinyMode = learnedModeFor("scrutiny", client);
+    const propagationMode = learnedModeFor("propagation", client);
+    if (scrutinyMode === "off" && propagationMode === "off") return;
+    const learned = scrutinyMode === "off" ? {} : { mode: scrutinyMode };
+    signal.learned = learned;
+    const requests = [];
+    if (scrutinyMode !== "off") {
+      requests.push(Promise.resolve(client.scoreSignal({ text, channel })).then((scored) => {
+        if (scored) Object.assign(learned, { value: scored.value, version: scored.version });
+      }));
+    }
+    if (propagationMode !== "off") {
+      requests.push(Promise.resolve(client.clusterOf(text)).then((found) => {
+        if (found && found.cluster !== null && found.cluster !== undefined) learned.cluster = found.cluster;
+      }));
+    }
+    const state = { settled: false, promise: null };
+    state.promise = Promise.allSettled(requests).then(() => { state.settled = true; });
+    pendingLearned.set(signal, state);
+    const mustWait = (scrutinyMode === "live" && client.usable(LEARNED_HEADS.value)) || propagationMode === "live";
+    if (mustWait) await state.promise;
+  } catch { /* a learned score never blocks a turn */ }
+}
+
+// The arm of a randomized specialist comparison, recorded only in the
+// router's experiment mode (in shadow and live it follows from routed).
+function experimentArm(routing) {
+  return routing?.mode === "experiment" && (routing.arm === "specialist" || routing.arm === "generalist") ? routing.arm : null;
 }
 
 // Progress is advisory and must never be able to fail an otherwise healthy
