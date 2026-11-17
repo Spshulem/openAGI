@@ -157,8 +157,10 @@ internal fun chatActivityLabel(data: String): String? {
     if (tool != null) return "Using ${tool.replace('_', ' ')}"
     return when (field("stage")) {
         null -> null
-        "routing" -> "Getting started"
-        "thinking" -> "Thinking"
+        // Every model hop reports `model`, a queued local turn `queued`: say
+        // what the person sees, not the pipeline's stage name (as on iOS).
+        "routing", "queued" -> "Getting started"
+        "thinking", "model" -> "Thinking"
         "saving" -> "Saving"
         else -> field("stage")!!.replace('-', ' ').replaceFirstChar { it.uppercase() }
     }

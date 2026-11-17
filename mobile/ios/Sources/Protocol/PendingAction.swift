@@ -13,6 +13,10 @@ public struct PendingAction: Codable, Sendable, Equatable, Identifiable {
     public let dedupeKey: String?
     public let status: String
     public let createdAt: Date
+    // When the agent last asked for this card. A repeated request reuses the
+    // pending card, so this moves while createdAt keeps its age. Absent from
+    // mains older than the field.
+    public let raisedAt: Date?
     public let expiresAt: Date?
     public let decidedAt: Date?
     public let decidedBy: String?
@@ -23,6 +27,9 @@ public struct PendingAction: Codable, Sendable, Equatable, Identifiable {
 extension PendingAction {
     // The daemon records the turn's session in `context.sessionId`; phone
     // chats run as `devices:<thread>:<conversationId>` (shared-conversations.js).
+    // When the agent last asked for it (`createdAt` on mains without raisedAt).
+    public var lastRaisedAt: Date { raisedAt ?? createdAt }
+
     public var sessionID: String? {
         if case .object(let fields) = context, case .string(let id) = fields["sessionId"] { return id }
         return nil
@@ -34,8 +41,10 @@ extension PendingAction {
     public static func raised(in actions: [PendingAction], thread: ConversationThread, conversationID: String,
                               since: Date, scopedToSession: Bool = true, limit: Int = 3) -> [PendingAction] {
         let session = "devices:\(thread.rawValue):\(conversationID)"
+        // Newest request first: a card asked for again outranks its creation date.
         return Array(actions
-            .filter { (!scopedToSession || $0.sessionID == session) && $0.createdAt >= since.addingTimeInterval(-5) }
+            .filter { (!scopedToSession || $0.sessionID == session) && $0.lastRaisedAt >= since.addingTimeInterval(-5) }
+            .sorted { $0.lastRaisedAt > $1.lastRaisedAt }
             .prefix(limit))
     }
 }
