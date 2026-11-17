@@ -112,7 +112,7 @@ fun InboxScreen(
                     rowFor = { action ->
                         InboxRowData(
                             title = action.summary.ifBlank { action.toolName },
-                            subtitle = action.createdAt?.let { "Raised " + RelativeTime.short(minutesAgo(it)) + " ago" },
+                            subtitle = (action.raisedAt ?: action.createdAt)?.let { "Raised " + RelativeTime.short(minutesAgo(it)) + " ago" },
                             onClick = { approvalError = null; approvalResolved = false; openAction = action },
                         )
                     },

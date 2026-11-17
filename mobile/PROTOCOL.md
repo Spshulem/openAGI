@@ -598,6 +598,7 @@ Response — verified live against the daemon:
       "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-20T01:40:25.625Z",
+      "raisedAt": "2026-09-20T01:40:25.625Z",
       "expiresAt": null,
       "decidedAt": null,
       "decidedBy": null,
@@ -612,6 +613,13 @@ Response — verified live against the daemon:
 OpenAGI chat). `mode` is `queue` (waits for an approval surface), `chat`
 (raised in the owner's own chat, which answers it by code) or `owner` (a
 record of a call the owner's own instruction ran; never pending).
+
+`raisedAt` is when the agent last asked for the card. A repeated request in
+the same chat reuses the pending card rather than making a new one: `createdAt`
+keeps its age, `raisedAt` moves to the new request, and `expiresAt` is renewed
+if the request carries an approval window. Use `raisedAt` for "raised since
+the owner's latest message"; fall back to `createdAt` when it is absent (mains
+older than the field).
 
 (`mobile/fixtures/pending-actions.json` pins the empty-list shape,
 `{"actions": []}`, because the fixture daemon has nothing pending; the object

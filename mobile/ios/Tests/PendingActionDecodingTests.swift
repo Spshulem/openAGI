@@ -82,11 +82,13 @@ final class PendingActionDecodingTests: XCTestCase {
     // newer requests can neither appear nor push this turn's out of the limit.
     func testRaisedApprovalsKeepOnlyThisConversationsRecentRequests() {
         let asked = Date(timeIntervalSince1970: 1_000_000)
-        func action(_ id: String, session: String?, at offset: TimeInterval) -> PendingAction {
+        func action(_ id: String, session: String?, at offset: TimeInterval,
+                    raisedAt raised: TimeInterval? = nil) -> PendingAction {
             PendingAction(id: id, toolName: "send_email", args: nil,
                           context: session.map { .object(["sessionId": .string($0)]) },
                           summary: id, reason: nil, dedupeKey: nil, status: "pending",
-                          createdAt: asked.addingTimeInterval(offset), expiresAt: nil,
+                          createdAt: asked.addingTimeInterval(offset),
+                          raisedAt: raised.map { asked.addingTimeInterval($0) }, expiresAt: nil,
                           decidedAt: nil, decidedBy: nil, result: nil, error: nil)
         }
         let actions = [
@@ -95,10 +97,12 @@ final class PendingActionDecodingTests: XCTestCase {
             action("other-3", session: "devices:agent:other", at: 28),
             action("no-context", session: nil, at: 27),
             action("mine", session: "devices:agent:main", at: 10),
-            action("mine-before-asking", session: "devices:agent:main", at: -60)
+            action("mine-before-asking", session: "devices:agent:main", at: -60),
+            // Created long ago, asked for again in this turn: it belongs here.
+            action("mine-asked-again", session: "devices:agent:main", at: -600, raisedAt: 12)
         ]
         let raised = PendingAction.raised(in: actions, thread: .agent, conversationID: "main", since: asked)
-        XCTAssertEqual(raised.map(\.id), ["mine"])
+        XCTAssertEqual(raised.map(\.id), ["mine-asked-again", "mine"])
         XCTAssertEqual(actions.first { $0.id == "mine" }?.sessionID, "devices:agent:main")
         XCTAssertNil(actions.first { $0.id == "no-context" }?.sessionID)
         // A main without shared threads: no session to match, keep the old window.

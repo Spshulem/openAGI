@@ -82,6 +82,19 @@ export class PendingActionStore {
       if (existing) {
         // The owner's latest words for the same request are the ones a confirm carries.
         if (existing.mode === "chat") this._noteOwnerIntent(existing.id, ownerIntent);
+        // Asked again in the same chat: the card belongs to this turn now.
+        // createdAt keeps its age; raisedAt is what "since your latest
+        // message" reads. A fresh request also gets a fresh approval window,
+        // as a new card would. A request from elsewhere changes neither.
+        if ((existing.context?.sessionId ?? null) === (context?.sessionId ?? null)) {
+          const nowMs = this.now();
+          existing.raisedAt = new Date(nowMs).toISOString();
+          const ttl = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0 ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000) : null;
+          if (ttl && existing.expiresAt && Date.parse(existing.expiresAt) < nowMs + ttl) {
+            existing.expiresAt = new Date(nowMs + ttl).toISOString();
+          }
+          this._appendJournal({ op: "raise", id: existing.id, raisedAt: existing.raisedAt, expiresAt: existing.expiresAt });
+        }
         return existing;
       }
     }
@@ -102,6 +115,7 @@ export class PendingActionStore {
       confirmCode: confirmCode === false ? null : this._newCode(typeof confirmCode === "string" ? confirmCode : null),
       status: "pending",
       createdAt,
+      raisedAt: createdAt,
       expiresAt: boundedTtlMs ? new Date(createdMs + boundedTtlMs).toISOString() : null,
       decidedAt: null,
       decidedBy: null,
@@ -156,7 +170,7 @@ export class PendingActionStore {
     const since = Date.parse(sinceIso ?? "");
     return this.list({ status: "pending" }).filter((action) => action.mode === "chat"
       && action.context?.sessionId === sessionId
-      && (!Number.isFinite(since) || Date.parse(action.createdAt) >= since));
+      && (!Number.isFinite(since) || Date.parse(action.raisedAt ?? action.createdAt) >= since));
   }
 
   _newCode(requested) {
@@ -346,6 +360,12 @@ export class PendingActionStore {
           a.claimedAt = event.claimedAt;
           a.claimedBy = event.claimedBy;
           a.executionId = event.executionId;
+        }
+      } else if (event.op === "raise" && event.id && typeof event.raisedAt === "string") {
+        const a = this.actions.get(event.id);
+        if (a) {
+          a.raisedAt = event.raisedAt;
+          if (typeof event.expiresAt === "string") a.expiresAt = event.expiresAt;
         }
       } else if (event.op === "continuation" && event.id && event.continuation) {
         const a = this.actions.get(event.id);
