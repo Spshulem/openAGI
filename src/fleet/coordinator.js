@@ -61,8 +61,11 @@ export function deriveProjectInfo({ cwd = null, workspace = null, repo = null, p
     }
   }
 
-  if (!project && resolvedRepo) {
-    project = resolvedRepo.split("/")[1] ?? resolvedRepo;
+  const repoShort = resolvedRepo ? (resolvedRepo.split("/")[1] ?? null) : null;
+  if (repoShort) {
+    if (!project || project.toLowerCase() !== repoShort.toLowerCase()) {
+      project = repoShort;
+    }
   }
   if (!project && ws) {
     project = ws;
@@ -163,13 +166,74 @@ function collapseMigratedThreads(threads) {
   return [...paseoByKey.values(), ...out];
 }
 
+const PASEO_PROJECTS_CACHE_TTL_MS = 10 * 60_000;
+const paseoProjectsByHostCache = new Map();
+
+function parsePaseoProjectRepo(projectKey) {
+  const m = /^remote:github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/i.exec(String(projectKey ?? "").trim());
+  return m ? m[1] : null;
+}
+
+async function raceTimeout(promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timed out")), ms);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadPaseoProjectsMap(api, serverId, { useCache = true } = {}) {
+  if (typeof api?.projects?.list !== "function") return new Map();
+  const now = Date.now();
+  const cached = useCache ? paseoProjectsByHostCache.get(serverId) : null;
+  if (cached && now - cached.at < PASEO_PROJECTS_CACHE_TTL_MS) {
+    return cached.map;
+  }
+  const fetchPromise = (async () => {
+    const res = await api.projects.list();
+    const list = res?.projects ?? res?.entries ?? [];
+    const map = new Map();
+    for (const prj of Array.isArray(list) ? list : []) {
+      if (!prj?.projectId) continue;
+      if (prj.projectKind === "non_git" && /imported history/i.test(String(prj.projectDisplayName ?? ""))) {
+        continue;
+      }
+      map.set(prj.projectId, {
+        projectId: prj.projectId,
+        projectKey: prj.projectKey ?? null,
+        repo: parsePaseoProjectRepo(prj.projectKey),
+        displayName: cleanName(prj.projectCustomName || prj.projectDisplayName) ?? null,
+        rootPath: typeof prj.projectRootPath === "string" && prj.projectRootPath.trim() ? prj.projectRootPath.trim() : null
+      });
+    }
+    if (useCache) paseoProjectsByHostCache.set(serverId, { at: Date.now(), map });
+    return map;
+  })();
+
+  try {
+    return await raceTimeout(fetchPromise, 5_000);
+  } catch {
+    // Let slow initial cold scan populate cache in background if still running, fall back to stale cache or empty map now.
+    fetchPromise.catch(() => {});
+    return cached?.map ?? new Map();
+  }
+}
+
 async function fetchPaseoHostInventory(config, { includeArchived = false, factory } = {}) {
   if (!config?.paseo?.enabled) return { hosts: [], threads: [], emptyWorkspaces: [] };
   const inventoryConfig = {
     ...config,
-    paseo: { ...config.paseo, timeoutMs: Math.min(config.paseo.timeoutMs ?? 25_000, 25_000) }
+    paseo: { ...config.paseo, timeoutMs: Math.min(config.paseo.timeoutMs ?? 30_000, 30_000) }
   };
   const selfIsLocal = isLocalPaseoUrl(inventoryConfig.paseo?.url);
+  const useProjectCache = !factory;
   return withPaseo(inventoryConfig, async (client, signal) => {
     const directory = await client.hosts.list();
     const selfId = directory?.self?.serverId ?? "local";
@@ -181,32 +245,75 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
         .map((h) => ({ serverId: h.serverId, label: h.label || h.hostname || h.serverId, status: "online" }))
     ];
 
-    const threads = [];
-    const emptyWorkspaces = [];
-
-    for (const host of hostEntries) {
+    const perHost = await Promise.all(hostEntries.map(async (host) => {
       signal.throwIfAborted();
+      const hostThreads = [];
+      const hostEmptyWorkspaces = [];
       let api;
       try {
         api = await hostApi(client, host.serverId, directory);
       } catch {
-        continue;
+        return { hostThreads, hostEmptyWorkspaces };
       }
 
-      // Optional workspace catalog for newly created workspaces with 0 agents yet.
-      if (typeof api?.workspaces?.list === "function") {
-        try {
-          const wsRes = await api.workspaces.list({ page: { limit: 100 } });
-          for (const ws of wsRes?.entries ?? []) {
-            if (!ws?.directory || (ws.archivedAt && !includeArchived)) continue;
-            emptyWorkspaces.push({
-              serverId: host.serverId,
-              hostLabel: host.label,
-              cwd: ws.directory,
-              workspace: cleanName(ws.name) ?? null
-            });
-          }
-        } catch { /* workspaces.list is optional across daemon builds */ }
+      const [projectsById, workspacesById] = await Promise.all([
+        loadPaseoProjectsMap(api, host.serverId, { useCache: useProjectCache }),
+        (async () => {
+          const map = new Map();
+          if (typeof api?.workspaces?.list !== "function") return map;
+          try {
+            const wsRes = await raceTimeout(api.workspaces.list({ page: { limit: 200 } }), 8_000);
+            for (const ws of wsRes?.entries ?? []) {
+              if (!ws?.id) continue;
+              const labels = Array.isArray(ws.labels)
+                ? ws.labels.filter((l) => typeof l === "string" && l.trim()).map((l) => l.trim())
+                : [];
+              const dir = ws.workspaceDirectory ?? ws.directory ?? ws.projectRootPath ?? null;
+              const projName = cleanName(ws.projectCustomName || ws.projectDisplayName) ?? null;
+              if (ws.projectKind === "non_git" && /imported history/i.test(String(ws.projectDisplayName ?? ""))) {
+                continue;
+              }
+              map.set(ws.id, {
+                id: ws.id,
+                projectId: ws.projectId ?? null,
+                projectName: projName,
+                projectRootPath: typeof ws.projectRootPath === "string" && ws.projectRootPath.trim() ? ws.projectRootPath.trim() : null,
+                name: cleanName(ws.title || ws.name) ?? null,
+                directory: typeof dir === "string" && dir.trim() ? dir.trim() : null,
+                archivedAt: ws.archivingAt ?? ws.archivedAt ?? null,
+                labels
+              });
+            }
+          } catch { /* workspaces.list is optional across daemon builds */ }
+          return map;
+        })()
+      ]);
+
+      for (const ws of workspacesById.values()) {
+        if (ws.archivedAt && !includeArchived) continue;
+        const prj = ws.projectId ? projectsById.get(ws.projectId) : null;
+        const wsDir = ws.projectRootPath ?? prj?.rootPath ?? ws.directory ?? null;
+        if (!wsDir) continue;
+        hostEmptyWorkspaces.push({
+          serverId: host.serverId,
+          hostLabel: host.label,
+          cwd: wsDir,
+          workspace: prj?.displayName ?? ws.projectName ?? ws.name ?? null,
+          repo: prj?.repo ?? null,
+          labels: ws.labels
+        });
+      }
+
+      for (const prj of projectsById.values()) {
+        if (!prj.rootPath) continue;
+        hostEmptyWorkspaces.push({
+          serverId: host.serverId,
+          hostLabel: host.label,
+          cwd: prj.rootPath,
+          workspace: prj.displayName ?? null,
+          repo: prj.repo ?? null,
+          labels: []
+        });
       }
 
       let cursor;
@@ -223,22 +330,36 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
           if (!agent?.id) continue;
           if (!includeArchived && agent.archivedAt) continue;
           const row = paseoThread(agent, host.serverId, [], true);
+          const wsMeta = agent.workspaceId ? workspacesById.get(agent.workspaceId) : null;
+          const prjMeta = wsMeta?.projectId ? projectsById.get(wsMeta.projectId) : null;
+          if (!row.repo && prjMeta?.repo) row.repo = prjMeta.repo;
+          if (!row.workspace && wsMeta?.name) row.workspace = clampText(wsMeta.name, 80);
           row.meta.hostLabel = host.label;
           row.meta.rawStatus = agent.status ?? "idle";
           row.meta.isLocalHost = Boolean(selfIsLocal && host.serverId === selfId);
-          threads.push(row);
+          row.meta.paseoWorkspaceName = wsMeta?.name ?? null;
+          row.meta.paseoProjectName = prjMeta?.displayName ?? wsMeta?.projectName ?? null;
+          row.meta.paseoLabels = wsMeta?.labels ?? [];
+          row.meta.paseoProjectRoot = prjMeta?.rootPath ?? wsMeta?.projectRootPath ?? null;
+          hostThreads.push(row);
         }
         if (!res?.pageInfo?.hasMore) break;
         cursor = res.pageInfo.nextCursor;
         if (!cursor || seen.has(cursor)) break;
         seen.add(cursor);
       }
-    }
-    return { hosts: hostEntries, threads, emptyWorkspaces };
+      return { hostThreads, hostEmptyWorkspaces };
+    }));
+
+    return {
+      hosts: hostEntries,
+      threads: perHost.flatMap((h) => h.hostThreads),
+      emptyWorkspaces: perHost.flatMap((h) => h.hostEmptyWorkspaces)
+    };
   }, factory);
 }
 
-export async function listWorkspaces(supervisor, { query = "", includeArchived = false, limit = 30, factory } = {}) {
+export async function listWorkspaces(supervisor, { query = "", includeArchived = false, limit = 30, maxSessionsPerWorkspace = null, factory } = {}) {
   const maxWorkspaces = Math.min(60, Math.max(1, Number(limit) || 30));
   const byKey = new Map();
   const hostLabels = new Map();
@@ -294,7 +415,7 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
   };
 
   for (const ws of emptyWorkspaces) {
-    const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace });
+    const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace, repo: ws.repo });
     const group = ensureGroup(info);
     const wsScore = scoreWorkspaceTarget({ cwd: ws.cwd, migrated: info.migrated, worktree: info.worktree, status: "idle", updatedAt: null });
     group.candidates.push({
@@ -385,6 +506,8 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       kind: thread.kind,
       title: clampText(redactSecrets(thread.title || thread.workspace || thread.key), 120),
       workspace: info.worktree ?? cleanName(thread.workspace) ?? null,
+      workspaceId: thread.meta?.workspaceId ?? null,
+      paseoLabels: Array.isArray(thread.meta?.paseoLabels) ? thread.meta.paseoLabels.slice(0, 6) : [],
       cwd,
       serverId: thread.kind === "paseo" ? serverId : null,
       host: hostLabel,
@@ -457,7 +580,9 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       });
     }
 
-    const perWorkspaceSessions = needle ? 25 : 8;
+    const perWorkspaceSessions = Number.isInteger(maxSessionsPerWorkspace) && maxSessionsPerWorkspace > 0
+      ? Math.min(200, maxSessionsPerWorkspace)
+      : (needle ? 25 : 8);
     workspaces.push({
       id: group.id,
       name: group.name,

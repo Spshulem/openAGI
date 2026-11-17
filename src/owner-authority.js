@@ -80,12 +80,15 @@ export const INTENT_FAMILIES = Object.freeze({
   coordinate: {
     pattern: [
       String.raw`(?:co+rdinate|cordinate|sync(?:\s+up)?|orchestrate|align|huddle)\s+(?:together|with|across|in|on)\b(?!\s+(?:me|us|my\s+calendar)\b)`,
-      String.raw`(?:co+rdinate|cordinate)\b[^.!?\n]{0,120}?\b(?:workspaces?|chats?|threads?|sessions?|agents?|paseo|codex|claude|conductor|repos?|prs?|releases?)\b`,
+      String.raw`(?:co+rdinate|cordinate)\b[^.!?\n]{0,120}?\b(?:workspaces?|chats?|threads?|sessions?|agents?|paseo|codex|claude|conductor|repos?|prs?|releases?|supervisors?)\b`,
       String.raw`(?:check(?:\s+in)?|follow\s+up|work|reach\s+out)\s+with\s+${TO_RECIPIENT}`,
       String.raw`(?:have|get|make|let)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:check(?!\s+the\s+(?:news|weather|stock|email|calendar)\b)|verify|test|finish|complete|ship|merge|rebase|update|report|sync|co+rdinate|cordinate|wrap\s+up|cut|prepare|deploy|continue|run|push)\b`,
-      String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`
+      String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`,
+      String.raw`work\s+on\s+(?!(?:it|this|that)\s*(?:$|[.,;:!?\n]))(?:(?:this|that|the|a|an|my|our)\s+)*[\w-]{3,}`,
+      String.raw`(?:in|inside|for)\s+(?:(?:the|my)\s+)?[\w-]+\s*(?:workspace|project|repo|supervisor)?\s*[,;:]?\s*(?:(?:please|go|let['’]?s|lets)\s+)*(?:work\s+on|implement|build|fix|add|ship|update)\b`,
+      String.raw`(?:sync|label|tag|organize|group|cluster)\b[^.!?\n]{0,60}?\b(?:themes?|workspace\s+labels?|paseo\s+labels?)\b`
     ].join("|"),
-    tools: ["fleet_send_message", "fleet_start_session", "reply_to_coding_agent"]
+    tools: ["fleet_send_message", "fleet_start_session", "fleet_dispatch_goal", "fleet_sync_themes", "reply_to_coding_agent"]
   },
   // Messaging needs a recipient, so "write a summary of these results", "tell
   // if this site is legit" or "write a twitter thread" never lets read text

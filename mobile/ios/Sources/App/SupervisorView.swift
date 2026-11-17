@@ -1130,15 +1130,33 @@ private struct ActiveSessionsSheet: View {
     let onScan: () -> Void
     let onSelectThread: (FleetThread) -> Void
 
+    private enum BrowseMode: String, CaseIterable, Identifiable {
+        case themes = "Projects & Themes"
+        case sessions = "Sessions"
+        var id: String { rawValue }
+    }
+
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @State private var browseMode: BrowseMode = .themes
     @State private var query = ""
     @State private var searchHits: [FleetSearchHit] = []
     @State private var isSearching = false
     @State private var searchError: String?
+    @State private var hierarchy: FleetHierarchyResponse?
+    @State private var loadingHierarchy = false
+    @State private var selectedProjectId: String?
+    @State private var goalDraft = ""
+    @State private var dispatchingGoal = false
+    @State private var dispatchOutcomeNote: String?
 
     private var threads: [FleetThread] {
         SupervisorFormat.sorted(state?.snapshot?.threads ?? [])
+    }
+
+    private var activeProject: FleetProjectGroup? {
+        guard let selectedProjectId, let hierarchy else { return nil }
+        return hierarchy.projects.first(where: { $0.id == selectedProjectId })
     }
 
     var body: some View {
@@ -1146,14 +1164,22 @@ private struct ActiveSessionsSheet: View {
             List {
                 if let state {
                     Section {
-                        HStack {
-                            Text(SupervisorFormat.scanLine(lastTickAt: state.lastTickAt, autoScan: state.enabled, now: Date()))
-                                .font(Theme.Typography.caption)
-                                .foregroundStyle(Theme.muted)
-                            Spacer()
-                            Button(scanning ? "Scanning…" : "Scan now") { onScan() }
-                                .font(Theme.Typography.caption.weight(.semibold))
-                                .disabled(scanning)
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text(SupervisorFormat.scanLine(lastTickAt: state.lastTickAt, autoScan: state.enabled, now: Date()))
+                                    .font(Theme.Typography.caption)
+                                    .foregroundStyle(Theme.muted)
+                                Spacer()
+                                Button(scanning ? "Scanning…" : "Scan now") { onScan() }
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .disabled(scanning)
+                            }
+                            Picker("Browse", selection: $browseMode) {
+                                ForEach(BrowseMode.allCases) { item in
+                                    Text(item.rawValue).tag(item)
+                                }
+                            }
+                            .pickerStyle(.segmented)
                         }
                     }
                 }
@@ -1206,6 +1232,8 @@ private struct ActiveSessionsSheet: View {
                             }
                         }
                     }
+                } else if browseMode == .themes {
+                    themesContent
                 } else {
                     Section(threads.isEmpty ? "Sessions" : SupervisorFormat.summary(threads)) {
                         if state?.snapshot == nil {
@@ -1235,6 +1263,9 @@ private struct ActiveSessionsSheet: View {
             }
             .listStyle(.insetGrouped)
             .searchable(text: $query, prompt: "Search repos, PRs, branches, transcripts")
+            .task {
+                await loadHierarchy()
+            }
             .task(id: query) {
                 let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else {
@@ -1258,13 +1289,185 @@ private struct ActiveSessionsSheet: View {
                     searchError = "Couldn't search sessions right now."
                 }
             }
-            .navigationTitle("Sessions")
+            .navigationTitle(activeProject?.supervisorTitle ?? "Supervisor Map")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                if activeProject != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("All Projects") {
+                            selectedProjectId = nil
+                            dispatchOutcomeNote = nil
+                        }
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var themesContent: some View {
+        if loadingHierarchy && hierarchy == nil {
+            Section {
+                ProgressView("Loading projects & themes…")
+            }
+        } else if let project = activeProject {
+            Section("Direct \(project.supervisorTitle)") {
+                TextField("e.g. Go work on the citation pipeline…", text: $goalDraft, axis: .vertical)
+                    .lineLimit(2...4)
+                HStack(spacing: 10) {
+                    Button(dispatchingGoal ? "Routing…" : "Auto-Route & Work") {
+                        Task { await runGoalDispatch(project: project.name, mode: "auto") }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(dispatchingGoal || goalDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button("Preview") {
+                        Task { await runGoalDispatch(project: project.name, mode: "preview") }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(dispatchingGoal || goalDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if let dispatchOutcomeNote {
+                    Text(dispatchOutcomeNote)
+                        .font(.caption)
+                        .foregroundStyle(Theme.ink)
+                }
+            }
+
+            ForEach(project.themes) { theme in
+                Section("\(theme.name) (\(theme.counts.total))") {
+                    ForEach(theme.sessions) { item in
+                        Button {
+                            let existing = threads.first(where: { $0.key == item.key })
+                            let mapped = existing ?? FleetThread(
+                                key: item.key,
+                                title: item.title,
+                                workspace: project.name,
+                                repo: project.repo,
+                                state: item.state,
+                                pr: item.prRefs.first.map { FleetPR(ref: $0) },
+                                live: item.state == "running"
+                            )
+                            onSelectThread(mapped)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    Text(item.title ?? SupervisorFormat.formatOpaqueKey(item.key))
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(Theme.ink)
+                                    Spacer()
+                                    Text((item.state ?? "idle").capitalized)
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(item.state == "running" ? Theme.live : Theme.muted)
+                                }
+                                let sub = [item.host, item.prRefs.first.flatMap(SupervisorFormat.prNumber)].compactMap { $0 }.joined(separator: " · ")
+                                if !sub.isEmpty {
+                                    Text(sub).font(.caption).foregroundStyle(Theme.muted)
+                                }
+                                if let snippet = item.snippet, !snippet.isEmpty {
+                                    Text(snippet).font(.caption).foregroundStyle(Theme.muted).lineLimit(2)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        } else if let hierarchy, !hierarchy.projects.isEmpty {
+            Section("Active Projects (\(hierarchy.projects.count))") {
+                ForEach(hierarchy.projects) { project in
+                    Button {
+                        selectedProjectId = project.id
+                        dispatchOutcomeNote = nil
+                    } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(project.supervisorTitle)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Theme.ink)
+                                Spacer()
+                                if project.counts.running > 0 {
+                                    Text("\(project.counts.running) active")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(Theme.live)
+                                } else {
+                                    Text("\(project.counts.total) chats")
+                                        .font(.caption2)
+                                        .foregroundStyle(Theme.muted)
+                                }
+                            }
+                            if !project.themes.isEmpty {
+                                Text(project.themes.prefix(3).map(\.name).joined(separator: " · "))
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.muted)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        } else {
+            Section("Projects & Themes") {
+                Text("Switch to Sessions or tap Scan now to populate project themes.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+    }
+
+    private func loadHierarchy() async {
+        guard !loadingHierarchy else { return }
+        loadingHierarchy = true
+        defer { loadingHierarchy = false }
+        do {
+            let loaded = try await model.client.fleetHierarchy(limit: 40)
+            hierarchy = loaded
+            if loaded.projects.isEmpty {
+                browseMode = .sessions
+            }
+        } catch {
+            if hierarchy == nil {
+                browseMode = .sessions
+            }
+        }
+    }
+
+    private func runGoalDispatch(project: String, mode: String) async {
+        let trimmed = goalDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !dispatchingGoal else { return }
+        dispatchingGoal = true
+        defer { dispatchingGoal = false }
+        do {
+            let res = try await model.client.fleetDispatchGoal(project: project, goal: trimmed, mode: mode)
+            if let outcome = res.result {
+                switch outcome.status {
+                case "suggest_existing":
+                    let title = outcome.matchedSession?.title ?? outcome.matchedSession?.key ?? "existing chat"
+                    dispatchOutcomeNote = "Match found: \"\(title)\". Tap Auto-Route & Work to send to it."
+                case "suggest_new":
+                    dispatchOutcomeNote = "No existing chat owns this workstream — Auto-Route & Work will start a new Paseo session in \(project)."
+                case "routed_existing":
+                    let title = outcome.matchedSession?.title ?? outcome.matchedSession?.key ?? "existing chat"
+                    dispatchOutcomeNote = "Routed directive to \"\(title)\"."
+                    goalDraft = ""
+                    await loadHierarchy()
+                case "started_new":
+                    let title = outcome.createdSession?.title ?? "new session"
+                    dispatchOutcomeNote = "Started new Paseo session \"\(title)\" in \(project)."
+                    goalDraft = ""
+                    await loadHierarchy()
+                default:
+                    dispatchOutcomeNote = "Supervisor status: \(outcome.status)."
+                }
+            }
+        } catch {
+            dispatchOutcomeNote = "Could not dispatch directive right now."
         }
     }
 }

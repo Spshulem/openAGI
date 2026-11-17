@@ -1121,3 +1121,199 @@ public struct FleetBatchCardsResult: Decodable, Sendable, Equatable {
         state = c.lenient(FleetState.self, .state)
     }
 }
+
+public struct FleetHierarchyCounts: Decodable, Sendable, Equatable {
+    public var running: Int
+    public var idle: Int
+    public var sleeping: Int
+    public var total: Int
+
+    private enum CodingKeys: String, CodingKey { case running, idle, sleeping, total }
+
+    public init(running: Int = 0, idle: Int = 0, sleeping: Int = 0, total: Int = 0) {
+        self.running = running
+        self.idle = idle
+        self.sleeping = sleeping
+        self.total = total
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        running = c.lenient(Int.self, .running) ?? 0
+        idle = c.lenient(Int.self, .idle) ?? 0
+        sleeping = c.lenient(Int.self, .sleeping) ?? 0
+        total = c.lenient(Int.self, .total) ?? 0
+    }
+}
+
+public struct FleetHierarchySession: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String { key }
+    public var key: String
+    public var title: String?
+    public var workspace: String?
+    public var theme: String?
+    public var state: String?
+    public var host: String?
+    public var prRefs: [String]
+    public var snippet: String?
+    public var needsYouCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case key, title, workspace, theme, state, host, prRefs, snippet, needsYouCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = c.lenient(String.self, .key) ?? ""
+        title = c.lenient(String.self, .title)
+        workspace = c.lenient(String.self, .workspace)
+        theme = c.lenient(String.self, .theme)
+        state = c.lenient(String.self, .state)
+        host = c.lenient(String.self, .host)
+        prRefs = c.lenientList(String.self, .prRefs)
+        snippet = c.lenient(String.self, .snippet)
+        needsYouCount = c.lenient(Int.self, .needsYouCount) ?? 0
+    }
+}
+
+public struct FleetThemeGroup: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    public var labelPath: String?
+    public var source: String?
+    public var counts: FleetHierarchyCounts
+    public var needsYouCount: Int
+    public var prRefs: [String]
+    public var sessions: [FleetHierarchySession]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, labelPath, source, counts, needsYouCount, prRefs, sessions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? UUID().uuidString
+        name = c.lenient(String.self, .name) ?? "General"
+        labelPath = c.lenient(String.self, .labelPath)
+        source = c.lenient(String.self, .source)
+        counts = c.lenient(FleetHierarchyCounts.self, .counts) ?? FleetHierarchyCounts()
+        needsYouCount = c.lenient(Int.self, .needsYouCount) ?? 0
+        prRefs = c.lenientList(String.self, .prRefs)
+        sessions = c.lenientList(FleetHierarchySession.self, .sessions)
+    }
+}
+
+public struct FleetProjectGroup: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    public var supervisorTitle: String
+    public var repo: String?
+    public var counts: FleetHierarchyCounts
+    public var needsYouCount: Int
+    public var themes: [FleetThemeGroup]
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, supervisorTitle, repo, counts, needsYouCount, themes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let resolvedName = c.lenient(String.self, .name) ?? "Workspace"
+        id = c.lenient(String.self, .id) ?? resolvedName.lowercased()
+        name = resolvedName
+        supervisorTitle = c.lenient(String.self, .supervisorTitle) ?? "\(resolvedName) Supervisor"
+        repo = c.lenient(String.self, .repo)
+        counts = c.lenient(FleetHierarchyCounts.self, .counts) ?? FleetHierarchyCounts()
+        needsYouCount = c.lenient(Int.self, .needsYouCount) ?? 0
+        themes = c.lenientList(FleetThemeGroup.self, .themes)
+    }
+}
+
+public struct FleetHierarchyResponse: Decodable, Sendable, Equatable {
+    public var totalProjects: Int
+    public var totalThemes: Int
+    public var totalSessions: Int
+    public var projects: [FleetProjectGroup]
+
+    private enum CodingKeys: String, CodingKey {
+        case totalProjects, totalThemes, totalSessions, projects
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        projects = c.lenientList(FleetProjectGroup.self, .projects)
+        totalProjects = c.lenient(Int.self, .totalProjects) ?? projects.count
+        totalThemes = c.lenient(Int.self, .totalThemes) ?? 0
+        totalSessions = c.lenient(Int.self, .totalSessions) ?? 0
+    }
+}
+
+public struct FleetDispatchGoalResponse: Decodable, Sendable, Equatable {
+    public struct MatchedSession: Decodable, Sendable, Equatable {
+        public var key: String
+        public var title: String?
+        public var theme: String?
+        public var state: String?
+        public var confidence: Double?
+
+        private enum CodingKeys: String, CodingKey { case key, title, theme, state, confidence }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            key = c.lenient(String.self, .key) ?? ""
+            title = c.lenient(String.self, .title)
+            theme = c.lenient(String.self, .theme)
+            state = c.lenient(String.self, .state)
+            confidence = c.lenient(Double.self, .confidence)
+        }
+    }
+
+    public struct CreatedSession: Decodable, Sendable, Equatable {
+        public var key: String
+        public var title: String?
+        public var host: String?
+        public var cwd: String?
+
+        private enum CodingKeys: String, CodingKey { case key, title, host, cwd }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            key = c.lenient(String.self, .key) ?? ""
+            title = c.lenient(String.self, .title)
+            host = c.lenient(String.self, .host)
+            cwd = c.lenient(String.self, .cwd)
+        }
+    }
+
+    public struct Outcome: Decodable, Sendable, Equatable {
+        public var ok: Bool
+        public var status: String
+        public var inferredTheme: String?
+        public var matchedSession: MatchedSession?
+        public var createdSession: CreatedSession?
+
+        private enum CodingKeys: String, CodingKey {
+            case ok, status, inferredTheme, matchedSession, createdSession
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            ok = c.lenient(Bool.self, .ok) ?? true
+            status = c.lenient(String.self, .status) ?? "done"
+            inferredTheme = c.lenient(String.self, .inferredTheme)
+            matchedSession = c.lenient(MatchedSession.self, .matchedSession)
+            createdSession = c.lenient(CreatedSession.self, .createdSession)
+        }
+    }
+
+    public var result: Outcome?
+    public var state: FleetState?
+
+    private enum CodingKeys: String, CodingKey { case result, state }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        result = c.lenient(Outcome.self, .result)
+        state = c.lenient(FleetState.self, .state)
+    }
+}

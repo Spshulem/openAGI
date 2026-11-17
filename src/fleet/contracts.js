@@ -452,6 +452,20 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
       timeoutMs: overrides.judge?.timeoutMs ?? 40_000
     },
+    // Lightweight `/v1/decisions` (`gpt-6-luna`) keep-alive gate & goal matcher.
+    // Uses OPENAI_API_KEY directly (0% codex-lb quota draw, output_tokens: 0).
+    decisions: (() => {
+      const apiKey = String(overrides.decisions?.apiKey ?? env.OPENAI_API_KEY ?? "").trim();
+      return {
+        enabled: overrides.decisions?.enabled ?? (Boolean(apiKey) && !envOff(env.OPENAGI_FLEET_DECISIONS)),
+        apiKey,
+        url: overrides.decisions?.url ?? (String(env.OPENAGI_DECISIONS_URL ?? "").trim() || "https://api.openai.com/v1/decisions"),
+        model: overrides.decisions?.model ?? (String(env.OPENAGI_DECISIONS_MODEL ?? "").trim() || DEFAULT_REVIEW_CODEX_MODEL),
+        threshold: typeof overrides.decisions?.threshold === "number" ? overrides.decisions.threshold : 0.5,
+        needsOwnerThreshold: typeof overrides.decisions?.needsOwnerThreshold === "number" ? overrides.decisions.needsOwnerThreshold : 0.6,
+        timeoutMs: overrides.decisions?.timeoutMs ?? envNumber(env.OPENAGI_DECISIONS_TIMEOUT_MS, 8_000)
+      };
+    })(),
     // Disk space: safe cleanup, archive to the SD card, and asks. On with
     // the supervisor unless OPENAGI_FLEET_STORAGE=0.
     storage: {

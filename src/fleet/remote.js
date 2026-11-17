@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -41,6 +41,11 @@ export function createFleetCapability(supervisor) {
       }
       if (payload.path === '/fleet/api/workspaces') {
         if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
+        if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/hierarchy') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
@@ -70,7 +75,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|route|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -353,6 +358,9 @@ export class RemoteFleetSupervisor {
   }
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
+  async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
+  async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
   async batchActCards(input = {}) {
