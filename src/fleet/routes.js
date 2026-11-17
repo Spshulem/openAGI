@@ -187,11 +187,14 @@ export function createFleetRoute({ supervisor } = {}) {
         const body = (await readObject(readBody)) ?? {};
         const project = typeof body.project === "string" ? body.project.trim() : "";
         if (project.length > 160) return fail(400, "project must be up to 160 characters.");
+        if (body.pinnedAssignments !== undefined && body.pinnedAssignments !== null && (!Array.isArray(body.pinnedAssignments) || body.pinnedAssignments.length > 50)) {
+          return fail(400, "pinnedAssignments must be an array of up to 50 items.");
+        }
         try {
           const synced = await supervisor.syncThemes({
             project: project || null,
             dryRun: body.dryRun === true,
-            pinnedAssignments: Array.isArray(body.pinnedAssignments) ? body.pinnedAssignments : null
+            pinnedAssignments: Array.isArray(body.pinnedAssignments) ? body.pinnedAssignments.slice(0, 50) : null
           });
           return ok({ result: synced, state: state() });
         } catch (err) {

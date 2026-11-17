@@ -188,6 +188,7 @@ struct SupervisorView: View {
                     state: state,
                     scanning: scanning || state?.running == true,
                     onScan: { Task { await scan() } },
+                    onAcceptState: { fresh in accept(nextSequence(), fresh) },
                     onSelectThread: { thread in
                         activeSheet = nil
                         Task { @MainActor in
@@ -1128,6 +1129,7 @@ private struct ActiveSessionsSheet: View {
     let state: FleetState?
     let scanning: Bool
     let onScan: () -> Void
+    var onAcceptState: ((FleetState) -> Void)? = nil
     let onSelectThread: (FleetThread) -> Void
 
     private enum BrowseMode: String, CaseIterable, Identifiable {
@@ -1162,9 +1164,9 @@ private struct ActiveSessionsSheet: View {
     var body: some View {
         NavigationStack {
             List {
-                if let state {
-                    Section {
-                        VStack(alignment: .leading, spacing: 10) {
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let state {
                             HStack {
                                 Text(SupervisorFormat.scanLine(lastTickAt: state.lastTickAt, autoScan: state.enabled, now: Date()))
                                     .font(Theme.Typography.caption)
@@ -1174,13 +1176,13 @@ private struct ActiveSessionsSheet: View {
                                     .font(Theme.Typography.caption.weight(.semibold))
                                     .disabled(scanning)
                             }
-                            Picker("Browse", selection: $browseMode) {
-                                ForEach(BrowseMode.allCases) { item in
-                                    Text(item.rawValue).tag(item)
-                                }
-                            }
-                            .pickerStyle(.segmented)
                         }
+                        Picker("Browse", selection: $browseMode) {
+                            ForEach(BrowseMode.allCases) { item in
+                                Text(item.rawValue).tag(item)
+                            }
+                        }
+                        .pickerStyle(.segmented)
                     }
                 }
 
@@ -1354,8 +1356,9 @@ private struct ActiveSessionsSheet: View {
                             onSelectThread(mapped)
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
+                                let nonEmptyTitle = item.title.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
                                 HStack {
-                                    Text(item.title ?? SupervisorFormat.formatOpaqueKey(item.key))
+                                    Text(nonEmptyTitle ?? SupervisorFormat.formatOpaqueKey(item.key))
                                         .font(.subheadline.weight(.semibold))
                                         .foregroundStyle(Theme.ink)
                                     Spacer()
@@ -1445,6 +1448,9 @@ private struct ActiveSessionsSheet: View {
         defer { dispatchingGoal = false }
         do {
             let res = try await model.client.fleetDispatchGoal(project: project, goal: trimmed, mode: mode)
+            if let fresh = res.state {
+                onAcceptState?(fresh)
+            }
             if let outcome = res.result {
                 switch outcome.status {
                 case "suggest_existing":
@@ -1462,8 +1468,10 @@ private struct ActiveSessionsSheet: View {
                     dispatchOutcomeNote = "Started new Paseo session \"\(title)\" in \(project)."
                     goalDraft = ""
                     await loadHierarchy()
+                case "blocked":
+                    dispatchOutcomeNote = outcome.message ?? "Supervisor could not deliver directive right now."
                 default:
-                    dispatchOutcomeNote = "Supervisor status: \(outcome.status)."
+                    dispatchOutcomeNote = outcome.message ?? "Supervisor status: \(outcome.status)."
                 }
             }
         } catch {

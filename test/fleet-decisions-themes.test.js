@@ -166,10 +166,22 @@ test("decisions keep-alive gate suppresses completed chats, escalates owner bloc
   assert.match(delivered[0].message, /Supervisor keep-alive check/);
 
   const openQuestions = supervisor.getState().questions;
-  assert.ok(openQuestions.some((q) => q.threadKey === "codex:blocked1"), "blocked thread surfaced to owner");
+  const blockedQuestion = openQuestions.find((q) => q.threadKey === "codex:blocked1");
+  assert.ok(blockedQuestion, "blocked thread surfaced to owner");
+  assert.ok(!blockedQuestion.options.includes("skip"), "agent-ask never offers 'skip' which would send 'Owner answer: skip'");
   assert.ok(!openQuestions.some((q) => q.threadKey === "codex:done1"), "completed thread stayed quiet");
 
-  // Next tick 20 minutes later: unchanged completed thread hits 6h decisions cache -> 0 new HTTP calls for it!
+  // Verify observe mode with OPENAI_API_KEY set never records bogus unjudged planned nudges for completed idle chats!
+  supervisor.setMode("observe");
+  clock += 5 * MIN;
+  await supervisor.tick({ reason: "observe-check" });
+  const plannedForDone = supervisor.getState().actions.filter(
+    (a) => a.threadKey === "codex:done1" && a.status === "planned"
+  );
+  assert.equal(plannedForDone.length, 0, "observe mode never records unjudged idle-report placeholders");
+
+  supervisor.setMode("auto");
+  // Next tick 20 minutes later: unchanged completed thread hits decisions cache -> 0 new HTTP calls for it!
   clock += 20 * MIN;
   // Unfinished thread already received a nudge without reply so policy holds it; blocked thread has open question; done1 is cached!
   const prevCalls = decisionCalls.length;
@@ -538,7 +550,18 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   });
   assert.equal(remoteDispatchPreview.status, "suggest_existing");
 
-  // Verify `fleet_dispatch_goal` pins resolved target in `prepareApprovalArgs`!
+  // Verify `deriveProjectInfo` handles Conductor v2 worktrees (`/conductor/workspaces/<project>/<city>`)!
+  const condV2 = deriveProjectInfo({ cwd: "/Users/dev/conductor/workspaces/AI-SEO/bullard" });
+  assert.equal(condV2.name, "AI-SEO");
+  assert.equal(condV2.worktree, "bullard");
+
+  // Verify unowned `cwd` is rejected in `dispatchManagerGoal`!
+  await assert.rejects(
+    () => supervisor.dispatchGoal({ project: "AI-SEO", goal: "Add tests", cwd: "/etc", mode: "force_new" }),
+    /does not belong to project/
+  );
+
+  // Verify `fleet_dispatch_goal` pins resolved target in `prepareApprovalArgs` & rejects unknown `targetKey`!
   const registry = new ToolRegistry();
   registerFleetTools(registry, supervisor);
   const dispatchTool = registry.get("fleet_dispatch_goal");
@@ -549,16 +572,43 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   });
   assert.equal(pinned.pinnedAction, "route_existing");
   assert.equal(pinned.targetKey, "paseo:mac-laptop.seo-sleep-1");
+  await assert.rejects(
+    () => dispatchTool.prepareApprovalArgs({ project: "AI-SEO", goal: "Test", targetKey: "paseo:unknown.fake" }),
+    /No fleet thread/
+  );
 
-  // Verify owner-authority covers natural manager directives without code walls!
+  // Verify `registerFleetTools(registry, null)` cleanly unregisters all new tools!
+  registerFleetTools(registry, null);
+  assert.equal(registry.get("fleet_hierarchy"), undefined);
+  assert.equal(registry.get("fleet_dispatch_goal"), undefined);
+  assert.equal(registry.get("fleet_sync_themes"), undefined);
+
+  // Verify owner-authority covers explicit workspace/coding directives while rejecting generic prose & cross-tool escalation!
   for (const phrase of [
-    "hey, go work on this Steve strictly citation thing",
-    "in AI-SEO, go work on the citation dashboard",
+    "in the AI-SEO project, go work on the citation dashboard",
     "for the bb-recorder supervisor, fix the Android history copy",
-    "sync Paseo labels across workspaces",
-    "organize workspaces into themes"
+    "go work on the citation tracker in the AI-SEO workspace",
+    "implement schema markup in the AI-SEO repo",
+    "fix the failing tests in PR 42"
   ]) {
     assert.equal(intentCovers(ownerIntentText(phrase), "fleet_dispatch_goal"), true, phrase);
-    assert.equal(intentCovers(ownerIntentText(phrase), "fleet_sync_themes"), true, phrase);
+    assert.equal(intentCovers(ownerIntentText(phrase), "fleet_sync_themes"), false, `no label escalation: ${phrase}`);
+  }
+  for (const labelPhrase of ["sync Paseo labels", "update workspace theme labels"]) {
+    assert.equal(intentCovers(ownerIntentText(labelPhrase), "fleet_sync_themes"), true, labelPhrase);
+    assert.equal(intentCovers(ownerIntentText(labelPhrase), "fleet_start_session"), false, `no session escalation: ${labelPhrase}`);
+    assert.equal(intentCovers(ownerIntentText(labelPhrase), "fleet_send_message"), false, `no message escalation: ${labelPhrase}`);
+  }
+  for (const nonCoding of [
+    "Read that customer email and help me work on a draft reply",
+    "In short, update me on what this webpage says",
+    "For tomorrow, add a reminder from this email",
+    "In summary, build a table from these search results",
+    "Read these feedback emails and group them into themes"
+  ]) {
+    assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_dispatch_goal"), false, nonCoding);
+    assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_start_session"), false, nonCoding);
+    assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_send_message"), false, nonCoding);
+    assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_sync_themes"), false, nonCoding);
   }
 });

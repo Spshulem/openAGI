@@ -2014,6 +2014,7 @@ export class FleetSupervisor {
       ...prev,
       ...thread,
       archived,
+      excluded: prev?.excluded === "self" ? "self" : (thread.excluded ?? prev?.excluded ?? null),
       repo: thread.repo ?? prev.repo ?? null,
       branch: thread.branch ?? prev.branch ?? null,
       prRefs: mergedPrRefs,
@@ -2553,8 +2554,9 @@ export class FleetSupervisor {
     const movedOn = action.threadFacts && facts && facts !== action.threadFacts ? "the thread moved on since the proposal" : null;
     // The owner muted it or it left supervision since: nothing goes in.
     const excluded = this.lastThreads.get(action.threadKey)?.excluded ?? null;
+    const unjudged = action.requiresJudge && !action.judged ? "not judged yet" : null;
     const held = this.store.mutedUntil(action.threadKey) || this.store.mutedUntil(action.targetKey) ? "muted by owner"
-      : excluded ? `thread ${excluded}` : null;
+      : excluded ? `thread ${excluded}` : unjudged;
     const settled = held ?? movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
@@ -2739,7 +2741,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true || this.decisionsGate?.enabled === true });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true || (this.decisionsGate?.enabled === true && mode !== "observe") });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -2887,9 +2889,6 @@ export class FleetSupervisor {
       if (gateCandidates.length > 0) {
         const gateVerdicts = await gate.evaluateBatch(gateCandidates, { started });
         const answeredAfterGate = this.ownerAnswerThreads(started);
-        const openQuestionThreads = new Set(
-          this.store.openQuestions().flatMap((q) => [q.threadKey, ...(q.threadKeys ?? [])].filter(Boolean))
-        );
         for (const item of gateCandidates) {
           const gv = gateVerdicts.get(item.thread.key);
           if (!gv) continue;
@@ -2938,20 +2937,16 @@ export class FleetSupervisor {
                 reason: gv.reason
               });
             }
-            if (openQuestionThreads.has(item.thread.key)) {
-              item.decision = judgeWait(item.decision, "decisions: already waiting on owner", false);
-            } else {
-              const reply = agentReply(item.thread);
-              item.decision = this.applyJudgeVerdict(item, {
-                action: "ask-owner",
-                reason: gv.reason,
-                question: {
-                  title: "Needs your decision",
-                  body: clampText(redactSecrets(reply.text || item.decision.reason || "Session is blocked on an owner decision."), 220),
-                  options: ["continue", "skip"]
-                }
-              });
-            }
+            const reply = agentReply(item.thread);
+            item.decision = this.applyJudgeVerdict(item, {
+              action: "ask-owner",
+              reason: gv.reason,
+              question: {
+                title: "Needs your decision",
+                body: clampText(redactSecrets(reply.text || item.decision.reason || "Session is blocked on an owner decision."), 220),
+                options: ["continue", "open thread"]
+              }
+            });
             continue;
           }
           if (!judgeEnabled && gv.action === "send") {
@@ -3607,10 +3602,19 @@ export class FleetSupervisor {
         head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
         threadFacts: threadFacts.get(decision.threadKey) ?? null,
+        ...(decision.judged ? { judged: true } : {}),
+        ...(decision.requiresJudge ? { requiresJudge: true } : {}),
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
+
+      // Contextual idle-review placeholders must never be recorded as planned/proposed
+      // or sent without an explicit judge/decisions verdict in the current scan.
+      if (decision.requiresJudge && !decision.judged) {
+        decision.reason = `${decision.reason}; held: not judged this scan`;
+        continue;
+      }
 
       // The live mode, not the tick's: the owner may have left Auto mid-scan.
       const liveMode = this.mode;

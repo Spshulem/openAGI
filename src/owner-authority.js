@@ -84,11 +84,14 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`(?:check(?:\s+in)?|follow\s+up|work|reach\s+out)\s+with\s+${TO_RECIPIENT}`,
       String.raw`(?:have|get|make|let)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:check(?!\s+the\s+(?:news|weather|stock|email|calendar)\b)|verify|test|finish|complete|ship|merge|rebase|update|report|sync|co+rdinate|cordinate|wrap\s+up|cut|prepare|deploy|continue|run|push)\b`,
       String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`,
-      String.raw`work\s+on\s+(?!(?:it|this|that)\s*(?:$|[.,;:!?\n]))(?:(?:this|that|the|a|an|my|our)\s+)*[\w-]{3,}`,
-      String.raw`(?:in|inside|for)\s+(?:(?:the|my)\s+)?[\w-]+\s*(?:workspace|project|repo|supervisor)?\s*[,;:]?\s*(?:(?:please|go|let['’]?s|lets)\s+)*(?:work\s+on|implement|build|fix|add|ship|update)\b`,
-      String.raw`(?:sync|label|tag|organize|group|cluster)\b[^.!?\n]{0,60}?\b(?:themes?|workspace\s+labels?|paseo\s+labels?)\b`
+      String.raw`(?:in|inside|for)\s+(?:(?:the|my)\s+)?[\w-]+\s+(?:workspace|project|repo|supervisor)\b\s*[,;:]?\s*(?:(?:please|go|let['’]?s|lets)\s+)*(?:work\s+on|implement|build|fix|add|ship|update)\b`,
+      String.raw`work\s+on\b[^.!?\n]{0,100}?\b(?:(?:in|inside|for)\s+(?:(?:the|my)\s+)?[\w-]+\s+(?:workspace|project|repo|supervisor)|prs?|pull requests?|branch(?:es)?|repos?|repository|codebase|workspaces?|paseo|codex|claude|conductor)\b`
     ].join("|"),
-    tools: ["fleet_send_message", "fleet_start_session", "fleet_dispatch_goal", "fleet_sync_themes", "reply_to_coding_agent"]
+    tools: ["fleet_send_message", "fleet_start_session", "fleet_dispatch_goal", "reply_to_coding_agent"]
+  },
+  themes: {
+    pattern: String.raw`(?:sync|apply|assign|update)\b[^.!?\n]{0,60}?\b(?:paseo\s+(?:workspace\s+|theme\s+)?labels?|workspace\s+(?:theme\s+)?labels?|theme\s+labels?)\b`,
+    tools: ["fleet_sync_themes"]
   },
   // Messaging needs a recipient, so "write a summary of these results", "tell
   // if this site is legit" or "write a twitter thread" never lets read text
@@ -133,14 +136,14 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`(?:have|get|make|ask|let)\s+${ARTICLES}${CODING_AGENT}\s+to\b`,
       String.raw`(?:start|launch|kick off|spin up|fire up|send|have|get|make|ask|let)\s+${ARTICLES}(?:${CODING_AGENT}|claude|agents?)\s+(?:in\s+)?(?:to\s+)?(?:(?:go|please|now|then)\s+)?(?:fix|repair|build|implement|debug|refactor|patch|rebase)\b`
     ].join("|"),
-    tools: ["start_coding_agent", "watch_coding_agent"]
+    tools: ["start_coding_agent", "watch_coding_agent", "fleet_dispatch_goal"]
   },
   // "fix the G2 upload page", "check CI on PR 142 and fix it": a repair verb
   // counts only when the text names code somewhere.
   repair: {
     verbs: "fix|repair|build|patch",
     nouns: /\b(bugs?|tests?|(?:the|a|my|this|that|failing|broken|ci) builds?|ci|prs?|pull requests?|branch(?:es)?|repo|repository|code|codebase|crash(?:es)?|errors?|regressions?|features?|issues?|pages?|screens?|modules?|flows?|functions?|endpoints?)\b/i,
-    tools: ["start_coding_agent", "watch_coding_agent"]
+    tools: ["start_coding_agent", "watch_coding_agent", "fleet_dispatch_goal"]
   },
   // Watching an agent: "watch codex", "monitor the claude session".
   watch: {

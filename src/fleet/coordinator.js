@@ -11,12 +11,15 @@ import path from "node:path";
 import {
   SUPERVISOR_PREFIX,
   clampText,
+  codexExecBarred,
+  isSelfThread,
   openChatFor,
   parsePaseoThreadKey,
   parsePrRef,
   redactSecrets,
   runCommand
 } from "./contracts.js";
+import { chooseRoute } from "./policy.js";
 import { readThreadConversation } from "./conversation.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
@@ -30,12 +33,15 @@ function cleanName(value) {
   return trimmed;
 }
 
-export function deriveProjectInfo({ cwd = null, workspace = null, repo = null, prRefs = [] } = {}) {
+export function deriveProjectInfo({ cwd = null, workspace = null, projectName = null, repo = null, prRefs = [] } = {}) {
   const resolvedRepo = (typeof repo === "string" && REPO_SLUG_RE.test(repo.trim()) ? repo.trim() : null)
     ?? parsePrRef(prRefs?.[0])?.repo
     ?? null;
   const rawCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   const ws = cleanName(workspace);
+  const explicitProj = projectName && !/imported history/i.test(String(projectName))
+    ? cleanName(projectName)
+    : null;
 
   let project = null;
   let worktree = null;
@@ -43,22 +49,36 @@ export function deriveProjectInfo({ cwd = null, workspace = null, repo = null, p
 
   if (rawCwd) {
     const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/.exec(rawCwd);
-    const condMatch = /\/([^/]+)\/\.conductor\/([^/]+)/.exec(rawCwd);
+    const condWsMatch = /\/conductor\/workspaces\/([^/]+)\/([^/]+)/.exec(rawCwd);
+    const condDotMatch = /\/([^/]+)\/\.conductor\/([^/]+)/.exec(rawCwd);
+    const condRepoMatch = /\/conductor\/repos\/([^/]+)/.exec(rawCwd);
+    const codexWtMatch = /\/codex-worktrees\/[0-9a-f]+\/([^/]+)/i.exec(rawCwd);
     const devMatch = /(?:\/Users\/[^/]+|\/home\/[^/]+)\/(?:Dev|Developer|Code|Projects|Repos)\/([^/]+)/i.exec(rawCwd);
     if (wtMatch) {
       project = wtMatch[1];
       worktree = wtMatch[2];
-    } else if (condMatch) {
-      project = condMatch[1];
-      worktree = condMatch[2];
+    } else if (condWsMatch) {
+      project = condWsMatch[1];
+      worktree = condWsMatch[2];
+    } else if (condDotMatch) {
+      project = condDotMatch[1];
+      worktree = condDotMatch[2];
+    } else if (condRepoMatch) {
+      project = condRepoMatch[1];
+    } else if (codexWtMatch) {
+      project = codexWtMatch[1];
     } else if (devMatch) {
       project = devMatch[1];
-    } else {
+    } else if (!/\/imported history(?:\/|$)/i.test(rawCwd)) {
       const base = path.basename(rawCwd);
-      if (base && base !== "." && base !== "/" && !OPAQUE_ID_RE.test(base)) {
+      if (base && base !== "." && base !== "/" && !OPAQUE_ID_RE.test(base) && !/^\d{3,6}$/.test(base)) {
         project = base;
       }
     }
+  }
+
+  if (!project && explicitProj && !/^\d{3,6}$/.test(explicitProj)) {
+    project = explicitProj;
   }
 
   const repoShort = resolvedRepo ? (resolvedRepo.split("/")[1] ?? null) : null;
@@ -291,6 +311,7 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
 
       for (const ws of workspacesById.values()) {
         if (ws.archivedAt && !includeArchived) continue;
+        if (/imported history/i.test(String(ws.projectName ?? "")) && !(ws.labels?.length > 0)) continue;
         const prj = ws.projectId ? projectsById.get(ws.projectId) : null;
         const wsDir = ws.projectRootPath ?? prj?.rootPath ?? ws.directory ?? null;
         if (!wsDir) continue;
@@ -298,7 +319,8 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
           serverId: host.serverId,
           hostLabel: host.label,
           cwd: wsDir,
-          workspace: prj?.displayName ?? ws.projectName ?? ws.name ?? null,
+          workspace: ws.name ?? null,
+          projectName: prj?.displayName ?? ws.projectName ?? null,
           repo: prj?.repo ?? null,
           labels: ws.labels
         });
@@ -311,6 +333,7 @@ async function fetchPaseoHostInventory(config, { includeArchived = false, factor
           hostLabel: host.label,
           cwd: prj.rootPath,
           workspace: prj.displayName ?? null,
+          projectName: prj.displayName ?? null,
           repo: prj.repo ?? null,
           labels: []
         });
@@ -414,8 +437,55 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     return group;
   };
 
+  const repoByRootPath = new Map();
+  const knownRepoByCompactName = new Map();
+  const noteKnownRepo = (slug) => {
+    if (!slug || !REPO_SLUG_RE.test(slug)) return;
+    const short = slug.split("/")[1] ?? "";
+    const compact = short.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (compact) knownRepoByCompactName.set(compact, slug);
+  };
   for (const ws of emptyWorkspaces) {
-    const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace, repo: ws.repo });
+    if (ws.repo) {
+      noteKnownRepo(ws.repo);
+      if (ws.cwd) repoByRootPath.set(`${ws.serverId}:${ws.cwd.replace(/\/+$/, "")}`, ws.repo);
+    }
+  }
+  for (const t of byKey.values()) {
+    const tRepo = t?.repo ?? parsePrRef(t?.prRefs?.[0])?.repo ?? null;
+    if (tRepo) {
+      noteKnownRepo(tRepo);
+      const tCwd = (t?.meta?.paseoProjectRoot || t?.meta?.paseoCwd || t?.cwd || "").replace(/\/+$/, "");
+      const tSrv = t?.meta?.serverId ?? (t?.kind === "paseo" ? parsePaseoThreadKey(t.key)?.serverId : null) ?? "local";
+      if (tCwd) repoByRootPath.set(`${tSrv}:${tCwd}`, tRepo);
+    }
+  }
+  const inferRepoFromLabels = (labels) => {
+    for (const raw of labels ?? []) {
+      const slash = String(raw ?? "").indexOf("/");
+      if (slash <= 0) continue;
+      const compact = String(raw).slice(0, slash).toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (compact && knownRepoByCompactName.has(compact)) return knownRepoByCompactName.get(compact);
+    }
+    return null;
+  };
+  const lookupRootRepo = (serverId, cwd) => {
+    if (!cwd) return null;
+    const norm = cwd.replace(/\/+$/, "");
+    const direct = repoByRootPath.get(`${serverId}:${norm}`);
+    if (direct) return direct;
+    for (const [k, r] of repoByRootPath) {
+      if (k.startsWith(`${serverId}:`) && norm.startsWith(`${k.slice(serverId.length + 1)}/`)) {
+        return r;
+      }
+    }
+    return null;
+  };
+
+  for (const ws of emptyWorkspaces) {
+    const inferredRepo = ws.repo ?? lookupRootRepo(ws.serverId, ws.cwd) ?? inferRepoFromLabels(ws.labels);
+    const info = deriveProjectInfo({ cwd: ws.cwd, workspace: ws.workspace, projectName: ws.projectName, repo: inferredRepo });
+    if (info.key === "unknown") continue;
     const group = ensureGroup(info);
     const wsScore = scoreWorkspaceTarget({ cwd: ws.cwd, migrated: info.migrated, worktree: info.worktree, status: "idle", updatedAt: null });
     group.candidates.push({
@@ -439,9 +509,16 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     group.hostsMap.set(ws.serverId, hostBucket);
   }
 
+  const effectiveSelfConfig = supervisor?.config
+    ? { ...supervisor.config, selfSessionIds: [...(supervisor.config.selfSessionIds ?? []), ...(supervisor?.store?.selfSessions?.() ?? [])] }
+    : null;
+  let countedSessions = 0;
+
   for (const thread of collapseMigratedThreads(byKey.values())) {
     if (!thread?.key) continue;
+    if (thread.excluded === "self" || (effectiveSelfConfig && isSelfThread(thread, effectiveSelfConfig))) continue;
     const cwd = thread.meta?.paseoCwd ?? thread.cwd ?? null;
+    const serverId = thread.meta?.serverId ?? (thread.kind === "paseo" ? parsePaseoThreadKey(thread.key)?.serverId : null) ?? "local";
     const cardRefs = [thread.key, ...(thread.meta?.aliases ?? [])]
       .map((k) => cardPrByThread.get(k))
       .filter(Boolean);
@@ -449,17 +526,26 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       ...(thread.prRefs ?? []),
       ...cardRefs
     ].filter(Boolean))];
-    const info = deriveProjectInfo({ cwd, workspace: thread.workspace, repo: thread.repo, prRefs });
+    const resolvedRepo = thread.repo
+      ?? lookupRootRepo(serverId, thread.meta?.paseoProjectRoot || cwd)
+      ?? inferRepoFromLabels(thread.meta?.paseoLabels);
+    const info = deriveProjectInfo({
+      cwd,
+      workspace: thread.workspace,
+      projectName: thread.meta?.paseoProjectName ?? null,
+      repo: resolvedRepo,
+      prRefs
+    });
     const group = ensureGroup(info);
 
     const sessionState = normalizeSessionState(thread);
+    countedSessions += 1;
     group.counts.total += 1;
     if (sessionState === "archived") group.counts.archived += 1;
     else if (sessionState === "sleeping") group.counts.sleeping += 1;
     else if (sessionState === "running" || sessionState === "waiting") group.counts.running += 1;
     else group.counts.idle += 1;
 
-    const serverId = thread.meta?.serverId ?? (thread.kind === "paseo" ? parsePaseoThreadKey(thread.key)?.serverId : null) ?? "local";
     const hostLabel = thread.meta?.hostLabel ?? hostLabels.get(serverId) ?? serverId;
 
     if (cwd && thread.kind === "paseo") {
@@ -501,6 +587,15 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       }
     }
 
+    const blockedOnPermission = Boolean(
+      thread.meta?.pendingPermission || thread.meta?.pendingCard || thread.meta?.blockedOnOwner || thread.meta?.prompt
+    );
+    const hasRoute = thread.kind === "paseo"
+      ? sessionState !== "archived"
+      : sessionState !== "archived"
+        && !codexExecBarred(thread)
+        && Boolean(chooseRoute(thread, "propose", supervisor?.lastDelivery ?? { mode: "cli", ready: null }));
+
     group.sessions.push({
       key: thread.key,
       kind: thread.kind,
@@ -513,7 +608,8 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       host: hostLabel,
       provider: thread.meta?.provider ?? thread.kind,
       state: sessionState,
-      wakeable: sessionState !== "archived",
+      wakeable: hasRoute,
+      blockedOnPermission,
       prRefs: prRefs.slice(0, 4),
       lastActivityAt: thread.lastActivityAt ?? null,
       snippet: clampText(redactSecrets(thread.lastAgentText || thread.reason || ""), 220) || null,
@@ -607,11 +703,15 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     || a.name.localeCompare(b.name)
   );
 
+  const filteredSessionsCount = needle
+    ? workspaces.reduce((sum, w) => sum + (w.counts?.total ?? 0), 0)
+    : countedSessions;
+
   return {
     scannedAt: new Date().toISOString(),
     query: needle || null,
     totalWorkspaces: workspaces.length,
-    totalSessions: [...byKey.values()].length,
+    totalSessions: filteredSessionsCount,
     workspaces: workspaces.slice(0, maxWorkspaces)
   };
 }
@@ -707,6 +807,8 @@ export async function readChatTranscript(supervisor, { key, limit = 20, factory 
       key: cleanKey,
       kind: cleanKey.split(":")[0] || "unknown",
       title: cleanKey,
+      status: "idle",
+      prRefs: [],
       messageCount: (conv.messages ?? []).slice(-maxMessages).length,
       messages: (conv.messages ?? []).slice(-maxMessages).map((m) => ({
         role: m.role,

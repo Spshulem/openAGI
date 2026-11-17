@@ -11,7 +11,7 @@
 //   3. Smart theme classifier: assigns unlabelled sessions to project workstreams.
 
 import crypto from "node:crypto";
-import { clampText, redactSecrets } from "./contracts.js";
+import { clampTail, clampText, redactSecrets } from "./contracts.js";
 
 export const DEFAULT_DECISIONS_URL = "https://api.openai.com/v1/decisions";
 export const DEFAULT_DECISIONS_MODEL = "gpt-6-luna";
@@ -82,6 +82,7 @@ export async function callDecisionsEndpoint({
   try {
     const res = await fetchImpl(validUrl, {
       method: "POST",
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${cleanKey}`,
         "Content-Type": "application/json"
@@ -177,7 +178,8 @@ export function createDecisionsKeepAliveGate({
     for (const entry of entries) {
       const cKey = keyFor(entry);
       const hit = cache.get(cKey);
-      if (hit && started - hit.at < CACHE_TTL_MS) {
+      const ttlMs = config?.judge?.enabled && entry?.decision?.requiresJudge ? 10 * 60_000 : CACHE_TTL_MS;
+      if (hit && started - hit.at < ttlMs) {
         verdicts.set(entry.thread.key, { ...hit.verdict, cached: true });
       } else {
         uncached.push({ ...entry, cKey });
@@ -201,8 +203,11 @@ export function createDecisionsKeepAliveGate({
             }
           : null,
         planned_nudge: clampText(redactSecrets(decision?.message ?? ""), 280),
-        last_owner_message: clampText(redactSecrets(thread?.lastUserText ?? ""), 360),
-        last_agent_message: clampText(redactSecrets(thread?.lastAgentTail || thread?.lastAgentText || ""), 1100)
+        last_owner_message: clampTail(redactSecrets(thread?.lastUserText ?? ""), 360),
+        last_agent_message: clampTail(
+          redactSecrets(thread?.lastAgentFull || thread?.lastAgentTail || thread?.lastAgentText || ""),
+          1100
+        )
       }));
 
       const questions = [];

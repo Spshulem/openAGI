@@ -17,7 +17,7 @@ const TOOL_NAMES = [
   "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app",
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
-  "fleet_batch_cards"
+  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes"
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
 const LABEL_MAX = 80;
@@ -505,7 +505,7 @@ export function registerFleetTools(registry, supervisor) {
     },
     prepareApprovalArgs: (args) => fleetDispatchGoalTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.cwd ?? null, args.goal])}`,
+    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.goal])}`,
     summarize: (args) => args.summaryLabel,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
@@ -564,12 +564,13 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
 
   if (explicitKey && !forceNew) {
+    const validated = await Promise.resolve(fleetTarget(supervisor, { key: explicitKey, message: goal }));
     return {
       pinnedAction: "route_existing",
-      targetKey: explicitKey,
+      targetKey: validated.key,
       ...(project ? { project } : {}),
       goal,
-      summaryLabel: `Route directive to session ${clip(explicitKey, 80)}:\n${clip(goal, 220)}`
+      summaryLabel: `Route directive to session "${validated.name}" (${validated.key}):\n${clip(goal, 220)}`
     };
   }
 
@@ -596,18 +597,19 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
   }
 
   const target = preview?.newSessionTarget ?? {};
-  const cwd = target.cwd || (typeof args?.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : null);
-  if (!cwd && !resolvedProject) {
-    throw new Error("Could not resolve a target directory for this project.");
+  const cwd = target.cwd || null;
+  if (!cwd) {
+    throw new Error(`Could not resolve a target directory for project "${clip(resolvedProject, 80)}".`);
   }
+  const hostSuffix = target.hostLabel || target.serverId ? ` on ${clip(target.hostLabel || target.serverId, 50)}` : "";
   return {
     pinnedAction: "start_new",
     project: resolvedProject,
     ...(target.serverId ? { serverId: target.serverId } : {}),
-    ...(cwd ? { cwd } : {}),
+    cwd,
     ...(provider ? { provider } : {}),
     goal,
-    summaryLabel: `Start new Paseo session in ${resolvedProject}${cwd ? ` (${clip(cwd, 80)})` : ""}:\n${clip(goal, 220)}`
+    summaryLabel: `Start new Paseo session in ${resolvedProject}${hostSuffix} (${clip(cwd, 80)}):\n${clip(goal, 220)}`
   };
 }
 

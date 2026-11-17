@@ -2,9 +2,10 @@
 // Scoped Project Supervisor hierarchy, and Manager-Level Goal Dispatch
 // ("Go work on <feature> in <project>").
 
-import { clampText, redactSecrets } from "./contracts.js";
+import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets } from "./contracts.js";
 import { listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, matchGoalWithDecisions } from "./decisions-gate.js";
+import { hostApi, isLocalPaseoUrl, withPaseo } from "./sources/paseo.js";
 
 // Valid Paseo WorkspaceLabelColor enum values from `@getpaseo/protocol`.
 export const PASEO_LABEL_COLORS = Object.freeze([
@@ -324,6 +325,8 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
     });
   }
 
+  const actionableCards = openCards.filter((c) => c?.kind !== "preference");
+
   return {
     generatedAt: new Date().toISOString(),
     projectFilter: project ? String(project).trim() : null,
@@ -333,11 +336,11 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
     generalSupervisor: {
       title: "General Supervisor",
       runningCount: totalRunning,
-      needsYouCount: openCards.length,
+      needsYouCount: actionableCards.length,
       overlapCount: totalOverlaps,
       headline:
-        openCards.length > 0
-          ? `${openCards.length} decision${openCards.length === 1 ? "" : "s"} waiting · ${totalRunning} active across ${projects.length} project${projects.length === 1 ? "" : "s"}`
+        actionableCards.length > 0
+          ? `${actionableCards.length} decision${actionableCards.length === 1 ? "" : "s"} waiting · ${totalRunning} active across ${projects.length} project${projects.length === 1 ? "" : "s"}`
           : `${totalRunning} active coding session${totalRunning === 1 ? "" : "s"} across ${projects.length} project${projects.length === 1 ? "" : "s"}`
     },
     projects
@@ -345,6 +348,15 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
 }
 
 async function applyPaseoWorkspaceLabelsViaDaemon(config, assignmentsByHost) {
+  const rawUrl = config?.paseo?.url ?? "ws://127.0.0.1:6767/ws";
+  const parsedUrl = new URL(rawUrl);
+  if (!["ws:", "wss:"].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) {
+    throw new Error("Invalid Paseo endpoint.");
+  }
+  if (parsedUrl.protocol === "ws:" && !isLocalPaseoUrl(parsedUrl.href)) {
+    throw new Error("Remote Paseo endpoints require wss.");
+  }
+
   const [{ DaemonClient }, { createHostClient, createHostChannelTransport, HostTransportBudget }] = await Promise.all([
     import("@getpaseo/client/internal/daemon-client"),
     import("@getpaseo/client/node")
@@ -352,17 +364,18 @@ async function applyPaseoWorkspaceLabelsViaDaemon(config, assignmentsByHost) {
 
   const budget = new HostTransportBudget();
   const origin = createHostClient(
-    config.paseo.url ?? "ws://127.0.0.1:6767/ws",
+    parsedUrl.href,
     {
       clientId: `openagi-label-sync-${Date.now()}`,
-      ...(config.paseo.password ? { password: config.paseo.password } : {}),
-      reconnect: { enabled: false }
+      ...(config.paseo?.password ? { password: config.paseo.password } : {}),
+      reconnect: { enabled: false },
+      connectTimeoutMs: 5_000
     },
     budget
   );
 
-  const results = [];
-  try {
+  const runSync = async () => {
+    const results = [];
     await origin.connect();
     const directory = await origin.listHosts();
     const selfId = directory?.self?.serverId ?? "local";
@@ -372,13 +385,20 @@ async function applyPaseoWorkspaceLabelsViaDaemon(config, assignmentsByHost) {
       let closeRemote = null;
       try {
         if (serverId !== selfId && serverId !== "local") {
+          const isOnline = (directory?.hosts ?? []).some(
+            (h) => h?.serverId === serverId && h.enabled && h.status === "online"
+          );
+          if (!isOnline) {
+            throw new Error(`Paseo host "${clampText(serverId, 60)}" is offline.`);
+          }
           const scopeId = `label-sync-${Math.random().toString(36).slice(2, 10)}`;
           const routeId = await origin.openHostRoute(serverId, scopeId);
           hostClient = new DaemonClient({
             url: "ws://routed-host/ws",
             clientId: scopeId,
             transportFactory: createHostChannelTransport(origin, serverId, scopeId, routeId),
-            reconnect: { enabled: false }
+            reconnect: { enabled: false },
+            connectTimeoutMs: 5_000
           });
           closeRemote = async () => {
             try { await hostClient.close(); } catch { /* ignore */ }
@@ -406,26 +426,38 @@ async function applyPaseoWorkspaceLabelsViaDaemon(config, assignmentsByHost) {
         if (closeRemote) await closeRemote();
       }
     }
+    return results;
+  };
+
+  let timer;
+  try {
+    return await Promise.race([
+      runSync(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Paseo label sync timed out")), 25_000);
+        timer.unref?.();
+      })
+    ]);
   } finally {
+    clearTimeout(timer);
     try { await origin.close(); } catch { /* ignore */ }
   }
-  return results;
 }
 
 export async function syncThemesToPaseoLabels(supervisor, { project = null, dryRun = false, pinnedAssignments = null, factory = null, setLabelImpl = null } = {}) {
   let planned;
   if (Array.isArray(pinnedAssignments)) {
-    planned = pinnedAssignments.filter((item) =>
-      item?.workspaceId && /^wks_/i.test(item.workspaceId) && typeof item.labelName === "string" && item.labelName.trim()
+    planned = pinnedAssignments.slice(0, 50).filter((item) =>
+      item?.workspaceId && /^wks_[0-9a-f]+$/i.test(item.workspaceId) && typeof item.labelName === "string" && item.labelName.trim()
     ).map((item) => ({
-      serverId: item.serverId || "local",
-      host: item.host || item.serverId || "local",
+      serverId: String(item.serverId || "local").slice(0, 120),
+      host: String(item.host || item.serverId || "local").slice(0, 120),
       workspaceId: item.workspaceId,
-      project: item.project ?? null,
-      theme: item.theme ?? null,
-      labelName: item.labelName.trim(),
+      project: item.project ? String(item.project).slice(0, 120) : null,
+      theme: item.theme ? String(item.theme).slice(0, 120) : null,
+      labelName: clampText(item.labelName.trim(), 100),
       color: PASEO_LABEL_COLORS.includes(item.color) ? item.color : "sky",
-      sampleSessionTitle: item.sampleSessionTitle ?? null
+      sampleSessionTitle: item.sampleSessionTitle ? clampText(item.sampleSessionTitle, 120) : null
     }));
   } else {
     const hierarchy = await buildFleetHierarchy(supervisor, { project, includeArchived: false, limit: 50, factory });
@@ -435,7 +467,7 @@ export async function syncThemesToPaseoLabels(supervisor, { project = null, dryR
       for (const theme of prj.themes) {
         if (theme.name === "General & Standalone") continue;
         for (const session of theme.sessions) {
-          if (session.kind !== "paseo" || !session.workspaceId || !/^wks_/i.test(session.workspaceId)) continue;
+          if (session.kind !== "paseo" || !session.workspaceId || !/^wks_[0-9a-f]+$/i.test(session.workspaceId)) continue;
           if (Array.isArray(session.paseoLabels) && session.paseoLabels.some((l) => !IGNORED_PASEO_LABELS.has(String(l).toLowerCase()))) {
             continue;
           }
@@ -602,6 +634,162 @@ function resolveTargetProject(projects, explicitProject, goal) {
   return null;
 }
 
+async function batchHydrateCandidateTranscripts(supervisor, entries, { factory } = {}) {
+  const paseoEntries = entries.filter((e) => e.session.key.startsWith("paseo:") && supervisor?.config?.paseo?.enabled);
+  const otherEntries = entries.filter((e) => !paseoEntries.includes(e));
+
+  if (paseoEntries.length > 0) {
+    try {
+      const readCfg = {
+        ...supervisor.config,
+        paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 15_000, 15_000) }
+      };
+      await withPaseo(readCfg, async (client) => {
+        const directory = await client.hosts.list();
+        const apiByHost = new Map();
+        const getApi = async (srvId) => {
+          if (!apiByHost.has(srvId)) {
+            apiByHost.set(srvId, hostApi(client, srvId, directory));
+          }
+          return apiByHost.get(srvId);
+        };
+        await Promise.all(paseoEntries.map(async (entry) => {
+          const parsed = parsePaseoThreadKey(entry.session.key);
+          if (!parsed) return;
+          try {
+            let timer;
+            const history = await Promise.race([
+              (async () => {
+                const api = await getApi(parsed.serverId);
+                return api.agents.ref(parsed.agentId).timeline.refetch({ direction: "tail", limit: 40 });
+              })(),
+              new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error("transcript timeout")), 6_000);
+                timer.unref?.();
+              })
+            ]).finally(() => clearTimeout(timer));
+            const rawMsgs = (history?.entries ?? [])
+              .filter((e) => ["user_message", "assistant_message", "error"].includes(e?.item?.type))
+              .slice(-8)
+              .map((e) => {
+                if (e.item.type === "error") {
+                  return { role: "error", text: clampText(redactSecrets(String(e.item.message ?? "")), 320), at: e.timestamp ?? null };
+                }
+                const txt = String(e.item.text ?? "");
+                const isSup = e.item.type === "user_message" && txt.startsWith(SUPERVISOR_PREFIX);
+                return {
+                  role: isSup ? "supervisor" : e.item.type === "user_message" ? "user" : "assistant",
+                  text: clampText(redactSecrets(txt), 320),
+                  at: e.timestamp ?? null
+                };
+              });
+            if (rawMsgs.length > 0) {
+              entry.transcriptMessages = rawMsgs.slice(-4);
+              entry.recentContext = rawMsgs.slice(-6).map((m) => `[${m.role}]: ${m.text}`).join("\n");
+            }
+          } catch {
+            // Keep surface snippet if single transcript times out.
+          }
+        }));
+      }, factory);
+    } catch {
+      // Fall through if Paseo WS connection fails.
+    }
+  }
+
+  await Promise.all(otherEntries.map(async (entry) => {
+    try {
+      const tr = await readChatTranscript(supervisor, { key: entry.session.key, limit: 8, factory });
+      if (Array.isArray(tr?.messages) && tr.messages.length > 0) {
+        entry.transcriptMessages = tr.messages.slice(-4).map((m) => ({
+          role: m.role,
+          text: clampText(redactSecrets(m.text ?? ""), 280),
+          at: m.at ?? null
+        }));
+        entry.recentContext = tr.messages
+          .slice(-6)
+          .map((m) => `[${m.role}]: ${clampText(redactSecrets(m.text ?? ""), 320)}`)
+          .join("\n");
+      }
+    } catch {
+      // Keep surface snippet.
+    }
+  }));
+}
+
+function resolveValidatedSpawnTarget(targetProject, explicitCwd, explicitServerId) {
+  const cleanCwd = typeof explicitCwd === "string" && explicitCwd.trim() ? explicitCwd.trim().replace(/\/+$/, "") : null;
+  const cleanSrv = typeof explicitServerId === "string" && explicitServerId.trim() ? explicitServerId.trim() : null;
+
+  if (!cleanCwd && !cleanSrv) {
+    return {
+      cwd: targetProject.defaultTarget?.cwd ?? null,
+      serverId: targetProject.defaultTarget?.serverId ?? null,
+      hostLabel: targetProject.defaultTarget?.hostLabel ?? targetProject.defaultTarget?.serverId ?? null
+    };
+  }
+
+  const projectPaths = [];
+  if (targetProject.defaultTarget?.cwd) {
+    projectPaths.push({
+      serverId: targetProject.defaultTarget.serverId,
+      hostLabel: targetProject.defaultTarget.hostLabel ?? targetProject.defaultTarget.serverId,
+      cwd: targetProject.defaultTarget.cwd.replace(/\/+$/, "")
+    });
+  }
+  for (const h of targetProject.hosts ?? []) {
+    if (h?.preferredCwd) {
+      projectPaths.push({
+        serverId: h.serverId,
+        hostLabel: h.label ?? h.serverId,
+        cwd: h.preferredCwd.replace(/\/+$/, "")
+      });
+    }
+  }
+  for (const t of targetProject.themes ?? []) {
+    for (const s of t.sessions ?? []) {
+      if (s?.cwd) {
+        projectPaths.push({
+          serverId: s.serverId || "local",
+          hostLabel: s.host || s.serverId || "local",
+          cwd: s.cwd.replace(/\/+$/, "")
+        });
+      }
+    }
+  }
+
+  if (cleanCwd) {
+    const matchesProject = projectPaths.filter((p) =>
+      (!cleanSrv || p.serverId === cleanSrv)
+      && (cleanCwd === p.cwd || cleanCwd.startsWith(`${p.cwd}/`) || p.cwd.startsWith(`${cleanCwd}/`))
+    );
+    if (matchesProject.length === 0) {
+      throw new Error(`Directory "${clampText(cleanCwd, 120)}" does not belong to project "${targetProject.name}".`);
+    }
+    const uniqueHosts = [...new Set(matchesProject.map((p) => p.serverId))];
+    const resolvedSrv = cleanSrv ?? (uniqueHosts.length === 1 ? uniqueHosts[0] : null);
+    if (!resolvedSrv) {
+      throw new Error(`Directory "${clampText(cleanCwd, 120)}" exists on multiple hosts; specify serverId.`);
+    }
+    const hostInfo = matchesProject.find((p) => p.serverId === resolvedSrv);
+    return {
+      cwd: cleanCwd,
+      serverId: resolvedSrv,
+      hostLabel: hostInfo?.hostLabel ?? resolvedSrv
+    };
+  }
+
+  const hostEntry = (targetProject.hosts ?? []).find((h) => h.serverId === cleanSrv && h.preferredCwd);
+  if (!hostEntry) {
+    throw new Error(`Project "${targetProject.name}" has no known checkout on Paseo host "${clampText(cleanSrv, 80)}".`);
+  }
+  return {
+    cwd: hostEntry.preferredCwd,
+    serverId: cleanSrv,
+    hostLabel: hostEntry.label ?? cleanSrv
+  };
+}
+
 export async function dispatchManagerGoal(
   supervisor,
   {
@@ -633,6 +821,12 @@ export async function dispatchManagerGoal(
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
     const cleanKey = String(targetKey).trim();
+    if (!isThreadKey(cleanKey)) {
+      throw new Error(`Invalid session key "${clampText(cleanKey, 80)}".`);
+    }
+    const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
+    const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
+    const knownState = known?.agentStatus ?? "running";
     const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt });
     const ok = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
@@ -646,14 +840,13 @@ export async function dispatchManagerGoal(
     return {
       ok,
       status: ok ? "routed_existing" : "blocked",
+      message: sent?.delivery?.detail ?? null,
       project: project ? { id: String(project).toLowerCase(), name: String(project) } : null,
-      matchedSession: { key: cleanKey },
+      matchedSession: { key: cleanKey, title: knownTitle, state: knownState },
       delivery: sent?.delivery ?? null
     };
   }
 
-  // Always load full project list when `project` is unset so goal inference works,
-  // or scoped when `project` is provided (falling back to full list if needed).
   let hierarchy = await buildFleetHierarchy(supervisor, {
     project: project ? String(project).trim() : null,
     includeArchived: false,
@@ -664,6 +857,15 @@ export async function dispatchManagerGoal(
   if (!targetProject && project) {
     hierarchy = await buildFleetHierarchy(supervisor, { project: null, includeArchived: false, limit: 50, factory });
     targetProject = resolveTargetProject(hierarchy.projects, project, cleanGoal);
+  }
+  if (!targetProject) {
+    const withArchived = await buildFleetHierarchy(supervisor, {
+      project: project ? String(project).trim() : null,
+      includeArchived: true,
+      limit: 50,
+      factory
+    });
+    targetProject = resolveTargetProject(withArchived.projects, project, cleanGoal);
   }
   if (!targetProject) {
     const available = hierarchy.projects.slice(0, 8).map((p) => p.name).join(", ");
@@ -677,10 +879,12 @@ export async function dispatchManagerGoal(
   const inferredTheme = inferSessionTheme({ title: cleanGoal }, targetProject.name);
   const themeFilter = theme ? String(theme).trim().toLowerCase() : null;
 
+  // Exclude archived, unroutable, or permission-blocked (`waiting`) sessions so automatic
+  // goal routing never auto-approves or denies an unrelated pending permission card.
   const allSessions = targetProject.themes
     .filter((t) => !themeFilter || t.id === themeFilter || t.name.toLowerCase().includes(themeFilter))
     .flatMap((t) => t.sessions)
-    .filter((s) => s.wakeable !== false && s.state !== "archived");
+    .filter((s) => s.wakeable !== false && s.state !== "archived" && s.state !== "waiting" && !s.blockedOnPermission);
 
   const goalTerms = extractKeywords(cleanGoal).filter((t) => t !== targetProject.id && t !== targetProject.name.toLowerCase());
 
@@ -700,35 +904,8 @@ export async function dispatchManagerGoal(
       || String(b.session.lastActivityAt ?? "").localeCompare(String(a.session.lastActivityAt ?? ""))
     );
 
-  // Inspect actual Paseo/local chat transcripts for top 4 candidates so we match
-  // workstreams discussed inside the conversation even when chat titles are terse!
   if (normalizedMode !== "force_new" && preRanked.length > 0) {
-    const topToRead = preRanked.slice(0, 4);
-    await Promise.all(topToRead.map(async (entry) => {
-      try {
-        let timer;
-        const tr = await Promise.race([
-          readChatTranscript(supervisor, { key: entry.session.key, limit: 8, factory }),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("transcript timeout")), 5_000);
-            timer.unref?.();
-          })
-        ]).finally(() => clearTimeout(timer));
-        if (Array.isArray(tr?.messages) && tr.messages.length > 0) {
-          entry.transcriptMessages = tr.messages.slice(-4).map((m) => ({
-            role: m.role,
-            text: clampText(redactSecrets(m.text ?? ""), 280),
-            at: m.at ?? null
-          }));
-          entry.recentContext = tr.messages
-            .slice(-6)
-            .map((m) => `[${m.role}]: ${clampText(m.text ?? "", 320)}`)
-            .join("\n");
-        }
-      } catch {
-        // Keep surface snippet if transcript fetch times out.
-      }
-    }));
+    await batchHydrateCandidateTranscripts(supervisor, preRanked.slice(0, 4), { factory });
   }
 
   for (const entry of preRanked) {
@@ -790,12 +967,19 @@ export async function dispatchManagerGoal(
       : best.lexicalScore >= 0.34
   );
 
-  const resolvedCwd = cwd || targetProject.defaultTarget?.cwd || null;
-  const resolvedServerId = serverId || targetProject.defaultTarget?.serverId || null;
+  const spawnTarget = (cwd || serverId)
+    ? resolveValidatedSpawnTarget(targetProject, cwd, serverId)
+    : {
+        cwd: targetProject.defaultTarget?.cwd ?? null,
+        serverId: targetProject.defaultTarget?.serverId ?? null,
+        hostLabel: targetProject.defaultTarget?.hostLabel ?? targetProject.defaultTarget?.serverId ?? null
+      };
+  const resolvedCwd = spawnTarget.cwd;
+  const resolvedServerId = spawnTarget.serverId;
   const suggestedTitle = clampTitleFromGoal(cleanGoal, targetProject.name);
   const newSessionTarget = {
     serverId: resolvedServerId,
-    hostLabel: targetProject.defaultTarget?.hostLabel ?? resolvedServerId,
+    hostLabel: spawnTarget.hostLabel,
     cwd: resolvedCwd,
     suggestedTitle
   };
@@ -854,6 +1038,7 @@ export async function dispatchManagerGoal(
     return {
       ok: delivered,
       status: delivered ? "routed_existing" : "blocked",
+      message: sent?.delivery?.detail ?? null,
       project: projectSummary,
       inferredTheme: best.session.theme || inferredTheme.name,
       candidatesChecked: allSessions.length,

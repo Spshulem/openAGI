@@ -1147,7 +1147,10 @@ public struct FleetHierarchyCounts: Decodable, Sendable, Equatable {
 }
 
 public struct FleetHierarchySession: Decodable, Sendable, Equatable, Identifiable {
-    public var id: String { key }
+    public var id: String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "\(host ?? "local"):\(title ?? "session")" : trimmed
+    }
     public var key: String
     public var title: String?
     public var workspace: String?
@@ -1192,8 +1195,9 @@ public struct FleetThemeGroup: Decodable, Sendable, Equatable, Identifiable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = c.lenient(String.self, .id) ?? UUID().uuidString
-        name = c.lenient(String.self, .name) ?? "General"
+        let resolvedName = c.lenient(String.self, .name) ?? "General"
+        id = c.lenient(String.self, .id) ?? resolvedName.lowercased()
+        name = resolvedName
         labelPath = c.lenient(String.self, .labelPath)
         source = c.lenient(String.self, .source)
         counts = c.lenient(FleetHierarchyCounts.self, .counts) ?? FleetHierarchyCounts()
@@ -1288,18 +1292,21 @@ public struct FleetDispatchGoalResponse: Decodable, Sendable, Equatable {
     public struct Outcome: Decodable, Sendable, Equatable {
         public var ok: Bool
         public var status: String
+        public var message: String?
         public var inferredTheme: String?
         public var matchedSession: MatchedSession?
         public var createdSession: CreatedSession?
 
         private enum CodingKeys: String, CodingKey {
-            case ok, status, inferredTheme, matchedSession, createdSession
+            case ok, status, message, inferredTheme, matchedSession, createdSession
         }
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            ok = c.lenient(Bool.self, .ok) ?? true
-            status = c.lenient(String.self, .status) ?? "done"
+            let resolvedStatus = c.lenient(String.self, .status) ?? "done"
+            status = resolvedStatus
+            ok = c.lenient(Bool.self, .ok) ?? (resolvedStatus != "blocked")
+            message = c.lenient(String.self, .message)
             inferredTheme = c.lenient(String.self, .inferredTheme)
             matchedSession = c.lenient(MatchedSession.self, .matchedSession)
             createdSession = c.lenient(CreatedSession.self, .createdSession)
