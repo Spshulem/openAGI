@@ -66,9 +66,15 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertFalse(app.navigationBars[title].exists)
     }
 
-    private func tab(_ app: XCUIApplication, _ title: String) {
+    // A tab's own button: in the tab bar where there is one, else (iPad's
+    // top tabs) the button with the tab's title.
+    private func tabButton(_ app: XCUIApplication, _ title: String) -> XCUIElement {
         let tab = app.tabBars.buttons[title]
-        let target = tab.exists ? tab : app.buttons[title].firstMatch
+        return tab.exists ? tab : app.buttons[title].firstMatch
+    }
+
+    private func tab(_ app: XCUIApplication, _ title: String) {
+        let target = tabButton(app, title)
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(title) tab")
         XCTAssertTrue(target.isHittable, "Not hittable: \(title) tab")
         target.tap()
@@ -157,6 +163,16 @@ final class NativeNavigationTests: XCTestCase {
             XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
             XCTAssertTrue(close.isHittable, "Close must stay accessible after switching tabs")
             capture("native-supporting-chat", app: app)
+            // The tabs must not move when a tab with the supporting chat gives
+            // way to one without it (the rail jumped to the hinge on a Duo).
+            let withPane = tabButton(app, "Supervisor").frame
+            tab(app, "Chat")
+            XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
+            let withoutPane = tabButton(app, "Supervisor").frame
+            XCTAssertEqual(withPane.midX, withoutPane.midX, accuracy: 1, "The tabs stay put across tabs")
+            XCTAssertEqual(withPane.midY, withoutPane.midY, accuracy: 1, "The tabs stay put across tabs")
+            tab(app, "Tasks")
+            XCTAssertTrue(close.waitForExistence(timeout: 5))
             close.tap()
             XCTAssertFalse(close.exists)
             capture("native-supporting-chat-closed", app: app)
