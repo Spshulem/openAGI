@@ -157,6 +157,16 @@ final class NativeNavigationTests: XCTestCase {
             XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
             XCTAssertTrue(close.isHittable, "Close must stay accessible after switching tabs")
             capture("native-supporting-chat", app: app)
+            // The tab bar must not move when a tab with the supporting chat
+            // gives way to one without it (it jumped to the hinge on a Duo).
+            let withPane = app.tabBars.firstMatch.frame
+            tab(app, "Chat")
+            XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
+            let withoutPane = app.tabBars.firstMatch.frame
+            XCTAssertEqual(withPane.minX, withoutPane.minX, accuracy: 1, "The tab bar stays put across tabs")
+            XCTAssertEqual(withPane.maxX, withoutPane.maxX, accuracy: 1, "The tab bar stays put across tabs")
+            tab(app, "Tasks")
+            XCTAssertTrue(close.waitForExistence(timeout: 5))
             close.tap()
             XCTAssertFalse(close.exists)
             capture("native-supporting-chat-closed", app: app)
