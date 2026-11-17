@@ -17,7 +17,7 @@ const TOOL_NAMES = [
   "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app",
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
-  "fleet_batch_cards"
+  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes"
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
 const LABEL_MAX = 80;
@@ -470,6 +470,162 @@ export function registerFleetTools(registry, supervisor) {
         value: args.value ?? null
       });
     } });
+  if (typeof supervisor.getHierarchy === "function") registry.register({ name: "fleet_hierarchy", source: SOURCE, sideEffects: false, untrustedOutput: true,
+    description: "Build the visual Supervisor hierarchy across all Paseo hosts and coding sources: General Supervisor -> Scoped Project Supervisors (e.g. 'bb-recorder Supervisor', 'AI-SEO Supervisor', 'buildbetter Supervisor') -> Themes/Workstreams (honoring Paseo native workspace labels and auto-clustering unlabelled sessions) -> Agent Sessions & open decision cards. Pass `project` to drill into one Project Supervisor.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", maxLength: 160, description: "Optional project/workspace name (e.g. 'bb-recorder', 'AI-SEO', 'buildbetter')" },
+        includeArchived: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 50 }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => supervisor.getHierarchy({
+      project: typeof args?.project === "string" && args.project.trim() ? args.project.trim() : null,
+      includeArchived: args?.includeArchived === true,
+      limit: Number.isInteger(args?.limit) ? args.limit : 40
+    }) });
+  if (typeof supervisor.dispatchGoal === "function") registry.register({ name: "fleet_dispatch_goal", source: SOURCE, needsConfirmation: true,
+    description: "Manager-level goal dispatch inside a project/workspace ('Go work on <feature/bug> in <project>'): scans existing sessions + recent Paseo chat histories + OpenAI `/v1/decisions` (`gpt-6-luna`) to find if an existing session already owns that workstream (waking or routing to it if yes) or spawns a new Paseo coding session in the project's canonical directory if no existing session owns it.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", maxLength: 160, description: "Target project/workspace (e.g. 'AI-SEO', 'bb-recorder', 'buildbetter'); inferred from goal when unambiguous" },
+        theme: { type: "string", maxLength: 120, description: "Optional theme/workstream filter" },
+        goal: { type: "string", minLength: 1, maxLength: 4000, description: "High-level directive or feature/fix to execute" },
+        mode: { type: "string", enum: ["auto", "force_new"], description: "'auto' (default) routes to matching session or creates a new one; 'force_new' always creates a fresh session" },
+        targetKey: { type: "string", maxLength: KEY_MAX, description: "Optional explicit session key to route to" },
+        serverId: { type: "string", maxLength: 120 },
+        cwd: { type: "string", maxLength: 400 },
+        provider: { type: "string", maxLength: 80 }
+      },
+      required: ["goal"],
+      additionalProperties: false
+    },
+    prepareApprovalArgs: (args) => fleetDispatchGoalTarget(supervisor, args),
+    approvalTtlMs: 10 * 60_000,
+    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.goal])}`,
+    summarize: (args) => args.summaryLabel,
+    handler: async (args, context) => {
+      if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+      if (args.pinnedAction === "route_existing" && args.targetKey) {
+        const res = await supervisor.dispatchGoal({
+          project: args.project ?? null,
+          goal: args.goal,
+          targetKey: args.targetKey
+        });
+        if (!res?.ok) {
+          throw new Error(`Could not route directive (${res?.delivery?.status ?? "blocked"}): ${clip(res?.delivery?.detail ?? "check chat", 200)}`);
+        }
+        return res;
+      }
+      return supervisor.dispatchGoal({
+        project: args.project ?? null,
+        goal: args.goal,
+        mode: "force_new",
+        serverId: args.serverId ?? null,
+        cwd: args.cwd ?? null,
+        provider: args.provider ?? null
+      });
+    } });
+  if (typeof supervisor.syncThemes === "function") registry.register({ name: "fleet_sync_themes", source: SOURCE, needsConfirmation: true,
+    description: "Sync inferred `Project/Theme` labels onto unlabelled Paseo workspaces so Paseo's sidebar groups match the Supervisor's project/theme organization.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", maxLength: 160, description: "Optional project name to limit label sync" }
+      },
+      additionalProperties: false
+    },
+    prepareApprovalArgs: (args) => fleetSyncThemesTarget(supervisor, args),
+    approvalTtlMs: 10 * 60_000,
+    approvalDedupeKey: (args, context) => `fleet-sync-themes:${digest([context?.sessionId ?? null, args.project ?? null, args.pinnedAssignments])}`,
+    summarize: (args) => args.summaryLabel,
+    handler: async (args, context) => {
+      if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+      if (!args.pinnedAssignments?.length) {
+        return { ok: true, dryRun: false, plannedCount: 0, appliedCount: 0, failedCount: 0, assignments: [] };
+      }
+      return supervisor.syncThemes({
+        project: args.project ?? null,
+        pinnedAssignments: args.pinnedAssignments
+      });
+    } });
+}
+
+async function fleetDispatchGoalTarget(supervisor, args = {}) {
+  const goal = typeof args?.goal === "string" ? args.goal.trim() : "";
+  if (!goal || goal.length > 4000) throw new Error("Goal must be 1-4000 characters.");
+  const project = typeof args?.project === "string" && args.project.trim() ? args.project.trim() : null;
+  const theme = typeof args?.theme === "string" && args.theme.trim() ? args.theme.trim() : null;
+  const explicitKey = typeof args?.targetKey === "string" && args.targetKey.trim() ? args.targetKey.trim() : null;
+  const forceNew = args?.mode === "force_new";
+  const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
+
+  if (explicitKey && !forceNew) {
+    const validated = await Promise.resolve(fleetTarget(supervisor, { key: explicitKey, message: goal }));
+    return {
+      pinnedAction: "route_existing",
+      targetKey: validated.key,
+      ...(project ? { project } : {}),
+      goal,
+      summaryLabel: `Route directive to session "${validated.name}" (${validated.key}):\n${clip(goal, 220)}`
+    };
+  }
+
+  const preview = await supervisor.dispatchGoal({
+    project,
+    theme,
+    goal,
+    mode: "preview",
+    serverId: typeof args?.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : null,
+    cwd: typeof args?.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : null,
+    provider
+  });
+
+  const resolvedProject = preview?.project?.name ?? project ?? "workspace";
+  if (!forceNew && preview?.status === "suggest_existing" && preview?.matchedSession?.key) {
+    const ms = preview.matchedSession;
+    return {
+      pinnedAction: "route_existing",
+      targetKey: ms.key,
+      project: resolvedProject,
+      goal,
+      summaryLabel: `Route directive in ${resolvedProject} to existing session "${clip(ms.title || ms.key, 70)}" (${ms.key}):\n${clip(goal, 220)}`
+    };
+  }
+
+  const target = preview?.newSessionTarget ?? {};
+  const cwd = target.cwd || null;
+  if (!cwd) {
+    throw new Error(`Could not resolve a target directory for project "${clip(resolvedProject, 80)}".`);
+  }
+  const hostSuffix = target.hostLabel || target.serverId ? ` on ${clip(target.hostLabel || target.serverId, 50)}` : "";
+  return {
+    pinnedAction: "start_new",
+    project: resolvedProject,
+    ...(target.serverId ? { serverId: target.serverId } : {}),
+    cwd,
+    ...(provider ? { provider } : {}),
+    goal,
+    summaryLabel: `Start new Paseo session in ${resolvedProject}${hostSuffix} (${clip(cwd, 80)}):\n${clip(goal, 220)}`
+  };
+}
+
+async function fleetSyncThemesTarget(supervisor, args = {}) {
+  const project = typeof args?.project === "string" && args.project.trim() ? args.project.trim() : null;
+  const preview = await supervisor.syncThemes({ project, dryRun: true });
+  const assignments = Array.isArray(preview?.assignments) ? preview.assignments : [];
+  const sample = assignments.slice(0, 3).map((a) => a.labelName).join(", ");
+  const suffix = assignments.length > 3 ? ` +${assignments.length - 3} more` : "";
+  return {
+    ...(project ? { project } : {}),
+    pinnedAssignments: assignments,
+    summaryLabel: assignments.length > 0
+      ? `Sync ${assignments.length} Paseo workspace theme label${assignments.length === 1 ? "" : "s"} (${sample}${suffix})`
+      : `Sync Paseo workspace theme labels${project ? ` for ${project}` : ""} (all workspaces already labelled)`
+  };
 }
 
 function fleetStartSessionTarget(args = {}) {

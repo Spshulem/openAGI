@@ -166,6 +166,75 @@ export function createFleetRoute({ supervisor } = {}) {
         }
         return ok(await supervisor.listWorkspaces({ query, includeArchived, limit }));
       }
+      if (parts.length === 1 && parts[0] === "hierarchy") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.getHierarchy !== "function") {
+          return fail(503, "Project/theme hierarchy is not available.");
+        }
+        const project = url?.searchParams?.get("project") ?? "";
+        const includeArchived = url?.searchParams?.get("includeArchived") === "true";
+        const limit = Number(url?.searchParams?.get("limit") ?? 40);
+        if (project.length > 160 || !Number.isInteger(limit) || limit < 1 || limit > 60) {
+          return fail(400, "Pass project up to 160 characters and limit of 1-60.");
+        }
+        return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
+      }
+      if (parts.length === 2 && parts[0] === "themes" && parts[1] === "sync") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.syncThemes !== "function") {
+          return fail(503, "Theme label sync is not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        const project = typeof body.project === "string" ? body.project.trim() : "";
+        if (project.length > 160) return fail(400, "project must be up to 160 characters.");
+        if (body.pinnedAssignments !== undefined && body.pinnedAssignments !== null && (!Array.isArray(body.pinnedAssignments) || body.pinnedAssignments.length > 50)) {
+          return fail(400, "pinnedAssignments must be an array of up to 50 items.");
+        }
+        try {
+          const synced = await supervisor.syncThemes({
+            project: project || null,
+            dryRun: body.dryRun === true,
+            pinnedAssignments: Array.isArray(body.pinnedAssignments) ? body.pinnedAssignments.slice(0, 50) : null
+          });
+          return ok({ result: synced, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Theme label sync failed.").slice(0, 220));
+        }
+      }
+      if (parts.length === 1 && parts[0] === "dispatch") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.dispatchGoal !== "function") {
+          return fail(503, "Manager goal dispatch is not available.");
+        }
+        const body = await readObject(readBody);
+        const goal = typeof body?.goal === "string" ? body.goal.trim() : "";
+        const project = typeof body?.project === "string" ? body.project.trim() : "";
+        const theme = typeof body?.theme === "string" ? body.theme.trim() : "";
+        const targetKey = typeof body?.targetKey === "string" ? body.targetKey.trim() : "";
+        if (!goal || goal.length > 4000) return fail(400, "goal must be 1-4000 characters.");
+        if (project.length > 160 || theme.length > 120) return fail(400, "project/theme too long.");
+        if (targetKey && !THREAD_KEY.test(targetKey)) return fail(400, "Pass a valid targetKey.");
+        const dispatchMode = typeof body?.mode === "string" ? body.mode.trim().toLowerCase() : "auto";
+        if (!["preview", "auto", "execute", "force_new"].includes(dispatchMode)) {
+          return fail(400, "mode must be preview, auto, execute, or force_new.");
+        }
+        try {
+          const result = await supervisor.dispatchGoal({
+            project: project || null,
+            theme: theme || null,
+            goal,
+            mode: dispatchMode,
+            targetKey: targetKey || null,
+            serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
+            cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null,
+            provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            ...sendOptions
+          });
+          return ok({ result, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Could not dispatch goal.").slice(0, 220));
+        }
+      }
       if (parts.length === 1 && parts[0] === "repo-status") {
         if (method !== "GET") return fail(405, "Use GET.");
         if (typeof supervisor.inspectRepoStatus !== "function") {

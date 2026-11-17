@@ -597,6 +597,32 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetSearchResponse.self, from: data)
     }
 
+    public func fleetHierarchy(project: String? = nil, limit: Int = 40) async throws -> FleetHierarchyResponse {
+        var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 60)))]
+        if let project, !project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(URLQueryItem(name: "project", value: project))
+        }
+        var request = try authorizedRequest(path: "/fleet/api/hierarchy", method: "GET", queryItems: items)
+        request.timeoutInterval = 35
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetHierarchyResponse.self, from: data)
+    }
+
+    public func fleetDispatchGoal(project: String, goal: String, mode: String = "auto", targetKey: String? = nil) async throws -> FleetDispatchGoalResponse {
+        var request = try authorizedRequest(path: "/fleet/api/dispatch", method: "POST")
+        var body: [String: Any] = [
+            "project": project,
+            "goal": goal,
+            "mode": mode
+        ]
+        if let targetKey { body["targetKey"] = targetKey }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 90
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetDispatchGoalResponse.self, from: data)
+    }
+
     // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)
 
     // Hands this phone's relay pass and push key to its own daemon, over the

@@ -80,6 +80,7 @@ const EXACT = new Set([
   "GET /fleet/api/diagnose",
   "GET /fleet/api/search",
   "GET /fleet/api/workspaces",
+  "GET /fleet/api/hierarchy",
   "GET /fleet/api/repo-status",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
@@ -87,6 +88,8 @@ const EXACT = new Set([
   "POST /fleet/api/mode",
   "POST /fleet/api/preferences",
   "POST /fleet/api/route",
+  "POST /fleet/api/dispatch",
+  "POST /fleet/api/themes/sync",
   "POST /fleet/api/sessions/start",
   "POST /fleet/api/cards/batch",
   // The owner's own message to one fleet thread (its chat's reply box).

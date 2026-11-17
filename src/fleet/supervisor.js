@@ -27,6 +27,8 @@ import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
+import { createDecisionsKeepAliveGate } from "./decisions-gate.js";
+import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } from "./themes.js";
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { createPaseoSource } from "./sources/paseo.js";
@@ -831,6 +833,18 @@ export class FleetSupervisor {
     return this._nudgeJudge;
   }
 
+  // Lightweight `/v1/decisions` (`gpt-6-luna`) keep-alive gate; 0% codex-lb draw.
+  get decisionsGate() {
+    if (this.deps.decisionsGate !== undefined) return this.deps.decisionsGate;
+    this._decisionsGate ??= createDecisionsKeepAliveGate({
+      config: this.config,
+      env: this.deps.env ?? {},
+      fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl ?? globalThis.fetch,
+      now: () => this.now()
+    });
+    return this._decisionsGate;
+  }
+
   // runModel for the review; tests inject a fake one.
   get reviewRunner() {
     if (this.deps.runModel) return this.deps.runModel;
@@ -1007,6 +1021,10 @@ export class FleetSupervisor {
           // Which ran last: { provider, model, fallbackReason }.
           lastRun: this.lastReview.ran ?? null,
           lastError: this.lastReview.error
+        },
+        decisions: {
+          enabled: Boolean(this.decisionsGate?.enabled),
+          model: this.decisionsGate?.model ?? this.config.decisions?.model ?? null
         }
       }
     };
@@ -1996,6 +2014,7 @@ export class FleetSupervisor {
       ...prev,
       ...thread,
       archived,
+      excluded: prev?.excluded === "self" ? "self" : (thread.excluded ?? prev?.excluded ?? null),
       repo: thread.repo ?? prev.repo ?? null,
       branch: thread.branch ?? prev.branch ?? null,
       prRefs: mergedPrRefs,
@@ -2049,6 +2068,22 @@ export class FleetSupervisor {
 
   async batchActCards(options = {}) {
     return batchActCards(this, options);
+  }
+
+  async getHierarchy(options = {}) {
+    return buildFleetHierarchy(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async syncThemes(options = {}) {
+    return syncThemesToPaseoLabels(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async dispatchGoal(options = {}) {
+    return dispatchManagerGoal(this, {
+      ...options,
+      factory: options.factory ?? this.deps.paseoFactory,
+      decisionsFetch: options.decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl
+    });
   }
 
   updatePreferences(patch = {}) {
@@ -2519,8 +2554,9 @@ export class FleetSupervisor {
     const movedOn = action.threadFacts && facts && facts !== action.threadFacts ? "the thread moved on since the proposal" : null;
     // The owner muted it or it left supervision since: nothing goes in.
     const excluded = this.lastThreads.get(action.threadKey)?.excluded ?? null;
+    const unjudged = action.requiresJudge && !action.judged ? "not judged yet" : null;
     const held = this.store.mutedUntil(action.threadKey) || this.store.mutedUntil(action.targetKey) ? "muted by owner"
-      : excluded ? `thread ${excluded}` : null;
+      : excluded ? `thread ${excluded}` : unjudged;
     const settled = held ?? movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
@@ -2705,7 +2741,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true || (this.decisionsGate?.enabled === true && mode !== "observe") });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -2827,7 +2863,10 @@ export class FleetSupervisor {
   // replaced in place.
   async judgeNudges(items, { started }) {
     const judge = this.nudgeJudge;
-    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode === "observe") return;
+    const judgeEnabled = Boolean(judge?.enabled) && typeof judge?.judge === "function";
+    const gate = this.decisionsGate;
+    const gateEnabled = Boolean(gate?.enabled) && typeof gate?.evaluateBatch === "function";
+    if ((!judgeEnabled && !gateEnabled) || this.mode === "observe") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
     for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
     // Only answers given since this scan began count (ownerAnswerThreads).
@@ -2836,6 +2875,104 @@ export class FleetSupervisor {
     // being sent, gets no automatic nudge: the answer goes first
     // (deliverQueuedAnswers), never a playbook nudge beside or over it.
     const answering = this.ownerAnswerThreads(started);
+    if (gateEnabled) {
+      const gateCandidates = [];
+      for (const item of items) {
+        if (!judgeable(item.decision, item.thread)) continue;
+        if (answering.has(item.thread.key)) {
+          item.decision = judgeWait(item.decision, "owner answer goes first; no nudge");
+          continue;
+        }
+        if (item.decision.notBefore && Date.parse(item.decision.notBefore) > started) continue;
+        gateCandidates.push(item);
+      }
+      if (gateCandidates.length > 0) {
+        const gateVerdicts = await gate.evaluateBatch(gateCandidates, { started });
+        const answeredAfterGate = this.ownerAnswerThreads(started);
+        for (const item of gateCandidates) {
+          const gv = gateVerdicts.get(item.thread.key);
+          if (!gv) continue;
+          if (answeredAfterGate.has(item.thread.key)) {
+            item.decision = judgeWait(item.decision, "owner answered meanwhile; no nudge");
+            continue;
+          }
+          if (gv.action === "error") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "failed",
+                status: "failed",
+                reason: `decisions gate unavailable: ${gv.error}`
+              });
+            }
+            if (!judgeEnabled) {
+              item.decision = judgeWait(item.decision, `decisions gate unavailable: ${gv.error}`);
+            }
+            continue;
+          }
+          if (gv.action === "wait") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "wait",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            item.decision = judgeWait(item.decision, `decisions: ${gv.reason}`, false);
+            continue;
+          }
+          if (!judgeEnabled && gv.action === "ask-owner") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "ask-owner",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            const reply = agentReply(item.thread);
+            item.decision = this.applyJudgeVerdict(item, {
+              action: "ask-owner",
+              reason: gv.reason,
+              question: {
+                title: "Needs your decision",
+                body: clampText(redactSecrets(reply.text || item.decision.reason || "Session is blocked on an owner decision."), 220),
+                options: ["continue", "open thread"]
+              }
+            });
+            continue;
+          }
+          if (!judgeEnabled && gv.action === "send") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "send",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            const keepAliveMessage = item.decision.requiresJudge && !item.decision.deferredRouteDecision
+              ? "Supervisor keep-alive check: unfinished in-scope work remains in this session. Continue and verify the remaining in-scope steps now (do not merge, deploy, release, delete data, or spend without explicit owner approval). If blocked on the owner, stop and state the exact decision needed in one line."
+              : item.decision.message;
+            item.decision = this.applyJudgeVerdict(item, {
+              action: "send",
+              message: keepAliveMessage,
+              reason: gv.reason
+            });
+          }
+        }
+      }
+    }
+    if (!judgeEnabled) return;
     const history = this.nudgeHistory(new Set(items.filter((item) => judgeable(item.decision, item.thread)).map((item) => item.thread.key)));
     const due = [];
     for (const item of items) {
@@ -3452,7 +3589,8 @@ export class FleetSupervisor {
     // A computer-use send that timed out or lost Open Computer Use leaves
     // the app agent busy or restarting: the rest of the tick's typing waits.
     let uiStalled = answeredNow.uiStalled === true;
-    const judgeOn = Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function";
+    const judgeOn = (Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function")
+      || (Boolean(this.decisionsGate?.enabled) && typeof this.decisionsGate?.evaluateBatch === "function");
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -3464,10 +3602,19 @@ export class FleetSupervisor {
         head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
         threadFacts: threadFacts.get(decision.threadKey) ?? null,
+        ...(decision.judged ? { judged: true } : {}),
+        ...(decision.requiresJudge ? { requiresJudge: true } : {}),
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
+
+      // Contextual idle-review placeholders must never be recorded as planned/proposed
+      // or sent without an explicit judge/decisions verdict in the current scan.
+      if (decision.requiresJudge && !decision.judged) {
+        decision.reason = `${decision.reason}; held: not judged this scan`;
+        continue;
+      }
 
       // The live mode, not the tick's: the owner may have left Auto mid-scan.
       const liveMode = this.mode;
