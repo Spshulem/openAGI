@@ -1,3 +1,5 @@
+import { checkServers } from '../openagi/server-discovery'
+import type { LiveCue } from '../openagi/live-cues'
 import type { SpeechModel } from '../openagi/live-speech'
 import type { HomeMode } from '../openagi/store'
 import type { LifelogHomeState } from './openagi-glasses-renderer'
@@ -10,6 +12,8 @@ export type PhoneInteraction = 'idle' | 'recording' | 'review' | 'working' | 'un
 
 export interface OpenAGIPhoneActions {
   pair(code: string, origin: string): void
+  toggleTranscript?(): void
+  configureLiveCues?(enabled: boolean): void
   ask(): void
   newConversation(): void
   unlink(): void
@@ -33,6 +37,7 @@ export interface OpenAGIPhoneActions {
   inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
   // A supervisor question answered with one of its fixed choices.
   answerQuestion?(id: string, answer: string): Promise<{ ok: boolean; detail: string }>
+  actCard?(id: string, cardOp: 'primary' | 'defer' | 'fix_ci'): Promise<{ ok: boolean; detail: string }>
   markMoment?(): void
   configureHomeMode?(mode: HomeMode): void
   recordingConsent?(consent: boolean): void
@@ -73,11 +78,13 @@ export class OpenAGIPhoneCompanion {
         <section class="card" role="status" aria-live="polite"><h1 id="status">Starting…</h1><p id="detail">Connecting to your agent.</p></section>
         <section id="pair" class="pair">
           <h2>Connect to your OpenAGI main</h2>
+          <ol class="setup-steps"><li><strong>Install your main.</strong> Open <a href="https://github.com/Spshulem/openAGI#readme" target="_blank" rel="noopener noreferrer">the computer setup guide</a> on your Mac or server, then finish model setup.</li><li><strong>Connect your phone.</strong> Use the same Wi-Fi, or turn on Tailscale on both devices and HTTPS Serve on your main.</li><li><strong>Pair once.</strong> Open Connect glasses on your computer. Paste its card, or check its address below and enter the six-digit code.</li></ol>
           <p>Already have OpenAGI? On your main computer, open <strong>Connect glasses</strong> at /g2/connect. Paste its connection card below.</p>
           <label for="connection-card">Connection card</label><textarea id="connection-card" autocomplete="off" placeholder="Paste your connection card"></textarea><button id="read-connection-card">Review connection</button><p id="card-status" role="status"></p>
           <details><summary>New to OpenAGI?</summary><p>Install OpenAGI on a computer, select your model, then connect these glasses. Your computer stays in control; G2 does not need a separate agent subscription.</p><a href="https://github.com/Spshulem/openAGI#readme" target="_blank" rel="noopener noreferrer">Computer installation guide</a><p>You can preview the layout below without a microphone or agent connection.</p><button id="preview-interface">Preview interface · no recording</button></details>
           <label for="agent-origin">Main server URL</label>
           <input id="agent-origin" type="url" autocomplete="off" placeholder="https://your-main.example.com" value="${escapeHtml(allowedOrigins[0] ?? '')}">
+          <button id="find-server">Find / check my main</button><p id="server-status" role="status">Checks saved or entered HTTPS addresses without credentials. Even Hub does not expose nearby Wi-Fi or Tailscale peer browsing; paste your main’s address or connection card.</p><div id="server-results"></div>
           <p>Use the machine that hosts your main, not another node. G2 will connect as a node. Choose ONE method below.</p>
           <h2>Option 1: Pair with a code</h2>
           <label for="pair-code">Pairing code</label>
@@ -95,6 +102,7 @@ export class OpenAGIPhoneCompanion {
           <button id="cancel-request" hidden>Cancel request</button>
           <section id="pending-question" class="ambient" hidden><h2>Saved question</h2><p id="pending-detail">Check the same request without starting it twice.</p><button id="resume-request">Check / send saved question</button><button id="dismiss-request">Clear after checking History</button></section>
           <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
+          <section id="cue-panel" class="ambient" data-page="listen"><h2>Live cues</h2><button id="toggle-transcript" aria-pressed="false">Show transcript on glasses</button><label><input id="live-cues-enabled" type="checkbox"> Offer brief answers and context while I listen</label><p>Requires consented lifelog. Uses your main model and read-only connected data, at most 20 checks per hour. Suggested tasks need confirmation. Transcript visibility does not change recording.</p><p id="cue-status" role="status">Live cues off.</p><div id="live-cues"></div></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
@@ -168,6 +176,9 @@ export class OpenAGIPhoneCompanion {
       this.actionsSection.hidden = false; this.interaction('unavailable')
       this.set('Interface preview', 'No microphone, pairing, or model is active. Connect above when you are ready.')
     })
+    root.querySelector('#toggle-transcript')?.addEventListener('click', () => actions.toggleTranscript?.())
+    root.querySelector('#live-cues-enabled')?.addEventListener('change', () => actions.configureLiveCues?.(root.querySelector<HTMLInputElement>('#live-cues-enabled')!.checked))
+    root.querySelector('#find-server')?.addEventListener('click', () => { void this.findServers(allowedOrigins) })
     root.querySelector('#pause-lifelog')?.addEventListener('click', () => { if (this.currentLifelog === 'listening' || this.currentLifelog === 'starting') actions.pauseLifelog?.(); else actions.resumeLifelog?.() })
     root.querySelector('#resume-request')?.addEventListener('click', () => actions.resumeRequest?.())
     root.querySelector('#dismiss-request')?.addEventListener('click', () => { if (window.confirm('Have you checked History? Clearing this local reminder does not cancel main work or undo completed actions.')) actions.dismissRequest?.() })
@@ -218,6 +229,19 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#recording-consent')?.addEventListener('change', () => actions.recordingConsent?.(root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Recording consent turns off. Previously accepted tasks remain.')) actions.deleteMemory?.() })
     root.querySelector('#proactive-items')?.addEventListener('click', event => {
+      const cardButton = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-card-op]') : null
+      if (cardButton?.dataset.id && cardButton.dataset.cardOp) {
+        const card = cardButton.closest('details'), status = card?.querySelector<HTMLElement>('.answer-status')
+        const buttons = card ? [...card.querySelectorAll<HTMLButtonElement>('button')] : []
+        buttons.forEach(b => { b.disabled = true })
+        if (status) status.textContent = 'Running…'
+        const op = cardButton.dataset.cardOp as 'primary' | 'defer' | 'fix_ci'
+        void actions.actCard?.(cardButton.dataset.id, op).then(result => {
+          if (status) status.textContent = result.ok ? `Done: ${result.detail || cardButton.textContent || op}` : `Halted: ${result.detail || 'Check PR or session state.'}`
+          if (!result.ok) buttons.forEach(b => { b.disabled = false })
+        })
+        return
+      }
       const answerButton = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-answer]') : null
       if (answerButton?.dataset.id && answerButton.dataset.answer !== undefined) {
         const card = answerButton.closest('details'), status = card?.querySelector<HTMLElement>('.answer-status')
@@ -295,7 +319,34 @@ export class OpenAGIPhoneCompanion {
     this.historyStatus(page.archivedOnMain ? 'Earlier archived messages remain on main.' : root.childElementCount ? 'Saved on your main · only this G2’s conversations' : 'No conversations found on main.')
   }
   historyStatus(text: string): void { this.actionsSection.querySelector<HTMLElement>('#history-status')!.textContent = text }
-  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) this.lifelogStatus('') }
+  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) { this.lifelogStatus(''); this.actionsSection.querySelector('#live-cues')?.replaceChildren() } }
+  savedServer(origin: string | null): void { if (origin) this.pairSection.querySelector<HTMLInputElement>('#agent-origin')!.value = origin }
+  private async findServers(allowed: string[]): Promise<void> {
+    const button = this.pairSection.querySelector<HTMLButtonElement>('#find-server')!, status = this.pairSection.querySelector<HTMLElement>('#server-status')!, root = this.pairSection.querySelector<HTMLElement>('#server-results')!
+    const input = this.pairSection.querySelector<HTMLInputElement>('#agent-origin')!
+    button.disabled = true; root.replaceChildren(); status.textContent = 'Checking your main…'
+    try {
+      const addresses = input.value.trim() ? [input.value.trim()] : allowed
+      if (!addresses.length) { status.textContent = 'Paste your computer’s HTTPS / Tailscale address or connection card first. In Even Hub, the app cannot browse nearby computers.'; return }
+      const servers = await checkServers(addresses)
+      status.textContent = servers.length ? 'Choose your main, then enter its one-time pairing code.' : 'No main responded. Keep OpenAGI running; check HTTPS Serve and that both devices use the same Wi-Fi or Tailscale network.'
+      for (const server of servers) {
+        const choose = document.createElement('button'); choose.textContent = `${server.name} · OpenAGI responding`
+        choose.onclick = () => { input.value = server.origin; this.pairSection.querySelector<HTMLInputElement>('#pair-code')!.focus(); status.textContent = 'Main selected. Enter the code from Connect glasses on that computer.' }
+        root.append(choose)
+      }
+    } catch (error) { status.textContent = error instanceof Error ? error.message : 'Check your main’s HTTPS address.' }
+    finally { button.disabled = false }
+  }
+  transcriptVisible(visible: boolean): void { const b = this.actionsSection.querySelector<HTMLButtonElement>('#toggle-transcript')!; b.textContent = visible ? 'Hide transcript on glasses' : 'Show transcript on glasses'; b.setAttribute('aria-pressed', String(visible)) }
+  liveCuesEnabled(enabled: boolean): void { this.actionsSection.querySelector<HTMLInputElement>('#live-cues-enabled')!.checked = enabled; this.cueStatus(enabled ? 'Start consented lifelog for live cues.' : 'Live cues off.') }
+  cueStatus(text: string): void { this.actionsSection.querySelector<HTMLElement>('#cue-status')!.textContent = text }
+  cue(cue: LiveCue): void {
+    const root = this.actionsSection.querySelector<HTMLElement>('#live-cues')!, card = document.createElement('details'), title = document.createElement('summary'), brief = document.createElement('p'), detail = document.createElement('p')
+    title.textContent = `${cue.kind === 'task' ? 'Suggested task · ' : ''}${cue.title}`; brief.textContent = cue.brief; detail.textContent = cue.detail
+    card.append(title, brief, detail); root.prepend(card)
+    while (root.childElementCount > 30) root.lastElementChild?.remove()
+  }
   lifelogStatus(message: string): void {
     const status = this.actionsSection.querySelector('#lifelog-status'); if (status) status.textContent = message
     this.actionsSection.querySelector('#lifelog-moments')?.replaceChildren()
@@ -361,18 +412,27 @@ export class OpenAGIPhoneCompanion {
     for (const item of items) {
       const card = document.createElement('details'); card.className = 'ambient'
       const title = document.createElement('summary'); title.textContent = item.title
-      const summary = document.createElement('p'); summary.textContent = item.summary
+      const summary = document.createElement('p'); summary.textContent = item.pmBrief && item.pmBrief !== item.summary ? `${item.pmBrief}\n${item.summary}` : item.summary
       card.append(title, summary)
+      const hasCardAct = Boolean(item.supervisor && item.cardId && item.primaryLabel)
+      if (hasCardAct) {
+        const isMergeCard = item.cardKind === 'merge_ready' || item.cardKind === 'pr_ready'
+        const primaryIsFix = /fix ci|rebase/i.test(item.primaryLabel ?? '')
+        const b = document.createElement('button'); b.textContent = isMergeCard && !primaryIsFix && item.prRef ? `${item.primaryLabel} (${item.prRef})` : item.primaryLabel!; b.className = 'answer'; b.dataset.cardOp = 'primary'; b.dataset.id = item.id; card.append(b)
+        if (['failing', 'failure', 'error'].includes((item.ciState ?? '').toLowerCase()) && !primaryIsFix) {
+          const fix = document.createElement('button'); fix.textContent = 'Have agent fix CI'; fix.className = 'answer'; fix.dataset.cardOp = 'fix_ci'; fix.dataset.id = item.id; card.append(fix)
+        }
+      }
       // Supervisor questions answer here: one button per fixed choice.
-      const answers = item.supervisor ? (item.options ?? []).filter(o => o && o !== 'dismiss') : []
+      const answers = item.supervisor ? (item.options ?? []).filter(o => o && o !== 'dismiss' && (!hasCardAct || o.toLowerCase() !== (item.primaryLabel ?? '').toLowerCase())) : []
       for (const option of answers) {
         const b = document.createElement('button'); b.textContent = option; b.className = 'answer'; b.dataset.answer = option; b.dataset.id = item.id; card.append(b)
       }
-      if (answers.length) { const status = document.createElement('p'); status.className = 'answer-status'; card.append(status) }
+      if (hasCardAct || answers.length) { const status = document.createElement('p'); status.className = 'answer-status'; card.append(status) }
       for (const [op, text] of [['dismiss', 'Dismiss alert'], ['snooze', 'Snooze 1 hour'], ...(item.action === 'accept-task' ? [['accept-task', item.reminder ? 'Review reminder date & time' : 'Review and add user task']] : []), ...(item.action === 'complete-task' ? [['complete-task', 'Complete task on main']] : [])]) {
         const b = document.createElement('button'); b.textContent = text; b.dataset.inboxOp = op; b.dataset.id = item.id; card.append(b)
       }
-      if (!answers.length && !['accept-task', 'complete-task'].includes(item.action)) { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
+      if (!hasCardAct && !answers.length && !['accept-task', 'complete-task'].includes(item.action)) { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
       root.append(card)
     }
   }
@@ -417,7 +477,7 @@ export class OpenAGIPhoneCompanion {
     list.prepend(item)
     while (list.children.length > 12) list.lastChild?.remove()
   }
-  history(entries: { question: string; at: string }[]): void {
+  history(entries: { question: string; at: string; thread?: 'agent' | 'supervisor' }[]): void {
     const root = this.actionsSection.querySelector('#recent-answers')
     if (!root) return
     root.replaceChildren()
@@ -437,7 +497,8 @@ export class OpenAGIPhoneCompanion {
       question.textContent = entry.question
       const action = document.createElement('span')
       action.className = 'recent-resume'
-      action.textContent = 'Resume conversation →'
+      // Supervisor replies open to read; only agent answers resume a chat.
+      action.textContent = entry.thread === 'supervisor' ? 'Supervisor · read answer →' : 'Resume conversation →'
       button.append(timestamp, question, action)
       root.append(button)
     })
@@ -452,7 +513,7 @@ function injectStyles(): void {
   const style = document.createElement('style')
   style.textContent = `
     [hidden]{display:none!important}
-    .page-nav{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;position:sticky;top:0;z-index:2;background:#0d1110;padding:8px 0}.page-nav button{padding:10px 3px;font-size:13px;background:#17241d;color:#e5eee8;border-color:#3b5043}.page-nav button[aria-pressed="true"]{background:#54f59c;color:#07120c}#proactive-items,#lifelog-moments,#recent-answers{max-height:55vh;overflow-y:auto;overscroll-behavior:contain;display:grid;gap:12px}details:not([open])>:not(summary){display:none}summary{cursor:pointer;line-height:1.5}details[open]>summary{margin-bottom:12px}details button{margin:6px 0}#proactive-items:empty::before{content:'No inbox items yet.'}
+    .page-nav{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;position:sticky;top:0;z-index:2;background:#0d1110;padding:8px 0}.page-nav button{padding:10px 3px;font-size:13px;background:#17241d;color:#e5eee8;border-color:#3b5043}.page-nav button[aria-pressed="true"]{background:#54f59c;color:#07120c}#live-cues,#proactive-items,#lifelog-moments,#recent-answers{max-height:55vh;overflow-y:auto;overscroll-behavior:contain;display:grid;gap:12px}details:not([open])>:not(summary){display:none}summary{cursor:pointer;line-height:1.5}details[open]>summary{margin-bottom:12px}details button{margin:6px 0}#proactive-items:empty::before{content:'No inbox items yet.'}
     :root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1110;color:#f5f7f5}*{box-sizing:border-box}
     body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#17352a,#0d1110 48%)}.shell{width:min(620px,100%);margin:0 auto;padding:28px 20px;display:grid;gap:20px}
     header{display:flex;align-items:end;justify-content:space-between}.brand{font-size:24px;font-weight:760}.eyebrow{color:#72f5ac;text-transform:uppercase;letter-spacing:.15em;font-size:11px}

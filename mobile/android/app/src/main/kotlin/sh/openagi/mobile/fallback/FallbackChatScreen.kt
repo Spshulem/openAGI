@@ -25,7 +25,7 @@ import sh.openagi.mobile.ui.components.FoldSafeSinglePane
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
+fun FallbackChatScreen(context: Context, localAgentMode: Boolean = false, onDismiss: () -> Unit) {
     var provider by remember { mutableStateOf(FallbackProvider.LOCAL) }
     var model by remember { mutableStateOf(provider.defaultModel) }
     var modelDraft by remember { mutableStateOf(model) }
@@ -50,7 +50,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
     LaunchedEffect(Unit) {
         try {
             val loaded = withContext(Dispatchers.IO) { FallbackVault(context.applicationContext) }
-            provider = withContext(Dispatchers.IO) { loaded.provider() }
+            provider = if (localAgentMode) FallbackProvider.LOCAL else withContext(Dispatchers.IO) { loaded.provider() }
             vault = loaded
         }
         catch (_: Exception) { error = "Secure storage is unavailable. Close and reopen the app to try again; no API key or conversation has been stored." }
@@ -189,13 +189,13 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
         Surface(modifier = Modifier.fillMaxSize()) {
             FoldSafeSinglePane {
                 Scaffold(topBar = {
-                    TopAppBar(title = { Text(if (options) "Chat options" else "Chat without server") },
-                        navigationIcon = { TextButton(onClick = { if (options) { options = false; key = "" } else onDismiss() }, enabled = !busy) { Text(if (options) "Back" else "Server") } },
+                    TopAppBar(title = { Text(if (localAgentMode) "Gemini Nano" else if (options) "Chat options" else "Chat without server") },
+                        navigationIcon = { TextButton(onClick = { if (localAgentMode) onDismiss() else if (options) { options = false; key = "" } else onDismiss() }, enabled = !busy) { Text(if (options || localAgentMode) "Back" else "Server") } },
                         actions = { if (!options) TextButton(onClick = { modelDraft = model; options = true }, enabled = !busy) { Text("Options") } })
                 }) { padding ->
                     Column(Modifier.padding(padding).fillMaxSize().imePadding().padding(horizontal = 16.dp)) {
                         Text(if (provider == FallbackProvider.LOCAL) "On this phone · Gemini Nano" else "Direct · ${provider.title} · $model", style = MaterialTheme.typography.titleSmall)
-                        Text("Separate chat on this phone. Server tasks, integrations and shared history need your server connection.", style = MaterialTheme.typography.bodySmall)
+                        Text(if (localAgentMode) "Gemini Nano powers your phone agent. Tasks, Today, Inbox and history stay in its local workspace." else "Separate chat on this phone. Server tasks, integrations and shared history need your server connection.", style = MaterialTheme.typography.bodySmall)
                         Spacer(Modifier.height(12.dp))
                         if (options) {
                             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -213,7 +213,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                                     }
                                 }
                                 item { Text("Choose a model", style = MaterialTheme.typography.titleMedium) }
-                                itemsIndexed(FallbackProvider.entries) { _, choice ->
+                                itemsIndexed(if (localAgentMode) listOf(FallbackProvider.LOCAL) else FallbackProvider.entries) { _, choice ->
                                     Row(Modifier.fillMaxWidth()) {
                                         RadioButton(selected = provider == choice, onClick = { selectProvider(choice) }, enabled = !busy)
                                         TextButton(onClick = { selectProvider(choice) }, enabled = !busy) { Text(choice.title) }
@@ -258,7 +258,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                                             vault?.history(selectedProvider, selectedModel).orEmpty()
                                         }
                                         key = ""
-                                        options = false
+                                        if (localAgentMode) onDismiss() else options = false
                                     } catch (_: Exception) {
                                         lines = emptyList()
                                         hasKey = false

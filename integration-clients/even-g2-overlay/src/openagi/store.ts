@@ -24,13 +24,16 @@ const StateSchema = z.object({
   recordingConsent: z.boolean().default(false),
   // Main's grant for that consent. Persistent; main revokes only on request.
   lifelogConsent: ConsentSchema.nullable().default(null),
+  transcriptVisible: z.boolean().default(false),
+  liveCuesEnabled: z.boolean().default(false),
+  lastAgentOrigin: z.string().url().nullable().default(null),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
   speechTransport: z.enum(['relay', 'direct']).default('relay'),
   autoSend: z.boolean().default(true),
   connectionMode: z.enum(['enrollment', 'direct']).default('enrollment'),
   agentOrigin: z.string().url().nullable().default(null),
-  history: z.array(z.object({ conversationId: z.string().uuid(), continuation: z.string().max(200).nullable().default(null), question: z.string(), reply: z.string(), at: z.string() })).max(30).default([]),
+  history: z.array(z.object({ conversationId: z.string().uuid(), continuation: z.string().max(200).nullable().default(null), question: z.string(), reply: z.string(), at: z.string(), thread: z.enum(['agent', 'supervisor']).default('agent') })).max(30).default([]),
 })
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
@@ -49,8 +52,9 @@ export function migrateState(raw: unknown): unknown {
   return { ...old, homeMode, recordingConsent: homeMode === 'lifelog' && Boolean(old.lifelogConsent), lifelogConsent: null }
 }
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'homeMode' | 'wakePhrase' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'homeMode' | 'wakePhrase' | 'speechModel' | 'speechTransport' | 'autoSend' | 'transcriptVisible' | 'lastAgentOrigin'>): OpenAGIState {
   return {
+    transcriptVisible: preferences?.transcriptVisible ?? false, liveCuesEnabled: false, lastAgentOrigin: preferences?.lastAgentOrigin ?? null,
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
     continuation: null, interfaceStyle: 'focused', savedDraft: '', pendingRequest: null,
     homeMode: preferences?.homeMode ?? 'talk', recordingConsent: false, lifelogConsent: null,
@@ -73,9 +77,10 @@ export class OpenAGIStore {
     return this.snapshot()
   }
   snapshot(): OpenAGIState { return structuredClone(this.state) }
-  async remember(question: string, reply: string): Promise<void> {
+  // Supervisor replies are kept apart from the agent chat they never joined.
+  async remember(question: string, reply: string, thread: ConversationThread = 'agent'): Promise<void> {
     if (!this.state.conversationId) return
-    await this.update({ history: [...this.state.history, { conversationId: this.state.conversationId, continuation: this.state.continuation, question: question.slice(0, 4000), reply: reply.slice(0, 16000), at: new Date().toISOString() }].slice(-30) })
+    await this.update({ history: [...this.state.history, { conversationId: this.state.conversationId, continuation: this.state.continuation, question: question.slice(0, 4000), reply: reply.slice(0, 16000), at: new Date().toISOString(), thread }].slice(-30) })
   }
   update(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const savedPatch = structuredClone(patch)
@@ -86,7 +91,7 @@ export class OpenAGIStore {
   private async persistUpdate(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const changedMain = patch.agentOrigin !== undefined && patch.agentOrigin !== this.state.agentOrigin
     const changedCredential = patch.nodeToken !== undefined && patch.nodeToken !== this.state.nodeToken
-    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain || changedCredential ? { history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogConsent: null } : {}), version: 2 })
+    const next = StateSchema.parse({ ...this.state, ...patch, ...(patch.agentOrigin ? { lastAgentOrigin: patch.agentOrigin } : {}), ...(changedMain || changedCredential ? { liveCuesEnabled: false, history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogConsent: null } : {}), version: 2 })
     await this.storage.set(KEY, JSON.stringify(next))
     this.state = next
     return this.snapshot()

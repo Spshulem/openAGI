@@ -13,17 +13,22 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
+import { appendJsonLine, ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { matchCatalog } from "./mcp-catalog.js";
 import { buildReconciliationCalibration } from "./reconciliation-calibration.js";
 import { resolveDataDir } from "./data-dir.js";
 import { suggestionAdmissionStatus, withSuggestionAdmission } from "./suggestion-admission.js";
+import { LEARNED_HEADS, learnedModeFor } from "./learning/learned-scores.js";
 
 const SUGGEST_DIR = "proactive/suggestions";
 const DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h — don't repeat the same proposal within a 6h window
 const MIN_INTERVAL_MS = 8 * 60 * 1000;        // back off if we just ran (handles overlapping cron + dispatch)
 const MIN_SNIPPETS = 2;                       // need real activity, not silence
+// Live learned gate: share of below-threshold proposals still let through, so
+// the gate keeps seeing outcomes for the kind of proposal it would block.
+const LEARNED_EXPLORE_RATE = 0.1;
+const HELD_SUGGESTIONS_FILE = "learning/held-suggestions.jsonl";
 
 const TASK_INTENT_PROMPT = [
   "For category=task, include taskIntent: {state: planned|in_progress|completed|context|unknown, evidence: <short exact quote from the supplied chat or OCR>}.",
@@ -86,6 +91,7 @@ export class ProactiveObserver {
     this.maxPendingSuggestions = options.maxPendingSuggestions;
     this.suggestDir = path.join(this.dataDir, SUGGEST_DIR);
     this.lookbackMinutes = options.lookbackMinutes ?? 15;
+    this.random = typeof options.random === "function" ? options.random : Math.random;
     this.lastRunAt = 0;
     ensureDir(this.suggestDir);
   }
@@ -223,6 +229,9 @@ export class ProactiveObserver {
       proposal.mcpRegister = matchedCatalog.entry.register;
     }
 
+    const learned = await this.learnedSuggestionScore(proposal, now);
+    if (learned?.held) return learned.held;
+
     return this.persist({
       source: isLongHorizon ? "weekly-observer" : "proactive-observer",
       category: proposal.category,
@@ -236,8 +245,48 @@ export class ProactiveObserver {
       taskBucket: proposal.bucket ?? "today",
       taskIntent,
       context: { apps: ctx.apps?.slice(0, 5) ?? [], snippetCount: ctx.snippets?.length ?? 0, mode },
-      status: "pending"
+      status: "pending",
+      ...(learned ? { learned: learned.learned } : {})
     });
+  }
+
+  // Optional learned score for a proposal (src/learning/learned-scores.js).
+  // Returns null when the score is off or unavailable: the proposal goes
+  // ahead exactly as without it. In shadow the score is only recorded on the
+  // suggestion. In live, with a usable head, a proposal scored below the
+  // service's threshold is held back, except LEARNED_EXPLORE_RATE of them,
+  // which go through marked explore. A held proposal is logged without text.
+  async learnedSuggestionScore(proposal, now = new Date()) {
+    try {
+      const client = this.runtime?.modelClient;
+      const mode = learnedModeFor("suggestions", client);
+      if (mode === "off") return null;
+      const scored = await client.scoreSuggestion({
+        title: proposal.title,
+        rationale: proposal.rationale,
+        category: proposal.category
+      });
+      if (!scored) return null;
+      const learned = { pAccept: scored.pAccept, version: scored.version, mode };
+      if (mode !== "live") return { learned };
+      const health = await client.health();
+      const threshold = health?.thresholds?.suggestion;
+      if (!client.usable(LEARNED_HEADS.suggestion) || typeof threshold !== "number" || scored.pAccept >= threshold) {
+        return { learned };
+      }
+      if (this.random() < LEARNED_EXPLORE_RATE) return { learned: { ...learned, explore: true } };
+      try {
+        appendJsonLine(path.join(this.dataDir, HELD_SUGGESTIONS_FILE), {
+          at: (now instanceof Date ? now : new Date(now)).toISOString(),
+          category: proposal.category ?? null,
+          pAccept: scored.pAccept,
+          version: scored.version
+        });
+      } catch { /* the hold stands even if its log line cannot be written */ }
+      return { learned, held: { skipped: true, reason: "learned gate", pAccept: scored.pAccept } };
+    } catch {
+      return null;
+    }
   }
 
   recentSessionExcerpt() {
@@ -334,6 +383,10 @@ export class ProactiveObserver {
           candidate.taskAutoCreated = true;
           candidate.note = "Auto-created task from proactive observer (OPENAGI_AUTO_TASKS=1).";
         }
+        // Record the proposal as work to be graded by what happens to it. An
+        // auto-created task carries no owner vote; its completion grades it.
+        candidate.workOutcomeId = this.runtime?.grounded?.onSuggestionProposed?.(candidate) ?? null;
+        if (task) this.runtime?.grounded?.onSuggestionResolved?.(candidate, "auto-accepted");
         writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
         return { task };
       }
@@ -387,6 +440,7 @@ export class ProactiveObserver {
     candidate.resolvedAt = nowIso();
     if (note) candidate.note = note;
     writeJsonAtomic(file, candidate);
+    this.runtime?.grounded?.onSuggestionResolved?.(candidate, status);
     return candidate;
   }
 }
@@ -524,10 +578,16 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
     return { skipped: true, reason: "insufficient activity across all sources" };
   }
 
-  const candidates = this.runtime.tasks
-    .list({ status: "pending", limit: 30 })
-    .filter((t) => t.queue === "user");
-  if (candidates.length === 0) return { skipped: true, reason: "no pending user tasks" };
+  // Filter the queue before bounding the batch: a busy agent queue must
+  // not hide user work. Progress is not terminal; keep checking it for a
+  // completion receipt. Rotate so an unchanged first page cannot starve
+  // the rest of the backlog. This cursor is process-local and read-only.
+  const eligible = this.runtime.tasks.list({ queue: "user", limit: 100_000 })
+    .filter((t) => t.queue === "user" && ["pending", "in_progress"].includes(t.status));
+  if (eligible.length === 0) return { skipped: true, reason: "no pending user tasks" };
+  const offset = (this.taskScanOffset ?? 0) % eligible.length;
+  const candidates = [...eligible.slice(offset), ...eligible.slice(0, offset)].slice(0, 30);
+  const candidateIds = new Set(candidates.map((t) => t.id));
 
   const provider = this.runtime.agentHost?.modelProvider;
   if (!provider?.isConfigured?.() || provider.constructor.name === "DeterministicModelProvider") {
@@ -617,6 +677,7 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
     return { skipped: true, reason: "could not parse llm output" };
   }
 
+  this.taskScanOffset = (offset + candidates.length) % eligible.length;
   const updates = Array.isArray(parsed?.updates) ? parsed.updates : [];
   let completed = 0;
   let inProgressed = 0;
@@ -631,9 +692,9 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
   );
 
   for (const u of updates) {
-    if (!u?.taskId) continue;
+    if (!u?.taskId || !candidateIds.has(u.taskId)) continue;
     const task = this.runtime.tasks.get(u.taskId);
-    if (!task || task.status === "completed") continue;
+    if (!task || task.queue !== "user" || !["pending", "in_progress"].includes(task.status)) continue;
     const confidence = Number(u.confidence ?? 0);
     const sources = Array.isArray(u.sources) ? u.sources.filter((s) => typeof s === "string") : [];
     const completeThreshold = calibration.thresholdFor(sources).threshold;

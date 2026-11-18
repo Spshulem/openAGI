@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TodayView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.appCanvas) private var canvas
     var onRevoked: () -> Void = {}
     @State private var settingsShown = false
 
@@ -24,6 +25,21 @@ struct TodayView: View {
                 if let headline = model.snapshot?.summary.brief.headline, !headline.isEmpty {
                     Section {
                         Text(headline).font(.headline)
+                    }
+                }
+                if let review = model.snapshot?.summary.taskReview {
+                    Section {
+                        if review.status == "reviewed" || review.status == "no_tasks", let date = review.lastReviewedAt {
+                            LabeledContent("Task relevance reviewed") { Text(date, style: .relative) }
+                        } else {
+                            Label(review.status == "unavailable" ? "Task review needs a model" : "Task review couldn't finish",
+                                  systemImage: "exclamationmark.clock")
+                            Text("Saved tasks remain visible. Refresh syncs the list; it doesn't reassess tasks.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if let date = review.lastReviewedAt {
+                                LabeledContent("Last successful review") { Text(date, style: .relative) }
+                            }
+                        }
                     }
                 }
                 let visible = model.snapshot?.visibleToday ?? []
@@ -53,7 +69,12 @@ struct TodayView: View {
                     }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(canvas)
+            .listRowSpacing(4)
             .navigationTitle("Today")
+            .navigationBarTitleDisplayMode(.inline)
             .refreshable { await model.refreshData() }
             .task { await model.refreshToday() }
             .toolbar {
@@ -101,13 +122,15 @@ struct TodayView: View {
             // when an earlier snapshot has real tasks to keep displaying.
             EmptyView()
         } else if model.snapshot == nil && model.refreshFailed {
-            ContentUnavailableView {
-                Label("Couldn't load Today", systemImage: "wifi.exclamationmark")
-            } description: {
-                Text("Your agent couldn't be reached.")
-            } actions: {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Agent unavailable", systemImage: "wifi.exclamationmark")
+                Text("Reconnect to load Today. Saved tasks stay available.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Button("Retry") { Task { await model.refreshData() } }
+                    .frame(minHeight: 44)
             }
+            .padding(.vertical, 8)
+            .listRowBackground(Color.clear)
         } else {
             ContentUnavailableView {
                 Label("No tasks scheduled today", systemImage: "sun.max")

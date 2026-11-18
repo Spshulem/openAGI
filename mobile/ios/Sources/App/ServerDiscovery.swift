@@ -199,10 +199,14 @@ struct ServerDiscoverySheet: View {
             Form {
                 Section("Saved server") {
                     Text(server.absoluteString).textSelection(.enabled)
-                    Text("Your pairing stays saved. Searching does not switch servers or share any credentials.")
+                    if ServerConnectionGuidance.requiresTailscale(server) {
+                        Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
+                            .font(.footnote)
+                    }
+                    Text("Your pairing stays saved. Discovery checks whether a server responds; reconnecting also checks your saved pairing. Searching does not switch servers or share credentials.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Tailscale or Wi-Fi address") {
+                Section("Server address") {
                     TextField("main.tail1234.ts.net:43210", text: $addressText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -224,7 +228,7 @@ struct ServerDiscoverySheet: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(candidate.name)
                                 Text(candidate.address.absoluteString).font(.caption)
-                                Text(candidate.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check OpenAGI, Tailscale, DNS, and access rules" } ?? "Nearby announcement or connection check pending")
+                                Text(candidate.reachable.map { $0 ? "Server reachable · pairing not checked" : "Not reachable · check OpenAGI, Tailscale, DNS, and access rules" } ?? "Nearby announcement or connection check pending")
                                     .font(.footnote).foregroundStyle(.secondary)
                                 Text("Connect to this server…").font(.footnote)
                             }
@@ -232,7 +236,7 @@ struct ServerDiscoverySheet: View {
                         .accessibilityIdentifier("discovered-server-\(candidate.id)")
                     }
                 } footer: {
-                    Text("Tap a server to open connection setup with its address filled in. Keep Tailscale and Use Tailscale DNS enabled on both devices. Searching and selecting never shares your saved credentials; a new connection requires a one-time pairing code.")
+                    Text("Tap a server to open connection setup with its address filled in. Use a local Wi-Fi address, a Tailscale address, or a public HTTPS address. Tailscale addresses require Tailscale and Tailscale DNS on both devices. Searching and selecting never shares your saved credentials; a new connection requires a one-time pairing code.")
                 }
             }
             .navigationTitle("Find servers")

@@ -1,9 +1,9 @@
 import type { OpenAGIApiClient } from './api-client'
 import { OpenAGIApiError } from './config'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[]; questionId?: string; threadKey?: string }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[]; questionId?: string; threadKey?: string; cardId?: string; cardKind?: string; pmBrief?: string; primaryLabel?: string; prRef?: string; ciState?: string }
 // The supervisor's glanceable status: counts by colour, red then yellow threads.
-export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
+export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; cardsCount?: number; catchUpSummary?: string | null; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
 export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'
 export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number; supervisorOnly?: boolean }
 export interface ProactiveView {
@@ -131,6 +131,17 @@ export class G2ProactiveClient {
       await this.refresh()
       return { ok: result.ok === true, detail: result.detail ?? '' }
     } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : 'Main did not answer' } }
+  }
+  // Acts on an enriched Supervisor PM card (safe preflight PR merge, fix CI,
+  // defer, or progressive preference). Halted preflight leaves the card open.
+  async actCard(id: string, cardOp: 'primary' | 'secondary' | 'defer' | 'fix_ci' | 'ship' = 'primary', value?: string): Promise<{ ok: boolean; status?: string; detail: string }> {
+    try {
+      const result = await this.api.proactive({ op: 'act-card', id, cardOp, ...(value ? { value } : {}) }, this.controller.signal) as unknown as { ok?: boolean; status?: string; detail?: string }
+      this.feedGeneration++
+      if (result.ok === true) { this.items = this.items.filter(i => i.id !== id); this.view.inbox?.(this.items) }
+      await this.refresh()
+      return { ok: result.ok === true, status: result.status, detail: result.detail ?? '' }
+    } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : 'Main did not confirm card action' } }
   }
   async fleetStatus(): Promise<FleetStatus | null> {
     try { return await this.api.proactive({ op: 'fleet-status' }, this.controller.signal) as unknown as FleetStatus }

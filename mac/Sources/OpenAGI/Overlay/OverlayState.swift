@@ -237,6 +237,10 @@ final class OverlayState: ObservableObject {
           self.answer = reset ? text : self.answer + text
         }
       )
+      if supervisor && !answer.isEmpty {
+        let finalAnswer = answer
+        Task { await SharedSupervisorClient.shared.appendMirror(userText: q, assistantText: finalAnswer) }
+      }
     } catch {
       if AppState.requestMayStillBeRunning(after: error) {
         isDetached = true

@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import androidx.glance.appwidget.updateAll
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
@@ -16,14 +17,24 @@ import sh.openagi.mobile.widget.TodayWidget
 // summary, so one tap does not silently trigger a second, unrelated refresh.
 class DrainWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        val credentials = Credentials.load(applicationContext) ?: return Result.success()
+        val credentials = try {
+            backgroundCredentials(applicationContext, inputData.getString(WORKSPACE_ID))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return if (runAttemptCount < 2) Result.retry() else Result.failure()
+        } catch (_: LinkageError) {
+            return Result.failure()
+        } ?: return Result.success()
         val coordinator = RefreshCoordinator(
             DaemonClient(credentials.server, credentials.nodeId, credentials.token),
-            SnapshotStore(applicationContext.filesDir),
-            OutboundQueue(applicationContext.filesDir),
+            SnapshotStore(Credentials.workspaceDirectory(applicationContext, credentials)),
+            OutboundQueue(Credentials.workspaceDirectory(applicationContext, credentials)),
         )
         coordinator.drainQueue()
         TodayWidget().updateAll(applicationContext)
         return Result.success()
     }
+
+    companion object { const val WORKSPACE_ID = "workspaceId" }
 }

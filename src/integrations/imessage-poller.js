@@ -25,6 +25,7 @@ import os from "node:os";
 import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "../file-utils.js";
 import { resolveDataDir } from "../data-dir.js";
+import { extractAttributedText } from "./imessage-bridge.js";
 
 const DEFAULT_INTERVAL_MS = 60 * 1000;
 const DEFAULT_DB_PATH = path.join(os.homedir(), "Library", "Messages", "chat.db");
@@ -160,13 +161,13 @@ export class IMessagePollerSource {
 
     let db;
     try {
-      // Read-only open keeps us from racing Messages.app's writes. node:sqlite
-      // doesn't expose a `readOnly` flag explicitly so we open with the
-      // immutable URI parameter via setting the path; if that breaks across
-      // node versions, fall back to a regular open (Messages.app uses WAL,
-      // so concurrent reads should still work).
-      db = new sqlite.DatabaseSync(this.dbPath);
+      // Messages owns this live WAL database. Enforce read-only at open time:
+      // never acquire write authority or create a replacement if it disappears.
+      // Do not use immutable mode, which can miss uncheckpointed WAL messages.
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true });
+      db.exec("PRAGMA query_only = 1; PRAGMA busy_timeout = 2000;");
     } catch (err) {
+      try { db?.close(); } catch { /* ignore */ }
       this.lastError = err.code === "SQLITE_CANTOPEN" || /unable to open/i.test(err.message)
         ? "permission-denied — grant Full Disk Access in System Settings"
         : err.message;
@@ -203,14 +204,14 @@ export class IMessagePollerSource {
           m.ROWID         AS rowid,
           m.guid          AS guid,
           m.text          AS text,
+          m.attributedBody AS body,
           m.is_from_me    AS isFromMe,
           m.date          AS appleDate,
           h.id            AS handleId
         FROM message m
         LEFT JOIN handle h ON h.ROWID = m.handle_id
         WHERE m.ROWID > ?
-          AND m.text IS NOT NULL
-          AND TRIM(m.text) <> ''
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
           AND EXISTS (
             SELECT 1
             FROM chat_message_join cmj
@@ -236,7 +237,9 @@ export class IMessagePollerSource {
       for (const row of rows) {
         if (row.rowid > highestRowid) highestRowid = row.rowid;
         const ts = appleTimestampToIso(row.appleDate);
-        const text = String(row.text ?? "").trim();
+        // Recent Messages versions store text only in attributedBody. Decode
+        // after self-chat filtering; advance past attachments/invalid bodies.
+        const text = String(row.text ?? "").trim() || extractAttributedText(row.body);
         if (!text) continue;
 
         if (this.mode === "task") {

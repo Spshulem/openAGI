@@ -127,7 +127,9 @@
       "someday": 0,
       "done": 0,
       "pending": 5,
-      "completed": 0
+      "completed": 0,
+      "active": 5,
+      "cancelled": 0
     },
     "agent": {
       "total": 0,
@@ -139,7 +141,9 @@
       "someday": 0,
       "done": 0,
       "pending": 0,
-      "completed": 0
+      "completed": 0,
+      "active": 0,
+      "cancelled": 0
     }
   }
 }

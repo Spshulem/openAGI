@@ -12,10 +12,23 @@ function pageScript() {
 
 test("fleet page is a standalone document with the four sections", () => {
   assert.match(fleetPage, /^<!doctype html>/i);
-  for (const text of ["Needs you", "Doing", "Infra", "Fleet", "Scan now", 'href="/"']) {
+  for (const text of ["Needs you", "Doing", "System status", "Supervisor", "Scan now", 'href="/"']) {
     assert.ok(fleetPage.includes(text), text);
   }
   for (const mode of ["observe", "propose", "auto"]) assert.ok(fleetPage.includes('data-mode="' + mode + '"'), mode);
+});
+
+test("fleet page says when the mode is not confirmed by the fleet computer", async () => {
+  const waiting = boot({ state: sampleState({ mode: null, modeConfirmed: false }) });
+  await flush();
+  assert.equal(waiting.el("modeHint").textContent, "Waiting for the fleet computer.");
+  for (const mode of ["observe", "propose", "auto"]) assert.equal(waiting.el("mode-" + mode).attributes?.["aria-pressed"] ?? "false", "false");
+  const last = boot({ state: sampleState({ mode: "auto", modeConfirmed: false }) });
+  await flush();
+  assert.equal(last.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
+  const live = boot({ state: sampleState({ mode: "auto", modeConfirmed: true }) });
+  await flush();
+  assert.notEqual(live.el("modeHint").textContent, "Last reported mode. Waiting for the fleet computer.");
 });
 
 test("fleet page script parses", () => {
@@ -44,6 +57,7 @@ class FakeElement {
     this.children = [];
     this.listeners = {};
     this.dataset = {};
+    this.style = {};
     this.attributes = {};
     this._text = "";
     this.className = "";
@@ -63,20 +77,24 @@ class FakeElement {
   set textContent(value) { this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map((c) => c.textContent).join(""); }
   set innerHTML(_value) { throw new Error("innerHTML must not be used"); }
-  append(...nodes) { for (const node of nodes) this.children.push(node); }
+  append(...nodes) { for (const node of nodes) { node.parent = this; this.children.push(node); } }
   appendChild(node) { this.children.push(node); return node; }
   replaceChildren(...nodes) { this._text = ""; this.children = [...nodes]; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
   addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
-  async click() { for (const fn of this.listeners.click ?? []) await fn({ preventDefault() {} }); }
+  async click() { if (this.onclick) await this.onclick({ preventDefault() {} }); for (const fn of this.listeners.click ?? []) await fn({ preventDefault() {} }); }
+  focus() { this.focused = true; }
+  get isConnected() { return true; }
+  querySelector(selector) { return this.all().find(e => selector.startsWith('.') ? e.className === selector.slice(1) : e.tagName.toLowerCase() === selector) ?? null; }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); }
   scrollIntoView(options) { this.scrolled = options; }
   all() { return [this, ...this.children.flatMap((c) => c.all())]; }
 }
 
 const STATIC_IDS = [
   "scan", "scanned", "timer", "modeHint", "status", "lastError", "needsList", "needsCount", "doingList", "doingCount",
-  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
+  "codingList", "codingDetail", "codingStatus", "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
 ];
 
 function sampleState(overrides = {}) {
@@ -132,7 +150,7 @@ function sampleState(overrides = {}) {
   };
 }
 
-function boot({ search = "", state = sampleState(), confirmResult = true, promptResult = null } = {}) {
+function boot({ search = "", state = sampleState(), managed = { sessions: [], watches: [] }, confirmResult = true, promptResult = null } = {}) {
   const elements = new Map(STATIC_IDS.map((id) => [id, new FakeElement(id.startsWith("mode-") ? "button" : "div")]));
   for (const mode of ["observe", "propose", "auto"]) elements.get("mode-" + mode).dataset.mode = mode;
   const requests = [];
@@ -141,6 +159,11 @@ function boot({ search = "", state = sampleState(), confirmResult = true, prompt
   const fetch = async (path, init = {}) => {
     const body = init.body ? JSON.parse(init.body) : undefined;
     requests.push({ path, method: init.method ?? "GET", body });
+    if (path === '/coding-agents/watch') {
+      managed.watches = body.enabled ? [{ provider: body.provider, sessionId: body.sessionId, active: true }] : [];
+      return { ok: true, status: 200, json: async () => ({ watching: body.enabled }) };
+    }
+    if (path === '/coding-agents') return { ok: true, status: 200, json: async () => managed };
     const pending = responses.shift();
     const next = pending ? await pending : null;
     if (next) return { ok: next.status < 400, status: next.status, json: async () => next.body };
@@ -185,7 +208,7 @@ function findAll(root, predicate) {
 test("page renders state with text only and neutralises unsafe links", async () => {
   const page = boot();
   await settle();
-  assert.equal(page.requests[0].path, "/fleet/api/state");
+  assert.ok(page.requests.some(request => request.path === "/fleet/api/state"));
   const needs = page.el("needsList");
   assert.ok(needs.textContent.includes("<img src=x onerror=alert(1)>"), "untrusted title is plain text");
   const optionButtons = findAll(needs, (e) => e.tagName === "BUTTON");
@@ -744,4 +767,221 @@ test('clarification cards collect an answer and show its unresolved state as tex
   assert.match(f.el('needsList').textContent, /Your clarification: <img src=x> synthetic answer/);
   assert.match(f.el('status').textContent, /still unresolved/);
   assert.equal(f.el('needsList').all().some(e => e.tagName === 'IMG'), false);
+});
+
+// ─── chat and reply ───────────────────────────────────────────────────────
+
+const conversationDetail = (key) => ({ thread: { key, conversation: { truncated: false, unavailableReason: null, messages: [
+  { id: "m1", role: "user", text: "Ship the fix <b>now</b>", at: new Date(Date.now() - 30 * 60_000).toISOString() },
+  { id: "m2", role: "assistant", text: "Tests pass. Merge to main or wait?", at: new Date(Date.now() - 5 * 60_000).toISOString() }
+] } } });
+
+function chatOf(root) {
+  return findAll(root, (e) => e.tagName === "DETAILS" && e.className === "chatwrap")[0];
+}
+
+test("the thread list is headed In progress, not Watching", () => {
+  assert.match(fleetPage, /<h2 id="fleetH">In progress /);
+  assert.doesNotMatch(fleetPage, /<h2[^>]*>Watching/);
+});
+
+test("a question card opens Chat and reply: the conversation, then a reply that posts { reply }", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: false };
+  const page = boot({ state });
+  await settle();
+  const needs = page.el("needsList");
+  const chat = chatOf(needs);
+  assert.ok(chat, "the card has a Chat and reply block");
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA").length, 0, "filled only once opened");
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chat);
+  const get = page.requests.find((r) => r.path.startsWith("/fleet/api/threads/"));
+  assert.equal(get.path, "/fleet/api/threads/codex%3Aa");
+  const opened = chatOf(page.el("needsList"));
+  assert.ok(opened.textContent.includes("Ship the fix <b>now</b>"), "messages as plain text");
+  assert.ok(opened.textContent.includes("Tests pass. Merge to main or wait?"));
+  assert.ok(opened.textContent.indexOf("Ship the fix") < opened.textContent.indexOf("Tests pass"), "oldest first");
+  const area = findAll(opened, (e) => e.tagName === "TEXTAREA")[0];
+  assert.equal(area.maxLength, 2000);
+  area.value = "  Wait for Nikhil, then merge.  ";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.responses.push({ status: 200, body: { question: { id: "fq_one", status: "answered" }, delivery: { status: "sent", route: "computer-use" }, state: sampleState({ questions: [] }) } });
+  await findAll(opened, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_one");
+  assert.deepEqual(post.body, { reply: "Wait for Nikhil, then merge." });
+  assert.equal(page.el("status").textContent, "Sent to the agent.");
+});
+
+test("a blocked reply keeps the words and says why", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: true };
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chatOf(page.el("needsList")));
+  let chat = chatOf(page.el("needsList"));
+  assert.ok(chat.textContent.includes("only typed into the agent app"), "a risky reply says how it goes");
+  const area = findAll(chat, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Merge it.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.responses.push({ status: 200, body: { question: state.questions[0], delivery: { status: "blocked", detail: "risky ask: approve it in the chat" }, state } });
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await findAll(chat, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  assert.match(page.el("status").textContent, /^Not sent: risky ask: approve it in the chat/);
+  chat = chatOf(page.el("needsList"));
+  assert.equal(chat.open, true, "stays open across the repaint");
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA")[0].value, "Merge it.", "the draft survives");
+});
+
+// PR #278 Bugbot: a 404/409 on send reloaded while the reply box still had
+// the focus, so the repaint was skipped (the closed ask stayed) and the
+// reload's success wiped the error that said why.
+test("a reply to a question that closed meanwhile removes its card and keeps saying why, even with the box focused", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], canReply: true, risky: false };
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("codex:a") });
+  await expand(chatOf(page.el("needsList")));
+  const area = findAll(chatOf(page.el("needsList")), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Merge it.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.context.document.activeElement = area;
+  page.setState({ ...state, questions: [] });
+  page.responses.push({ status: 409, body: { error: "That question is already closed." } });
+  await findAll(chatOf(page.el("needsList")), (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  assert.equal(chatOf(page.el("needsList")), undefined, "the closed question left the page");
+  assert.equal(page.el("status").textContent, "That question is already closed.");
+  assert.match(page.el("status").className, /err/);
+});
+
+test("a reply refused with 404 while focused keeps the draft and the reason", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Rebase on main first.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  page.context.document.activeElement = area;
+  page.responses.push({ status: 404, body: { error: "That thread is not in the last scan." } });
+  await findAll(rowOf(page, "No plan"), (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  assert.equal(page.el("status").textContent, "That thread is not in the last scan.");
+  const again = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  assert.notEqual(again, area, "repainted despite the focus");
+  assert.equal(again.value, "Rebase on main first.", "the draft survives");
+});
+
+test("a question only the app answers has no reply box: Answer it in the app, and Open chat", async () => {
+  const state = watchState();
+  state.questions = [{ ...state.questions[0], kind: "agent-card", answerIn: "agent app", options: ["open thread"], canReply: false,
+    openChat: { app: "codex", url: "codex://threads/01a13388", label: "amex · Codex", note: null } }];
+  const page = boot({ state });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("conductor:d1") });
+  await expand(chatOf(page.el("needsList")));
+  const chat = chatOf(page.el("needsList"));
+  assert.equal(findAll(chat, (e) => e.tagName === "TEXTAREA").length, 0);
+  assert.ok(chat.textContent.includes("Answer it in Codex."));
+  assert.equal(findAll(chat, (e) => e.tagName === "A" && e.textContent === "Open chat")[0].href, "codex://threads/01a13388");
+});
+
+test("a question with no single thread has no chat block", async () => {
+  const state = sampleState();
+  state.questions[0] = { ...state.questions[0], kind: "limit", threadKey: null, threadKeys: ["codex:a", "claude:b"], canReply: false };
+  const page = boot({ state });
+  await settle();
+  assert.equal(chatOf(page.el("needsList")), undefined);
+});
+
+test("an In progress row shows its chat and sends the owner's message to the thread", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  page.responses.push({ status: 200, body: conversationDetail("conductor:p2") });
+  await expand(rowOf(page, "No plan"));
+  const row = rowOf(page, "No plan");
+  assert.ok(row.textContent.includes("Chat and reply"));
+  assert.ok(row.textContent.includes("Tests pass. Merge to main or wait?"));
+  const area = findAll(row, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Rebase on main first.";
+  page.responses.push({ status: 200, body: { delivery: { status: "queued", detail: "Saved. It goes to the agent once the Mac can type (owner using the Mac)." }, state: watchState() } });
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/send");
+  assert.deepEqual(post.body, { threadKey: "conductor:p2", message: "Rebase on main first." });
+  assert.match(page.el("status").textContent, /^Saved\. It goes to the agent once the Mac can type/);
+});
+
+test("a row whose question takes a reply answers that question", async () => {
+  const state = watchState();
+  state.questions[0].canReply = true;
+  const page = boot({ state });
+  await settle();
+  const row = rowOf(page, "Capacity fix");
+  const area = findAll(row, (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "Add a slot, then rerun.";
+  page.responses.push({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send reply")[0].click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_cap");
+  assert.deepEqual(post.body, { reply: "Add a slot, then rerun." });
+});
+
+test("an empty reply sends nothing", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  const row = rowOf(page, "No plan");
+  await findAll(row, (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  assert.equal(page.requests.filter((r) => r.method === "POST").length, 0);
+  assert.equal(page.el("status").textContent, "Type a reply first.");
+});
+
+test("words typed while a reply sends stay as the next draft", async () => {
+  const page = boot({ state: watchState() });
+  await settle();
+  let release;
+  page.responses.push(new Promise((resolve) => { release = resolve; }));
+  let area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  area.value = "First message.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  const sending = findAll(rowOf(page, "No plan"), (e) => e.tagName === "BUTTON" && e.textContent === "Send to chat")[0].click();
+  await settle();
+  area.value = "Second message.";
+  for (const fn of area.listeners.input ?? []) fn({});
+  release({ status: 200, body: { delivery: { status: "sent" }, state: watchState() } });
+  await sending;
+  await settle();
+  assert.deepEqual(page.requests.find((r) => r.method === "POST").body, { threadKey: "conductor:p2", message: "First message." });
+  area = findAll(rowOf(page, "No plan"), (e) => e.tagName === "TEXTAREA")[0];
+  assert.equal(area.value, "Second message.");
+});
+
+test("managed exec sessions remain visible and watching requires an explicit in-page confirmation", async () => {
+  const page = boot({ state: sampleState({ snapshot: { threads: [], counts: { threads: 1, inScope: 0 } } }), managed: {
+    sessions: [{ provider: "codex", sessionId: "managed-1", project: "<img src=x> onboarding project", status: "idle", route: "builtin-cli", replyAvailable: true, model: "gpt-5" }], watches: []
+  } });
+  await settle();
+  assert.match(page.el("codingList").textContent, /onboarding project/);
+  assert.match(page.el("codingList").textContent, /Response ready/);
+  assert.equal(findAll(page.el("codingList"), e => e.tagName === "IMG").length, 0);
+  const named = label => findAll(page.el("codingList"), e => e.tagName === "BUTTON" && e.textContent === label)[0];
+  await named("Watch session").click();
+  assert.equal(page.requests.filter(r => r.path === "/coding-agents/watch").length, 0);
+  assert.ok(named("Start watching").focused);
+  await named("Cancel").click();
+  assert.equal(page.requests.filter(r => r.path === "/coding-agents/watch").length, 0);
+  await named("Watch session").click();
+  await named("Start watching").click();
+  assert.ok(named("Stop watching"));
+  assert.deepEqual(page.requests.filter(r => r.path === "/coding-agents/watch").map(r => r.body.enabled), [true]);
+  await named("Stop watching").click();
+  assert.ok(named("Watch session"));
+  assert.deepEqual(page.requests.filter(r => r.path === "/coding-agents/watch").map(r => r.body.enabled), [true, false]);
 });

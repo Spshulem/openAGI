@@ -363,3 +363,65 @@ test("Antigravity detail and owner actions accept raw and encoded thread keys", 
   }
   assert.deepEqual(seen, [...Array(2)].flatMap(() => ["detail", "push", "mute", "unmute"].map((action) => [action, "antigravity:a1"])));
 });
+
+// ─── replies ──────────────────────────────────────────────────────────────
+
+function replySupervisor({ canReply = true, delivery = { status: "sent", route: "computer-use" } } = {}) {
+  const sup = fakeSupervisor();
+  sup.state.questions[0].canReply = canReply;
+  sup.replyQuestion = async (id, reply, options) => {
+    sup.calls.push(["replyQuestion", id, reply, options]);
+    if (!sup.state.questions.some((q) => q.id === id)) return null;
+    if (["sent", "queued"].includes(delivery.status)) sup.state.questions = sup.state.questions.filter((q) => q.id !== id);
+    return { question: { id, status: ["sent", "queued"].includes(delivery.status) ? "answered" : "open", answer: reply }, delivery };
+  };
+  return sup;
+}
+
+test("POST questions/:id { reply } sends the owner's words and returns the delivery and state", async () => {
+  const sup = replySupervisor();
+  const route = createFleetRoute({ supervisor: sup });
+  const res = await route("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "  Wait for review, then merge.  " }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(sup.calls.find((c) => c[0] === "replyQuestion"), ["replyQuestion", "fq_open1", "Wait for review, then merge.", { deadlineAt: null }]);
+  assert.equal(res.body.delivery.status, "sent");
+  assert.equal(res.body.question.status, "answered");
+  assert.equal(res.body.state.questions.length, 0);
+  assert.equal(sup.calls.some((c) => c[0] === "answerQuestion"), false, "a reply is never an option answer");
+});
+
+test("a blocked reply comes back 200 with the question still open", async () => {
+  const sup = replySupervisor({ delivery: { status: "blocked", route: null, detail: "risky ask: approve it in the chat" } });
+  const route = createFleetRoute({ supervisor: sup });
+  const res = await route("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "yes" }));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.delivery.status, "blocked");
+  assert.equal(res.body.state.questions.length, 1);
+});
+
+test("replies are 1-2000 characters, only to open questions that take one", async () => {
+  const route = createFleetRoute({ supervisor: replySupervisor() });
+  const post = (id, value) => route("POST", "/fleet/api/questions/" + id, url("/fleet/api/questions/" + id), body(value));
+  for (const reply of ["", "   ", 7, null, "x".repeat(2001)]) {
+    const res = await post("fq_open1", { reply });
+    assert.equal(res.status, 400, JSON.stringify(reply));
+    assert.match(res.body.error, /1-2000/);
+  }
+  assert.equal((await post("fq_open1", { reply: "x".repeat(2000) })).status, 200);
+  assert.equal((await post("fq_gone", { reply: "hi" })).status, 404);
+  const noReply = createFleetRoute({ supervisor: replySupervisor({ canReply: false }) });
+  const refused = await noReply("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "hi" }));
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.error, /no typed reply/);
+  const missing = fakeSupervisor();
+  missing.state.questions[0].canReply = true;
+  const unavailable = await createFleetRoute({ supervisor: missing })("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "hi" }));
+  assert.equal(unavailable.status, 503);
+});
+
+test("a reply to a question closed mid-request is 409", async () => {
+  const sup = replySupervisor();
+  sup.replyQuestion = async () => null;
+  const res = await createFleetRoute({ supervisor: sup })("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "hi" }));
+  assert.equal(res.status, 409);
+});

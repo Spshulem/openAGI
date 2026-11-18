@@ -73,7 +73,7 @@ test("Computer History uses measured capture status and a day-grouped, paginated
   assert.match(renderer, /encodeURIComponent\(id\)/, "skill suggestion ids must be encoded before reaching the accept route");
   assert.match(renderer, /result\.skillCreateError/, "retryable skill creation failures must not be reported as success");
   assert.match(renderer, /state\.activityFilter\.limit \+= HISTORY_PAGE_SIZE/, "Load more must expand the bounded query");
-  assert.match(renderer, /results\.length > requestedLimit/, "pagination must be based on a one-row lookahead");
+  assert.match(renderer, /results\.length > HISTORY_PAGE_SIZE/, "pagination must be based on a one-row lookahead");
   assert.match(hostedSource, /Math\.min\(5_000, Number\.isFinite\(parsedLimit\)/,
     "private OCR search responses must remain server-bounded");
 
@@ -365,4 +365,20 @@ test("Ask about your history deep-links to Chat with an editable starter prompt"
   assert.equal(next.searchParams.get("compose"), "ask-history");
   assert.equal(selectedTab, "chat");
   assert.match(dashboardScript, /"ask-history": "Summarize what I was working on recently/);
+});
+
+
+test("Tasks and Today route request failures to recovery instead of an empty queue", async () => {
+  for (const [name, title] of [["renderTasks", "Tasks"], ["renderToday", "Today"]]) {
+    const source = dashboardScript.match(new RegExp("async function " + name + "\\(\\) \\{[\\s\\S]*?\\n\\}"))?.[0];
+    assert.ok(source);
+    const recovered = [];
+    const context = vm.createContext({ state: {}, URLSearchParams,
+      window: { location: { search: "" } },
+      fetchJson: async () => { const error = new Error('unavailable'); error.code = 'main-pairing-required'; throw error; },
+      renderWorkspaceUnavailable: async (title, error) => recovered.push([title, error.code]) });
+    vm.runInContext(source, context);
+    await context[name]();
+    assert.deepEqual(recovered, [[title, 'main-pairing-required']]);
+  }
 });
