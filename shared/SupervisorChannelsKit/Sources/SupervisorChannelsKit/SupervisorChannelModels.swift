@@ -115,6 +115,10 @@ public struct SupervisorOverlapNotice: Identifiable, Equatable, Sendable {
 }
 
 public enum SupervisorChannelGrouping {
+    private static func looksLikeProjectSlug(_ raw: String) -> Bool {
+        !raw.isEmpty && raw.count <= 36 && !raw.contains(": ") && !raw.contains(" ") && !raw.contains("(") && !raw.contains(")")
+    }
+
     public static func normalizeProject(
         explicit: String? = nil,
         repo: String? = nil,
@@ -122,24 +126,23 @@ public enum SupervisorChannelGrouping {
         cwd: String? = nil
     ) -> String {
         if let raw = explicit?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !raw.isEmpty,
+           looksLikeProjectSlug(raw),
            raw.caseInsensitiveCompare("General") != .orderedSame {
             return raw
         }
         if let repoRaw = repo?.trimmingCharacters(in: .whitespacesAndNewlines), !repoRaw.isEmpty {
             let parts = repoRaw.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-            if let last = parts.last, !last.isEmpty {
+            if let last = parts.last, looksLikeProjectSlug(last) {
                 return last
             }
         }
-        let dirCandidate = [cwd, workspace]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        if let dirCandidate {
+        for dirCandidate in [cwd, workspace].compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) }).filter({ !$0.isEmpty }) {
             let cleaned = dirCandidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let base = cleaned.split(separator: "/").last.map(String.init) ?? cleaned
+            let isPath = cleaned.contains("/")
+            let base = isPath ? (cleaned.split(separator: "/").last.map(String.init) ?? "") : cleaned
             if !base.isEmpty,
-               base.caseInsensitiveCompare("workspace") != .orderedSame {
+               base.caseInsensitiveCompare("workspace") != .orderedSame,
+               isPath || looksLikeProjectSlug(base) {
                 return base
             }
         }
@@ -204,7 +207,7 @@ public enum SupervisorChannelGrouping {
             }
         }
 
-        return displayNames.keys.sorted { lhs, rhs in
+        return displayNames.keys.filter { $0 != "general" }.sorted { lhs, rhs in
             let lw = waiting[lhs, default: 0], rw = waiting[rhs, default: 0]
             if lw != rw { return lw > rw }
             let lr = running[lhs, default: 0], rr = running[rhs, default: 0]

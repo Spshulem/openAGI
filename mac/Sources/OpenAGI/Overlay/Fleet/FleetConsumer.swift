@@ -42,6 +42,8 @@ final class FleetConsumer: ObservableObject {
   /// Typed replies not sent yet, by FleetOpenItem.key. Kept across Back and
   /// a failed send; cleared once the hub takes it.
   @Published private(set) var drafts: [String: String] = [:]
+  /// Optional image payloads attached to a workspace reply, keyed by FleetOpenItem.key.
+  private var pendingReplyImages: [String: [[String: Any]]] = [:]
   /// FleetOpenItem keys with a reply in flight.
   @Published private(set) var replyInFlight: Set<String> = []
   /// Each item's last reply result, under its reply box.
@@ -249,6 +251,40 @@ final class FleetConsumer: ObservableObject {
     drafts[item.key] = text.isEmpty ? nil : text
   }
 
+  /// Routes workspace thread/question replies through the single `sendReply`
+  /// path (preserving Quick Ask / Supervisor Workspace image & text invariants).
+  func sendWorkspaceThreadReply(threadKey: String, message: String, images: [[String: Any]] = []) async -> FleetNote {
+    await sendWorkspaceReply(for: .thread(threadKey), message: message, images: images)
+  }
+
+  /// Reply to a Needs-You card with optional photo attachments via `sendReply`.
+  func sendWorkspaceQuestionReply(_ question: FleetQuestion, message: String, images: [[String: Any]] = []) async -> FleetNote {
+    await sendWorkspaceReply(for: .question(question.id), message: message, images: images)
+  }
+
+  private func sendWorkspaceReply(for item: FleetOpenItem, message: String, images: [[String: Any]]) async -> FleetNote {
+    let targetItem: FleetOpenItem
+    if case let .question(id) = item, !images.isEmpty, let tk = question(id)?.threadKey {
+      targetItem = .thread(tk)
+    } else {
+      targetItem = item
+    }
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    let effective = trimmed.isEmpty && !images.isEmpty ? "Please inspect the attached image(s)." : trimmed
+    guard FleetReplyTarget.message(effective) != nil else {
+      return FleetNote(text: "Enter a message or attach a photo first.", isError: true)
+    }
+    let slot = targetItem.key
+    drafts[slot] = effective
+    pendingReplyImages[slot] = images.isEmpty ? nil : images
+    await sendReply(targetItem)
+    if let note = replyNotes[slot] { return note }
+    if !replyInFlight.contains(slot), drafts[slot] == nil {
+      return FleetNote(text: "Sent to the agent.", isError: false)
+    }
+    return FleetNote(text: "Couldn't send reply.", isError: true)
+  }
+
   func clearReplyNote(_ item: FleetOpenItem) {
     replyNotes[item.key] = nil
   }
@@ -258,9 +294,10 @@ final class FleetConsumer: ObservableObject {
   func sendReply(_ item: FleetOpenItem) async {
     let slot = item.key
     guard !replyInFlight.contains(slot), let submitted = drafts[slot], let message = FleetReplyTarget.message(submitted) else { return }
+    let attachedImages = pendingReplyImages[slot] ?? []
     let target = replyTarget(item)
     let path: String
-    let body: [String: Any]
+    var body: [String: Any]
     switch target {
     case let .question(id):
       path = "/fleet/api/questions/\(id)"
@@ -268,6 +305,7 @@ final class FleetConsumer: ObservableObject {
     case let .thread(key):
       path = "/fleet/api/send"
       body = ["threadKey": key, "message": message]
+      if !attachedImages.isEmpty { body["images"] = attachedImages }
     case let .none(why):
       replyNotes[slot] = FleetNote(text: why, isError: true)
       return
@@ -285,7 +323,10 @@ final class FleetConsumer: ObservableObject {
       let (data, response) = try await send(req)
       let code = (response as? HTTPURLResponse)?.statusCode ?? 0
       let note = Self.replyNote(code: code, data: data, target: target)
-      if note.taken { drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted) }
+      if note.taken {
+        drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted)
+        pendingReplyImages[slot] = nil
+      }
       replyNotes[slot] = note.note
       if (200..<300).contains(code) {
         if let state = (try? JSONDecoder().decode(FleetQuestionResponse.self, from: data))?.state {
@@ -624,6 +665,7 @@ final class FleetConsumer: ObservableObject {
     sendingDeadline = [:]
     openItem = nil
     drafts = [:]
+    pendingReplyImages = [:]
     replyNotes = [:]
     details = [:]
     threadNotes = [:]

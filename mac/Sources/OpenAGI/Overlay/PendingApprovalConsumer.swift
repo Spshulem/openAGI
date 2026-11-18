@@ -168,10 +168,24 @@ final class PendingApprovalConsumer: ObservableObject {
       lastOutcome = "Cleared stale requests."
       lastError = nil
       await refresh()
-    } catch let error as MainConnectionError {
-      lastError = error.localizedDescription
     } catch {
-      lastError = "Couldn't dismiss approvals."
+      let targets = items.filter { mode == nil || $0.mode == mode }
+      if !targets.isEmpty {
+        for item in targets {
+          await decide(item.id, decision: "deny")
+        }
+        await refresh()
+        if items.allSatisfy({ mode != nil && $0.mode != mode }) {
+          lastOutcome = "Cleared stale requests."
+          lastError = nil
+          return
+        }
+      }
+      if let mainErr = error as? MainConnectionError {
+        lastError = mainErr.localizedDescription
+      } else {
+        lastError = "Couldn't dismiss approvals."
+      }
     }
   }
 

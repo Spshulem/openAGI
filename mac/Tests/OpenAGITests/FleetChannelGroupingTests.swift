@@ -6,7 +6,18 @@ final class FleetChannelGroupingTests: XCTestCase {
     XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(explicit: "buildbetter", repo: "acme/other"), "buildbetter")
     XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(explicit: "General", repo: "buildbetter-app/bb-recorder"), "bb-recorder")
     XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(cwd: "/Users/dev/openAGI/"), "openAGI")
+    XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(workspace: "Give each Bob user a personal workspace"), "general")
+    XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(workspace: "feat(surveys): persist replies"), "general")
     XCTAssertEqual(SupervisorChannelGrouping.normalizeProject(), "general")
+  }
+
+  func testProjectChannelsOmitsGeneralDuplicate() {
+    let items = [
+      SupervisorDecisionItem(id: "1", project: "general", headline: "Disk cleanup"),
+      SupervisorDecisionItem(id: "2", project: "buildbetter", headline: "Merge PR"),
+    ]
+    let channels = SupervisorChannelGrouping.projectChannels(from: items)
+    XCTAssertEqual(channels.map(\.displayName), ["# buildbetter"])
   }
 
   func testGroupByProjectOrdersWaitingHighestFirstWithGeneralLast() {

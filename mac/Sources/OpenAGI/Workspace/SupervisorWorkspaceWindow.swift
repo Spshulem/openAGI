@@ -1,6 +1,7 @@
 import AppKit
 import SupervisorChannelsKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class SupervisorWindowController {
@@ -19,12 +20,12 @@ final class SupervisorWindowController {
       return
     }
     let root = SupervisorWorkspaceView()
-      .frame(minWidth: 740, minHeight: 500)
+      .frame(minWidth: 780, minHeight: 540)
     let host = NSHostingController(rootView: root)
     let win = NSWindow(contentViewController: host)
     win.title = "OpenAGI Supervisor Workspace"
     win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-    win.setContentSize(NSSize(width: 980, height: 680))
+    win.setContentSize(NSSize(width: 1020, height: 700))
     win.center()
     win.isReleasedWhenClosed = false
     self.window = win
@@ -37,6 +38,7 @@ private enum WorkspaceChannel: Hashable {
   case general
   case needsYou
   case tasks
+  case sessions
   case project(String)
 }
 
@@ -48,7 +50,18 @@ struct SupervisorWorkspaceView: View {
 
   @State private var channel: WorkspaceChannel = .general
   @State private var composerText = ""
+  @State private var composerImages: [WorkspaceImageAttachment] = []
+  @State private var composerStatusNote: String? = nil
+  @State private var isDropTargeted = false
+  @State private var inlineChatOpen = false
   @State private var newTaskTitle = ""
+
+  @State private var expandedQuestionIDs: Set<String> = []
+  @State private var expandedThreadKeys: Set<String> = []
+  @State private var threadReplyText: [String: String] = [:]
+  @State private var threadReplyImages: [String: [WorkspaceImageAttachment]] = [:]
+  @State private var threadReplyBusy: Set<String> = []
+  @State private var threadReplyFeedback: [String: FleetNote] = [:]
 
   private var decisionItems: [SupervisorDecisionItem] {
     let byKey = Dictionary(fleet.threads.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
@@ -98,7 +111,7 @@ struct SupervisorWorkspaceView: View {
 
   private var activeTargetLabel: String {
     switch channel {
-    case .general, .needsYou, .tasks:
+    case .general, .needsYou, .tasks, .sessions:
       return "#general · Synced (Mac · Paseo · Phone · G2)"
     case let .project(name):
       return "#\(name) · Synced Supervisor"
@@ -108,7 +121,7 @@ struct SupervisorWorkspaceView: View {
   var body: some View {
     HStack(spacing: 0) {
       sidebar
-        .frame(width: 225)
+        .frame(width: 215)
         .background(Color(nsColor: .windowBackgroundColor))
 
       Divider()
@@ -125,6 +138,8 @@ struct SupervisorWorkspaceView: View {
               needsYouStage
             case .tasks:
               tasksStage
+            case .sessions:
+              sessionsStage
             case let .project(projName):
               projectStage(projName)
             }
@@ -132,6 +147,12 @@ struct SupervisorWorkspaceView: View {
           .padding(16)
           .frame(maxWidth: .infinity, alignment: .leading)
         }
+
+        if channel != .general && inlineChatOpen {
+          Divider()
+          inlineSupervisorDrawer
+        }
+
         Divider()
         bottomComposer
       }
@@ -143,6 +164,8 @@ struct SupervisorWorkspaceView: View {
       await approvals.refresh()
     }
   }
+
+  // MARK: - Sidebar
 
   private var sidebar: some View {
     ScrollView {
@@ -172,6 +195,12 @@ struct SupervisorWorkspaceView: View {
           badge: supervisor.tasks.isEmpty ? nil : "\(supervisor.tasks.count)",
           selected: channel == .tasks
         ) { channel = .tasks }
+
+        channelRow(
+          title: "⚡ # sessions",
+          badge: sessionBriefs.isEmpty ? nil : "\(sessionBriefs.count)",
+          selected: channel == .sessions
+        ) { channel = .sessions }
 
         if !projectChannels.isEmpty {
           Text("PROJECT CHANNELS")
@@ -230,6 +259,8 @@ struct SupervisorWorkspaceView: View {
     .buttonStyle(.plain)
   }
 
+  // MARK: - Header
+
   private var stageHeader: some View {
     HStack(spacing: 10) {
       VStack(alignment: .leading, spacing: 2) {
@@ -249,6 +280,9 @@ struct SupervisorWorkspaceView: View {
           await supervisor.refreshAll()
           await fleet.refresh()
           await approvals.refresh()
+          for key in expandedThreadKeys {
+            await fleet.loadDetail(key)
+          }
         }
       }
       Button("Web Dashboard") {
@@ -264,9 +298,12 @@ struct SupervisorWorkspaceView: View {
     case .general: return "# general — Synced Supervisor"
     case .needsYou: return "# needs-you — Decisions by Project"
     case .tasks: return "# tasks — OpenAGI Todo Queue"
+    case .sessions: return "# sessions — All Watched Coding Chats"
     case let .project(name): return "# \(name)"
     }
   }
+
+  // MARK: - Stages
 
   @ViewBuilder
   private var generalStage: some View {
@@ -282,25 +319,11 @@ struct SupervisorWorkspaceView: View {
     }
 
     if supervisor.messages.isEmpty {
-      Text("Start talking to Supervisor — your thread stays synced across Mac Floater, Mac Workspace, Paseo, iPhone, and Even G2.")
+      Text("Start talking to Supervisor — attach screenshots, paste images, or ask about any thread. Synced across Mac, Paseo, iPhone, and Even G2.")
         .font(.callout)
         .foregroundStyle(.secondary)
     } else {
-      ForEach(supervisor.messages) { msg in
-        VStack(alignment: msg.role == "user" ? .trailing : .leading, spacing: 4) {
-          Text(msg.role == "user" ? (msg.sourceName ?? "You") : "Supervisor")
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
-          Text(msg.text)
-            .textSelection(.enabled)
-            .padding(10)
-            .background(
-              msg.role == "user" ? Color.accentColor.opacity(0.16) : Color(nsColor: .controlBackgroundColor),
-              in: RoundedRectangle(cornerRadius: 10)
-            )
-        }
-        .frame(maxWidth: .infinity, alignment: msg.role == "user" ? .trailing : .leading)
-      }
+      supervisorMessagesView(supervisor.messages)
     }
   }
 
@@ -403,6 +426,25 @@ struct SupervisorWorkspaceView: View {
   }
 
   @ViewBuilder
+  private var sessionsStage: some View {
+    if sessionBriefs.isEmpty {
+      Text("No active or recently watched sessions loaded.")
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    } else {
+      let runningFirst = sessionBriefs.sorted { a, b in
+        let ar = a.state == "running" ? 1 : 0
+        let br = b.state == "running" ? 1 : 0
+        if ar != br { return ar > br }
+        return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+      }
+      ForEach(runningFirst) { session in
+        sessionCardView(session, showProjectTag: true)
+      }
+    }
+  }
+
+  @ViewBuilder
   private func projectStage(_ projName: String) -> some View {
     let overlaps = SupervisorChannelGrouping.calmOverlaps(
       for: SupervisorChannelGrouping.filterSessions(sessionBriefs, project: projName)
@@ -431,63 +473,410 @@ struct SupervisorWorkspaceView: View {
 
     let projSessions = SupervisorChannelGrouping.filterSessions(sessionBriefs, project: projName)
     if projSessions.isEmpty {
-      Text("No loaded sessions in #\(projName) yet. Type below to start or route one.")
+      Text("No loaded sessions in #\(projName) yet. Type below to ask Supervisor or route a goal.")
         .font(.callout)
         .foregroundStyle(.secondary)
     } else {
       Text("Sessions (\(projSessions.count))")
         .font(.subheadline.weight(.semibold))
       ForEach(projSessions) { session in
-        HStack {
-          Circle()
-            .fill(session.state == "running" ? Color.green : Color.secondary.opacity(0.4))
-            .frame(width: 8, height: 8)
-          VStack(alignment: .leading, spacing: 2) {
-            Text(session.title).font(.body.weight(.medium))
-            Text([session.state, session.host, session.cwd].compactMap { $0 }.joined(separator: " · "))
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          }
-          Spacer()
-          Button("Ask in #general") {
-            composerText = "Check on \(session.title) in #\(projName): "
-            channel = .general
-          }
-        }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        sessionCardView(session, showProjectTag: false)
       }
     }
   }
 
+  // MARK: - Question & Thread Cards (Expandable Context + Transcript + Direct Reply)
+
+  private func toggleQuestionExpand(_ q: FleetQuestion) {
+    if expandedQuestionIDs.contains(q.id) {
+      expandedQuestionIDs.remove(q.id)
+    } else {
+      expandedQuestionIDs.insert(q.id)
+      if let tk = q.threadKey {
+        Task { await fleet.loadDetail(tk) }
+      }
+    }
+  }
+
+  private func toggleThreadExpand(_ key: String) {
+    if expandedThreadKeys.contains(key) {
+      expandedThreadKeys.remove(key)
+    } else {
+      expandedThreadKeys.insert(key)
+      Task { await fleet.loadDetail(key) }
+    }
+  }
+
   private func questionCardView(_ q: FleetQuestion) -> some View {
-    VStack(alignment: .leading, spacing: 8) {
-      HStack {
-        Text(q.title).font(.subheadline.weight(.semibold))
-        Spacer()
-        if let label = q.chatLabel {
-          Text(label).font(.caption).foregroundStyle(.secondary)
+    let isExpanded = expandedQuestionIDs.contains(q.id)
+    let busy = fleet.inFlight.contains(q.id) || fleet.stillSending.contains(q.id)
+    let detail = q.threadKey.flatMap { fleet.details[$0] }
+    let openChat = q.openChat ?? q.chats.first ?? q.threadKey.flatMap { fleet.thread($0)?.openChat } ?? detail?.openChat
+    let slotKey = "q:\(q.id)"
+
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack(alignment: .top, spacing: 8) {
+        VStack(alignment: .leading, spacing: 2) {
+          if q.risky { FleetRiskyLabel() }
+          Text(q.title)
+            .font(.subheadline.weight(.semibold))
+            .textSelection(.enabled)
+          if let label = q.chatLabel ?? openChat?.label {
+            Text(label)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+          }
         }
+        Spacer()
+        if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
+          Button("\(btnTitle) ↗") {
+            fleet.openChat(chat)
+          }
+          .controlSize(.small)
+          .help(chat.link == nil ? (chat.note ?? "Bring \(chat.appName ?? "app") forward") : "Open this thread directly")
+        }
+        Button(isExpanded ? "Hide ▴" : "Context & Chat ▾") {
+          toggleQuestionExpand(q)
+        }
+        .controlSize(.small)
       }
+
       if !q.body.isEmpty {
-        Text(q.body).font(.callout).foregroundStyle(.secondary)
+        Text(q.body)
+          .font(.callout)
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
       }
+
       HStack(spacing: 8) {
         ForEach(q.tappableOptions.prefix(4), id: \.self) { opt in
           Button(q.label(for: opt)) {
             Task { await fleet.answer(q, option: opt) }
           }
-          .disabled(fleet.inFlight.contains(q.id))
+          .disabled(busy)
         }
+        Button("Ask Supervisor") {
+          composerText = "About \"\(q.title)\": "
+          inlineChatOpen = true
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
         Spacer()
         Button("Dismiss") {
           Task { await fleet.dismiss(q) }
         }
-        .disabled(fleet.inFlight.contains(q.id))
+        .disabled(busy)
+      }
+
+      if let note = fleet.notes[q.id] {
+        FleetNoteRow(note: note) { fleet.clearNote(q.id) }
+      }
+
+      if isExpanded {
+        Divider()
+        if let context = q.displayAskContext, !context.isEmpty {
+          VStack(alignment: .leading, spacing: 3) {
+            Text("Agent context:")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+            Text(context)
+              .font(.callout)
+              .textSelection(.enabled)
+              .padding(8)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+          }
+        }
+
+        if let tk = q.threadKey {
+          let thread = fleet.thread(tk)
+          let summary = FleetThreadSummary(thread: thread, detail: detail)
+          FleetThreadLines(summary: summary, showsExcerpt: detail?.conversation == nil && (q.displayAskContext?.isEmpty ?? true))
+          FleetConversationList(conversation: detail?.conversation, loading: fleet.detailLoading.contains(tk))
+        } else {
+          Text("No linked live thread key; reply directly below to answer through the supervisor.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+
+        directThreadComposer(
+          slotKey: slotKey,
+          placeholder: "Reply directly to this session (or attach photo)…",
+          onRefresh: q.threadKey.map { tk in { Task { await fleet.loadDetail(tk) } } }
+        ) { text, payloadImages in
+          await fleet.sendWorkspaceQuestionReply(q, message: text, images: payloadImages)
+        }
       }
     }
     .padding(12)
     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+  }
+
+  private func sessionCardView(_ session: SupervisorSessionBrief, showProjectTag: Bool) -> some View {
+    let isExpanded = expandedThreadKeys.contains(session.id)
+    let thread = fleet.thread(session.id)
+    let detail = fleet.details[session.id]
+    let summary = FleetThreadSummary(thread: thread, detail: detail)
+    let openChat = thread?.openChat ?? detail?.openChat
+    let group = thread?.watch?.group
+    let busy = fleet.threadInFlight.contains(session.id)
+    let slotKey = "t:\(session.id)"
+
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 8) {
+        Button {
+          toggleThreadExpand(session.id)
+        } label: {
+          HStack(spacing: 8) {
+            Circle()
+              .fill(session.state == "running" ? Color.green : Color.secondary.opacity(0.4))
+              .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+              HStack(spacing: 6) {
+                Text(session.title).font(.body.weight(.medium))
+                if showProjectTag {
+                  Text("#\(session.project)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                }
+              }
+              Text([session.state, session.host, session.cwd, thread?.prShortRef].compactMap { $0 }.joined(separator: " · "))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            }
+            Spacer()
+          }
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
+          Button("\(btnTitle) ↗") {
+            fleet.openChat(chat)
+          }
+          .controlSize(.small)
+        }
+        Button(isExpanded ? "Hide ▴" : "Context & Chat ▾") {
+          toggleThreadExpand(session.id)
+        }
+        .controlSize(.small)
+      }
+
+      if isExpanded {
+        Divider()
+        FleetThreadLines(summary: summary, showsExcerpt: detail?.conversation == nil)
+        FleetConversationList(conversation: detail?.conversation, loading: fleet.detailLoading.contains(session.id))
+
+        HStack(spacing: 8) {
+          if group == "push", !summary.muted, summary.pushMessage != nil {
+            Button("Push now") { Task { await fleet.pushNow(session.id) } }
+              .controlSize(.small)
+              .buttonStyle(.borderedProminent)
+              .disabled(busy || thread?.pushing == true)
+          }
+          Button(summary.muted ? "Unmute" : "Mute 24h") {
+            Task { summary.muted ? await fleet.unmute(session.id) : await fleet.mute(session.id) }
+          }
+          .controlSize(.small)
+          .disabled(busy)
+          Button("Ask Supervisor") {
+            composerText = "Check on \"\(session.title)\" (\(session.id)): "
+            inlineChatOpen = true
+          }
+          .controlSize(.small)
+          Spacer()
+          if busy { ProgressView().controlSize(.small) }
+        }
+
+        if let note = fleet.threadNotes[session.id] {
+          FleetNoteRow(note: note) { fleet.clearThreadNote(session.id) }
+        }
+
+        directThreadComposer(
+          slotKey: slotKey,
+          placeholder: "Reply directly to \(session.title) (or attach photo)…",
+          onRefresh: { Task { await fleet.loadDetail(session.id) } }
+        ) { text, payloadImages in
+          await fleet.sendWorkspaceThreadReply(threadKey: session.id, message: text, images: payloadImages)
+        }
+      }
+    }
+    .padding(10)
+    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+  }
+
+  @ViewBuilder
+  private func directThreadComposer(
+    slotKey: String,
+    placeholder: String,
+    onRefresh: (() -> Void)?,
+    onSubmitReply: @escaping (String, [[String: Any]]) async -> FleetNote
+  ) -> some View {
+    let draft = Binding<String>(
+      get: { threadReplyText[slotKey] ?? "" },
+      set: { threadReplyText[slotKey] = $0 }
+    )
+    let attached = threadReplyImages[slotKey] ?? []
+    let isBusy = threadReplyBusy.contains(slotKey)
+
+    VStack(alignment: .leading, spacing: 6) {
+      if let note = threadReplyFeedback[slotKey] {
+        FleetNoteRow(note: note) { threadReplyFeedback[slotKey] = nil }
+      }
+      if !attached.isEmpty {
+        attachmentStrip(attached) { removeId in
+          threadReplyImages[slotKey] = (threadReplyImages[slotKey] ?? []).filter { $0.id != removeId }
+        }
+      }
+      HStack(spacing: 6) {
+        Button {
+          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - attached.count))
+          appendAttachments(picked, to: &threadReplyImages[slotKey, default: []])
+        } label: {
+          Label("Photo", systemImage: "photo.badge.plus")
+            .font(.caption)
+        }
+        .controlSize(.small)
+        .disabled(isBusy || attached.count >= 4)
+
+        Button {
+          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - attached.count))
+          if pasted.isEmpty {
+            threadReplyFeedback[slotKey] = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
+          } else {
+            appendAttachments(pasted, to: &threadReplyImages[slotKey, default: []])
+          }
+        } label: {
+          Label("Paste", systemImage: "doc.on.clipboard")
+            .font(.caption)
+        }
+        .controlSize(.small)
+        .disabled(isBusy || attached.count >= 4)
+
+        TextField(placeholder, text: draft)
+          .textFieldStyle(.roundedBorder)
+          .disabled(isBusy)
+          .onSubmit {
+            sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
+          }
+
+        if let onRefresh {
+          Button {
+            onRefresh()
+          } label: {
+            Image(systemName: "arrow.clockwise")
+          }
+          .controlSize(.small)
+          .help("Reload thread transcript")
+        }
+
+        Button(isBusy ? "Sending…" : "Send to Thread") {
+          sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
+        }
+        .controlSize(.small)
+        .disabled(
+          isBusy ||
+            ((threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attached.isEmpty)
+        )
+      }
+    }
+  }
+
+  private func sendDirectReply(
+    slotKey: String,
+    onSubmitReply: @escaping (String, [[String: Any]]) async -> FleetNote
+  ) {
+    let text = (threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let imgs = threadReplyImages[slotKey] ?? []
+    guard !text.isEmpty || !imgs.isEmpty else { return }
+    guard !threadReplyBusy.contains(slotKey) else { return }
+    threadReplyBusy.insert(slotKey)
+    threadReplyFeedback[slotKey] = nil
+    let payloads = imgs.map(\.fleetPayload)
+    Task {
+      let note = await onSubmitReply(text, payloads)
+      threadReplyBusy.remove(slotKey)
+      threadReplyFeedback[slotKey] = note
+      if !note.isError {
+        threadReplyText[slotKey] = ""
+        threadReplyImages[slotKey] = []
+      }
+    }
+  }
+
+  // MARK: - Inline Supervisor Chat Drawer & Bottom Composer
+
+  @ViewBuilder
+  private func supervisorMessagesView(_ messages: [SyncedSupervisorMessage]) -> some View {
+    ForEach(messages) { msg in
+      VStack(alignment: msg.role == "user" ? .trailing : .leading, spacing: 4) {
+        Text(msg.role == "user" ? (msg.sourceName ?? "You") : "Supervisor")
+          .font(.caption2.weight(.semibold))
+          .foregroundStyle(.secondary)
+        if !msg.localThumbnailData.isEmpty {
+          HStack(spacing: 6) {
+            ForEach(Array(msg.localThumbnailData.enumerated()), id: \.offset) { _, data in
+              if let nsImg = NSImage(data: data) {
+                Image(nsImage: nsImg)
+                  .resizable()
+                  .scaledToFill()
+                  .frame(width: 72, height: 72)
+                  .clipShape(RoundedRectangle(cornerRadius: 8))
+              }
+            }
+          }
+        }
+        Text(msg.text)
+          .textSelection(.enabled)
+          .padding(10)
+          .background(
+            msg.role == "user" ? Color.accentColor.opacity(0.16) : Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 10)
+          )
+      }
+      .frame(maxWidth: .infinity, alignment: msg.role == "user" ? .trailing : .leading)
+    }
+  }
+
+  private var inlineSupervisorDrawer: some View {
+    VStack(spacing: 0) {
+      HStack {
+        Text("💬 Supervisor Chat (\(supervisor.messages.count))")
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(.secondary)
+        Spacer()
+        Button("Full #general ↗") {
+          channel = .general
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+        Button("Minimize") {
+          inlineChatOpen = false
+        }
+        .buttonStyle(.borderless)
+        .font(.caption)
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 6)
+      .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+
+      ScrollView {
+        VStack(alignment: .leading, spacing: 8) {
+          if supervisor.messages.isEmpty {
+            Text("No supervisor messages yet — ask anything or attach screenshots below.")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          } else {
+            supervisorMessagesView(Array(supervisor.messages.suffix(12)))
+          }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .frame(maxHeight: 220)
+    }
   }
 
   private var bottomComposer: some View {
@@ -497,15 +886,58 @@ struct SupervisorWorkspaceView: View {
           .font(.caption2)
           .foregroundStyle(.secondary)
         Spacer()
-        if let err = supervisor.lastError {
+        if channel != .general {
+          Button(inlineChatOpen ? "▾ Hide Chat" : "▸ Chat (\(supervisor.messages.count))") {
+            inlineChatOpen.toggle()
+          }
+          .buttonStyle(.borderless)
+          .font(.caption2)
+        }
+        if let note = composerStatusNote {
+          Text(note).font(.caption2).foregroundStyle(.orange).lineLimit(1)
+        } else if let err = supervisor.lastError {
           Text(err).font(.caption2).foregroundStyle(.red).lineLimit(1)
         }
       }
+
+      if !composerImages.isEmpty {
+        attachmentStrip(composerImages) { removeId in
+          composerImages.removeAll { $0.id == removeId }
+        }
+      }
+
       HStack(spacing: 8) {
+        Button {
+          composerStatusNote = nil
+          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - composerImages.count))
+          appendAttachments(picked, to: &composerImages)
+        } label: {
+          Label(
+            composerImages.isEmpty ? "+ Photo" : "+\(composerImages.count)",
+            systemImage: "photo.badge.plus"
+          )
+        }
+        .disabled(supervisor.isSending || composerImages.count >= 4)
+        .help("Attach up to 4 images or screenshots")
+
+        Button {
+          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - composerImages.count))
+          if pasted.isEmpty {
+            composerStatusNote = "Clipboard has no image to attach."
+          } else {
+            composerStatusNote = nil
+            appendAttachments(pasted, to: &composerImages)
+          }
+        } label: {
+          Image(systemName: "doc.on.clipboard")
+        }
+        .disabled(supervisor.isSending || composerImages.count >= 4)
+        .help("Paste image from clipboard")
+
         TextField(
           channel == .general
-            ? "Ask Supervisor anything (synced across all devices)…"
-            : "Ask Supervisor about #\(channelNameForPlaceholder)…",
+            ? "Ask Supervisor anything or drop/attach photos (synced across all devices)…"
+            : "Ask Supervisor about #\(channelNameForPlaceholder) or attach photos…",
           text: $composerText
         )
         .textFieldStyle(.roundedBorder)
@@ -517,12 +949,62 @@ struct SupervisorWorkspaceView: View {
         }
         .disabled(
           supervisor.isSending ||
-            composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            (composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && composerImages.isEmpty)
         )
+      }
+      .padding(4)
+      .background(isDropTargeted ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+      .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { providers in
+        Task {
+          let dropped = await WorkspaceImageAttachment.fromDropProviders(
+            providers,
+            limit: max(1, 4 - composerImages.count)
+          )
+          await MainActor.run {
+            composerStatusNote = nil
+            appendAttachments(dropped, to: &composerImages)
+          }
+        }
+        return true
       }
     }
     .padding(12)
     .background(.ultraThinMaterial)
+  }
+
+  private func attachmentStrip(_ items: [WorkspaceImageAttachment], onRemove: @escaping (String) -> Void) -> some View {
+    ScrollView(.horizontal, showsIndicators: false) {
+      HStack(spacing: 8) {
+        ForEach(items) { item in
+          ZStack(alignment: .topTrailing) {
+            Image(nsImage: item.preview)
+              .resizable()
+              .scaledToFill()
+              .frame(width: 56, height: 56)
+              .clipShape(RoundedRectangle(cornerRadius: 8))
+            Button {
+              onRemove(item.id)
+            } label: {
+              Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.white, .black.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .offset(x: 4, y: -4)
+          }
+          .padding(.top, 4)
+          .padding(.trailing, 4)
+        }
+      }
+    }
+  }
+
+  private func appendAttachments(_ incoming: [WorkspaceImageAttachment], to target: inout [WorkspaceImageAttachment]) {
+    for item in incoming where target.count < 4 {
+      if !target.contains(item) {
+        target.append(item)
+      }
+    }
   }
 
   private var channelNameForPlaceholder: String {
@@ -532,15 +1014,21 @@ struct SupervisorWorkspaceView: View {
 
   private func sendFromWorkspace() {
     let raw = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !raw.isEmpty else { return }
+    let imgs = composerImages
+    guard !raw.isEmpty || !imgs.isEmpty else { return }
     let textToSend: String
     if case let .project(projName) = channel {
-      textToSend = "[\(projName)] \(raw)"
+      textToSend = raw.isEmpty ? "[\(projName)] Please inspect the attached screenshot(s)." : "[\(projName)] \(raw)"
+      inlineChatOpen = true
+    } else if channel != .general {
+      textToSend = raw
+      inlineChatOpen = true
     } else {
       textToSend = raw
     }
     composerText = ""
-    channel = .general
-    Task { await supervisor.sendMessage(textToSend) }
+    composerImages = []
+    composerStatusNote = nil
+    Task { await supervisor.sendMessage(textToSend, attachments: imgs) }
   }
 }

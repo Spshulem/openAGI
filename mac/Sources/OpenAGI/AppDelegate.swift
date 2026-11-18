@@ -51,6 +51,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       if ProcessInfo.processInfo.arguments.contains("--connect-phone") {
         PhonePairingWindowController.shared.show(state: AppState.shared)
       }
+      if ProcessInfo.processInfo.arguments.contains("--show-supervisor") {
+        SupervisorWindowController.shared.show()
+      }
 
       // Start the durable outreach consumer if a remote main is configured.
       // Backfills from the persisted cursor so nothing queued while the app was
@@ -103,13 +106,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   // Finder/Spotlight can reopen a running dockless app even when its menu-bar
-  // item is hidden by the notch. Always reveal the privacy controls there.
+  // item is hidden by the notch. Reveal Supervisor Workspace (or Privacy when requested).
   nonisolated func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-    Task { @MainActor in PrivacyWindowController.shared.show() }
+    Task { @MainActor in
+      if ProcessInfo.processInfo.arguments.contains("--show-permissions") {
+        PrivacyWindowController.shared.show()
+      } else {
+        SupervisorWindowController.shared.show()
+      }
+    }
     return false
   }
 
   nonisolated func application(_ application: NSApplication, open urls: [URL]) {
+    if urls.contains(where: AppLink.opensSupervisor) {
+      Task { @MainActor in SupervisorWindowController.shared.show() }
+      return
+    }
     guard urls.contains(where: AppLink.opensPrivacy) else { return }
     Task { @MainActor in PrivacyWindowController.shared.show() }
   }
