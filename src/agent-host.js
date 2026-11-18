@@ -267,7 +267,13 @@ export class AgentHost {
     const contextUntrusted = Boolean(attachments.length || memoryHitsForModel.length || intuitions.length
       || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
       || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
-    const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text) } : null;
+    const isSupervisorThread = metadata.thread === "supervisor" || agent?.id === "supervisor";
+    const supervisorAutoApprove = Boolean(
+      principal
+      && isSupervisorThread
+      && this.runtime?.fleetSupervisor?.getState?.()?.preferences?.autoApprove !== false
+    );
+    const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text), supervisorAutoApprove } : null;
     let confirmation = null;
     if (principal && !ephemeral) {
       if (principal.via === "voice") {
@@ -372,6 +378,7 @@ export class AgentHost {
         // Server-built per turn. The model controls only tool names and args;
         // tool results are data and can only taint __turn (ToolRegistry).
         ...(principal ? { __owner: principal, __turn: turnState } : {}),
+        ...(attachments.length ? { __attachments: attachments } : {}),
         // Set only by the approval-continuation transport (an action id).
         ...(typeof options.continuationOf === "string" && options.continuationOf ? { __continuationOf: options.continuationOf } : {})
       }

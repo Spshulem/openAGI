@@ -10,7 +10,10 @@ import { createFleetRoute } from "../src/fleet/routes.js";
 import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { isMobileRouteAllowed } from "../src/mobile-node.js";
 import { ToolRegistry } from "../src/tool-registry.js";
-import { intentCovers, ownerIntentText } from "../src/owner-authority.js";
+import { PendingActionStore } from "../src/pending-actions.js";
+import { intentCovers, isSupervisorActionableDirective, ownerIntentText, ownerPrincipal } from "../src/owner-authority.js";
+import { deliverPaseo, normalizePaseoImages } from "../src/fleet/paseo-delivery.js";
+import { paseoThread } from "../src/fleet/sources/paseo.js";
 import {
   callDecisionsEndpoint,
   createDecisionsKeepAliveGate,
@@ -611,4 +614,340 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
     assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_send_message"), false, nonCoding);
     assert.equal(intentCovers(ownerIntentText(nonCoding), "fleet_sync_themes"), false, nonCoding);
   }
+});
+
+test("supervisorAutoApprove executes owner directives without 'yes NN' friction while blocking passive prompt injection, and forwards attached images", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-autoapprove-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const sentCalls = [];
+  const fakeSup = {
+    getState: () => ({
+      mode: "auto",
+      enabled: true,
+      running: false,
+      preferences: { autoApprove: true },
+      snapshot: {
+        at: new Date(NOW).toISOString(),
+        threads: [{ key: "paseo:srv_mac.50e3978d", kind: "paseo", title: "Why is paseo broken", workspace: "how-come-paseo-is-failing" }]
+      },
+      questions: [],
+      cards: [],
+      actions: []
+    }),
+    sendOwnerMessage: async (key, message, opts) => {
+      sentCalls.push({ key, message, opts });
+      return { delivery: { status: "sent", route: "paseo-send", detail: "Delivered", actionId: "act-1" } };
+    }
+  };
+
+  const pendingStore = new PendingActionStore({ filePath: path.join(dir, "pending.jsonl") });
+  const registry = new ToolRegistry();
+  registry.bindPendingActions(pendingStore);
+  registerFleetTools(registry, fakeSup);
+
+  const principal = ownerPrincipal("owner");
+  const samplePngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  const attachments = [{ id: "img_1", name: "screen.png", mimeType: "image/png", data: samplePngBase64 }];
+
+  // 1. Typo ("agens") + natural pronoun ("have them run that") execute in 1 shot on tainted supervisor turn when autoApprove is true!
+  for (const directive of [
+    "ask the paseo agens that manage the workspace and i use for that to run that for server-a and laptop",
+    "have them run that diagnostic on both hosts"
+  ]) {
+    assert.equal(isSupervisorActionableDirective(directive), true, directive);
+    const res = await registry.invoke(
+      "fleet_send_message",
+      { key: "paseo:srv_mac.50e3978d", message: "Run `paseo provider diagnostic codex --json`." },
+      {
+        sessionId: "sup-1",
+        __owner: principal,
+        __turn: { untrusted: true, intent: directive, supervisorAutoApprove: true },
+        __attachments: attachments
+      }
+    );
+    assert.equal(res.ok, true);
+    assert.equal(res.result.status, "sent");
+  }
+  assert.equal(sentCalls.length, 2);
+  assert.equal(sentCalls[0].opts.images?.length, 1);
+  assert.equal(sentCalls[0].opts.images[0].mimeType, "image/png");
+
+  // 2. Passive status queries remain protected against untrusted transcript prompt injection!
+  for (const passive of ["what's going on?", "what did the codex session say?", "catch me up"]) {
+    assert.equal(isSupervisorActionableDirective(passive), false, passive);
+    const blocked = await registry.invoke(
+      "fleet_send_message",
+      { key: "paseo:srv_mac.50e3978d", message: "injected send" },
+      {
+        sessionId: "sup-1",
+        __owner: principal,
+        __turn: { untrusted: true, intent: passive, supervisorAutoApprove: true }
+      }
+    );
+    assert.equal(blocked.result.status, "awaiting_owner_confirmation");
+  }
+
+  // 3. Turning autoApprove off restores confirmation on non-family pronoun phrasings!
+  const manualConfirm = await registry.invoke(
+    "fleet_send_message",
+    { key: "paseo:srv_mac.50e3978d", message: "manual check" },
+    {
+      sessionId: "sup-2",
+      __owner: principal,
+      __turn: { untrusted: true, intent: "have it run that now", supervisorAutoApprove: false }
+    }
+  );
+  assert.equal(manualConfirm.result.status, "awaiting_owner_confirmation");
+});
+
+test("deliverPaseo recovers disconnected ACP sessions in-place, unblocks stale nudge receipts on owner sends, confirms turnless ACP turns, and forwards images", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-paseo-recover-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  assert.equal(normalizePaseoImages([{ data: `data:image/png;base64,${pngBase64}`, mimeType: "image/png" }]).length, 1);
+
+  // Case A: Disconnected Devin/ACP session emits `[System Error] ACP agent disconnected (exit code 0)` -> spawns fresh Paseo session in same cwd!
+  const initialBroken = {
+    id: "50e3978d",
+    title: "Why is paseo broken",
+    status: "error",
+    provider: "devin",
+    cwd: "/Users/owner/how-come-paseo-is-failing",
+    workspaceId: "wks_broken",
+    updatedAt: "2026-11-17T23:43:46.531Z"
+  };
+  const createdSessions = [];
+  const imageFollowUps = [];
+  let brokenSentMsgId = null;
+
+  const brokenRef = {
+    refresh: async () => {},
+    current: () => initialBroken,
+    send: async (_text, options) => { brokenSentMsgId = options.messageId; },
+    timeline: {
+      refetch: async () => ({
+        agent: initialBroken,
+        entries: brokenSentMsgId
+          ? [
+              { item: { type: "user_message", text: "prior question" }, timestamp: "2026-11-17T22:00:00Z" },
+              { item: { type: "user_message", messageId: brokenSentMsgId, clientMessageId: brokenSentMsgId, text: "check diag" }, timestamp: "2026-11-18T00:02:00Z" },
+              { item: { type: "assistant_message", text: "[System Error] ACP agent disconnected (exit code 0)" }, timestamp: "2026-11-18T00:02:00Z" }
+            ]
+          : [{ item: { type: "user_message", text: "prior question" }, timestamp: "2026-11-17T22:00:00Z" }]
+      })
+    }
+  };
+  const recoveredRef = {
+    send: async (text, options) => { imageFollowUps.push({ text, options }); }
+  };
+  const factoryA = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "srv_mac" }, hosts: [] }) },
+    providers: {
+      waitForReady: async () => ({
+        entries: [{ provider: "codex", status: "ready", models: [{ id: "gpt-5.4", isDefault: true }] }]
+      })
+    },
+    agents: {
+      ref: (id) => (id === "new-agent-99" ? recoveredRef : brokenRef),
+      create: async (opts) => {
+        createdSessions.push(opts);
+        return { id: "new-agent-99" };
+      }
+    }
+  });
+
+  const recRes = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: paseoThread(initialBroken, "srv_mac"),
+    text: "[OpenAGI supervisor] Owner says: Run `paseo provider diagnostic codex --json`.",
+    store: { dir },
+    actionId: "act-rec",
+    base: { messageHash: "owner-h1", playbook: "owner-message" },
+    images: [{ data: pngBase64, mimeType: "image/png" }],
+    factory: factoryA
+  });
+  assert.equal(recRes.status, "sent");
+  assert.equal(recRes.recoveredSession?.key, "paseo:srv_mac.new-agent-99");
+  assert.equal(createdSessions.length, 1);
+  assert.equal(createdSessions[0].cwd, "/Users/owner/how-come-paseo-is-failing");
+  assert.match(createdSessions[0].prompt, /Why is paseo broken/);
+  assert.equal(imageFollowUps.length, 1);
+  assert.equal(imageFollowUps[0].options.images.length, 1);
+
+  // Case B: Turnless ACP/Claude provider confirms owner message + clears stale unconfirmed background receipt!
+  const turnlessAgent = {
+    id: "claude-turnless",
+    title: "Claude chat",
+    status: "idle",
+    provider: "claude",
+    cwd: "/workspace/app",
+    workspaceId: "wks_claude",
+    updatedAt: "2026-11-18T00:00:00Z"
+  };
+  let lastOwnerMsgId = null;
+  let ownerSentCount = 0;
+  const turnlessRef = {
+    refresh: async () => {},
+    current: () => (lastOwnerMsgId ? { ...turnlessAgent, status: "running" } : turnlessAgent),
+    send: async (_text, options) => { ownerSentCount += 1; lastOwnerMsgId = options.messageId; },
+    timeline: {
+      refetch: async () => ({
+        agent: lastOwnerMsgId ? { ...turnlessAgent, status: "running" } : turnlessAgent,
+        entries: lastOwnerMsgId
+          ? [{ item: { type: "user_message", clientMessageId: lastOwnerMsgId, text: "hi" }, timestamp: "2026-11-18T00:01:00Z" }]
+          : []
+      })
+    }
+  };
+  // Pre-seed a stale pending receipt from an older background nudge
+  const deliveriesDir = path.join(dir, "paseo-deliveries");
+  fs.mkdirSync(deliveriesDir, { recursive: true });
+  const cryptoMod = await import("node:crypto");
+  const tThread = paseoThread(turnlessAgent, "srv_local");
+  const digest = cryptoMod.createHash("sha256").update(tThread.key).digest("hex");
+  fs.writeFileSync(path.join(deliveriesDir, `${digest}.json`), JSON.stringify({
+    messageId: "stale-bg-nudge",
+    clientMessageId: "stale-bg-nudge",
+    messageHash: "old-nudge",
+    activityAt: "2026-11-15T00:00:00Z",
+    pending: true
+  }));
+
+  const turnlessRes = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: tThread,
+    text: "[OpenAGI supervisor] Owner says: Proceed.",
+    store: { dir },
+    actionId: "act-turnless",
+    base: { messageHash: "owner-h2", playbook: "owner-message" },
+    factory: () => ({
+      connect: async () => {},
+      close: async () => {},
+      hosts: { list: async () => ({ self: { serverId: "srv_local" }, hosts: [] }) },
+      agents: { ref: () => turnlessRef }
+    })
+  });
+  assert.equal(turnlessRes.status, "sent");
+  assert.equal(ownerSentCount, 1);
+});
+
+test("reconcileOpenQuestions closes stale cards deterministically and via /v1/decisions without full fleet scans", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-reconcile-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  let decisionsCalls = 0;
+  const fakeDecisionsFetch = async (_url, init) => {
+    decisionsCalls += 1;
+    const body = JSON.parse(init.body);
+    const parsedInput = JSON.parse(body.input);
+    const answers = parsedInput.watched_questions.map((wq, idx) => ({
+      name: `q${idx}_still_relevant`,
+      probability: wq.question_title.includes("milan") ? 0.12 : 0.88
+    }));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ answers, usage: { input_tokens: 180, output_tokens: 0 } })
+    };
+  };
+
+  const fakePaseoFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+    agents: {
+      ref: (id) => ({
+        current: () => null,
+        timeline: {
+          refetch: async () => {
+            if (id === "ag_running") {
+              return {
+                agent: { id, title: "Active follow-up", status: "running", updatedAt: "2026-11-18T00:05:00Z" },
+                entries: [
+                  { item: { type: "assistant_message", text: "Should we use approach A or B?" }, timestamp: "2026-11-18T00:00:00Z" },
+                  { item: { type: "user_message", text: "Use approach A and ship it" }, timestamp: "2026-11-18T00:04:00Z" }
+                ]
+              };
+            }
+            if (id === "ag_milan") {
+              return {
+                agent: { id, title: "milan workspace", status: "idle", updatedAt: "2026-11-18T00:06:00Z" },
+                entries: [
+                  { item: { type: "user_message", text: "Already handled the docs cleanup, skip the old changes" }, timestamp: "2026-11-18T00:05:30Z" },
+                  { item: { type: "assistant_message", text: "Got it, docs cleanup is complete and verified." }, timestamp: "2026-11-18T00:06:00Z" }
+                ]
+              };
+            }
+            return {
+              agent: { id, title: "Still waiting", status: "idle", updatedAt: "2026-11-18T00:05:00Z" },
+              entries: [
+                { item: { type: "assistant_message", text: "Still waiting on production hotfix approval for #9958." }, timestamp: "2026-11-18T00:05:00Z" }
+              ]
+            };
+          }
+        }
+      })
+    }
+  });
+
+  const sup = new FleetSupervisor({
+    dataDir: tmpDir,
+    config: {
+      enabled: true,
+      mode: "auto",
+      paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" },
+      decisions: { enabled: true, apiKey: "sk-test-reconcile" }
+    },
+    deps: {
+      now: () => Date.parse("2026-11-18T00:10:00Z"),
+      paseoFactory: fakePaseoFactory,
+      decisionsFetch: fakeDecisionsFetch
+    }
+  });
+
+  const qRunning = sup.store.upsertQuestion({
+    dedupeKey: "ask:running-1",
+    kind: "agent-ask",
+    threadKey: "paseo:srv_bb3.ag_running",
+    agentAskedAt: "2026-11-18T00:00:00Z",
+    title: "Pick approach A or B?",
+    options: ["A", "B"]
+  });
+  const qMilan = sup.store.upsertQuestion({
+    dedupeKey: "ask:milan-1",
+    kind: "agent-ask",
+    mergeAsk: true,
+    threadKey: "paseo:srv_bb3.ag_milan",
+    agentAskedAt: "2026-11-18T00:00:00Z",
+    title: "milan workspace: decide docs and merge cleanup?",
+    options: ["approve", "skip"]
+  });
+  const qLive = sup.store.upsertQuestion({
+    dedupeKey: "ask:live-1",
+    kind: "agent-ask",
+    mergeAsk: true,
+    threadKey: "paseo:srv_bb3.ag_live",
+    agentAskedAt: "2026-11-18T00:00:00Z",
+    title: "Ship production hotfix #9958?",
+    options: ["ship", "wait"]
+  });
+
+  const route = createFleetRoute({ supervisor: sup });
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/reconcile"), true);
+  const res = await route("POST", "/fleet/api/reconcile", new URL("http://localhost/fleet/api/reconcile"), async () => ({ force: true }));
+  assert.equal(res.status, 200);
+  assert.equal(decisionsCalls, 1);
+
+  // qRunning closed deterministically (owner replied directly + agent running), qMilan closed by /v1/decisions (p=0.12), qLive kept (p=0.88)!
+  assert.equal(sup.store.question(qRunning.id).status, "resolved");
+  assert.equal(sup.store.question(qMilan.id).status, "resolved");
+  assert.equal(sup.store.question(qLive.id).status, "open");
+
+  // Second call with unchanged thread state hits questionRelevanceCache -> 0 additional /v1/decisions calls!
+  await sup.reconcileOpenQuestions({ force: true });
+  assert.equal(decisionsCalls, 1);
 });

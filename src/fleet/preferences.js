@@ -54,6 +54,7 @@ function iso(ms) {
 
 export function defaultPreferences() {
   return {
+    autoApprove: true,
     mergePolicy: "manual_confirm",
     cadence: "balanced",
     autoSlices: Object.fromEntries(Object.keys(SAFE_SLICES).map((key) => [key, "ask"])),
@@ -70,6 +71,7 @@ export function defaultPreferences() {
 export function normalizePreferences(raw) {
   const base = defaultPreferences();
   if (!isObject(raw)) return base;
+  const autoApprove = typeof raw.autoApprove === "boolean" ? raw.autoApprove : base.autoApprove;
   const mergePolicy = MERGE_POLICIES.includes(raw.mergePolicy) ? raw.mergePolicy : base.mergePolicy;
   const cadence = CADENCE_MODES.includes(raw.cadence) ? raw.cadence : base.cadence;
   const autoSlices = { ...base.autoSlices };
@@ -114,7 +116,7 @@ export function normalizePreferences(raw) {
         reverted: item.reverted === true
       }))
     : [];
-  return { mergePolicy, cadence, autoSlices, streaks, dismissedPrompts, ciMergeWatchPrompt, autonomousActions };
+  return { autoApprove, mergePolicy, cadence, autoSlices, streaks, dismissedPrompts, ciMergeWatchPrompt, autonomousActions };
 }
 
 // Identifies whether a question belongs to a safe routine slice. Risky,
@@ -253,6 +255,14 @@ export function applyPreferencePatch(rawPrefs, patch = {}, { now = Date.now() } 
     }
   }
 
+  if (typeof patch.autoApprove === "boolean") {
+    prefs.autoApprove = patch.autoApprove;
+  }
+  if (patch.choice === "auto_approve_on") {
+    prefs.autoApprove = true;
+  } else if (patch.choice === "auto_approve_off") {
+    prefs.autoApprove = false;
+  }
   if (MERGE_POLICIES.includes(patch.mergePolicy)) {
     prefs.mergePolicy = patch.mergePolicy;
     prefs.ciMergeWatchPrompt = null;

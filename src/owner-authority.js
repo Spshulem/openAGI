@@ -57,7 +57,7 @@ const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|se
 // must end the clause, so "write a thread to summarize this" names no one.
 const NOT_TOLD = String.raw`(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who|whose|a|an|(?:them|these|those|it)\s+apart|(?:(?:the|some|any|this|that|these|those|your|my|our)\s+)?(?:difference|truth|time|story|stories|jokes?|lies?|fortunes?|tales?))\b)`;
 const NOT_NAME = String.raw`(?:me|us|my|your|our|his|her|their|them|him|it|the|a|an|this|that|these|those|some|any|everyone|everybody|someone|somebody)\b`;
-const TARGET_NOUN = String.raw`(?:${CODING_AGENT}|paseo|claude|conductor|agents?|threads?|chats?|sessions?|workspaces?|worktrees?)\b(?!['’]s)`;
+const TARGET_NOUN = String.raw`(?:${CODING_AGENT}|paseo|claude|conductor|agents?|agens?|agnets?|threads?|chats?|sessions?|workspaces?|worktrees?)\b(?!['’]s)`;
 const NAMED_RECIPIENT = String.raw`${ARTICLES}(?:(?!(?:about|of|for|on|in|from|with|regarding|to|and|that)\b)[\w-]+\s+){0,2}?${TARGET_NOUN}`;
 const CLAUSE_END = String.raw`(?=\s*(?:$|[.,;:!?\n]|(?:and|then|now|please|so|saying|with|that|too|in|on|via)\b))`;
 const TO_RECIPIENT = String.raw`(?:${NAMED_RECIPIENT}|(?!${NOT_NAME})[\w-]+(?:['’]s\s+(?:[\w-]+\s+)?${TARGET_NOUN}|${CLAUSE_END}))`;
@@ -166,6 +166,27 @@ export function intentFamilies(text) {
 // Tools outside every family never pass: a tainted turn asks for the code.
 export function intentCovers(intent, toolName) {
   return intentFamilies(intent).some((name) => INTENT_FAMILIES[name].tools.includes(toolName));
+}
+
+const SUPERVISOR_DIRECTIVE_RE = new RegExp(
+  `${LEAD}(?:` + [
+    String.raw`(?:ask|tell|have|get|make|let)\s+(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who)\b)\S`,
+    String.raw`(?:send|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
+    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto)\b`,
+    String.raw`(?:go\s+ahead|go\s+for\s+it|do\s+(?:it|that)|sounds\s+(?:good|fine)|looks\s+(?:good|fine)|fine\s+(?:with|by)\s+me|works\s+for\s+me|lgtm)\b`
+  ].join("|") + `)`,
+  "i"
+);
+
+// Principle-based Supervisor Auto-Approve check: allows natural owner directives
+// (including pronouns like "have them run that" or typos) in the Supervisor chat
+// while still blocking passive status queries ("what's going on?", "what did X say?")
+// from executing side-effecting tools on untrusted transcript reads.
+export function isSupervisorActionableDirective(intent) {
+  const value = String(intent ?? "").trim();
+  if (!value) return false;
+  if (intentFamilies(value).length > 0) return true;
+  return SUPERVISOR_DIRECTIVE_RE.test(value);
 }
 
 // The intent a tainted turn is judged on: the owner's own words only. The

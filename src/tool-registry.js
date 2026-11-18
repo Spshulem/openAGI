@@ -1,7 +1,7 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
-import { intentCovers, isOwnerPrincipal } from "./owner-authority.js";
+import { intentCovers, isOwnerPrincipal, isSupervisorActionableDirective } from "./owner-authority.js";
 import { argsDigest } from "./pending-actions.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
@@ -73,6 +73,7 @@ export class ToolRegistry {
       // Optional fn(args, context) -> false | true | string. Truthy makes even
       // an owner instruction ask for the spoken code; a string says why.
       ownerConfirm: typeof tool.ownerConfirm === "function" ? tool.ownerConfirm : null,
+      supervisorAutoApprove: Boolean(tool.supervisorAutoApprove),
       metadata: tool.metadata ?? {}
     };
     this.tools.set(normalized.name, normalized);
@@ -103,6 +104,7 @@ export class ToolRegistry {
       prepareApprovalArgs,
       approvalDedupeKey,
       ownerConfirm,
+      supervisorAutoApprove,
       ...rest
     }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
@@ -291,7 +293,10 @@ export class ToolRegistry {
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
-    const tainted = turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
+    const autoApproved = turn.supervisorAutoApprove === true
+      && tool.supervisorAutoApprove === true
+      && isSupervisorActionableDirective(turn.intent ?? "");
+    const tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
     const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {

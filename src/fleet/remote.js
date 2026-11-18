@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -253,7 +253,8 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}) }); }
+  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(Array.isArray(images) && images.length ? { images } : {}) }); }
+  async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
     return screen;

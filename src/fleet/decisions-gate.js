@@ -348,3 +348,66 @@ export async function matchGoalWithDecisions({
   });
   return { ok: true, scores, inputTokens: res.inputTokens };
 }
+
+export async function evaluateQuestionsRelevanceWithDecisions({
+  items,
+  apiKey,
+  url = DEFAULT_DECISIONS_URL,
+  model = DEFAULT_DECISIONS_MODEL,
+  timeoutMs = DEFAULT_DECISIONS_TIMEOUT_MS,
+  fetchImpl = globalThis.fetch
+} = {}) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return { ok: false, scores: new Map() };
+  }
+  const capped = items.slice(0, 12);
+  const input = {
+    watched_questions: capped.map((item, idx) => ({
+      idx,
+      question_id: item.id,
+      kind: item.kind ?? "agent-ask",
+      asked_at: item.askedAt ?? null,
+      question_title: clampText(redactSecrets(item.title ?? ""), 160),
+      question_body: clampText(redactSecrets(item.body ?? ""), 400),
+      thread_status: item.threadStatus ?? "idle",
+      last_owner_at: item.lastOwnerAt ?? null,
+      last_owner_text: clampText(redactSecrets(item.lastOwnerText ?? ""), 400),
+      last_agent_at: item.lastAgentAt ?? null,
+      last_agent_text: clampTail(redactSecrets(item.lastAgentText ?? ""), 700),
+      recent_messages: Array.isArray(item.recentMessages)
+        ? item.recentMessages.slice(-5).map((m) => ({
+            role: m.role,
+            at: m.at ?? null,
+            text: clampText(redactSecrets(m.text ?? ""), 280)
+          }))
+        : []
+    }))
+  };
+  const questions = capped.map((_, idx) => ({
+    type: "predicate",
+    name: `q${idx}_still_relevant`,
+    instructions:
+      `Inspect \`watched_questions[${idx}]\`. Is the coding session STILL blocked or waiting on the owner for the exact question/decision ` +
+      `described in \`question_title\` / \`question_body\` (raised at \`asked_at\`), so the Supervisor should keep showing this card to the owner? ` +
+      `Answer FALSE (low probability) if the owner already replied or followed up after \`asked_at\`, if the agent already moved on to later work, ` +
+      `or if the question was an optional offer that is now out of date.`
+  }));
+
+  const res = await callDecisionsEndpoint({
+    input,
+    questions,
+    apiKey,
+    url,
+    model,
+    timeoutMs,
+    fetchImpl
+  });
+  if (!res.ok) return { ok: false, error: res.error, scores: new Map() };
+
+  const scores = new Map();
+  capped.forEach((item, idx) => {
+    const p = res.probabilities.get(`q${idx}_still_relevant`);
+    if (typeof p === "number") scores.set(item.id, p);
+  });
+  return { ok: true, scores, inputTokens: res.inputTokens };
+}
