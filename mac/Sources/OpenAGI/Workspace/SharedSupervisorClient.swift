@@ -216,6 +216,37 @@ struct SyncedSupervisorMessage: Identifiable, Decodable, Equatable, Sendable {
   }
 }
 
+struct MacModelOption: Identifiable, Equatable, Sendable {
+  let id: String
+  let label: String
+
+  static let curatedOpenAI: [MacModelOption] = [
+    MacModelOption(id: "gpt-6.2-sol", label: "GPT-6.2 Sol"),
+    MacModelOption(id: "gpt-6.1-sol", label: "GPT-6.1 Sol"),
+    MacModelOption(id: "gpt-6-luna", label: "GPT-6 Luna"),
+    MacModelOption(id: "gpt-6.1-terra", label: "GPT-6.1 Terra"),
+    MacModelOption(id: "gpt-5.4", label: "GPT-5.4"),
+    MacModelOption(id: "gpt-5.4-mini", label: "GPT-5.4 Mini"),
+    MacModelOption(id: "gpt-4.1", label: "GPT-4.1")
+  ]
+
+  static func displayName(for modelId: String?) -> String {
+    guard let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
+      return "Model"
+    }
+    return curatedOpenAI.first(where: { $0.id == id })?.label ?? id
+  }
+}
+
+private struct ModelSettingsResponse: Decodable {
+  struct Active: Decodable {
+    let provider: String?
+    let model: String?
+  }
+  let preference: String?
+  let active: Active?
+}
+
 private struct SupervisorStreamStatus: Decodable {
   let stage: String?
 }
@@ -257,7 +288,14 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var isSending = false
   @Published private(set) var streamingReplyText: String? = nil
   @Published private(set) var progressStage: String? = nil
+  @Published private(set) var activeModelId: String? = nil
+  @Published private(set) var activeProvider: String? = nil
+  @Published private(set) var isSwitchingModel = false
   @Published private(set) var lastError: String? = nil
+
+  var activeModelLabel: String {
+    MacModelOption.displayName(for: activeModelId)
+  }
 
   private struct UnsupportedFieldsError: Error {}
 
@@ -300,6 +338,69 @@ final class SharedSupervisorClient: ObservableObject {
     await withTaskGroup(of: Void.self) { group in
       group.addTask { await self.refreshMessages() }
       group.addTask { await self.refreshTasks() }
+      group.addTask { await self.refreshModelSettings() }
+    }
+  }
+
+  func refreshModelSettings() async {
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/settings/models"))
+    authed(&req)
+    req.timeoutInterval = 8
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
+      activeProvider = decoded.active?.provider
+      activeModelId = decoded.active?.model
+    } catch {
+      // Non-fatal while daemon or main restarts.
+    }
+  }
+
+  func selectOpenAIModel(_ modelId: String) async {
+    guard !isSwitchingModel else { return }
+    isSwitchingModel = true
+    defer { isSwitchingModel = false }
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/settings/models"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "preference": "openai",
+      "openaiModel": modelId
+    ])
+    req.timeoutInterval = 15
+    authed(&req)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
+      activeProvider = decoded.active?.provider ?? "openai"
+      activeModelId = decoded.active?.model ?? modelId
+      lastError = nil
+    } catch {
+      lastError = error.localizedDescription
+    }
+  }
+
+  func setFleetMode(_ mode: String) async {
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/fleet/api/mode"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: ["mode": mode])
+    req.timeoutInterval = 15
+    authed(&req)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      await FleetConsumer.shared.refresh()
+    } catch {
+      lastError = error.localizedDescription
     }
   }
 

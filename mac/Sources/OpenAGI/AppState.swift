@@ -36,6 +36,22 @@ final class AppState: ObservableObject {
   @Published var tasksUnavailable = false
   @Published var paused: Bool = false
 
+  nonisolated static let showsInDockDefaultsKey = "openagi.mac.showsInDock"
+  @Published var showsInDock: Bool = AppState.defaultShowsInDock()
+
+  nonisolated static func defaultShowsInDock(defaults: UserDefaults = .standard) -> Bool {
+    guard let stored = defaults.object(forKey: showsInDockDefaultsKey) as? Bool else {
+      return true
+    }
+    return stored
+  }
+
+  func setShowsInDock(_ enabled: Bool, defaults: UserDefaults = .standard) {
+    showsInDock = enabled
+    defaults.set(enabled, forKey: Self.showsInDockDefaultsKey)
+    AppDelegate.applyActivationPolicy(showsInDock: enabled)
+  }
+
   // Remote "main" pointer for proactive outreach. When set, OutreachConsumer
   // points at this URL/token (a separate host from the local daemon above) and
   // durably pulls the outreach feed. Persisted in UserDefaults; the wizard or a

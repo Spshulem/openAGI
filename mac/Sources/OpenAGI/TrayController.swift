@@ -335,6 +335,10 @@ struct TrayMenu: View {
         get: { OverlayController.isEnabled },
         set: { OverlayController.setEnabled($0) }
       ))
+      Toggle("Show in Dock", isOn: Binding(
+        get: { state.showsInDock },
+        set: { state.setShowsInDock($0) }
+      ))
       Toggle("Open at Login", isOn: Binding(
         get: { LoginItem.isEnabled },
         set: { LoginItem.setEnabled($0) }

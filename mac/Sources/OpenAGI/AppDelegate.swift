@@ -9,7 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
   nonisolated func applicationDidFinishLaunching(_ notification: Notification) {
     Task { @MainActor in
-      NSApp.setActivationPolicy(.accessory) // No Dock icon, only menubar.
+      Self.applyActivationPolicy(showsInDock: AppState.shared.showsInDock)
+      Self.installMainMenuIfNeeded(target: self)
 
       UNUserNotificationCenter.current().delegate = self
       // Register outreach categories (inline action buttons) up front so any
@@ -48,10 +49,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
       // Local launch intent reveals the same native flow as the menu item,
       // so support can verify the packaged app even when the tray is hidden.
-      if ProcessInfo.processInfo.arguments.contains("--connect-phone") {
+      let args = ProcessInfo.processInfo.arguments
+      if args.contains("--connect-phone") {
         PhonePairingWindowController.shared.show(state: AppState.shared)
       }
-      if ProcessInfo.processInfo.arguments.contains("--show-supervisor") {
+      if args.contains("--show-supervisor") {
+        SupervisorWindowController.shared.show()
+      } else if AppState.shared.showsInDock,
+                !args.contains("--show-permissions"),
+                !args.contains("--connect-phone"),
+                !args.contains("--background") {
         SupervisorWindowController.shared.show()
       }
 
@@ -169,5 +176,153 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
     completionHandler([.banner, .sound])
+  }
+
+  nonisolated func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+    false
+  }
+
+  func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+    let menu = NSMenu(title: "OpenAGI")
+    let waitingCount = FleetConsumer.shared.questions.count + PendingApprovalConsumer.shared.items.count
+    let needsTitle = waitingCount > 0 ? "Needs You (\(waitingCount))" : "Needs You"
+    let items: [(String, Selector)] = [
+      ("Open Supervisor Workspace", #selector(openWorkspaceFromMenu)),
+      (needsTitle, #selector(openNeedsYouFromMenu)),
+      ("Tasks", #selector(openTasksFromMenu)),
+      ("Sessions", #selector(openSessionsFromMenu)),
+    ]
+    for (title, action) in items {
+      let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+      item.target = self
+      menu.addItem(item)
+    }
+    menu.addItem(.separator())
+    let quickAsk = NSMenuItem(title: "Quick Ask  ⌥Space", action: #selector(toggleQuickAskFromMenu), keyEquivalent: "")
+    quickAsk.target = self
+    menu.addItem(quickAsk)
+    let scan = NSMenuItem(title: "Scan Coding Agents", action: #selector(scanFleetFromMenu), keyEquivalent: "")
+    scan.target = self
+    menu.addItem(scan)
+    return menu
+  }
+
+  static func applyActivationPolicy(showsInDock: Bool) {
+    guard let app = NSApp else { return }
+    app.setActivationPolicy(showsInDock ? .regular : .accessory)
+    if showsInDock {
+      let waitingCount = FleetConsumer.shared.questions.count + PendingApprovalConsumer.shared.items.count
+      updateDockBadge(count: waitingCount)
+    } else {
+      app.dockTile.badgeLabel = nil
+    }
+  }
+
+  static func updateDockBadge(count: Int) {
+    guard let app = NSApp else { return }
+    app.dockTile.badgeLabel = (AppState.shared.showsInDock && count > 0) ? "\(count)" : nil
+  }
+
+  @objc private func openWorkspaceFromMenu() { SupervisorWindowController.shared.show(channel: nil) }
+  @objc private func openGeneralFromMenu() { SupervisorWindowController.shared.show(channel: .general) }
+  @objc private func openNeedsYouFromMenu() { SupervisorWindowController.shared.show(channel: .needsYou) }
+  @objc private func openTasksFromMenu() { SupervisorWindowController.shared.show(channel: .tasks) }
+  @objc private func openSessionsFromMenu() { SupervisorWindowController.shared.show(channel: .sessions) }
+  @objc private func toggleQuickAskFromMenu() { OverlayController.shared.toggle() }
+  @objc private func scanFleetFromMenu() { Task { await FleetConsumer.shared.scan() } }
+  @objc private func checkUpdatesFromMenu() { UpdateController.shared.checkForUpdates() }
+  @objc private func openPrivacyFromMenu() { PrivacyWindowController.shared.show() }
+  @objc private func connectPhoneFromMenu() { PhonePairingWindowController.shared.show(state: AppState.shared) }
+
+  static func installMainMenuIfNeeded(target: AppDelegate) {
+    guard let app = NSApp else { return }
+    if let existing = app.mainMenu, existing.items.count >= 5 { return }
+
+    let mainMenu = NSMenu()
+
+    let appRoot = NSMenuItem()
+    let appMenu = NSMenu(title: "OpenAGI")
+    appMenu.addItem(withTitle: "About OpenAGI", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+    let checkUpdates = NSMenuItem(title: "Check for Updates…", action: #selector(checkUpdatesFromMenu), keyEquivalent: "")
+    checkUpdates.target = target
+    appMenu.addItem(checkUpdates)
+    appMenu.addItem(.separator())
+    let privacy = NSMenuItem(title: "Permissions & Privacy…", action: #selector(openPrivacyFromMenu), keyEquivalent: ",")
+    privacy.target = target
+    appMenu.addItem(privacy)
+    let pair = NSMenuItem(title: "Connect a Phone…", action: #selector(connectPhoneFromMenu), keyEquivalent: "")
+    pair.target = target
+    appMenu.addItem(pair)
+    appMenu.addItem(.separator())
+    appMenu.addItem(withTitle: "Hide OpenAGI", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+    let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+    hideOthers.keyEquivalentModifierMask = [.command, .option]
+    appMenu.addItem(hideOthers)
+    appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+    appMenu.addItem(.separator())
+    appMenu.addItem(withTitle: "Quit OpenAGI", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appRoot.submenu = appMenu
+    mainMenu.addItem(appRoot)
+
+    let fileRoot = NSMenuItem()
+    let fileMenu = NSMenu(title: "File")
+    let openWs = NSMenuItem(title: "Open Supervisor Workspace", action: #selector(openWorkspaceFromMenu), keyEquivalent: "0")
+    openWs.target = target
+    fileMenu.addItem(openWs)
+    fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    fileRoot.submenu = fileMenu
+    mainMenu.addItem(fileRoot)
+
+    let editRoot = NSMenuItem()
+    let editMenu = NSMenu(title: "Edit")
+    editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    editMenu.addItem(redo)
+    editMenu.addItem(.separator())
+    editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editRoot.submenu = editMenu
+    mainMenu.addItem(editRoot)
+
+    let viewRoot = NSMenuItem()
+    let viewMenu = NSMenu(title: "View")
+    let viewChannels: [(String, Selector, String)] = [
+      ("General", #selector(openGeneralFromMenu), "1"),
+      ("Needs You", #selector(openNeedsYouFromMenu), "2"),
+      ("Tasks", #selector(openTasksFromMenu), "3"),
+      ("Sessions", #selector(openSessionsFromMenu), "4")
+    ]
+    for (title, sel, key) in viewChannels {
+      let item = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+      item.target = target
+      viewMenu.addItem(item)
+    }
+    viewMenu.addItem(.separator())
+    let scanItem = NSMenuItem(title: "Scan Coding Agents", action: #selector(scanFleetFromMenu), keyEquivalent: "r")
+    scanItem.target = target
+    viewMenu.addItem(scanItem)
+    let quickAskItem = NSMenuItem(title: "Quick Ask", action: #selector(toggleQuickAskFromMenu), keyEquivalent: "")
+    quickAskItem.target = target
+    viewMenu.addItem(quickAskItem)
+    viewRoot.submenu = viewMenu
+    mainMenu.addItem(viewRoot)
+
+    let windowRoot = NSMenuItem()
+    let windowMenu = NSMenu(title: "Window")
+    windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+    windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+    windowMenu.addItem(.separator())
+    let bringWs = NSMenuItem(title: "Supervisor Workspace", action: #selector(openWorkspaceFromMenu), keyEquivalent: "")
+    bringWs.target = target
+    windowMenu.addItem(bringWs)
+    windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+    windowRoot.submenu = windowMenu
+    mainMenu.addItem(windowRoot)
+
+    app.mainMenu = mainMenu
+    app.windowsMenu = windowMenu
   }
 }

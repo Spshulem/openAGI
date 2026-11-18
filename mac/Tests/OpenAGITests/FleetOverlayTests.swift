@@ -312,4 +312,36 @@ final class FleetOverlayTests: XCTestCase {
     let decoded = try JSONDecoder().decode(SyncedSupervisorMessage.self, from: Data(json.utf8))
     XCTAssertEqual(decoded.thumbnailImageData, [thumbBytes])
   }
+
+  func testWorkspaceMarkdownParserAndModelOptionsAndDockDefault() throws {
+    let md = """
+      # Status Summary
+      All **tests** passed cleanly.
+      - Item one
+      - Item two
+      1. First step
+      2. Second step
+      ```swift
+      print("ok")
+      ```
+      """
+    let blocks = WorkspaceMarkdownParser.parse(md)
+    XCTAssertEqual(blocks.count, 5)
+    XCTAssertEqual(blocks[0], .heading(level: 1, text: "Status Summary"))
+    XCTAssertEqual(blocks[1], .paragraph("All **tests** passed cleanly."))
+    XCTAssertEqual(blocks[2], .bulletList(["Item one", "Item two"]))
+    XCTAssertEqual(blocks[3], .numberedList(["First step", "Second step"]))
+    XCTAssertEqual(blocks[4], .codeBlock(language: "swift", code: "print(\"ok\")"))
+
+    XCTAssertEqual(MacModelOption.displayName(for: "gpt-6.2-sol"), "GPT-6.2 Sol")
+    XCTAssertEqual(MacModelOption.displayName(for: "custom-model"), "custom-model")
+    XCTAssertEqual(MacModelOption.displayName(for: nil), "Model")
+
+    let suiteName = "FleetOverlayTests.dock.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    XCTAssertTrue(AppState.defaultShowsInDock(defaults: defaults))
+    defaults.set(false, forKey: AppState.showsInDockDefaultsKey)
+    XCTAssertFalse(AppState.defaultShowsInDock(defaults: defaults))
+  }
 }

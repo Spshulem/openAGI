@@ -3,12 +3,32 @@ import SupervisorChannelsKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum WorkspaceChannel: Hashable {
+  case general
+  case needsYou
+  case tasks
+  case sessions
+  case project(String)
+}
+
+@MainActor
+final class SupervisorWorkspaceNavigation: ObservableObject {
+  @Published var selectedChannel: WorkspaceChannel? = .general
+}
+
 @MainActor
 final class SupervisorWindowController {
   static let shared = SupervisorWindowController()
   private var window: NSWindow?
+  private let navigation = SupervisorWorkspaceNavigation()
 
-  func show() {
+  func show(channel: WorkspaceChannel? = nil) {
+    if let channel {
+      navigation.selectedChannel = channel
+    }
+    if AppState.shared.showsInDock {
+      AppDelegate.applyActivationPolicy(showsInDock: true)
+    }
     if let win = window {
       win.makeKeyAndOrderFront(nil)
       NSApp.activate(ignoringOtherApps: true)
@@ -19,42 +39,73 @@ final class SupervisorWindowController {
       }
       return
     }
-    let root = SupervisorWorkspaceView()
-      .frame(minWidth: 780, minHeight: 540)
+    let root = SupervisorWorkspaceView(nav: navigation)
+      .frame(minWidth: 820, minHeight: 580)
     let host = NSHostingController(rootView: root)
     let win = NSWindow(contentViewController: host)
-    win.title = "OpenAGI Supervisor Workspace"
-    win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-    win.setContentSize(NSSize(width: 1020, height: 700))
+    win.title = "OpenAGI"
+    win.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+    win.toolbarStyle = .unified
+    win.titleVisibility = .visible
+    win.setContentSize(NSSize(width: 1100, height: 740))
     win.center()
+    win.setFrameAutosaveName("OpenAGISupervisorWorkspace")
     win.isReleasedWhenClosed = false
+    win.collectionBehavior = [.managed, .participatesInCycle]
     self.window = win
     win.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 }
 
-private enum WorkspaceChannel: Hashable {
-  case general
-  case needsYou
-  case tasks
-  case sessions
-  case project(String)
+private struct StarterPrompt: Identifiable {
+  let id: String
+  let symbol: String
+  let title: String
+  let detail: String
+  let prompt: String
 }
 
+private let supervisorStarters: [StarterPrompt] = [
+  StarterPrompt(
+    id: "needs",
+    symbol: "bell.badge",
+    title: "Summarize what needs me",
+    detail: "Prioritized decisions, blockers, and tool approvals across projects",
+    prompt: "Summarize everything currently waiting on my decision across all active sessions."
+  ),
+  StarterPrompt(
+    id: "sessions",
+    symbol: "terminal",
+    title: "Check active coding sessions",
+    detail: "Status, current branch or PR state, and next suggested step",
+    prompt: "Give me a quick status brief on all running and idle coding sessions."
+  ),
+  StarterPrompt(
+    id: "task",
+    symbol: "checklist",
+    title: "Track a new follow-up task",
+    detail: "Capture a task in my synced queue for later review",
+    prompt: "Add a task to my queue: "
+  )
+]
+
 struct SupervisorWorkspaceView: View {
+  @ObservedObject var nav: SupervisorWorkspaceNavigation
   @ObservedObject private var app = AppState.shared
   @ObservedObject private var supervisor = SharedSupervisorClient.shared
   @ObservedObject private var fleet = FleetConsumer.shared
   @ObservedObject private var approvals = PendingApprovalConsumer.shared
 
-  @State private var channel: WorkspaceChannel = .general
+  @State private var columnVisibility: NavigationSplitViewVisibility = .all
+  @State private var searchQuery = ""
   @State private var composerText = ""
   @State private var composerImages: [WorkspaceImageAttachment] = []
   @State private var composerStatusNote: String? = nil
   @State private var isDropTargeted = false
   @State private var inlineChatOpen = false
   @State private var newTaskTitle = ""
+  @FocusState private var composerFocused: Bool
 
   @State private var expandedQuestionIDs: Set<String> = []
   @State private var expandedThreadKeys: Set<String> = []
@@ -62,6 +113,18 @@ struct SupervisorWorkspaceView: View {
   @State private var threadReplyImages: [String: [WorkspaceImageAttachment]] = [:]
   @State private var threadReplyBusy: Set<String> = []
   @State private var threadReplyFeedback: [String: FleetNote] = [:]
+
+  private var activeChannel: WorkspaceChannel {
+    nav.selectedChannel ?? .general
+  }
+
+  private var waitingTotal: Int {
+    fleet.questions.count + approvals.items.count
+  }
+
+  private var runningCount: Int {
+    fleet.threads.filter { $0.state == "running" }.count
+  }
 
   private var decisionItems: [SupervisorDecisionItem] {
     let byKey = Dictionary(fleet.threads.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
@@ -109,271 +172,450 @@ struct SupervisorWorkspaceView: View {
     SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
   }
 
-  private var activeTargetLabel: String {
-    switch channel {
-    case .general, .needsYou, .tasks, .sessions:
-      return "#general · Synced (Mac · Paseo · Phone · G2)"
+  private var navigationTitleText: String {
+    switch activeChannel {
+    case .general: return "Supervisor"
+    case .needsYou: return "Needs You"
+    case .tasks: return "Tasks"
+    case .sessions: return "Sessions"
+    case let .project(name): return "#\(name)"
+    }
+  }
+
+  private var navigationSubtitleText: String {
+    switch activeChannel {
+    case .general:
+      return "Synced across Mac, Paseo, iPhone, and Even G2 · \(runningCount) running · \(waitingTotal) waiting"
+    case .needsYou:
+      return waitingTotal == 0 ? "Queue clear" : "\(waitingTotal) awaiting decision or approval"
+    case .tasks:
+      return "\(supervisor.tasks.count) open task\(supervisor.tasks.count == 1 ? "" : "s")"
+    case .sessions:
+      return "\(runningCount) running · \(sessionBriefs.count) watched"
     case let .project(name):
-      return "#\(name) · Synced Supervisor"
+      let count = SupervisorChannelGrouping.filterSessions(sessionBriefs, project: name).count
+      return "\(count) session\(count == 1 ? "" : "s") in #\(name)"
+    }
+  }
+
+  private var activeTargetLabel: String {
+    switch activeChannel {
+    case .general, .needsYou, .tasks, .sessions:
+      return "Synced Supervisor (Mac · Paseo · Phone · G2)"
+    case let .project(name):
+      return "Scoped to #\(name) · Synced Supervisor"
     }
   }
 
   var body: some View {
-    HStack(spacing: 0) {
+    NavigationSplitView(columnVisibility: $columnVisibility) {
       sidebar
-        .frame(width: 215)
-        .background(Color(nsColor: .windowBackgroundColor))
-
-      Divider()
-
-      VStack(spacing: 0) {
-        stageHeader
-        Divider()
-        ScrollView {
-          VStack(alignment: .leading, spacing: 14) {
-            switch channel {
-            case .general:
-              generalStage
-            case .needsYou:
-              needsYouStage
-            case .tasks:
-              tasksStage
-            case .sessions:
-              sessionsStage
-            case let .project(projName):
-              projectStage(projName)
-            }
-          }
-          .padding(16)
-          .frame(maxWidth: .infinity, alignment: .leading)
-        }
-
-        if channel != .general && inlineChatOpen {
-          Divider()
-          inlineSupervisorDrawer
-        }
-
-        Divider()
-        bottomComposer
-      }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
+    } detail: {
+      detailStage
     }
+    .navigationSplitViewStyle(.balanced)
     .task {
       await supervisor.refreshAll()
       await fleet.refresh()
       await approvals.refresh()
+      AppDelegate.updateDockBadge(count: waitingTotal)
+    }
+    .onChange(of: waitingTotal) { _, count in
+      AppDelegate.updateDockBadge(count: count)
     }
   }
 
-  // MARK: - Sidebar
+  // MARK: - Sidebar (Floating Liquid Glass on macOS 26/27)
 
   private var sidebar: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 4) {
-        Text("SUPERVISOR")
-          .font(.system(size: 10, weight: .bold))
-          .foregroundStyle(.secondary)
-          .padding(.horizontal, 10)
-          .padding(.top, 12)
+    List(selection: $nav.selectedChannel) {
+      Section("Supervisor") {
+        sidebarBadgeRow(title: "General", systemImage: "binoculars", count: 0, highlight: false)
+          .tag(WorkspaceChannel.general)
 
-        channelRow(
-          title: "🌐 # general",
-          badge: nil,
-          selected: channel == .general
-        ) { channel = .general }
+        sidebarBadgeRow(title: "Needs You", systemImage: "bell.badge", count: waitingTotal, highlight: waitingTotal > 0)
+          .tag(WorkspaceChannel.needsYou)
 
-        channelRow(
-          title: "🔔 # needs-you",
-          badge: (fleet.questions.count + approvals.items.count) > 0
-            ? "\(fleet.questions.count + approvals.items.count)" : nil,
-          accentBadge: !fleet.questions.isEmpty,
-          selected: channel == .needsYou
-        ) { channel = .needsYou }
+        sidebarBadgeRow(title: "Tasks", systemImage: "checklist", count: supervisor.tasks.count, highlight: false)
+          .tag(WorkspaceChannel.tasks)
 
-        channelRow(
-          title: "✅ # tasks",
-          badge: supervisor.tasks.isEmpty ? nil : "\(supervisor.tasks.count)",
-          selected: channel == .tasks
-        ) { channel = .tasks }
+        sidebarBadgeRow(title: "Sessions", systemImage: "terminal", count: sessionBriefs.count, highlight: false)
+          .tag(WorkspaceChannel.sessions)
+      }
 
-        channelRow(
-          title: "⚡ # sessions",
-          badge: sessionBriefs.isEmpty ? nil : "\(sessionBriefs.count)",
-          selected: channel == .sessions
-        ) { channel = .sessions }
-
-        if !projectChannels.isEmpty {
-          Text("PROJECT CHANNELS")
-            .font(.system(size: 10, weight: .bold))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .padding(.top, 14)
-
+      if !projectChannels.isEmpty {
+        Section("Projects") {
           ForEach(projectChannels) { summary in
-            let projName: String = {
-              if case let .project(n) = summary.kind { return n }
-              return summary.displayName
-            }()
-            let badgeText = summary.waitingCount > 0
-              ? "\(summary.waitingCount) req"
-              : summary.runningCount > 0 ? "\(summary.runningCount)●" : "\(summary.totalCount)"
-            channelRow(
+            let projName = projectName(for: summary)
+            let count = summary.waitingCount > 0 ? summary.waitingCount : summary.totalCount
+            sidebarBadgeRow(
               title: "# \(projName)",
-              badge: badgeText,
-              accentBadge: summary.waitingCount > 0,
-              selected: channel == .project(projName)
-            ) { channel = .project(projName) }
+              systemImage: summary.waitingCount > 0 ? "exclamationmark.circle.fill" : "folder",
+              count: count,
+              highlight: summary.waitingCount > 0
+            )
+            .tag(WorkspaceChannel.project(projName))
           }
         }
       }
-      .padding(.horizontal, 8)
-      .padding(.bottom, 16)
+    }
+    .listStyle(.sidebar)
+    .navigationSplitViewColumnWidth(min: 205, ideal: 232, max: 275)
+  }
+
+  private func projectName(for summary: SupervisorChannelSummary) -> String {
+    if case let .project(name) = summary.kind { return name }
+    return summary.displayName
+  }
+
+  private func sidebarBadgeRow(title: String, systemImage: String, count: Int, highlight: Bool) -> some View {
+    HStack(spacing: 8) {
+      Label(title, systemImage: systemImage)
+        .lineLimit(1)
+      Spacer(minLength: 4)
+      if count > 0 {
+        Text("\(count)")
+          .font(.caption2.weight(.semibold))
+          .padding(.horizontal, 7)
+          .padding(.vertical, 2)
+          .background(
+            (highlight ? WorkspaceTheme.caution : WorkspaceTheme.muted).opacity(0.16),
+            in: Capsule()
+          )
+          .foregroundStyle(highlight ? WorkspaceTheme.caution : WorkspaceTheme.muted)
+      }
     }
   }
 
-  private func channelRow(
-    title: String,
-    badge: String?,
-    accentBadge: Bool = false,
-    selected: Bool,
-    action: @escaping () -> Void
-  ) -> some View {
-    Button(action: action) {
-      HStack {
-        Text(title)
-          .font(.system(size: 13, weight: selected ? .semibold : .regular))
-          .foregroundStyle(selected ? Color.primary : Color.secondary)
-          .lineLimit(1)
-        Spacer()
-        if let badge {
-          Text(badge)
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(accentBadge ? Color.orange : Color.secondary)
+  // MARK: - Detail Stage + Unified Liquid Glass Toolbar
+
+  private var detailStage: some View {
+    ScrollViewReader { proxy in
+      ScrollView {
+        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x4) {
+          switch activeChannel {
+          case .general:
+            generalStage
+          case .needsYou:
+            needsYouStage
+          case .tasks:
+            tasksStage
+          case .sessions:
+            sessionsStage
+          case let .project(projName):
+            projectStage(projName)
+          }
+          Color.clear
+            .frame(height: 1)
+            .id("workspace-bottom-anchor")
+        }
+        .padding(.horizontal, WorkspaceTheme.Spacing.x6)
+        .padding(.top, WorkspaceTheme.Spacing.x4)
+        .padding(.bottom, WorkspaceTheme.Spacing.x5)
+        .frame(maxWidth: activeChannel == .general ? 760 : 860, alignment: .leading)
+        .frame(maxWidth: .infinity)
+      }
+      .onChange(of: supervisor.messages.count) { _, _ in
+        if activeChannel == .general {
+          proxy.scrollTo("workspace-bottom-anchor", anchor: .bottom)
         }
       }
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
-      .background(selected ? Color.accentColor.opacity(0.14) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
-      .contentShape(Rectangle())
+      .onChange(of: supervisor.streamingReplyText) { _, text in
+        if activeChannel == .general, text != nil {
+          proxy.scrollTo("workspace-bottom-anchor", anchor: .bottom)
+        }
+      }
+      .onChange(of: activeChannel) { _, next in
+        if next == .general {
+          Task { @MainActor in
+            proxy.scrollTo("workspace-bottom-anchor", anchor: .bottom)
+          }
+        }
+      }
     }
-    .buttonStyle(.plain)
+    .background(WorkspaceTheme.canvas)
+    .safeAreaInset(edge: .bottom, spacing: 0) {
+      floatingBottomDock
+    }
+    .navigationTitle(navigationTitleText)
+    .navigationSubtitle(navigationSubtitleText)
+    .searchable(text: $searchQuery, placement: .toolbar, prompt: "Filter messages, sessions, tasks…")
+    .toolbar { toolbarItems }
   }
 
-  // MARK: - Header
-
-  private var stageHeader: some View {
-    HStack(spacing: 10) {
-      VStack(alignment: .leading, spacing: 2) {
-        Text(headerTitle)
-          .font(.headline)
-        Text("\(fleet.threads.filter { $0.state == "running" }.count) running · \(fleet.questions.count) waiting · \(supervisor.tasks.count) tasks")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+  @ToolbarContentBuilder
+  private var toolbarItems: some ToolbarContent {
+    ToolbarItemGroup(placement: .primaryAction) {
+      Button {
+        nav.selectedChannel = waitingTotal > 0 ? .needsYou : .sessions
+      } label: {
+        HStack(spacing: 6) {
+          Circle()
+            .fill(runningCount > 0 ? WorkspaceTheme.live : (waitingTotal > 0 ? WorkspaceTheme.caution : WorkspaceTheme.muted))
+            .frame(width: 7, height: 7)
+          Text(waitingTotal > 0 ? "\(waitingTotal) waiting" : "\(runningCount) active")
+            .font(.caption.weight(.medium))
+        }
       }
-      Spacer()
-      Button("Scan Fleet") {
+      .help("Jump to Needs You or active sessions")
+
+      Menu {
+        ForEach(MacModelOption.curatedOpenAI) { option in
+          Button {
+            Task { await supervisor.selectOpenAIModel(option.id) }
+          } label: {
+            if supervisor.activeModelId == option.id {
+              Label(option.label, systemImage: "checkmark")
+            } else {
+              Text(option.label)
+            }
+          }
+        }
+      } label: {
+        Label(supervisor.isSwitchingModel ? "Switching…" : supervisor.activeModelLabel, systemImage: "cpu")
+      }
+      .help("Select active Supervisor model")
+
+      Button {
         Task { await fleet.scan() }
+      } label: {
+        Label(fleet.scanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
       }
       .disabled(fleet.scanning)
-      Button("Refresh") {
-        Task {
-          await supervisor.refreshAll()
-          await fleet.refresh()
-          await approvals.refresh()
-          for key in expandedThreadKeys {
-            await fleet.loadDetail(key)
+      .help("Scan coding agents now (⌘R)")
+
+      Menu {
+        if let currentMode = fleet.status?.mode {
+          Menu("Supervisor Mode (\(currentMode.capitalized))") {
+            ForEach(["observe", "propose", "auto"], id: \.self) { mode in
+              Button {
+                Task { await supervisor.setFleetMode(mode) }
+              } label: {
+                if currentMode == mode {
+                  Label(mode.capitalized, systemImage: "checkmark")
+                } else {
+                  Text(mode.capitalized)
+                }
+              }
+            }
           }
         }
-      }
-      Button("Web Dashboard") {
-        app.openDashboard()
+        Button("Refresh Everything") {
+          Task {
+            await supervisor.refreshAll()
+            await fleet.refresh()
+            await approvals.refresh()
+            for key in expandedThreadKeys {
+              await fleet.loadDetail(key)
+            }
+          }
+        }
+        Button("Quick Ask  ⌥Space") { OverlayController.shared.toggle() }
+        Divider()
+        Button("Connect Phone…") { PhonePairingWindowController.shared.show(state: app) }
+        Button("Permissions & Privacy…") { PrivacyWindowController.shared.show() }
+        Button("Open Web Dashboard ↗") { app.openDashboard() }
+      } label: {
+        Label("More", systemImage: "ellipsis.circle")
       }
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 10)
   }
 
-  private var headerTitle: String {
-    switch channel {
-    case .general: return "# general — Synced Supervisor"
-    case .needsYou: return "# needs-you — Decisions by Project"
-    case .tasks: return "# tasks — OpenAGI Todo Queue"
-    case .sessions: return "# sessions — All Watched Coding Chats"
-    case let .project(name): return "# \(name)"
-    }
+  // MARK: - Search Filtering Helpers
+
+  private var trimmedQuery: String {
+    searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func matchesQuery(_ parts: [String?]) -> Bool {
+    guard !trimmedQuery.isEmpty else { return true }
+    let joined = parts.compactMap { $0 }.joined(separator: " ")
+    return joined.localizedCaseInsensitiveContains(trimmedQuery)
   }
 
   // MARK: - Stages
 
   @ViewBuilder
   private var generalStage: some View {
-    if !fleet.questions.isEmpty || !approvals.items.isEmpty {
-      HStack {
-        Text("\(fleet.questions.count) decisions waiting · \(approvals.items.count) approvals · \(supervisor.tasks.count) tasks")
-          .font(.subheadline.weight(.medium))
+    if waitingTotal > 0 {
+      HStack(spacing: WorkspaceTheme.Spacing.x3) {
+        Image(systemName: "bell.badge.fill")
+          .foregroundStyle(WorkspaceTheme.caution)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("\(waitingTotal) item\(waitingTotal == 1 ? "" : "s") need your input")
+            .font(WorkspaceTheme.Typography.secondary.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.ink)
+          Text("\(fleet.questions.count) decisions · \(approvals.items.count) tool approvals · \(supervisor.tasks.count) tasks")
+            .font(WorkspaceTheme.Typography.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
         Spacer()
-        Button("Review Needs You") { channel = .needsYou }
+        WorkspaceActionButton(prominent: true, small: true) {
+          nav.selectedChannel = .needsYou
+        } label: {
+          Text("Review")
+        }
       }
-      .padding(12)
-      .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+      .padding(WorkspaceTheme.Spacing.x3)
+      .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
+    }
+
+    let visibleMessages = supervisor.messages.filter {
+      matchesQuery([$0.text, $0.sourceName])
     }
 
     if supervisor.messages.isEmpty {
-      Text("Start talking to Supervisor — attach screenshots, paste images, or ask about any thread. Synced across Mac, Paseo, iPhone, and Even G2.")
-        .font(.callout)
-        .foregroundStyle(.secondary)
+      generalEmptyHero
+    } else if visibleMessages.isEmpty {
+      Text("No messages matching \"\(trimmedQuery)\".")
+        .font(WorkspaceTheme.Typography.secondary)
+        .foregroundStyle(WorkspaceTheme.muted)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, WorkspaceTheme.Spacing.x8)
     } else {
-      supervisorMessagesView(supervisor.messages)
+      supervisorMessagesView(visibleMessages)
     }
+  }
+
+  private var generalEmptyHero: some View {
+    VStack(spacing: WorkspaceTheme.Spacing.x6) {
+      VStack(spacing: WorkspaceTheme.Spacing.x2) {
+        Image(systemName: "binoculars")
+          .font(.title)
+          .foregroundStyle(WorkspaceTheme.live)
+          .frame(width: 56, height: 56)
+          .background(WorkspaceTheme.live.opacity(0.12), in: Circle())
+
+        Text("Your coding agents, one thread")
+          .font(.title2.bold())
+          .foregroundStyle(WorkspaceTheme.ink)
+          .multilineTextAlignment(.center)
+
+        Text("Ask about any session, drop screenshots to debug, or manage your synced tasks across Mac, Paseo, iPhone, and Even G2.")
+          .font(WorkspaceTheme.Typography.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 460)
+      }
+      .frame(maxWidth: .infinity)
+
+      VStack(spacing: WorkspaceTheme.Spacing.x2) {
+        ForEach(supervisorStarters) { starter in
+          Button {
+            composerText = starter.prompt
+            composerFocused = true
+          } label: {
+            HStack(spacing: WorkspaceTheme.Spacing.x3) {
+              Image(systemName: starter.symbol)
+                .font(.body)
+                .foregroundStyle(WorkspaceTheme.live)
+                .frame(width: 28)
+              VStack(alignment: .leading, spacing: 2) {
+                Text(starter.title)
+                  .font(WorkspaceTheme.Typography.body.weight(.semibold))
+                  .foregroundStyle(WorkspaceTheme.ink)
+                Text(starter.detail)
+                  .font(WorkspaceTheme.Typography.secondary)
+                  .foregroundStyle(WorkspaceTheme.muted)
+              }
+              Spacer(minLength: 0)
+              Image(systemName: "arrow.up.left")
+                .font(.caption)
+                .foregroundStyle(WorkspaceTheme.muted)
+            }
+            .padding(WorkspaceTheme.Spacing.x4)
+            .frame(maxWidth: 520, alignment: .leading)
+            .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
+          }
+          .buttonStyle(.plain)
+        }
+      }
+      .frame(maxWidth: .infinity)
+    }
+    .padding(.vertical, WorkspaceTheme.Spacing.x8)
   }
 
   @ViewBuilder
   private var needsYouStage: some View {
-    if !approvals.items.isEmpty {
+    let filteredApprovals = approvals.items.filter { matchesQuery([$0.summary, $0.toolName]) }
+    if !filteredApprovals.isEmpty {
       HStack {
-        Text("Pending Tool Approvals (\(approvals.items.count))")
-          .font(.subheadline.weight(.semibold))
+        Text("Pending Tool Approvals (\(filteredApprovals.count))")
+          .font(WorkspaceTheme.Typography.section)
+          .foregroundStyle(WorkspaceTheme.ink)
         Spacer()
-        Button("Dismiss all") {
+        WorkspaceActionButton(small: true) {
           Task { await approvals.dismissAll() }
+        } label: {
+          Text("Dismiss all")
         }
       }
-      ForEach(approvals.items) { item in
-        HStack(alignment: .center, spacing: 10) {
-          VStack(alignment: .leading, spacing: 2) {
-            Text(item.summary).font(.body.weight(.medium))
-            Text(item.toolName).font(.caption).foregroundStyle(.secondary)
+
+      WorkspaceRowGroup {
+        ForEach(Array(filteredApprovals.enumerated()), id: \.element.id) { idx, item in
+          if idx > 0 { WorkspaceHairline() }
+          HStack(alignment: .center, spacing: WorkspaceTheme.Spacing.x3) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(item.summary)
+                .font(WorkspaceTheme.Typography.body.weight(.medium))
+                .foregroundStyle(WorkspaceTheme.ink)
+              Text(item.toolName)
+                .font(WorkspaceTheme.Typography.dataMono)
+                .foregroundStyle(WorkspaceTheme.muted)
+            }
+            Spacer()
+            WorkspaceActionButton(small: true) {
+              Task { await approvals.deny(item.id) }
+            } label: {
+              Text("Deny")
+            }
+            WorkspaceActionButton(prominent: true, small: true) {
+              Task { await approvals.approve(item.id) }
+            } label: {
+              Text("Approve")
+            }
           }
-          Spacer()
-          Button("Approve") { Task { await approvals.approve(item.id) } }
-          Button("Deny") { Task { await approvals.deny(item.id) } }
+          .padding(WorkspaceTheme.Spacing.x3)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
       }
     }
 
-    let groups = SupervisorChannelGrouping.groupByProject(decisionItems)
-    if groups.isEmpty && approvals.items.isEmpty {
-      Text("Queue clear — nothing waiting on you.")
-        .font(.callout)
-        .foregroundStyle(.secondary)
+    let filteredDecisions = decisionItems.filter { item in
+      let q = fleet.questions.first(where: { $0.id == item.id })
+      return matchesQuery([item.project, item.headline, q?.body])
+    }
+    let groups = SupervisorChannelGrouping.groupByProject(filteredDecisions)
+
+    if groups.isEmpty && filteredApprovals.isEmpty {
+      VStack(spacing: WorkspaceTheme.Spacing.x2) {
+        Text(trimmedQuery.isEmpty ? "Queue clear" : "Nothing matching \"\(trimmedQuery)\"")
+          .font(WorkspaceTheme.Typography.body.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.ink)
+        Text("Decisions and approvals from your coding agents appear here.")
+          .font(WorkspaceTheme.Typography.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, WorkspaceTheme.Spacing.x8)
     } else {
       ForEach(groups) { group in
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
           HStack {
-            Text("# \(group.project) (\(group.items.count) waiting)")
-              .font(.subheadline.weight(.bold))
+            Text("#\(group.project) · \(group.items.count) waiting")
+              .font(WorkspaceTheme.Typography.section)
+              .foregroundStyle(WorkspaceTheme.ink)
             Spacer()
             if group.project.lowercased() != "general" {
               Button("Open #\(group.project) ↗") {
-                channel = .project(group.project)
+                nav.selectedChannel = .project(group.project)
               }
               .buttonStyle(.plain)
-              .foregroundStyle(.blue)
-              .font(.caption)
+              .foregroundStyle(WorkspaceTheme.live)
+              .font(WorkspaceTheme.Typography.caption.weight(.semibold))
             }
           }
+          .padding(.top, WorkspaceTheme.Spacing.x2)
+
           ForEach(group.items) { item in
             if let q = fleet.questions.first(where: { $0.id == item.id }) {
               questionCardView(q)
@@ -386,53 +628,96 @@ struct SupervisorWorkspaceView: View {
 
   @ViewBuilder
   private var tasksStage: some View {
-    HStack(spacing: 8) {
-      TextField("Quick add task…", text: $newTaskTitle)
-        .textFieldStyle(.roundedBorder)
+    HStack(spacing: WorkspaceTheme.Spacing.x2) {
+      Image(systemName: "plus.circle.fill")
+        .foregroundStyle(WorkspaceTheme.live)
+        .font(.title3)
+      TextField("Add a synced task…", text: $newTaskTitle)
+        .textFieldStyle(.plain)
+        .font(WorkspaceTheme.Typography.body)
         .onSubmit {
           let t = newTaskTitle
           newTaskTitle = ""
           Task { await supervisor.createTask(title: t) }
         }
-      Button("Add Task") {
+      WorkspaceActionButton(prominent: true, small: true) {
         let t = newTaskTitle
         newTaskTitle = ""
         Task { await supervisor.createTask(title: t) }
+      } label: {
+        Text("Add")
       }
       .disabled(newTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
-    if supervisor.tasks.isEmpty {
-      Text("No open tasks.")
-        .font(.callout)
-        .foregroundStyle(.secondary)
+    .padding(.horizontal, WorkspaceTheme.Spacing.x4)
+    .padding(.vertical, 10)
+    .workspaceGlassCapsule(cornerRadius: 16, focused: false)
+
+    let visibleTasks = supervisor.tasks.filter { matchesQuery([$0.title, $0.notes]) }
+    if visibleTasks.isEmpty {
+      VStack(spacing: WorkspaceTheme.Spacing.x2) {
+        Text(trimmedQuery.isEmpty ? "No open tasks." : "No tasks matching \"\(trimmedQuery)\".")
+          .font(WorkspaceTheme.Typography.body.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.ink)
+        Text("New tasks added here or from your phone sync automatically.")
+          .font(WorkspaceTheme.Typography.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, WorkspaceTheme.Spacing.x8)
     } else {
-      ForEach(supervisor.tasks) { task in
-        HStack {
-          VStack(alignment: .leading, spacing: 2) {
-            Text(task.title).font(.body)
-            if let notes = task.notes, !notes.isEmpty {
-              Text(notes).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+      WorkspaceRowGroup {
+        ForEach(Array(visibleTasks.enumerated()), id: \.element.id) { idx, task in
+          if idx > 0 { WorkspaceHairline() }
+          HStack(spacing: WorkspaceTheme.Spacing.x3) {
+            Button {
+              Task { await supervisor.completeTask(task.id) }
+            } label: {
+              Image(systemName: "circle")
+                .font(.title3)
+                .foregroundStyle(WorkspaceTheme.live)
+                .frame(width: 28, height: 28)
             }
+            .buttonStyle(.plain)
+            .help("Complete task")
+
+            VStack(alignment: .leading, spacing: 2) {
+              Text(task.title)
+                .font(WorkspaceTheme.Typography.body)
+                .foregroundStyle(WorkspaceTheme.ink)
+                .textSelection(.enabled)
+              if let notes = task.notes, !notes.isEmpty {
+                Text(notes)
+                  .font(WorkspaceTheme.Typography.caption)
+                  .foregroundStyle(WorkspaceTheme.muted)
+                  .lineLimit(2)
+              }
+            }
+            Spacer()
           }
-          Spacer()
-          Button("✓ Done") {
-            Task { await supervisor.completeTask(task.id) }
-          }
+          .padding(.horizontal, WorkspaceTheme.Spacing.x4)
+          .padding(.vertical, WorkspaceTheme.Spacing.x3)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
       }
     }
   }
 
   @ViewBuilder
   private var sessionsStage: some View {
-    if sessionBriefs.isEmpty {
-      Text("No active or recently watched sessions loaded.")
-        .font(.callout)
-        .foregroundStyle(.secondary)
+    let filtered = sessionBriefs.filter { matchesQuery([$0.title, $0.project, $0.host, $0.cwd]) }
+    if filtered.isEmpty {
+      VStack(spacing: WorkspaceTheme.Spacing.x2) {
+        Text(trimmedQuery.isEmpty ? "No coding sessions loaded." : "No sessions matching \"\(trimmedQuery)\".")
+          .font(WorkspaceTheme.Typography.body.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.ink)
+        Text("Press Scan in the toolbar to discover active Paseo, Conductor, or Codex threads.")
+          .font(WorkspaceTheme.Typography.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
+      .frame(maxWidth: .infinity)
+      .padding(.vertical, WorkspaceTheme.Spacing.x8)
     } else {
-      let runningFirst = sessionBriefs.sorted { a, b in
+      let runningFirst = filtered.sorted { a, b in
         let ar = a.state == "running" ? 1 : 0
         let br = b.state == "running" ? 1 : 0
         if ar != br { return ar > br }
@@ -446,46 +731,57 @@ struct SupervisorWorkspaceView: View {
 
   @ViewBuilder
   private func projectStage(_ projName: String) -> some View {
-    let overlaps = SupervisorChannelGrouping.calmOverlaps(
-      for: SupervisorChannelGrouping.filterSessions(sessionBriefs, project: projName)
-    )
+    let projectSessionsAll = SupervisorChannelGrouping.filterSessions(sessionBriefs, project: projName)
+    let overlaps = SupervisorChannelGrouping.calmOverlaps(for: projectSessionsAll)
     ForEach(overlaps) { ov in
-      HStack(spacing: 8) {
-        Image(systemName: "info.circle")
-          .foregroundStyle(.orange)
+      HStack(spacing: WorkspaceTheme.Spacing.x2) {
+        Image(systemName: "info.circle.fill")
+          .foregroundStyle(WorkspaceTheme.caution)
         Text(ov.detail)
-          .font(.caption.weight(.medium))
-          .foregroundStyle(.orange)
+          .font(WorkspaceTheme.Typography.caption.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.ink)
       }
-      .padding(10)
+      .padding(WorkspaceTheme.Spacing.x3)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+      .background(WorkspaceTheme.caution.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+          .strokeBorder(WorkspaceTheme.caution.opacity(0.28), lineWidth: 0.5)
+      )
     }
 
     let matchingCards = decisionItems.filter {
       $0.project.caseInsensitiveCompare(projName) == .orderedSame
+        && matchesQuery([$0.headline, $0.project])
     }
-    ForEach(matchingCards) { item in
-      if let q = fleet.questions.first(where: { $0.id == item.id }) {
-        questionCardView(q)
+    if !matchingCards.isEmpty {
+      Text("Waiting on You")
+        .font(WorkspaceTheme.Typography.section)
+        .foregroundStyle(WorkspaceTheme.ink)
+      ForEach(matchingCards) { item in
+        if let q = fleet.questions.first(where: { $0.id == item.id }) {
+          questionCardView(q)
+        }
       }
     }
 
-    let projSessions = SupervisorChannelGrouping.filterSessions(sessionBriefs, project: projName)
+    let projSessions = projectSessionsAll.filter { matchesQuery([$0.title, $0.host, $0.cwd]) }
     if projSessions.isEmpty {
-      Text("No loaded sessions in #\(projName) yet. Type below to ask Supervisor or route a goal.")
-        .font(.callout)
-        .foregroundStyle(.secondary)
+      Text("No loaded sessions in #\(projName). Ask Supervisor below to inspect or dispatch work.")
+        .font(WorkspaceTheme.Typography.secondary)
+        .foregroundStyle(WorkspaceTheme.muted)
+        .padding(.vertical, WorkspaceTheme.Spacing.x4)
     } else {
       Text("Sessions (\(projSessions.count))")
-        .font(.subheadline.weight(.semibold))
+        .font(WorkspaceTheme.Typography.section)
+        .foregroundStyle(WorkspaceTheme.ink)
       ForEach(projSessions) { session in
         sessionCardView(session, showProjectTag: false)
       }
     }
   }
 
-  // MARK: - Question & Thread Cards (Expandable Context + Transcript + Direct Reply)
+  // MARK: - Question & Session Cards
 
   private func toggleQuestionExpand(_ q: FleetQuestion) {
     if expandedQuestionIDs.contains(q.id) {
@@ -514,58 +810,71 @@ struct SupervisorWorkspaceView: View {
     let openChat = q.openChat ?? q.chats.first ?? q.threadKey.flatMap { fleet.thread($0)?.openChat } ?? detail?.openChat
     let slotKey = "q:\(q.id)"
 
-    return VStack(alignment: .leading, spacing: 8) {
-      HStack(alignment: .top, spacing: 8) {
-        VStack(alignment: .leading, spacing: 2) {
+    return VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+      HStack(alignment: .top, spacing: WorkspaceTheme.Spacing.x2) {
+        VStack(alignment: .leading, spacing: 3) {
           if q.risky { FleetRiskyLabel() }
           Text(q.title)
-            .font(.subheadline.weight(.semibold))
+            .font(WorkspaceTheme.Typography.body.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.ink)
             .textSelection(.enabled)
           if let label = q.chatLabel ?? openChat?.label {
             Text(label)
-              .font(.caption)
-              .foregroundStyle(.secondary)
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
               .lineLimit(1)
           }
         }
         Spacer()
         if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
-          Button("\(btnTitle) ↗") {
+          WorkspaceActionButton(small: true) {
             fleet.openChat(chat)
+          } label: {
+            Text("\(btnTitle) ↗")
           }
-          .controlSize(.small)
           .help(chat.link == nil ? (chat.note ?? "Bring \(chat.appName ?? "app") forward") : "Open this thread directly")
         }
-        Button(isExpanded ? "Hide ▴" : "Context & Chat ▾") {
+        WorkspaceActionButton(small: true) {
           toggleQuestionExpand(q)
+        } label: {
+          Label(isExpanded ? "Hide" : "Context", systemImage: isExpanded ? "chevron.up" : "chevron.down")
         }
-        .controlSize(.small)
       }
 
       if !q.body.isEmpty {
         Text(q.body)
-          .font(.callout)
-          .foregroundStyle(.secondary)
+          .font(WorkspaceTheme.Typography.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
           .textSelection(.enabled)
       }
 
-      HStack(spacing: 8) {
-        ForEach(q.tappableOptions.prefix(4), id: \.self) { opt in
-          Button(q.label(for: opt)) {
+      HStack(spacing: WorkspaceTheme.Spacing.x2) {
+        ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { index, opt in
+          WorkspaceActionButton(prominent: index == 0 && !q.risky, small: true) {
             Task { await fleet.answer(q, option: opt) }
+          } label: {
+            Text(q.label(for: opt))
           }
           .disabled(busy)
         }
+
         Button("Ask Supervisor") {
           composerText = "About \"\(q.title)\": "
           inlineChatOpen = true
+          composerFocused = true
         }
         .buttonStyle(.borderless)
-        .font(.caption)
+        .font(WorkspaceTheme.Typography.caption.weight(.medium))
+        .foregroundStyle(WorkspaceTheme.live)
+
         Spacer()
+
         Button("Dismiss") {
           Task { await fleet.dismiss(q) }
         }
+        .buttonStyle(.borderless)
+        .font(WorkspaceTheme.Typography.caption)
+        .foregroundStyle(WorkspaceTheme.muted)
         .disabled(busy)
       }
 
@@ -574,18 +883,19 @@ struct SupervisorWorkspaceView: View {
       }
 
       if isExpanded {
-        Divider()
+        WorkspaceHairline(leadingInset: 0)
         if let context = q.displayAskContext, !context.isEmpty {
-          VStack(alignment: .leading, spacing: 3) {
-            Text("Agent context:")
-              .font(.caption.weight(.semibold))
-              .foregroundStyle(.secondary)
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Agent context")
+              .font(WorkspaceTheme.Typography.caption.weight(.semibold))
+              .foregroundStyle(WorkspaceTheme.muted)
             Text(context)
-              .font(.callout)
+              .font(WorkspaceTheme.Typography.secondary)
+              .foregroundStyle(WorkspaceTheme.ink)
               .textSelection(.enabled)
-              .padding(8)
+              .padding(WorkspaceTheme.Spacing.x3)
               .frame(maxWidth: .infinity, alignment: .leading)
-              .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+              .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
           }
         }
 
@@ -595,22 +905,22 @@ struct SupervisorWorkspaceView: View {
           FleetThreadLines(summary: summary, showsExcerpt: detail?.conversation == nil && (q.displayAskContext?.isEmpty ?? true))
           FleetConversationList(conversation: detail?.conversation, loading: fleet.detailLoading.contains(tk))
         } else {
-          Text("No linked live thread key; reply directly below to answer through the supervisor.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+          Text("Reply directly below to answer through Supervisor.")
+            .font(WorkspaceTheme.Typography.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
         }
 
         directThreadComposer(
           slotKey: slotKey,
-          placeholder: "Reply directly to this session (or attach photo)…",
+          placeholder: "Reply directly to this session…",
           onRefresh: q.threadKey.map { tk in { Task { await fleet.loadDetail(tk) } } }
         ) { text, payloadImages in
           await fleet.sendWorkspaceQuestionReply(q, message: text, images: payloadImages)
         }
       }
     }
-    .padding(12)
-    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+    .padding(WorkspaceTheme.Spacing.x4)
+    .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
   }
 
   private func sessionCardView(_ session: SupervisorSessionBrief, showProjectTag: Bool) -> some View {
@@ -622,28 +932,31 @@ struct SupervisorWorkspaceView: View {
     let group = thread?.watch?.group
     let busy = fleet.threadInFlight.contains(session.id)
     let slotKey = "t:\(session.id)"
+    let isRunning = session.state == "running"
 
-    return VStack(alignment: .leading, spacing: 8) {
-      HStack(spacing: 8) {
+    return VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+      HStack(spacing: WorkspaceTheme.Spacing.x2) {
         Button {
           toggleThreadExpand(session.id)
         } label: {
-          HStack(spacing: 8) {
+          HStack(spacing: WorkspaceTheme.Spacing.x3) {
             Circle()
-              .fill(session.state == "running" ? Color.green : Color.secondary.opacity(0.4))
+              .fill(isRunning ? WorkspaceTheme.live : WorkspaceTheme.muted.opacity(0.4))
               .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 2) {
               HStack(spacing: 6) {
-                Text(session.title).font(.body.weight(.medium))
+                Text(session.title)
+                  .font(WorkspaceTheme.Typography.body.weight(.semibold))
+                  .foregroundStyle(WorkspaceTheme.ink)
                 if showProjectTag {
                   Text("#\(session.project)")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(WorkspaceTheme.muted)
                 }
               }
               Text([session.state, session.host, session.cwd, thread?.prShortRef].compactMap { $0 }.joined(separator: " · "))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(WorkspaceTheme.Typography.dataMono)
+                .foregroundStyle(WorkspaceTheme.muted)
                 .lineLimit(1)
             }
             Spacer()
@@ -653,39 +966,49 @@ struct SupervisorWorkspaceView: View {
         .buttonStyle(.plain)
 
         if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
-          Button("\(btnTitle) ↗") {
+          WorkspaceActionButton(small: true) {
             fleet.openChat(chat)
+          } label: {
+            Text("\(btnTitle) ↗")
           }
-          .controlSize(.small)
         }
-        Button(isExpanded ? "Hide ▴" : "Context & Chat ▾") {
+        WorkspaceActionButton(small: true) {
           toggleThreadExpand(session.id)
+        } label: {
+          Label(isExpanded ? "Hide" : "Context", systemImage: isExpanded ? "chevron.up" : "chevron.down")
         }
-        .controlSize(.small)
       }
 
       if isExpanded {
-        Divider()
+        WorkspaceHairline(leadingInset: 0)
         FleetThreadLines(summary: summary, showsExcerpt: detail?.conversation == nil)
         FleetConversationList(conversation: detail?.conversation, loading: fleet.detailLoading.contains(session.id))
 
-        HStack(spacing: 8) {
+        HStack(spacing: WorkspaceTheme.Spacing.x2) {
           if group == "push", !summary.muted, summary.pushMessage != nil {
-            Button("Push now") { Task { await fleet.pushNow(session.id) } }
-              .controlSize(.small)
-              .buttonStyle(.borderedProminent)
-              .disabled(busy || thread?.pushing == true)
+            WorkspaceActionButton(prominent: true, small: true) {
+              Task { await fleet.pushNow(session.id) }
+            } label: {
+              Text("Push now")
+            }
+            .disabled(busy || thread?.pushing == true)
           }
-          Button(summary.muted ? "Unmute" : "Mute 24h") {
+          WorkspaceActionButton(small: true) {
             Task { summary.muted ? await fleet.unmute(session.id) : await fleet.mute(session.id) }
+          } label: {
+            Text(summary.muted ? "Unmute" : "Mute 24h")
           }
-          .controlSize(.small)
           .disabled(busy)
+
           Button("Ask Supervisor") {
             composerText = "Check on \"\(session.title)\" (\(session.id)): "
             inlineChatOpen = true
+            composerFocused = true
           }
-          .controlSize(.small)
+          .buttonStyle(.borderless)
+          .font(WorkspaceTheme.Typography.caption.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.live)
+
           Spacer()
           if busy { ProgressView().controlSize(.small) }
         }
@@ -696,15 +1019,15 @@ struct SupervisorWorkspaceView: View {
 
         directThreadComposer(
           slotKey: slotKey,
-          placeholder: "Reply directly to \(session.title) (or attach photo)…",
+          placeholder: "Reply directly to \(session.title)…",
           onRefresh: { Task { await fleet.loadDetail(session.id) } }
         ) { text, payloadImages in
           await fleet.sendWorkspaceThreadReply(threadKey: session.id, message: text, images: payloadImages)
         }
       }
     }
-    .padding(10)
-    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    .padding(WorkspaceTheme.Spacing.x4)
+    .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
   }
 
   @ViewBuilder
@@ -720,8 +1043,9 @@ struct SupervisorWorkspaceView: View {
     )
     let attached = threadReplyImages[slotKey] ?? []
     let isBusy = threadReplyBusy.contains(slotKey)
+    let hasTextOrPhoto = !(threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attached.isEmpty
 
-    VStack(alignment: .leading, spacing: 6) {
+    VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
       if let note = threadReplyFeedback[slotKey] {
         FleetNoteRow(note: note) { threadReplyFeedback[slotKey] = nil }
       }
@@ -730,33 +1054,34 @@ struct SupervisorWorkspaceView: View {
           threadReplyImages[slotKey] = (threadReplyImages[slotKey] ?? []).filter { $0.id != removeId }
         }
       }
-      HStack(spacing: 6) {
-        Button {
-          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - attached.count))
-          appendAttachments(picked, to: &threadReplyImages[slotKey, default: []])
-        } label: {
-          Label("Photo", systemImage: "photo.badge.plus")
-            .font(.caption)
-        }
-        .controlSize(.small)
-        .disabled(isBusy || attached.count >= 4)
-
-        Button {
-          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - attached.count))
-          if pasted.isEmpty {
-            threadReplyFeedback[slotKey] = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
-          } else {
-            appendAttachments(pasted, to: &threadReplyImages[slotKey, default: []])
+      HStack(spacing: 8) {
+        Menu {
+          Button("Attach Image File…", systemImage: "photo.on.rectangle") {
+            let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - attached.count))
+            appendAttachments(picked, to: &threadReplyImages[slotKey, default: []])
+          }
+          Button("Paste Image from Clipboard", systemImage: "doc.on.clipboard") {
+            let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - attached.count))
+            if pasted.isEmpty {
+              threadReplyFeedback[slotKey] = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
+            } else {
+              appendAttachments(pasted, to: &threadReplyImages[slotKey, default: []])
+            }
           }
         } label: {
-          Label("Paste", systemImage: "doc.on.clipboard")
-            .font(.caption)
+          Image(systemName: "plus")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(WorkspaceTheme.muted)
+            .frame(width: 26, height: 26)
         }
-        .controlSize(.small)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
         .disabled(isBusy || attached.count >= 4)
 
         TextField(placeholder, text: draft)
-          .textFieldStyle(.roundedBorder)
+          .textFieldStyle(.plain)
+          .font(WorkspaceTheme.Typography.secondary)
           .disabled(isBusy)
           .onSubmit {
             sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
@@ -767,20 +1092,36 @@ struct SupervisorWorkspaceView: View {
             onRefresh()
           } label: {
             Image(systemName: "arrow.clockwise")
+              .font(.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
           }
-          .controlSize(.small)
+          .buttonStyle(.plain)
           .help("Reload thread transcript")
         }
 
-        Button(isBusy ? "Sending…" : "Send to Thread") {
+        Button {
           sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
+        } label: {
+          if isBusy {
+            ProgressView().controlSize(.small)
+              .frame(width: 26, height: 26)
+          } else {
+            Image(systemName: "arrow.up")
+              .font(.system(size: 12, weight: .bold))
+              .foregroundStyle(.white)
+              .frame(width: 26, height: 26)
+              .background(
+                hasTextOrPhoto ? WorkspaceTheme.live : WorkspaceTheme.muted.opacity(0.35),
+                in: Circle()
+              )
+          }
         }
-        .controlSize(.small)
-        .disabled(
-          isBusy ||
-            ((threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attached.isEmpty)
-        )
+        .buttonStyle(.plain)
+        .disabled(isBusy || !hasTextOrPhoto)
       }
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .workspaceGlassCapsule(cornerRadius: 18, focused: false)
     }
   }
 
@@ -806,63 +1147,110 @@ struct SupervisorWorkspaceView: View {
     }
   }
 
-  // MARK: - Inline Supervisor Chat Drawer & Bottom Composer
+  // MARK: - Shared Supervisor Messages (DESIGN.md Alignment + Markdown)
 
   @ViewBuilder
   private func supervisorMessagesView(_ messages: [SyncedSupervisorMessage]) -> some View {
-    ForEach(messages) { msg in
-      VStack(alignment: msg.role == "user" ? .trailing : .leading, spacing: 4) {
-        Text(msg.role == "user" ? (msg.sourceName ?? "You") : "Supervisor")
-          .font(.caption2.weight(.semibold))
-          .foregroundStyle(.secondary)
-        let thumbs = msg.thumbnailImageData
-        if !thumbs.isEmpty {
-          HStack(spacing: 6) {
-            ForEach(Array(thumbs.enumerated()), id: \.offset) { _, data in
-              if let nsImg = NSImage(data: data) {
-                Image(nsImage: nsImg)
-                  .resizable()
-                  .scaledToFill()
-                  .frame(width: 72, height: 72)
-                  .clipShape(RoundedRectangle(cornerRadius: 8))
-              }
+    let lastAssistantId = messages.last(where: { $0.role != "user" })?.id
+    VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+      ForEach(messages) { msg in
+        if msg.role == "user" {
+          userBubbleRow(msg)
+        } else {
+          assistantDocumentRow(msg, showsActions: msg.id == lastAssistantId && !supervisor.isSending)
+        }
+      }
+
+      if supervisor.isSending {
+        let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
+          if !liveText.isEmpty {
+            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(supervisor.streamingReplyText ?? liveText))
+          }
+          HStack(spacing: 8) {
+            ProgressView()
+              .controlSize(.small)
+            Text(sendingStageLabel)
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+  }
+
+  private func userBubbleRow(_ msg: SyncedSupervisorMessage) -> some View {
+    VStack(alignment: .trailing, spacing: WorkspaceTheme.Spacing.x1) {
+      if let src = msg.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines),
+         !src.isEmpty,
+         src.caseInsensitiveCompare("Mac") != .orderedSame {
+        Text("From \(src)")
+          .font(WorkspaceTheme.Typography.caption)
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
+      let thumbs = msg.thumbnailImageData
+      if !thumbs.isEmpty {
+        HStack(spacing: 8) {
+          ForEach(Array(thumbs.enumerated()), id: \.offset) { _, data in
+            if let nsImg = NSImage(data: data) {
+              Image(nsImage: nsImg)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 96, height: 96)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                  RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(WorkspaceTheme.edge, lineWidth: 0.5)
+                )
             }
           }
         }
-        Text(msg.text)
-          .textSelection(.enabled)
-          .padding(10)
-          .background(
-            msg.role == "user" ? Color.accentColor.opacity(0.16) : Color(nsColor: .controlBackgroundColor),
-            in: RoundedRectangle(cornerRadius: 10)
-          )
       }
-      .frame(maxWidth: .infinity, alignment: msg.role == "user" ? .trailing : .leading)
-    }
-
-    if supervisor.isSending {
-      let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-      VStack(alignment: .leading, spacing: 4) {
-        HStack(spacing: 6) {
-          Text("Supervisor")
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
-          ProgressView()
-            .controlSize(.mini)
-          if !liveText.isEmpty, let stage = supervisor.progressStage, !stage.isEmpty {
-            Text(sendingStageLabel)
-              .font(.caption2)
-              .foregroundStyle(.secondary)
-          }
+      Text(msg.text)
+        .font(WorkspaceTheme.Typography.chatBody)
+        .foregroundStyle(WorkspaceTheme.ink)
+        .textSelection(.enabled)
+        .padding(.horizontal, WorkspaceTheme.Spacing.x4)
+        .padding(.vertical, WorkspaceTheme.Spacing.x3)
+        .background(
+          WorkspaceTheme.surfaceFill,
+          in: RoundedRectangle(cornerRadius: WorkspaceTheme.bubbleRadius, style: .continuous)
+        )
+        .frame(maxWidth: 520, alignment: .trailing)
+        .contextMenu {
+          Button("Copy") { copyText(msg.text) }
         }
-        Text(liveText.isEmpty ? sendingStageLabel : supervisor.streamingReplyText ?? sendingStageLabel)
-          .foregroundStyle(liveText.isEmpty ? .secondary : .primary)
-          .textSelection(.enabled)
-          .padding(10)
-          .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
     }
+    .frame(maxWidth: .infinity, alignment: .trailing)
+  }
+
+  private func assistantDocumentRow(_ msg: SyncedSupervisorMessage, showsActions: Bool) -> some View {
+    VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
+      WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(msg.text))
+      if showsActions {
+        HStack(spacing: 8) {
+          Button {
+            copyText(msg.text)
+          } label: {
+            Label("Copy", systemImage: "doc.on.doc")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.top, 2)
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .contextMenu {
+      Button("Copy") { copyText(msg.text) }
+    }
+  }
+
+  private func copyText(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
   }
 
   private var sendingStageLabel: String {
@@ -873,20 +1261,195 @@ struct SupervisorWorkspaceView: View {
     case "context": return "Gathering context…"
     case "reasoning", "model": return "Thinking…"
     case "tool": return "Using tools…"
-    case "saving": return "Saving the answer…"
-    default: return "Working…"
+    case "saving": return "Saving answer…"
+    default: return "Thinking…"
     }
   }
 
-  private var inlineSupervisorDrawer: some View {
+  // MARK: - Floating Liquid Glass Bottom Dock & Inline Supervisor Sheet
+
+  private var floatingBottomDock: some View {
+    VStack(spacing: WorkspaceTheme.Spacing.x2) {
+      if activeChannel != .general && inlineChatOpen {
+        inlineSupervisorSheet
+      }
+
+      if let err = supervisor.lastError {
+        HStack(alignment: .top, spacing: 8) {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.alert)
+          Text(err)
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.alert)
+            .lineLimit(3)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          Button {
+            supervisor.clearError()
+          } label: {
+            Image(systemName: "xmark")
+              .font(.caption2)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .workspaceCardSurface(cornerRadius: 12)
+      }
+
+      if let note = composerStatusNote {
+        HStack {
+          Text(note)
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.caution)
+          Spacer()
+        }
+        .padding(.horizontal, 10)
+      }
+
+      if !composerImages.isEmpty {
+        attachmentStrip(composerImages) { removeId in
+          composerImages.removeAll { $0.id == removeId }
+        }
+      }
+
+      floatingPillBar
+
+      Text(activeTargetLabel)
+        .font(.caption2)
+        .foregroundStyle(WorkspaceTheme.muted)
+    }
+    .frame(maxWidth: 740)
+    .padding(.horizontal, WorkspaceTheme.Spacing.x5)
+    .padding(.bottom, WorkspaceTheme.Spacing.x3)
+    .padding(.top, 6)
+    .frame(maxWidth: .infinity)
+  }
+
+  private var floatingPillBar: some View {
+    let trimmed = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let canSend = !supervisor.isSending && (!trimmed.isEmpty || !composerImages.isEmpty)
+
+    return HStack(alignment: .bottom, spacing: 8) {
+      Menu {
+        Button("Photo or Screenshot…", systemImage: "photo.on.rectangle") {
+          composerStatusNote = nil
+          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - composerImages.count))
+          appendAttachments(picked, to: &composerImages)
+        }
+        Button("Paste Image from Clipboard", systemImage: "doc.on.clipboard") {
+          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - composerImages.count))
+          if pasted.isEmpty {
+            composerStatusNote = "Clipboard has no image to attach."
+          } else {
+            composerStatusNote = nil
+            appendAttachments(pasted, to: &composerImages)
+          }
+        }
+      } label: {
+        Image(systemName: "plus")
+          .font(.system(size: 16, weight: .semibold))
+          .foregroundStyle(composerImages.isEmpty ? WorkspaceTheme.muted : WorkspaceTheme.live)
+          .frame(width: 34, height: 34)
+          .contentShape(Circle())
+      }
+      .menuStyle(.borderlessButton)
+      .menuIndicator(.hidden)
+      .fixedSize()
+      .disabled(supervisor.isSending || composerImages.count >= 4)
+      .help("Attach or paste up to 4 images")
+
+      TextField(composerPlaceholder, text: $composerText, axis: .vertical)
+        .textFieldStyle(.plain)
+        .font(WorkspaceTheme.Typography.chatBody)
+        .lineLimit(1...6)
+        .focused($composerFocused)
+        .disabled(supervisor.isSending)
+        .padding(.vertical, 7)
+        .onSubmit {
+          sendFromWorkspace()
+        }
+
+      if activeChannel != .general {
+        Button {
+          withAnimation(.easeOut(duration: 0.16)) {
+            inlineChatOpen.toggle()
+          }
+        } label: {
+          HStack(spacing: 4) {
+            Image(systemName: "bubble.left.and.bubble.right")
+              .font(.caption.weight(.semibold))
+            Text("\(supervisor.messages.count)")
+              .font(.caption2.weight(.semibold))
+          }
+          .padding(.horizontal, 9)
+          .padding(.vertical, 6)
+          .background(
+            (inlineChatOpen ? WorkspaceTheme.live : WorkspaceTheme.muted).opacity(0.14),
+            in: Capsule()
+          )
+          .foregroundStyle(inlineChatOpen ? WorkspaceTheme.live : WorkspaceTheme.muted)
+        }
+        .buttonStyle(.plain)
+        .help(inlineChatOpen ? "Minimize Supervisor chat drawer" : "Show Supervisor chat history")
+      }
+
+      Button {
+        sendFromWorkspace()
+      } label: {
+        Group {
+          if supervisor.isSending {
+            ProgressView()
+              .controlSize(.small)
+          } else {
+            Image(systemName: "arrow.up")
+              .font(.system(size: 14, weight: .bold))
+              .foregroundStyle(.white)
+          }
+        }
+        .frame(width: 32, height: 32)
+        .background(
+          canSend ? WorkspaceTheme.live : WorkspaceTheme.muted.opacity(0.32),
+          in: Circle()
+        )
+      }
+      .buttonStyle(.plain)
+      .disabled(!canSend)
+      .help("Send to Supervisor")
+    }
+    .padding(.horizontal, 10)
+    .padding(.vertical, 6)
+    .workspaceGlassCapsule(cornerRadius: WorkspaceTheme.pillRadius, focused: composerFocused)
+    .overlay(
+      RoundedRectangle(cornerRadius: WorkspaceTheme.pillRadius, style: .continuous)
+        .strokeBorder(isDropTargeted ? WorkspaceTheme.live : Color.clear, lineWidth: 2)
+    )
+    .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { providers in
+      Task {
+        let dropped = await WorkspaceImageAttachment.fromDropProviders(
+          providers,
+          limit: max(1, 4 - composerImages.count)
+        )
+        await MainActor.run {
+          composerStatusNote = nil
+          appendAttachments(dropped, to: &composerImages)
+        }
+      }
+      return true
+    }
+  }
+
+  private var inlineSupervisorSheet: some View {
     VStack(spacing: 0) {
       HStack {
-        Text("💬 Supervisor Chat (\(supervisor.messages.count))")
+        Label("Supervisor Chat (\(supervisor.messages.count))", systemImage: "bubble.left.and.bubble.right")
           .font(.caption.weight(.semibold))
-          .foregroundStyle(.secondary)
+          .foregroundStyle(WorkspaceTheme.muted)
         Spacer()
-        Button("Full #general ↗") {
-          channel = .general
+        Button("Full General ↗") {
+          nav.selectedChannel = .general
         }
         .buttonStyle(.borderless)
         .font(.caption)
@@ -896,142 +1459,27 @@ struct SupervisorWorkspaceView: View {
         .buttonStyle(.borderless)
         .font(.caption)
       }
-      .padding(.horizontal, 12)
-      .padding(.vertical, 6)
-      .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+      .padding(.horizontal, 14)
+      .padding(.vertical, 8)
+
+      WorkspaceHairline(leadingInset: 0)
 
       ScrollView {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
           if supervisor.messages.isEmpty {
-            Text("No supervisor messages yet — ask anything or attach screenshots below.")
-              .font(.caption)
-              .foregroundStyle(.secondary)
+            Text("No messages yet — ask anything or drop screenshots below.")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
           } else {
             supervisorMessagesView(Array(supervisor.messages.suffix(12)))
           }
         }
-        .padding(12)
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
       }
       .frame(maxHeight: 220)
     }
-  }
-
-  private var bottomComposer: some View {
-    VStack(alignment: .leading, spacing: 6) {
-      HStack {
-        Text("Target: \(activeTargetLabel)")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-        Spacer()
-        if channel != .general {
-          Button(inlineChatOpen ? "▾ Hide Chat" : "▸ Chat (\(supervisor.messages.count))") {
-            inlineChatOpen.toggle()
-          }
-          .buttonStyle(.borderless)
-          .font(.caption2)
-        }
-        if let note = composerStatusNote {
-          Text(note).font(.caption2).foregroundStyle(.orange).lineLimit(1)
-        }
-      }
-
-      if let err = supervisor.lastError {
-        HStack(alignment: .top, spacing: 6) {
-          Image(systemName: "exclamationmark.triangle.fill")
-            .font(.caption)
-            .foregroundStyle(.red)
-          Text(err)
-            .font(.caption)
-            .foregroundStyle(.red)
-            .lineLimit(3)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-          Button {
-            supervisor.clearError()
-          } label: {
-            Image(systemName: "xmark")
-              .font(.caption2)
-              .foregroundStyle(.secondary)
-          }
-          .buttonStyle(.plain)
-          .help("Dismiss error")
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
-      }
-
-      if !composerImages.isEmpty {
-        attachmentStrip(composerImages) { removeId in
-          composerImages.removeAll { $0.id == removeId }
-        }
-      }
-
-      HStack(spacing: 8) {
-        Button {
-          composerStatusNote = nil
-          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - composerImages.count))
-          appendAttachments(picked, to: &composerImages)
-        } label: {
-          Label(
-            composerImages.isEmpty ? "+ Photo" : "+\(composerImages.count)",
-            systemImage: "photo.badge.plus"
-          )
-        }
-        .disabled(supervisor.isSending || composerImages.count >= 4)
-        .help("Attach up to 4 images or screenshots")
-
-        Button {
-          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - composerImages.count))
-          if pasted.isEmpty {
-            composerStatusNote = "Clipboard has no image to attach."
-          } else {
-            composerStatusNote = nil
-            appendAttachments(pasted, to: &composerImages)
-          }
-        } label: {
-          Image(systemName: "doc.on.clipboard")
-        }
-        .disabled(supervisor.isSending || composerImages.count >= 4)
-        .help("Paste image from clipboard")
-
-        TextField(
-          channel == .general
-            ? "Ask Supervisor anything or drop/attach photos (synced across all devices)…"
-            : "Ask Supervisor about #\(channelNameForPlaceholder) or attach photos…",
-          text: $composerText
-        )
-        .textFieldStyle(.roundedBorder)
-        .disabled(supervisor.isSending)
-        .onSubmit { sendFromWorkspace() }
-
-        Button(supervisor.isSending ? "Sending…" : "Send") {
-          sendFromWorkspace()
-        }
-        .disabled(
-          supervisor.isSending ||
-            (composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && composerImages.isEmpty)
-        )
-      }
-      .padding(4)
-      .background(isDropTargeted ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
-      .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { providers in
-        Task {
-          let dropped = await WorkspaceImageAttachment.fromDropProviders(
-            providers,
-            limit: max(1, 4 - composerImages.count)
-          )
-          await MainActor.run {
-            composerStatusNote = nil
-            appendAttachments(dropped, to: &composerImages)
-          }
-        }
-        return true
-      }
-    }
-    .padding(12)
-    .background(.ultraThinMaterial)
+    .workspaceCardSurface(cornerRadius: 18)
   }
 
   private func attachmentStrip(_ items: [WorkspaceImageAttachment], onRemove: @escaping (String) -> Void) -> some View {
@@ -1042,14 +1490,18 @@ struct SupervisorWorkspaceView: View {
             Image(nsImage: item.preview)
               .resizable()
               .scaledToFill()
-              .frame(width: 56, height: 56)
-              .clipShape(RoundedRectangle(cornerRadius: 8))
+              .frame(width: 64, height: 64)
+              .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+              .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                  .strokeBorder(WorkspaceTheme.edge, lineWidth: 0.5)
+              )
             Button {
               onRemove(item.id)
             } label: {
               Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 14))
-                .foregroundStyle(.white, .black.opacity(0.7))
+                .font(.system(size: 15))
+                .foregroundStyle(.white, .black.opacity(0.75))
             }
             .buttonStyle(.plain)
             .offset(x: 4, y: -4)
@@ -1069,9 +1521,15 @@ struct SupervisorWorkspaceView: View {
     }
   }
 
-  private var channelNameForPlaceholder: String {
-    if case let .project(name) = channel { return name }
-    return "general"
+  private var composerPlaceholder: String {
+    switch activeChannel {
+    case .general:
+      return "Message Supervisor (drop or attach screenshots)…"
+    case let .project(name):
+      return "Ask Supervisor about #\(name)…"
+    case .needsYou, .tasks, .sessions:
+      return "Ask Supervisor…"
+    }
   }
 
   private func sendFromWorkspace() {
@@ -1080,10 +1538,10 @@ struct SupervisorWorkspaceView: View {
     let imgs = composerImages
     guard !raw.isEmpty || !imgs.isEmpty else { return }
     let textToSend: String
-    if case let .project(projName) = channel {
+    if case let .project(projName) = activeChannel {
       textToSend = raw.isEmpty ? "[\(projName)] Please inspect the attached screenshot(s)." : "[\(projName)] \(raw)"
       inlineChatOpen = true
-    } else if channel != .general {
+    } else if activeChannel != .general {
       textToSend = raw
       inlineChatOpen = true
     } else {
