@@ -113,6 +113,61 @@ test("a retried update id runs one agent turn", async () => {
   assert.equal(handled.length, 1);
 });
 
+test("an update whose turn or reply failed can be retried", async () => {
+  const { channel, handled, sends } = makeChannel();
+  const { code } = channel.pairing.generateCode();
+  await channel.handleUpdate(update(556, "/pair " + code));
+
+  // The agent turn throws: the retry must run a fresh turn.
+  const realHandle = channel.agentHost.handleMessage;
+  channel.agentHost.handleMessage = async () => { throw new Error("provider down"); };
+  const first = update(556, "hello");
+  await assert.rejects(channel.handleUpdate(first), /provider down/);
+  channel.agentHost.handleMessage = realHandle;
+  const retry = await channel.handleUpdate(first);
+  assert.notEqual(retry.reason, "duplicate-update");
+  assert.equal(handled.length, 1);
+
+  // The outbound reply throws: the retry must send the reply again.
+  const realSend = channel.sendMessage;
+  channel.sendMessage = async () => { throw new Error("network down"); };
+  const second = update(556, "again");
+  await assert.rejects(channel.handleUpdate(second), /network down/);
+  channel.sendMessage = realSend;
+  const sendsBefore = sends.length;
+  await channel.handleUpdate(second);
+  assert.equal(sends.length, sendsBefore + 1);
+
+  // A completed update is still deduplicated.
+  const dup = await channel.handleUpdate(second);
+  assert.equal(dup.reason, "duplicate-update");
+});
+
+test("polling does not skip past an update whose turn failed", async () => {
+  const { channel, handled } = makeChannel();
+  const { code } = channel.pairing.generateCode();
+  await channel.handleUpdate(update(557, "/pair " + code));
+  const failing = update(557, "hello");
+  let fail = true;
+  const realHandle = channel.agentHost.handleMessage;
+  channel.agentHost.handleMessage = async (input) => {
+    if (fail) throw new Error("provider down");
+    return realHandle(input);
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: [failing] }) });
+  try {
+    await assert.rejects(channel.pollOnce(), /provider down/);
+    assert.ok((channel.state.offset ?? 0) <= failing.update_id);
+    fail = false;
+    await channel.pollOnce();
+    assert.equal(handled.length, 1);
+    assert.equal(channel.state.offset, failing.update_id + 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("the webhook secret check fails closed when no secret is configured", () => {
   assert.equal(verifyTelegramSecret({ headerValue: undefined, expected: null }).ok, false);
   assert.equal(verifyTelegramSecret({ headerValue: "anything", expected: "" }).ok, false);

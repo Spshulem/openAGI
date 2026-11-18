@@ -145,11 +145,23 @@ export class TelegramChannel {
   }
 
   async handleUpdate(update) {
-    if (Number.isSafeInteger(update?.update_id)) {
-      if (this.seenUpdates.has(update.update_id)) return { ignored: true, reason: "duplicate-update" };
-      this.seenUpdates.add(update.update_id);
-      if (this.seenUpdates.size > 1000) this.seenUpdates.delete(this.seenUpdates.values().next().value);
+    const updateId = update?.update_id;
+    if (!Number.isSafeInteger(updateId)) return this.processUpdate(update);
+    if (this.seenUpdates.has(updateId)) return { ignored: true, reason: "duplicate-update" };
+    // Claimed while in flight so a concurrent retry is skipped, but released if
+    // the turn or the reply fails so Telegram's retry (or the next poll) can
+    // process it again instead of losing the message.
+    this.seenUpdates.add(updateId);
+    if (this.seenUpdates.size > 1000) this.seenUpdates.delete(this.seenUpdates.values().next().value);
+    try {
+      return await this.processUpdate(update);
+    } catch (error) {
+      this.seenUpdates.delete(updateId);
+      throw error;
     }
+  }
+
+  async processUpdate(update) {
     appendJsonLine(this.eventsPath, { at: nowIso(), update });
     const message = update.message ?? update.edited_message;
     const text = message?.text ?? message?.caption;
