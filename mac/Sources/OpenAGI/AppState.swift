@@ -698,7 +698,74 @@ final class AppState: ObservableObject {
       "metadata": meta
     ]
     let body = try JSONSerialization.data(withJSONObject: payload)
-    return try await streamOverlayMessage(body: body, onProgress: onProgress, onTextDelta: onTextDelta)
+    do {
+      return try await streamOverlayMessage(body: body, onProgress: onProgress, onTextDelta: onTextDelta)
+    } catch {
+      let ns = error as NSError
+      if ns.domain == "OpenAGI",
+         ns.code == 400,
+         ns.localizedDescription.localizedCaseInsensitiveContains("unsupported fields") {
+        let fallback = Self.workerFallbackOverlayPayload(
+          text: text,
+          sessionId: sessionId,
+          screenContext: screenContext,
+          briefContext: briefContext
+        )
+        let fallbackBody = try JSONSerialization.data(withJSONObject: fallback)
+        return try await streamOverlayMessage(body: fallbackBody, onProgress: onProgress, onTextDelta: onTextDelta)
+      }
+      throw error
+    }
+  }
+
+  /// Build an allowlisted `/message` body when a paired worker rejects
+  /// `channel` / `agentId` / `metadata` via main's `requestNodeId` gate.
+  nonisolated static func workerFallbackOverlayPayload(
+    text: String,
+    sessionId: String,
+    screenContext: ScreenContext?,
+    briefContext: BriefChatContext?
+  ) -> [String: Any] {
+    let isSupervisor = (sessionId == overlaySupervisorSessionId)
+    var contextLines: [String] = []
+    if let brief = briefContext {
+      let title = brief.title.trimmingCharacters(in: .whitespacesAndNewlines)
+      let why = brief.why.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !title.isEmpty {
+        if !why.isEmpty && why != title {
+          contextLines.append("Context (\(brief.kind)): \(title) — \(why)")
+        } else {
+          contextLines.append("Context (\(brief.kind)): \(title)")
+        }
+      }
+    }
+    if let s = screenContext {
+      let trimmedScreen = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmedScreen.isEmpty {
+        let header: String
+        if let w = s.window, !w.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          header = "\(s.app) — \(w)"
+        } else {
+          header = s.app
+        }
+        contextLines.append("Active screen (\(header)):\n\(String(trimmedScreen.prefix(4000)))")
+      }
+    }
+    var effectiveText = contextLines.isEmpty
+      ? text
+      : "\(text)\n\n[\(contextLines.joined(separator: "\n"))]"
+    if effectiveText.utf8.count > 60_000 {
+      var trimmed = String(effectiveText.prefix(20_000))
+      while trimmed.utf8.count > 60_000, !trimmed.isEmpty {
+        trimmed.removeLast(min(256, trimmed.count))
+      }
+      effectiveText = trimmed
+    }
+    return [
+      "text": effectiveText,
+      "thread": isSupervisor ? "supervisor" : "agent",
+      "from": isSupervisor ? "mac-supervisor" : "mac-overlay"
+    ]
   }
 
   /// Consume POST /message's opt-in SSE response. Status and heartbeat frames
@@ -953,15 +1020,26 @@ final class AppState: ObservableObject {
     return out
   }
 
+  /// Extract a readable error string from daemon JSON error payloads (`message` / `error`).
+  nonisolated static func extractErrorMessage(_ data: Data) -> String {
+    if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      let msg = (obj["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let err = (obj["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      if !msg.isEmpty { return msg }
+      if !err.isEmpty { return err }
+    }
+    return (String(data: data.prefix(300), encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   /// Throw on any non-2xx so callers see a real error instead of decoding
   /// an error body into nil and rendering it as "(no reply)".
   nonisolated static func ensureOK(_ resp: URLResponse, _ data: Data) throws {
     guard let http = resp as? HTTPURLResponse else { return }
     guard (200..<300).contains(http.statusCode) else {
       if let error = MainConnectionError.decode(statusCode: http.statusCode, data: data) { throw error }
-      let snippet = String(data: data.prefix(300), encoding: .utf8) ?? ""
+      let detail = Self.extractErrorMessage(data)
       throw NSError(domain: "OpenAGI", code: http.statusCode, userInfo: [
-        NSLocalizedDescriptionKey: "HTTP \(http.statusCode)\(snippet.isEmpty ? "" : ": \(snippet)")"
+        NSLocalizedDescriptionKey: "HTTP \(http.statusCode)\(detail.isEmpty ? "" : ": \(detail)")"
       ])
     }
   }

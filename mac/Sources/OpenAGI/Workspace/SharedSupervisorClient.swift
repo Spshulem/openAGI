@@ -186,6 +186,13 @@ struct WorkspaceImageAttachment: Identifiable, Equatable {
   }
 }
 
+struct SyncedAttachmentPreview: Decodable, Equatable, Sendable {
+  let id: String
+  let name: String?
+  let mimeType: String?
+  let thumbnail: String?
+}
+
 struct SyncedSupervisorMessage: Identifiable, Decodable, Equatable, Sendable {
   let id: String
   let role: String
@@ -193,11 +200,33 @@ struct SyncedSupervisorMessage: Identifiable, Decodable, Equatable, Sendable {
   let at: String?
   let sourceName: String?
   let sourceNodeId: String?
+  let attachments: [SyncedAttachmentPreview]?
   var localThumbnailData: [Data] = []
 
-  enum CodingKeys: String, CodingKey {
-    case id, role, text, at, sourceName, sourceNodeId
+  var thumbnailImageData: [Data] {
+    if !localThumbnailData.isEmpty { return localThumbnailData }
+    return (attachments ?? []).compactMap { preview in
+      guard let encoded = preview.thumbnail, !encoded.isEmpty else { return nil }
+      return Data(base64Encoded: encoded)
+    }
   }
+
+  enum CodingKeys: String, CodingKey {
+    case id, role, text, at, sourceName, sourceNodeId, attachments
+  }
+}
+
+private struct SupervisorStreamStatus: Decodable {
+  let stage: String?
+}
+
+private struct SupervisorStreamDelta: Decodable {
+  let text: String
+  let reset: Bool?
+}
+
+private struct SupervisorStreamFailure: Decodable {
+  let error: String?
 }
 
 struct MacTaskItem: Identifiable, Decodable, Equatable, Sendable {
@@ -226,9 +255,46 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var messages: [SyncedSupervisorMessage] = []
   @Published private(set) var tasks: [MacTaskItem] = []
   @Published private(set) var isSending = false
+  @Published private(set) var streamingReplyText: String? = nil
+  @Published private(set) var progressStage: String? = nil
   @Published private(set) var lastError: String? = nil
 
+  private struct UnsupportedFieldsError: Error {}
+
+  func clearError() {
+    lastError = nil
+  }
+
   private init() {}
+
+  /// Builds a `POST /message` payload restricted to fields allowlisted by
+  /// `src/hosted-interface.js` (`requestNodeId` gate). Never include client-only
+  /// fields like `metadata`, `channel`, or `agentId` here.
+  nonisolated static func buildMessagePayload(
+    text: String,
+    focusedCardId: String? = nil,
+    attachments: [WorkspaceImageAttachment] = [],
+    includeThread: Bool = true,
+    includeFocusedCard: Bool = true
+  ) -> [String: Any] {
+    var payload: [String: Any] = [
+      "text": text,
+      "from": "mac-supervisor"
+    ]
+    if includeThread {
+      payload["thread"] = "supervisor"
+    }
+    if includeFocusedCard,
+       let rawCard = focusedCardId?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !rawCard.isEmpty,
+       rawCard.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil {
+      payload["focusedCardId"] = rawCard
+    }
+    if !attachments.isEmpty {
+      payload["attachments"] = attachments.map(\.agentHostPayload)
+    }
+    return payload
+  }
 
   func refreshAll() async {
     await withTaskGroup(of: Void.self) { group in
@@ -270,51 +336,162 @@ final class SharedSupervisorClient: ObservableObject {
     }
   }
 
-  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async {
+  @discardableResult
+  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard (!trimmed.isEmpty || !attachments.isEmpty), !isSending else { return }
+    guard (!trimmed.isEmpty || !attachments.isEmpty), !isSending else { return false }
     isSending = true
     lastError = nil
-    defer { isSending = false }
+    streamingReplyText = nil
+    progressStage = "queued"
+    defer {
+      isSending = false
+      streamingReplyText = nil
+      progressStage = nil
+    }
 
     let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+    let localId = "local_\(UUID().uuidString)"
     let optimistic = SyncedSupervisorMessage(
-      id: "local_\(UUID().uuidString)",
+      id: localId,
       role: "user",
       text: displayText,
       at: ISO8601DateFormatter().string(from: Date()),
       sourceName: "Mac",
       sourceNodeId: nil,
+      attachments: nil,
       localThumbnailData: attachments.map(\.previewData)
     )
     messages.append(optimistic)
 
-    var payload: [String: Any] = [
-      "text": displayText,
-      "thread": "supervisor",
-      "metadata": ["sourceName": "Mac"]
-    ]
-    if let focusedCardId, !focusedCardId.isEmpty {
-      payload["focusedCardId"] = focusedCardId
+    let hasValidCardId = focusedCardId?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil
+
+    var attempts: [(includeThread: Bool, includeFocusedCard: Bool)] = [(true, true)]
+    if hasValidCardId {
+      attempts.append((true, false))
     }
-    if !attachments.isEmpty {
-      payload["attachments"] = attachments.map(\.agentHostPayload)
+    attempts.append((false, false))
+
+    do {
+      var replyText: String? = nil
+      for (index, attempt) in attempts.enumerated() {
+        do {
+          let payload = Self.buildMessagePayload(
+            text: displayText,
+            focusedCardId: focusedCardId,
+            attachments: attachments,
+            includeThread: attempt.includeThread,
+            includeFocusedCard: attempt.includeFocusedCard
+          )
+          replyText = try await performStreamedMessage(payload: payload)
+          break
+        } catch is UnsupportedFieldsError {
+          if index == attempts.count - 1 {
+            throw NSError(domain: "OpenAGI", code: 400, userInfo: [
+              NSLocalizedDescriptionKey: "HTTP 400: node message contains unsupported fields"
+            ])
+          }
+          continue
+        }
+      }
+      if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty {
+        messages.append(SyncedSupervisorMessage(
+          id: "local_reply_\(UUID().uuidString)",
+          role: "assistant",
+          text: reply,
+          at: ISO8601DateFormatter().string(from: Date()),
+          sourceName: nil,
+          sourceNodeId: nil,
+          attachments: nil
+        ))
+      }
+      await refreshMessages()
+      await refreshTasks()
+      return true
+    } catch {
+      messages.removeAll { $0.id == localId }
+      lastError = error.localizedDescription
+      return false
     }
+  }
+
+  private func performStreamedMessage(payload: [String: Any]) async throws -> String? {
     var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/message"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+    req.httpBody = try JSONSerialization.data(withJSONObject: payload)
     req.timeoutInterval = 180
     authed(&req)
 
-    do {
-      let (data, response) = try await URLSession.shared.data(for: req)
-      try AppState.ensureOK(response, data)
-      await refreshMessages()
-      await refreshTasks()
-    } catch {
-      lastError = error.localizedDescription
+    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+    guard let http = response as? HTTPURLResponse else {
+      throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
+        NSLocalizedDescriptionKey: "The daemon returned an invalid response."
+      ])
     }
+
+    if !(200..<300).contains(http.statusCode) {
+      var errData = Data()
+      for try await byte in bytes {
+        errData.append(byte)
+        if errData.count >= 4096 { break }
+      }
+      if http.statusCode == 400,
+         AppState.extractErrorMessage(errData).localizedCaseInsensitiveContains("unsupported fields") {
+        throw UnsupportedFieldsError()
+      }
+      try AppState.ensureOK(response, errData)
+      return nil
+    }
+
+    let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+    if !contentType.contains("text/event-stream") {
+      var data = Data()
+      for try await byte in bytes { data.append(byte) }
+      try AppState.ensureOK(response, data)
+      let decoded = try JSONDecoder().decode(AppState.MessageReply.self, from: data)
+      return decoded.reply
+    }
+
+    var parser = ServerSentEventParser()
+    for try await line in bytes.lines {
+      guard let event = parser.consume(line: line) else { continue }
+      let data = Data(event.data.utf8)
+      switch event.name {
+      case "status", "heartbeat":
+        if let status = try? JSONDecoder().decode(SupervisorStreamStatus.self, from: data),
+           let stage = status.stage, !stage.isEmpty {
+          progressStage = stage
+        }
+      case "delta":
+        if let delta = try? JSONDecoder().decode(SupervisorStreamDelta.self, from: data),
+           !delta.text.isEmpty {
+          streamingReplyText = delta.reset == true ? delta.text : (streamingReplyText ?? "") + delta.text
+        }
+      case "final":
+        let decoded = try? JSONDecoder().decode(AppState.MessageReply.self, from: data)
+        if let reply = decoded?.reply, !reply.isEmpty {
+          streamingReplyText = reply
+        }
+        return decoded?.reply ?? streamingReplyText
+      case "failure":
+        let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
+        let message = failure?.error ?? "Supervisor could not complete that request."
+        throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+      default:
+        continue
+      }
+    }
+
+    if let partial = streamingReplyText, !partial.isEmpty {
+      return partial
+    }
+    throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
+      NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
+    ])
   }
 
   func appendMirror(userText: String, assistantText: String) async {

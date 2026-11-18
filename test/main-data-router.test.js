@@ -376,3 +376,79 @@ test("draft delivery capabilities come from main while channel setup stays local
   assert.equal(isMainDataRoute("POST", "/channels", new URLSearchParams("source=main")), false);
   assert.equal(isMainDataRoute("GET", "/channels/telegram/pairing-code", new URLSearchParams("source=main")), false);
 });
+
+test("Mac supervisor workspace /message payload passes main's worker proxy allowlist and persists attachments", async (t) => {
+  const clientSwift = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../mac/Sources/OpenAGI/Workspace/SharedSupervisorClient.swift"),
+    "utf8"
+  );
+  const buildBlock = clientSwift.match(/static func buildMessagePayload\([\s\S]*?\n  \}/)?.[0] ?? "";
+  assert.ok(buildBlock.length > 0, "SharedSupervisorClient.buildMessagePayload must exist");
+  assert.match(buildBlock, /"thread"\s*\]\s*=\s*"supervisor"/);
+  assert.doesNotMatch(buildBlock, /"metadata"\s*[:\]]|"channel"\s*[:\]]|"agentId"\s*[:\]]/);
+
+  const prevToken = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = OWNER;
+  t.after(() => {
+    if (prevToken === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = prevToken;
+  });
+
+  const { main, worker } = await pair(t);
+  const identity = readOrCreateIdentity(worker.dataDir);
+  const proxyToken = "m".repeat(43);
+  main.nodeRegistry.enroll(identity.nodeId, WORKER.token, {
+    platform: "openagi",
+    name: "Spencer Mac",
+    ownerProxyToken: proxyToken
+  });
+  writeNodeConfig({
+    remote: main.url,
+    token: null,
+    nodeToken: WORKER.token,
+    nodeEnrollmentConfirmed: true,
+    ownerProxyToken: proxyToken
+  }, worker.dataDir);
+
+  const sampleJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xd9]).toString("base64");
+  const ownerHeaders = { authorization: `Bearer ${OWNER}`, "content-type": "application/json" };
+
+  // Any client-supplied metadata/channel/agentId is rejected by main's requestNodeId gate.
+  const rejected = await fetch(worker.url + "/message", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ text: "Bad", thread: "supervisor", metadata: { sourceName: "Mac" } })
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error, "node message contains unsupported fields");
+
+  // Allowlisted Mac payload (text, from, thread, attachments) succeeds and lands in devices:supervisor:main.
+  const sent = await fetch(worker.url + "/message", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({
+      text: "Check screenshot",
+      from: "mac-supervisor",
+      thread: "supervisor",
+      attachments: [{
+        id: "img_test123",
+        name: "screen.jpg",
+        mimeType: "image/jpeg",
+        data: sampleJpeg,
+        thumbnail: sampleJpeg
+      }]
+    })
+  });
+  assert.equal(sent.status, 200);
+  assert.equal((await sent.json()).reply, "Main's reply");
+
+  const historyRes = await fetch(worker.url + "/conversations/supervisor/messages?limit=10", {
+    headers: { authorization: `Bearer ${OWNER}` }
+  });
+  assert.equal(historyRes.status, 200);
+  const history = await historyRes.json();
+  const userTurn = history.messages.find((m) => m.role === "user");
+  assert.equal(userTurn?.text, "Check screenshot");
+  assert.equal(userTurn?.attachments?.[0]?.id, "img_test123");
+  assert.equal(userTurn?.attachments?.[0]?.thumbnail, sampleJpeg);
+});

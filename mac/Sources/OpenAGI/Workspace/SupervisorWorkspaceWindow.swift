@@ -815,9 +815,10 @@ struct SupervisorWorkspaceView: View {
         Text(msg.role == "user" ? (msg.sourceName ?? "You") : "Supervisor")
           .font(.caption2.weight(.semibold))
           .foregroundStyle(.secondary)
-        if !msg.localThumbnailData.isEmpty {
+        let thumbs = msg.thumbnailImageData
+        if !thumbs.isEmpty {
           HStack(spacing: 6) {
-            ForEach(Array(msg.localThumbnailData.enumerated()), id: \.offset) { _, data in
+            ForEach(Array(thumbs.enumerated()), id: \.offset) { _, data in
               if let nsImg = NSImage(data: data) {
                 Image(nsImage: nsImg)
                   .resizable()
@@ -837,6 +838,43 @@ struct SupervisorWorkspaceView: View {
           )
       }
       .frame(maxWidth: .infinity, alignment: msg.role == "user" ? .trailing : .leading)
+    }
+
+    if supervisor.isSending {
+      let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 6) {
+          Text("Supervisor")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+          ProgressView()
+            .controlSize(.mini)
+          if !liveText.isEmpty, let stage = supervisor.progressStage, !stage.isEmpty {
+            Text(sendingStageLabel)
+              .font(.caption2)
+              .foregroundStyle(.secondary)
+          }
+        }
+        Text(liveText.isEmpty ? sendingStageLabel : supervisor.streamingReplyText ?? sendingStageLabel)
+          .foregroundStyle(liveText.isEmpty ? .secondary : .primary)
+          .textSelection(.enabled)
+          .padding(10)
+          .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
+
+  private var sendingStageLabel: String {
+    switch supervisor.progressStage {
+    case "queued": return "Queued…"
+    case "routing": return "Choosing the right agent…"
+    case "accepted": return "Request saved…"
+    case "context": return "Gathering context…"
+    case "reasoning", "model": return "Thinking…"
+    case "tool": return "Using tools…"
+    case "saving": return "Saving the answer…"
+    default: return "Working…"
     }
   }
 
@@ -895,9 +933,33 @@ struct SupervisorWorkspaceView: View {
         }
         if let note = composerStatusNote {
           Text(note).font(.caption2).foregroundStyle(.orange).lineLimit(1)
-        } else if let err = supervisor.lastError {
-          Text(err).font(.caption2).foregroundStyle(.red).lineLimit(1)
         }
+      }
+
+      if let err = supervisor.lastError {
+        HStack(alignment: .top, spacing: 6) {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.caption)
+            .foregroundStyle(.red)
+          Text(err)
+            .font(.caption)
+            .foregroundStyle(.red)
+            .lineLimit(3)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          Button {
+            supervisor.clearError()
+          } label: {
+            Image(systemName: "xmark")
+              .font(.caption2)
+              .foregroundStyle(.secondary)
+          }
+          .buttonStyle(.plain)
+          .help("Dismiss error")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
       }
 
       if !composerImages.isEmpty {
@@ -1013,7 +1075,8 @@ struct SupervisorWorkspaceView: View {
   }
 
   private func sendFromWorkspace() {
-    let raw = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let rawDraft = composerText
+    let raw = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
     let imgs = composerImages
     guard !raw.isEmpty || !imgs.isEmpty else { return }
     let textToSend: String
@@ -1029,6 +1092,16 @@ struct SupervisorWorkspaceView: View {
     composerText = ""
     composerImages = []
     composerStatusNote = nil
-    Task { await supervisor.sendMessage(textToSend, attachments: imgs) }
+    Task {
+      let ok = await supervisor.sendMessage(textToSend, attachments: imgs)
+      if !ok {
+        if composerText.isEmpty {
+          composerText = rawDraft
+        }
+        if composerImages.isEmpty && !imgs.isEmpty {
+          composerImages = imgs
+        }
+      }
+    }
   }
 }
