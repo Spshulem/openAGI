@@ -46,10 +46,11 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   /// The hub takes a typed reply for it (POST /fleet/api/questions/:id
   /// { reply }). False from a hub before it.
   var canReply: Bool = false
+  let project: String?
 
   enum CodingKeys: String, CodingKey {
     case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
-    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply
+    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project
   }
 
   /// Why the supervisor's review kept it, or the close the owner overrode
@@ -129,6 +130,7 @@ extension FleetQuestion {
     risky = (try? c.decodeIfPresent(Bool.self, forKey: .risky)) ?? false
     askContext = try? c.decodeIfPresent(String.self, forKey: .askContext)
     canReply = (try? c.decodeIfPresent(Bool.self, forKey: .canReply)) ?? false
+    project = try? c.decodeIfPresent(String.self, forKey: .project)
   }
 }
 

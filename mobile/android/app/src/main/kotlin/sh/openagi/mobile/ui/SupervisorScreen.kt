@@ -27,6 +27,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -46,6 +47,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.ModalBottomSheet
@@ -871,17 +873,66 @@ private fun NeedsYouSection(
     onVoiceFocus: (FleetQuestion) -> Unit,
     onOpenQuestion: (FleetQuestion) -> Unit,
 ) {
-    val questions = state.questions.filter { it.id.isNotBlank() }
+    val allQuestions = state.questions.filter { it.id.isNotBlank() }
     val threads = state.snapshot?.threads.orEmpty()
+    val threadsByKey = threads.associateBy { it.key }
+    fun projectOf(q: FleetQuestion): String {
+        val explicit = q.project?.trim()?.takeIf { it.isNotEmpty() && !it.equals("General", ignoreCase = true) }
+        if (explicit != null) return explicit
+        val t = q.threadKey?.let { threadsByKey[it] }
+        val repo = t?.repo?.trim()?.split('/')?.lastOrNull { it.isNotEmpty() }
+        if (repo != null) return repo
+        val ws = t?.workspace?.trim()?.trimEnd('/')?.split('/')?.lastOrNull { it.isNotEmpty() }
+        if (ws != null && !ws.equals("workspace", ignoreCase = true)) return ws
+        return "general"
+    }
+    var selectedProject by rememberSaveable { mutableStateOf<String?>(null) }
+    val projectCounts = allQuestions.groupingBy { projectOf(it) }.eachCount()
+    val projectNames = projectCounts.keys.sortedByDescending { projectCounts[it] ?: 0 }
+    val questions = if (selectedProject == null) {
+        allQuestions
+    } else {
+        allQuestions.filter { projectOf(it).equals(selectedProject, ignoreCase = true) }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("Needs you", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+        if (projectNames.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FilterChip(
+                    selected = selectedProject == null,
+                    onClick = { selectedProject = null },
+                    label = { Text("All (${allQuestions.size})") },
+                )
+                projectNames.forEach { proj ->
+                    FilterChip(
+                        selected = selectedProject == proj,
+                        onClick = { selectedProject = if (selectedProject == proj) null else proj },
+                        label = { Text("#$proj (${projectCounts[proj] ?: 0})") },
+                    )
+                }
+            }
+        }
         // An answered question leaves the list; its result still needs saying.
-        if (note != null && questions.none { it.id == note.first }) NoteLine(note.second)
+        if (note != null && allQuestions.none { it.id == note.first }) NoteLine(note.second)
         RowGroup {
             if (questions.isEmpty()) {
                 InlineMessage("Nothing needs you.")
             } else {
                 questions.forEachIndexed { index, question ->
+                    val proj = projectOf(question)
+                    if (projectNames.size > 1 && selectedProject == null && (index == 0 || projectOf(questions[index - 1]) != proj)) {
+                        Text(
+                            text = "# $proj",
+                            style = OpenAGIType.caption,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+                        )
+                    }
                     QuestionRow(
                         question = question,
                         threads = threads,

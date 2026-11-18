@@ -1,0 +1,300 @@
+import Foundation
+
+public enum SupervisorChannelKind: Equatable, Hashable, Sendable {
+    case general
+    case needsYou
+    case tasks
+    case project(String)
+}
+
+public struct SupervisorChannelSummary: Identifiable, Equatable, Hashable, Sendable {
+    public let id: String
+    public let kind: SupervisorChannelKind
+    public let displayName: String
+    public let waitingCount: Int
+    public let runningCount: Int
+    public let totalCount: Int
+
+    public init(
+        id: String,
+        kind: SupervisorChannelKind,
+        displayName: String,
+        waitingCount: Int = 0,
+        runningCount: Int = 0,
+        totalCount: Int = 0
+    ) {
+        self.id = id
+        self.kind = kind
+        self.displayName = displayName
+        self.waitingCount = waitingCount
+        self.runningCount = runningCount
+        self.totalCount = totalCount
+    }
+}
+
+public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let project: String
+    public let headline: String
+    public let kindLabel: String
+    public let risky: Bool
+    public let noticedAtISO: String?
+
+    public init(
+        id: String,
+        project: String,
+        headline: String,
+        kindLabel: String = "Needs you",
+        risky: Bool = false,
+        noticedAtISO: String? = nil
+    ) {
+        self.id = id
+        self.project = project
+        self.headline = headline
+        self.kindLabel = kindLabel
+        self.risky = risky
+        self.noticedAtISO = noticedAtISO
+    }
+}
+
+public struct SupervisorChannelGroup: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let project: String
+    public let items: [SupervisorDecisionItem]
+
+    public init(project: String, items: [SupervisorDecisionItem]) {
+        self.id = project.lowercased()
+        self.project = project
+        self.items = items
+    }
+}
+
+public struct SupervisorSessionBrief: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let project: String
+    public let theme: String
+    public let title: String
+    public let host: String?
+    public let cwd: String?
+    public let state: String
+    public let lastActivityISO: String?
+
+    public init(
+        id: String,
+        project: String,
+        theme: String = "General",
+        title: String,
+        host: String? = nil,
+        cwd: String? = nil,
+        state: String = "idle",
+        lastActivityISO: String? = nil
+    ) {
+        self.id = id
+        self.project = project
+        self.theme = theme
+        self.title = title
+        self.host = host
+        self.cwd = cwd
+        self.state = state
+        self.lastActivityISO = lastActivityISO
+    }
+}
+
+public struct SupervisorOverlapNotice: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let project: String
+    public let targetPath: String
+    public let detail: String
+
+    public init(id: String, project: String, targetPath: String, detail: String) {
+        self.id = id
+        self.project = project
+        self.targetPath = targetPath
+        self.detail = detail
+    }
+}
+
+public enum SupervisorChannelGrouping {
+    public static func normalizeProject(
+        explicit: String? = nil,
+        repo: String? = nil,
+        workspace: String? = nil,
+        cwd: String? = nil
+    ) -> String {
+        if let raw = explicit?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty,
+           raw.caseInsensitiveCompare("General") != .orderedSame {
+            return raw
+        }
+        if let repoRaw = repo?.trimmingCharacters(in: .whitespacesAndNewlines), !repoRaw.isEmpty {
+            let parts = repoRaw.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+            if let last = parts.last, !last.isEmpty {
+                return last
+            }
+        }
+        let dirCandidate = [cwd, workspace]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let dirCandidate {
+            let cleaned = dirCandidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let base = cleaned.split(separator: "/").last.map(String.init) ?? cleaned
+            if !base.isEmpty,
+               base.caseInsensitiveCompare("workspace") != .orderedSame {
+                return base
+            }
+        }
+        return "general"
+    }
+
+    public static func groupByProject(_ items: [SupervisorDecisionItem]) -> [SupervisorChannelGroup] {
+        var order: [String] = []
+        var canonicalName: [String: String] = [:]
+        var buckets: [String: [SupervisorDecisionItem]] = [:]
+
+        for item in items {
+            let project = normalizeProject(explicit: item.project)
+            let key = project.lowercased()
+            if buckets[key] == nil {
+                order.append(key)
+                canonicalName[key] = project
+                buckets[key] = []
+            }
+            buckets[key, default: []].append(item)
+        }
+
+        let sortedKeys = order.sorted { lhs, rhs in
+            if lhs == "general" && rhs != "general" { return false }
+            if rhs == "general" && lhs != "general" { return true }
+            let lc = buckets[lhs]?.count ?? 0
+            let rc = buckets[rhs]?.count ?? 0
+            if lc != rc { return lc > rc }
+            return (canonicalName[lhs] ?? lhs).localizedCaseInsensitiveCompare(canonicalName[rhs] ?? rhs) == .orderedAscending
+        }
+
+        return sortedKeys.map { key in
+            SupervisorChannelGroup(
+                project: canonicalName[key] ?? key,
+                items: buckets[key] ?? []
+            )
+        }
+    }
+
+    public static func projectChannels(
+        from items: [SupervisorDecisionItem],
+        sessions: [SupervisorSessionBrief] = []
+    ) -> [SupervisorChannelSummary] {
+        var displayNames: [String: String] = [:]
+        var waiting: [String: Int] = [:]
+        var running: [String: Int] = [:]
+        var total: [String: Int] = [:]
+
+        for item in items {
+            let proj = normalizeProject(explicit: item.project)
+            let key = proj.lowercased()
+            displayNames[key] = displayNames[key] ?? proj
+            waiting[key, default: 0] += 1
+        }
+        for s in sessions {
+            let proj = normalizeProject(explicit: s.project, cwd: s.cwd)
+            let key = proj.lowercased()
+            displayNames[key] = displayNames[key] ?? proj
+            total[key, default: 0] += 1
+            if s.state.lowercased() == "running" {
+                running[key, default: 0] += 1
+            }
+        }
+
+        return displayNames.keys.sorted { lhs, rhs in
+            let lw = waiting[lhs, default: 0], rw = waiting[rhs, default: 0]
+            if lw != rw { return lw > rw }
+            let lr = running[lhs, default: 0], rr = running[rhs, default: 0]
+            if lr != rr { return lr > rr }
+            return (displayNames[lhs] ?? lhs).localizedCaseInsensitiveCompare(displayNames[rhs] ?? rhs) == .orderedAscending
+        }.map { key in
+            SupervisorChannelSummary(
+                id: "project:\(key)",
+                kind: .project(displayNames[key] ?? key),
+                displayName: "# \(displayNames[key] ?? key)",
+                waitingCount: waiting[key, default: 0],
+                runningCount: running[key, default: 0],
+                totalCount: total[key, default: 0]
+            )
+        }
+    }
+
+    public static func filterSessions(
+        _ sessions: [SupervisorSessionBrief],
+        project: String?,
+        theme: String? = nil
+    ) -> [SupervisorSessionBrief] {
+        sessions.filter { s in
+            if let project, !project.isEmpty {
+                let targetKey = normalizeProject(explicit: project).lowercased()
+                let sKey = normalizeProject(explicit: s.project, cwd: s.cwd).lowercased()
+                if sKey != targetKey { return false }
+            }
+            if let theme, !theme.isEmpty {
+                if s.theme.caseInsensitiveCompare(theme) != .orderedSame { return false }
+            }
+            return true
+        }
+    }
+
+    /// Calm overlap detection: emits only when >= 2 actively RUNNING sessions target
+    /// the exact same working directory on the same host. Idle and multi-host work never warn.
+    public static func calmOverlaps(for sessions: [SupervisorSessionBrief]) -> [SupervisorOverlapNotice] {
+        struct BucketKey: Hashable {
+            let projectKey: String
+            let host: String
+            let cwd: String
+        }
+        var counts: [BucketKey: [SupervisorSessionBrief]] = [:]
+        for s in sessions where s.state.lowercased() == "running" {
+            guard let rawCwd = s.cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !rawCwd.isEmpty else {
+                continue
+            }
+            let normalizedCwd = rawCwd.count > 1 && rawCwd.hasSuffix("/") ? String(rawCwd.dropLast()) : rawCwd
+            let hostKey = (s.host?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? "local"
+            let projKey = normalizeProject(explicit: s.project, cwd: normalizedCwd)
+            let bucket = BucketKey(projectKey: projKey, host: hostKey, cwd: normalizedCwd)
+            counts[bucket, default: []].append(s)
+        }
+
+        return counts.compactMap { bucket, list in
+            guard list.count >= 2 else { return nil }
+            let folder = bucket.cwd.split(separator: "/").last.map(String.init) ?? bucket.cwd
+            return SupervisorOverlapNotice(
+                id: "\(bucket.projectKey):\(bucket.host):\(bucket.cwd)",
+                project: bucket.projectKey,
+                targetPath: bucket.cwd,
+                detail: "\(list.count) running chats are editing \(folder) simultaneously"
+            )
+        }
+        .sorted { $0.id < $1.id }
+    }
+
+    /// Overlay surface filter for pending actions: stale (>2h) `chat` ("yes NN")
+    /// confirmations are hidden so the Mac pill doesn't accumulate dead noise.
+    public static func shouldShowInOverlay(
+        mode: String?,
+        raisedAtISO: String?,
+        createdAtISO: String?,
+        now: Date = Date(),
+        maxChatAgeSeconds: TimeInterval = 7200
+    ) -> Bool {
+        guard mode == "chat" else { return true }
+        let iso = raisedAtISO ?? createdAtISO
+        guard let iso, !iso.isEmpty else { return false }
+        guard let date = parseFlexibleISO8601(iso) else { return false }
+        return now.timeIntervalSince(date) < maxChatAgeSeconds
+    }
+
+    private static func parseFlexibleISO8601(_ string: String) -> Date? {
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFractional.date(from: string) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: string)
+    }
+}

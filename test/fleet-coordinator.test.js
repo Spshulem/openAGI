@@ -266,7 +266,7 @@ test("listWorkspaces, readChatTranscript, inspectRepoStatus, startPaseoSession, 
     hostLabel: "workstation-mac",
     cwd: "/Users/dev/Dev/recorder-app"
   });
-  assert.ok(recWs.overlaps.some((o) => o.kind === "concurrent_cwd"), "detects 2 loaded sessions sharing /Users/dev/Dev/recorder-app");
+  assert.equal(recWs.overlaps.some((o) => o.kind === "concurrent_cwd"), false, "does not warn for 1 running + 1 idle session in /Users/dev/Dev/recorder-app");
 
   // 2. readChatTranscript reads sleeping Paseo chat timeline & caches PR refs
   const transcript = await sup.readChatTranscript({ key: "paseo:srv_mac.rec-live-1", limit: 10 });

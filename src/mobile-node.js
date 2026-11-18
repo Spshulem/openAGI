@@ -64,6 +64,7 @@ const EXACT = new Set([
   "POST /tasks",
   "GET /tasks/clarifications",
   "GET /pending-actions",
+  "POST /pending-actions/dismiss-all",
   "POST /message",
   "GET /events",
   "GET /brief/today",
@@ -99,6 +100,7 @@ const EXACT = new Set([
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  "POST /conversations/supervisor/append",
   "GET /conversations",
   "POST /conversations",
   "GET /lifelog/moments",
