@@ -25,9 +25,11 @@ import sh.openagi.mobile.store.NotifiedQuestionsStore
 object SupervisorNotifier {
     const val CHANNEL_QUESTIONS = "supervisor-questions"
     const val CHANNEL_LIVE = "supervisor-live"
+    const val CHANNEL_SESSIONS = "supervisor-sessions"
     const val EXTRA_TAB = "sh.openagi.mobile.extra.TAB"
     const val TAB_SUPERVISOR = "supervisor"
     const val EXTRA_QUESTION_ID = "sh.openagi.mobile.extra.QUESTION_ID"
+    const val EXTRA_THREAD_KEY = "sh.openagi.mobile.extra.THREAD_KEY"
 
     // The app ships no drawables of its own yet; a system one keeps the
     // status bar icon a clean monochrome silhouette as Android requires.
@@ -47,6 +49,11 @@ object SupervisorNotifier {
                 NotificationChannelCompat.Builder(CHANNEL_LIVE, NotificationManagerCompat.IMPORTANCE_MIN)
                     .setName("Supervisor connection")
                     .setDescription("Shown while live supervisor alerts are on.")
+                    .setShowBadge(false)
+                    .build(),
+                NotificationChannelCompat.Builder(CHANNEL_SESSIONS, NotificationManagerCompat.IMPORTANCE_LOW)
+                    .setName("Agent session progress")
+                    .setDescription("Session counts and quick access while monitoring your agents.")
                     .setShowBadge(false)
                     .build(),
             ),
@@ -136,7 +143,7 @@ object SupervisorNotifier {
     // Opens the app on the Supervisor tab. MainActivity is singleTask, so a
     // running app receives this in onNewIntent. Public so the live-alerts
     // service's ongoing notification can open the same place.
-    fun openSupervisorIntent(context: Context, questionId: String? = null): PendingIntent {
+    fun openSupervisorIntent(context: Context, questionId: String? = null, threadKey: String? = null): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
             .putExtra(EXTRA_TAB, TAB_SUPERVISOR)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -144,6 +151,10 @@ object SupervisorNotifier {
             intent.putExtra(EXTRA_QUESTION_ID, questionId)
             // See answerIntent: extras never tell two PendingIntents apart.
             intent.identifier = "open/$questionId"
+        }
+        if (threadKey != null) {
+            intent.putExtra(EXTRA_THREAD_KEY, threadKey)
+            intent.identifier = "session/$threadKey"
         }
         val requestCode = questionId?.let { SupervisorAlerts.notificationId(it) } ?: 0
         return PendingIntent.getActivity(context, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)

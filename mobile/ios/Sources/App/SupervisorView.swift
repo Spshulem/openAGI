@@ -154,6 +154,16 @@ struct SupervisorView: View {
             }
         }
         .task(id: model.fleetGeneration) { await refresh() }
+        // A Live Activity, notification or Shortcut asks for a session (or
+        // just the overview). Close whatever sheet is up, then open the
+        // linked session once the state that lists it has loaded.
+        .onChange(of: PushRouter.shared.supervisorRequest, initial: true) { _, request in
+            guard request > 0 else { return }
+            activeSheet = nil
+            openThread = nil
+            openLinkedThread()
+        }
+        .onChange(of: state) { _, _ in openLinkedThread() }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(state?.running == true ? 5 : 25))
@@ -275,6 +285,14 @@ struct SupervisorView: View {
             return "Reply to decision or ask Supervisor…"
         }
         return "Ask Supervisor or route a bug…"
+    }
+
+    private func openLinkedThread() {
+        guard let key = PushRouter.shared.threadKey, let state else { return }
+        // A vanished session leaves the current overview visible. Never
+        // substitute some other session for the one the person tapped.
+        openThread = state.snapshot?.threads.first(where: { $0.key == key }).map { ThreadPresentation(thread: $0) }
+        PushRouter.shared.threadKey = nil
     }
 
     private func syncFocusedCard() {

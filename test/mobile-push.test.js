@@ -101,9 +101,9 @@ test("activity rows: active groups only, you → working → waiting, newest fir
     }
   };
   const activity = buildActivity(state, new Date(T0));
-  assert.deepEqual(Object.keys(activity), ["at", "counts", "rows"]);
+  assert.deepEqual(Object.keys(activity), ["at", "counts", "rows", "observedAt", "partial"]);
   assert.equal(activity.at, "2026-10-15T12:00:00.000Z");
-  assert.deepEqual(activity.counts, { you: 1, working: 3, waiting: 2 });
+  assert.deepEqual(activity.counts, { you: 1, working: 3, waiting: 2, blocked: 0 });
   assert.deepEqual(activity.rows.map((r) => r.key), ["codex:y", "codex:k2", "codex:k1"]);
   assert.deepEqual(activity.rows[0], { key: "codex:y", title: "T codex:y", group: "you", waitingOn: "your answer", since: "2026-10-15T11:58:00.000Z" });
 
@@ -115,7 +115,7 @@ test("activity rows: active groups only, you → working → waiting, newest fir
   assert.equal(long.since, null);
   assert.equal(all.rows.find((r) => r.key === "codex:w2").waitingOn, null);
 
-  assert.deepEqual(buildActivity(null, new Date(T0)).counts, { you: 0, working: 0, waiting: 0 });
+  assert.deepEqual(buildActivity(null, new Date(T0)).counts, { you: 0, working: 0, waiting: 0, blocked: 0 });
   assert.deepEqual(buildActivity({ snapshot: null }, new Date(T0)).rows, []);
 });
 
@@ -132,6 +132,7 @@ test("alert plaintext: the Android option filter, caps, and a fallback title", (
 
 test("a fleet event starts the activity once, 2 s later, with a 30 min stale date", async (t) => {
   const h = harness(t, { threads: [thread("codex:a", "working")] });
+  h.state.snapshot.at = new Date(T0).toISOString();
   h.events.emit("fleet", {});
   h.events.emit("outreach", {});
   h.events.emit("outreach-resolved", {});
@@ -143,9 +144,9 @@ test("a fleet event starts the activity once, 2 s later, with a 30 min stale dat
   const start = h.sent[0];
   assert.equal(start.url, "https://relay.test/v1/send");
   assert.equal(start.pass, "p1.pass-one");
-  assert.equal(start.staleAt, Math.floor((T0 + 2 * SEC + 30 * MIN) / 1000));
+  assert.equal(start.staleAt, Math.floor((T0 + 30 * MIN) / 1000));
   assert.equal(start.priority, undefined);
-  assert.deepEqual(h.open(start).counts, { you: 0, working: 1, waiting: 0 });
+  assert.deepEqual(h.open(start).counts, { you: 0, working: 1, waiting: 0, blocked: 0 });
   // No change, no send.
   h.events.emit("fleet", {});
   await h.advance(5 * SEC);
@@ -175,9 +176,9 @@ test("updates are throttled to one per 20 s; the trailing send carries the lates
   assert.deepEqual(h.types(), ["activity-start", "activity-update"]);
   const update = h.sent[1];
   assert.equal(h.now - T0, 20 * SEC);
-  assert.deepEqual(h.open(update).counts, { you: 0, working: 2, waiting: 1 });
+  assert.deepEqual(h.open(update).counts, { you: 0, working: 2, waiting: 1, blocked: 0 });
   assert.equal(update.priority, undefined, "you did not rise");
-  assert.equal(update.staleAt, Math.floor((T0 + 20 * SEC + 30 * MIN) / 1000));
+  assert.equal(update.staleAt, Math.floor((T0 + 20 * SEC) / 1000), "unknown source age is immediately stale");
 });
 
 test("an update is priority 10 only when the you count rose", async (t) => {
@@ -209,7 +210,7 @@ test("two idle minutes end the activity with a 15 min dismissal; activity again 
   assert.deepEqual(h.types(), ["activity-start", "activity-update", "activity-end"]);
   const end = h.sent[2];
   assert.equal(end.dismissAt, Math.floor((idleAt + 2 * MIN + 15 * MIN) / 1000));
-  assert.deepEqual(h.open(end).counts, { you: 0, working: 0, waiting: 0 });
+  assert.deepEqual(h.open(end).counts, { you: 0, working: 0, waiting: 0, blocked: 0 });
 
   h.state.snapshot.threads = [thread("codex:b", "you")];
   await h.push.flush();
@@ -359,7 +360,7 @@ test("a daemon restart updates the activity it started instead of starting a sec
   await after.push.flush();
   assert.deepEqual(h.types(), ["activity-start", "activity-update"]);
   assert.equal(h.sent[1].priority, undefined);
-  assert.deepEqual(h.open(h.sent[1]).counts, { you: 0, working: 1, waiting: 0 });
+  assert.deepEqual(h.open(h.sent[1]).counts, { you: 0, working: 1, waiting: 0, blocked: 0 });
   await after.push.flush();
   assert.equal(h.sent.length, 2, "unchanged content is not resent");
 });
@@ -724,4 +725,44 @@ test("forgetting during a restart end prevents a replacement Live Activity", asy
   await advancing;
   assert.deepEqual(h.types(), ["activity-start", "activity-end"]);
   assert.equal(h.push.live.has(NODE), false);
+});
+
+test("blocked sessions stay visible, needs-you takes priority, and duplicate sessions count once", () => {
+  const blocked = { ...thread("codex:blocked", "blocked"), reason: "Provider sign-in required" };
+  const activity = buildActivity({ snapshot: { threads: [thread("codex:run", "working"), blocked,
+    thread("codex:answer", "you"), blocked, thread("", "working"), thread("quiet", "quiet")] } });
+  assert.deepEqual(activity.counts, { you: 1, working: 1, waiting: 0, blocked: 1 });
+  assert.deepEqual(activity.rows.map(r => r.key), ["codex:answer", "codex:blocked", "codex:run"]);
+  assert.equal(activity.rows[1].waitingOn, "Provider sign-in required");
+});
+
+test("a blocked-only fleet starts an activity instead of looking idle", async t => {
+  const h = harness(t, { threads: [thread("codex:blocked", "blocked")] });
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start"]);
+  assert.equal(h.open(h.sent[0]).counts.blocked, 1);
+});
+
+test("a new successful scan refreshes an unchanged activity without inventing a fresh scan", async t => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  h.state.snapshot.at = new Date(T0 - MIN).toISOString();
+  await h.push.flush();
+  assert.equal(h.open(h.sent[0]).observedAt, h.state.snapshot.at);
+  assert.equal(h.sent[0].staleAt, Math.floor((T0 + 29 * MIN) / 1000));
+  await h.advance(30 * SEC);
+  await h.push.flush();
+  assert.equal(h.sent.length, 1, "delivery time alone never refreshes the observation");
+  h.state.snapshot.at = new Date(h.now).toISOString();
+  await h.push.flush();
+  assert.deepEqual(h.types(), ["activity-start", "activity-update"]);
+  assert.equal(h.open(h.sent[1]).observedAt, h.state.snapshot.at);
+  assert.equal(h.sent[1].staleAt, Math.floor((h.now + 30 * MIN) / 1000));
+});
+
+test("source failures flag partial results while preserving the last observed timestamp", () => {
+  const activity = buildActivity({ lastError: "scan failed", snapshot: {
+    at: new Date(T0 - 60 * MIN).toISOString(), threads: [thread("a", "working")]
+  } }, new Date(T0));
+  assert.equal(activity.partial, true);
+  assert.equal(activity.observedAt, new Date(T0 - 60 * MIN).toISOString());
 });
