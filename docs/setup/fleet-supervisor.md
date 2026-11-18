@@ -56,6 +56,23 @@ The page choice is saved and wins over the env value.
 Questions reach you in every mode. Your answer to an agent's own question is
 sent to that thread in every mode, when a route exists.
 
+## Scan coverage
+
+Each scan evaluates at most 150 eligible threads by default. A quarter of the
+slots keep the most recently active chats visible; the remaining slots rotate
+through the least recently scanned chats. Quiet conversations therefore receive
+fresh checks even when newer conversations keep changing. Open permission cards
+are still included beyond that limit. Excluded or unavailable histories remain
+excluded, and every nudge still passes the existing policy and delivery checks.
+
+`GET /fleet/api/state` reports `snapshot.counts.eligible`, `inScope`, and
+`deferred`: available threads, threads evaluated in this scan, and available
+threads waiting for another scan. `threads` also includes excluded discoveries,
+so it is not the review backlog. Rotation starts over when the supervisor
+restarts. The model review and send limits are separate: being scanned does not
+mean a nudge was sent or its task completed. Quiet hours limit phone pushes,
+not background conversation review.
+
 ## Env vars
 
 | Var | Default | Means |
@@ -72,6 +89,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
 | `OPENAGI_FLEET_BACKGROUND_ROUTES` | none | `codex-exec`, `peer-relay`, or both: routes an app send may take while you are at the Mac. See [While you work](#while-you-work) |
+| `OPENAGI_FLEET_AUTO_APPROVE` | none | `codex`: in Auto mode, click Allow on the approval cards Codex raises (it can ask even with full access). The chats its sidebar marks "Awaiting approval" are opened when you are away, and each card gets the narrowest grant shown ("Allow this conversation", then "Allow once"), never "Always allow" |
 | `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
 | `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
@@ -381,10 +399,13 @@ or `waiting for idle`) is not left for the next 5-min scan:
   needs-you review (the next scheduled scan runs it). At most one a minute.
 - **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
   The send goes now, without the screen, instead of waiting:
-  - `codex-exec`: a Codex thread started in the Codex CLI that no app holds
-    open (no writer lock, read again at send time). Never a
-    thread the Codex app or Conductor started: a resumed turn holds the
-    writer lock for hours, and the app then cannot open the thread.
+  - `codex-exec`: only a Codex thread with positive CLI ownership evidence
+    (`source=cli` or `source=exec`) that no app holds open (no writer lock,
+    read again at send time). Missing or unfamiliar source metadata stays
+    blocked. `source=vscode` stays protected even with a CLI-like originator;
+    an originator by itself does not establish CLI ownership.
+    Never a thread the Codex app or Conductor started: a resumed turn holds
+    the writer lock for hours, and the app then cannot open the thread.
   - `peer-relay`: a Conductor chat whose live Claude session is idle right
     now, with no open pick in the chat.
   Never `claude-resume`, never a thread with a running turn or a permission
@@ -394,8 +415,12 @@ or `waiting for idle`) is not left for the next 5-min scan:
 
 - Non-live Conductor sessions: no CLI delivery route. You get "open it" after
   90 min stuck, unless computer-use delivery is on.
-- Codex threads the Codex app started: never sent through `codex exec`, even
-  with the app closed. Send by hand or use computer-use delivery.
+- Codex threads with app ownership, Conductor ownership, or unverified
+  CLI ownership: never sent through `codex exec`, even with the app closed.
+  Send by hand or use computer-use delivery. This rule also covers direct
+  sends, older proposals and `computer-use-first` fallback. Missing metadata
+  requires a supported catalog read; changing the delivery mode does not
+  bypass the check.
 - Computer-use delivery reads the apps' accessibility trees. An app update can
   change them; a thread it cannot verify is blocked, never guessed.
 - Main mirroring requires an explicitly selected enrolled coding Mac; without
@@ -634,16 +659,51 @@ Inventory is paginated, including closed chats for exclusion. At most twelve
 changed chat histories are read per scan, four at a time; subsequent scans work
 through the remaining histories. Unknown or failed histories cannot produce
 nudges. Snapshot `paseo.discovered` and `paseo.historyPending` expose coverage;
-normal fleet scope limits still apply. Only bounded message text is retained,
-not tool output or images. Paseo workspaces are never probed through local git
-or filesystem scans. Migration aliases suppress duplicate legacy supervision.
+normal fleet scope limits still apply. Only bounded, redacted message text and
+provider error notices are retained, not tool output or images. Paseo workspaces
+are never probed through local git or filesystem scans. Migration aliases
+suppress duplicate legacy supervision.
 
-Native sends refresh the exact host and agent before dispatch. Running, closed,
-archived, permission-blocked, changed-workspace and changed-revision chats are
-held. Each attempt first records a durable message ID; a failed or uncertain
-send is never automatically repeated. Acknowledgement alone is not success:
-the correlated message must have turn-start or subsequent assistant evidence.
-No provider import, reload, settings change or legacy-session fallback is used.
+Structured Paseo error events and a failed agent's current `lastError` feed the
+same error policy as other sources. A model-capacity failure appears as red
+`infra-blocked` / `model-limit` and asks the owner to switch models or wait;
+the supervisor does not change models or repeatedly send “continue.” Error
+notices stay separate from assistant replies and judge conversation. A new
+active turn or later message clears a historical timeline error. Unknown
+history still excludes the chat from actions. This detects the failure; it
+does not restore provider capacity or guarantee that a retry succeeds.
+
+Native sends refresh the exact host and agent before dispatch and revalidate
+both the baseline timeline's agent and the current handle after the read.
+Running, closed, archived, permission-blocked, changed-workspace and
+changed-revision chats are held. Each attempt first records a durable client message ID and the timeline
+cursor immediately before dispatch; a failed or uncertain send is never
+automatically repeated. Acknowledgement alone is not success: an exact turn ID,
+linked through the submitted message or returned by the host, must match a
+running turn or an assistant response. Later replies or start times alone cannot
+prove execution. No provider import, reload, settings change or legacy-session
+fallback is used.
+
+Acceptance can precede the message and turn appearing in Paseo's timeline.
+Delivery rechecks entries after that cursor every 250 ms for a five-second
+confirmation window, bounded by the existing Paseo request timeout. Each read
+can follow up to ten pages of 80 entries; unsupported, stale or reset cursors
+fall back to a fresh 40-entry tail. Exact message-to-turn and client-to-provider
+IDs learned from the timeline are persisted immediately, so a later completed
+response can confirm the turn even if the original user entry leaves the page.
+These are sequential, read-only checks; the message is sent once and
+the chat stays locked against concurrent delivery. If confirmation is still
+unavailable, the durable receipt stays pending and the question card remains
+open. An unconfirmed-turn warning records uncertainty about execution: inspect
+the existing chat before retrying and preserve its delivery journal. Text,
+timestamps, nearby activity and a changed projection never settle a receipt.
+The pinned Paseo SDK's send method returns no correlation IDs. Confirmation
+therefore depends on IDs retained in its timeline; optional response IDs are
+supported for future adapters but are not required for current SDK operation.
+When history lacks those IDs, receipts remain pending. Installing this change
+does not reconstruct missing historical IDs or clear older uncertain receipts.
+Recovery requires authoritative correlation or a separate owner-reviewed
+reconciliation of the existing delivery.
 
 Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
 current public API has no atomic idle-only send precondition, and Paseo can fall

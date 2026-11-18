@@ -8,8 +8,10 @@ struct ComposerLayout: Layout {
     private let control: CGFloat = 44
     private let gap: CGFloat = 8
 
+    // Three controls plus a field still worth typing in. Duo's cover screen,
+    // beside its trailing rail, is just under 360 and keeps one line.
     private func separatesControls(at width: CGFloat) -> Bool {
-        prefersSeparateControls || width < 360
+        prefersSeparateControls || width < 3 * (control + gap) + 140
     }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {

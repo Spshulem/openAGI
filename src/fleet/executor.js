@@ -293,6 +293,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
     if (thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return "conductor-owned: open it in Conductor";
     if (codexAppOwned(thread)) return "codex-app-owned: typed into the Codex app only";
+    if (codexExecBarred(thread)) return "Codex CLI ownership unverified: background resume is blocked; use the owning app";
     if (!isDirectory(thread.cwd)) return "cwd missing";
   }
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
@@ -682,6 +683,9 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     const route = backgroundRouteFor(thread, config);
     if (!route) {
       // The Codex app owns its threads even while it has not loaded one.
+      // Unknown ownership is also blocked, but must not be reported as an
+      // app-held writer lock: the metadata is simply insufficient to claim
+      // which process owns the transcript.
       if (thread?.kind === "codex" && (thread.writerLocked || codexAppOwned(thread))) why.locked = true;
       return null;
     }
@@ -715,7 +719,9 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     return { route, live: { ...thread.live, peerName: fresh.live.peerName, pid: fresh.live.pid, status: fresh.live.status } };
   }
 
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false } = {}) {
+  // typedOnly: a risky ask's owner answer, which only ever goes typed into
+  // the app; a block there returns as is, never by a background route.
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -744,7 +750,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
       try {
-        const result = await paseoDelivery({ config, thread, text, store, actionId, base });
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images });
         const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
         return { ...result, actionId: id };
       }
@@ -769,7 +775,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       // for this thread. Otherwise it waits for idle.
       // A send asked to queue never goes another way: a relay arrives now.
       const identity = isCodexIdentityBlock(thread, result);
-      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor")) return result;
+      if (!(isPresenceBlock(result) || identity) || (queue && step.target?.app === "conductor") || typedOnly) return result;
       const why = {};
       const fallback = await fallbackRoute(thread, step.target, deadlineAt, why);
       if (!fallback && identity && why.locked) {

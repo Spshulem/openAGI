@@ -8,7 +8,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "2128"
+    CURRENT_PROJECT_VERSION: "2132"
     DEVELOPMENT_TEAM: ""
     # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
     # provisioning profile — it works on any Mac, headless or not) rather
@@ -54,6 +54,9 @@ settings:
     OPENAGI_APP_GROUP: group.sh.openagi.mobile
     # Bundle ids are global too; the extensions derive theirs from it.
     OPENAGI_BUNDLE_ID: sh.openagi.OpenAGI
+packages:
+  SupervisorChannelsKit:
+    path: ../../shared/SupervisorChannelsKit
 targets:
   OpenAGI:
     type: application
@@ -105,6 +108,7 @@ targets:
         OPENAGI_PUSH_RELAY: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
+      - package: SupervisorChannelsKit
       - target: OpenAGIWidget
         embed: true
       - target: OpenAGINotify

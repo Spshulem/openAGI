@@ -66,9 +66,15 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertFalse(app.navigationBars[title].exists)
     }
 
-    private func tab(_ app: XCUIApplication, _ title: String) {
+    // A tab's own button: in the tab bar where there is one, else (iPad's
+    // top tabs) the button with the tab's title.
+    private func tabButton(_ app: XCUIApplication, _ title: String) -> XCUIElement {
         let tab = app.tabBars.buttons[title]
-        let target = tab.exists ? tab : app.buttons[title].firstMatch
+        return tab.exists ? tab : app.buttons[title].firstMatch
+    }
+
+    private func tab(_ app: XCUIApplication, _ title: String) {
+        let target = tabButton(app, title)
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(title) tab")
         XCTAssertTrue(target.isHittable, "Not hittable: \(title) tab")
         target.tap()
@@ -157,6 +163,16 @@ final class NativeNavigationTests: XCTestCase {
             XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
             XCTAssertTrue(close.isHittable, "Close must stay accessible after switching tabs")
             capture("native-supporting-chat", app: app)
+            // The tabs must not move when a tab with the supporting chat gives
+            // way to one without it (the rail jumped to the hinge on a Duo).
+            let withPane = tabButton(app, "Supervisor").frame
+            tab(app, "Chat")
+            XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
+            let withoutPane = tabButton(app, "Supervisor").frame
+            XCTAssertEqual(withPane.midX, withoutPane.midX, accuracy: 1, "The tabs stay put across tabs")
+            XCTAssertEqual(withPane.midY, withoutPane.midY, accuracy: 1, "The tabs stay put across tabs")
+            tab(app, "Tasks")
+            XCTAssertTrue(close.waitForExistence(timeout: 5))
             close.tap()
             XCTAssertFalse(close.exists)
             capture("native-supporting-chat-closed", app: app)
@@ -300,6 +316,61 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(done.exists && done.isHittable)
         done.tap()
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
+    }
+
+    func testChatRedesignEmptyStateRepliesWorkingLineAndApprovalCard() {
+        let app = launch(["--ui-chat-redesign", "--ui-dark"])
+        tab(app, "Chat")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        let composer = element(app, "chat-composer")
+        composer.tap()
+        composer.typeText("What is waiting on me?")
+        capture("redesign-chat-composer", app: app)
+        tap(app, "chat-send")
+        XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertTrue(element(app, "chat-reply-copy").waitForExistence(timeout: 5), "The newest reply offers Copy")
+        XCTAssertTrue(element(app, "chat-approval-raised-approval").waitForExistence(timeout: 10),
+                      "An approval raised by the turn shows under its reply")
+        capture("redesign-chat-approval", app: app)
+        tap(app, "chat-approval-review-raised-approval")
+        XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 5))
+        capture("redesign-chat-approval-review", app: app)
+    }
+
+    func testChatRedesignEmptyStateOffersStartingPoints() {
+        let app = launch(["--ui-empty-chat", "--ui-dark"])
+        tab(app, "Chat")
+        XCTAssertTrue(element(app, "chat-home").waitForExistence(timeout: 10))
+        let heading = app.staticTexts["What can I take off your plate?"]
+        XCTAssertTrue(heading.exists)
+        // Measure against the empty state's own column, not the window or
+        // the scroll view: those run under the safe area, which is lopsided
+        // when the tab rail and status bar sit on one side (iPhone Duo).
+        let home = element(app, "chat-home").frame
+        let history = element(app, "chat-history").frame
+        let plan = element(app, "chat-suggestion-plan").frame
+        XCTAssertEqual(plan.minX, home.minX, accuracy: 2, "Starting points span the chat column")
+        XCTAssertEqual(plan.maxX, home.maxX, accuracy: 2, "Starting points span the chat column")
+        XCTAssertEqual(heading.frame.midX, home.midX, accuracy: 2, "The question is centred in the column")
+        XCTAssertGreaterThanOrEqual(home.minX - history.minX, 18,
+                                    "The empty chat keeps its leading gutter; an edge scroll must not offset it")
+        capture("redesign-chat-empty", app: app)
+        tap(app, "chat-suggestion-plan")
+        XCTAssertEqual(element(app, "chat-composer").value as? String, "Help me plan my day")
+    }
+
+    func testChatRedesignWorkingLineNamesTheTool() {
+        let app = launch(["--ui-chat-working", "--ui-dark"])
+        tab(app, "Chat")
+        let composer = element(app, "chat-composer")
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        composer.tap()
+        composer.typeText("Check my agents")
+        tap(app, "chat-send")
+        let working = element(app, "chat-working")
+        XCTAssertTrue(working.waitForExistence(timeout: 10))
+        XCTAssertTrue(working.label.contains("Using fleet status"), working.label)
+        capture("redesign-chat-working", app: app)
     }
 
     func testShortBubblesStayCompactAndLongMarkdownWrapsWithoutClipping() {

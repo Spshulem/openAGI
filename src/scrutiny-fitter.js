@@ -1,4 +1,6 @@
+import fs from "node:fs";
 import path from "node:path";
+import { JUDGE_CONFIGS } from "./scrutiny-panel.js";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
@@ -40,6 +42,33 @@ export class ScrutinyFitter {
     // without this restore, every fitted adjustment would silently vanish
     // on daemon restart and calibration could never accumulate.
     this.restoredWeightsAt = this.restoreWeights();
+    // Opt-in: weights fitted before grounded grades existed learned from the
+    // system's own scores. With the flag set, the first boot after this
+    // change restores the defaults (once) and keeps the old file for review.
+    if (process.env.OPENAGI_SCRUTINY_RESET_PRE_GROUNDED === "1" && this.restoredWeightsAt
+        && !fs.existsSync(this.preGroundedPath)) {
+      const saved = readJsonFile(this.weightsPath, null);
+      if (saved?.source === "auto-fit") this.resetToDefaults({ reason: "pre-grounded weights" });
+    }
+  }
+
+  get preGroundedPath() {
+    return path.join(this.dir, "weights.pre-grounded.json");
+  }
+
+  /** Restore every judge to its default weights, keeping a copy of the current file. */
+  resetToDefaults({ reason = "manual" } = {}) {
+    const judges = this.runtime?.scrutiny?.judges;
+    if (!judges) return null;
+    if (fs.existsSync(this.weightsPath)) fs.copyFileSync(this.weightsPath, this.preGroundedPath);
+    const proposals = {};
+    for (const [name, judge] of Object.entries(judges)) {
+      const defaults = JUDGE_CONFIGS[name]?.weights;
+      if (!defaults) continue;
+      proposals[name] = { from: { ...judge.weights }, to: { ...defaults } };
+    }
+    const applied = this._applyAndPersist(proposals, { source: "reset-pre-grounded", cycle: this.state.cycles });
+    return { reason, applied };
   }
 
   status() {
@@ -132,9 +161,11 @@ export class ScrutinyFitter {
 
     const outcomes = this.runtime.outcomes
       .recent(5000)
-      .filter((o) => o.resolved && typeof o.qualityScore === "number" && o.scrutinyDimensions);
+      // Grounded grades only (what happened to the work). Self-assigned
+      // quality scores and weak grounded grades are not evidence to fit on.
+      .filter((o) => typeof o.groundedScore === "number" && !o.groundedWeak && o.scrutinyDimensions);
     if (outcomes.length < this.minSamples) {
-      return { skipped: true, reason: `${outcomes.length} resolved outcomes, need ${this.minSamples}` };
+      return { skipped: true, reason: `${outcomes.length} grounded outcomes with scrutiny dimensions, need ${this.minSamples}` };
     }
 
     const proposals = {};
@@ -208,7 +239,7 @@ function computeCorrelationDeltas(outcomes, maxDelta) {
     const ys = [];
     for (const o of outcomes) {
       const x = o.scrutinyDimensions?.[dim];
-      const y = o.qualityScore;
+      const y = o.groundedScore;
       if (typeof x !== "number" || typeof y !== "number") continue;
       xs.push(x);
       ys.push(y);

@@ -99,6 +99,8 @@ export class DraftStore {
   edit(id, patch = {}) {
     const d = this.items.get(id);
     if (!d || d.status !== "pending") return null;
+    // Keep what the agent originally wrote so the owner's edit can be measured.
+    if (d.originalBody === undefined) d.originalBody = d.body;
     if (patch.title !== undefined) d.title = String(patch.title).trim() || d.title;
     if (patch.body !== undefined) d.body = String(patch.body);
     if (patch.recipient !== undefined) d.recipient = patch.recipient;
@@ -129,6 +131,7 @@ export class DraftStore {
     if (result !== undefined) d.sendResult = result;
     this.snapshot();
     this.runtime?.events?.emit?.("draft-resolved", { draft: d, status: "sent" });
+    this.runtime?.grounded?.onDraftResolved?.(d, "sent");
     return d;
   }
 
@@ -139,6 +142,7 @@ export class DraftStore {
     d.reviewedAt = nowIso();
     this.snapshot();
     this.runtime?.events?.emit?.("draft-resolved", { draft: d, status });
+    this.runtime?.grounded?.onDraftResolved?.(d, status);
     return d;
   }
 

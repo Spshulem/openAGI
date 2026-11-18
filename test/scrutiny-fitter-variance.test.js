@@ -21,7 +21,7 @@ function seed(runtime, makeDims, count = 50) {
   for (let i = 0; i < count; i += 1) {
     const dims = makeDims(i);
     const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
-    runtime.outcomes.resolve(o.id, dims.evidence, "system-inferred");
+    runtime.outcomes.ground(o.id, { score: dims.evidence, source: "test", fate: "test" });
   }
 }
 

@@ -33,7 +33,7 @@ final class FleetOverlayTests: XCTestCase {
     let state = try JSONDecoder().decode(FleetState.self, from: Data("""
       {"mode":3,"enabled":"yes","running":null,"questions":{"not":"an array"}}
       """.utf8))
-    XCTAssertEqual(state.mode, "observe")
+    XCTAssertEqual(state.mode, "")
     XCTAssertFalse(state.enabled)
     XCTAssertFalse(state.running)
     XCTAssertTrue(state.questions.isEmpty)

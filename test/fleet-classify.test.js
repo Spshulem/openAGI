@@ -718,3 +718,19 @@ test("Paseo native and migration aliases retain self exclusion", () => {
     assert.notEqual(classify({ ...thread, meta: { aliases: [`${provider}:someone-else`] } }).reason, "self");
   }
 });
+
+test("classifyThread recognizes waiting on your go and conditional merge/deploy sign-off phrases while respecting negations", () => {
+  for (const text of [
+    "PR #9165 is green — waiting on your go to merge.",
+    "Staging verified. I'll merge once you give the go.",
+    "All checks passed; I won't merge without your approval."
+  ]) {
+    assert.equal(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  }
+  for (const text of [
+    "No longer waiting on your approval.",
+    "Nothing here is waiting on your review."
+  ]) {
+    assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  }
+});

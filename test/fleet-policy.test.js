@@ -16,13 +16,15 @@ const playbooks = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR });
 const config = { mode: "auto", selfSessionIds: [], limits: { ...DEFAULTS } };
 
 function makeThread(overrides = {}) {
+  const { meta: providedMeta, ...rest } = overrides;
+  const meta = rest.kind === "codex" ? { source: "cli", ...(providedMeta ?? {}) } : (providedMeta ?? {});
   return {
     key: "conductor:s1", kind: "conductor", id: "s1", title: "Fix billing", cwd: "/work/madrid", repo: "acme/app",
     branch: "spencer/fix", workspace: "madrid", claudeSessionId: "c1", agentStatus: "idle",
     lastActivityAt: ago(30 * MIN), lastAgentText: "Pushed the fix.", lastAgentAt: ago(30 * MIN),
     lastUserText: "continue", lastUserAt: ago(60 * MIN), error: null, openTasks: [], prRefs: ["acme/app#6522"],
     live: { peerName: "madrid-1a", pid: 42, status: "idle" }, writerLocked: false, archived: false, excluded: null,
-    meta: {}, ...overrides
+    meta, ...rest
   };
 }
 
@@ -487,6 +489,22 @@ test("chooseRoute follows the delivery table", () => {
   assert.equal(chooseRoute({ ...codex, meta: { originator: "Codex Desktop" } }, "auto"), null);
   assert.equal(chooseRoute({ ...codex, meta: { originator: null, source: "vscode" } }, "auto"), null, "an older catalog row of the app's");
   assert.equal(chooseRoute({ ...codex, meta: { originator: "codex_exec", source: "exec" } }, "auto"), "codex-exec");
+  assert.equal(chooseRoute({ ...codex, meta: {} }, "auto"), null, "missing ownership metadata fails closed");
+  assert.equal(chooseRoute({ ...codex, meta: { originator: "codex_cli_rs", source: "vscode" } }, "auto"), null, "a CLI-like originator does not undo app protection");
+});
+
+test("unknown Codex ownership cannot fall back to exec when the app is unavailable", () => {
+  for (const meta of [undefined, null, {}, { source: null }, { source: "future-app" }, { originator: "codex_cli_rs" }]) {
+    const thread = { ...makeThread({ kind: "codex", id: "t1", live: null }), meta };
+    for (const delivery of [
+      "cli",
+      { mode: "computer-use-first", ready: false },
+      { mode: "computer-use-first", ready: true, apps: { "com.openai.codex": false } }
+    ]) {
+      assert.equal(chooseRoute(thread, "auto", delivery), null, JSON.stringify({ meta, delivery }));
+    }
+    assert.equal(chooseRoute(thread, "auto", { mode: "computer-use", ready: true }), "computer-use", "verified app delivery remains available");
+  }
 });
 
 test("chooseRoute honours OPENAGI_FLEET_DELIVERY: computer-use never picks a CLI route", () => {

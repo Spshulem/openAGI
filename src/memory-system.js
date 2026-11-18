@@ -34,6 +34,15 @@ export function isProtectedMemory(item = {}) {
   );
 }
 
+// The owner's saved facts are the default memory view. Runtime logs and
+// generated summaries remain available separately for diagnosis.
+export function isSavedMemory(item = {}) {
+  return isProtectedMemory(item) && item.kind !== "principle";
+}
+
+const correctionText = value => String(value ?? "").toLowerCase()
+  .replace(/\b([a-z]{4,})s\b/g, "$1");
+
 function legacyStrengthFloor(item) {
   const tierFloor = item.tier === "long" ? 0.3 : item.tier === "medium" ? 0.25 : 0.2;
   const evidenceFloor = 0.2
@@ -58,12 +67,64 @@ function latestIso(values) {
   return latest;
 }
 
+// Learned keep-score (chance an item is recalled) from the optional local
+// scoring service. Live only: a likely-recalled item decays more slowly and is
+// evicted later; an unlikely one the reverse. Protected memories are never
+// affected. In shadow (or with no score) nothing changes.
+const KEEP_MULTIPLIER_MIN = 0.5;
+const KEEP_MULTIPLIER_MAX = 1.5;
+const KEEP_EVICTION_WEIGHT = 0.2;
+const KEEP_SCORE_NEUTRAL = 0.5;
+
+function keepScoreOf(item) {
+  const score = item?.metadata?.keepScore;
+  return typeof score === "number" && Number.isFinite(score) ? score : null;
+}
+
 export class MemorySystem {
   constructor(options = {}) {
     this.items = new Map();
     this.limits = { ...DEFAULT_LIMITS, ...(options.limits ?? {}) };
     this.ttlMs = { ...DEFAULT_TTL_MS, ...(options.ttlMs ?? {}) };
     this.vectors = null;
+    // "off" | "shadow" | "live". AbiRuntime sets it from OPENAGI_LEARNED_MEMORY.
+    this.learnedMode = options.learnedMode ?? "off";
+    // Optional gate from the runtime: whether the service reports its keep
+    // head as usable. Live scores act only while it answers true.
+    this.keepScoresUsable = typeof options.keepScoresUsable === "function" ? options.keepScoresUsable : null;
+  }
+
+  /** Store a learned keep-score on an item. Ids and numbers only. */
+  setKeepScore(id, score, version = null) {
+    const item = this.items.get(id);
+    if (!item || typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1) return null;
+    item.metadata = {
+      ...(item.metadata ?? {}),
+      keepScore: score,
+      keepScoreVersion: typeof version === "string" ? version : null,
+      keepScoredAt: nowIso()
+    };
+    return item;
+  }
+
+  // Whether stored keep-scores act right now: live mode, and a usable head
+  // when the runtime supplied that check.
+  keepScoresLive() {
+    if (this.learnedMode !== "live") return false;
+    if (!this.keepScoresUsable) return true;
+    try {
+      return this.keepScoresUsable() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Factor on an item's decay: 1 unless a live keep-score applies to it. */
+  keepMultiplier(item, live = this.keepScoresLive()) {
+    if (!live) return 1;
+    const score = keepScoreOf(item);
+    if (score === null || isProtectedMemory(item)) return 1;
+    return Math.min(KEEP_MULTIPLIER_MAX, Math.max(KEEP_MULTIPLIER_MIN, KEEP_MULTIPLIER_MAX - score));
   }
 
   bindVectorStore(vectorStore) {
@@ -227,7 +288,8 @@ export class MemorySystem {
     const selected = scored.slice(0, limit);
     this.recordRecalls(selected.map((entry) => entry.item.id), {
       now,
-      source: options.source ?? "retrieve"
+      source: options.source ?? "retrieve",
+      sessionId: options.sessionId ?? null
     });
     return selected;
   }
@@ -239,7 +301,7 @@ export class MemorySystem {
    * receipt. Keeping this separate also lets vector-backed principle recall
    * use the same accounting without copying private text into telemetry.
    */
-  recordRecalls(ids, { now = nowIso(), source = "retrieve" } = {}) {
+  recordRecalls(ids, { now = nowIso(), source = "retrieve", sessionId = null } = {}) {
     const recalledAt = now instanceof Date ? now.toISOString() : String(now);
     const safeSource = ["retrieve", "principle-context"].includes(source) ? source : "retrieve";
     const updated = [];
@@ -253,6 +315,8 @@ export class MemorySystem {
         ...(item.metadata ?? {}),
         recallCount: Math.max(0, Number(item.metadata?.recallCount) || 0) + 1,
         lastRecalledAt: recalledAt,
+        ...(sessionId && item.metadata?.sessionId && sessionId !== item.metadata.sessionId
+          ? { recalledInOtherSession: true } : {}),
         recallSources: {
           ...priorSources,
           [safeSource]: Math.max(0, Number(priorSources[safeSource]) || 0) + 1
@@ -296,13 +360,48 @@ export class MemorySystem {
       // even locked items, just not one already superseded.
       if (item && !item.metadata?.supersededBy) targets.push(item);
     } else if (query) {
-      const hits = this.retrieve(query, { limit: 5, scope, includeShared: false });
+      // Retrieval strength/recency favors summaries of the last conversation.
+      // A correction must find the saved fact itself, even if five newer logs
+      // quote it. Match text without reinforcing memories just by searching.
+      const matches = [...this.items.values()]
+        .filter(item => !item.metadata?.supersededBy && (item.scope ?? "main") === scope)
+        .map(item => ({ item, score: tokenOverlapScore(correctionText(query), correctionText(`${item.content} ${(item.tags ?? []).join(" ")}`)) }))
+        .filter(hit => hit.score > 0).sort((a, b) => b.score - a.score);
+      const strongest = matches[0];
+      // Condensed principles inherit protected tags. Follow their same-scope
+      // evidence so a stronger principle can still lead back to its saved fact.
+      const principleSources = new Set();
+      const lineage = [strongest?.item];
+      for (const principle of lineage) {
+        if (principle?.kind !== "principle" || !Array.isArray(principle.metadata?.sources)) continue;
+        for (const id of principle.metadata.sources) {
+          const source = this.items.get(id);
+          if (principleSources.has(id) || !source || source.metadata?.supersededBy || (source.scope ?? "main") !== scope) continue;
+          principleSources.add(id);
+          lineage.push(source);
+        }
+      }
+      // Prefer saved facts tied for the strongest match, or quoted by an
+      // automatic memory or a principle derived from that saved fact.
+      const saved = matches.filter(hit => isSavedMemory(hit.item) && hit.score >= 0.5 && (
+        hit.score >= strongest.score || ((!isProtectedMemory(strongest.item) || principleSources.has(hit.item.id))
+          && tokenOverlapScore(correctionText(hit.item.content), correctionText(strongest.item.content)) >= 0.75)
+      ));
+      const hits = saved.length ? saved : matches.filter(hit => !isSavedMemory(hit.item) || hit.score >= strongest.score);
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
         // retrieve() already hides superseded items; corrections themselves are
         // fair game so a re-correction supersedes the prior one (no stacking).
         if (score >= 0.15 && score >= top * 0.8) targets.push(item);
         if (targets.length >= 3) break;
+      }
+      // Retire near-tied saved copies and automatic quotations of the winning
+      // fact. Compare with the original saved targets so copies cannot pull
+      // in progressively less related facts. Explicit-id corrections stay exact.
+      const savedTargets = targets.filter(isSavedMemory);
+      if (savedTargets.length) for (const { item, score } of matches) {
+        if (targets.includes(item) || score < top * 0.8 || (isProtectedMemory(item) && !isSavedMemory(item))) continue;
+        if (savedTargets.some(target => tokenOverlapScore(correctionText(target.content), correctionText(item.content)) >= 0.75)) targets.push(item);
       }
     }
 
@@ -367,6 +466,7 @@ export class MemorySystem {
 
   decay(now = new Date()) {
     const current = now instanceof Date ? now : new Date(now);
+    const keepLive = this.keepScoresLive();
     const removed = [];
     const promoted = [];
     const decayed = [];
@@ -410,7 +510,7 @@ export class MemorySystem {
           } else {
             const periods = Math.floor(Math.max(0, current.getTime() - lastDecayMs) / DECAY_INTERVAL_MS);
             if (periods > 0) {
-              item.strength = clamp(item.strength - this.decayRate(item.tier) * periods);
+              item.strength = clamp(item.strength - this.decayRate(item.tier) * periods * this.keepMultiplier(item, keepLive));
               item.lastDecayedAt = new Date(lastDecayMs + periods * DECAY_INTERVAL_MS).toISOString();
               decayed.push(item);
             }
@@ -445,7 +545,7 @@ export class MemorySystem {
         if (!item.locked && Number.isFinite(lastDecayMs)) {
           const periods = Math.floor(Math.max(0, current.getTime() - lastDecayMs) / DECAY_INTERVAL_MS);
           if (periods > 0) {
-            item.strength = clamp(item.strength - this.decayRate(item.tier) * periods);
+            item.strength = clamp(item.strength - this.decayRate(item.tier) * periods * this.keepMultiplier(item, keepLive));
             item.lastDecayedAt = new Date(lastDecayMs + periods * DECAY_INTERVAL_MS).toISOString();
             decayed.push(item);
           }
@@ -733,7 +833,7 @@ export class MemorySystem {
     if (Number.isFinite(lastDecayMs) && atMs > lastDecayMs) {
       periods = Math.floor((atMs - lastDecayMs) / DECAY_INTERVAL_MS);
       if (periods > 0) {
-        item.strength = clamp((item.strength ?? 0) - this.decayRate(item.tier) * periods);
+        item.strength = clamp((item.strength ?? 0) - this.decayRate(item.tier) * periods * this.keepMultiplier(item));
       }
     }
     // A repeat is a new evidence boundary even when less than one full decay
@@ -756,9 +856,17 @@ export class MemorySystem {
 
     // Locked corrections are exempt from cap eviction (low volume by nature;
     // a tier may briefly exceed its cap rather than forget a correction).
+    // Live keep-scores shift the eviction order: strength plus a small bonus
+    // for items likely to be recalled (unscored and protected items count as
+    // neutral).
+    const keepRank = this.keepScoresLive()
+      ? (item) => item.strength + KEEP_EVICTION_WEIGHT * ((isProtectedMemory(item) ? null : keepScoreOf(item)) ?? KEEP_SCORE_NEUTRAL)
+      : null;
     tierItems
       .filter((item) => !item.locked)
-      .sort((a, b) => a.strength - b.strength || a.lastAccessedAt.localeCompare(b.lastAccessedAt))
+      .sort(keepRank
+        ? (a, b) => keepRank(a) - keepRank(b) || a.lastAccessedAt.localeCompare(b.lastAccessedAt)
+        : (a, b) => a.strength - b.strength || a.lastAccessedAt.localeCompare(b.lastAccessedAt))
       .slice(0, Math.max(0, tierItems.length - limit))
       .forEach((item) => {
         this.items.delete(item.id);

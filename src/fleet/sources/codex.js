@@ -704,7 +704,8 @@ function buildThread(row, context) {
       threadSource: row.thread_source || null,
       // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
       originator: row.originator || null,
-      // "vscode" = an app's thread, "exec" = codex exec, "cli" = the Codex CLI.
+      // Preserve missing/unknown source metadata: background resume requires
+      // "cli" or "exec"; a CLI-like originator cannot override "vscode".
       source: row.source || null,
       // The name set in the Codex app; title is the first prompt when unset.
       catalogName: row.name ? clampText(redactSecrets(row.name), limits.titleMax) : null,

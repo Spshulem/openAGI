@@ -30,6 +30,9 @@ import sh.openagi.mobile.protocol.FleetMuteRequest
 import sh.openagi.mobile.protocol.FleetMuteResult
 import sh.openagi.mobile.protocol.FleetPushResult
 import sh.openagi.mobile.protocol.FleetQuestionResult
+import sh.openagi.mobile.protocol.FleetReplyRequest
+import sh.openagi.mobile.protocol.FleetSendRequest
+import sh.openagi.mobile.protocol.FleetSendResult
 import sh.openagi.mobile.protocol.FleetState
 import sh.openagi.mobile.protocol.FleetThreadDetailResult
 import sh.openagi.mobile.protocol.LifelogMoment
@@ -296,6 +299,30 @@ class DaemonClient(
         val body = ProtocolJson.json.encodeToString(FleetAnswerRequest.serializer(), FleetAnswerRequest(answer))
         val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
         return fleetCall(request, relayClient, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    // Free text to a question whose canReply is true: the hub types it into
+    // the question's chat and closes the question once it is sent or queued.
+    // The same long wait as an answer.
+    suspend fun fleetReply(id: String, reply: String): FleetQuestionResult {
+        val body = ProtocolJson.json.encodeToString(FleetReplyRequest.serializer(), FleetReplyRequest(reply))
+        val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
+        return fleetCall(request, relayClient, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    // The owner's own words to one thread, no question attached. 404 here is
+    // a hub without the route (every hub with it answers a bad key with 400),
+    // so it reads as Unauthorized: the same "update the hub" as a phone the
+    // route is not yet open to.
+    suspend fun fleetSendMessage(threadKey: String, message: String): FleetSendResult {
+        if (!THREAD_KEY.matches(threadKey)) throw DaemonException.NotFound()
+        val body = ProtocolJson.json.encodeToString(FleetSendRequest.serializer(), FleetSendRequest(threadKey, message))
+        val request = authorized("/fleet/api/send").post(body.toRequestBody(JSON)).build()
+        return try {
+            fleetCall(request, relayClient, FleetSendResult.serializer(), missingMeansUnavailable = false)
+        } catch (missing: DaemonException.NotFound) {
+            throw DaemonException.Unauthorized()
+        }
     }
 
     suspend fun fleetDismiss(id: String): FleetQuestionResult {

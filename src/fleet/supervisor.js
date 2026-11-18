@@ -11,7 +11,7 @@ import { readThreadConversation, unavailableConversation } from "./conversation.
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
@@ -23,8 +23,15 @@ import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
-import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
-import { createPaseoSource } from "./sources/paseo.js";
+import { buildSupervisorDeck } from "./cards.js";
+import { executeSafePrMerge } from "./intent-resolver.js";
+import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
+import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
+import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, createDecisionsKeepAliveGate, evaluateQuestionsRelevanceWithDecisions } from "./decisions-gate.js";
+import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } from "./themes.js";
+import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
+import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import { createPaseoSource, hostApi, paseoThread, withPaseo } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -183,8 +190,8 @@ function emptyBb3() {
 // thread at once), so they collapse into one line each. Identical titles
 // (the same BuildBot3 problem seen by a thread and by infra) collapse too.
 const GROUPED_KINDS = Object.freeze({
-  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
-  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
+  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} thread${n === 1 ? "" : "s"} capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
+  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open ${n === 1 ? "it" : "them"}?`, body: (labels) => `No live session to message: ${labels}.` },
   // Always one question, even for one thread, so the owner's answer holds
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
@@ -314,6 +321,11 @@ export function settledAsk(question, { thread = null, pr = null, prMissing = fal
   if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
   const spokeAt = Date.parse(agentReply(thread).at ?? "");
   if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
+  const ownerAt = Date.parse(thread?.lastUserAt ?? "");
+  const ownerDirect = Boolean(thread && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX));
+  if (!question.mergeAsk && ownerDirect && Number.isFinite(ownerAt) && Number.isFinite(askedAt) && ownerAt > askedAt && thread.agentStatus === "running") {
+    return "owner followed up: agent is working";
+  }
   return null;
 }
 
@@ -331,6 +343,31 @@ const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 // What changes when a thread moves: its newest agent or owner text and state.
 function activityMark(thread) {
   return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
+}
+
+// What a source's own listing says about a thread, before any git, PR or
+// screen read adds to it: a proposal made on these facts is only still
+// meant while they hold (a deferred thread is not reassessed).
+function discoveredFacts(thread) {
+  return shortHash(JSON.stringify([activityMark(thread), thread?.prRefs ?? [], thread?.branch ?? null, thread?.lastUserText ?? null]));
+}
+
+// The button auto-approve clicks, first match: the narrowest grant that keeps
+// the same card from coming back in that chat. Never "Always allow", which
+// grants it to every chat for good.
+const AUTO_APPROVE_LABELS = ["allow this conversation", "allow for this session", "allow for session", "allow once", "approve once", "approve", "allow", "yes, allow", "yes"];
+// Chats approved per scan, and cards in a row per chat (a command can raise
+// another right after).
+const AUTO_APPROVE_MAX_THREADS = 5;
+const AUTO_APPROVE_MAX_CARDS = 3;
+
+export function autoApproveLabel(buttons) {
+  const shown = (buttons ?? []).map((label) => ({ label, key: String(label ?? "").trim().toLowerCase() }));
+  for (const want of AUTO_APPROVE_LABELS) {
+    const hit = shown.find((button) => button.key === want);
+    if (hit) return hit.label;
+  }
+  return null;
 }
 
 function threadLabel(thread) {
@@ -376,12 +413,14 @@ export function groupQuestions(asks, byKey) {
   for (const [kind, list, part] of chunks) {
     const spec = GROUPED_KINDS[kind];
     const minSize = spec.minSize ?? 2;
-    if (list.length === 1 && minSize > 1) out.push(single(list[0]));
-    if (!list.length || list.length < minSize) continue;
+    if (list.length === 1 && minSize > 1 && !list[0].carried) out.push(single(list[0]));
+    // Carried members alone (see act) still rewrite their open group, so
+    // members reassessed this scan and no longer asked drop out of it.
+    if (!list.length || (list.length < minSize && !list.every((decision) => decision.carried))) continue;
     const threads = list.map((decision) => byKey.get(decision.threadKey)).filter(Boolean);
     // A delivery failure names its reason, so the owner knows what to fix.
     const labels = kind === "deliver"
-      ? list.map((decision) => `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`).join(", ")
+      ? list.map((decision) => (decision.carried ? threadLabel(byKey.get(decision.threadKey)) : `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`)).join(", ")
       : threads.map(threadLabel).join(", ");
     const resets = threads.map((thread) => thread.error?.resetAt).filter(Boolean).sort();
     out.push({
@@ -435,6 +474,66 @@ function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
 }
 
+const KNOWN_CACHE_MAX = 600;
+
+function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
+  if (!key || !value) return;
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > max) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
+
+function buildQuestionContextSnapshot(thread, pr) {
+  if (!thread && !pr) return null;
+  const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
+  const workspace = rawWorkspace && !/^wks_[0-9a-f]+$/i.test(rawWorkspace) ? clampText(rawWorkspace, 80) : null;
+  return {
+    threadTitle: clampText(redactSecrets(thread?.title ?? ""), 140) || null,
+    workspace,
+    repo: thread?.repo ?? pr?.repo ?? null,
+    branch: thread?.branch ?? pr?.headRef ?? null,
+    provider: thread?.meta?.provider ?? thread?.kind ?? null,
+    paseoCwd: thread?.meta?.paseoCwd ?? null,
+    paseoWorkspaceId: thread?.meta?.workspaceId ?? null,
+    paseoHasWorkspaceId: Boolean(thread?.meta && Object.prototype.hasOwnProperty.call(thread.meta, "workspaceId") && thread.meta.workspaceId !== undefined),
+    serverId: thread?.meta?.serverId ?? null,
+    aliases: Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases.slice(0, 4) : [],
+    agentSummary: clampTailLines(redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || ""), 1600) || null,
+    lastUserText: clampTailLines(redactSecrets(thread?.lastUserText || ""), 600) || null,
+    lastUserAt: thread?.lastUserAt ?? null,
+    lastAgentAt: thread?.lastAgentAt ?? null,
+    recentMessages: (thread?.meta?.conversation ?? []).slice(-4).map((m) => ({
+      role: m.role === "user" ? "user" : "assistant",
+      text: clampTailLines(redactSecrets(m.text ?? ""), 700),
+      at: m.at ?? null
+    })),
+    pr: pr ? {
+      ref: pr.ref,
+      url: pr.url,
+      number: pr.number,
+      title: clampText(redactSecrets(pr.title ?? ""), 180) || null,
+      bodySummary: pr.bodySummary ?? null,
+      state: pr.state ?? null,
+      isDraft: Boolean(pr.isDraft),
+      head: String(pr.headOid ?? "").slice(0, 10) || null,
+      mergeState: pr.mergeState ?? null,
+      ciState: pr.ci?.state ?? null,
+      failingChecks: (pr.ci?.failing ?? []).slice(0, 4),
+      unresolvedThreads: pr.unresolvedThreads ?? 0,
+      additions: Number.isFinite(pr.additions) ? pr.additions : null,
+      deletions: Number.isFinite(pr.deletions) ? pr.deletions : null,
+      changedFiles: Number.isFinite(pr.changedFiles) ? pr.changedFiles : null,
+      files: Array.isArray(pr.files) ? pr.files.slice(0, 12) : [],
+      gates: Array.isArray(pr.gates) ? pr.gates.slice(0, 4).map((g) => ({ label: g.label || g.name, state: g.state ?? null })) : [],
+      qa: pr.qa ? { required: pr.qa.required ?? null, freshOnHead: pr.qa.freshOnHead ?? null } : null
+    } : null
+  };
+}
+
 // How much of the agent's last message a thread's detail shows.
 const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
@@ -444,6 +543,34 @@ const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
 // a delete, a merge.
 const RISKY_ASK = /\b(?:prod(?:uction)?|releas(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?|delet(?:e|es|ed|ing|ion)|destroy|wipe|merg(?:e|es|ed|ing)|force[- ]push|rewrite (?:git )?history)\b|--admin\b/i;
 const MUTE_HOURS_DEFAULT = 24;
+// The asks the owner may answer in their own words: one thread's own
+// question, a stuck thread, a ready-to-merge ask. Not a card only the app
+// takes, a permission prompt, or a group.
+const REPLY_KINDS = new Set(["agent-ask", "stuck", "ready"]);
+export const REPLY_MAX = 2000;
+
+// questionView's risky flag: a release, deploy, delete or merge ask.
+export function riskyQuestion(question) {
+  const text = [question?.title, question?.body, ...(question?.options ?? [])].filter(Boolean).join(" ");
+  return Boolean(question?.mergeAsk) || question?.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question?.kind) && RISKY_ASK.test(text));
+}
+
+export function canReplyTo(question) {
+  const isPaseoInline = ["agent-card", "prompt"].includes(question?.kind)
+    && (question?.meta?.app === "paseo" || String(question?.threadKey ?? "").startsWith("paseo:"));
+  return typeof question?.threadKey === "string" && Boolean(question.threadKey)
+    && (REPLY_KINDS.has(question.kind) || isPaseoInline)
+    && !((question.threadKeys ?? []).length > 1);
+}
+
+// A risky answer or reply is typed into the agent's app as the owner's,
+// never relayed or resumed: an agent refused a relayed "yes".
+const RISKY_NO_ROUTE = "risky ask: it is only typed into the agent's app, and this Mac cannot type into it; approve it in the chat";
+const RISKY_WAITS = "risky ask: it is only typed into the agent's app";
+// Whether the Mac can type into this thread's app later (not a CLI-only Mac).
+function typesLater(thread, deliveryState) {
+  return Boolean(uiTargetFor(thread)) && ["computer-use", "computer-use-first"].includes(deliveryState?.mode);
+}
 
 // Delivery that failed only because typing into the app has to wait (a
 // strict computer-use Mac that cannot type now, or a typed send held back by
@@ -468,6 +595,11 @@ const QUEUED_ANSWER_MS = 24 * 60 * 60_000;
 function ownerDelivery(answer) {
   // Options are fixed strings chosen by policy, never agent text.
   return `Owner answer: ${answer}. Continue with that.`;
+}
+
+// The owner's own words, typed or spoken: a reply to a question.
+function ownerReply(text) {
+  return `Owner says: ${text}`;
 }
 
 // "retry" on a logged-out / disk-full question means the owner fixed it.
@@ -515,7 +647,12 @@ export class FleetSupervisor {
     this.lastTickAt = null;
     this.lastError = null;
     this.lastThreads = new Map();
+    this.knownThreads = new Map();
+    this.knownRows = new Map();
     this.lastPrs = new Map();
+    // threadKey -> scan ordinal. Activity alone must not keep quiet chats
+    // outside the scan forever when a fleet is larger than maxThreads.
+    this.scopeReadAt = new Map();
     // threadKey -> { classified, pr } and the infra and manager the last scan
     // read: what the owner's Push now decides from (pushNow).
     this.lastItems = new Map();
@@ -701,6 +838,18 @@ export class FleetSupervisor {
     return this._nudgeJudge;
   }
 
+  // Lightweight `/v1/decisions` (`gpt-6-luna`) keep-alive gate; 0% codex-lb draw.
+  get decisionsGate() {
+    if (this.deps.decisionsGate !== undefined) return this.deps.decisionsGate;
+    this._decisionsGate ??= createDecisionsKeepAliveGate({
+      config: this.config,
+      env: this.deps.env ?? {},
+      fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl ?? globalThis.fetch,
+      now: () => this.now()
+    });
+    return this._decisionsGate;
+  }
+
   // runModel for the review; tests inject a fake one.
   get reviewRunner() {
     if (this.deps.runModel) return this.deps.runModel;
@@ -816,6 +965,17 @@ export class FleetSupervisor {
     return this.running;
   }
 
+  emitFleet(reason = "update") {
+    try {
+      const snap = this.store.snapshot;
+      this.runtime?.events?.emit?.("fleet", {
+        at: snap?.at ?? new Date(this.now()).toISOString(),
+        reason,
+        counts: snap?.counts ?? null
+      });
+    } catch { /* listeners never break a mutation */ }
+  }
+
   getState() {
     const store = this.store;
     const open = store.openQuestions().filter((question) => {
@@ -827,9 +987,11 @@ export class FleetSupervisor {
     // while no tick runs.
     this.closeExpired();
     const snapshot = this.liveSnapshot(withHealth(store.snapshot), open);
-    const rows = new Map((snapshot?.threads ?? []).map((row) => [row?.key, row]));
+    for (const r of snapshot?.threads ?? []) if (r?.key) setBounded(this.knownRows, r.key, r);
+    const rows = new Map([...this.knownRows, ...(snapshot?.threads ?? []).map((row) => [row?.key, row])]);
     const questions = open.map((question) => this.questionView(question, rows));
-    return {
+    const actions = store.actions(50);
+    const baseState = {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
       running: Boolean(this.running),
@@ -840,7 +1002,7 @@ export class FleetSupervisor {
       fixes: store.fixes(),
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
-      actions: store.actions(50),
+      actions,
       suggestions: store.suggestions(),
       diagnosis: structuredClone(store.state.diagnosis),
       settings: {
@@ -864,9 +1026,21 @@ export class FleetSupervisor {
           // Which ran last: { provider, model, fallbackReason }.
           lastRun: this.lastReview.ran ?? null,
           lastError: this.lastReview.error
+        },
+        decisions: {
+          enabled: Boolean(this.decisionsGate?.enabled),
+          model: this.decisionsGate?.model ?? this.config.decisions?.model ?? null
         }
       }
     };
+    const deck = buildSupervisorDeck(baseState, {
+      preferences: store.preferences(),
+      now: this.now(),
+      threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
+      prsByKey: this.lastPrs,
+      knownRows: this.knownRows
+    });
+    return { ...baseState, ...deck };
   }
 
   // The last scan's rows brought up to now. Watching follows the questions
@@ -904,14 +1078,31 @@ export class FleetSupervisor {
   // button. A group names each of its chats.
   questionView(question, rows) {
     const chatOf = (key) => {
-      const thread = this.lastThreads.get(key);
-      return (thread ? openChatFor(thread) : rows.get(key)?.openChat) ?? null;
+      const thread = this.lastThreads.get(key) ?? this.knownThreads.get(key);
+      const fromThread = (thread ? openChatFor(thread) : rows.get(key)?.openChat) ?? null;
+      if (fromThread) return fromThread;
+      const parsed = parsePaseoThreadKey(key);
+      if (parsed) {
+        const snapTitle = question.contextSnapshot?.threadTitle;
+        return {
+          app: "paseo",
+          url: null,
+          label: `${snapTitle || "Paseo chat"} (Paseo)`,
+          serverId: parsed.serverId,
+          agentId: parsed.agentId,
+          note: "Open this existing chat on its Paseo host."
+        };
+      }
+      return null;
     };
     const openChat = question.threadKey ? chatOf(question.threadKey) : null;
     const chats = (question.threadKeys ?? []).map((key) => ({ threadKey: key, ...(chatOf(key) ?? { app: null, url: null, label: key, note: null }) }));
     const options = question.options ?? [];
-    const inApp = question.kind === "agent-card" || !options.some((option) => !APP_ONLY_OPTIONS.has(option));
-    const text = [question.title, question.body, ...options].filter(Boolean).join(" ");
+    const isPaseoThread = Boolean(parsePaseoThreadKey(question.threadKey));
+    const paseoInlineCard = question.kind === "agent-card"
+      && (openChat?.app === "paseo" || question.meta?.app === "paseo" || isPaseoThread);
+    const inApp = (question.kind === "agent-card" && !paseoInlineCard)
+      || (!isPaseoThread && !options.some((option) => !APP_ONLY_OPTIONS.has(option)));
     return {
       ...question,
       askedAt: question.agentAskedAt ?? question.createdAt ?? null,
@@ -919,7 +1110,9 @@ export class FleetSupervisor {
       answerIn: inApp ? "agent app" : "here",
       openChat,
       ...(chats.length ? { chats } : {}),
-      risky: Boolean(question.mergeAsk) || question.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
+      risky: riskyQuestion(question),
+      // Takes the owner's own words (POST questions/:id { reply }).
+      canReply: canReplyTo(question) || (isPaseoThread && ["agent-card", "prompt"].includes(question.kind))
     };
   }
 
@@ -932,6 +1125,7 @@ export class FleetSupervisor {
       }
     }
     if (mode === "observe") this.selfFixHub.stop("all").catch(() => {});
+    this.emitFleet("mode-changed");
     return saved;
   }
 
@@ -940,17 +1134,23 @@ export class FleetSupervisor {
     if (!question || question.status !== "open") return null;
     if (question.kind === "suggestion") {
       this.respondSuggestion(question.meta?.suggestionId, "Not now").catch(() => {});
+      this.emitFleet("question-dismissed");
       return this.store.question(id);
     }
     // A storage ask comes back every tick, and a dismissal holds while it is
     // asked: one dismiss would mute it for good. It counts as Later (24 h).
     if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
       this.resolveOutreach(question, "Later", "acted");
-      return this.store.answerQuestion(id, "Later");
+      const closed = this.store.answerQuestion(id, "Later");
+      this.emitFleet("question-dismissed");
+      return closed;
     }
+    this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "dismiss", question, answer: "dismiss", now: this.now() }));
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
-    return this.store.dismissQuestion(id);
+    const dismissed = this.store.dismissQuestion(id);
+    this.emitFleet("question-dismissed");
+    return dismissed;
   }
 
   // The owner's feedback and the self-fix requests it leads to: stored here,
@@ -1018,6 +1218,7 @@ export class FleetSupervisor {
       kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: id, status: "done",
       reason: clampText(`owner reopened: ${question.title}`, 300)
     });
+    this.emitFleet("question-reopened");
     return question;
   }
 
@@ -1086,7 +1287,7 @@ export class FleetSupervisor {
   // never send on their own). A thread its source could not show this tick
   // (the scan failed, or hit its cap) keeps its time; one that no longer
   // waits drops it, so the age is always that of a nudge still waiting.
-  trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config }) {
+  trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config, deferred = new Set() }) {
     if (mode !== "auto" || delivery.ready !== false) { this.uiBlockedSince.clear(); this.store.setUiBlockedSince(this.uiBlockedSince); return; }
     const now = new Set(decisions.filter((decision) => decision?.uiBlocked).map((decision) => decision.threadKey));
     const seen = new Set(threads.map((thread) => thread.key));
@@ -1094,6 +1295,8 @@ export class FleetSupervisor {
       // infra:bb3 and infra:lb belong to their probes, not a thread source.
       const [kind, probe] = String(key).split(":");
       if (kind === "infra") return Boolean(sourceErrors[probe]);
+      // Rotated out of a capped scan: not reassessed, so still waiting.
+      if (deferred.has(key)) return true;
       const capped = threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads;
       return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
     };
@@ -1148,11 +1351,13 @@ export class FleetSupervisor {
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
+      // A risky answer waits for typing, never a relay or resume.
+      if (pending.typedOnly && route !== "computer-use") continue;
       if ((contacted.uiStalled || deferUi) && route === "computer-use") continue;
       // Failed tries are bounded too, like the send loop's.
       if (tries >= budget * 2) continue;
       tries += 1;
-      const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
+      const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer", ...(pending.typedOnly ? { typedOnly: true } : {}) });
       if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
@@ -1338,7 +1543,7 @@ export class FleetSupervisor {
 
   // Clicks one button of the thread's permission card (or its one Resume
   // button) by exact label; stateId pins the card the owner saw.
-  async clickThread(threadKey, label, { stateId = null, deadlineAt = null, thread = null } = {}) {
+  async clickThread(threadKey, label, { stateId = null, deadlineAt = null, thread = null, auto = false } = {}) {
     const found = this.uiThread(threadKey, thread);
     if (found.error) return { delivery: { status: "blocked", route: null, detail: found.error }, prompt: null };
     if (typeof found.driver.clickLabel !== "function") return { delivery: { status: "blocked", route: null, detail: "clicking unavailable on this Mac" }, prompt: null };
@@ -1349,8 +1554,8 @@ export class FleetSupervisor {
       result = { status: "failed", detail: clampText(redactSecrets(`computer use failed: ${error?.message ?? error}; nothing confirmed`), 200) };
     }
     this.noteUiResult(found.thread, result);
-    this.store.recordAction({ kind: "click", playbook: "owner-click", threadKey: found.thread.key, route: "computer-use", status: result?.status ?? "failed",
-      reason: clampText(`owner: click ${label}`, 300), detail: clampText(result?.detail ?? "", 200), at: new Date(this.now()).toISOString() });
+    this.store.recordAction({ kind: "click", playbook: auto ? "auto-approve" : "owner-click", threadKey: found.thread.key, route: "computer-use", status: result?.status ?? "failed",
+      reason: clampText(`${auto ? "auto-approve" : "owner"}: click ${label}`, 300), detail: clampText(result?.detail ?? "", 200), at: new Date(this.now()).toISOString() });
     return { delivery: { status: result?.status ?? "failed", route: "computer-use", detail: result?.detail ?? null, ...(result?.code ? { code: result.code } : {}) }, prompt: result?.prompt ?? null };
   }
 
@@ -1370,6 +1575,56 @@ export class FleetSupervisor {
     if (["sent", "read"].includes(result.status) || card || READ_THE_APP.test(String(result.detail ?? ""))) this.unreadable.delete(target.app);
     if (card?.stateId && Array.isArray(card.buttons)) this.prompts.set(thread.key, { text: clampText(card.text ?? "", 300), buttons: card.buttons.slice(0, 6), stateId: card.stateId, at });
     else if (["sent", "read"].includes(result.status)) this.prompts.delete(thread.key);
+  }
+
+  // Auto-approve (OPENAGI_FLEET_AUTO_APPROVE=codex): Codex can raise approval
+  // cards even with full access on. One read of its sidebar finds the chats
+  // marked "Awaiting approval"; each is opened (never under the owner) and
+  // its card's Allow clicked, before any of them becomes a question.
+  async approveCodexCards(inScope, threads, started) {
+    const driver = this.uiDriver;
+    if (typeof driver?.attention !== "function" || typeof driver?.clickLabel !== "function") return;
+    // Only while Auto holds and the thread is not muted, checked again before
+    // each read and click: the owner can switch mode or mute mid-pass.
+    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key);
+    const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived && allowed(thread));
+    if (!codex.length) return;
+    let rows = [];
+    try {
+      const read = await driver.attention({ target: UI_APPS.codex, evidenceName: `attention-codex-${started}` });
+      rows = read?.status === "read" ? read.rows ?? [] : [];
+    } catch { /* unread: only cards already seen are approved */ }
+    const marked = new Set(rows.map(identityToken).filter(Boolean));
+    // A sidebar row is labelled with what Codex shows: the thread's title, or
+    // its first message. The names come from uiIdentity, like every other
+    // check of what is on screen, so a name another thread can show (a
+    // shared title or first message) proves nothing and is skipped. A label
+    // still claimed by two threads here binds to neither.
+    const all = threads ?? [...this.lastThreads.values()];
+    const names = new Map();
+    const claims = new Map();
+    for (const thread of codex) {
+      const identity = uiIdentity(thread, uiTargetFor(thread), all);
+      const own = identity.ambiguous ? [] : [...new Set([...(identity.tokens ?? []), ...(identity.altTokens ?? [])])];
+      names.set(thread.key, own);
+      for (const name of own) claims.set(name, (claims.get(name) ?? 0) + 1);
+    }
+    const shown = (thread) => names.get(thread.key).some((name) => marked.has(name) && claims.get(name) === 1);
+    const waiting = codex.filter((thread) => this.livePrompt(thread) || shown(thread));
+    for (const thread of waiting.slice(0, AUTO_APPROVE_MAX_THREADS)) {
+      if (!allowed(thread)) continue;
+      if (!this.livePrompt(thread)) {
+        try { await this.screenThread(thread.key, { thread, threads, navigate: true }); } catch { continue; }
+      }
+      for (let clicks = 0; clicks < AUTO_APPROVE_MAX_CARDS; clicks += 1) {
+        const card = this.livePrompt(thread);
+        const label = card ? autoApproveLabel(card.buttons) : null;
+        if (!label || !allowed(thread)) break;
+        const clicked = await this.clickThread(thread.key, label, { stateId: card.stateId, thread, auto: true });
+        if (clicked.delivery.status !== "sent") break;
+        if (!clicked.prompt) this.prompts.delete(thread.key);
+      }
+    }
   }
 
   // A read of this thread found no card, the thread has not moved since, and
@@ -1484,10 +1739,12 @@ export class FleetSupervisor {
       return result ? { question: this.store.question(id), delivery: null, fix: result.fix,
         ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}) } : null;
     }
-    // A question card is answered in the app itself. Until the supervisor
-    // can click it there, "open thread" is the only answer and it relays
-    // nothing; anything else is refused.
-    if (question.kind === "agent-card" && answer !== "open thread") return null;
+    // A question card is answered in the app itself unless Paseo exposed
+    // inline choices that can steer the Paseo agent directly.
+    const paseoCardAnswer = question.kind === "agent-card"
+      && (question.meta?.app === "paseo" || String(question.threadKey ?? "").startsWith("paseo:"))
+      && answer !== "open thread";
+    if (question.kind === "agent-card" && answer !== "open thread" && !paseoCardAnswer) return null;
     this.answering.add(id);
     if (question.threadKey) this.ownerAnsweredAt.set(question.threadKey, this.now());
     try {
@@ -1496,9 +1753,15 @@ export class FleetSupervisor {
       // A tap on one of a permission card's buttons clicks that button in
       // the thread (the card the question was raised for: its stateId).
       if (question.kind === "prompt" && question.threadKey && !["later", "opened"].includes(answer)) {
-        const clicked = await this.clickThread(question.threadKey, answer, { stateId: question.meta?.promptStateId ?? null, deadlineAt });
-        delivery = clicked.delivery;
-        if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+        if (String(question.threadKey).startsWith("paseo:")) {
+          const sent = await this.deliverToAsker(question, answer, ownerDelivery(answer), { deadlineAt, startedAt, settling, ownerChoice: answer });
+          delivery = sent.delivery;
+          if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+        } else {
+          const clicked = await this.clickThread(question.threadKey, answer, { stateId: question.meta?.promptStateId ?? null, deadlineAt });
+          delivery = clicked.delivery;
+          if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+        }
       }
       // "restart" on the can't-read question restarts that app, stopping
       // only the chats the question listed.
@@ -1522,32 +1785,31 @@ export class FleetSupervisor {
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
       const retry = question.kind === "infra" && answer === "retry";
-      if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
-        const thread = this.lastThreads.get(question.threadKey);
-        const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
-        const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-        const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
-        if (!thread || !route) {
-          delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
-        } else {
-          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-          if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
-          if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
-          // Starts the cooldown but does not spend the no-progress nudge budget.
-          this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
-        }
-        // The owner decided; only the typing has to wait (secure input, a
-        // locked screen, the owner at the keyboard). Keep the answer and send
-        // it once the Mac can type, instead of handing the question back.
-        if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, route, deliveryState, delivery)) {
-          // A tick may have closed the question meanwhile; only a stored answer is "saved".
-          const queued = this.store.queueAnswer(id, answer, message);
-          if (queued) {
-            this.resolveOutreach(question, answer, "acted");
-            this.applyOverride(question, answer);
-            return { question: queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
+      if ((question.kind === "agent-ask" || paseoCardAnswer || retry) && question.threadKey && answer !== "open thread") {
+        let deliveredChoice = answer;
+        if (paseoCardAnswer && Array.isArray(question.meta?.labels) && question.meta.labels.length > 0) {
+          if (question.meta.labels.includes(answer)) {
+            deliveredChoice = answer;
+          } else {
+            const numbered = /^([1-4])\.\s/.exec(String(answer ?? ""));
+            const byIndex = numbered ? question.meta.labels[Number(numbered[1]) - 1] : null;
+            if (typeof byIndex === "string" && byIndex.trim()) {
+              deliveredChoice = byIndex;
+            } else {
+              const prefix = String(answer ?? "").replace(/…$/, "").trim();
+              const matches = prefix ? question.meta.labels.filter((label) => label.startsWith(prefix)) : [];
+              if (matches.length === 1) deliveredChoice = matches[0];
+            }
           }
         }
+        const message = retry ? RETRY_DELIVERY : ownerDelivery(deliveredChoice);
+        const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling, ownerChoice: retry ? null : deliveredChoice });
+        if (sent.queued) {
+          this.resolveOutreach(question, answer, "acted");
+          this.applyOverride(question, answer);
+          return { question: sent.queued, delivery: sent.delivery };
+        }
+        delivery = sent.delivery;
       }
       // A background resume can fail while the others are still sending;
       // the group closes only once every thread has it.
@@ -1565,10 +1827,118 @@ export class FleetSupervisor {
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
+      this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "answer", question, answer, now: this.now() }));
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
       this.reopenIfUndelivered(id, settling, answer);
+      this.emitFleet("question-answered");
       return { question: answered, delivery };
+    } finally {
+      this.answering.delete(id);
+    }
+  }
+
+  // The owner's answer or reply to the one thread that asked. A risky ask
+  // goes only typed into its app. When only the typing has to wait (secure
+  // input, a locked screen, the owner at the keyboard) the words are kept
+  // and sent once the Mac can type, instead of handing the question back:
+  // { queued } is the question, closed with them.
+  syntheticPaseoThread(threadKey, question = null) {
+    if (!this.config.paseo?.enabled) return null;
+    const parsed = parsePaseoThreadKey(threadKey);
+    if (!parsed) return null;
+    const snap = question?.contextSnapshot ?? null;
+    return {
+      key: threadKey,
+      kind: "paseo",
+      id: parsed.agentId,
+      title: snap?.threadTitle || "Paseo chat",
+      workspace: snap?.workspace ?? null,
+      repo: snap?.repo ?? null,
+      branch: snap?.branch ?? null,
+      agentStatus: "idle",
+      archived: false,
+      excluded: null,
+      lastActivityAt: snap?.lastAgentAt ?? question?.createdAt ?? null,
+      lastUserAt: snap?.lastUserAt ?? null,
+      lastUserText: snap?.lastUserText ?? "",
+      lastAgentAt: snap?.lastAgentAt ?? null,
+      lastAgentText: (snap?.agentSummary ?? "").slice(-600),
+      lastAgentFull: snap?.agentSummary ?? "",
+      meta: {
+        serverId: parsed.serverId,
+        ...(snap?.paseoHasWorkspaceId
+          ? { workspaceId: snap.paseoWorkspaceId ?? null }
+          : (typeof snap?.paseoWorkspaceId === "string" ? { workspaceId: snap.paseoWorkspaceId } : {})),
+        provider: snap?.provider ?? "paseo",
+        paseoCwd: snap?.paseoCwd ?? null,
+        aliases: Array.isArray(snap?.aliases) ? snap.aliases : [],
+        conversation: Array.isArray(snap?.recentMessages) ? snap.recentMessages : []
+      }
+    };
+  }
+
+  async deliverToAsker(question, answer, message, { deadlineAt = null, startedAt = Date.now(), settling = [], queueMax, ownerChoice = null } = {}) {
+    const thread = this.lastThreads.get(question.threadKey)
+      ?? this.knownThreads.get(question.threadKey)
+      ?? this.syntheticPaseoThread(question.threadKey, question);
+    const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
+    const risky = riskyQuestion(question);
+    const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
+    const expectedPermissionId = question?.meta?.paseoPermissionId
+      ?? (question?.meta?.app === "paseo" && String(question?.meta?.cardId ?? "").startsWith("permission-") ? question.meta.cardId : null);
+    let delivery;
+    if (!thread || !route) {
+      const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
+        : typesLater(thread, deliveryState) ? RISKY_WAITS : RISKY_NO_ROUTE;
+      delivery = { status: "blocked", route: null, detail };
+    } else {
+      delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt, ownerChoice, expectedPermissionId, ...(risky ? { typedOnly: true } : {}) });
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+      if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
+      // Starts the cooldown but does not spend the no-progress nudge budget.
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    }
+    const waits = typingWaits(thread, route, deliveryState, delivery) || (risky && !route && typesLater(thread, deliveryState));
+    if (thread && delivery.status !== "sent" && waits) {
+      // A tick may have closed the question meanwhile; only a stored answer is "saved".
+      const queued = this.store.queueAnswer(question.id, answer, message, { typedOnly: risky, ...(queueMax ? { messageMax: queueMax } : {}) });
+      if (queued) return { queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
+    }
+    return { delivery };
+  }
+
+  // The owner's own words to the agent that asked ("Owner says: ..."), for
+  // a question canReplyTo allows. Sent or kept for when the Mac can type
+  // closes it; blocked or failed leaves it open. null: closed, or no reply.
+  async replyQuestion(id, reply, { deadlineAt = null } = {}) {
+    const startedAt = Date.now();
+    const text = String(reply ?? "").trim();
+    if (!text || text.length > REPLY_MAX || this.answering.has(id)) return null;
+    const question = this.store.question(id);
+    if (!question || question.status !== "open" || !canReplyTo(question)) return null;
+    this.answering.add(id);
+    this.ownerAnsweredAt.set(question.threadKey, this.now());
+    try {
+      const settling = [];
+      const message = ownerReply(text);
+      const sent = await this.deliverToAsker(question, text, message, { deadlineAt, startedAt, settling, queueMax: message.length });
+      // A free reply is no option: no override (a "stop" typed to a stuck
+      // thread must not mute it).
+      if (sent.queued) {
+        this.resolveOutreach(question, "reply", "acted");
+        return { question: sent.queued, delivery: sent.delivery };
+      }
+      if (sent.delivery.status !== "sent") {
+        return { question: this.store.question(id), delivery: sent.delivery };
+      }
+      const answered = this.store.answerQuestion(id, text);
+      this.resolveOutreach(question, "reply", "acted");
+      // The store keeps the reply clamped; a failed background send reopens
+      // the question only while that stored answer stands.
+      this.reopenIfUndelivered(id, settling, answered?.answer ?? text);
+      return { question: answered ?? this.store.question(id), delivery: sent.delivery };
     } finally {
       this.answering.delete(id);
     }
@@ -1590,22 +1960,34 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
-    const thread = this.lastThreads.get(threadKey);
+    const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
+    const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
+    const thread = this.lastThreads.get(threadKey)
+      ?? this.knownThreads.get(threadKey)
+      ?? this.syntheticPaseoThread(threadKey, matchingOpen);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
-    const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    // A thread with an open risky ask hears the owner only typed into its
+    // app, as an answer to that ask would be.
+    // A risky answer kept for typing still counts: its question is closed,
+    // but the agent has not heard it yet.
+    const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
+      || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
+    const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     if (!thread || !route) {
-      const detail = this.noRouteDetail(thread, deliveryState);
+      const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
+        : typesLater(thread, deliveryState) ? `${RISKY_WAITS}; send it again once the Mac can type, or approve it in the chat` : RISKY_NO_ROUTE;
       const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
       return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
     }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
@@ -1613,6 +1995,7 @@ export class FleetSupervisor {
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
       ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(delivery.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
@@ -1621,9 +2004,549 @@ export class FleetSupervisor {
   // step and why, its open questions, and what opens its chat. Built from
   // the last scan's row (kept across a restart), with this process's own
   // read of the chat when it has one. null: not in the last scan.
+  recordDiscoveredThread(thread) {
+    if (!thread?.key) return thread;
+    const prev = this.knownThreads.get(thread.key) ?? this.lastThreads.get(thread.key) ?? null;
+    const archived = typeof thread.archived === "boolean"
+      ? thread.archived
+      : Boolean(thread.state === "archived" || prev?.archived);
+    if (!prev) {
+      const normalized = typeof thread.archived === "boolean" ? thread : { ...thread, archived };
+      setBounded(this.knownThreads, thread.key, normalized);
+      return normalized;
+    }
+    const mergedPrRefs = [...new Set([...(thread.prRefs ?? []), ...(prev.prRefs ?? [])])];
+    const merged = {
+      ...prev,
+      ...thread,
+      archived,
+      excluded: prev?.excluded === "self" ? "self" : (thread.excluded ?? prev?.excluded ?? null),
+      repo: thread.repo ?? prev.repo ?? null,
+      branch: thread.branch ?? prev.branch ?? null,
+      prRefs: mergedPrRefs,
+      lastAgentText: thread.lastAgentText || prev.lastAgentText || "",
+      lastAgentFull: thread.lastAgentFull || prev.lastAgentFull || "",
+      meta: {
+        ...(prev.meta ?? {}),
+        ...(thread.meta ?? {}),
+        aliases: [...new Set([...(prev.meta?.aliases ?? []), ...(thread.meta?.aliases ?? [])])],
+        conversation: (thread.meta?.conversation?.length ? thread.meta.conversation : prev.meta?.conversation) ?? []
+      }
+    };
+    setBounded(this.knownThreads, thread.key, merged);
+    return merged;
+  }
+
+  async searchThreads(options = {}) {
+    const tmpRoot = os.tmpdir();
+    const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
+    const useDisk = options?.includeDisk === true || (options?.includeDisk !== false && (!inTempTestDir || Boolean(options?.homeDir)));
+    let threads = new Map([...this.knownThreads, ...this.lastThreads]);
+    if (useDisk && typeof options?.query === "string" && options.query.trim()) {
+      const archives = await collectArchiveThreads({
+        query: options.query,
+        homeDir: options.homeDir ?? os.homedir(),
+        includeRemotePaseoHosts: options.includeRemotePaseoHosts ?? Boolean(this.config?.paseo?.enabled)
+      });
+      for (const arch of archives.values()) {
+        this.recordDiscoveredThread(arch);
+      }
+      threads = mergeThreadsWithArchives(threads, archives);
+    }
+    return searchFleet(this.getState(), { natural: true, ...options }, threads);
+  }
+
+  async listWorkspaces(options = {}) {
+    return listWorkspaces(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async readChatTranscript(options = {}) {
+    return readChatTranscript(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async inspectRepoStatus(options = {}) {
+    return inspectRepoStatus(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async startPaseoSession(options = {}) {
+    return startPaseoSession(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async batchActCards(options = {}) {
+    return batchActCards(this, options);
+  }
+
+  async getHierarchy(options = {}) {
+    return buildFleetHierarchy(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async syncThemes(options = {}) {
+    return syncThemesToPaseoLabels(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async dispatchGoal(options = {}) {
+    return dispatchManagerGoal(this, {
+      ...options,
+      factory: options.factory ?? this.deps.paseoFactory,
+      decisionsFetch: options.decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl
+    });
+  }
+
+  // Lightweight, event-driven reconciliation of ONLY open questions' watched
+  // threads (never scans the full fleet, never spawns codex exec). Uses fast
+  // Paseo tail reads + /v1/decisions (gpt-6-luna, output_tokens: 0) when a
+  // watched thread has new activity since the question was raised.
+  async reconcileOpenQuestions({ force = false, factory = null, decisionsFetch = null } = {}) {
+    const now = this.now();
+    this.questionRelevanceCache ??= new Map();
+    if (!force && this.lastReconcileAt && now - this.lastReconcileAt < 8_000) {
+      return { checked: 0, closed: [], skippedThrottle: true };
+    }
+    this.lastReconcileAt = now;
+
+    const open = this.store.openQuestions().filter((q) => q?.threadKey && !q.pinned && !SELF_FINDING_KINDS.has(q.kind));
+    if (open.length === 0) return { checked: 0, closed: [] };
+
+    const paseoKeys = [...new Set(open.map((q) => q.threadKey).filter((k) => String(k).startsWith("paseo:")))];
+    const freshByKey = new Map();
+    const resolvedFactory = factory ?? this.deps.paseoFactory;
+
+    if (paseoKeys.length > 0 && this.config?.paseo?.enabled) {
+      try {
+        const probeCfg = {
+          ...this.config,
+          paseo: { ...this.config.paseo, timeoutMs: Math.min(this.config.paseo.timeoutMs ?? 6_000, 6_000) }
+        };
+        await withPaseo(probeCfg, async (client, signal) => {
+          const directory = await client.hosts.list();
+          const apiBySrv = new Map();
+          const getApi = (sid) => {
+            if (!apiBySrv.has(sid)) apiBySrv.set(sid, hostApi(client, sid, directory));
+            return apiBySrv.get(sid);
+          };
+          await Promise.all(paseoKeys.slice(0, 12).map(async (tKey) => {
+            const parsed = parsePaseoThreadKey(tKey);
+            if (!parsed) return;
+            try {
+              const api = await getApi(parsed.serverId);
+              const ref = api.agents.ref(parsed.agentId);
+              const hist = await ref.timeline.refetch({ direction: "tail", limit: 8 });
+              signal.throwIfAborted();
+              const agent = hist?.agent ?? ref.current();
+              if (!agent) return;
+              const fresh = paseoThread(agent, parsed.serverId, Array.isArray(hist?.entries) ? hist.entries : [], true);
+              this.recordDiscoveredThread(fresh);
+              freshByKey.set(tKey, { agent, thread: fresh });
+            } catch { /* ignore single unreachable host/thread */ }
+          }));
+        }, resolvedFactory);
+      } catch { /* Paseo unavailable: fall back to in-memory knownThreads */ }
+    }
+
+    const closed = [];
+    const candidatesForDecisions = [];
+
+    for (const q of open) {
+      const liveEntry = freshByKey.get(q.threadKey);
+      const thread = liveEntry?.thread ?? this.lastThreads.get(q.threadKey) ?? this.knownThreads.get(q.threadKey) ?? null;
+      if (!thread) continue;
+
+      const askedAtMs = Date.parse(q.agentAskedAt ?? q.createdAt ?? "") || 0;
+      const ownerAtMs = Date.parse(thread.lastUserAt ?? "") || 0;
+      const agentAtMs = Date.parse(thread.lastAgentAt ?? "") || 0;
+      const ownerDirect = !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
+
+      // 1. Archived session: close immediately.
+      if (thread.archived || liveEntry?.agent?.archivedAt) {
+        const reason = "session archived";
+        this.store.resolveQuestion(q.id, reason);
+        this.resolveOutreach(q, "resolved", "dismissed");
+        closed.push({ id: q.id, reason });
+        continue;
+      }
+
+      // 2. Permission / agent-card cleared in Paseo: close immediately.
+      if (liveEntry?.agent && (q.kind === "prompt" || q.kind === "agent-card")) {
+        const perms = Array.isArray(liveEntry.agent.pendingPermissions) ? liveEntry.agent.pendingPermissions : [];
+        const hasPendingCard = Boolean(thread.meta?.pendingCard);
+        if (q.kind === "prompt" && perms.length === 0) {
+          const reason = "permission prompt already resolved in Paseo";
+          this.store.resolveQuestion(q.id, reason);
+          this.resolveOutreach(q, "resolved", "dismissed");
+          closed.push({ id: q.id, reason });
+          continue;
+        }
+        if (q.kind === "agent-card" && !hasPendingCard && perms.length === 0) {
+          const reason = "question card already answered in Paseo";
+          this.store.resolveQuestion(q.id, reason);
+          this.resolveOutreach(q, "resolved", "dismissed");
+          closed.push({ id: q.id, reason });
+          continue;
+        }
+      }
+
+      // 3. Owner directly followed up in chat after the ask and the agent is now actively working on it.
+      if (q.kind === "agent-ask" && ownerDirect && askedAtMs > 0 && ownerAtMs > askedAtMs && thread.agentStatus === "running") {
+        const reason = "owner followed up directly in chat";
+        this.store.resolveQuestion(q.id, reason);
+        this.resolveOutreach(q, "resolved", "dismissed");
+        closed.push({ id: q.id, reason });
+        continue;
+      }
+
+      // 4. Thread updated since the ask (owner or agent spoke after askedAt): check semantic relevance via /v1/decisions (gpt-6-luna).
+      const hasNewActivity = askedAtMs > 0 && (ownerAtMs > askedAtMs || agentAtMs > askedAtMs);
+      if (!hasNewActivity || q.kind === "ready") continue;
+
+      const mark = `${activityMark(thread)}|${q.title ?? ""}|${q.body ?? ""}`;
+      if (this.questionRelevanceCache.get(q.id) === mark) continue;
+
+      candidatesForDecisions.push({
+        id: q.id,
+        question: q,
+        mark,
+        kind: q.kind,
+        askedAt: q.agentAskedAt ?? q.createdAt ?? null,
+        title: q.title ?? "",
+        body: q.body ?? "",
+        threadStatus: thread.agentStatus ?? "idle",
+        lastOwnerAt: ownerDirect ? (thread.lastUserAt ?? null) : null,
+        lastOwnerText: ownerDirect ? (thread.lastUserText ?? "") : "",
+        lastAgentAt: thread.lastAgentAt ?? null,
+        lastAgentText: thread.lastAgentFull || thread.lastAgentTail || thread.lastAgentText || "",
+        recentMessages: thread.meta?.conversation ?? []
+      });
+    }
+
+    const decisionsCfg = this.config?.decisions ?? {};
+    if (candidatesForDecisions.length > 0 && decisionsCfg.enabled && decisionsCfg.apiKey) {
+      const evalRes = await evaluateQuestionsRelevanceWithDecisions({
+        items: candidatesForDecisions,
+        apiKey: decisionsCfg.apiKey,
+        url: decisionsCfg.url || DEFAULT_DECISIONS_URL,
+        model: decisionsCfg.model || DEFAULT_DECISIONS_MODEL,
+        timeoutMs: Math.min(decisionsCfg.timeoutMs || DEFAULT_DECISIONS_TIMEOUT_MS, 5_000),
+        fetchImpl: decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl ?? globalThis.fetch
+      });
+      if (evalRes.ok) {
+        for (const cand of candidatesForDecisions) {
+          this.questionRelevanceCache.set(cand.id, cand.mark);
+          const pRelevant = evalRes.scores.get(cand.id);
+          if (typeof pRelevant === "number" && pRelevant < 0.38) {
+            const reason = `auto-closed stale question (p=${pRelevant.toFixed(2)}): thread moved on`;
+            this.store.resolveQuestion(cand.id, reason);
+            this.resolveOutreach(cand.question, "resolved", "dismissed");
+            this.store.recordAction({
+              kind: "review",
+              playbook: "decisions-reconcile",
+              threadKey: cand.question.threadKey,
+              questionId: cand.id,
+              status: "done",
+              reason: clampText(`${reason}: ${cand.title}`, 220)
+            });
+            closed.push({ id: cand.id, reason, probability: pRelevant });
+          }
+        }
+      }
+    }
+
+    if (closed.length > 0) {
+      this.emitFleet("questions-reconciled");
+    }
+    return { checked: open.length, closed };
+  }
+
+  updatePreferences(patch = {}) {
+    const prev = this.store.preferences();
+    const next = applyPreferencePatch(prev, patch, { now: this.now() });
+    this.store.savePreferences(next);
+    if (next.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && isSuppressedByQuietCadence(q, next)) {
+          this.resolveOutreach(q, "resolved", "dismissed");
+        }
+      }
+    } else if (prev.cadence === "quiet_until_ready") {
+      for (const q of this.store.openQuestions()) {
+        if (q.outreachId && !isSuppressedByQuietCadence(q, next)) {
+          this.reopenOutreach(q);
+        }
+      }
+    }
+    this.store.recordAction({
+      kind: "preference",
+      playbook: "owner-preference",
+      threadKey: null,
+      status: "done",
+      by: "owner",
+      reason: clampText(`owner updated preferences: ${patch?.choice || JSON.stringify(Object.keys(patch ?? {}))}`, 200)
+    });
+    this.emitFleet("preferences-updated");
+    return this.getState().preferences;
+  }
+
+  async routeIssue({ text, confirmTarget = null, autoSend = false, deadlineAt = null } = {}) {
+    if (confirmTarget) {
+      const cleanKey = String(confirmTarget).trim();
+      const message = String(text ?? "").trim();
+      const sent = await this.sendOwnerMessage(cleanKey, message, { deadlineAt });
+      this.emitFleet("issue-routed");
+      return {
+        action: "dispatched",
+        dispatched: sent?.delivery?.status === "sent",
+        targetKey: cleanKey,
+        delivery: sent?.delivery ?? null
+      };
+    }
+    const tmpRoot = os.tmpdir();
+    const inTempTestDir = Boolean(this.dataDir && path.resolve(this.dataDir).startsWith(path.resolve(tmpRoot) + path.sep));
+    const archives = !inTempTestDir
+      ? await collectArchiveThreads({ query: String(text ?? "").slice(0, 300), includeRemotePaseoHosts: Boolean(this.config?.paseo?.enabled) })
+      : new Map();
+    const routed = await routeCustomerIssue({
+      text,
+      state: this.getState(),
+      cachedThreads: mergeThreadsWithArchives(this.lastThreads, archives, { existingOnly: true }),
+      runModel: this.deps.routeModel ?? null
+    });
+    if (autoSend === true && routed.action === "auto_dispatch" && routed.primary?.key) {
+      const sent = await this.sendOwnerMessage(routed.primary.key, routed.suggestedMessage, { deadlineAt });
+      this.emitFleet("issue-routed");
+      return {
+        ...routed,
+        dispatched: sent?.delivery?.status === "sent",
+        delivery: sent?.delivery ?? null
+      };
+    }
+    return { ...routed, dispatched: false, delivery: null };
+  }
+
+  async actCard(cardId, { op = "primary", value = null, clarification = null, instructions = null, deadlineAt = null } = {}) {
+    const id = String(cardId ?? "").trim();
+    if (!id) return null;
+
+    if (op === "veto") {
+      const preferences = this.updatePreferences({
+        vetoActionId: typeof value === "string" && value.startsWith("auto_") ? value : null,
+        vetoSlice: typeof value === "string" && !value.startsWith("auto_") ? value : (id.startsWith("pref:slice:") ? id.slice("pref:slice:".length) : null)
+      });
+      return { ok: true, kind: "veto", status: "reverted", detail: "Reverted automatic slice back to manual confirmation.", preferences };
+    }
+
+    if (id.startsWith("pref:") || op === "preference") {
+      const prefCard = (this.getState().cards ?? []).find((c) => c.id === id) ?? null;
+      const normOp = String(op ?? "primary").toLowerCase();
+      const isDefer = normOp === "defer" || normOp === "dismiss";
+      const actionObj = isDefer ? null : (normOp === "secondary" ? prefCard?.secondaryAction : prefCard?.primaryAction);
+      const choice = typeof value === "string" && value
+        ? value
+        : (isDefer
+            ? `keep:${id}`
+            : (actionObj?.value ?? (normOp === "secondary" ? `keep:${id}` : id.replace(/^pref:/, ""))));
+      const preferences = this.updatePreferences({ choice });
+      return { ok: true, kind: "preference", status: "updated", detail: choice.startsWith("keep:") ? "Kept current default." : "Updated Supervisor preference.", preferences };
+    }
+
+    const currentState = this.getState();
+    const card = (currentState.cards ?? []).find((c) => c.id === id || c.questionId === id) ?? null;
+    const questionId = card?.questionId ?? id;
+    const question = this.store.question(questionId);
+    if (!question || question.status !== "open") return null;
+
+    const normalizedOp = String(op ?? "primary").toLowerCase();
+    const resolvedAction = normalizedOp === "secondary"
+      ? card?.secondaryAction
+      : normalizedOp === "primary"
+        ? card?.primaryAction
+        : (card?.extraActions ?? []).find((a) => a.op === normalizedOp && (value == null || a.value === value)) ?? null;
+    const effectiveOp = normalizedOp === "primary" || normalizedOp === "secondary"
+      ? (resolvedAction?.op ?? "answer")
+      : normalizedOp;
+    const effectiveValue = value ?? resolvedAction?.value ?? null;
+
+    if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {
+      const dismissed = this.dismissQuestion(question.id);
+      return { ok: Boolean(dismissed), kind: "defer", status: "dismissed", question: dismissed, delivery: null };
+    }
+
+    if (effectiveOp === "fix_ci") {
+      const targetKey = card?.threadKey ?? question.threadKey ?? null;
+      if (!targetKey) return { ok: false, kind: "fix_ci", status: "blocked", detail: "No coding session is linked to this PR." };
+      const prLabel = card?.prRef ?? question.prRef ?? "the pull request";
+      const fixPrompt = `Checks or mergeability failed on ${prLabel}. Please inspect the failing checks or rebase conflicts, fix them in scope, and push an updated commit.`;
+      const sent = await this.sendOwnerMessage(targetKey, fixPrompt, { deadlineAt });
+      this.emitFleet("card-fix-ci");
+      return {
+        ok: sent?.delivery?.status === "sent",
+        kind: "fix_ci",
+        status: sent?.delivery?.status ?? "blocked",
+        detail: sent?.delivery?.detail ?? (sent?.delivery?.status === "sent" ? `Asked ${targetKey} to fix ${prLabel}.` : "Could not reach coding session."),
+        delivery: sent?.delivery ?? null
+      };
+    }
+
+    if (effectiveOp === "merge" || effectiveOp === "ship" || effectiveOp === "merge_and_deploy") {
+      const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
+      const prefs = this.store.preferences();
+      const mergeOutcome = await executeSafePrMerge({
+        prRef,
+        expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
+        mergePolicy: prefs.mergePolicy,
+        ownerConfirmed: true,
+        config: this.config,
+        ghBin: this.config.bins?.gh ?? "gh",
+        run: this.deps.run ?? runCommand
+      });
+
+      if (mergeOutcome.status === "merged" || mergeOutcome.status === "already_merged") {
+        const markOption = (question.options ?? []).find((opt) => /^(?:merged|yes|done)$/i.test(opt)) ?? null;
+        if (markOption) {
+          this.store.answerQuestion(question.id, markOption);
+        } else {
+          this.store.resolveQuestion(question.id, `merged ${prRef}`);
+        }
+        this.resolveOutreach(question, "merged", "acted");
+        this.store.recordAction({
+          kind: "pr-merge",
+          playbook: effectiveOp === "merge_and_deploy" ? "owner-merge-deploy" : "owner-merge",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        let deployDelivery = null;
+        if (effectiveOp === "merge_and_deploy") {
+          const targetKey = card?.threadKey ?? question.threadKey ?? null;
+          if (targetKey) {
+            const deployPrompt = `Owner merged ${prRef}. Proceed with any post-merge deployment and live smoke verification in scope, and report back once healthy.`;
+            const sent = await this.sendOwnerMessage(targetKey, deployPrompt, { deadlineAt });
+            deployDelivery = sent?.delivery ?? null;
+          }
+        }
+        this.emitFleet(effectiveOp === "merge_and_deploy" ? "pr-merged-deploy" : "pr-merged");
+        const detail = deployDelivery?.status === "sent"
+          ? `${mergeOutcome.detail} Notified coding session to run post-merge deploy & verification.`
+          : deployDelivery
+            ? `${mergeOutcome.detail} (Post-merge session ping blocked: ${deployDelivery.detail ?? "check chat"}.)`
+            : mergeOutcome.detail;
+        return { ok: true, kind: effectiveOp === "merge_and_deploy" ? "merge_and_deploy" : "merge", ...mergeOutcome, detail, ...(deployDelivery ? { deployDelivery } : {}) };
+      }
+
+      if (mergeOutcome.status === "watching_ci") {
+        if (mergeOutcome.promptPreference) {
+          this.store.savePreferences(recordPreferenceSignal(prefs, { type: "ci_merge_attempt", prRef, now: this.now() }));
+        }
+        this.store.recordAction({
+          kind: "pr-watch",
+          playbook: "owner-merge-watch",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        this.emitFleet("pr-watching-ci");
+        return { ok: true, kind: "merge", ...mergeOutcome };
+      }
+
+      if (mergeOutcome.status === "queued_when_green") {
+        this.store.recordAction({
+          kind: "pr-merge-queued",
+          playbook: "owner-merge",
+          threadKey: question.threadKey ?? null,
+          status: "done",
+          by: "owner",
+          reason: mergeOutcome.detail
+        });
+        this.emitFleet("pr-merge-queued");
+        return { ok: true, kind: "merge", ...mergeOutcome };
+      }
+
+      this.store.recordAction({
+        kind: "pr-merge",
+        playbook: "owner-merge",
+        threadKey: question.threadKey ?? null,
+        status: "blocked",
+        by: "owner",
+        reason: mergeOutcome.detail
+      });
+      this.emitFleet("pr-merge-halted");
+      return { ok: false, kind: "merge", ...mergeOutcome };
+    }
+
+    if (question.kind === "self-fix" && effectiveValue === "Request changes" && typeof instructions === "string" && instructions.trim()) {
+      const fix = await this.reviseFix(question.meta?.fixId, instructions);
+      this.emitFleet("self-fix-revised");
+      return fix
+        ? { ok: true, kind: "answer", status: "sent", fix, delivery: { status: "sent", detail: "Changes sent to fixer." } }
+        : { ok: false, kind: "answer", status: "blocked", detail: "No fix with that id." };
+    }
+
+    if (effectiveOp === "reply") {
+      const replyText = String(effectiveValue ?? "").trim();
+      if (!replyText) return { ok: false, kind: "reply", status: "blocked", detail: "Enter a reply to send." };
+      if (canReplyTo(question)) {
+        const replied = await this.replyQuestion(question.id, replyText, { deadlineAt });
+        if (!replied) return { ok: false, kind: "reply", status: "closed", detail: "Question already closed." };
+        return {
+          ok: !replied.delivery || ["sent", "queued"].includes(replied.delivery.status),
+          kind: "reply",
+          status: replied.delivery?.status ?? "done",
+          detail: replied.delivery?.detail ?? "Delivered reply to coding session.",
+          ...replied
+        };
+      }
+      const targetKey = card?.threadKey ?? question.threadKey ?? null;
+      if (!targetKey) return { ok: false, kind: "reply", status: "blocked", detail: "No coding session is linked to this card." };
+      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt });
+      const deliveredOk = sent?.delivery?.status === "sent";
+      if (deliveredOk) {
+        this.store.answerQuestion(question.id, replyText);
+        this.resolveOutreach(question, "reply", "acted");
+        this.emitFleet("card-replied");
+      }
+      return {
+        ok: deliveredOk,
+        kind: "reply",
+        status: sent?.delivery?.status ?? "blocked",
+        detail: sent?.delivery?.detail ?? (deliveredOk ? "Delivered reply to coding session." : "Could not deliver reply."),
+        delivery: sent?.delivery ?? null
+      };
+    }
+
+    const answerOption = effectiveValue ?? (question.options ?? []).find((opt) => opt !== "dismiss") ?? null;
+    if (!answerOption) return { ok: false, kind: "answer", status: "blocked", detail: "No answer option available." };
+    const result = await this.answerQuestion(question.id, answerOption, { deadlineAt, clarification });
+    if (!result) return { ok: false, kind: "answer", status: "closed", detail: "Question already closed." };
+    return {
+      ok: !result.delivery || ["sent", "queued"].includes(result.delivery.status),
+      kind: "answer",
+      status: result.delivery?.status ?? "done",
+      detail: result.delivery?.detail ?? null,
+      ...result
+    };
+  }
+
   async threadConversation(threadKey) {
+    const state = this.getState();
+    const matchingQ = state.questions.find((q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey)) ?? null;
     const thread = this.lastThreads.get(threadKey)
-      ?? this.getState().snapshot?.threads?.find((row) => row.key === threadKey);
+      ?? this.knownThreads.get(threadKey)
+      ?? state.snapshot?.threads?.find((row) => row.key === threadKey)
+      ?? this.knownRows.get(threadKey)
+      ?? (matchingQ ? this.syntheticPaseoThread(threadKey, matchingQ) ?? {
+        key: threadKey,
+        kind: String(threadKey ?? "").split(":")[0] || "unknown",
+        id: String(threadKey ?? "").split(":").slice(1).join(":"),
+        lastUserText: matchingQ.contextSnapshot?.lastUserText ?? "",
+        lastUserAt: matchingQ.contextSnapshot?.lastUserAt ?? null,
+        lastAgentFull: matchingQ.contextSnapshot?.agentSummary ?? matchingQ.askContext ?? "",
+        lastAgentAt: matchingQ.contextSnapshot?.lastAgentAt ?? matchingQ.askedAt ?? null,
+        meta: {
+          paseoCwd: matchingQ.contextSnapshot?.paseoCwd ?? null,
+          aliases: matchingQ.contextSnapshot?.aliases ?? [],
+          conversation: matchingQ.contextSnapshot?.recentMessages ?? []
+        }
+      } : null);
     if (!thread) return null;
     try { return await readThreadConversation(thread, this.config); }
     catch { return unavailableConversation(thread); }
@@ -1631,20 +2554,69 @@ export class FleetSupervisor {
 
   threadDetail(threadKey) {
     const state = this.getState();
-    const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey);
+    const thread = this.lastThreads.get(threadKey) ?? this.knownThreads.get(threadKey) ?? null;
+    const matchingQuestions = state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
+    const snap = matchingQuestions[0]?.contextSnapshot ?? null;
+    const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey)
+      ?? this.knownRows.get(threadKey)
+      ?? (thread ? {
+        ...thread,
+        state: thread.excluded || thread.agentStatus || "idle",
+        health: thread.error ? "red" : (matchingQuestions.length ? "yellow" : "gray"),
+        openChat: openChatFor(thread)
+      } : null)
+      ?? (matchingQuestions.length ? {
+        key: threadKey,
+        kind: String(threadKey ?? "").split(":")[0] || "paseo",
+        title: snap?.threadTitle ?? matchingQuestions[0]?.chatLabel?.replace(/\s*\([^)]*\)$/, "") ?? matchingQuestions[0]?.title ?? null,
+        workspace: snap?.workspace ?? null,
+        repo: snap?.repo ?? parsePrRef(matchingQuestions[0]?.prRef)?.repo ?? null,
+        branch: snap?.branch ?? null,
+        agentStatus: "idle",
+        live: false,
+        state: matchingQuestions[0]?.kind === "ready" ? "ready-needs-human" : "needs-human",
+        health: "yellow",
+        reason: matchingQuestions[0]?.title ?? null,
+        blockers: [],
+        error: null,
+        lastAgentText: snap?.agentSummary ?? matchingQuestions[0]?.askContext ?? matchingQuestions[0]?.body ?? "",
+        lastAgentAt: snap?.lastAgentAt ?? matchingQuestions[0]?.askedAt ?? null,
+        lastOwnerAt: snap?.lastUserAt ?? null,
+        lastActivityAt: snap?.lastAgentAt ?? matchingQuestions[0]?.askedAt ?? matchingQuestions[0]?.createdAt ?? null,
+        pr: snap?.pr ? {
+          ref: snap.pr.ref,
+          url: snap.pr.url,
+          state: snap.pr.state,
+          isDraft: Boolean(snap.pr.isDraft),
+          title: snap.pr.title,
+          bodySummary: snap.pr.bodySummary ?? null,
+          additions: snap.pr.additions ?? null,
+          deletions: snap.pr.deletions ?? null,
+          changedFiles: snap.pr.changedFiles ?? null,
+          files: snap.pr.files ?? [],
+          ci: snap.pr.ciState ? { state: snap.pr.ciState, failing: snap.pr.failingChecks ?? [], pending: [] } : null,
+          unresolvedThreads: snap.pr.unresolvedThreads ?? 0,
+          mergeState: snap.pr.mergeState ?? null,
+          head: snap.pr.head ?? null
+        } : (matchingQuestions[0]?.prRef ? { ref: matchingQuestions[0].prRef, url: null, state: "OPEN" } : null),
+        openChat: matchingQuestions[0]?.openChat ?? null
+      } : null);
     if (!row) return null;
-    const thread = this.lastThreads.get(threadKey) ?? null;
-    const reply = thread ? agentReply(thread) : { text: row.lastAgentText ?? "", at: row.lastAgentAt ?? null };
+    const reply = thread
+      ? agentReply(thread)
+      : { text: row.lastAgentText || snap?.agentSummary || matchingQuestions[0]?.askContext || "", at: row.lastAgentAt ?? snap?.lastAgentAt ?? null };
+    const ownerAt = thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? snap?.lastUserAt ?? null);
+    const ownerText = thread && ownerAt ? (thread.lastUserText ?? "") : (snap?.lastUserText ?? "");
     return {
-      key: row.key, kind: row.kind, title: row.title ?? null, workspace: row.workspace ?? null, repo: row.repo ?? null, branch: row.branch ?? null,
+      key: row.key, kind: row.kind, title: row.title ?? snap?.threadTitle ?? null, workspace: row.workspace ?? snap?.workspace ?? null, repo: row.repo ?? snap?.repo ?? null, branch: row.branch ?? snap?.branch ?? null,
       app: row.app ?? null, agentStatus: row.agentStatus ?? null, live: Boolean(row.live), state: row.state ?? null, health: row.health ?? null,
       reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
       lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
-      lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
-      lastOwnerMessage: thread && ownerSpokeAt(thread)
-        ? { text: clampTail(redactSecrets(thread.lastUserText ?? ""), DETAIL_EXCERPT_MAX), at: ownerSpokeAt(thread) }
+      lastOwnerAt: ownerAt,
+      lastOwnerMessage: ownerAt && ownerText
+        ? { text: clampTail(redactSecrets(ownerText), DETAIL_EXCERPT_MAX), at: ownerAt }
         : null,
-      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (thread && ownerSpokeAt(thread) ? String(thread.lastUserText ?? "").length > DETAIL_EXCERPT_MAX : false),
+      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (ownerAt ? String(ownerText).length > DETAIL_EXCERPT_MAX : false),
       lastActivityAt: row.lastActivityAt ?? null,
       pr: row.pr ?? null,
       watch: row.watch ?? null,
@@ -1653,8 +2625,8 @@ export class FleetSupervisor {
       pushing: row.pushing === true,
       ...(row.prompt ? { prompt: row.prompt } : {}),
       muted: row.muted ?? null,
-      questions: state.questions.filter((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey)),
-      openChat: row.openChat ?? null,
+      questions: matchingQuestions,
+      openChat: row.openChat ?? matchingQuestions[0]?.openChat ?? null,
       scannedAt: state.snapshot?.at ?? null
     };
   }
@@ -1715,12 +2687,14 @@ export class FleetSupervisor {
   muteThread(threadKey, { hours = MUTE_HOURS_DEFAULT } = {}) {
     const until = this.store.mute(threadKey, this.now() + hours * 60 * MIN);
     this.store.recordAction({ kind: "mute", playbook: "owner-mute", threadKey, status: "done", reason: `owner: mute for ${hours} h`, by: "owner" });
+    this.emitFleet("thread-muted");
     return { until };
   }
 
   unmuteThread(threadKey) {
     const was = this.store.unmute(threadKey);
     if (was) this.store.recordAction({ kind: "unmute", playbook: "owner-mute", threadKey, status: "done", reason: "owner: unmute", by: "owner" });
+    this.emitFleet("thread-unmuted");
     return { until: null };
   }
 
@@ -1744,7 +2718,16 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
-    const settled = action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null;
+    // The thread moved on since this was proposed (a deferred thread's
+    // proposal outlives the scan that made it): its message is stale.
+    const facts = this.lastThreadFacts?.get(action.threadKey);
+    const movedOn = action.threadFacts && facts && facts !== action.threadFacts ? "the thread moved on since the proposal" : null;
+    // The owner muted it or it left supervision since: nothing goes in.
+    const excluded = this.lastThreads.get(action.threadKey)?.excluded ?? null;
+    const unjudged = action.requiresJudge && !action.judged ? "not judged yet" : null;
+    const held = this.store.mutedUntil(action.threadKey) || this.store.mutedUntil(action.targetKey) ? "muted by owner"
+      : excluded ? `thread ${excluded}` : unjudged;
+    const settled = held ?? movedOn ?? (action.kind === "nudge" ? await this.prSettledBeforeSend(thread, this.lastPrs.get(action.threadKey) ?? null, action) : null);
     if (settled) {
       const updated = this.store.updateAction(actionId, { status: "stale", detail: `not sent: ${settled}` });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
@@ -1823,7 +2806,10 @@ export class FleetSupervisor {
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
+    const unknownPrefixes = Array.isArray(paseoThreads?.unknownThreadPrefixes) ? paseoThreads.unknownThreadPrefixes : [];
+    const isUnknownPrefixKey = (key) => unknownPrefixes.some((prefix) => String(key ?? "").startsWith(prefix));
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
+    const threadFacts = new Map(threads.map((thread) => [thread.key, discoveredFacts(thread)]));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
     // With migration discovery unavailable, legacy identities are not safe to resume.
     if (config.paseo?.enabled && sourceErrors.paseo) {
@@ -1842,7 +2828,17 @@ export class FleetSupervisor {
       .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")));
     // An older thread past the cap still has its open card asked: the Codex
     // source kept it for that card alone.
-    const inScope = [...ranked.slice(0, config.limits.maxThreads), ...ranked.slice(config.limits.maxThreads).filter(hasCard)];
+    const selected = this.selectScanScope(ranked, threads, sourceErrors, unknownPrefixes);
+    const selectedKeys = new Set(selected.map((thread) => thread.key));
+    const inScope = [...selected, ...ranked.filter((thread) => !selectedKeys.has(thread.key) && hasCard(thread))];
+    // Every thread this scan reads counts as scanned, card overflow too, so
+    // a carded thread never also wins a quiet thread's rotation slot.
+    for (const thread of inScope) this.scopeReadAt.set(thread.key, this.tickCount);
+    // Eligible threads this capped scan did not read: their conditions were
+    // not reassessed, so nothing they hold (a group seat, a proposal, a
+    // remembered outage, a blocked-UI clock) is cleared on their account.
+    const scopeKeys = new Set(inScope.map((thread) => thread.key));
+    const deferred = new Set(ranked.filter((thread) => !scopeKeys.has(thread.key)).map((thread) => thread.key));
     // An automation or no-repo thread's open question card still needs the
     // owner. It is decided (asked) with the rest, but never read for git or
     // PRs, and classify gives it nothing to nudge.
@@ -1850,7 +2846,7 @@ export class FleetSupervisor {
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     resolveCreatedPrs(inScope);
-    await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
+    await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors, ranked);
     await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
     // An open question's PR is read too, even once its thread moved to
@@ -1869,6 +2865,9 @@ export class FleetSupervisor {
     const mutedKeys = store.mutedKeys();
     // Computer-use readiness, once per tick; the driver re-checks at each send.
     const delivery = await this.probeDelivery();
+    if (!deferUi && this.mode === "auto" && delivery.ready === true && config.autoApprove?.includes("codex")) {
+      try { await this.approveCodexCards(inScope, threads, started); } catch { /* best-effort: cards left are asked about below */ }
+    }
     // One thread waiting on a permission card whose buttons are not known
     // yet gets one screen read per tick, so its question offers them.
     // Never in Observe (it drives nothing); in Propose only a thread already
@@ -1912,7 +2911,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true || (this.decisionsGate?.enabled === true && mode !== "observe") });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -1938,7 +2937,7 @@ export class FleetSupervisor {
     // How long a nudge has waited on computer use, for telling the owner.
     // The live mode: the owner may have left Auto while this tick scanned.
     const queuedWaits = this.store.queuedAnswers().map((question) => ({ threadKey: question.threadKey, uiBlocked: true }));
-    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config });
+    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config, deferred });
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
     infraDecisions.push(...this.unreadableDecisions(started, threads));
@@ -1954,9 +2953,21 @@ export class FleetSupervisor {
       .filter((decision) => !mutedKeys.has(decision.threadKey) || decision.action === "none");
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
-    this.lastThreads = byKey;
+    const mergedLastThreads = new Map(byKey);
+    for (const [key, prev] of this.lastThreads) {
+      if (prev?.kind && (sourceErrors[prev.kind] || isUnknownPrefixKey(key)) && !mergedLastThreads.has(key)) mergedLastThreads.set(key, prev);
+    }
+    this.lastThreads = mergedLastThreads;
+    for (const [key, thread] of mergedLastThreads) setBounded(this.knownThreads, key, thread);
+    this.lastThreadFacts = threadFacts;
     // Each thread's PR as this scan read it, for a proposal sent later.
-    this.lastPrs = new Map(items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr]));
+    // A deferred thread keeps the last read, for its proposal still open.
+    const nextPrs = new Map([
+      ...[...this.lastPrs].filter(([key]) => deferred.has(key) || isUnknownPrefixKey(key) || (this.lastThreads.get(key)?.kind && sourceErrors[this.lastThreads.get(key).kind])),
+      ...items.filter((item) => item.pr).map((item) => [item.thread.key, item.pr])
+    ]);
+    for (const [ref, pr] of prs) if (ref && pr) nextPrs.set(ref, pr);
+    this.lastPrs = nextPrs;
     const decisionFor = effectiveDecisions(decisions);
     this.lastItems = new Map(items.map((item) => {
       const current = decisionFor.get(item.thread.key);
@@ -1978,11 +2989,11 @@ export class FleetSupervisor {
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });
-    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, unknownPrefixes, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, unknownPrefixes, mode, now: started, deferred });
 
     const finished = this.now();
-    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null });
+    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
     try { await this.diagnoseTick(); } catch (error) {
@@ -1992,6 +3003,29 @@ export class FleetSupervisor {
     return snapshot;
   }
 
+  // Keep a quarter of the slots for the most recently active conversations;
+  // rotate the rest through the least recently scanned. A busy top page can
+  // no longer starve older work. Selection changes no eligibility or send
+  // policy, and permission cards still bypass the cap in _tick, which
+  // stamps every thread read in scopeReadAt.
+  selectScanScope(ranked, threads, sourceErrors, unknownPrefixes = []) {
+    const present = new Set(threads.map((thread) => thread.key));
+    for (const key of this.scopeReadAt.keys()) {
+      if (!present.has(key) && !sourceErrors[key.split(":", 1)[0]] && !unknownPrefixes.some((p) => key.startsWith(p))) this.scopeReadAt.delete(key);
+    }
+    const limit = this.config.limits.maxThreads;
+    const recent = ranked.slice(0, Math.floor(limit / 4));
+    const recentKeys = new Set(recent.map((thread) => thread.key));
+    // Stable sort preserves newest-first order among never-scanned or
+    // equally recent rows, including the first scan after a restart.
+    const rotated = ranked.filter((thread) => !recentKeys.has(thread.key))
+      .sort((a, b) => (this.scopeReadAt.get(a.key) ?? 0) - (this.scopeReadAt.get(b.key) ?? 0));
+    const selected = [...recent, ...rotated.slice(0, limit - recent.length)];
+    // Display order stays newest first even when selection rotates.
+    const keys = new Set(selected.map((thread) => thread.key));
+    return ranked.filter((thread) => keys.has(thread.key));
+  }
+
   // The judge reads the chat before an automatic nudge goes out: send its
   // message, wait, or ask the owner. Only in Auto, only for the playbooks
   // in JUDGED_PLAYBOOKS, and never for a limit or error resume (those stay
@@ -1999,7 +3033,10 @@ export class FleetSupervisor {
   // replaced in place.
   async judgeNudges(items, { started }) {
     const judge = this.nudgeJudge;
-    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode === "observe") return;
+    const judgeEnabled = Boolean(judge?.enabled) && typeof judge?.judge === "function";
+    const gate = this.decisionsGate;
+    const gateEnabled = Boolean(gate?.enabled) && typeof gate?.evaluateBatch === "function";
+    if ((!judgeEnabled && !gateEnabled) || this.mode === "observe") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
     for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
     // Only answers given since this scan began count (ownerAnswerThreads).
@@ -2008,6 +3045,104 @@ export class FleetSupervisor {
     // being sent, gets no automatic nudge: the answer goes first
     // (deliverQueuedAnswers), never a playbook nudge beside or over it.
     const answering = this.ownerAnswerThreads(started);
+    if (gateEnabled) {
+      const gateCandidates = [];
+      for (const item of items) {
+        if (!judgeable(item.decision, item.thread)) continue;
+        if (answering.has(item.thread.key)) {
+          item.decision = judgeWait(item.decision, "owner answer goes first; no nudge");
+          continue;
+        }
+        if (item.decision.notBefore && Date.parse(item.decision.notBefore) > started) continue;
+        gateCandidates.push(item);
+      }
+      if (gateCandidates.length > 0) {
+        const gateVerdicts = await gate.evaluateBatch(gateCandidates, { started });
+        const answeredAfterGate = this.ownerAnswerThreads(started);
+        for (const item of gateCandidates) {
+          const gv = gateVerdicts.get(item.thread.key);
+          if (!gv) continue;
+          if (answeredAfterGate.has(item.thread.key)) {
+            item.decision = judgeWait(item.decision, "owner answered meanwhile; no nudge");
+            continue;
+          }
+          if (gv.action === "error") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "failed",
+                status: "failed",
+                reason: `decisions gate unavailable: ${gv.error}`
+              });
+            }
+            if (!judgeEnabled) {
+              item.decision = judgeWait(item.decision, `decisions gate unavailable: ${gv.error}`);
+            }
+            continue;
+          }
+          if (gv.action === "wait") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "wait",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            item.decision = judgeWait(item.decision, `decisions: ${gv.reason}`, false);
+            continue;
+          }
+          if (!judgeEnabled && gv.action === "ask-owner") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "ask-owner",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            const reply = agentReply(item.thread);
+            item.decision = this.applyJudgeVerdict(item, {
+              action: "ask-owner",
+              reason: gv.reason,
+              question: {
+                title: "Needs your decision",
+                body: clampText(redactSecrets(reply.text || item.decision.reason || "Session is blocked on an owner decision."), 220),
+                options: ["continue", "open thread"]
+              }
+            });
+            continue;
+          }
+          if (!judgeEnabled && gv.action === "send") {
+            if (!gv.cached) {
+              this.store.recordAction({
+                kind: "decisions",
+                threadKey: item.thread.key,
+                playbook: item.decision.playbook,
+                verdict: "send",
+                status: "done",
+                reason: gv.reason
+              });
+            }
+            const keepAliveMessage = item.decision.requiresJudge && !item.decision.deferredRouteDecision
+              ? "Supervisor keep-alive check: unfinished in-scope work remains in this session. Continue and verify the remaining in-scope steps now (do not merge, deploy, release, delete data, or spend without explicit owner approval). If blocked on the owner, stop and state the exact decision needed in one line."
+              : item.decision.message;
+            item.decision = this.applyJudgeVerdict(item, {
+              action: "send",
+              message: keepAliveMessage,
+              reason: gv.reason
+            });
+          }
+        }
+      }
+    }
+    if (!judgeEnabled) return;
     const history = this.nudgeHistory(new Set(items.filter((item) => judgeable(item.decision, item.thread)).map((item) => item.thread.key)));
     const due = [];
     for (const item of items) {
@@ -2160,7 +3295,7 @@ export class FleetSupervisor {
   // held back is retried next tick; a wait means the owner or a recent nudge
   // already has the thread. A thread hidden by a failed source waits up to
   // RECOVERY_HOLD_MS for that source.
-  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now() } = {}) {
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), unknownPrefixes = [], mode = "observe", now = this.now(), deferred = new Set() } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -2175,7 +3310,8 @@ export class FleetSupervisor {
           .map((decision) => decision.threadKey));
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
         const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
-        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
+        // A thread a capped scan deferred gets its resume once it is read.
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || deferred.has(key) || (holdHidden && (unknownKinds.has(key.split(":")[0]) || unknownPrefixes.some((p) => key.startsWith(p))))));
       }
     }
   }
@@ -2210,7 +3346,8 @@ export class FleetSupervisor {
     return results;
   }
 
-  async resolvePrRefs(inScope, localGit, config, run, sourceErrors) {
+  // eligible: every discovered thread the scan could read, deferred ones too.
+  async resolvePrRefs(inScope, localGit, config, run, sourceErrors, eligible = inScope) {
     if (this.skip.github) return;
     const find = this.deps.findPrForBranch ?? github.findPrForBranch;
     const now = this.now();
@@ -2238,10 +3375,26 @@ export class FleetSupervisor {
     // has one branch at a time, and every chat there records it: its PR is
     // none of theirs in particular. 21 Codex chats in one clone were all told
     // to finish its open PR. Such a chat's PR is only one it linked itself.
-    // Counted by checkout root, so chats in two of its subfolders share it.
-    const checkoutOf = (thread) => (thread.cwd ? localGit.get(thread.cwd)?.root ?? path.resolve(thread.cwd) : null);
-    const perCheckout = new Map();
+    // Counted by checkout root, so chats in two of its subfolders share it,
+    // and over every eligible chat: one a capped scan deferred still shares
+    // it. Its git was not read this scan, so the root last read for its
+    // folder stands in; never a containing folder's root (a nested worktree
+    // is its own checkout).
+    this.gitRoots ??= new Map();
+    const eligibleKeys = new Set([...inScope, ...eligible].map((thread) => thread.key));
+    for (const key of this.gitRoots.keys()) if (!eligibleKeys.has(key)) this.gitRoots.delete(key);
     for (const thread of inScope) {
+      const root = thread.cwd ? localGit.get(thread.cwd)?.root : null;
+      if (root) this.gitRoots.set(thread.key, { cwd: thread.cwd, root });
+    }
+    const scopeKeys = new Set(inScope.map((thread) => thread.key));
+    const checkoutOf = (thread) => {
+      if (!thread.cwd) return null;
+      const known = scopeKeys.has(thread.key) ? null : this.gitRoots.get(thread.key);
+      return localGit.get(thread.cwd)?.root ?? (known?.cwd === thread.cwd ? known.root : null) ?? path.resolve(thread.cwd);
+    };
+    const perCheckout = new Map();
+    for (const thread of new Set([...inScope, ...eligible])) {
       const checkout = checkoutOf(thread);
       if (checkout) perCheckout.set(checkout, (perCheckout.get(checkout) ?? 0) + 1);
     }
@@ -2403,13 +3556,14 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], prs = new Map(), unreadPrs = new Set(), unknownKinds = new Set(), unknownPrefixes = [], cappedKinds = new Set(), cardScanned = new Set(), deferUi = false, skipReview = false, storageUnknown = false, deferred = new Set(), threadFacts = new Map() }) {
     const store = this.store;
-    const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
+    const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]) || unknownPrefixes.some((prefix) => String(key ?? "").startsWith(prefix)));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
-    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
+    // A thread a capped scan deferred was not reassessed either.
+    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || deferred.has(key));
     // With no settled read remembered (a fresh start), an unread PR cannot
     // tell a merge that settled an ask from a live one: an ask the
     // supervisor already closed waits for GitHub instead of coming back.
@@ -2424,6 +3578,7 @@ export class FleetSupervisor {
     // One app thread can back two fleet threads (a Conductor session and the
     // Codex thread it hosts): type into it at most once per tick.
     const typedInto = new Set();
+    const autoAnsweredThreads = new Set();
 
     // A Codex question card is asked beside the thread's own decision.
     const asks = decisions.flatMap((decision) => [
@@ -2433,22 +3588,119 @@ export class FleetSupervisor {
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
-    for (const fields of groupQuestions(asks, byKey)) {
+    // A grouped question's member that a capped scan deferred keeps its seat
+    // until it is read again: the group is rebuilt with it, not without it.
+    const decidedKeys = new Set(decisions.map((decision) => decision.threadKey));
+    const carried = new Map();
+    for (const question of deferred.size ? store.openQuestions() : []) {
+      const kind = Object.keys(GROUPED_KINDS).find((name) => String(question.dedupeKey ?? "").replace(/:\d+$/, "") === GROUPED_KINDS[name].dedupeKey);
+      if (!kind || question.threadKey) continue;
+      for (const key of question.threadKeys ?? []) {
+        if (deferred.has(key) && !decidedKeys.has(key)) carried.set(key, { threadKey: key, action: "ask-user", playbook: null, carried: true, question: { kind, options: GROUPED_KINDS[kind].options } });
+      }
+    }
+    for (const fields of groupQuestions([...asks, ...carried.values()], byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
       // is until that source reads again.
-      const spec = unknownKinds.size ? GROUPED_KINDS[fields.kind] : null;
+      const spec = (unknownKinds.size || unknownPrefixes.length) ? GROUPED_KINDS[fields.kind] : null;
       const covers = (q) => (fields.threadKeys ? true : (q.threadKeys ?? []).includes(fields.threadKey));
       const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
-      const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
+      const open = sameChoices ? store.openQuestions().find((q) => String(q.dedupeKey ?? "").replace(/:\d+$/, "") === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       // The head it is asked at: a move past it settles the ask (settledAsk).
-      const question = store.upsertQuestion({ ...fields, askedHead: fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null });
+      const askThread = fields.threadKey ? (byKey.get(fields.threadKey) ?? this.knownThreads.get(fields.threadKey) ?? null) : null;
+      const askPrRef = fields.prRef ?? askThread?.prRefs?.[0] ?? null;
+      const matchesAskPr = (candidate) => Boolean(candidate && (!askPrRef || !candidate.ref || candidate.ref === askPrRef));
+      const itemPr = items.find((item) => (askPrRef && item?.pr?.ref === askPrRef) || (!askPrRef && fields.threadKey && item?.thread?.key === fields.threadKey))?.pr ?? null;
+      const lastThreadPr = fields.threadKey ? this.lastPrs.get(fields.threadKey) : null;
+      const askPr = (askPrRef ? prs.get(askPrRef) : null) ?? (matchesAskPr(itemPr) ? itemPr : null) ?? (matchesAskPr(lastThreadPr) ? lastThreadPr : null) ?? null;
+      const contextSnapshot = buildQuestionContextSnapshot(askThread, askPr);
+      const question = store.upsertQuestion({ ...fields, askedHead: askPr?.headOid ?? (fields.prRef ? prs.get(fields.prRef)?.headOid ?? null : null), contextSnapshot });
       asked.add(question.dedupeKey);
-      // The owner already answered or dismissed this one; stay quiet.
+      // The owner (or an earlier automatic slice) already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
+      // Progressive preference slices: ONLY when the owner explicitly made a
+      // safe routine slice automatic (never merges or risky asks) and mode is auto.
+      if (this.mode === "auto" && fields.kind === "agent-ask" && fields.threadKey && !fields.mergeAsk && !store.mutedUntil(fields.threadKey)) {
+        const slice = classifyQuestionSlice(fields);
+        const prefs = store.preferences();
+        const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
+        const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
+        const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
+        const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
+        if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
+          const delivery = await this.executor.deliver({ thread: targetThread, message: ownerDelivery(autoChoice), route, playbook: "owner-answer" });
+          if (delivery.status === "sent") {
+            sends += 1;
+            attempted.add(targetThread.key);
+            autoAnsweredThreads.add(targetThread.key);
+            if (uiKey) typedInto.add(uiKey);
+            store.answerQuestion(question.id, autoChoice);
+            this.resolveOutreach(question, autoChoice, "acted");
+            store.recordNudge(targetThread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: "owner-answer" });
+            const { prefs: updatedPrefs, record: autoRecord } = recordAutonomousSliceAction(prefs, {
+              slice,
+              threadKey: targetThread.key,
+              summary: clampText(`${fields.title} -> ${autoChoice}`, 160),
+              now: started
+            });
+            store.savePreferences(updatedPrefs);
+            const actionRecord = store.recordAction({
+              kind: "nudge",
+              playbook: `auto-slice:${slice}`,
+              threadKey: targetThread.key,
+              route: delivery.route ?? route,
+              status: "sent",
+              reason: clampText(`autonomous preference (${slice}): ${fields.title}`, 240),
+              at
+            });
+            if (delivery.done) {
+              this.reopenIfUndelivered(
+                question.id,
+                [delivery.done.then((reached) => {
+                  if (reached) return null;
+                  const latestPrefs = store.preferences();
+                  const entry = latestPrefs.autonomousActions.find((a) => a.id === autoRecord.id);
+                  if (entry) {
+                    entry.reverted = true;
+                    store.savePreferences(latestPrefs);
+                  }
+                  if (actionRecord?.id) {
+                    store.updateAction(actionRecord.id, { status: "failed", detail: "background delivery failed" });
+                  }
+                  return targetThread.key;
+                })],
+                autoChoice
+              );
+            }
+            continue;
+          }
+        }
+      }
       toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
+    }
+    // Rebuilt with its carried members, a group can need fewer chunks: an
+    // older chunk not asked again whose members all sit in a chunk of the
+    // same kind asked now, or were read and cleared, is superseded, so no
+    // thread is in two open groups (and resumed twice).
+    if (carried.size) {
+      const kindOf = (question) => (question.threadKey ? null : Object.keys(GROUPED_KINDS).find((name) => String(question.dedupeKey ?? "").replace(/:\d+$/, "") === GROUPED_KINDS[name].dedupeKey));
+      const regrouped = new Map();
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || !asked.has(question.dedupeKey)) continue;
+        for (const key of question.threadKeys ?? []) regrouped.set(`${kind}|${key}`, true);
+      }
+      for (const question of store.openQuestions()) {
+        const kind = kindOf(question);
+        if (!kind || asked.has(question.dedupeKey) || !question.threadKeys?.length) continue;
+        if (!question.threadKeys.some((key) => regrouped.has(`${kind}|${key}`))) continue;
+        if (!question.threadKeys.every((key) => regrouped.has(`${kind}|${key}`) || !unknown([key]))) continue;
+        store.resolveQuestion(question.id, "regrouped: its threads moved to another group");
+        this.resolveOutreach(question, "resolved", "dismissed");
+      }
     }
     // The supervisor reviews its own list before a new question reaches the
     // owner, so junk never pings; the main does not see it before then either.
@@ -2463,9 +3715,11 @@ export class FleetSupervisor {
       // close) waits for the next review; a failed review lets all out.
       this.awaitingReview = new Set([...this.awaitingReview].filter((id) => unsettled.has(id)));
     }
+    const notifyPrefs = store.preferences();
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
       if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      if (isSuppressedByQuietCadence(question, notifyPrefs)) continue;
       const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
       if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
@@ -2490,6 +3744,7 @@ export class FleetSupervisor {
     sends += restartedNow.sent;
     for (const key of restartedNow.uiKeys) typedInto.add(key);
     for (const key of restartedNow.threads) answeredNow.threads.add(key);
+    for (const key of autoAnsweredThreads) answeredNow.threads.add(key);
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
@@ -2504,7 +3759,8 @@ export class FleetSupervisor {
     // A computer-use send that timed out or lost Open Computer Use leaves
     // the app agent busy or restarting: the rest of the tick's typing waits.
     let uiStalled = answeredNow.uiStalled === true;
-    const judgeOn = Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function";
+    const judgeOn = (Boolean(this.nudgeJudge?.enabled) && typeof this.nudgeJudge?.judge === "function")
+      || (Boolean(this.decisionsGate?.enabled) && typeof this.decisionsGate?.evaluateBatch === "function");
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -2515,10 +3771,20 @@ export class FleetSupervisor {
         threadKey: decision.threadKey, targetKey, playbook: decision.playbook, route: decision.route,
         head: items.find((item) => item.thread.key === decision.threadKey)?.pr?.headOid ?? null,
         message: decision.message, reason: decision.reason, progressMark: decision.progressMark ?? null, kind: decision.action,
+        threadFacts: threadFacts.get(decision.threadKey) ?? null,
+        ...(decision.judged ? { judged: true } : {}),
+        ...(decision.requiresJudge ? { requiresJudge: true } : {}),
         ...(decision.messageHash ? { messageHash: decision.messageHash, factsKey: decision.factsKey ?? null, facts: decision.facts ?? null } : {})
       };
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
+
+      // Contextual idle-review placeholders must never be recorded as planned/proposed
+      // or sent without an explicit judge/decisions verdict in the current scan.
+      if (decision.requiresJudge && !decision.judged) {
+        decision.reason = `${decision.reason}; held: not judged this scan`;
+        continue;
+      }
 
       // The live mode, not the tick's: the owner may have left Auto mid-scan.
       const liveMode = this.mode;
@@ -2589,8 +3855,13 @@ export class FleetSupervisor {
 
     // A planned/proposed action the policy no longer wants is stale.
     // (Storage records its own plans; they are not tick decisions.)
+    // A deferred thread's stands only while what discovery shows of it is
+    // what the action was made on: one that moved on is stale too.
+    // Owner policy applies to it as it would on a read: a mute ends it.
+    const movedOn = (action) => deferred.has(action.threadKey) && (threadFacts.get(action.threadKey) !== action.threadFacts
+      || Boolean(store.mutedUntil(action.threadKey) || (action.targetKey && store.mutedUntil(action.targetKey))));
     for (const action of openActions) {
-      if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
+      if (action.kind !== "storage" && !seenActions.has(action.id) && (!unknown([action.threadKey]) || movedOn(action))) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
     // decided again this tick without asking. An agent's own ask and a
@@ -2653,7 +3924,7 @@ export class FleetSupervisor {
     // The supervisor's own findings (it can't reach a thread, nudges made no
     // progress) are facts, not guesses about an agent: the review never
     // clears those.
-    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey) && !SELF_FINDING_KINDS.has(question.kind));
+    const open = store.openQuestions().filter((question) => (asked.has(question.dedupeKey) || standing(question)) && !SELF_FINDING_KINDS.has(question.kind));
     if (!open.length) return unsettled;
     if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return unsettled;
     const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));
@@ -2731,7 +4002,16 @@ export class FleetSupervisor {
       // Only an agent's own question takes new choices: the others carry
       // meaning the supervisor acts on ("merged", "keep going", "added").
       const options = question.kind === "agent-ask" ? verdict.options ?? null : null;
-      const kept = store.recordReview(question.id, { title: verdict.title ?? null, options, fingerprint, reason: verdict.reason, category: "live" });
+      const kept = store.recordReview(question.id, {
+        title: verdict.title ?? null,
+        options,
+        fingerprint,
+        reason: verdict.reason,
+        category: "live",
+        brief: verdict.brief ?? null,
+        recommendation: verdict.recommendation ?? null,
+        suggestedReplies: verdict.suggestedReplies ?? null
+      });
       decisions.push({ id: question.id, decision: "keep", category: "live", reason: verdict.reason, title: kept?.title ?? question.title });
     }
     const closed = decisions.filter((decision) => decision.decision === "close").length;
@@ -2760,7 +4040,7 @@ export class FleetSupervisor {
     return { ...watch, since: new Date(since).toISOString() };
   }
 
-  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null }) {
+  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes = [], manager, delivery = null, storage = null, previous = null }) {
     const byState = {};
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
@@ -2786,7 +4066,24 @@ export class FleetSupervisor {
         reason: clampText(classified.reason, 160),
         blockers: (classified.blockers ?? []).slice(0, 6),
         pr: pr
-          ? { ref: pr.ref, url: pr.url, state: pr.state, title: clampText(pr.title, 100), ci: pr.ci, unresolvedThreads: pr.unresolvedThreads, mergeState: pr.mergeState, head: String(pr.headOid ?? "").slice(0, 10) }
+          ? {
+              ref: pr.ref,
+              url: pr.url,
+              state: pr.state,
+              isDraft: Boolean(pr.isDraft),
+              title: clampText(pr.title, 100),
+              bodySummary: pr.bodySummary ?? null,
+              additions: pr.additions ?? null,
+              deletions: pr.deletions ?? null,
+              changedFiles: pr.changedFiles ?? null,
+              files: Array.isArray(pr.files) ? pr.files.slice(0, 12) : [],
+              gates: Array.isArray(pr.gates) ? pr.gates.slice(0, 4).map((g) => ({ label: g.label || g.name, state: g.state ?? null })) : [],
+              qa: pr.qa ? { required: pr.qa.required ?? null, freshOnHead: pr.qa.freshOnHead ?? null } : null,
+              ci: pr.ci,
+              unresolvedThreads: pr.unresolvedThreads,
+              mergeState: pr.mergeState,
+              head: String(pr.headOid ?? "").slice(0, 10)
+            }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
         lastActivityAt: thread.lastActivityAt ?? null,
         lastAgentText: clampTail(redactSecrets(thread.lastAgentText), 600),
@@ -2802,24 +4099,57 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        requiresAttention: Boolean(thread.meta?.requiresAttention),
+        attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).
         openChat: openChatFor(thread),
         watch
       };
     });
+    const rowKeys = new Set(rows.map((r) => r.key));
+    let carriedCount = 0;
+    if (Array.isArray(previous?.threads) && (Object.keys(sourceErrors ?? {}).length > 0 || unknownPrefixes.length > 0)) {
+      for (const prevRow of previous.threads) {
+        const isUnknownHostRow = unknownPrefixes.some((p) => String(prevRow?.key ?? "").startsWith(p));
+        if (!prevRow?.key || !prevRow.kind || (!sourceErrors[prevRow.kind] && !isUnknownHostRow) || rowKeys.has(prevRow.key)) continue;
+        rowKeys.add(prevRow.key);
+        rows.push(prevRow);
+        carriedCount += 1;
+        if (prevRow.state) byState[prevRow.state] = (byState[prevRow.state] ?? 0) + 1;
+        if (prevRow.watch?.group) {
+          byWatch[prevRow.watch.group] = (byWatch[prevRow.watch.group] ?? 0) + 1;
+          seen.add(prevRow.key);
+        }
+      }
+    }
+    for (const r of rows) setBounded(this.knownRows, r.key, r);
     for (const key of this.watchSince.keys()) if (!seen.has(key)) this.watchSince.delete(key);
     const infraDecisions = decisions.filter((decision) => decision.threadKey.startsWith("infra:"))
       .map((decision) => ({ key: decision.threadKey, action: decision.action, reason: clampText(decision.reason, 200), notBefore: decision.notBefore ?? null }));
     const sources = Object.fromEntries(THREAD_KINDS.map((kind) => [kind, 0]));
     for (const thread of threads) sources[thread.kind] = (sources[thread.kind] ?? 0) + 1;
+    if (carriedCount > 0 && previous?.counts?.sources) {
+      for (const kind of THREAD_KINDS) {
+        if (sourceErrors?.[kind] && sources[kind] === 0 && Number.isFinite(previous.counts.sources[kind])) {
+          sources[kind] = previous.counts.sources[kind];
+        }
+      }
+    }
+    const eligibleCount = threads.filter((thread) => !thread.excluded).length + carriedCount;
+    const inScopeCount = inScope.length + carriedCount;
+    const totalThreads = carriedCount > 0
+      ? Math.max(threads.length + carriedCount, Object.values(sources).reduce((s, n) => s + (n || 0), 0))
+      : threads.length;
     return {
       at: new Date(finished).toISOString(),
       reason,
       durationMs: finished - started,
       mode,
       counts: {
-        threads: threads.length,
-        inScope: inScope.length,
+        threads: totalThreads,
+        eligible: eligibleCount,
+        inScope: inScopeCount,
+        deferred: Math.max(0, eligibleCount - inScopeCount),
         sources,
         byState,
         byWatch,

@@ -64,6 +64,7 @@ const EXACT = new Set([
   "POST /tasks",
   "GET /tasks/clarifications",
   "GET /pending-actions",
+  "POST /pending-actions/dismiss-all",
   "POST /message",
   "GET /events",
   "GET /brief/today",
@@ -78,14 +79,28 @@ const EXACT = new Set([
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
   "GET /fleet/api/diagnose",
+  "GET /fleet/api/search",
+  "GET /fleet/api/workspaces",
+  "GET /fleet/api/hierarchy",
+  "GET /fleet/api/repo-status",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
+  "POST /fleet/api/reconcile",
   "POST /fleet/api/mode",
+  "POST /fleet/api/preferences",
+  "POST /fleet/api/route",
+  "POST /fleet/api/dispatch",
+  "POST /fleet/api/themes/sync",
+  "POST /fleet/api/sessions/start",
+  "POST /fleet/api/cards/batch",
+  // The owner's own message to one fleet thread (its chat's reply box).
+  "POST /fleet/api/send",
   // Shared device threads and the read-only lifelog. Owner decision: paired
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  "POST /conversations/supervisor/append",
   "GET /conversations",
   "POST /conversations",
   "GET /lifelog/moments",
@@ -125,10 +140,11 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
+  { method: "POST", re: /^\/fleet\/api\/cards\/[A-Za-z0-9:%_-]{1,160}\/act$/ },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
-  // One fleet thread's detail, and the owner's Push now, Mute and Unmute.
-  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}$`) },
+  // One fleet thread's detail/transcript, and the owner's Push now, Mute and Unmute.
+  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}(?:/transcript)?$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }
 ];
 

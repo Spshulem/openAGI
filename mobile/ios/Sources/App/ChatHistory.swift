@@ -17,6 +17,9 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var sourceNodeId: String?
     var sourceName: String?
     var attachments: [ChatAttachment]
+    // What the agent is doing while this reply streams ("Using fleet
+    // status"). Never saved: it means nothing once the reply is done.
+    var activity: String?
 
     init(id: UUID = UUID(), role: Role, text: String, isStreaming: Bool = false, isFailed: Bool = false,
          timestamp: Date = Date(), serverID: String? = nil, sourceNodeId: String? = nil, sourceName: String? = nil, attachments: [ChatAttachment] = []) {

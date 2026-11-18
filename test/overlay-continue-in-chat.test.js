@@ -536,7 +536,11 @@ test("Mac Quick Ask has a Supervisor tab backed by the local fleet API", () => {
   assert.match(consumer, /path: "\/fleet\/api\/state"/);
   assert.match(consumer, /path: "\/fleet\/api\/questions\/\\\(id\)"/);
   assert.match(consumer, /path: "\/fleet\/api\/scan"/);
-  assert.doesNotMatch(consumer, /fleet\/api\/send/, "the overlay never sends free text to an agent thread");
+  // Free text reaches an agent thread only as the owner's own typed reply
+  // (Supervisor detail, #275): one /send call, inside sendReply's .thread case.
+  assert.equal(consumer.match(/fleet\/api\/send/g)?.length, 1, "one free-text route");
+  assert.match(consumer, /func sendReply\(_ item: FleetOpenItem\) async \{[\s\S]*?case let \.thread\(key\):\s*path = "\/fleet\/api\/send"/,
+    "free text goes to a thread only from the owner's typed reply");
   assert.match(consumer, /guard mine == generation else \{ return \}/);
 
   // Height watchers: the new state has to resize the manually sized panel.

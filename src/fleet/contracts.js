@@ -193,14 +193,19 @@ export const STORAGE_DEFAULTS = Object.freeze({
   scanMs: 60 * MIN, scanLowMs: 15 * MIN, scanBudgetMs: 120_000
 });
 
-export function defaultPaths(home = os.homedir()) {
+export function defaultPaths(home = os.homedir(), exists = fs.existsSync) {
+  const codexLbCandidates = [
+    path.join(home, ".codex", "codex-lb.env"),
+    path.join(home, ".config", "codex-lb", "env"),
+    path.join(home, ".config", "ccodex", "env")
+  ];
   return {
     home,
     codexHome: path.join(home, ".codex"),
     claudeHome: path.join(home, ".claude"),
     conductorDb: path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db"),
     buzzEndpointFile: path.join(home, ".claude", "buzz", "endpoint"),
-    codexLbEnvFile: path.join(home, ".codex", "codex-lb.env"),
+    codexLbEnvFile: codexLbCandidates.find((candidate) => exists(candidate)) ?? codexLbCandidates[0],
     bb3WatchState: path.join(home, ".bb3-watch-state"),
     bb3WatchGateState: path.join(home, ".bb3-watch-gate-state"),
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
@@ -287,6 +292,14 @@ export function parseBackgroundRoutes(value) {
   return [...new Set(names.filter((name) => BACKGROUND_ROUTES.includes(name)))];
 }
 
+// Apps whose approval cards the supervisor may approve by itself.
+export const AUTO_APPROVE_APPS = Object.freeze(["codex"]);
+
+export function parseAutoApprove(value) {
+  const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return [...new Set(names.filter((name) => AUTO_APPROVE_APPS.includes(name)))];
+}
+
 export function parseDeliveryMode(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return DELIVERY_MODES.includes(text) ? text : "cli";
@@ -309,6 +322,60 @@ function envOff(value) {
 function envNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeLocalPaseoListen(listen, tlsEnabled) {
+  const scheme = tlsEnabled ? "wss" : "ws";
+  const fallback = `${scheme}://127.0.0.1:6767/ws`;
+  const raw = String(listen ?? "").trim();
+  if (!raw || raw.startsWith("/") || /^unix:/i.test(raw)) return fallback;
+  if (/^\d{2,5}$/.test(raw)) {
+    const port = Number(raw);
+    return port >= 1 && port <= 65535 ? `${scheme}://127.0.0.1:${port}/ws` : fallback;
+  }
+  if (/^wss?:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      if (!parsed.hostname) return fallback;
+      const pathname = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "/ws";
+      return `${parsed.protocol}//${parsed.host}${pathname}`;
+    } catch {
+      return fallback;
+    }
+  }
+  const hostPort = raw.startsWith(":")
+    ? `127.0.0.1${raw}`
+    : raw.replace(/^0\.0\.0\.0:/, "127.0.0.1:").replace(/^\[::\]:/, "[::1]:");
+  if (!/^(?:\[[^\]]+\]|[^/\s:]+):\d{1,5}$/.test(hostPort)) return fallback;
+  try {
+    const parsed = new URL(`${scheme}://${hostPort}/ws`);
+    const port = Number(parsed.port);
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? parsed.toString() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function resolveLocalPaseoDefaults(home, env = process.env) {
+  const paseoHome = String(env.PASEO_HOME ?? "").trim() || path.join(home, ".paseo");
+  let listen = null;
+  let tlsEnabled = false;
+  let password = undefined;
+  try {
+    const pidInfo = JSON.parse(fs.readFileSync(path.join(paseoHome, "paseo.pid"), "utf8"));
+    if (typeof pidInfo?.listen === "number" || (typeof pidInfo?.listen === "string" && pidInfo.listen.trim())) {
+      listen = String(pidInfo.listen).trim();
+    }
+  } catch { /* optional */ }
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(paseoHome, "config.json"), "utf8"));
+    tlsEnabled = Boolean(cfg?.tls?.enabled);
+  } catch { /* optional */ }
+  try {
+    const rawPw = fs.readFileSync(path.join(paseoHome, "pilot-password"), "utf8").trim();
+    if (rawPw) password = rawPw;
+  } catch { /* optional */ }
+  return { url: normalizeLocalPaseoListen(listen, tlsEnabled), password };
 }
 
 // Single place that turns env + explicit overrides into the config every
@@ -356,6 +423,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
     // Off unless listed: OPENAGI_FLEET_BACKGROUND_ROUTES=codex-exec,peer-relay.
     backgroundRoutes: Array.isArray(overrides.backgroundRoutes) ? parseBackgroundRoutes(overrides.backgroundRoutes.join(",")) : parseBackgroundRoutes(env.OPENAGI_FLEET_BACKGROUND_ROUTES),
+    // Off unless listed: OPENAGI_FLEET_AUTO_APPROVE=codex clicks Allow on the
+    // approval cards Codex raises (in Auto mode), instead of asking the owner.
+    autoApprove: Array.isArray(overrides.autoApprove) ? parseAutoApprove(overrides.autoApprove.join(",")) : parseAutoApprove(env.OPENAGI_FLEET_AUTO_APPROVE),
     // The watcher that sends app deliveries soon after the owner steps away,
     // instead of at the next scheduled scan. On unless OPENAGI_FLEET_IDLE_DRAIN=0.
     idleDrain: {
@@ -382,6 +452,20 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
       timeoutMs: overrides.judge?.timeoutMs ?? 40_000
     },
+    // Lightweight `/v1/decisions` (`gpt-6-luna`) keep-alive gate & goal matcher.
+    // Uses OPENAI_API_KEY directly (0% codex-lb quota draw, output_tokens: 0).
+    decisions: (() => {
+      const apiKey = String(overrides.decisions?.apiKey ?? env.OPENAI_API_KEY ?? "").trim();
+      return {
+        enabled: overrides.decisions?.enabled ?? (Boolean(apiKey) && !envOff(env.OPENAGI_FLEET_DECISIONS)),
+        apiKey,
+        url: overrides.decisions?.url ?? (String(env.OPENAGI_DECISIONS_URL ?? "").trim() || "https://api.openai.com/v1/decisions"),
+        model: overrides.decisions?.model ?? (String(env.OPENAGI_DECISIONS_MODEL ?? "").trim() || DEFAULT_REVIEW_CODEX_MODEL),
+        threshold: typeof overrides.decisions?.threshold === "number" ? overrides.decisions.threshold : 0.5,
+        needsOwnerThreshold: typeof overrides.decisions?.needsOwnerThreshold === "number" ? overrides.decisions.needsOwnerThreshold : 0.6,
+        timeoutMs: overrides.decisions?.timeoutMs ?? envNumber(env.OPENAGI_DECISIONS_TIMEOUT_MS, 8_000)
+      };
+    })(),
     // Disk space: safe cleanup, archive to the SD card, and asks. On with
     // the supervisor unless OPENAGI_FLEET_STORAGE=0.
     storage: {
@@ -391,22 +475,27 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       criticalGb: envNumber(env.OPENAGI_FLEET_STORAGE_CRITICAL_GB, STORAGE_DEFAULTS.criticalGb),
       sdLowGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_LOW_GB, STORAGE_DEFAULTS.sdLowGb),
       sdReserveGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_RESERVE_GB, STORAGE_DEFAULTS.sdReserveGb),
-      dataMount: DEFAULT_DATA_MOUNT,
+      dataMount: String(env.OPENAGI_FLEET_STORAGE_DATA ?? "").trim()
+        || (fs.existsSync(DEFAULT_DATA_MOUNT) ? DEFAULT_DATA_MOUNT : (fs.existsSync(home) ? home : "/")),
       sdMount: String(env.OPENAGI_FLEET_STORAGE_SD ?? "").trim() || DEFAULT_SD_MOUNT,
       ...(overrides.storage ?? {}),
       enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
     },
     // Antigravity conversations: read, and sent to with agentapi, unless
     // OPENAGI_FLEET_ANTIGRAVITY=0. No data dir means no threads.
-    paseo: {
-      enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
-      only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
-      pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
-      url: env.OPENAGI_PASEO_URL || "ws://127.0.0.1:6767/ws",
-      password: env.OPENAGI_PASEO_PASSWORD,
-      serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
-      ...overrides.paseo
-    },
+    paseo: (() => {
+      const localPaseo = resolveLocalPaseoDefaults(home, env);
+      return {
+        enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
+        only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
+        pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
+        url: env.OPENAGI_PASEO_URL || localPaseo.url,
+        password: env.OPENAGI_PASEO_PASSWORD ?? localPaseo.password,
+        serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
+        autoHosts: overrides.paseo?.autoHosts ?? !envOff(env.OPENAGI_PASEO_AUTO_HOSTS),
+        ...overrides.paseo
+      };
+    })(),
     antigravity: {
       enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
     },
@@ -444,18 +533,22 @@ export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
 // they are only ever typed into the app, never resumed in the background.
 export const CODEX_DESKTOP_ORIGINATOR = "Codex Desktop";
 const CODEX_APP_ORIGINATORS = new Set([CODEX_DESKTOP_ORIGINATOR, "codex_work_desktop"]);
+const CODEX_CLI_SOURCES = new Set(["cli", "exec"]);
 
-// A thread an app started. Older catalogs leave originator null, but still
-// record source "vscode" for the app's threads (codex exec writes "exec",
-// the CLI "cli").
+// Preserve the app boundary for legacy catalogs with no originator. A CLI-like
+// originator alone must not override source "vscode": it can describe the
+// client resuming a thread, not the app where that thread belongs.
 export function codexAppOwned(thread) {
   return CODEX_APP_ORIGINATORS.has(thread?.meta?.originator) || thread?.meta?.source === "vscode";
 }
 
-// A Codex thread codex exec must not resume: Conductor's (it would fork) or
-// the Codex app's (it would lock the owner out of it).
+// A Codex thread codex exec must not resume: Conductor's (it would fork), the
+// Codex app's (it would lock the owner out), or anything whose ownership is
+// not positively identified as CLI-owned.
 export function codexExecBarred(thread) {
-  return thread?.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread);
+  if (thread?.kind !== "codex") return false;
+  return thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR || codexAppOwned(thread)
+    || !CODEX_CLI_SOURCES.has(thread.meta?.source);
 }
 
 // sessionTitle: the Conductor tab title (null when untitled); sessionCount:
@@ -554,7 +647,17 @@ export function openChatFor(thread) {
   if (!thread?.kind) return null;
   const name = (value) => clampText(value, CHAT_NAME_MAX);
   const title = name(thread.title);
-  if (thread.kind === "paseo") return { app: "paseo", url: null, label: `${title || "untitled chat"} (Paseo)`, serverId: thread.meta?.serverId, agentId: thread.id, note: "Open this existing chat on its Paseo host." };
+  if (thread.kind === "paseo") {
+    const parsed = parsePaseoThreadKey(thread.key);
+    return {
+      app: "paseo",
+      url: null,
+      label: `${title || "untitled chat"} (Paseo)`,
+      serverId: thread.meta?.serverId ?? parsed?.serverId,
+      agentId: thread.id ?? parsed?.agentId,
+      note: "Open this existing chat on its Paseo host."
+    };
+  }
   const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
   const target = uiTargetFor(thread);
   if (target?.app === "conductor") {
@@ -708,6 +811,15 @@ export function clampTail(value, max) {
   return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
 }
 
+// clampText with the lines kept: spaces collapse, newlines (and one blank
+// line between blocks) stay, so a multi-line message still reads as written.
+export function clampTextLines(value, max) {
+  const text = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[^\S\n]+/g, " ")
+    .replace(/ ?\n ?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!max || text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
 // clampTail with the lines kept: spaces collapse, newlines (and one blank
 // line between blocks) stay, so lists and sections can still be read.
 export function clampTailLines(value, max) {
@@ -737,6 +849,15 @@ export function redactSecrets(value) {
 
 export function threadKey(kind, id) {
   return `${kind}:${id}`;
+}
+
+export function parsePaseoThreadKey(key) {
+  const raw = String(key ?? "").trim();
+  if (!raw.startsWith("paseo:")) return null;
+  const rest = raw.slice("paseo:".length);
+  const dot = rest.indexOf(".");
+  if (dot <= 0 || dot >= rest.length - 1) return null;
+  return { serverId: rest.slice(0, dot), agentId: rest.slice(dot + 1) };
 }
 
 export function prRefKey(repo, number) {

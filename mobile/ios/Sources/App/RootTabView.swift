@@ -64,9 +64,7 @@ struct RootTabView: View {
     }
 
     var body: some View {
-        WorkspaceWithChat(chatPaneOpen: $chatPaneOpen,
-                          showsChatPane: model.selectedTab != .chat,
-                          content: nativeTabs)
+        nativeTabs
         .tint(Theme.live)
         .environment(model)
         .alert("Switch to another OpenAGI?", isPresented: switchAlertShown) {
@@ -129,22 +127,32 @@ struct RootTabView: View {
         @Bindable var model = model
         return TabView(selection: $model.selectedTab) {
             Tab("Today", systemImage: "sun.max", value: AppTab.today) {
-                TodayView(onRevoked: onRevoked)
+                withSupportingChat(TodayView(onRevoked: onRevoked))
             }
             Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) {
-                TasksView()
+                withSupportingChat(TasksView())
             }
             Tab("Inbox", systemImage: "tray", value: AppTab.inbox) {
-                InboxView()
+                withSupportingChat(InboxView())
             }.badge(model.inboxBadgeCount)
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) { ChatView() }
             Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
-                SupervisorView(showsInlineChat: false)
+                SupervisorView()
             }
         }
         // iOS 27.1 places the system tab and navigation bars around Duo's
         // status bar and camera. Keep this same hierarchy across every pose
         // so each destination retains its own NavigationStack and state.
+    }
+
+    // The supporting chat splits a tab's own content, never the TabView: the
+    // tab rail then always spans the window. Wrapping the whole TabView put
+    // it in the left page on Today/Tasks/Inbox and the full window on Chat
+    // and Supervisor, so on an unfolded Duo the rail jumped between the
+    // hinge and the edge as tabs changed. Chat and Supervisor have no pane:
+    // they are a conversation already.
+    private func withSupportingChat<Content: View>(_ content: Content) -> some View {
+        WorkspaceWithChat(chatPaneOpen: $chatPaneOpen, showsChatPane: true, content: content)
     }
 }
 

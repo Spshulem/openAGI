@@ -9,14 +9,16 @@ let package = Package(
     .executable(name: "OpenAGIComputerHelper", targets: ["OpenAGIComputerHelper"])
   ],
   dependencies: [
-    .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0")
+    .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
+    .package(path: "../shared/SupervisorChannelsKit")
   ],
   targets: [
     .executableTarget(
       name: "OpenAGI",
       dependencies: [
         .product(name: "Sparkle", package: "Sparkle"),
-        "OpenAGIComputerCore"
+        "OpenAGIComputerCore",
+        "SupervisorChannelsKit"
       ],
       path: "Sources/OpenAGI"
     ),
@@ -31,7 +33,10 @@ let package = Package(
     ),
     .testTarget(
       name: "OpenAGITests",
-      dependencies: ["OpenAGI"],
+      dependencies: [
+        "OpenAGI",
+        "SupervisorChannelsKit"
+      ],
       path: "Tests/OpenAGITests"
     )
   ]

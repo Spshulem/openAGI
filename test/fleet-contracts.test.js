@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
-  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  linkUiHosts, openChatFor, KIND_NAMES, ROUTES, THREAD_KINDS, THREAD_KIND_PATTERN, UI_APPS, clampTail, clampText, codexExecBarred, isAckItem, isPidAlive, isSupervisorOwnPrompt, liveCardItems, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
   ANTIGRAVITY_LS, defaultBinaries, openImmutableDb, isThreadKey, kindName, repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
@@ -193,6 +193,28 @@ test("uiTargetFor maps threads to the app that shows them, or none", () => {
   assert.equal(uiTargetFor({ key: "codex:t2", kind: "codex", id: "t2", meta: { originator: "codex_sdk_ts" } }), null);
   assert.equal(uiTargetFor({ key: "claude:c1", kind: "claude", id: "c1", meta: { entrypoint: "cli" } }), null, "terminal Claude: no app");
   assert.equal(uiTargetFor(null), null);
+});
+
+test("Codex background execution requires positive CLI ownership evidence", () => {
+  const thread = (meta) => ({ kind: "codex", meta });
+  for (const meta of [
+    undefined, null, {},
+    { source: null, originator: null },
+    { source: "future-app", originator: "future-client" },
+    { originator: "codex_cli_rs" },
+    { source: "vscode", originator: null },
+    { source: "vscode", originator: "codex_cli_rs" },
+    { source: "cli", originator: "Codex Desktop" },
+    { source: "exec", originator: "codex_work_desktop" },
+    { source: "cli", originator: "codex_sdk_ts" }
+  ]) {
+    assert.equal(codexExecBarred(thread(meta)), true, JSON.stringify(meta));
+  }
+  for (const source of ["cli", "exec"]) {
+    assert.equal(codexExecBarred(thread({ source })), false, source);
+    assert.equal(codexExecBarred(thread({ source, originator: "codex_cli_rs" })), false, source);
+  }
+  assert.equal(codexExecBarred({ kind: "conductor", meta: {} }), false, "does not change other providers' wait policy");
 });
 
 test("background routes are off unless listed, and never include claude-resume; the idle watcher is on unless turned off", () => {
