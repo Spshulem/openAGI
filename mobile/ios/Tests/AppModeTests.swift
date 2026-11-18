@@ -127,8 +127,13 @@ final class AppModeTests: XCTestCase {
             if hasBackup { try credentials.save(to: .server) }
             try parked.enqueue(pending)
             let session = AppSession()
-            session.chooseServer()
+            let selected = URL(string: "https://another.example.com")!
+            session.chooseServer(prefillServer: selected)
+            XCTAssertEqual(session.phase, .pairing)
+            XCTAssertEqual(session.pairingServer, selected)
+            XCTAssertEqual(Credentials.load(), credentials, "Selecting a discovered server must preserve the existing credential")
             session.goBack(queue: queue, parkedQueue: parked)
+            XCTAssertNil(session.pairingServer)
             XCTAssertEqual(session.phase, .ready(credentials))
             XCTAssertEqual(queue.all(), [pending])
             XCTAssertTrue(parked.all().isEmpty)

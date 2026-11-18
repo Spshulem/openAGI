@@ -695,6 +695,43 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertFalse(app.buttons["chat-send"].isEnabled)
     }
 
+    func testDiscoveredServerOpensPrefilledPairingAndSelectionFocusesCode() {
+        let app = launch()
+        tap(app, "open-settings")
+        tap(app, "settings-find-servers", in: "settings-form")
+        XCTAssertTrue(app.navigationBars["Find servers"].waitForExistence(timeout: 5))
+        tap(app, "discovery-search")
+        tap(app, "discovered-server-https://daemon.example.com")
+        let address = element(app, "pairing-server")
+        XCTAssertTrue(address.waitForExistence(timeout: 10), "Selecting a result must open connection setup")
+        XCTAssertEqual(address.value as? String, "https://daemon.example.com")
+        // Selecting a result inside setup must visibly advance to the code,
+        // rather than silently changing an address below the viewport.
+        tap(app, "pairing-find-servers")
+        tap(app, "pairing-discovered-server-https://daemon.example.com")
+        let code = element(app, "pairing-code")
+        XCTAssertTrue(code.waitForExistence(timeout: 5))
+        XCTAssertTrue(code.isHittable)
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        code.typeText("123456")
+        XCTAssertEqual(code.value as? String, "123456")
+        capture("native-discovery-selection", app: app)
+        // Duo scrolls native navigation controls with the form, and selecting
+        // a server scrolled to the code. Return to the toolbar before Back.
+        let cancel = app.buttons.matching(NSPredicate(format:
+            "identifier == 'pairing-cancel' OR identifier == 'BackButton' OR label == 'Back'")).firstMatch
+        for _ in 0..<6 {
+            if cancel.exists && cancel.isHittable { break }
+            // Drag in the upper half: the number pad covers the lower half.
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.2))
+            let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.5))
+            start.press(forDuration: 0.1, thenDragTo: end)
+        }
+        XCTAssertTrue(cancel.exists && cancel.isHittable, "Connection setup needs a reachable Back control")
+        cancel.tap()
+        XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 10))
+    }
+
     func testSettingsAndComposerRemainUsableInDarkModeWithAccessibilityText() {
         let app = launch(["--ui-dark", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tap(app, "open-settings")
