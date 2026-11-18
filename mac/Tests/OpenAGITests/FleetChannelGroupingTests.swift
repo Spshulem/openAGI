@@ -54,6 +54,11 @@ final class FleetChannelGroupingTests: XCTestCase {
     XCTAssertTrue(SupervisorChannelGrouping.shouldShowInOverlay(mode: "chat", raisedAtISO: freshChat, createdAtISO: nil, now: now))
     XCTAssertFalse(SupervisorChannelGrouping.shouldShowInOverlay(mode: "chat", raisedAtISO: staleChat, createdAtISO: nil, now: now))
     XCTAssertFalse(SupervisorChannelGrouping.shouldShowInOverlay(mode: "chat", raisedAtISO: nil, createdAtISO: nil, now: now))
+
+    let zombieQueue = iso.string(from: now.addingTimeInterval(-90 * 86_400))
     XCTAssertTrue(SupervisorChannelGrouping.shouldShowInOverlay(mode: "queue", raisedAtISO: staleChat, createdAtISO: nil, now: now))
+    XCTAssertFalse(SupervisorChannelGrouping.shouldShowInOverlay(mode: "queue", raisedAtISO: nil, createdAtISO: zombieQueue, now: now))
+    XCTAssertFalse(SupervisorChannelGrouping.shouldShowInOverlay(mode: nil, raisedAtISO: nil, createdAtISO: zombieQueue, now: now))
+    XCTAssertTrue(SupervisorChannelGrouping.shouldShowInOverlay(mode: "queue", raisedAtISO: nil, createdAtISO: nil, now: now))
   }
 }

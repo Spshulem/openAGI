@@ -344,4 +344,52 @@ final class FleetOverlayTests: XCTestCase {
     defaults.set(false, forKey: AppState.showsInDockDefaultsKey)
     XCTAssertFalse(AppState.defaultShowsInDock(defaults: defaults))
   }
+
+  func testFleetSingleCardPagerAndWatchingCollapsedByDefault() throws {
+    let fleet = FleetConsumer()
+    XCTAssertFalse(fleet.watchingExpanded)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+    fleet.stepQuestion(1)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+
+    let threeQuestions = try JSONDecoder().decode(FleetState.self, from: Data("""
+      {
+        "mode": "propose",
+        "enabled": true,
+        "running": false,
+        "questions": [
+          {"id": "q1", "title": "First", "body": "", "options": ["yes"]},
+          {"id": "q2", "title": "Second", "body": "", "options": ["yes"]},
+          {"id": "q3", "title": "Third", "body": "", "options": ["yes"]}
+        ]
+      }
+      """.utf8))
+    fleet.apply(threeQuestions)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+    fleet.stepQuestion(1)
+    XCTAssertEqual(fleet.currentQuestionIndex, 1)
+    fleet.stepQuestion(-2)
+    XCTAssertEqual(fleet.currentQuestionIndex, 2)
+
+    let oneQuestion = try JSONDecoder().decode(FleetState.self, from: Data("""
+      {
+        "mode": "propose",
+        "enabled": true,
+        "running": false,
+        "questions": [{"id": "q1", "title": "Only", "body": "", "options": ["yes"]}]
+      }
+      """.utf8))
+    fleet.apply(oneQuestion)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+
+    fleet.toggleWatchingExpanded()
+    XCTAssertTrue(fleet.watchingExpanded)
+    fleet.supervisorTabLeft()
+    XCTAssertFalse(fleet.watchingExpanded)
+
+    let approvals = PendingApprovalConsumer()
+    XCTAssertFalse(approvals.overlayExpanded)
+    approvals.toggleOverlayExpanded()
+    XCTAssertTrue(approvals.overlayExpanded)
+  }
 }

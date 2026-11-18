@@ -55,6 +55,10 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var threadInFlight: Set<String> = []
   /// Each thread's last Push now, Mute or Unmute result, in its row.
   @Published private(set) var threadNotes: [String: FleetNote] = [:]
+  /// Active index in the compact overlay single-card deck.
+  @Published var currentQuestionIndex: Int = 0
+  /// Whether the collapsible session list in the overlay is expanded.
+  @Published var watchingExpanded: Bool = false
 
   /// Bumped by every refresh start and every apply. A refresh publishes only
   /// if nothing newer started or landed meanwhile, so a slow GET can never
@@ -536,6 +540,18 @@ final class FleetConsumer: ObservableObject {
     if openWatchGroups.contains(group) { openWatchGroups.remove(group) } else { openWatchGroups.insert(group) }
   }
 
+  func stepQuestion(_ delta: Int) {
+    guard !questions.isEmpty else {
+      currentQuestionIndex = 0
+      return
+    }
+    currentQuestionIndex = (currentQuestionIndex + delta % questions.count + questions.count) % questions.count
+  }
+
+  func toggleWatchingExpanded() {
+    watchingExpanded.toggle()
+  }
+
   func clearNote(_ id: String) {
     notes[id] = nil
   }
@@ -587,7 +603,7 @@ final class FleetConsumer: ObservableObject {
 
   // MARK: - State
 
-  private func apply(_ state: FleetState) {
+  func apply(_ state: FleetState) {
     generation &+= 1
     let open = Set(state.questions.map(\.id))
     // A timed-out answer whose question has since closed: say so, since its
@@ -600,6 +616,9 @@ final class FleetConsumer: ObservableObject {
     notes = notes.filter { open.contains($0.key) }
     let oldQuestions = questions
     questions = state.questions
+    if currentQuestionIndex >= questions.count {
+      currentQuestionIndex = max(0, questions.count - 1)
+    }
     openQuestionIDs = Set(state.questions.map(\.id))
     threads = state.threads
     status = state.status
@@ -671,6 +690,8 @@ final class FleetConsumer: ObservableObject {
     threadNotes = [:]
     hasSupervisor = false
     available = false
+    currentQuestionIndex = 0
+    watchingExpanded = false
     OverlayState.shared.selectTab(.tasks)
     OverlayState.shared.pruneFleetContext(openIDs: [])
     OverlayState.shared.pruneVoiceContext(openIDs: [], threadKeys: [])
@@ -679,6 +700,7 @@ final class FleetConsumer: ObservableObject {
   /// The owner switched to Tasks: a supervisor with nothing to show loses
   /// its tab now, not while they were reading it.
   func supervisorTabLeft() {
+    watchingExpanded = false
     if !hasSupervisor { available = false }
   }
 

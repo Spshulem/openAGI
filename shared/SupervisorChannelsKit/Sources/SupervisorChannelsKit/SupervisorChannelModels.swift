@@ -277,19 +277,24 @@ public enum SupervisorChannelGrouping {
     }
 
     /// Overlay surface filter for pending actions: stale (>2h) `chat` ("yes NN")
-    /// confirmations are hidden so the Mac pill doesn't accumulate dead noise.
+    /// confirmations and zombie (>24h) queue requests are hidden so the Mac pill
+    /// and Dock badge do not accumulate dead noise from months-old sessions.
     public static func shouldShowInOverlay(
         mode: String?,
         raisedAtISO: String?,
         createdAtISO: String?,
         now: Date = Date(),
-        maxChatAgeSeconds: TimeInterval = 7200
+        maxChatAgeSeconds: TimeInterval = 7200,
+        maxQueueAgeSeconds: TimeInterval = 86_400
     ) -> Bool {
-        guard mode == "chat" else { return true }
-        let iso = raisedAtISO ?? createdAtISO
-        guard let iso, !iso.isEmpty else { return false }
-        guard let date = parseFlexibleISO8601(iso) else { return false }
-        return now.timeIntervalSince(date) < maxChatAgeSeconds
+        let iso = (raisedAtISO?.isEmpty == false ? raisedAtISO : nil)
+            ?? (createdAtISO?.isEmpty == false ? createdAtISO : nil)
+        if mode == "chat" {
+            guard let iso, let date = parseFlexibleISO8601(iso) else { return false }
+            return now.timeIntervalSince(date) < maxChatAgeSeconds
+        }
+        guard let iso, let date = parseFlexibleISO8601(iso) else { return true }
+        return now.timeIntervalSince(date) < maxQueueAgeSeconds
     }
 
     private static func parseFlexibleISO8601(_ string: String) -> Date? {

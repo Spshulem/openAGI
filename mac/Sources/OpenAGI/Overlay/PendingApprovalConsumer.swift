@@ -105,6 +105,11 @@ final class PendingApprovalConsumer: ObservableObject {
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
   @Published private(set) var lastChatSessionId: String? = nil
+  @Published var overlayExpanded: Bool = false
+
+  func toggleOverlayExpanded() {
+    overlayExpanded.toggle()
+  }
 
   /// Only the newest reconciliation may publish. Refreshes arrive from panel
   /// appearance, SSE, and decisions, so response order is not request order.
@@ -133,6 +138,7 @@ final class PendingApprovalConsumer: ObservableObject {
             createdAtISO: $0.createdAt
           )
       }
+      if items.isEmpty { overlayExpanded = false }
       lastError = nil
     } catch let error as MainConnectionError {
       guard generation == refreshGeneration else { return }
