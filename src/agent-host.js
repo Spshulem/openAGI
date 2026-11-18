@@ -273,7 +273,13 @@ export class AgentHost {
       && isSupervisorThread
       && this.runtime?.fleetSupervisor?.getState?.()?.preferences?.autoApprove !== false
     );
-    const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text), supervisorAutoApprove } : null;
+    const turnState = principal
+      ? {
+          untrusted: contextUntrusted,
+          intent: ownerIntentText(text),
+          ...(supervisorAutoApprove ? { supervisorAutoApprove: true } : {}),
+        }
+      : null;
     let confirmation = null;
     if (principal && !ephemeral) {
       if (principal.via === "voice") {
