@@ -250,10 +250,19 @@ export class CronScheduler {
   }
 
   async runDue(handler, now = new Date(), options = {}) {
+    // Snapshot a single clock value for selection, revalidation and receipts.
+    // Callers may supply a Date, ISO timestamp or epoch milliseconds.
+    const tickTime = new Date(now);
     const budgetMs = options.tickBudgetMs ?? resolveTickBudgetMs();
     const tickStartedMs = Date.now();
     const results = [];
-    for (const job of this.dueJobs(now)) {
+    for (const job of this.dueJobs(tickTime)) {
+      // Earlier handlers can await for minutes. Honor owner changes made
+      // during that wait instead of dispatching cancelled or stale work
+      // from the tick's initial snapshot. Reconsider changed definitions
+      // on the next tick; do not interrupt already executing work.
+      if (this.jobs.get(job.id) !== job || !job.enabled
+        || !job.nextRunAt || !(new Date(job.nextRunAt) <= tickTime)) continue;
       // Bounded fire: never pre-empt the first job (a lone slow job must still
       // get its full timeout), but past the budget stop STARTING new ones.
       // Their nextRunAt is untouched, so they are still due on the next tick.
@@ -278,7 +287,7 @@ export class CronScheduler {
         onTimeout: options.onTimeout,
         source: "cron"
       });
-      job.lastRunAt = (now instanceof Date ? now : new Date(now)).toISOString();
+      job.lastRunAt = tickTime.toISOString();
       job.nextRunAt = job.enabled ? this.computeNextRun(job, new Date(job.lastRunAt)).toISOString() : null;
       results.push({ job, result });
     }
