@@ -240,9 +240,11 @@ export class PendingActionStore {
     return action;
   }
 
-  prepareContinuation(id, { requestId, sessionId, resetFailed = false } = {}) {
+  // allowFailedExecution: a scheduled run resumes to report an approved tool
+  // that failed (the tool is not rerun). A computer-use resume never does.
+  prepareContinuation(id, { requestId, sessionId, resetFailed = false, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
-    if (!action || action.status !== "approved" || action.error != null) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution)) return null;
     if (action.continuation?.status === "delivered") return action.continuation;
     if (action.continuation && !(resetFailed && action.continuation.status === "failed")) {
       return action.continuation;
@@ -260,10 +262,10 @@ export class PendingActionStore {
     return action.continuation;
   }
 
-  claimContinuation(id, { maxAttempts = 5 } = {}) {
+  claimContinuation(id, { maxAttempts = 5, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
     const continuation = action?.continuation;
-    if (!action || action.status !== "approved" || action.error != null || !continuation) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution) || !continuation) return null;
     if (!new Set(["pending", "failed"]).has(continuation.status)) return null;
     if (continuation.attempts >= maxAttempts) return null;
     const deliveryId = createId("delivery");
@@ -475,6 +477,12 @@ function serializableContext(ctx) {
     from: ctx.from ?? null,
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Lets an approval resume the scheduled run that raised it.
+    ...(typeof ctx.scheduledJobId === "string" ? { scheduledJobId: ctx.scheduledJobId.slice(0, 200) } : {}),
+    ...(typeof ctx.scheduledJobName === "string" ? { scheduledJobName: ctx.scheduledJobName.slice(0, 200) } : {}),
+    // Server-built record of how the run was allowed to act. A one-shot job
+    // is gone by the time its card is approved, so the resume reads it here.
+    ...(ctx.ownerSchedule === true ? { ownerSchedule: true } : {}),
     // Audit only: a replayed record is plain data and never owner authority.
     authority: authorityRecord(ctx.__owner),
     // Grading provenance only (ids and numbers, no authority): lets work a

@@ -10,7 +10,7 @@ export const OUTREACH_DEFAULTS = {
   quietHours: { start: "22:00", end: "08:00" },
   stalledDays: 3,
   liveTypes: ["stalled-task", "pending-action", "clarification"],
-  digestTypes: ["draft", "suggestion", "skill"]
+  digestTypes: ["draft", "suggestion", "skill", "scheduled-run"]
 };
 
 function minutes(hhmm) {

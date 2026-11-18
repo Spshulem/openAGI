@@ -1,3 +1,38 @@
+import { isOwnerPrincipal } from './owner-authority.js';
+
+const DAY_NAMES = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const DAY_SETS = { daily: [0, 1, 2, 3, 4, 5, 6], weekdays: [1, 2, 3, 4, 5], weekends: [0, 6] };
+
+// "weekdays", "weekends", "daily", or a list like ["mon", "wed"] -> sorted
+// day numbers (0 = Sunday). null means every day.
+export function parseScheduleDays(value) {
+  if (value === undefined || value === null) return null;
+  const list = typeof value === 'string' && Object.hasOwn(DAY_SETS, value.trim().toLowerCase())
+    ? DAY_SETS[value.trim().toLowerCase()]
+    : (Array.isArray(value) ? value : String(value).split(',')).map(day => {
+      const index = DAY_NAMES.indexOf(String(day).trim().toLowerCase().slice(0, 3));
+      if (index < 0) throw new Error('days must be weekdays, weekends, daily, or day names like mon, wed.');
+      return index;
+    });
+  const days = [...new Set(list)].sort((a, b) => a - b);
+  if (!days.length) throw new Error('days must name at least one day.');
+  return days.length === 7 ? null : days;
+}
+
+export function describeSchedule(job) {
+  if (job.dailyAt) {
+    const days = Array.isArray(job.days) && job.days.length ? job.days : null;
+    const when = !days ? 'every day'
+      : days.join() === DAY_SETS.weekdays.join() ? 'every weekday'
+        : days.join() === DAY_SETS.weekends.join() ? 'every weekend day'
+          : `every ${days.map(day => DAY_NAMES[day]).join(', ')}`;
+    return `${when} at ${job.dailyAt}`;
+  }
+  if (job.input?.oneShot) return 'once';
+  if (job.intervalMs) return `every ${Math.round(job.intervalMs / 60000)} minutes`;
+  return 'on a schedule';
+}
+
 // Validate at the tool boundary: model schemas alone do not enforce this.
 export function scheduledPromptSpec(args, context = {}) {
   if (context.origin === 'cron' || context.scheduledJobId) {
@@ -14,16 +49,22 @@ export function scheduledPromptSpec(args, context = {}) {
       || args[key] > 365 * 86400) {
     throw new Error('Use a delay of at least 30 seconds or a recurring interval of at least 5 minutes, up to one year.');
   }
+  if (args.days !== undefined && args.days !== null && key !== 'dailyAt') throw new Error('days only applies with dailyAt.');
+  const days = key === 'dailyAt' ? parseScheduleDays(args.days) : null;
   const channel = String(args.channel ?? '').trim() || context.channel || 'local';
   const input = {
     prompt, channel,
     target: args.target || context.from || context.target || null,
     agentId: context.agentId ?? 'main', sessionId: context.sessionId,
-    oneShot: key === 'delaySeconds'
+    oneShot: key === 'delaySeconds',
+    // Only the authenticated owner's own turn marks a schedule as theirs. The
+    // runtime uses it to skip the scrutiny throttle when the job fires; gated
+    // tools still wait for approval because nobody is present to approve.
+    ...(isOwnerPrincipal(context.__owner) ? { createdBy: 'owner' } : {})
   };
   return {
     input,
-    ...(key === 'dailyAt' ? { dailyAt: args.dailyAt } : { intervalMs: args[key] * 1000 }),
+    ...(key === 'dailyAt' ? { dailyAt: args.dailyAt, days } : { intervalMs: args[key] * 1000 }),
     ...(key === 'delaySeconds' ? { nextRunAt: new Date(Date.now() + args.delaySeconds * 1000).toISOString() } : {})
   };
 }
@@ -35,5 +76,6 @@ export function sameScheduledPrompt(job, spec) {
     && ['channel', 'target', 'agentId', 'sessionId'].every(key => (job.input?.[key] ?? null) === (spec.input[key] ?? null))
     && Boolean(job.input?.oneShot) === spec.input.oneShot
     && (job.intervalMs ?? null) === (spec.intervalMs ?? null)
-    && (job.dailyAt ?? null) === (spec.dailyAt ?? null);
+    && (job.dailyAt ?? null) === (spec.dailyAt ?? null)
+    && (job.days ?? null)?.join() === (spec.days ?? null)?.join();
 }
