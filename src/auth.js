@@ -96,12 +96,15 @@ export function checkOrigin(req) {
   return { ok: true };
 }
 
+// The webhook is a public route whose chat id comes from the body, so a
+// missing secret fails closed: anyone could otherwise post an update as a
+// paired chat. Polling mode (TELEGRAM_POLLING=1) does not use this route.
 export function verifyTelegramSecret({ headerValue, expected }) {
-  if (!expected) return { ok: true, reason: "no telegram secret configured" };
+  if (!expected) return { ok: false, reason: "no telegram secret configured" };
   return safeEqual(headerValue, expected) ? { ok: true } : { ok: false, reason: "telegram secret mismatch" };
 }
 
-// Webhook shared-secret check for inbound BuildBetter pings. Unlike the
+// Webhook shared-secret check for inbound BuildBetter pings. Like the
 // telegram check, a MISSING expected secret fails closed — the webhook
 // triggers outbound API calls, so we won't accept unauthenticated pings.
 // The secret may arrive in the X-BuildBetter-Webhook-Secret header or a

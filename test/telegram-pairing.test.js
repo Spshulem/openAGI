@@ -83,3 +83,13 @@ test("pairing the same chat twice does not duplicate the allowlist entry", () =>
   p.attempt("555", b.code, { now: t0 + 3 });
   assert.deepEqual(p.allowlist(), ["555"]);
 });
+
+test("attempts with no open code do not count toward the lockout", () => {
+  const p = pairing();
+  const t0 = Date.parse("2026-07-06T12:00:00Z");
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal(p.attempt("666", "000000", { now: t0 + i }).reason, "no-active-code");
+  }
+  const issued = p.generateCode({ now: t0 + 100 });
+  assert.equal(p.attempt("12345", issued.code, { now: t0 + 200 }).ok, true);
+});
