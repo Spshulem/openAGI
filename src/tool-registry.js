@@ -1,7 +1,7 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
-import { intentCovers, isOwnerPrincipal } from "./owner-authority.js";
+import { intentCovers, isOwnerPrincipal, isSupervisorActionableDirective } from "./owner-authority.js";
 import { argsDigest } from "./pending-actions.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
@@ -73,6 +73,7 @@ export class ToolRegistry {
       // Optional fn(args, context) -> false | true | string. Truthy makes even
       // an owner instruction ask for the spoken code; a string says why.
       ownerConfirm: typeof tool.ownerConfirm === "function" ? tool.ownerConfirm : null,
+      supervisorAutoApprove: Boolean(tool.supervisorAutoApprove),
       metadata: tool.metadata ?? {}
     };
     this.tools.set(normalized.name, normalized);
@@ -103,6 +104,7 @@ export class ToolRegistry {
       prepareApprovalArgs,
       approvalDedupeKey,
       ownerConfirm,
+      supervisorAutoApprove,
       ...rest
     }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
@@ -291,7 +293,10 @@ export class ToolRegistry {
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
-    const tainted = turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
+    const autoApproved = turn.supervisorAutoApprove === true
+      && tool.supervisorAutoApprove === true
+      && isSupervisorActionableDirective(turn.intent ?? "");
+    const tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
     const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
@@ -442,7 +447,9 @@ export function registerCoreTools(registry, runtime) {
     },
     handler: async (args, context) => {
       const scope = context?.agentId && context.agentId !== "main" ? `specialist:${context.agentId}` : null;
-      const hits = runtime.memory.retrieve(String(args.query ?? ""), { limit: args.limit ?? 5, scope });
+      // Record cross-chat proof only for an explicit recall tool call, not
+      // background context assembly or opening the Memory page.
+      const hits = runtime.memory.retrieve(String(args.query ?? ""), { limit: args.limit ?? 5, scope, sessionId: context?.sessionId });
       return {
         count: hits.length,
         items: hits.map(({ item, score }) => ({
@@ -469,7 +476,7 @@ export function registerCoreTools(registry, runtime) {
       type: "object",
       properties: {
         correction: { type: "string", description: "The corrected fact, stated fully and standalone (e.g. 'The Acme review meeting is at 4pm, not 3pm')." },
-        query: { type: "string", description: "What the stale memory was about — used to find it (e.g. 'Acme review meeting time')." },
+        query: { type: "string", description: "The specific topic and subject of the stale fact (e.g. 'Acme review meeting time'). Prefer its exact id from recall; do not target a general transcript summary." },
         id: { type: "string", description: "Exact memory id to supersede, when known (from a recall result). Takes precedence over query." },
         tags: { type: "array", items: { type: "string" }, description: "Optional extra tags for the correction." }
       },
@@ -992,8 +999,8 @@ export function registerCoreTools(registry, runtime) {
       required: ["id"],
       additionalProperties: false
     },
-    handler: async (args) => {
-      const task = runtime.tasks.complete(args.id, args.completedVia ?? "agent");
+    handler: async (args, context) => {
+      const task = runtime.tasks.complete(args.id, args.completedVia ?? "agent", { byAgent: true, signal: context?.__signal ?? null });
       return task ? { id: task.id, status: task.status } : { error: "unknown task" };
     }
   });
@@ -1151,7 +1158,7 @@ export function registerCoreTools(registry, runtime) {
       required: ["title", "body"],
       additionalProperties: false
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       if (!runtime.drafts?.add) throw new Error("no draft store available");
       // One open draft per task, ever. Without this, a task that never got
       // completed collected a fresh draft every 30-minute pulse — 69 of the
@@ -1175,6 +1182,8 @@ export function registerCoreTools(registry, runtime) {
         }
       }
       const draft = runtime.drafts.add(args);
+      // A coalesced exact repeat is the same draft, not new work.
+      if (!draft.sourceMeta?.duplicateCount) runtime.grounded?.onDraftCreated?.(draft, context?.__signal ?? null);
       // The draft is the deliverable: release the agent's lease and reset the
       // attempt counter, and mark the task as awaiting review so the queue
       // stops serving it and the user can see what's waiting on them.

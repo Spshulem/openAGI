@@ -151,16 +151,20 @@ test("routing learns from outcome quality: struggling specialists repel work", a
     lastActivatedAt: new Date().toISOString(),
     metadata: {}
   };
-  const good = { ...base, id: "sp_good", meanOutcomeQuality: 0.9, outcomeSamples: 10 };
-  const bad = { ...base, id: "sp_bad", meanOutcomeQuality: 0.15, outcomeSamples: 10 };
-  const fresh = { ...base, id: "sp_fresh", meanOutcomeQuality: 0.1, outcomeSamples: 1 };
+  // Quality comes from grounded grades (what happened to the specialist's
+  // work), not the self-assigned outcome score.
+  const good = { ...base, id: "sp_good", groundedMean: 0.9, groundedSamples: 10 };
+  const bad = { ...base, id: "sp_bad", groundedMean: 0.15, groundedSamples: 10 };
+  const fresh = { ...base, id: "sp_fresh", groundedMean: 0.1, groundedSamples: 1 };
+  const selfScoredOnly = { ...base, id: "sp_self", meanOutcomeQuality: 0.1, outcomeSamples: 10 };
 
   const router = new SpecialistRouter({ threshold: 0.99, mode: "live" });
-  const results = await router.search("can you help me sort out my overlapping calendar events this week", [], [good, bad, fresh]);
+  const results = await router.search("can you help me sort out my overlapping calendar events this week", [], [good, bad, fresh, selfScoredOnly]);
   const score = (id) => results.find((r) => r.specialist.id === id).score;
 
   assert.ok(score("sp_good") > score("sp_bad"), "quality separates otherwise-identical specialists");
   assert.equal(results.find((r) => r.specialist.id === "sp_fresh").breakdown.qualityAdjust, 0, "no penalty before 3 samples");
   assert.ok(results.find((r) => r.specialist.id === "sp_good").breakdown.qualityAdjust > 0);
   assert.ok(results.find((r) => r.specialist.id === "sp_bad").breakdown.qualityAdjust < 0);
+  assert.equal(results.find((r) => r.specialist.id === "sp_self").breakdown.qualityAdjust, 0, "self-assigned scores do not move routing");
 });

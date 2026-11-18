@@ -163,7 +163,13 @@ export class SelfFixRunner {
       let fix = this.store.fix(id);
       const token = (this.deps.readToken ?? readGitHubToken)({ env: this.env, home: this.home });
       let envText = "";
-      try { envText = fs.readFileSync(path.join(this.home, ".codex/codex-lb.env"), "utf8"); } catch { /* checked below */ }
+      for (const candidate of [
+        path.join(this.home, ".codex", "codex-lb.env"),
+        path.join(this.home, ".config", "codex-lb", "env"),
+        path.join(this.home, ".config", "ccodex", "env")
+      ]) {
+        try { envText = fs.readFileSync(candidate, "utf8"); break; } catch { /* try next */ }
+      }
       const key = this.deps.lbKey ?? parseEnvText(envText).CODEX_LB_API_KEY;
       scrub = keyScrubber(token, key);
       if (!key) throw new Error("codex-lb key missing.");

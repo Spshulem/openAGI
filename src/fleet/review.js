@@ -33,6 +33,12 @@ const TITLE_MAX = 60;
 const OPTION_MAX = 40;
 const OPTIONS_MAX = 4;
 const REASON_MAX = 160;
+const BRIEF_CONTEXT_MAX = 220;
+const BRIEF_SUMMARY_MAX = 480;
+const BRIEF_DECISION_MAX = 240;
+const RECOMMENDATION_MAX = 180;
+const SUGGESTED_REPLY_MAX = 110;
+const SUGGESTED_REPLIES_MAX = 4;
 const OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
 // Supervisor plumbing, not work: never related to anything.
 const NOT_RELATED = new Set(["self", "relay"]);
@@ -51,7 +57,12 @@ export const REVIEW_SCHEMA = Object.freeze({
           reason: { type: "string" },
           title: { type: "string" },
           options: { type: "array", items: { type: "string" } },
-          duplicateOf: { type: "string" }
+          duplicateOf: { type: "string" },
+          briefContext: { type: "string" },
+          briefSummary: { type: "string" },
+          briefDecision: { type: "string" },
+          recommendation: { type: "string" },
+          suggestedReplies: { type: "array", items: { type: "string" } }
         },
         required: ["id", "decision", "category", "reason"],
         additionalProperties: false
@@ -65,7 +76,7 @@ export const REVIEW_SCHEMA = Object.freeze({
 // The same contract for codex --output-schema, whose strict mode wants every
 // property required: the optional ones may be null instead, and a null is
 // dropped again before the verdicts are read (codexReviews).
-const REVIEW_OPTIONAL = new Set(["title", "options", "duplicateOf"]);
+const REVIEW_OPTIONAL = new Set(["title", "options", "duplicateOf", "briefContext", "briefSummary", "briefDecision", "recommendation", "suggestedReplies"]);
 export const REVIEW_SCHEMA_CODEX = Object.freeze({
   ...REVIEW_SCHEMA,
   properties: {
@@ -105,7 +116,14 @@ export const REVIEW_SYSTEM_PROMPT = [
   "- title: at most 60 characters, plain words, naming the repo and #PR (or the workspace) and saying what is asked. Example: \"buildbetter #6899: mark ready and merge?\"",
   "- options: 2 to 4 short answers under 40 characters the agent can act on, like \"merge now\" or \"wait\". Keep the agent's own choices when they fit. Use [\"open thread\"] when the answer needs typing.",
   "Other kinds keep the supervisor's own title and buttons: leave title and options out for them.",
-  "reason: one short plain sentence with the evidence (times, PR state, which thread). Never close without one.",
+  "",
+  "For EVERY question you keep (all kinds: ready, agent-ask, agent-card, prompt, stuck), also write an executive decision brief so the owner can decide and reply right on the Supervisor card without opening the full chat:",
+  "- briefContext (<= 200 chars): 1-2 plain sentences explaining what this chat/session was working on or investigating.",
+  "- briefSummary (<= 440 chars): 2-4 plain-English sentences or '- ' bullets summarizing what changed, what tests/QA passed, and any caveats, tradeoffs, or unverified areas the owner must know (never raw git SHAs or markdown tables).",
+  "- briefDecision (<= 220 chars): 1-2 direct sentences stating the exact decision, choice, or answer needed from the owner right now.",
+  "- recommendation (<= 170 chars): concise Supervisor advice for the owner (e.g. 'Safe to merge — CI and full verification pass with 0 open threads.' or 'Reply with the URL and whether it is staging or production.'). Put internal audit timestamps/SHAs in reason, never in recommendation.",
+  "- suggestedReplies: 2 to 4 concrete, natural-language quick replies (each <= 100 chars) the owner can tap or lightly edit to send straight back to the coding session.",
+  "reason: one short plain sentence with the audit evidence (times, PR state, which thread). Never close without one.",
   "",
   "Times are ISO UTC. lastUser.by says whether the last message in a thread came from the owner or from the supervisor.",
   "<other_open> lists open questions not under review this time, only as duplicateOf targets and context: return no verdict for them.",
@@ -137,7 +155,10 @@ function questionPrRefs(question, threads) {
 export function reviewFingerprint(question, { threads = new Map(), prs = new Map() } = {}) {
   const asked = question?.askedAs ?? { title: question?.title, options: question?.options };
   const activity = questionKeys(question).map((key) => threads.get(key)?.lastActivityAt ?? null);
-  const prStates = questionPrRefs(question, threads).map((ref) => `${ref}:${prs.get(ref)?.state ?? "?"}`);
+  const prStates = questionPrRefs(question, threads).map((ref) => {
+    const pr = prs.get(ref);
+    return `${ref}:${pr?.state ?? "?"}:${pr?.ci?.state ?? ""}:${pr?.mergeState ?? ""}:${String(pr?.headOid ?? "").slice(0, 10)}`;
+  });
   return shortHash(JSON.stringify([asked.title ?? "", question?.body ?? "", asked.options ?? [], activity, prStates]));
 }
 
@@ -177,7 +198,16 @@ function threadView(thread, question, states, tailChars) {
     lastActivityAt: thread.lastActivityAt ?? null,
     lastAgentAt: thread.lastAgentAt ?? null,
     lastAgentText: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), tailChars),
-    lastUser: lastUser(thread, USER_TEXT_CHARS)
+    lastUser: lastUser(thread, USER_TEXT_CHARS),
+    ...(thread.meta?.pendingPermission ? { pendingPermission: thread.meta.pendingPermission } : {}),
+    ...(Array.isArray(thread.meta?.conversation) && thread.meta.conversation.length
+      ? {
+          recentConversation: thread.meta.conversation.slice(-4).map((m) => ({
+            role: m.role === "user" ? "owner" : "agent",
+            text: text(m.text, 340)
+          }))
+        }
+      : {})
   };
 }
 
@@ -207,6 +237,10 @@ function prView(pr) {
     state: pr.state ?? null,
     isDraft: pr.isDraft ?? null,
     title: text(pr.title, 100),
+    ...(pr.bodySummary ? { bodySummary: text(pr.bodySummary, 800) } : {}),
+    ...(Number.isFinite(pr.additions) ? { additions: pr.additions } : {}),
+    ...(Number.isFinite(pr.deletions) ? { deletions: pr.deletions } : {}),
+    ...(Number.isFinite(pr.changedFiles) ? { changedFiles: pr.changedFiles } : {}),
     // A ready question names its head; the thread may be on another branch.
     headRef: pr.headRef ?? null,
     headOid: String(pr.headOid ?? "").slice(0, 10) || null,
@@ -308,6 +342,17 @@ function cleanOptions(options) {
   return out.length === 1 && out[0].toLowerCase() === "open thread" ? ["open thread"] : null;
 }
 
+function cleanSuggestedReplies(replies) {
+  if (!Array.isArray(replies)) return null;
+  const out = [];
+  for (const item of replies) {
+    const value = text(item, SUGGESTED_REPLY_MAX);
+    if (value && !out.includes(value)) out.push(value);
+    if (out.length >= SUGGESTED_REPLIES_MAX) break;
+  }
+  return out.length > 0 ? out : null;
+}
+
 function cleanVerdict(raw, entry, ids) {
   const reason = text(raw.reason, REASON_MAX);
   const close = raw.decision === "close" && CLOSE_CATEGORIES.has(raw.category);
@@ -326,6 +371,20 @@ function cleanVerdict(raw, entry, ids) {
     return { id: entry.id, decision: "close", category: raw.category, reason, ...(duplicateOf ? { duplicateOf } : {}) };
   }
   const verdict = { id: entry.id, decision: "keep", category: "live", reason: reason || "still needs you" };
+  const briefContext = text(raw.briefContext, BRIEF_CONTEXT_MAX);
+  const briefSummary = clampText(redactSecrets(raw.briefSummary ?? ""), BRIEF_SUMMARY_MAX);
+  const briefDecision = text(raw.briefDecision, BRIEF_DECISION_MAX);
+  const recommendation = text(raw.recommendation, RECOMMENDATION_MAX);
+  const suggestedReplies = cleanSuggestedReplies(raw.suggestedReplies);
+  if (briefContext || briefSummary || briefDecision) {
+    verdict.brief = {
+      context: briefContext || null,
+      whatChanged: briefSummary || null,
+      decision: briefDecision || null
+    };
+  }
+  if (recommendation) verdict.recommendation = recommendation;
+  if (suggestedReplies) verdict.suggestedReplies = suggestedReplies;
   // The other kinds' buttons carry meaning ("merged", "added") that a new
   // title could contradict.
   if (entry.kind !== "agent-ask") return verdict;
@@ -461,7 +520,7 @@ function parseResult(stdout) {
 // the result's structured_output). --safe-mode skips the owner's hooks,
 // CLAUDE.md, skills and MCP servers, so a Stop hook never pushes the phone;
 // --no-session-persistence keeps the run out of the fleet's own scan.
-function createClaudeReview({ config, run, env, model }) {
+export function createClaudeReview({ config, run, env, model }) {
   const cwd = config?.paths?.relayCwd ?? null;
   const timeoutMs = config?.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
   return async function runClaude({ system, prompt, schema }) {

@@ -178,30 +178,41 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
   }
 
   saveSession(session) {
-    let persisted = sanitizePersistedSession({
+    const source = sanitizePersistedSession({
       ...session,
       updatedAt: nowIso()
     }).session;
     // Models already use only the most recent turns. Preserve older messages
     // in immutable owner-only chunks instead of rewriting months of history
     // synchronously on every foreground/background message.
-    if (Array.isArray(persisted.messages) && persisted.messages.length > this.maxActiveMessages) {
-      const archived = persisted.messages.slice(0, -this.retainedMessages);
+    const messages = Array.isArray(source.messages) ? source.messages : [];
+    let archiveCount = messages.length > this.maxActiveMessages ? messages.length - this.retainedMessages : 0;
+    const tail = () => archiveCount ? { ...source, messages: messages.slice(archiveCount),
+      metadata: { ...source.metadata, archivedMessageCount: (source.metadata?.archivedMessageCount ?? 0) + archiveCount,
+        historyArchived: true } } : source;
+    const serialize = value => `${JSON.stringify(value, null, 2)}\n`;
+    let persisted = tail();
+    let serialized = serialize(persisted);
+    // Photo turns can reach the byte cap long before the message-count cap.
+    // Archive older turns without removing the newest message or its pixels.
+    while (Buffer.byteLength(serialized) > this.maxSessionBytes && archiveCount < messages.length - 1) {
+      archiveCount += 1;
+      persisted = tail();
+      serialized = serialize(persisted);
+    }
+    if (Buffer.byteLength(serialized) > this.maxSessionBytes) {
+      throw Object.assign(new Error("Session history exceeds the safe size limit. Preserve an archive before repairing it."), { code: "SESSION_TOO_LARGE" });
+    }
+    if (archiveCount) {
+      const archived = messages.slice(0, archiveCount);
       // startIndex orders chunks for archivedMessages(); a replayed rotation
       // computes the same value, so content addressing still de-duplicates.
-      const chunk = { sessionId: session.id, startIndex: persisted.metadata?.archivedMessageCount ?? 0, messages: archived };
+      const chunk = { sessionId: session.id, startIndex: source.metadata?.archivedMessageCount ?? 0, messages: archived };
       const hash = createHash("sha256").update(JSON.stringify(chunk)).digest("hex");
       const archive = path.join(this.archivesDir, `${safeFilename(session.id)}.history`, `${hash}.json`);
       // Archive first: a failed active write leaves the old history intact;
       // replay uses the same content-addressed chunk, not a duplicate archive.
       if (!fs.existsSync(archive)) writeJsonAtomic(archive, chunk);
-      persisted = { ...persisted, messages: persisted.messages.slice(-this.retainedMessages),
-        metadata: { ...persisted.metadata, archivedMessageCount: (persisted.metadata?.archivedMessageCount ?? 0) + archived.length,
-          historyArchived: true } };
-    }
-    const serialized = `${JSON.stringify(persisted, null, 2)}\n`;
-    if (Buffer.byteLength(serialized) > this.maxSessionBytes) {
-      throw Object.assign(new Error("Session history exceeds the safe size limit. Preserve an archive before repairing it."), { code: "SESSION_TOO_LARGE" });
     }
     writeTextAtomic(this.sessionPath(session.id), serialized);
   }

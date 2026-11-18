@@ -445,7 +445,7 @@ test("agent turn writes an outcome record into runtime.outcomes", async () => {
 });
 
 test("specialist router scores by text and tag overlap, respects threshold", async () => {
-  const router = new SpecialistRouter({ threshold: 0.4 });
+  const router = new SpecialistRouter({ threshold: 0.4, mode: "live" });
   const specialists = [
     {
       id: "s1",
@@ -585,11 +585,15 @@ test("propagation tracks rolling outcome quality and retires bad specialists", (
     scrutiny: { reasons: [] }
   });
   const sp = r.specialist;
+  // Retirement follows grounded grades (what happened to the work), not the
+  // self-assigned outcome score.
   for (let i = 0; i < 12; i += 1) propagation.recordOutcomeQuality(sp.id, 0.15);
   assert.ok(sp.meanOutcomeQuality < 0.3);
+  assert.equal(propagation.retirementSweep({ dormancyDays: 999, minSamples: 10, qualityFloor: 0.3 }).length, 0);
+  for (let i = 0; i < 12; i += 1) propagation.recordGroundedQuality(sp.id, 0.15);
   const retired = propagation.retirementSweep({ dormancyDays: 999, minSamples: 10, qualityFloor: 0.3 });
   assert.equal(retired.length, 1);
-  assert.match(retired[0].retirementReason, /quality/);
+  assert.match(retired[0].retirementReason, /grounded mean/);
 });
 
 test("recall is scoped per specialist when called with non-main agentId", () => {
@@ -653,7 +657,7 @@ test("specialist router blends keyword and semantic signals", async () => {
     status: "available"
   };
   await vs.upsert("specialist", sp.id, `${sp.name}\n${sp.boundedScope}`);
-  const router = new SpecialistRouter({ vectorStore: vs, threshold: 0.3 });
+  const router = new SpecialistRouter({ vectorStore: vs, threshold: 0.3, mode: "live" });
   const decision = await router.decide(
     "schedule a meeting on my calendar this week",
     ["message", "calendar"],
@@ -677,7 +681,7 @@ test("scrutiny fitter stages proposals during warmup, auto-applies after", () =>
     };
     const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
     // Quality strongly correlated with evidence
-    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+    runtime.outcomes.ground(o.id, { score: Math.min(1, dims.evidence + 0.05 * Math.random()), source: "test", fate: "test" });
   }
 
   const fitter = new ScrutinyFitter({ runtime, dir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-")), warmupCycles: 1 });
@@ -707,7 +711,7 @@ test("fitted scrutiny weights persist to disk and restore into a fresh panel", (
       uncertainty: Math.random()
     };
     const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
-    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+    runtime.outcomes.ground(o.id, { score: Math.min(1, dims.evidence + 0.05 * Math.random()), source: "test", fate: "test" });
   }
   const fitter = new ScrutinyFitter({ runtime, dir, warmupCycles: 0 });
   const r = fitter.fit();
@@ -1092,15 +1096,10 @@ test("HTTP MCP client speaks Streamable HTTP with bearer auth (mocked fetch)", a
   globalThis.fetch = async (url, opts) => {
     calls.push({ url, headers: opts.headers, body: JSON.parse(opts.body) });
     const next = responseQueue.shift();
-    return {
-      ok: next.status < 400,
+    return new Response(typeof next.body === "string" ? next.body : JSON.stringify(next.body), {
       status: next.status,
-      statusText: "OK",
-      headers: { get: (k) => next.headers[k.toLowerCase()] ?? null },
-      json: async () => typeof next.body === "string" ? {} : next.body,
-      text: async () => typeof next.body === "string" ? next.body : JSON.stringify(next.body),
-      body: { getReader: () => ({ read: async () => ({ done: true, value: null }) }) }
-    };
+      headers: next.headers
+    });
   };
   try {
     const client = new McpHttpClient({
@@ -1132,27 +1131,9 @@ test("HTTP MCP client parses SSE response body for matching id", async () => {
     "",
     ""
   ].join("\n");
-  const encoded = new TextEncoder().encode(sseBody);
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    statusText: "OK",
-    headers: { get: (k) => k === "content-type" ? "text/event-stream" : null },
-    json: async () => ({}),
-    text: async () => sseBody,
-    body: {
-      getReader() {
-        let sent = false;
-        return {
-          async read() {
-            if (sent) return { done: true, value: null };
-            sent = true;
-            return { done: false, value: encoded };
-          }
-        };
-      }
-    }
+  globalThis.fetch = async () => new Response(sseBody, {
+    headers: { "content-type": "text/event-stream" }
   });
   try {
     const client = new McpHttpClient({ name: "sse", url: "https://x.example/mcp" });

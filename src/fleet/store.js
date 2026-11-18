@@ -1,16 +1,18 @@
 // Owner-only persistent state for the fleet supervisor: mode, last snapshot,
 // per-thread nudge ledger, needs-you questions, escalations, and the action
 // log. One JSON file (0600) plus an append-only actions.jsonl journal.
-// Methods never throw on disk errors; the last one is kept in lastWriteError.
+// Ordinary writes retain disk errors in lastWriteError. Mode changes throw
+// and roll back on failure: an unsaved Auto choice must never be acknowledged.
 
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { REMEDIES, suggestionPlan } from "./remedies.js";
-import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
+import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
+import { defaultPreferences, normalizePreferences } from "./preferences.js";
 
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
@@ -76,7 +78,8 @@ function emptyState() {
     diagnosis: {},
     fixLocks: {},
     fixCommands: {},
-    selfSessions: []
+    selfSessions: [],
+    preferences: defaultPreferences()
   };
 }
 
@@ -88,7 +91,7 @@ function isObject(value) {
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
-  for (const [key, value] of Object.entries(meta).slice(0, 8)) {
+  for (const [key, value] of Object.entries(meta).slice(0, 12)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
   }
@@ -218,8 +221,13 @@ export class FleetStore {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    const previous = this.state.mode;
     this.state.mode = mode;
     this._save();
+    if (this.lastWriteError) {
+      this.state.mode = previous;
+      throw new Error("Supervisor mode could not be saved. Check available disk space and retry.");
+    }
     return mode;
   }
 
@@ -297,12 +305,38 @@ export class FleetStore {
   // An agent's own ask (agent-ask) also carries mergeAsk (it asks to merge,
   // so it holds until answered or merged) and askedBy ("judge" when the
   // judge raised it, which reads the chat only before a nudge).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null } = {}) {
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null, contextSnapshot = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
     // while the ask stays open.
     const origin = { askContext: clampTail(redactSecrets(askContext), ASK_CONTEXT_MAX) || null, agentAskedAt: agentAskedAt ?? null };
+    const cleanContext = isObject(contextSnapshot) ? structuredClone(contextSnapshot) : null;
+    const mergeContext = (prev, next, expectedPrRef = null) => {
+      if (!next && !isObject(prev)) return undefined;
+      const keepPrevPr = isObject(prev?.pr)
+        && (!expectedPrRef || !prev.pr.ref || prev.pr.ref === expectedPrRef)
+        && (!next?.pr?.ref || !prev.pr.ref || prev.pr.ref === next.pr.ref);
+      if (!isObject(next)) {
+        if (!isObject(prev)) return undefined;
+        return keepPrevPr ? prev : { ...prev, pr: null };
+      }
+      if (!isObject(prev)) return next;
+      const nextClean = Object.fromEntries(
+        Object.entries(next).filter(([k, v]) => k !== "pr" && v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))
+      );
+      const nextPrClean = isObject(next.pr)
+        ? Object.fromEntries(Object.entries(next.pr).filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0)))
+        : null;
+      const mergedPr = nextPrClean
+        ? { ...(keepPrevPr ? prev.pr : {}), ...nextPrClean }
+        : (keepPrevPr ? prev.pr : null);
+      return {
+        ...prev,
+        ...nextClean,
+        pr: mergedPr
+      };
+    };
     const fields = {
       ...(card ? { card: clampText(redactSecrets(card), this.limits.cardBodyMax) } : {}),
       threadKey: threadKey ?? null,
@@ -328,7 +362,8 @@ export class FleetStore {
       // scanAskedAt: only a scan asking it sets this (a reopen does not).
       // Asking again does not push its expiry back (liveSinceMs).
       Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
-      if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
+      if (!existing.askContext && (origin.askContext || origin.agentAskedAt)) Object.assign(existing, origin);
+      if (cleanContext) existing.contextSnapshot = mergeContext(existing.contextSnapshot, cleanContext, fields.prRef);
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
@@ -358,13 +393,14 @@ export class FleetStore {
     // The agent asks again in a newer message while its last ask is still
     // open: one question per agent, so the open one takes the new ask in
     // place (same id, same outreach copy, no second push).
-    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now);
+    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now, cleanContext, mergeContext);
     if (superseded) return superseded;
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
       keepReviewWording(resolved, fields);
-      Object.assign(resolved, fields, origin.askContext ? origin : {}, {
+      const mergedSnap = mergeContext(resolved.contextSnapshot, cleanContext, fields.prRef);
+      Object.assign(resolved, fields, (origin.askContext || origin.agentAskedAt) ? origin : {}, mergedSnap ? { contextSnapshot: mergedSnap } : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
         reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
         lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
@@ -376,7 +412,8 @@ export class FleetStore {
       id: makeId("fq"),
       dedupeKey: key,
       ...fields,
-      ...(origin.askContext ? origin : {}),
+      ...((origin.askContext || origin.agentAskedAt) ? origin : {}),
+      ...(cleanContext ? { contextSnapshot: cleanContext } : {}),
       ...(head ? { askedHead: head } : {}),
       status: "open",
       answer: null,
@@ -414,10 +451,14 @@ export class FleetStore {
 
   // The owner answered, but the answer could not be typed yet: the question
   // is answered (off the owner's list) and its message waits to be sent.
-  queueAnswer(id, answer, message) {
+  // typedOnly: a risky ask's, sent only typed into the app. messageMax: an
+  // owner's reply keeps all its words. The kept message keeps its line
+  // breaks, as an immediate send would.
+  queueAnswer(id, answer, message, { typedOnly = false, messageMax = this.limits.bodyMax } = {}) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
-    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampTextLines(message, Math.max(this.limits.bodyMax, messageMax)), since: iso(this.now()),
+      ...(typedOnly ? { typedOnly: true } : {}) } });
   }
 
   queuedAnswers() {
@@ -472,7 +513,7 @@ export class FleetStore {
   // The review kept an open question. A rewrite changes the same record
   // (same dedupeKey), so its outreach copy updates in place; askedAs keeps
   // the policy's wording so the next tick's ask does not undo it.
-  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null } = {}) {
+  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null, brief = null, recommendation = null, suggestedReplies = null } = {}) {
     const question = this._findQuestion(id);
     if (!question || question.status !== "open") return null;
     const now = iso(this.now());
@@ -488,9 +529,21 @@ export class FleetStore {
     }
     // Kept again with nothing changed: the supervisor checks it less often.
     const streak = fingerprint && fingerprint === question.reviewFingerprint ? (question.reviewStreak ?? 0) + 1 : 0;
+    const nextBrief = (brief && typeof brief === "object") || recommendation || (Array.isArray(suggestedReplies) && suggestedReplies.length)
+      ? {
+          context: brief?.context ? clampText(redactSecrets(brief.context), 240) : (question.reviewBrief?.context ?? null),
+          whatChanged: brief?.whatChanged ? clampText(redactSecrets(brief.whatChanged), 500) : (question.reviewBrief?.whatChanged ?? null),
+          decision: brief?.decision ? clampText(redactSecrets(brief.decision), 260) : (question.reviewBrief?.decision ?? null),
+          recommendation: recommendation ? clampText(redactSecrets(recommendation), 200) : (question.reviewBrief?.recommendation ?? null),
+          suggestedReplies: Array.isArray(suggestedReplies) && suggestedReplies.length
+            ? suggestedReplies.slice(0, 4).map((item) => clampText(redactSecrets(item), 120)).filter(Boolean)
+            : (question.reviewBrief?.suggestedReplies ?? [])
+        }
+      : (question.reviewBrief ?? null);
     Object.assign(question, {
       reviewedAt: now, reviewFingerprint: fingerprint, reviewReason: clampText(reason, 160) || null, reviewCategory: category ?? null,
-      reviewStreak: streak
+      reviewStreak: streak,
+      ...(nextBrief ? { reviewBrief: nextBrief } : {})
     });
     this._save();
     return { ...question };
@@ -663,6 +716,16 @@ export class FleetStore {
   saveDiagnosis(patch) {
     Object.assign(this.state.diagnosis, patch);
     this._save();
+  }
+
+  preferences() {
+    return normalizePreferences(this.state.preferences);
+  }
+
+  savePreferences(next) {
+    this.state.preferences = normalizePreferences(next);
+    this._save();
+    return this.preferences();
   }
 
   // ─── infra escalations and outages ──────────────────────────────────────
@@ -1013,7 +1076,7 @@ export class FleetStore {
   // PR) keeps its push and its expiry; a different one is put to the owner
   // anew, with its own day and push (milan: a new decision 23 h into an old
   // ask would expire an hour later, never pushed, then stay quiet a day).
-  _supersedeAgentAsk(key, fields, origin, head, now) {
+  _supersedeAgentAsk(key, fields, origin, head, now, contextSnapshot = null, mergeContext = null) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
     const askedAt = toMs(origin.agentAskedAt, null);
     if (askedAt === null) return null;
@@ -1029,8 +1092,12 @@ export class FleetStore {
     const body = norm(fields.body);
     const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
       || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
+    const mergedSnap = typeof mergeContext === "function"
+      ? mergeContext(older.contextSnapshot, contextSnapshot, fields.prRef)
+      : (contextSnapshot ?? older.contextSnapshot);
     Object.assign(older, fields, origin, {
-      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      ...(mergedSnap ? { contextSnapshot: mergedSnap } : {}),
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0, reviewBrief: null,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
       ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
     });
@@ -1188,7 +1255,8 @@ export class FleetStore {
       fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
       suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
-      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
+      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
+      preferences: normalizePreferences(raw.preferences)
     };
   }
 

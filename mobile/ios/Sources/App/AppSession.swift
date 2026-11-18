@@ -135,25 +135,22 @@ final class AppSession {
         }
     }
 
-    // Back to the Mac. What was added here while away goes to it first; if
-    // the Mac still can't be reached, this throws and nothing switches.
-    // The current screen's model is detached only once the Mac has the work,
-    // so a failed attempt leaves the iPhone agent exactly as it was.
-    func switchBackToServer(detaching current: AppModel? = nil) async throws -> Int {
-        guard let backup = serverBackup else {
-            current?.detach()
+    // Restore the existing enrollment. Offline uploads run separately: an
+    // older server or a failed upload must not block a valid connection.
+    func switchBackToServer(detaching current: AppModel? = nil) async throws {
+        guard let backup = serverBackup ?? Credentials.load().flatMap({ $0.isEmbedded ? nil : $0 }) else {
             chooseServer()
-            return 0
+            return
         }
         let client = DaemonClient(server: backup.server, nodeID: backup.nodeID, token: backup.token)
-        let sent = try await OfflineCopy.shared.sendOfflineWork(to: client)
-        current?.detach()
-        // The Mac's own queued work, parked when the app left it.
-        try? OutboundQueue.parkedForServer().move(to: OutboundQueue())
-        try backup.save()
-        paired()
+        try await SavedServerReconnect.restore(client: client, persist: { try backup.save() }, activate: {
+            current?.detach()
+            try? OutboundQueue.parkedForServer().move(to: OutboundQueue())
+            paired()
+        })
+        // The embedded daemon keeps each page until its upload is accepted.
+        // A failed upload therefore remains available on the phone for retry.
         Task { await OfflineCopy.shared.sync(from: client, force: true) }
-        return sent
     }
 
     // The Mac is unreachable: continue on this iPhone with the offline copy.
@@ -204,6 +201,15 @@ final class AppSession {
             mode = nil
             phase = .welcome
         }
+    }
+}
+
+@MainActor
+enum SavedServerReconnect {
+    static func restore(client: DaemonClient, persist: () throws -> Void, activate: () -> Void) async throws {
+        try await client.heartbeat()
+        try persist()
+        activate()
     }
 }
 

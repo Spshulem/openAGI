@@ -115,22 +115,30 @@ final class OutreachConsumer: ObservableObject {
     }
   }
 
+  private static let maxRetainedItems = 200
+
   private func ingest(_ incoming: [OutreachItem]) {
+    var byId: [String: OutreachItem] = Dictionary(
+      items.map { ($0.id, $0) },
+      uniquingKeysWith: { existing, incoming in
+        existing.seq >= incoming.seq ? existing : incoming
+      }
+    )
     for item in incoming.sorted(by: { $0.seq < $1.seq }) {
       // Drop items already resolved server-side; only surface live ones.
       let resolved = (item.status == "acted" || item.status == "dismissed")
       if resolved {
-        items.removeAll { $0.id == item.id }
+        byId.removeValue(forKey: item.id)
         continue
       }
-      // A reworded item (new seq, same id) replaces its row in place.
-      if let index = items.firstIndex(where: { $0.id == item.id }) {
-        items[index] = item
-        continue
+      let isNew = byId[item.id] == nil
+      byId[item.id] = item
+      if isNew, presented.insert(item.id).inserted {
+        NotificationPresenter.shared.present(item)
       }
-      items.insert(item, at: 0)
-      if presented.insert(item.id).inserted { NotificationPresenter.shared.present(item) }
     }
+    let ordered = byId.values.sorted { $0.seq > $1.seq }
+    items = Array(ordered.prefix(Self.maxRetainedItems))
   }
 
   // Server resolved an item out-of-band (cross-device act, cron, auto-resolve).

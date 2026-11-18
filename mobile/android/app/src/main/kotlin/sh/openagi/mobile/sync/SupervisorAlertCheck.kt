@@ -34,7 +34,9 @@ suspend fun <T> withAlertLock(block: suspend () -> T): T = checkLock.withLock { 
 // then would wrongly clear pings the owner has not acted on yet.
 suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient, onState: (FleetState) -> Unit = {}): AlertCheckResult = checkLock.withLock {
     val app = context.applicationContext
-    val paired = Credentials.load(app) ?: return@withLock AlertCheckResult.Unauthorized
+    val credentials = Credentials.load(app) ?: return@withLock AlertCheckResult.Unauthorized
+    if (!client.belongsTo(credentials)) return@withLock AlertCheckResult.Unauthorized
+    if (credentials.isEmbedded) return@withLock AlertCheckResult.NoSupervisor
     val state = try {
         client.fleetState()
     } catch (cancellation: CancellationException) {
@@ -49,7 +51,7 @@ suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient, onStat
     // The fetch can take seconds. A pairing forgotten meanwhile has already
     // cleared its notifications; posting this old daemon's questions now
     // would bring them back under nobody's credential.
-    if (Credentials.load(app) != paired) return@withLock AlertCheckResult.Unauthorized
+    if (Credentials.load(app) != credentials) return@withLock AlertCheckResult.Unauthorized
     // The main may answer with a placeholder while its coding node is down.
     // It is reachable, but these are not new counts or resolved questions.
     if (!state.questionsAuthoritative) return@withLock AlertCheckResult.Offline

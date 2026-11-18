@@ -43,10 +43,14 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let risky: Bool
   /// The agent message the ask came from (untrusted, redacted).
   let askContext: String?
+  /// The hub takes a typed reply for it (POST /fleet/api/questions/:id
+  /// { reply }). False from a hub before it.
+  var canReply: Bool = false
+  let project: String?
 
   enum CodingKeys: String, CodingKey {
     case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
-    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext
+    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project
   }
 
   /// Why the supervisor's review kept it, or the close the owner overrode
@@ -125,6 +129,8 @@ extension FleetQuestion {
     chats = ((try? c.decodeIfPresent([Lossy<FleetOpenChat>].self, forKey: .chats)) ?? []).compactMap { $0.value }
     risky = (try? c.decodeIfPresent(Bool.self, forKey: .risky)) ?? false
     askContext = try? c.decodeIfPresent(String.self, forKey: .askContext)
+    canReply = (try? c.decodeIfPresent(Bool.self, forKey: .canReply)) ?? false
+    project = try? c.decodeIfPresent(String.self, forKey: .project)
   }
 }
 
@@ -227,7 +233,8 @@ struct FleetState: Decodable, Equatable {
 extension FleetState {
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
-    mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? "observe"
+    // Empty until the fleet computer has reported one: never a guess.
+    mode = (try? c.decodeIfPresent(String.self, forKey: .mode)) ?? ""
     enabled = (try? c.decodeIfPresent(Bool.self, forKey: .enabled)) ?? false
     running = (try? c.decodeIfPresent(Bool.self, forKey: .running)) ?? false
     lastTickAt = try? c.decodeIfPresent(String.self, forKey: .lastTickAt)

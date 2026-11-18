@@ -1,6 +1,8 @@
 // Owner-only context for a thread already present in the fleet. Reads stay
 // bounded and use source paths/IDs from the scan, never from the caller.
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createHash } from "node:crypto";
 import { SUPERVISOR_PREFIX, openReadOnlyDb, parseJsonLines, readTail, redactSecrets, toIso } from "./contracts.js";
 import { cleanCodexUserText, userInputKind } from "./sources/codex.js";
@@ -115,7 +117,63 @@ function lastExchange(thread, reason) {
   return boundConversation(messages, true, reason);
 }
 
+function findLinkedTranscript(thread, config) {
+  const home = config?.paths?.home || os.homedir();
+  const aliases = Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases : [];
+  const cwd = typeof thread?.meta?.paseoCwd === "string" ? thread.meta.paseoCwd.trim() : "";
+  for (const alias of aliases) {
+    const [kind, id] = String(alias ?? "").split(":");
+    if (!id || !/^[A-Za-z0-9_.-]+$/.test(id)) continue;
+    if (kind === "claude") {
+      if (cwd) {
+        const slug = cwd.replace(/[^A-Za-z0-9_-]/g, "-");
+        const direct = path.join(home, ".claude", "projects", slug, `${id}.jsonl`);
+        if (fs.existsSync(direct)) return { kind: "claude", file: direct };
+      }
+      const projectsRoot = path.join(home, ".claude", "projects");
+      try {
+        for (const entry of fs.readdirSync(projectsRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const candidate = path.join(projectsRoot, entry.name, `${id}.jsonl`);
+          if (fs.existsSync(candidate)) return { kind: "claude", file: candidate };
+        }
+      } catch { /* ignore */ }
+    } else if (kind === "codex") {
+      const sessionsRoot = path.join(home, ".codex", "sessions");
+      try {
+        for (const y of fs.readdirSync(sessionsRoot)) {
+          const yDir = path.join(sessionsRoot, y);
+          for (const m of fs.readdirSync(yDir)) {
+            const mDir = path.join(yDir, m);
+            for (const d of fs.readdirSync(mDir)) {
+              const dDir = path.join(mDir, d);
+              for (const fn of fs.readdirSync(dDir)) {
+                if (fn.endsWith(".jsonl") && fn.includes(id)) return { kind: "codex", file: path.join(dDir, fn) };
+              }
+            }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  return null;
+}
+
 export async function readThreadConversation(thread, config) {
+  if (thread.kind === "paseo") {
+    const conv = thread.meta?.conversation ?? [];
+    if (conv.length) return boundConversation(conv, true);
+    const linked = findLinkedTranscript(thread, config);
+    if (linked) {
+      const text = readTail(linked.file, READ_BYTES);
+      const messages = linked.kind === "codex" ? codexConversation(text) : claudeConversation(text);
+      if (messages.length) return boundConversation(messages, fs.statSync(linked.file).size > READ_BYTES);
+    }
+    if (thread.lastUserText || thread.lastAgentFull || thread.lastAgentText) {
+      return lastExchange(thread, null);
+    }
+    return boundConversation([], true);
+  }
   if (["codex", "claude"].includes(thread.kind) && thread.meta?.file) {
     const file = thread.meta.file;
     const text = readTail(file, READ_BYTES);

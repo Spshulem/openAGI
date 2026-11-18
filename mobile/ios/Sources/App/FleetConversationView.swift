@@ -3,6 +3,8 @@ import SwiftUI
 struct FleetConversationView: View {
     @Environment(AppModel.self) private var model
     let thread: FleetThread
+    var fallbackMessages: [SupervisorRecentMessage] = []
+    var fallbackSummary: String? = nil
     @State private var detail: FleetThreadDetail?
     @State private var loading = false
     @State private var error: String?
@@ -39,15 +41,36 @@ struct FleetConversationView: View {
                         Text("No conversation messages were available in the latest read.")
                             .font(Theme.Typography.body).foregroundStyle(Theme.muted)
                     }
+                } else if !fallbackMessages.isEmpty {
+                    Text("Saved recent turns from this coding session.")
+                        .font(Theme.Typography.caption).foregroundStyle(Theme.muted)
+                    ForEach(fallbackMessages) { message in
+                        VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
+                            HStack {
+                                Text(message.role == "user" ? "You" : "Agent")
+                                Spacer()
+                                if let at = message.at { Text(at, format: .dateTime.month(.abbreviated).day().hour().minute()) }
+                            }
+                            .font(Theme.Typography.caption).foregroundStyle(Theme.muted)
+                            MarkdownContent(blocks: MarkdownParser.parse(message.text))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        RowHairline()
+                    }
                 } else if let detail {
                     Text("This host didn’t return conversation history. Run a scan and try again; older servers need an update.")
                         .font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
                     if let message = detail.lastAgentMessage?.text, !message.isEmpty {
                         MarkdownContent(blocks: MarkdownParser.parse(message)).textSelection(.enabled)
                     }
+                } else if let fallbackSummary, !fallbackSummary.isEmpty, error != nil {
+                    Text("Saved summary from this coding session.")
+                        .font(Theme.Typography.caption).foregroundStyle(Theme.muted)
+                    MarkdownContent(blocks: MarkdownParser.parse(fallbackSummary)).textSelection(.enabled)
                 }
                 if loading { ProgressView("Loading conversation…").frame(maxWidth: .infinity) }
-                if let error {
+                if let error, fallbackMessages.isEmpty, (fallbackSummary ?? "").isEmpty {
                     Text(error).font(Theme.Typography.body).foregroundStyle(Theme.alert)
                     Button("Try again") { Task { await load() } }
                 }

@@ -15,6 +15,7 @@
       "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-24T05:31:34.834Z",
+      "raisedAt": "2026-09-24T05:31:34.834Z",
       "expiresAt": null,
       "decidedAt": null,
       "decidedBy": null,

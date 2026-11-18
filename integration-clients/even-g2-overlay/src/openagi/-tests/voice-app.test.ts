@@ -150,3 +150,31 @@ it('the 30-second cap commits once and system exit closes the microphone and soc
   expect(f.phone.set).toHaveBeenCalledWith('Supervisor voice', expect.stringContaining('30-second limit'))
   await f.app.systemExit(); expect(f.sockets[0].close).toHaveBeenCalledOnce(); expect(f.audio.active).toBe(false)
 })
+
+it('talking on Supervisor home focuses the lead PM card automatically without opening menus', async () => {
+  const f = await fixture()
+  try {
+    f.app.proactive.items = [{
+      id: 'o-pr-88',
+      cardId: 'q:fq_88',
+      cardKind: 'pr_ready',
+      questionId: 'fq_88',
+      threadKey: 'codex:auth',
+      prRef: 'acme/api#88',
+      pmBrief: 'Auth refresh green · Rec: Merge PR #88',
+      primaryLabel: 'Merge PR',
+      supervisor: true,
+      title: 'PR #88 ready',
+      summary: 'Auth refresh green',
+      category: 'approvals',
+      important: true,
+      seen: false,
+      action: 'act-fleet-card',
+    }]
+    expect(f.app.holdStart()).toBe(true)
+    await f.ready()
+    const focus = { view: 'supervisor', cardId: 'q:fq_88', questionId: 'fq_88', threadKey: 'codex:auth', prRef: 'acme/api#88' }
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'start', gesture: 'tap', mode: 'ptt', focus })
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'context', focus })
+  } finally { await f.app.systemExit() }
+})

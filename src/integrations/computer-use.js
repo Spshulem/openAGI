@@ -609,6 +609,9 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           note: "The approved computer-use session is already active. Continue with computer_screenshot / computer_click / etc; do not request approval again."
         };
       }
+      // The approval may outlive a cached local readiness check. Refresh
+      // before resolving its immutable target; never substitute another node.
+      await runtime.nodeCapabilities?.refresh?.();
       const explicit = explicitComputerNode();
       const selected = explicit?.kind === "http" && explicit.id === args.nodeId
         ? explicit

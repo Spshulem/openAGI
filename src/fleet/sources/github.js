@@ -5,7 +5,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { clampText, parsePrRef, prRefKey, repoFromRemote, runCommand } from "../contracts.js";
+import { clampText, clampTextLines, parsePrRef, prRefKey, redactSecrets, repoFromRemote, runCommand } from "../contracts.js";
 
 const BATCH_SIZE = 20;
 const GH_TIMEOUT_MS = 60_000;
@@ -37,7 +37,7 @@ export const DEFAULT_REQUIRED_CHECKS = Object.freeze({
 });
 
 const PR_FRAGMENT = [
-  "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
+  "fragment P on PullRequest { number url title body additions deletions changedFiles state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
   " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:100){nodes{__typename",
   " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state createdAt}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
@@ -300,6 +300,16 @@ function uiPrefixesFor(repo, config) {
   return config?.uiPathPrefixes?.[repo] ?? DEFAULT_UI_PATH_PREFIXES[repo] ?? null;
 }
 
+export function summarizePrBody(body) {
+  const raw = String(body ?? "").replace(/<!--[\s\S]*?-->/g, "");
+  const cleaned = raw
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\|.*(?:codex-pull-request-review|token usage|cost estimate)/i.test(line))
+    .join("\n");
+  const summary = clampTextLines(redactSecrets(cleaned), 900);
+  return summary || null;
+}
+
 export function normalizePr(repo, node, config) {
   const number = Number(node.number);
   const headOid = node.headRefOid ?? "";
@@ -311,6 +321,11 @@ export function normalizePr(repo, node, config) {
     number,
     url: node.url ?? `https://github.com/${repo}/pull/${number}`,
     title: clampText(node.title, 200),
+    bodySummary: summarizePrBody(node.body),
+    additions: Number.isFinite(Number(node.additions)) ? Number(node.additions) : null,
+    deletions: Number.isFinite(Number(node.deletions)) ? Number(node.deletions) : null,
+    changedFiles: Number.isFinite(Number(node.changedFiles)) ? Number(node.changedFiles) : (files.length || null),
+    files: files.slice(0, 12),
     state: node.state ?? null,
     isDraft: Boolean(node.isDraft),
     headRef: node.headRefName ?? "",

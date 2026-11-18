@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@evenrealities/even_hub_sdk':
-        specifier: 0.0.15
-        version: 0.0.15
+        specifier: 0.0.16
+        version: 0.0.16
       zod:
         specifier: 4.4.3
         version: 4.4.3
@@ -132,8 +132,8 @@ packages:
     resolution: {integrity: sha512-+CNAzxglkrpNf/kKywqQfk74QjtceuOE7Qm+AF8miRvPF/wmmK5+OJOgVh3AVTT3RP2mH3+FOaxlE5v72owk0A==}
     engines: {node: ^20.19.0 || ^22.13.0 || >=24}
 
-  '@evenrealities/even_hub_sdk@0.0.15':
-    resolution: {integrity: sha512-N4SuDg/4MIgpah61IJAdtzOMcUg05/x0jz/+FkEdPnd9Dq7pCgOq5AtOSoU2i00hoYCOCdRSlBjWyq8LQCsfDQ==}
+  '@evenrealities/even_hub_sdk@0.0.16':
+    resolution: {integrity: sha512-8/qMR4W3vna6xAM5/dFDmKoTR98D7Vo3TDBrtS0JgdUSvBVyAnUXuhODI3H587fI2TfLbp4T+FNT3EdkB3+Big==}
     engines: {node: ^20.0.0 || >=22.0.0}
 
   '@evenrealities/evenhub-cli@0.1.13':
@@ -1337,7 +1337,7 @@ snapshots:
       '@eslint/core': 1.2.1
       levn: 0.4.1
 
-  '@evenrealities/even_hub_sdk@0.0.15': {}
+  '@evenrealities/even_hub_sdk@0.0.16': {}
 
   '@evenrealities/evenhub-cli@0.1.13(typescript@5.9.3)':
     dependencies:

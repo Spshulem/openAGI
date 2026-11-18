@@ -17,8 +17,13 @@ android {
         targetSdk = 36
         versionCode = 9
         versionName = "0.1.8"
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        externalNativeBuild { cmake { arguments += listOf("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON", "-DANDROID_STL=c++_shared") } }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+
+    ndkVersion = "27.2.12479018"
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 
     buildTypes {
         release {
@@ -45,6 +50,7 @@ android {
 
     sourceSets {
         getByName("main").kotlin.srcDir("src/main/kotlin")
+        getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/daemonAssets"))
         getByName("test").kotlin.srcDir("src/test/kotlin")
     }
 
@@ -90,4 +96,12 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
+
+val prepareEmbeddedRuntime by tasks.registering(Exec::class) {
+    workingDir(rootDir)
+    commandLine("bash", "scripts/prepare-embedded-runtime.sh")
+}
+tasks.configureEach {
+    if (name == "preBuild" || name.startsWith("configureCMake") || name.startsWith("mergeDebugAssets") || name.startsWith("mergeReleaseAssets")) dependsOn(prepareEmbeddedRuntime)
 }

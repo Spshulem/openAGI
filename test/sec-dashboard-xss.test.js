@@ -297,3 +297,17 @@ test("SEC-4: the login page is served with the same headers", async () => {
     _resetDataDirCache();
   }
 });
+
+
+test("onboarding links stay local and separated ordered-list items retain their numbers", async () => {
+  const { script } = await dashboard();
+  const render = shippedRenderMarkdown(script);
+  const output = render("1. First\n\nDetails\n\n2. Second\n\nMore details\n\n3. Third");
+  assert.match(output, /<ol><li>First<\/li><\/ol>/);
+  assert.match(output, /<ol start="2"><li>Second/);
+  assert.match(output, /<ol start="3"><li>Third/);
+  assert.match(render("[Set up](/?tab=coding-agents)"), /href="\/\?tab=coding-agents"/);
+  for (const url of ["//evil.example", "/\\evil.example", "/?tab=coding-agents&token=secret", "/unknown"]) {
+    assert.doesNotMatch(render("[Open](" + url + ")"), /href=/);
+  }
+});
