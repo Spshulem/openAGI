@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { TaskStore } from "../src/task-store.js";
 import { TaskSweep } from "../src/task-sweep.js";
+import { buildMobileSummary, summaryETag } from "../src/mobile-summary.js";
 
 const dataDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "openagi-sweep-"));
 
@@ -83,4 +84,75 @@ test("archives terminal tasks older than the window", async () => {
   assert.equal(r.archived, 1, "the completed task is archived");
   assert.equal(store.get(done.id), null, "archived task removed from active store");
   assert.ok(store.get(keep.id), "pending task retained");
+});
+
+test("review receives time and bounded context for an expired one-time task", async (t) => {
+  const dir = dataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new TaskStore({ runtime: {}, dataDir: dir });
+  const expired = store.add({ title: "Review the group order", description: "Order closes at 2026-01-01T12:00:00Z.", dueDate: "2026-01-01T12:00:00Z" }, { source: "inbox", queue: "user" });
+  const keep = store.add({ title: "Finish a long-term project", description: "x".repeat(1500), dueDate: "2026-01-01" }, { source: "observer", queue: "user" });
+  const now = new Date("2026-02-01T12:00:00Z");
+  const provider = {
+    isConfigured: () => true,
+    generate: async ({ input, instructions }) => {
+      assert.ok(instructions.includes(now.toISOString()));
+      assert.match(instructions, /Age or an overdue date ALONE is not evidence/);
+      const tasks = JSON.parse(input);
+      const order = tasks.find((v) => v.title === expired.title);
+      assert.equal(order.description, expired.description);
+      assert.equal(order.dueDate, expired.dueDate);
+      assert.equal(order.createdAt, expired.createdAt);
+      assert.equal(order.updatedAt, expired.updatedAt);
+      assert.equal(tasks.find((v) => v.title === keep.title).description.length, 1000);
+      return { text: JSON.stringify(tasks.map((v) => ({ i: v.i, queue: "user", action: null, stale: v.title === expired.title }))) };
+    }
+  };
+  const runtime = { tasks: store, agentHost: { modelProvider: provider } };
+  const sweep = runtime.taskSweep = new TaskSweep({ runtime });
+  const before = summaryETag(buildMobileSummary(runtime, { now }));
+  const result = await sweep.sweep({ now });
+  assert.equal(result.review.status, "reviewed");
+  assert.equal(store.get(expired.id).status, "cancelled");
+  assert.equal(store.get(keep.id).status, "pending", "overdue work is retained without evidence it is obsolete");
+  assert.equal(buildMobileSummary(runtime, { now }).taskReview.lastReviewedAt, now.toISOString());
+  assert.notEqual(summaryETag(buildMobileSummary(runtime, { now })), before);
+  assert.deepEqual(new TaskSweep({ runtime }).reviewStatus, sweep.reviewStatus, "review status survives daemon restart");
+});
+
+test("failed or unavailable model review never advances the last successful review", async (t) => {
+  const dir = dataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new TaskStore({ runtime: {}, dataDir: dir });
+  const task = store.add({ title: "Keep this unfinished work" }, { source: "inbox", queue: "user" });
+  const runtime = { tasks: store, agentHost: { modelProvider: llmProvider(() => ({ queue: "user", action: null, stale: false })) } };
+  const sweep = new TaskSweep({ runtime });
+  await sweep.sweep({ now: new Date("2026-02-01T00:00:00Z") });
+  const successful = sweep.reviewStatus.lastReviewedAt;
+  for (const text of ["not json", "[]", '[{"i":0,"queue":"user","stale":"true"}]']) {
+    runtime.agentHost.modelProvider = { isConfigured: () => true, generate: async () => ({ text }) };
+    await sweep.sweep({ now: new Date("2026-02-02T00:00:00Z") });
+    assert.equal(sweep.reviewStatus.status, "failed");
+    assert.equal(sweep.reviewStatus.lastReviewedAt, successful);
+    assert.equal(store.get(task.id).status, "pending");
+  }
+  runtime.agentHost.modelProvider = null;
+  await sweep.sweep();
+  assert.equal(sweep.reviewStatus.status, "unavailable");
+  assert.equal(sweep.reviewStatus.lastReviewedAt, successful);
+  fs.writeFileSync(sweep.reviewFile, "corrupt optional metadata");
+  assert.equal(new TaskSweep({ runtime }).reviewStatus, null, "metadata damage cannot block startup");
+});
+
+test("an empty sweep reports no tasks, and summary refresh does not run a review", async (t) => {
+  const dir = dataDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const runtime = { tasks: new TaskStore({ runtime: {}, dataDir: dir }) };
+  runtime.taskSweep = new TaskSweep({ runtime });
+  assert.equal(buildMobileSummary(runtime).taskReview, null);
+  const { review } = await runtime.taskSweep.sweep();
+  assert.equal(review.status, "no_tasks");
+  assert.ok(review.lastReviewedAt);
+  buildMobileSummary(runtime);
+  assert.deepEqual(runtime.taskSweep.reviewStatus, review);
 });

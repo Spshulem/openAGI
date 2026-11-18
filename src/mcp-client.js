@@ -1,3 +1,4 @@
+import { collectMcpTools } from "./mcp-tool-list.js";
 import { spawn } from "node:child_process";
 import { appendJsonLine, ensureDir } from "./file-utils.js";
 import path from "node:path";
@@ -94,8 +95,7 @@ export class McpStdioClient {
         { timeoutMs: 300000 }
       );
       this.notify("notifications/initialized", {});
-      const list = await this.request("tools/list", {}, { timeoutMs: 60000 });
-      this.tools = list?.tools ?? [];
+      this.tools = await collectMcpTools((method, params) => this.request(method, params, { timeoutMs: 60000 }));
       this.connected = true;
       this.lastError = null;
       return { tools: this.tools, serverInfo: this.serverInfo };
@@ -114,8 +114,7 @@ export class McpStdioClient {
 
   async listTools() {
     if (!this.connected) await this.connect();
-    const list = await this.request("tools/list", {});
-    this.tools = list?.tools ?? this.tools;
+    this.tools = await collectMcpTools((method, params) => this.request(method, params));
     return this.tools;
   }
 

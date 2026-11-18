@@ -478,9 +478,15 @@ export function extractAttributedText(body) {
   i += 1;
   if (i >= buf.length) return "";
   let len = buf[i++];
-  if (len === 0x81) { len = buf.readUInt16LE(i); i += 2; }
-  else if (len === 0x82) { len = buf.readUInt32LE(i); i += 4; }
-  if (!Number.isFinite(len) || len <= 0) return "";
+  if (len === 0x81) {
+    if (i + 2 > buf.length) return "";
+    len = buf.readUInt16LE(i); i += 2;
+  }
+  else if (len === 0x82) {
+    if (i + 4 > buf.length) return "";
+    len = buf.readUInt32LE(i); i += 4;
+  }
+  if (!Number.isFinite(len) || len <= 0 || i + len > buf.length) return "";
   // Strip U+FFFC (object-replacement) placeholders that mark inline attachments.
   return buf.slice(i, Math.min(i + len, buf.length)).toString("utf8").replace(/￼/g, "").trim();
 }

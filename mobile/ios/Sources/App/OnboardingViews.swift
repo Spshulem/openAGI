@@ -6,14 +6,20 @@ import UIKit
 
 // First run: where should the agent run? This iPhone is the default and
 // needs nothing else; a server can be added now or later from Settings.
-struct WelcomeView: View {
+struct StepByStepWelcomeView: View {
     @Environment(AppSession.self) private var session
+    var showChat: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Text("Your personal agent for chat, tasks and memory.")
+                    Text("Choose where it runs, connect a model or server, then start chatting. No OpenAGI account is required.")
+                        .foregroundStyle(.secondary)
+                }
+                if let error = session.setupError {
+                    Section { Text(error).foregroundStyle(.red) }
                 }
                 Section {
                     Button("On this iPhone", systemImage: "iphone") { session.choosePhone() }
@@ -32,8 +38,32 @@ struct WelcomeView: View {
                 } footer: {
                     Text("Use an existing OpenAGI agent on your Mac or server. You can connect later in Settings.")
                 }
+                Section("Connecting your devices") {
+                    Label("On the same Wi-Fi, Find servers looks for an announcement from the updated desktop app or daemon. Update and restart it first.", systemImage: "wifi")
+                    Label("Over Tailscale, enter your main server's DNS name from the Tailscale device list. Wi-Fi announcements don't cross Tailscale.", systemImage: "network")
+                    Label("A public HTTPS server address works over the internet without Tailscale.", systemImage: "globe")
+                    Label("Get a one-time code from OpenAGI on your Mac: Connect a phone… Or use Nodes → Connect a phone on your main server's dashboard.", systemImage: "key")
+                }
+                if session.mode != nil {
+                    Section {
+                        Text("Your existing pairing, models and conversations stay saved while you run setup again.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
+            .accessibilityIdentifier("setup-welcome")
             .navigationTitle("OpenAGI")
+            .toolbar {
+                if let showChat {
+                    ToolbarItem(placement: .primaryAction) { Button("Chat setup", action: showChat) }
+                }
+                if session.mode != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Return to app") { session.goBack() }
+                            .accessibilityIdentifier("setup-cancel")
+                    }
+                }
+            }
         }
     }
 }
@@ -56,15 +86,18 @@ struct PhoneSetupView: View {
     @State private var step: Step = .model
     @State private var modelStatus = OnDeviceModelStatus.current()
     @State private var credentials: Credentials?
-    @State private var name = ""
+    @State private var name = "OpenAGI"
     @State private var focus = ""
     @State private var isWorking = false
     @State private var errorText: String?
     @State private var showingModelSettings = false
+    @State private var startedAutomatically = false
+    @State private var usingLocalModel = false
 
     var body: some View {
         NavigationStack {
-            Form {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
                     switch step {
                     case .model: modelStep
                     case .starting: startingStep
@@ -73,16 +106,27 @@ struct PhoneSetupView: View {
                     case .brain: brainStep
                     case .notifications: notificationsStep
                     }
+                }
+                .padding(24)
+                .frame(maxWidth: 600)
+                .frame(maxWidth: .infinity)
             }
+            .textFieldStyle(.roundedBorder)
             .navigationTitle("Set up your agent")
             .navigationBarTitleDisplayMode(.inline)
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { modelStatus = OnDeviceModelStatus.current() }
             }
+            .task {
+                guard !startedAutomatically else { return }
+                startedAutomatically = true
+                if modelStatus == .available { start() }
+            }
             .toolbar {
-                if step == .model {
+                if step != .starting {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Back") { session.goBack() }
+                        Button(session.mode == nil ? "Back" : "Cancel setup") { session.goBack() }
+                            .disabled(isWorking)
                     }
                 }
             }
@@ -185,8 +229,10 @@ struct PhoneSetupView: View {
 
     @ViewBuilder private var notificationsStep: some View {
         header("Stay in the loop", "Allow local notifications for a morning plan and evening recap. iOS controls when background refresh can run; open the app to keep them current.")
-        PrimaryButton(title: "Turn on notifications") { requestNotifications() }
+        PrimaryButton(title: "Turn on notifications", isLoading: isWorking) { requestNotifications() }
+            .disabled(isWorking)
         SecondaryTextButton(title: "Not now") { finish() }
+            .disabled(isWorking)
     }
 
     // MARK: Actions
@@ -237,6 +283,15 @@ struct PhoneSetupView: View {
         Task {
             do {
                 credentials = try await PhoneAgent.bringUp()
+                if let credentials, modelStatus == .available {
+                    let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+                    do {
+                        try await PhoneModelSetup.useLocal(client: client, availability: modelStatus)
+                        usingLocalModel = true
+                    } catch {
+                        errorText = error.localizedDescription
+                    }
+                }
                 step = .name
             } catch {
                 step = .startFailed(error.localizedDescription)
@@ -254,7 +309,7 @@ struct PhoneSetupView: View {
                     "name": name.trimmingCharacters(in: .whitespacesAndNewlines),
                     "focus": focus.trimmingCharacters(in: .whitespacesAndNewlines)
                 ])
-                step = .brain
+                step = usingLocalModel ? .notifications : .brain
             } catch {
                 errorText = "Couldn't save that. Try again."
             }
@@ -262,7 +317,10 @@ struct PhoneSetupView: View {
     }
 
     private func requestNotifications() {
+        guard !isWorking else { return }
+        isWorking = true
         Task {
+            defer { isWorking = false }
             _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
             if let credentials { await PhoneAgent.refreshDigests(credentials) }
             finish()
@@ -270,7 +328,7 @@ struct PhoneSetupView: View {
     }
 
     private func finish() {
-        guard let credentials else { return }
+        guard session.phase == .phoneSetup, let credentials else { return }
         session.finishPhoneSetup(credentials)
     }
 

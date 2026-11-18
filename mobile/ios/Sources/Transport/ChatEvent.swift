@@ -12,6 +12,35 @@ import Foundation
 public struct ChatStatusFrame: Codable, Sendable, Equatable {
     public let stage: String
     public let sessionId: String?
+    // The tool a hop is running ("fleet_status"), when the stage is one.
+    public let tool: String?
+
+    public init(stage: String, sessionId: String? = nil, tool: String? = nil) {
+        self.stage = stage
+        self.sessionId = sessionId
+        self.tool = tool
+    }
+
+    // Plain words for what the agent is doing, shown while a reply streams:
+    // the tool it is running, else its stage. Matches Android's
+    // chatActivityLabel.
+    public var activityLabel: String? {
+        if let tool = tool?.trimmingCharacters(in: .whitespacesAndNewlines), !tool.isEmpty {
+            return "Using " + tool.replacingOccurrences(of: "_", with: " ")
+        }
+        let stage = stage.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch stage {
+        case "": return nil
+        // Every model hop reports `model`, and a queued local turn `queued`:
+        // say what the person sees, not the pipeline's stage name.
+        case "routing", "queued": return "Getting started"
+        case "thinking", "model": return "Thinking"
+        case "saving": return "Saving"
+        default:
+            let words = stage.replacingOccurrences(of: "-", with: " ")
+            return words.prefix(1).uppercased() + words.dropFirst()
+        }
+    }
 }
 
 public struct ChatSessionFrame: Codable, Sendable, Equatable {

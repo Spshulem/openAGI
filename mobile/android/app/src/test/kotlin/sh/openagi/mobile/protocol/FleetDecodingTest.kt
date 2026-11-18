@@ -317,4 +317,58 @@ class FleetDecodingTest {
         assertTrue(question.answeredInAgentApp)
     }
 
+
+    private fun detail(json: String): FleetThreadDetail =
+        FleetJson.json.decodeFromString(FleetThreadDetailResult.serializer(), json).thread!!
+
+    @Test
+    fun decodesTheConversation() {
+        val thread = detail(
+            """
+            {"thread": {"key": "codex:abc", "conversation": {"truncated": true, "unavailableReason": null, "messages": [
+              {"id": "m1", "role": "user", "text": "Fix the test", "at": "2026-11-10T09:00:00.000Z"},
+              {"id": "m2", "role": "assistant", "text": "Which one?", "at": "2026-11-10T09:01:00.000Z", "extra": 1}
+            ]}}}
+            """,
+        )
+        val conversation = thread.conversation!!
+        assertTrue(conversation.truncated)
+        assertNull(conversation.unavailableReason)
+        assertEquals(listOf("m1", "m2"), conversation.messages.map { it.id })
+        assertTrue(conversation.messages[0].fromOwner)
+        assertFalse(conversation.messages[1].fromOwner)
+        assertEquals(Instant.parse("2026-11-10T09:01:00Z"), conversation.messages[1].at)
+    }
+
+    @Test
+    fun aConversationIsReadLossily() {
+        val thread = detail(
+            """
+            {"thread": {"key": "codex:abc", "conversation": {"truncated": "yes", "unavailableReason": "Only the last exchange could be read.",
+              "messages": [{"role": "assistant", "text": "kept", "at": "not a date"}, {"role": "user", "text": {"x": 1}}, 7, null,
+                           {"role": "assistant", "text": "   "}, {"text": "no role"}]}}}
+            """,
+        )
+        val conversation = thread.conversation!!
+        assertFalse(conversation.truncated)
+        assertEquals("Only the last exchange could be read.", conversation.unavailableReason)
+        assertEquals(listOf("kept", "no role"), conversation.messages.map { it.text })
+        assertNull(conversation.messages[0].at)
+        assertFalse(conversation.messages[1].fromOwner)
+    }
+
+    @Test
+    fun noConversationOnAnOlderHubOrAnOddShape() {
+        assertNull(detail("""{"thread": {"key": "codex:abc"}}""").conversation)
+        assertNull(detail("""{"thread": {"key": "codex:abc", "conversation": null}}""").conversation)
+        assertNull(detail("""{"thread": {"key": "codex:abc", "conversation": "text"}}""").conversation)
+        val empty = detail("""{"thread": {"key": "codex:abc", "conversation": {"messages": "nope"}}}""").conversation!!
+        assertTrue(empty.messages.isEmpty())
+    }
+
+    @Test
+    fun canReplyDefaultsToFalse() {
+        val questions = decode("""{"questions":[{"id":"a"},{"id":"b","canReply":true},{"id":"c","canReply":null}]}""").questions
+        assertEquals(listOf(false, true, false), questions.map { it.canReply })
+    }
 }

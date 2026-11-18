@@ -76,13 +76,19 @@ public enum HostAllowlist {
     }
 
     private static func isCGNAT(_ host: String) -> Bool {
-        let parts = host.split(separator: ".").compactMap { Int($0) }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count == 4, labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy({ $0.isASCII && $0.isNumber }) }) else { return false }
+        let parts = labels.compactMap { Int($0) }
         guard parts.count == 4, parts.allSatisfy({ (0...255).contains($0) }) else { return false }
         return parts[0] == 100 && (64...127).contains(parts[1])
     }
 
     private static func isPrivateOrTailscale(_ host: String) -> Bool {
-        let parts = host.split(separator: ".").compactMap { Int($0) }
+        // Do not discard nonnumeric labels: a public name such as
+        // 10.0.0.5.attacker.example must never count as a private IP.
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count == 4, labels.allSatisfy({ !$0.isEmpty && $0.allSatisfy({ $0.isASCII && $0.isNumber }) }) else { return false }
+        let parts = labels.compactMap { Int($0) }
         guard parts.count == 4, parts.allSatisfy({ (0...255).contains($0) }) else { return false }
         switch (parts[0], parts[1]) {
         case (10, _): return true

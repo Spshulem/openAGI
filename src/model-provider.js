@@ -1,3 +1,4 @@
+import { imageContent, imageHistory, unsupportedImageInput } from "./message-attachments.js";
 import { redactFailureDiagnostic } from "./agent-failure.js";
 import { ModelRouter } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
@@ -33,8 +34,9 @@ export class DeterministicModelProvider {
     return true;
   }
 
-  async generate({ input, scrutiny, memoryHits = [], agent, messages = [], tools = [], toolRegistry, context = {}, onProgress, onTextDelta }) {
+  async generate({ input, attachments = [], scrutiny, memoryHits = [], agent, messages = [], tools = [], toolRegistry, context = {}, onProgress, onTextDelta }) {
     notifyProgress(onProgress, { stage: "model", provider: this.name, model: "deterministic", hop: 1, maxToolHops: 1 });
+    if (attachments.length) throw unsupportedImageInput();
     const text = String(input ?? "").trim();
     const lower = text.toLowerCase();
     const lines = [];
@@ -109,7 +111,7 @@ export class OpenAIResponsesProvider {
     return this.router.allowed?.(chosen) ?? chosen;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
+  async generate({ input, attachments = [], instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
     const model = this.resolveModel({ model: modelOverride, tier, task });
     let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
@@ -128,11 +130,11 @@ export class OpenAIResponsesProvider {
     // function_call items never touched.
     const contextWindow = new ToolLoopContext({ maxInputTokens: this.maxInputTokens });
     const conversationInput = [
-      ...messages.slice(-12).map((message) => contextWindow.mark({
+      ...imageHistory(messages, input, attachments).map((message) => contextWindow.mark({
         role: message.role === "assistant" ? "assistant" : "user",
-        content: message.content
+        content: imageContent(message.content, message.role === "user" ? message.metadata?.attachments : [])
       }, { kind: "history" })),
-      contextWindow.mark({ role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }, { kind: "anchor" })
+      contextWindow.mark({ role: "user", content: imageContent(contextBlock ? `${contextBlock}\n\n${input}` : input, attachments) }, { kind: "anchor" })
     ];
 
     const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
@@ -436,7 +438,7 @@ export class AnthropicProvider {
     return this.router.allowed?.(chosen) ?? chosen;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
+  async generate({ input, attachments = [], instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
     if (!this.apiKey) throw new Error("ANTHROPIC_API_KEY is not configured.");
     const model = this.resolveModel({ model: modelOverride, tier, task });
     let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
@@ -457,11 +459,11 @@ export class AnthropicProvider {
     const contextBlock = turnContext ?? buildTurnContext({ scrutiny, memoryHits });
     const contextWindow = new AnthropicToolLoopContext({ maxInputTokens: this.maxInputTokens });
     const convo = [
-      ...messages.slice(-12).map((m) => contextWindow.mark({
+      ...imageHistory(messages, input, attachments).map((m) => contextWindow.mark({
         role: m.role === "assistant" ? "assistant" : "user",
-        content: m.content
+        content: imageContent(m.content, m.role === "user" ? m.metadata?.attachments : [], "anthropic")
       }, { kind: "history" })),
-      { role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }
+      { role: "user", content: imageContent(contextBlock ? `${contextBlock}\n\n${input}` : input, attachments, "anthropic") }
     ];
 
     const toolCalls = [];

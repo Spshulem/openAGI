@@ -822,7 +822,7 @@ function seedCapeTown(home, title = "BOB briefs stale data fix") {
   const result = (id, text, parent = null) => ({ type: "user", session_id: "s-cape", parent_tool_use_id: parent, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] } });
   addMessage(db, "s-cape", "user", `Ship ${BB_PULL}/6817 first, then build on top of #5544`, iso(300 * MIN));
   addMessage(db, "s-cape", "assistant", sdk.text("s-cape", "Merged #6817. Building on top of #5544."), iso(290 * MIN));
-  addMessage(db, "s-cape", "assistant", call("toolu_m4", "ssh dev@100.99.3.113 'cd ~/scratch/bob-fresh && gh pr create -R buildbetter-app/buildbetter --draft --base feature/bob-brief-skill'", "toolu_sub1"), iso(200 * MIN));
+  addMessage(db, "s-cape", "assistant", call("toolu_m4", "ssh dev@192.0.2.10 'cd ~/scratch/bob-fresh && gh pr create -R buildbetter-app/buildbetter --draft --base feature/bob-brief-skill'", "toolu_sub1"), iso(200 * MIN));
   addMessage(db, "s-cape", "assistant", result("toolu_m4", `ok ${BB_PULL}/7089\n`, "toolu_sub1"), iso(199 * MIN));
   addMessage(db, "s-cape", "assistant", call("toolu_cm", "gh pr comment 7089 --body-file /tmp/c.md", "toolu_sub1"), iso(198 * MIN));
   addMessage(db, "s-cape", "assistant", result("toolu_cm", `${BB_PULL}/7089#issuecomment-5939150350`, "toolu_sub1"), iso(197 * MIN));
@@ -871,7 +871,7 @@ test("a gh pr create on the line after a heredoc body is the chat's PR", async (
   const home = makeHome(t);
   const file = seedCapeTown(home);
   const db = new DatabaseSync(file);
-  const command = "cd /Users/shooby/Dev/bbapp/.worktrees/proposal-expiry && cat > /tmp/proposal-expiry-pr-body.md <<'EOF'\nChat inbox and triage proposals now last 24 hours.\nEOF\ngh pr create --repo buildbetter-app/buildbetter --base main --title \"Proposals last 24 hours\" --body-file /tmp/proposal-expiry-pr-body.md";
+  const command = "cd /Users/example/Dev/app/.worktrees/proposal-expiry && cat > /tmp/proposal-expiry-pr-body.md <<'EOF'\nChat inbox and triage proposals now last 24 hours.\nEOF\ngh pr create --repo buildbetter-app/buildbetter --base main --title \"Proposals last 24 hours\" --body-file /tmp/proposal-expiry-pr-body.md";
   addMessage(db, "s-cape", "assistant", { type: "assistant", session_id: "s-cape", parent_tool_use_id: null,
     message: { role: "assistant", model: "claude-opus-5-5", content: [{ type: "tool_use", id: "toolu_heredoc", name: "Bash", input: { command } }] } }, iso(2 * MIN));
   addMessage(db, "s-cape", "assistant", { type: "user", session_id: "s-cape", parent_tool_use_id: null,

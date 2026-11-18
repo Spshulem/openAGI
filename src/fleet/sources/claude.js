@@ -143,7 +143,7 @@ function blockText(content) {
     .map((block) => block.text).join("\n").trim();
 }
 
-function isOwnerText(row, text) {
+export function isOwnerText(row, text) {
   if (NON_OWNER_ORIGINS.has(row.origin?.kind)) return false;
   if (NON_OWNER_TURNS.has(row.turnOrigin)) return false;
   if (row.promptSource === "system") return false;

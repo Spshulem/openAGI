@@ -1,6 +1,6 @@
 import Foundation
 
-public struct PairingPayload: Sendable, Equatable {
+public struct PairingPayload: Sendable, Hashable {
     public let serverURL: URL
     public let code: String
 

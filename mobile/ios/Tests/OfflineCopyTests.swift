@@ -8,6 +8,8 @@ final class OfflineCopyTests: XCTestCase {
         XCTAssertEqual(OfflineCopy.itemCount(work), 7)
         XCTAssertEqual(OfflineCopy.itemCount(Data(#"{"version":1,"messages":{"agent":[],"supervisor":[]},"tasks":[],"memories":[]}"#.utf8)), 0)
         XCTAssertEqual(OfflineCopy.itemCount(Data("nope".utf8)), 0)
+        let named = Data(#"{"messages":{"agent":[],"supervisor":[],"agent:00000000-0000-4000-8000-000000000001":[{},{}]},"tasks":[],"memories":[]}"#.utf8)
+        XCTAssertEqual(OfflineCopy.itemCount(named), 2, "Named chat work must trigger upload before acknowledgment")
     }
 
     @MainActor

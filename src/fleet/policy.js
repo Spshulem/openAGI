@@ -82,6 +82,8 @@ export function chooseRoute(thread, mode, delivery = null) {
   // Antigravity takes messages through its own API (agentapi send-message):
   // nothing is typed or forked, the app shows it in the conversation, so
   // every delivery mode may use it.
+  if (thread.excluded === "paseo-migrated") return null;
+  if (thread.kind === "paseo") return "paseo-send";
   if (thread.kind === "antigravity") return "antigravity-send";
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
@@ -186,6 +188,7 @@ function makeContext(classified, thread, options) {
   const delivery = options.delivery ?? config?.delivery ?? null;
   return {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery, config,
+    contextualIdleReview: options.contextualIdleReview === true,
     // The owner's own Push now (supervisor pushNow): see resolveNudge.
     ownerPush: options.ownerPush === true,
     mutedKeys: keySet(options.mutedKeys),
@@ -221,17 +224,19 @@ function intentFor(ctx) {
 
 function idleIntent(ctx) {
   const { classified, thread, ledger, limits, now } = ctx;
-  if (!classified.idle?.promised) return { type: "none", reason: classified.reason };
-  // Fresh stops only: an old thread's last words are history. Measured from
-  // the words, not activity (a delivered nudge is activity too).
+  const contextual = ctx.contextualIdleReview && thread.agentStatus === "idle"
+    && Boolean(thread.lastAgentFull || thread.lastAgentText || thread.lastUserText);
+  if (!contextual && !classified.idle?.promised) return { type: "none", reason: classified.reason };
+  // The mechanical fallback only handles fresh promises. A contextual review
+  // can assess old work instead of discarding it solely because of age.
   const quietMs = msSince(thread.lastAgentAt, now);
-  if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
+  if (!contextual && (quietMs === null || quietMs > limits.idleReportMaxAgeMs)) return { type: "none", reason: classified.reason };
   // A daily cap, whatever its progress mark says: a shared checkout's head
   // moves with other agents' commits.
   // Deliveries only: a send blocked while the owner types is no nudge.
   const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && entry.status === "sent" && now - Date.parse(entry.at) < DAY_MS).length;
   if (sentToday >= IDLE_REPORT_DAILY_MAX) return { type: "none", reason: `${classified.reason}; idle-report sent ${sentToday} times today` };
-  return nudge("idle-report", "said it would keep going, then stopped");
+  return nudge("idle-report", contextual ? "idle conversation needs contextual review" : "said it would keep going, then stopped", { requiresJudge: contextual });
 }
 
 function nudge(playbook, reason, extra = {}) {
@@ -480,20 +485,35 @@ function cardIntent(ctx, card) {
   const oldest = items[0];
   const item = card.app === "codex" ? items.at(-1) : items[0];
   const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
-  const head = clampText(item.header || item.question, 50);
+  const namedHeader = item.header && !/^question\s+\d+$/i.test(String(item.header).trim()) ? item.header : null;
+  const head = clampText(namedHeader || item.question, 50);
   const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
   const extra = item.multiSelect ? " Pick any." : "";
-  const others = items.filter((other) => other !== item).map((other) => clampText(other.header || other.question, 60));
+  const others = items.filter((other) => other !== item).map((other) => {
+    const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
+      ? (other.question || other.header)
+      : (other.header || other.question);
+    return clampText(label, 60);
+  });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
   const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
+  const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
+    ? item.options.slice(0, 3)
+    : [];
+  const clampedChoices = rawChoices.map((opt) => clampText(opt, 40));
+  const needsNumberPrefix = rawChoices.some((opt, idx) => opt.length > 40 || clampedChoices.indexOf(clampedChoices[idx]) !== idx);
+  const inlineOptions = rawChoices.length > 0
+    ? [...rawChoices.map((opt, idx) => (needsNumberPrefix ? clampText(`${idx + 1}. ${opt}`, 40) : opt)), "open thread"]
+    : ["open thread"];
   const question = {
-    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
-      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options],
+      ...(card.requestId ? { paseoPermissionId: String(card.requestId) } : {})
     },
     ...(late ? { baseKey: key } : {}),
     agentAskedAt: item.at ?? null
@@ -534,6 +554,31 @@ function agentAskIntent(ctx) {
   const ask = classified.ask ?? {};
   if (ask.card) return cardIntent(ctx, ask.card);
   if (thread.meta?.blockedOnOwner === true) {
+    const paseoPerm = thread.kind === "paseo" ? thread.meta?.pendingPermission : null;
+    if (paseoPerm && paseoPerm.id) {
+      const permWhat = paseoPerm.command
+        ? `Run \`${paseoPerm.command}\``
+        : paseoPerm.filePath
+          ? `Modify \`${paseoPerm.filePath}\``
+          : (paseoPerm.description || paseoPerm.title || paseoPerm.name || "Approve requested tool action");
+      const permLabels = Array.isArray(paseoPerm.actions) && paseoPerm.actions.length >= 2
+        ? paseoPerm.actions.slice(0, 2).map((a) => a.label).filter(Boolean)
+        : ["Allow", "Deny"];
+      return {
+        type: "ask", reason: "blocked on a permission prompt",
+        question: {
+          ...question(
+            ctx,
+            `${ctx.facts.label}: allow ${fact(paseoPerm.name || paseoPerm.kind || "tool", 24)}?`,
+            ownerExcerpt(permWhat, ctx.limits.bodyMax),
+            [...permLabels, "later"],
+            `prompt:${thread.key}:${paseoPerm.id}`,
+            "prompt"
+          ),
+          meta: { paseoPermissionId: paseoPerm.id }
+        }
+      };
+    }
     // A card the supervisor read on screen: its own buttons are the options,
     // and a tap clicks that button (supervisor.answerQuestion). A new card is
     // a new question (its stateId is in the key).
@@ -615,7 +660,7 @@ function resolveIntent(ctx, intent) {
 
 function resolveNudge(ctx, intent, base) {
   const { thread, limits, now, ledger } = ctx;
-  const decision = { ...base, playbook: intent.playbook, reason: intent.reason };
+  const decision = { ...base, playbook: intent.playbook, reason: intent.reason, ...(intent.requiresJudge ? { requiresJudge: true } : {}) };
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (ctx.ownerPush) return pushedNudge(ctx, intent, decision, playbook);
@@ -674,7 +719,13 @@ function resolveNudge(ctx, intent, base) {
     // computer-use-first too for a thread no CLI may reach (the Codex app's).
     const waitUi = uiWaitReason(thread, ctx.delivery) ?? (codexExecBarred(thread) ? uiBlockedReason(thread, ctx.delivery) : null);
     if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
-    return { ...unreachableDecision(ctx, decision), uiBlocked };
+    const unavailable = { ...unreachableDecision(ctx, decision), uiBlocked };
+    if (intent.requiresJudge) return {
+      ...decision, action: "nudge", route: null,
+      message: "Review whether this idle conversation has unfinished authorized work before asking the owner to restore access.",
+      deferredRouteDecision: unavailable
+    };
+    return unavailable;
   }
   const message = `${reply.prefix}${renderTemplate(playbook.body, vars)}`;
   const messageHash = shortHash(message);
@@ -1396,8 +1447,13 @@ function agentLabel(thread) {
 export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
-  const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
-    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
+  const rawWorkspace = /^(?:wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
+  const rawPaseoTitle = thread.kind === "paseo" ? stripTags(thread.title) : "";
+  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|you are working inside conductor\b.*)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
+  const place = fact(rawWorkspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
+    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
+    || cleanPaseoTitle
+    || (thread.kind === "paseo" ? fact(String(thread.meta?.paseoCwd ?? "").replace(/\/+$/, "").split("/").pop(), 30) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
   return place || `${kindName(thread.kind)} chat`;
 }
@@ -1424,7 +1480,9 @@ function ownerExcerpt(text, max) {
 }
 
 function stripTags(text) {
-  return String(text ?? "").replace(/<[^>]{0,200}>/g, " ");
+  return String(text ?? "")
+    .replace(/<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:<\/(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)/gi, " ")
+    .replace(/<[^>]{0,200}>/g, " ");
 }
 
 function question(ctx, title, body, options, dedupeKey, kind) {

@@ -213,6 +213,7 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| GET | `/mobile/capabilities` | authenticated image-upload support preflight |
 | POST | `/mobile/push` | iOS push registration, §7.1 |
 | DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
@@ -239,7 +240,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | GET | `/fleet/api/state` | fleet supervisor state, see "Fleet supervisor routes" below |
 | POST | `/fleet/api/scan` | no body; runs a scan and returns state (can take ~100s) |
 | POST | `/fleet/api/mode` | body `{"mode": "observe"\|"propose"\|"auto"}`; returns state |
-| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}` or `{"dismiss": true}` |
+| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}`, `{"reply": "<1-2000 chars>"}` (only when the question's `canReply` is true) or `{"dismiss": true}` |
+| POST | `/fleet/api/send` | body `{"threadKey": "<row key>", "message": "<1-2000 chars>", "queue"?: true}`; the owner's own message to one thread |
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
@@ -270,6 +272,15 @@ listed path are refused with `401`. Shapes are the daemon's
   is `404` (`409` only when it closed during the request): treat both as
   "already closed" and refresh. An answer that relays to a live session can
   take up to ~190s.
+- A reply (`{"reply"}`) goes to the asking thread as `Owner says: <text>`.
+  `delivery.status` `sent` or `queued` (kept until the Mac can type) closes
+  the question; `blocked` or `failed` leaves it open with `delivery.detail`.
+  `409` when the question's `canReply` is false. `canReply` is true only for
+  a single-thread `agent-ask`, `stuck` or `ready` question. A `risky`
+  question's answer or reply is only typed into the agent's app, never
+  relayed or resumed; without a way to type it is `blocked` ("approve it in
+  the chat").
+- `POST /fleet/api/send` → `{delivery, state}`.
 - `POST /fleet/api/actions/:id/send` → `{action, delivery, state}`; `409` when
   the action is not a proposed one (for example after leaving propose mode),
   `404` when the id is unknown.
@@ -279,6 +290,36 @@ listed path are refused with `401`. Shapes are the daemon's
 Supervisor chat is the ordinary `POST /message` with `"thread": "supervisor"`
 (§3.1). The agent has two read-only tools for it, `fleet_status` and
 `fleet_thread`.
+
+### Image attachments
+
+`POST /message` also accepts `attachments` in both `agent` and `supervisor`
+threads. Each item is `{id, name, mimeType, data, thumbnail?}`: `data` is base64
+JPEG, PNG or WebP, and `thumbnail` is an optional base64 JPEG preview. No URLs
+or filesystem paths are accepted. Up to four images, 1 MiB each and 3 MiB total,
+fit within the 5 MiB JSON request limit. An empty text plus images is a valid turn.
+
+The iOS Photos and Files pickers downsample images off the main thread, normalize
+orientation, remove source metadata, and show removable previews before sending.
+Before uploading, iOS checks the authenticated `/mobile/capabilities` response
+for image support. A missing or unsupported endpoint shows update guidance and
+keeps the draft and its attachments available for retry.
+OpenAI/ChatGPT, Claude and compatible local vision models receive native image
+content blocks. Language-only on-device models explicitly report that a vision
+model is required. Old servers reject images with update guidance; the phone
+never retries an image turn as text alone.
+
+Full image data is retained in the agent session for subsequent model turns.
+Shared history returns only attachment identity/name and a bounded thumbnail;
+SSE does not echo the pixels. The phone caches only these small previews.
+
+Offline conversation mirrors carry validated full image attachments separately
+from bounded public message metadata. Pages and snapshots containing photos use
+mirror version 2; text-only payloads remain version 1. New readers accept both.
+Legacy readers reject version 2 before acknowledging an upload, so the phone
+retains unsent originals rather than replacing them with a text-only snapshot.
+Both import paths restore the validated pixels to message attachments without
+importing owner-authority metadata.
 
 ### 3.1 Chat threads
 
@@ -440,6 +481,14 @@ whole protocol:
 - `brief.headline` is one human-readable sentence assembled server-side
   ("2 things today, 1 overdue, 3 waiting on you").
 
+`taskReview` is optional (older servers omit it). It reports the latest
+relevance sweep as `{status, attemptedAt, lastReviewedAt}`. Status is `reviewed`,
+`no_tasks`, `unavailable` (no configured model), or `failed`. `lastReviewedAt`
+advances only after a complete valid review, or a sweep with no active tasks;
+a failed attempt retains the prior successful timestamp. Fetching the summary
+only syncs saved work; it does not trigger a relevance review. Age alone is
+not evidence that an unfinished task should be removed.
+
 ### ETag / 304
 
 The response carries an `ETag` header computed over the **entire payload
@@ -549,6 +598,7 @@ Response — verified live against the daemon:
       "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-20T01:40:25.625Z",
+      "raisedAt": "2026-09-20T01:40:25.625Z",
       "expiresAt": null,
       "decidedAt": null,
       "decidedBy": null,
@@ -563,6 +613,13 @@ Response — verified live against the daemon:
 OpenAGI chat). `mode` is `queue` (waits for an approval surface), `chat`
 (raised in the owner's own chat, which answers it by code) or `owner` (a
 record of a call the owner's own instruction ran; never pending).
+
+`raisedAt` is when the agent last asked for the card. A repeated request in
+the same chat reuses the pending card rather than making a new one: `createdAt`
+keeps its age, `raisedAt` moves to the new request, and `expiresAt` is renewed
+if the request carries an approval window. Use `raisedAt` for "raised since
+the owner's latest message"; fall back to `createdAt` when it is absent (mains
+older than the field).
 
 (`mobile/fixtures/pending-actions.json` pins the empty-list shape,
 `{"actions": []}`, because the fixture daemon has nothing pending; the object

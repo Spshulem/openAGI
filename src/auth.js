@@ -134,6 +134,22 @@ export function isLoopbackHost(host) {
   return octets[0] === 127; // the whole 127.0.0.0/8 loopback block
 }
 
+// Loopback binding alone does not stop DNS rebinding: a browser can connect
+// to 127.0.0.1 while keeping an attacker's hostname in both Host and Origin.
+// Tokenless installations must only answer a literal loopback authority,
+// including on public and first-run routes. Authenticated tailnet/proxy
+// installations keep accepting their configured external hostnames.
+export function checkRequestHost(req, token) {
+  if (typeof token === "string" && token.trim()) return { ok: true };
+  const authority = req.headers.host;
+  if (typeof authority === "string" && !/[\s/@\\?#]/.test(authority)) {
+    try {
+      if (isLoopbackHost(new URL(`http://${authority}`).hostname)) return { ok: true };
+    } catch { /* malformed authorities fail closed */ }
+  }
+  return { ok: false, reason: "tokenless requests require a loopback Host header" };
+}
+
 // The bind-time authorization policy, kept next to checkAuth so the two are
 // read together.
 //

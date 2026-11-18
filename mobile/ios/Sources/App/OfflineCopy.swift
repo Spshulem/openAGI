@@ -8,7 +8,7 @@ import Observation
 // a snapshot of the Mac's chats, memory, instructions, skills and open
 // tasks. If the Mac can't be reached, the person can continue on the phone
 // agent with that context; when the Mac is back, what was added offline is
-// sent to it (additions only) before switching back.
+// sent to it (additions only) in the background after reconnecting.
 @MainActor
 @Observable
 final class OfflineCopy {
@@ -16,6 +16,7 @@ final class OfflineCopy {
 
     private(set) var lastSyncedAt: Date? = UserDefaults.standard.object(forKey: Keys.lastSynced) as? Date
     private(set) var isSyncing = false
+    private(set) var syncIssue: String?
 
     private enum Keys {
         static let lastSynced = "sh.openagi.offlineCopy.lastSynced"
@@ -42,8 +43,10 @@ final class OfflineCopy {
             let now = Date()
             lastSyncedAt = now
             UserDefaults.standard.set(now, forKey: Keys.lastSynced)
+            syncIssue = nil
             return true
         } catch {
+            syncIssue = "Your phone-local changes are still saved on this iPhone. They haven't finished syncing with the server; reconnecting does not discard them."
             return false
         }
     }

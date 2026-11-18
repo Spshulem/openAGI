@@ -62,7 +62,7 @@ test("missing CLI or legacy empty folders show recovery instead of a start form"
 test("configured start still queues approval with the exact selected identity", async () => {
   const f = await render({ enabled: true, workspaces: [workspace], providers: [provider] });
   const selects = f.elements.filter(e => e.tag === "select");
-  selects[0].value = "codex"; selects[1].value = workspace.id;
+  selects[0].value = workspace.id; selects[1].value = "codex";
   f.elements.filter(e => e.tag === "textarea").at(-1).value = "Inspect the chosen project";
   await f.elements.find(e => e.textContent === "Review start approval").onclick();
   assert.equal(f.sent[0].route, "/coding-agents/start");

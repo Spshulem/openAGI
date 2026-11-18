@@ -27,7 +27,7 @@ struct PairingView: View {
         let candidate = backup ?? Credentials.load()
         let savedServer = candidate.flatMap { $0.isEmbedded ? nil : $0.server }
         self.savedServer = savedServer
-        self.canResumeServer = backup != nil && prefillServer == nil
+        self.canResumeServer = savedServer != nil && prefillServer == nil
         _serverText = State(initialValue: (prefillServer ?? savedServer)?.absoluteString ?? "")
         _codeText = State(initialValue: prefillCode ?? "")
         self.onCancel = onCancel
@@ -48,7 +48,7 @@ struct PairingView: View {
                     }
 
                     if let savedServer {
-                        Text("Your saved server is \(savedServer.absoluteString). Opening this screen does not remove its pairing.")
+                        Text("Your saved server is \(savedServer.absoluteString). Reconnect with the saved pairing; you don't need a new code after a disconnection.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     if canResumeServer {
@@ -57,11 +57,11 @@ struct PairingView: View {
                                 isPairing = true
                                 defer { isPairing = false }
                                 do {
-                                    _ = try await AppSession.shared.switchBackToServer()
+                                    try await AppSession.shared.switchBackToServer()
                                     onPaired()
                                 } catch {
                                     errorHeadline = "Can't return to the saved server yet."
-                                    errorDetail = "Your pairing is still saved. Check Tailscale and the server connection, then try again."
+                                    if let savedServer { errorDetail = ServerConnectionGuidance.savedPairingFailure(error, server: savedServer) }
                                 }
                             }
                         }
@@ -72,8 +72,8 @@ struct PairingView: View {
                     Text("Apple Intelligence chat works without a server on supported iPhones with Apple Intelligence enabled.")
                         .font(.footnote).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 8) {
-                        Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / saved Tailscale", systemImage: "network") {
-                            discovery.start(addresses: [savedServer, URL(string: serverText)].compactMap { $0 })
+                        Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / Tailscale address", systemImage: "network") {
+                            discovery.start(addresses: [savedServer, TailscaleServerAddress.parse(serverText)].compactMap { $0 })
                         }
                         .disabled(discovery.searching)
                         ForEach(discovery.servers) { server in
@@ -81,14 +81,14 @@ struct PairingView: View {
                                 VStack(alignment: .leading) {
                                     Text(server.name)
                                     Text(server.address.absoluteString).font(.caption)
-                                    Text(server.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
+                                    Text(server.reachable.map { $0 ? "Server reachable · pairing not checked" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             .buttonStyle(.bordered)
                         }
                         if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
-                        Text("Nearby discovery uses Bonjour. Tailscale servers are checked by their saved or entered address; keep Tailscale and its DNS enabled.")
+                        Text("Tailscale does not broadcast servers. In Tailscale, open the device list → your Mac or Distiller → copy DNS name. Enter it below, then tap Find servers. Keep Tailscale and Use Tailscale DNS enabled on both devices.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     VStack(alignment: .leading, spacing: 8) {
@@ -109,9 +109,20 @@ struct PairingView: View {
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .keyboardType(.URL)
+                            Text("Use the complete address shown with your code. HTTP and HTTPS can use different ports.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if let server = TailscaleServerAddress.parse(serverText),
+                               ServerConnectionGuidance.requiresTailscale(server) {
+                                Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
+                                    .font(.footnote)
+                                    .accessibilityIdentifier("pairing-tailscale-required")
+                            }
                         }
                         .padding(Theme.Spacing.x4)
                     }
+
+                    Text("Tailscale is optional: use a local Wi-Fi address or your server’s public HTTPS address instead.")
+                        .font(.footnote).foregroundStyle(.secondary)
 
                     VStack(spacing: Theme.Spacing.x2) {
                         Text("Pairing code")
@@ -164,7 +175,7 @@ struct PairingView: View {
     private func pair() async {
         errorHeadline = nil
         errorDetail = nil
-        guard let server = URL(string: serverText), server.host != nil else {
+        guard let server = TailscaleServerAddress.parse(serverText), server.host != nil else {
             errorHeadline = "That address can't be reached from a phone."
             errorDetail = "Enter the full address the daemon printed, including http:// or https://."
             return
@@ -181,6 +192,7 @@ struct PairingView: View {
             )
             let credentials = Credentials(server: server, nodeID: enrollment.node.id, token: enrollment.nodeToken)
             try credentials.save()
+            AppSession.shared.prepareForPairing()
             // Kick the first refresh so the day's tasks are already on disk
             // by the time the tab bar appears; failure here is not fatal to
             // pairing itself, so it's not surfaced as a pairing error.
@@ -189,7 +201,7 @@ struct PairingView: View {
             didPair = true
             onPaired()
         } catch let error as DaemonError {
-            (errorHeadline, errorDetail) = Self.message(for: error)
+            (errorHeadline, errorDetail) = Self.message(for: error, server: server)
         } catch {
             errorHeadline = "Pairing failed."
             errorDetail = error.localizedDescription
@@ -216,7 +228,7 @@ struct PairingView: View {
     }
 
     // DESIGN.md's copy rules, verbatim where they give exact wording.
-    private static func message(for error: DaemonError) -> (headline: String, detail: String) {
+    private static func message(for error: DaemonError, server: URL) -> (headline: String, detail: String) {
         switch error {
         case .unreachableHost(let host) where HostAllowlist.isBlockedByAppTransportSecurity(host):
             return ("That address can't be reached from a phone.",
@@ -228,11 +240,11 @@ struct PairingView: View {
             return ("That code didn't work.", "Codes last 30 minutes and work once. Run openagi pair-phone for a new one.")
         case .conflict:
             return ("This phone is already paired.", "Revoke it from Settings first, then pair again.")
-        case .transport:
-            return ("Can't reach OpenAGI.", "Check the address and that your phone can reach the daemon.")
+        case .transport(let cause):
+            return ("Can't reach OpenAGI.", PairingConnectionFailure.detail(for: cause, server: server))
         case .mainConnection(let issue):
             return ("Main connection needs attention", issue.message)
-        case .notFound, .server, .malformedResponse, .agentHostDisabled:
+        case .notFound, .server, .malformedResponse, .agentHostDisabled, .imagesUnsupported:
             return ("Pairing failed.", "Try again.")
         }
     }

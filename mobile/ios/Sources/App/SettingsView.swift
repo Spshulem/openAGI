@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.appCanvas) private var canvas
     let onRevoked: () -> Void
 
     @State private var path: [WorkspaceDestination] = []
@@ -15,6 +16,13 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             Form {
+                Section("App") {
+                    NavigationLink {
+                        AppearanceView()
+                    } label: {
+                        Label("Appearance", systemImage: "paintpalette")
+                    }
+                }
                 Section {
                     LabeledContent("Runs on", value: model.isOnPhone ? "This iPhone" : "Server")
                     if !model.isOnPhone {
@@ -24,11 +32,19 @@ struct SettingsView: View {
                                 .textSelection(.enabled)
                                 .multilineTextAlignment(.trailing)
                         }
+                        if case .offline = model.lastOutcome,
+                           ServerConnectionGuidance.requiresTailscale(model.credentials.server) {
+                            Label("Server unreachable. " + ServerConnectionGuidance.tailscaleRequirement, systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     LabeledContent("Data", value: model.dataStatus)
                         .accessibilityIdentifier("settings-data-status")
                     if let issue = model.mainConnectionIssue {
                         Text(issue.message).foregroundStyle(.secondary)
+                    }
+                    if let issue = OfflineCopy.shared.syncIssue {
+                        Text(issue).font(.footnote).foregroundStyle(.secondary)
                     }
                     if let fetchedAt = model.snapshot?.fetchedAt {
                         LabeledContent("Last synced") {
@@ -57,6 +73,18 @@ struct SettingsView: View {
                 }
 
                 WorkspaceSection()
+
+                Section {
+                    Button("Run setup again", systemImage: "arrow.counterclockwise") {
+                        dismiss()
+                        AppSession.shared.restartOnboarding(from: model)
+                    }
+                    .accessibilityIdentifier("settings-restart-setup")
+                } header: {
+                    Text("Setup")
+                } footer: {
+                    Text("Replay the welcome and setup screens. Your pairing, saved models and conversations are kept. Use Return to app to leave setup.")
+                }
 
                 Section {
                     Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
@@ -89,6 +117,8 @@ struct SettingsView: View {
 
                 Section("About") {
                     LabeledContent("Version", value: Self.buildVersion)
+                    Link("Privacy Policy", destination: URL(string: "https://github.com/Spshulem/openAGI/blob/main/mobile/PRIVACY.md")!)
+                    Link("Support", destination: URL(string: "https://github.com/Spshulem/openAGI/issues")!)
                     if !model.isOnPhone {
                         LabeledContent("Phone ID") {
                             Text(model.credentials.nodeID)
@@ -107,6 +137,8 @@ struct SettingsView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(canvas)
             .accessibilityIdentifier("settings-form")
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -164,9 +196,9 @@ struct SettingsView: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            _ = try await AppSession.shared.switchBackToServer(detaching: model)
+            try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            switchError = "Can't reach your server yet. Your work stays on this iPhone until it can."
+            switchError = ServerConnectionGuidance.savedPairingFailure(error, server: AppSession.shared.serverBackup?.server ?? model.credentials.server)
         }
     }
 

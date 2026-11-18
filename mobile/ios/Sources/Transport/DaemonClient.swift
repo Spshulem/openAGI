@@ -31,6 +31,7 @@ public enum DaemonError: Error {
     // and it is not "the server broke" -- it is a legible, expected state
     // chat's UI must say plainly rather than showing a generic server error.
     case agentHostDisabled
+    case imagesUnsupported
     case mainConnection(MainConnectionIssue)
 }
 
@@ -49,7 +50,7 @@ extension DaemonError: Equatable {
         case let (.server(a), .server(b)): return a == b
         case (.malformedResponse, .malformedResponse): return true
         case (.transport, .transport): return true
-        case (.agentHostDisabled, .agentHostDisabled): return true
+        case (.agentHostDisabled, .agentHostDisabled), (.imagesUnsupported, .imagesUnsupported): return true
         case let (.mainConnection(a), .mainConnection(b)): return a == b
         default: return false
         }
@@ -92,6 +93,7 @@ public actor DaemonClient {
     // predates shared threads). In memory only: a relaunch probes again, so
     // an updated main is picked up.
     private var sharedThreadsUnsupported = false
+    private var focusedCardUnsupported = false
 
     public init(server: URL, nodeID: String, token: String, session: URLSession = .shared) {
         self.server = server
@@ -270,17 +272,42 @@ public actor DaemonClient {
     // main that still keeps it apart from Chat, and on a newer one the
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
-                                     from: String? = nil, sessionId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [],
+                                     conversationId: String = "main", focusedCardId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+        // Check before uploading pixels. Older mains can reject a large body
+        // before returning a useful error; that is not a dropped agent turn.
+        if !attachments.isEmpty { try await requireImageSupport() }
         var body: [String: Any] = ["text": text]
+        if !attachments.isEmpty {
+            body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
+        }
         if let from { body["from"] = from }
         if let sessionId { body["sessionId"] = sessionId }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        if conversationId != "main" && sharedThreadsUnsupported { throw DaemonError.notFound }
         let bytes: URLSession.AsyncBytes
         if let thread, !sharedThreadsUnsupported {
             var threaded = body
             threaded["thread"] = thread.rawValue
+            if let focusedCardId, !focusedCardId.isEmpty, !focusedCardUnsupported {
+                threaded["focusedCardId"] = focusedCardId
+            }
             do {
                 bytes = try await openMessageStream(body: threaded)
+            } catch is FocusedCardRejected {
+                focusedCardUnsupported = true
+                var fallbackThreaded = body
+                fallbackThreaded["thread"] = thread.rawValue
+                do {
+                    bytes = try await openMessageStream(body: fallbackThreaded)
+                } catch is SharedThreadsRejected {
+                    guard conversationId == "main" else { throw DaemonError.notFound }
+                    sharedThreadsUnsupported = true
+                    bytes = try await openMessageStream(body: body)
+                }
             } catch is SharedThreadsRejected {
+                // A named chat must never fall back into the default chat.
+                guard conversationId == "main" else { throw DaemonError.notFound }
                 // An older main's node-scoped `/message` allows only text,
                 // from, and sessionId, and 400s anything else during
                 // validation -- before the turn runs -- so resending
@@ -312,6 +339,39 @@ public actor DaemonClient {
     }
 
     private struct SharedThreadsRejected: Error {}
+    private struct FocusedCardRejected: Error {}
+
+    private struct MessageCapabilities: Decodable { let imageAttachments: Bool }
+
+    private func requireImageSupport() async throws {
+        let request = try authorizedRequest(path: "/mobile/capabilities", method: "GET")
+        do {
+            let (data, http) = try await perform(request)
+            try Self.requireConversationJSON(data: data, response: http)
+            guard try Self.decodeJSON(MessageCapabilities.self, from: data).imageAttachments else {
+                throw DaemonError.imagesUnsupported
+            }
+        } catch DaemonError.unauthorized {
+            // A legacy route can be owner-only even though this enrollment
+            // is valid. Prove that separately; never replace its credential.
+            try await heartbeat()
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.notFound {
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.malformedResponse {
+            throw DaemonError.imagesUnsupported
+        }
+    }
+
+    private func performConversationRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        do { return try await perform(request) }
+        catch DaemonError.unauthorized {
+            // A valid heartbeat plus a rejected catalog means this feature
+            // is unavailable, not that the saved enrollment has expired.
+            try await heartbeat()
+            throw DaemonError.notFound
+        }
+    }
 
     private func openMessageStream(body: [String: Any]) async throws -> URLSession.AsyncBytes {
         var request = try authorizedRequest(path: "/message", method: "POST")
@@ -342,9 +402,14 @@ public actor DaemonClient {
             // src/hosted-interface.js before shared threads: "node message
             // contains unsupported fields". Only meaningful when `thread`
             // was sent; the caller retries once without it.
-            if http.statusCode == 400, body["thread"] != nil {
+            if http.statusCode == 413, body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+            if http.statusCode == 400 {
                 let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
-                if text.contains("unsupported fields") { throw SharedThreadsRejected() }
+                if text.contains("unsupported fields") {
+                    if body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+                    if body["focusedCardId"] != nil { throw FocusedCardRejected() }
+                    if body["thread"] != nil { throw SharedThreadsRejected() }
+                }
             }
             _ = try validate(response)
         }
@@ -355,12 +420,41 @@ public actor DaemonClient {
     // user/assistant turns, oldest first. A main from before shared threads
     // answers 404 (`DaemonError.notFound`); callers keep their local cache
     // and say the main needs updating.
-    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50) async throws -> ConversationPage {
+    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50, conversationId: String = "main") async throws -> ConversationPage {
         var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100)))]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
         if let before { items.append(URLQueryItem(name: "before", value: before)) }
         let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(ConversationPage.self, from: data)
+    }
+
+    public func conversations() async throws -> [ConversationSummary] {
+        let request = try authorizedRequest(path: "/conversations", method: "GET")
+        let (data, http) = try await performConversationRequest(request)
+        try Self.requireConversationJSON(data: data, response: http)
+        return try Self.decodeJSON(ConversationCatalog.self, from: data).conversations
+    }
+
+    public func createConversation(thread: ConversationThread, sourceId: String? = nil) async throws -> ConversationSummary {
+        var body = ["thread": thread.rawValue]
+        if let sourceId { body["sourceId"] = sourceId }
+        var request = try authorizedRequest(path: "/conversations", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, http) = try await performConversationRequest(request)
+        try Self.requireConversationJSON(data: data, response: http)
+        return try Self.decodeJSON(ConversationSummary.self, from: data)
+    }
+
+    private static func requireConversationJSON(data: Data, response: HTTPURLResponse) throws {
+        // Older dashboards return their HTML app shell with 200 for unknown
+        // GET routes. That is an unsupported catalog, not a lost pairing.
+        let type = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let prefix = String(decoding: data.prefix(128), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if type.contains("text/html") || prefix.hasPrefix("<!doctype html") || prefix.hasPrefix("<html") {
+            throw DaemonError.notFound
+        }
     }
 
     // MARK: - Lifelog
@@ -386,6 +480,18 @@ public actor DaemonClient {
     // state/scan/mode; the Supervisor screen maps both. On a question or an
     // action a 404 means that one item is gone and 409 that it was already
     // closed elsewhere -- `.notFound` / `.conflict`, as everywhere else.
+    public func fleetThreadDetail(key: String) async throws -> FleetThreadDetail {
+        // One identity segment, never an arbitrary caller-supplied path.
+        guard key.range(of: #"^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
+            throw DaemonError.malformedResponse
+        }
+        let request = try authorizedRequest(path: "/fleet/api/threads/\(key)", method: "GET")
+        let (data, _) = try await perform(request)
+        let detail = try Self.decodeJSON(FleetThreadDetailResponse.self, from: data).thread
+        guard detail.key == key else { throw DaemonError.malformedResponse }
+        return detail
+    }
+
     public func fleetState() async throws -> FleetState {
         let request = try authorizedRequest(path: "/fleet/api/state", method: "GET")
         let (data, _) = try await perform(request)
@@ -433,6 +539,88 @@ public actor DaemonClient {
         request.timeoutInterval = 200
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
+    public func fleetActCard(id: String, op: String, value: String? = nil,
+                             clarification: String? = nil, instructions: String? = nil) async throws -> FleetCardActResult {
+        guard !id.isEmpty, !id.contains("/") else { throw DaemonError.malformedResponse }
+        var request = try authorizedRequest(path: "/fleet/api/cards/\(id)/act", method: "POST")
+        var body: [String: Any] = ["op": op]
+        if let value { body["value"] = value }
+        if let clarification { body["clarification"] = clarification }
+        if let instructions { body["instructions"] = instructions }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetCardActResult.self, from: data)
+    }
+
+    public func fleetBatchCards(op: String, filter: String? = nil) async throws -> FleetBatchCardsResult {
+        var request = try authorizedRequest(path: "/fleet/api/cards/batch", method: "POST")
+        var body: [String: Any] = ["op": op]
+        if let filter { body["filter"] = filter }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetBatchCardsResult.self, from: data)
+    }
+
+    public func fleetUpdatePreferences(cadence: String? = nil, mergePolicy: String? = nil,
+                                       choice: String? = nil, vetoSlice: String? = nil,
+                                       vetoActionID: String? = nil) async throws -> FleetState {
+        struct Response: Decodable { let state: FleetState? }
+        var request = try authorizedRequest(path: "/fleet/api/preferences", method: "POST")
+        var body: [String: Any] = [:]
+        if let cadence { body["cadence"] = cadence }
+        if let mergePolicy { body["mergePolicy"] = mergePolicy }
+        if let choice { body["choice"] = choice }
+        if let vetoSlice { body["vetoSlice"] = vetoSlice }
+        if let vetoActionID { body["vetoActionId"] = vetoActionID }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        if let state = (try? Self.decodeJSON(Response.self, from: data))?.state {
+            return state
+        }
+        return try await fleetState()
+    }
+
+    public func fleetSearch(query: String, limit: Int = 20) async throws -> FleetSearchResponse {
+        let items = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "limit", value: String(min(max(limit, 1), 50)))
+        ]
+        let request = try authorizedRequest(path: "/fleet/api/search", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetSearchResponse.self, from: data)
+    }
+
+    public func fleetHierarchy(project: String? = nil, limit: Int = 40) async throws -> FleetHierarchyResponse {
+        var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 60)))]
+        if let project, !project.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(URLQueryItem(name: "project", value: project))
+        }
+        var request = try authorizedRequest(path: "/fleet/api/hierarchy", method: "GET", queryItems: items)
+        request.timeoutInterval = 35
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetHierarchyResponse.self, from: data)
+    }
+
+    public func fleetDispatchGoal(project: String, goal: String, mode: String = "auto", targetKey: String? = nil) async throws -> FleetDispatchGoalResponse {
+        var request = try authorizedRequest(path: "/fleet/api/dispatch", method: "POST")
+        var body: [String: Any] = [
+            "project": project,
+            "goal": goal,
+            "mode": mode
+        ]
+        if let targetKey { body["targetKey"] = targetKey }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 90
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetDispatchGoalResponse.self, from: data)
     }
 
     // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)

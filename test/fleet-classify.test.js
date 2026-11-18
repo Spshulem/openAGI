@@ -710,3 +710,27 @@ test("liveWatch: Waiting on you only while a question the owner can see is open"
   assert.equal(liveWatch(quiet, { state: "idle-no-pr" }), quiet);
   assert.equal(liveWatch(null, { askedAt: ago(1 * MIN) }), null);
 });
+
+test("Paseo native and migration aliases retain self exclusion", () => {
+  for (const provider of ["codex", "claude", "conductor", "antigravity"]) {
+    const thread = makeThread({ kind: "paseo", id: "agent", key: "paseo:host.agent", meta: { aliases: [`${provider}:self-session`] } });
+    assert.equal(classify(thread).reason, "self");
+    assert.notEqual(classify({ ...thread, meta: { aliases: [`${provider}:someone-else`] } }).reason, "self");
+  }
+});
+
+test("classifyThread recognizes waiting on your go and conditional merge/deploy sign-off phrases while respecting negations", () => {
+  for (const text of [
+    "PR #9165 is green — waiting on your go to merge.",
+    "Staging verified. I'll merge once you give the go.",
+    "All checks passed; I won't merge without your approval."
+  ]) {
+    assert.equal(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  }
+  for (const text of [
+    "No longer waiting on your approval.",
+    "Nothing here is waiting on your review."
+  ]) {
+    assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  }
+});

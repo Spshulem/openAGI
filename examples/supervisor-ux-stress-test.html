@@ -1,0 +1,2613 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>OpenAGI Supervisor · P0 iOS Interactive UX Stress Test</title>
+  <style>
+    :root {
+      --bg-page: #07080a;
+      --bg-phone: #0d0e11;
+      --bg-surface: #17191e;
+      --bg-surface-2: #20232a;
+      --bg-surface-3: #2a2e37;
+      --bg-sheet: #15171c;
+      --border: rgba(255, 255, 255, 0.09);
+      --border-strong: rgba(255, 255, 255, 0.18);
+      --ink: #f5f6f8;
+      --muted: #9aa0ae;
+      --subtle: #687080;
+      --white-pill: #f7f8fa;
+      --white-pill-ink: #0d0e11;
+      --green: #32d583;
+      --green-bg: rgba(50, 213, 131, 0.13);
+      --amber: #fdb022;
+      --amber-bg: rgba(253, 176, 34, 0.14);
+      --red: #f97066;
+      --red-bg: rgba(249, 112, 102, 0.14);
+      --blue: #53b1fd;
+      --blue-bg: rgba(83, 177, 253, 0.14);
+      --purple: #a48afb;
+      --purple-bg: rgba(164, 138, 251, 0.14);
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, system-ui, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: radial-gradient(circle at 22% 10%, #161924 0%, var(--bg-page) 55%);
+      color: var(--ink);
+      font-family: var(--font);
+      -webkit-font-smoothing: antialiased;
+      min-height: 100vh;
+    }
+
+    button, input {
+      font-family: inherit;
+    }
+
+    /* Workbench Layout */
+    .workbench {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 20px 24px 36px;
+      display: grid;
+      grid-template-columns: 430px minmax(0, 1fr);
+      gap: 28px;
+      align-items: start;
+    }
+
+    @media (max-width: 980px) {
+      .workbench {
+        grid-template-columns: 1fr;
+        padding: 10px;
+        gap: 18px;
+      }
+    }
+
+    /* iPhone 16 Pro Viewport */
+    .phone-stage {
+      position: sticky;
+      top: 18px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+
+    @media (max-width: 980px) {
+      .phone-stage { position: static; }
+    }
+
+    .phone-frame {
+      width: 402px;
+      max-width: 100%;
+      height: 836px;
+      background: var(--bg-phone);
+      border-radius: 46px;
+      border: 1.5px solid rgba(255, 255, 255, 0.16);
+      box-shadow:
+        0 30px 80px rgba(0, 0, 0, 0.72),
+        0 0 0 6px #050608,
+        inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* iOS Status Bar */
+    .ios-status {
+      height: 44px;
+      padding: 12px 26px 4px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .dynamic-island {
+      width: 108px;
+      height: 26px;
+      border-radius: 99px;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      font-size: 10.5px;
+      color: var(--muted);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+
+    /* Top App Header */
+    .app-header {
+      padding: 6px 16px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+      background: rgba(13, 14, 17, 0.92);
+      backdrop-filter: blur(14px);
+      z-index: 5;
+    }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .thread-switcher {
+      display: inline-flex;
+      background: var(--bg-surface);
+      padding: 3px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      gap: 2px;
+    }
+
+    .thread-btn {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+    }
+
+    .thread-btn.active {
+      background: var(--bg-surface-3);
+      color: var(--ink);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    }
+
+    .badge-count {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--white-pill);
+      color: var(--white-pill-ink);
+    }
+
+    .running-pill {
+      border: 1px solid var(--border-strong);
+      background: var(--bg-surface);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 500;
+      padding: 5px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .running-pill:hover {
+      background: var(--bg-surface-2);
+    }
+
+    .segmented-view-toggle {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      background: var(--bg-surface);
+      padding: 2px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+
+    .seg-btn {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+
+    .seg-btn.active {
+      background: var(--bg-surface-3);
+      color: var(--ink);
+    }
+
+    /* Main Scroll Area inside Phone */
+    .chat-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      scroll-behavior: smooth;
+    }
+
+    .chat-scroll::-webkit-scrollbar { width: 4px; }
+    .chat-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 4px; }
+
+    /* Scrutinizer Autonomy Meter Pill */
+    .autonomy-banner {
+      background: rgba(164, 138, 251, 0.08);
+      border: 1px solid rgba(164, 138, 251, 0.24);
+      border-radius: 14px;
+      padding: 9px 12px;
+      font-size: 12.5px;
+      color: #dbd2ff;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+
+    .autonomy-banner:hover {
+      background: rgba(164, 138, 251, 0.13);
+    }
+
+    .autonomy-banner-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-weight: 600;
+    }
+
+    .autonomy-log {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(164, 138, 251, 0.18);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .autonomy-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .veto-btn {
+      border: 1px solid rgba(249, 112, 102, 0.35);
+      background: rgba(249, 112, 102, 0.1);
+      color: #fda29b;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 2px 8px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    /* Messages */
+    .msg-assistant {
+      font-size: 14.5px;
+      line-height: 1.46;
+      color: var(--ink);
+      padding-right: 8px;
+    }
+
+    .msg-assistant .msg-meta {
+      font-size: 11px;
+      color: var(--subtle);
+      margin-bottom: 3px;
+      font-weight: 500;
+    }
+
+    .msg-user-wrap {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .msg-user {
+      max-width: 80%;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border);
+      color: var(--ink);
+      padding: 9px 13px;
+      border-radius: 18px 18px 4px 18px;
+      font-size: 14.5px;
+      line-height: 1.4;
+    }
+
+    /* 1-Line Receipt Row */
+    .receipt-pill {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 7px 11px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .receipt-pill strong {
+      color: var(--ink);
+      font-weight: 600;
+    }
+
+    .mini-undo-btn {
+      border: 1px solid var(--border-strong);
+      background: var(--bg-surface-2);
+      color: var(--ink);
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    /* Disambiguation / Picker Inline Card */
+    .inline-picker-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 16px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .picker-option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--bg-surface-2);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 9px 11px;
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+      font-size: 12.5px;
+    }
+
+    .picker-option:hover {
+      border-color: var(--border-strong);
+      background: var(--bg-surface-3);
+    }
+
+    /* Pinned Duet Card Deck (Above Composer) */
+    .deck-zone {
+      padding: 6px 14px 4px;
+      flex-shrink: 0;
+      position: relative;
+    }
+
+    .deck-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      padding: 0 4px;
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .deck-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .deck-arrow {
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--bg-surface);
+      color: var(--ink);
+      cursor: pointer;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .deck-arrow:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
+
+    .duet-card-stack {
+      position: relative;
+      padding-bottom: 6px;
+    }
+
+    .duet-card-peek {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 0;
+      height: 18px;
+      background: #14161b;
+      border: 1px solid var(--border);
+      border-radius: 0 0 18px 18px;
+      z-index: 1;
+    }
+
+    .duet-card {
+      position: relative;
+      z-index: 2;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 20px;
+      padding: 14px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .duet-card.halted {
+      border-color: rgba(249, 112, 102, 0.55);
+      background: linear-gradient(180deg, rgba(249, 112, 102, 0.09), var(--bg-surface) 60%);
+    }
+
+    .duet-card.graduation {
+      border-color: rgba(164, 138, 251, 0.5);
+      background: linear-gradient(180deg, rgba(164, 138, 251, 0.1), var(--bg-surface) 60%);
+    }
+
+    .duet-card-body {
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .card-kicker-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+    }
+
+    .kind-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      font-size: 11px;
+    }
+
+    .kind-merge { background: var(--green-bg); color: var(--green); }
+    .kind-ask { background: var(--amber-bg); color: var(--amber); }
+    .kind-halt { background: var(--red-bg); color: var(--red); }
+    .kind-grad { background: var(--purple-bg); color: var(--purple); }
+
+    .card-headline {
+      font-size: 15.5px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      line-height: 1.28;
+      color: var(--ink);
+    }
+
+    .card-summary {
+      font-size: 13px;
+      line-height: 1.4;
+      color: var(--muted);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .scrutiny-hint {
+      font-size: 11.5px;
+      color: #c5b6ff;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .duet-actions {
+      display: grid;
+      grid-template-columns: 1fr 1.25fr;
+      gap: 9px;
+      margin-top: 2px;
+    }
+
+    .pill-secondary {
+      border: 1px solid var(--border-strong);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--ink);
+      font-size: 13.5px;
+      font-weight: 600;
+      min-height: 42px;
+      padding: 8px 12px;
+      line-height: 1.2;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.14s ease;
+    }
+
+    .pill-secondary:hover { background: var(--bg-surface-2); }
+
+    .pill-primary {
+      border: 0;
+      background: var(--white-pill);
+      color: var(--white-pill-ink);
+      font-size: 13.5px;
+      font-weight: 700;
+      min-height: 42px;
+      padding: 8px 14px;
+      line-height: 1.2;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform 0.1s ease, opacity 0.14s ease;
+    }
+
+    .pill-primary:hover { opacity: 0.92; }
+    .pill-primary:active { transform: scale(0.985); }
+
+    /* One-Pill Duet Composer */
+    .composer-zone {
+      padding: 6px 14px 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      background: var(--bg-phone);
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .binding-chip-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 4px;
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .binding-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      padding: 2px 9px;
+      border-radius: 999px;
+      color: var(--ink);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .binding-pill button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0 2px;
+      font-size: 13px;
+      line-height: 1;
+    }
+
+    .quick-voice-strip {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+
+    .quick-voice-strip::-webkit-scrollbar { display: none; }
+
+    .utterance-chip {
+      border: 1px solid var(--border);
+      background: var(--bg-surface);
+      color: var(--muted);
+      font-size: 11.5px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      white-space: nowrap;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .utterance-chip:hover {
+      color: var(--ink);
+      border-color: var(--border-strong);
+      background: var(--bg-surface-2);
+    }
+
+    .composer-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      padding: 5px 6px 5px 13px;
+    }
+
+    .composer-plus {
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1;
+      user-select: none;
+    }
+
+    .composer-input {
+      flex: 1;
+      min-width: 0;
+      border: 0;
+      outline: none;
+      background: transparent;
+      color: var(--ink);
+      font-size: 14.5px;
+    }
+
+    .composer-input::placeholder { color: var(--subtle); }
+
+    .talk-pill-btn {
+      border: 0;
+      background: var(--white-pill);
+      color: var(--white-pill-ink);
+      font-size: 13px;
+      font-weight: 700;
+      height: 34px;
+      padding: 0 13px;
+      border-radius: 999px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    /* Raw 74-Threads Table View (for Scenario 5 Mode C comparison!) */
+    .all-threads-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .raw-thread-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 11px;
+      border-radius: 11px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      font-size: 12.5px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 7px;
+    }
+
+    .dot.green { background: var(--green); }
+    .dot.yellow { background: var(--amber); }
+    .dot.red { background: var(--red); }
+    .dot.gray { background: var(--subtle); }
+
+    /* Bottom Sheet Overlay inside Phone (Duet Screenshot 2!) */
+    .sheet-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.72);
+      backdrop-filter: blur(6px);
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .duet-sheet {
+      background: var(--bg-sheet);
+      border-top: 1px solid var(--border-strong);
+      border-radius: 28px 28px 0 0;
+      padding: 10px 20px 22px;
+      max-height: 84%;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 -16px 48px rgba(0, 0, 0, 0.7);
+    }
+
+    .sheet-grabber {
+      width: 40px;
+      height: 4px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, 0.22);
+      margin: 0 auto 2px;
+    }
+
+    .sheet-title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .sheet-title {
+      font-size: 19px;
+      font-weight: 700;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+    }
+
+    .sheet-close {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      border: 1px solid var(--border);
+      background: var(--bg-surface-2);
+      color: var(--muted);
+      font-size: 15px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .wavy-divider {
+      height: 8px;
+      opacity: 0.35;
+      background-image: radial-gradient(circle at 6px -2px, transparent 6px, rgba(255,255,255,0.5) 6.5px, rgba(255,255,255,0.5) 7.5px, transparent 8px);
+      background-size: 12px 10px;
+      background-repeat: repeat-x;
+    }
+
+    .sheet-section-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: 0.01em;
+      margin-bottom: 6px;
+    }
+
+    .timeline-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+      font-size: 13px;
+      color: var(--muted);
+      padding: 4px 0;
+    }
+
+    .resource-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .resource-row {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 9px 11px;
+      border-radius: 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      text-align: left;
+      color: var(--ink);
+    }
+
+    .resource-row:hover { background: var(--bg-surface-2); }
+
+    .resource-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: var(--bg-surface-2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      flex-shrink: 0;
+    }
+
+    /* Right Column: Stress-Test Control Lab */
+    .lab-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .lab-header {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .lab-header h1 {
+      margin: 0;
+      font-size: 21px;
+      letter-spacing: -0.02em;
+    }
+
+    .lab-header p {
+      margin: 0;
+      font-size: 13.5px;
+      color: var(--muted);
+      line-height: 1.48;
+    }
+
+    .scenario-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 13px;
+    }
+
+    .scenario-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 15px 17px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      transition: border-color 0.15s ease;
+    }
+
+    .scenario-card.active-scenario {
+      border-color: rgba(83, 177, 253, 0.55);
+      box-shadow: 0 0 0 1px rgba(83, 177, 253, 0.2);
+    }
+
+    .scenario-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .scenario-num {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--blue);
+    }
+
+    .scenario-title {
+      font-size: 15.5px;
+      font-weight: 700;
+      margin: 2px 0 3px;
+    }
+
+    .scenario-desc {
+      font-size: 12.8px;
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.42;
+    }
+
+    .trigger-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+
+    .trigger-btn {
+      border: 1px solid rgba(83, 177, 253, 0.36);
+      background: rgba(83, 177, 253, 0.12);
+      color: #bce0ff;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 11px;
+      border-radius: 9px;
+      cursor: pointer;
+    }
+
+    .trigger-btn:hover {
+      background: rgba(83, 177, 253, 0.2);
+    }
+
+    .policy-options {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    @media (max-width: 680px) {
+      .policy-options { grid-template-columns: 1fr; }
+    }
+
+    .policy-opt {
+      border: 1px solid var(--border);
+      background: var(--bg-phone);
+      color: var(--muted);
+      border-radius: 11px;
+      padding: 8px 10px;
+      text-align: left;
+      font-size: 12px;
+      line-height: 1.35;
+      cursor: pointer;
+      transition: all 0.13s ease;
+    }
+
+    .policy-opt strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 2px;
+      font-size: 12px;
+    }
+
+    .policy-opt.selected {
+      border-color: var(--green);
+      background: rgba(50, 213, 131, 0.08);
+      color: var(--ink);
+    }
+
+    /* Export Spec Card */
+    .spec-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 15px 17px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .spec-code {
+      background: var(--bg-phone);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      color: #c8d0e0;
+      white-space: pre-wrap;
+      margin: 0;
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="workbench">
+    <!-- LEFT: P0 iOS OpenAGI Prototype -->
+    <div class="phone-stage">
+      <div class="phone-frame" id="phoneFrame">
+        <!-- iOS Status Bar -->
+        <div class="ios-status">
+          <span>21:04</span>
+          <div class="dynamic-island">
+            <span class="live-dot"></span>
+            <span id="sseStatusText">SSE Live</span>
+          </div>
+          <span>5G · 94%</span>
+        </div>
+
+        <!-- App Header: Two Separate Threads (Everything vs Supervisor) -->
+        <div class="app-header">
+          <div class="header-row">
+            <div class="thread-switcher" role="tablist" aria-label="OpenAGI Threads">
+              <button class="thread-btn" id="tabEverything" data-thread="everything">
+                Everything
+              </button>
+              <button class="thread-btn active" id="tabSupervisor" data-thread="supervisor">
+                Supervisor
+                <span class="badge-count" id="supervisorBadge">3</span>
+              </button>
+            </div>
+
+            <!-- Scenario 5 Mode A: Compact Active Sessions Pill -->
+            <button class="running-pill" id="runningPillBtn" title="View active coding sessions">
+              <span class="live-dot"></span>
+              <span id="runningPillText">4 running · 2 CI ▾</span>
+            </button>
+          </div>
+
+          <!-- Scenario 5 Mode C: Segmented Toggle (hidden unless Mode C chosen) -->
+          <div class="segmented-view-toggle hidden" id="modeCSegmented">
+            <button class="seg-btn active" id="segStreamBtn">PM Stream</button>
+            <button class="seg-btn" id="segThreadsBtn">All Sessions (74)</button>
+          </div>
+        </div>
+
+        <!-- Scrollable Stream -->
+        <div class="chat-scroll" id="chatScroll"></div>
+
+        <!-- Pinned Swipeable Duet Card Deck -->
+        <div class="deck-zone" id="deckZone"></div>
+
+        <!-- One-Pill Duet Composer -->
+        <div class="composer-zone">
+          <div class="binding-chip-row" id="bindingRow"></div>
+
+          <div class="quick-voice-strip" aria-label="Simulated voice or chat utterances">
+            <button class="utterance-chip" data-say="Yeah, go for it">🗣️ "Yeah, go for it"</button>
+            <button class="utterance-chip" data-say="Did it touch the SQLite schema?">🗣️ "Did it touch SQLite?"</button>
+            <button class="utterance-chip" data-say="Ship all the green PRs">🗣️ "Ship all green PRs"</button>
+            <button class="utterance-chip" data-say="Customer hit a crash switching workspaces — go ping that chat">🗣️ "Customer bug: workspace crash"</button>
+            <button class="utterance-chip" data-say="G2 mic drops after 10s when phone locks — route to the right chat">🗣️ "Ambiguous bug: G2 mic"</button>
+            <button class="utterance-chip" data-say="Stop asking me about lockfile rebases, just do them automatically">🗣️ "Learn rule: auto-rebase"</button>
+          </div>
+
+          <form class="composer-pill" id="composerForm">
+            <span class="composer-plus">+</span>
+            <input
+              class="composer-input"
+              id="composerInput"
+              type="text"
+              autocomplete="off"
+              placeholder="Message Supervisor…"
+            />
+            <button type="submit" class="talk-pill-btn" id="sendOrTalkBtn">
+              <span>|·|</span>
+              <span id="sendBtnLabel">Talk</span>
+            </button>
+          </form>
+        </div>
+
+        <!-- Duet Detail Sheet / Active Drawer Overlay -->
+        <div class="sheet-backdrop hidden" id="sheetBackdrop">
+          <div class="duet-sheet" id="sheetContent"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Interactive UX Edge-Case Stress-Test Lab -->
+    <div class="lab-panel">
+      <div class="lab-header">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <h1>OpenAGI Supervisor · P0 iOS UX Stress Test</h1>
+          <button class="pill-secondary" id="resetDemoBtn" style="height:34px;padding:0 14px;font-size:12.5px;">
+            ↺ Reset Baseline
+          </button>
+        </div>
+        <p>
+          Stress-test the agreed <strong>P0 iOS Duet-style Supervisor</strong> (two separate threads: <code>Everything</code> for personal/email + <code>Supervisor</code> for your coding fleet, deep-search session routing, and zero hardcoded keyword gates). Trigger any of the <strong>5 edge-case scenarios</strong> below and flip policy options live to feel how the iPhone UI behaves.
+        </p>
+      </div>
+
+      <div class="scenario-grid" id="scenarioGrid">
+        <!-- Scenario 1 -->
+        <section class="scenario-card" data-scenario="1">
+          <div class="scenario-top">
+            <div>
+              <div class="scenario-num">Scenario 1 · Pile-Up &amp; Auto-Expiry</div>
+              <div class="scenario-title">"Back from a 1-hour meeting" (9 chats finished while away)</div>
+              <p class="scenario-desc">
+                Simulates 9 fleet completions/asks landing while you're out—plus 1 PR merged directly on GitHub 1.5s later so you can watch live SSE auto-collapse.
+              </p>
+            </div>
+            <div class="trigger-row">
+              <button class="trigger-btn" id="trigPileup">▶ Fire 9-Event Pile-Up</button>
+              <button class="trigger-btn" id="trigExternalResolve">⚡ Simulate External Paseo/GH Resolve</button>
+            </div>
+          </div>
+          <div class="policy-options" data-policy="pileup">
+            <button class="policy-opt selected" data-val="deck_coalesced">
+              <strong>A · Recommended</strong>
+              Pinned card deck + 1 coalesced catch-up message; stale cards collapse to 1-line receipts.
+            </button>
+            <button class="policy-opt" data-val="chronological_spam">
+              <strong>B · Chronological Bubbles</strong>
+              Every finished session posts its own full message bubble in chat history.
+            </button>
+            <button class="policy-opt" data-val="deck_silent">
+              <strong>C · Silent Deck Only</strong>
+              Zero proactive chat messages—only update the card deck above composer.
+            </button>
+          </div>
+        </section>
+
+        <!-- Scenario 2 -->
+        <section class="scenario-card" data-scenario="2">
+          <div class="scenario-top">
+            <div>
+              <div class="scenario-num">Scenario 2 · Natural Intent Resolution</div>
+              <div class="scenario-title">"Yeah, go for it" when 3 cards are open (Zero keyword gates)</div>
+              <p class="scenario-desc">
+                Say natural phrases without hardcoded keywords. Compare binding to the visible top card vs. semantic override (<em>"merge the auth one"</em>) vs. batch (<em>"ship all green PRs"</em>).
+              </p>
+            </div>
+            <div class="trigger-row">
+              <button class="trigger-btn" data-fire-say="Yeah, go for it">▶ Say "Yeah, go for it"</button>
+              <button class="trigger-btn" data-fire-say="Looks good on the auth rebase, ship that one">▶ Say "Ship the auth one" (Card #2)</button>
+              <button class="trigger-btn" data-fire-say="Ship all the green PRs">▶ Say "Ship all green PRs"</button>
+            </div>
+          </div>
+          <div class="policy-options" data-policy="replyBinding">
+            <button class="policy-opt selected" data-val="top_card_semantic">
+              <strong>A · Recommended</strong>
+              Bind to visible top card (removable chip), override semantically if another PR/repo is named, allow batch.
+            </button>
+            <button class="policy-opt" data-val="explicit_tap_only">
+              <strong>B · Explicit Tap Required</strong>
+              Ignore card actions unless you tapped a card first; treat composer as general chat.
+            </button>
+            <button class="policy-opt" data-val="always_confirm_multi">
+              <strong>C · Always Disambiguate</strong>
+              Whenever &gt;1 card is open, require a 1-tap confirmation picker before acting.
+            </button>
+          </div>
+        </section>
+
+        <!-- Scenario 3 -->
+        <section class="scenario-card" data-scenario="3">
+          <div class="scenario-top">
+            <div>
+              <div class="scenario-num">Scenario 3 · Deep-Search Index + LLM Issue Router</div>
+              <div class="scenario-title">Customer bug routing: confident active match vs. ambiguous/archived</div>
+              <p class="scenario-desc">
+                Searches indexed Paseo, Codex, Claude &amp; Antigravity transcripts (BM25 + metadata) and runs a structured LLM picker to dispatch or offer options + "Spawn new Paseo chat".
+              </p>
+            </div>
+            <div class="trigger-row">
+              <button class="trigger-btn" data-fire-say="Customer hit a crash switching workspaces — go ping that chat">▶ Confident Match (93%)</button>
+              <button class="trigger-btn" data-fire-say="G2 mic drops after 10s when phone locks — route to the right chat">▶ Ambiguous / Archived (58% vs 51%)</button>
+              <button class="trigger-btn" data-fire-say="Customer wants CSV export on invoices — spin that up">▶ Missing Session (0% match)</button>
+            </div>
+          </div>
+          <div class="policy-options" data-policy="bugRouting">
+            <button class="policy-opt selected" data-val="auto_high_conf">
+              <strong>A · Recommended</strong>
+              Auto-dispatch ≥85% active match (with Undo); show picker + "Spawn Paseo chat" if ambiguous/missing.
+            </button>
+            <button class="policy-opt" data-val="always_preview">
+              <strong>B · Always Preview Card</strong>
+              Never send into a coding chat until you tap `[Send to X]` on a preview card.
+            </button>
+            <button class="policy-opt" data-val="no_spawn">
+              <strong>C · Existing Chats Only</strong>
+              Auto-send to active matches, but never offer to spawn brand-new Paseo sessions.
+            </button>
+          </div>
+        </section>
+
+        <!-- Scenario 4 -->
+        <section class="scenario-card" data-scenario="4">
+          <div class="scenario-top">
+            <div>
+              <div class="scenario-num">Scenario 4 · Stale-Green Merge Race Condition</div>
+              <div class="scenario-title">Tapping Merge or saying "go for it" right as GitHub state shifts</div>
+              <p class="scenario-desc">
+                Choose what happened on GitHub 30 seconds before you said <em>"yeah, go for it"</em> on the top PR card, then trigger the merge to test the preflight gate.
+              </p>
+            </div>
+            <div class="trigger-row">
+              <button class="trigger-btn" id="trigMergeGreen">▶ Merge (Still Green)</button>
+              <button class="trigger-btn" id="trigMergeRunning">▶ Merge (CI Mid-Run on New Commit)</button>
+              <button class="trigger-btn" id="trigMergeFailed">▶ Merge (CI Just Failed!)</button>
+            </div>
+          </div>
+          <div class="policy-options" data-policy="mergePreflight">
+            <button class="policy-opt selected" data-val="preflight_queue_auto">
+              <strong>A · Recommended</strong>
+              Merge immediately if green; queue <code>gh pr merge --auto</code> if CI running; halt &amp; offer CI fix if red.
+            </button>
+            <button class="policy-opt" data-val="strict_green_only">
+              <strong>B · Strict Green Only</strong>
+              Refuse &amp; re-ask even when CI is merely mid-run; never queue auto-merge.
+            </button>
+            <button class="policy-opt" data-val="countdown_5s">
+              <strong>C · 5s Undo Countdown</strong>
+              Hold every merge behind a 5-second countdown toast, even when green.
+            </button>
+          </div>
+        </section>
+
+        <!-- Scenario 5 -->
+        <section class="scenario-card" data-scenario="5">
+          <div class="scenario-top">
+            <div>
+              <div class="scenario-num">Scenario 5 · 74-Thread Escape Hatch &amp; Scrutinizer Graduation</div>
+              <div class="scenario-title">Where raw running sessions live + 6-month autonomy progression</div>
+              <p class="scenario-desc">
+                Compare the compact header pill drawer vs. the old 74-thread list, and trigger a <strong>Scrutinizer Policy Graduation</strong> card to see autonomy climb toward zero decisions.
+              </p>
+            </div>
+            <div class="trigger-row">
+              <button class="trigger-btn" id="trigOpenRunning">▶ Inspect Running Sessions</button>
+              <button class="trigger-btn" id="trigGraduation">🎓 Trigger Scrutinizer Graduation Card</button>
+            </div>
+          </div>
+          <div class="policy-options" data-policy="sessionSurface">
+            <button class="policy-opt selected" data-val="header_pill_drawer">
+              <strong>A · Recommended</strong>
+              Pure stream + deck, with compact <code>4 running · 2 CI</code> pill opening an active-only drawer.
+            </button>
+            <button class="policy-opt" data-val="chat_only">
+              <strong>B · Pure Chat Only</strong>
+              Hide running pill completely; ask <em>"what's running?"</em> in chat when curious.
+            </button>
+            <button class="policy-opt" data-val="segmented_74">
+              <strong>C · Stream | All 74 Toggle</strong>
+              Keep a top segmented toggle flipping to the full 74-thread table.
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <!-- Live Policy Spec Export -->
+      <div class="spec-box">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+          <div>
+            <div style="font-size:13.5px;font-weight:700;">Selected P0 UX Policy Configuration</div>
+            <div style="font-size:12px;color:var(--muted);">Updates live as you toggle options above—copy back into chat if you tweak any defaults.</div>
+          </div>
+          <button class="pill-primary" id="copySpecBtn" style="height:34px;padding:0 14px;font-size:12.5px;">
+            Copy Spec JSON
+          </button>
+        </div>
+        <pre class="spec-code" id="specPreview"></pre>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- Indexed Fleet Sessions (Simulating BM25 Transcript Index + Metadata) ---
+    const INDEXED_SESSIONS = [
+      {
+        key: "paseo:codex/paseo-delivery",
+        app: "Paseo · Codex",
+        repo: "openAGI",
+        branch: "codex/paseo-delivery-correlation",
+        state: "ready-merge",
+        health: "green",
+        pr: "#284",
+        summary: "Durable Paseo turn receipts in paseo-delivery.js (+64/-18). 42/42 tests green.",
+        keywords: ["paseo", "delivery", "turn", "receipt", "correlation", "send", "duplicate"]
+      },
+      {
+        key: "paseo:spencer/auth-rebase",
+        app: "Paseo · Claude",
+        repo: "buildbetter",
+        branch: "fix/auth-session-refresh",
+        state: "ready-merge",
+        health: "green",
+        pr: "#291",
+        summary: "Refreshed OAuth rotation lock in auth-refresh.ts (+31/-14). CI checks green.",
+        keywords: ["auth", "oauth", "token", "login", "refresh", "rebase", "session"]
+      },
+      {
+        key: "paseo:fix/preserve-workspace-launch-context",
+        app: "Paseo · Codex",
+        repo: "paseo",
+        branch: "fix/preserve-workspace-launch-context",
+        state: "running",
+        health: "green",
+        pr: "#302",
+        summary: "Retaining created workspaces & draft origin across placement switches.",
+        keywords: ["workspace", "switching", "workspaces", "crash", "placement", "draft", "origin", "launch"]
+      },
+      {
+        key: "claude:billing-stripe-webhooks",
+        app: "Claude Code",
+        repo: "buildbetter",
+        branch: "feat/stripe-retry-idempotency",
+        state: "needs-human",
+        health: "yellow",
+        pr: "#288",
+        summary: "Waiting on decision: backfill 14 failed Nov 12 webhook events or only guard new events?",
+        keywords: ["stripe", "billing", "webhook", "invoice", "customer", "backfill", "payment"]
+      },
+      {
+        key: "paseo:spencer/g2-three-modes",
+        app: "Paseo · Codex",
+        repo: "openAGI",
+        branch: "spencer/g2-three-modes",
+        state: "waiting-ci",
+        health: "green",
+        pr: "#282",
+        summary: "G2 Agents 0.5.5 mode switching and Supervisor voice separation.",
+        keywords: ["g2", "glasses", "mic", "microphone", "voice", "mode", "supervisor", "even"]
+      },
+      {
+        key: "archived:codex/g2-audio-watch",
+        app: "Codex (Archived 2d ago)",
+        repo: "openAGI",
+        branch: "fix/g2-hidden-audio-gap",
+        state: "archived",
+        health: "gray",
+        pr: "#252 (Merged)",
+        summary: "10s hidden phone screen audioWatch silence detector in openagi-g2-app.ts.",
+        keywords: ["g2", "mic", "drops", "10s", "phone", "locks", "hidden", "audio", "silence"]
+      },
+      {
+        key: "antigravity:ios-chat-duo",
+        app: "Antigravity",
+        repo: "openAGI",
+        branch: "spencer/ios-chat-duo",
+        state: "running",
+        health: "green",
+        pr: "#285",
+        summary: "Fixing keyboard safe-area layout hang on Duo unfolded chat.",
+        keywords: ["ios", "keyboard", "hang", "duo", "chat", "safe", "area"]
+      },
+      {
+        key: "codex:sqlite-wal-isolation",
+        app: "Codex",
+        repo: "openAGI",
+        branch: "fix/sqlite-wal-busy-timeout",
+        state: "waiting-ci",
+        health: "green",
+        pr: "#289",
+        summary: "Running node test suite on isolated data-dir SQLite WAL stores.",
+        keywords: ["sqlite", "database", "lock", "test", "wal"]
+      }
+    ];
+
+    // Generate 66 quiet background sessions so "All 74 Sessions" feels realistically noisy!
+    const QUIET_SESSIONS = Array.from({ length: 66 }, (_, i) => ({
+      key: `quiet:session-${i + 1}`,
+      app: i % 3 === 0 ? "Paseo" : i % 3 === 1 ? "Codex" : "Claude Code",
+      repo: i % 2 === 0 ? "openAGI" : "buildbetter",
+      branch: `chore/task-${140 + i}`,
+      state: i % 4 === 0 ? "done" : "idle-no-pr",
+      health: i % 5 === 0 ? "gray" : "green",
+      pr: null,
+      summary: "Idle, no action needed."
+    }));
+
+    // --- State ---
+    const state = {
+      activeThread: "supervisor", // "everything" | "supervisor"
+      modeCSubTab: "stream",      // "stream" | "threads"
+      autonomyExpanded: false,
+      autonomyPct: 89,
+      explicitCardFocused: false,
+      unboundByUser: false,
+      deckIndex: 0,
+      policies: {
+        pileup: "deck_coalesced",
+        replyBinding: "top_card_semantic",
+        bugRouting: "auto_high_conf",
+        mergePreflight: "preflight_queue_auto",
+        sessionSurface: "header_pill_drawer"
+      },
+      autonomyActions: [
+        { id: "auto_1", text: "Nudged codex/paseo-delivery to add turn-receipt regression test", at: "20:48", axis: "in-scope-test" },
+        { id: "auto_2", text: "Rebased fix/auth-session-refresh onto origin/main after lockfile drift", at: "20:54", axis: "lockfile-rebase" },
+        { id: "auto_3", text: "Re-ran flaky observation-retention test on PR #284 (passed on retry)", at: "21:01", axis: "ci-flake-retry" }
+      ],
+      everythingMessages: [
+        {
+          id: "ev_1",
+          role: "assistant",
+          at: "20:55",
+          text: "Your personal Everything inbox stays clean of coding fleet noise: Wendell replied to CEO Update 163 about Loopit, and David at Brex sent the DPA for signature."
+        },
+        {
+          id: "ev_2",
+          role: "receipt",
+          text: "✉️ Drafted reply to Wendell · Waiting in Personal Inbox"
+        }
+      ],
+      messages: [],
+      cards: []
+    };
+
+    function initialCards() {
+      return [
+        {
+          id: "card_pr284",
+          kind: "merge",
+          kindLabel: "Merge Ready · CI Green",
+          repo: "openAGI",
+          pr: "#284",
+          threadKey: "paseo:codex/paseo-delivery",
+          headline: "Merge PR #284: Fix Paseo turn delivery correlation",
+          summary: "Requires durable Paseo turn evidence before marking sends complete (+64 / -18 in paseo-delivery.js). All 42 tests and GitHub checks passed.",
+          noticedAt: "21:04",
+          scrutiny: "Recommended: Merge PR · Matched 6/6 prior merges (94%)",
+          primaryLabel: "Merge PR #284",
+          secondaryLabel: "Defer",
+          primaryOp: "merge",
+          schemaTouched: false,
+          filesChanged: "src/fleet/paseo-delivery.js, test/paseo-delivery.test.js",
+          timeline: [
+            "20:41 · Owner asked agent to stop false-positive Paseo send errors",
+            "20:48 · Supervisor auto-nudged: 'Add unit test for dropped turn stream'",
+            "21:03 · GitHub CI green (42 passed, 0 failed) · Mergeable"
+          ],
+          resources: [
+            { icon: "💬", title: "codex/paseo-delivery-correlation", sub: "Paseo Session · Active" },
+            { icon: "🔀", title: "PR #284 · +64 / -18", sub: "GitHub · Checks passing, no conflicts" }
+          ]
+        },
+        {
+          id: "card_pr291",
+          kind: "merge",
+          kindLabel: "Merge Ready · CI Green",
+          repo: "buildbetter",
+          pr: "#291",
+          threadKey: "paseo:spencer/auth-rebase",
+          headline: "Merge PR #291: Guard concurrent OAuth refresh rotation",
+          summary: "Serializes refresh token rotation across tabs (+31 / -14 in auth-refresh.ts). Rebased cleanly onto main; CI is green.",
+          noticedAt: "21:02",
+          scrutiny: "Recommended: Merge PR · Matched 4/4 auth bugfixes (91%)",
+          primaryLabel: "Merge PR #291",
+          secondaryLabel: "Defer",
+          primaryOp: "merge",
+          schemaTouched: false,
+          filesChanged: "src/auth/auth-refresh.ts, test/auth-refresh.test.ts",
+          timeline: [
+            "20:54 · Supervisor auto-rebased onto origin/main",
+            "21:02 · Build & Playwright auth smoke checks passed"
+          ],
+          resources: [
+            { icon: "💬", title: "fix/auth-session-refresh", sub: "Paseo · Claude Opus" },
+            { icon: "🔀", title: "PR #291 · +31 / -14", sub: "GitHub · Squash merge ready" }
+          ]
+        },
+        {
+          id: "card_webhook",
+          kind: "ask",
+          kindLabel: "Decision Needed · Scope",
+          repo: "buildbetter",
+          pr: "#288",
+          threadKey: "claude:billing-stripe-webhooks",
+          headline: "Backfill 14 dropped Stripe webhooks from Nov 12, or guard forward only?",
+          summary: "Stripe retry fix is tested, but replaying Nov 12 events will trigger 14 customer receipt emails unless suppressed.",
+          noticedAt: "20:59",
+          scrutiny: "Escalated: External customer email side-effect (Scrutiny: High)",
+          primaryLabel: "Backfill silently (no email)",
+          secondaryLabel: "Guard new only",
+          primaryOp: "answer_backfill",
+          schemaTouched: true,
+          filesChanged: "src/billing/webhook-handler.ts, migrations/20261114_webhook_idempotency.sql",
+          timeline: [
+            "20:50 · Agent fixed empty-payload crash in webhook-handler.ts",
+            "20:59 · Supervisor blocked auto-continue because backfill sends external emails"
+          ],
+          resources: [
+            { icon: "💬", title: "feat/stripe-retry-idempotency", sub: "Claude Code · Waiting on you" },
+            { icon: "🗄️", title: "20261114_webhook_idempotency.sql", sub: "Adds idempotency_key unique index" }
+          ]
+        }
+      ];
+    }
+
+    function resetBaseline() {
+      state.activeThread = "supervisor";
+      state.modeCSubTab = "stream";
+      state.deckIndex = 0;
+      state.explicitCardFocused = false;
+      state.unboundByUser = false;
+      state.autonomyPct = 89;
+      state.cards = initialCards();
+      state.messages = [
+        {
+          id: "m_intro",
+          role: "assistant",
+          at: "21:04",
+          text: "You have 6 active coding sessions moving across openAGI and buildbetter. I handled 3 routine test/rebase nudges automatically; 2 PRs are green to merge and 1 Stripe scope call needs you."
+        }
+      ];
+      closeSheet();
+      renderAll();
+    }
+
+    // --- Rendering ---
+    const el = (id) => document.getElementById(id);
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function focusedCard() {
+      if (!state.cards.length) return null;
+      if (state.deckIndex >= state.cards.length) state.deckIndex = Math.max(0, state.cards.length - 1);
+      return state.cards[state.deckIndex] || null;
+    }
+
+    function renderHeader() {
+      el("tabEverything").classList.toggle("active", state.activeThread === "everything");
+      el("tabSupervisor").classList.toggle("active", state.activeThread === "supervisor");
+      const count = state.cards.length;
+      const badge = el("supervisorBadge");
+      badge.textContent = String(count);
+      badge.classList.toggle("hidden", count === 0);
+
+      // Scenario 5 policy controls
+      const pill = el("runningPillBtn");
+      const seg = el("modeCSegmented");
+      if (state.activeThread !== "supervisor") {
+        pill.classList.add("hidden");
+        seg.classList.add("hidden");
+      } else if (state.policies.sessionSurface === "header_pill_drawer") {
+        pill.classList.remove("hidden");
+        seg.classList.add("hidden");
+      } else if (state.policies.sessionSurface === "chat_only") {
+        pill.classList.add("hidden");
+        seg.classList.add("hidden");
+      } else {
+        pill.classList.add("hidden");
+        seg.classList.remove("hidden");
+      }
+
+      el("segStreamBtn").classList.toggle("active", state.modeCSubTab === "stream");
+      el("segThreadsBtn").classList.toggle("active", state.modeCSubTab === "threads");
+    }
+
+    function renderScroll() {
+      const container = el("chatScroll");
+
+      // Personal Everything Thread
+      if (state.activeThread === "everything") {
+        container.innerHTML = `
+          <div class="autonomy-banner" style="border-color:rgba(83,177,253,0.3);background:rgba(83,177,253,0.08);color:#cbe7ff;cursor:default;">
+            <div class="autonomy-banner-top">
+              <span>✨ Personal Everything Agent (Emails, Calendar, Ops)</span>
+            </div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:4px;">
+              Kept separate from your coding fleet so 70+ repo turns never drown out customer &amp; exec threads.
+            </div>
+          </div>
+          ${state.everythingMessages.map(renderMessageItem).join("")}
+        `;
+        return;
+      }
+
+      // Scenario 5 Mode C: Raw 74-Thread List Comparison
+      if (state.policies.sessionSurface === "segmented_74" && state.modeCSubTab === "threads") {
+        const all = [...INDEXED_SESSIONS, ...QUIET_SESSIONS];
+        container.innerHTML = `
+          <div style="font-size:12px;color:var(--amber);padding:4px 2px;">
+            ⚠️ Legacy comparison: scrolling 74 raw threads (68 green/gray) vs. staying in the PM Stream.
+          </div>
+          <div class="all-threads-list">
+            ${all.slice(0, 32).map(t => `
+              <div class="raw-thread-row">
+                <div style="min-width:0;">
+                  <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                    <span class="dot ${t.health}"></span>${escapeHtml(t.branch)}
+                  </div>
+                  <div style="font-size:11px;color:var(--muted);">${escapeHtml(t.repo)} · ${escapeHtml(t.app)}</div>
+                </div>
+                <span style="font-size:11px;color:var(--muted);flex-shrink:0;">${escapeHtml(t.state)}</span>
+              </div>
+            `).join("")}
+            <div style="text-align:center;font-size:11.5px;color:var(--subtle);padding:8px;">+ 42 more quiet green/gray threads…</div>
+          </div>
+        `;
+        return;
+      }
+
+      // Main Supervisor Stream
+      const autonomyHtml = `
+        <div class="autonomy-banner" id="autonomyBanner">
+          <div class="autonomy-banner-top">
+            <span>⚡ Handled ${state.autonomyActions.length} routine decisions · ${state.autonomyPct}% autonomous</span>
+            <span>${state.autonomyExpanded ? "▴" : "▾"}</span>
+          </div>
+          ${state.autonomyExpanded ? `
+            <div class="autonomy-log">
+              ${state.autonomyActions.map(a => `
+                <div class="autonomy-row">
+                  <span>${escapeHtml(a.at)} · ${escapeHtml(a.text)}</span>
+                  <button class="veto-btn" data-veto="${escapeHtml(a.id)}">Don't do that</button>
+                </div>
+              `).join("")}
+            </div>
+          ` : ""}
+        </div>
+      `;
+
+      container.innerHTML = autonomyHtml + state.messages.map(renderMessageItem).join("");
+
+      const banner = el("autonomyBanner");
+      if (banner) {
+        banner.addEventListener("click", (e) => {
+          const vetoBtn = e.target.closest("[data-veto]");
+          if (vetoBtn) {
+            e.stopPropagation();
+            handleVeto(vetoBtn.getAttribute("data-veto"));
+            return;
+          }
+          state.autonomyExpanded = !state.autonomyExpanded;
+          renderScroll();
+        });
+      }
+
+      container.querySelectorAll("[data-undo-id]").forEach(btn => {
+        btn.addEventListener("click", () => handleUndo(btn.getAttribute("data-undo-id")));
+      });
+
+      container.querySelectorAll("[data-pick-route]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const target = btn.getAttribute("data-pick-route");
+          const issue = btn.getAttribute("data-issue");
+          const msgId = btn.getAttribute("data-msgid");
+          completePickedRoute(msgId, target, issue);
+        });
+      });
+
+      container.querySelectorAll("[data-disambig-card]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const cardId = btn.getAttribute("data-disambig-card");
+          const msgId = btn.getAttribute("data-msgid");
+          state.messages = state.messages.filter(m => m.id !== msgId);
+          const card = state.cards.find(c => c.id === cardId);
+          if (card) executePrimaryCardAction(card, { source: "voice-disambiguated" });
+        });
+      });
+
+      container.scrollTop = container.scrollHeight;
+    }
+
+    function renderMessageItem(m) {
+      if (m.role === "user") {
+        return `<div class="msg-user-wrap"><div class="msg-user">${escapeHtml(m.text)}</div></div>`;
+      }
+      if (m.role === "receipt") {
+        return `
+          <div class="receipt-pill">
+            <span>${m.html || escapeHtml(m.text)}</span>
+            ${m.undoable ? `<button class="mini-undo-btn" data-undo-id="${escapeHtml(m.id)}">Undo</button>` : ""}
+          </div>
+        `;
+      }
+      if (m.role === "picker") {
+        return `
+          <div class="inline-picker-card">
+            <div style="font-size:13px;font-weight:700;">${escapeHtml(m.title)}</div>
+            <div style="font-size:12px;color:var(--muted);">${escapeHtml(m.subtitle)}</div>
+            ${m.options.map(opt => `
+              <button class="picker-option"
+                data-msgid="${escapeHtml(m.id)}"
+                data-pick-route="${escapeHtml(opt.target)}"
+                data-issue="${escapeHtml(m.issue)}">
+                <div>
+                  <div style="font-weight:600;">${escapeHtml(opt.label)}</div>
+                  <div style="font-size:11px;color:var(--muted);">${escapeHtml(opt.detail)}</div>
+                </div>
+                <span style="font-size:11px;font-weight:700;color:var(--blue);">${escapeHtml(opt.badge)}</span>
+              </button>
+            `).join("")}
+          </div>
+        `;
+      }
+      if (m.role === "disambig") {
+        return `
+          <div class="inline-picker-card">
+            <div style="font-size:13px;font-weight:700;">Which open card should I run "${escapeHtml(m.utterance)}" on?</div>
+            ${m.cards.map(c => `
+              <button class="picker-option" data-msgid="${escapeHtml(m.id)}" data-disambig-card="${escapeHtml(c.id)}">
+                <div>
+                  <div style="font-weight:600;">${escapeHtml(c.headline)}</div>
+                  <div style="font-size:11px;color:var(--muted);">${escapeHtml(c.repo)} · ${escapeHtml(c.primaryLabel)}</div>
+                </div>
+                <span style="font-size:11.5px;font-weight:700;color:var(--green);">Run →</span>
+              </button>
+            `).join("")}
+          </div>
+        `;
+      }
+      return `
+        <div class="msg-assistant">
+          ${m.at ? `<div class="msg-meta">Supervisor · ${escapeHtml(m.at)}</div>` : ""}
+          <div>${escapeHtml(m.text)}</div>
+        </div>
+      `;
+    }
+
+    function renderDeck() {
+      const zone = el("deckZone");
+      if (state.activeThread !== "supervisor" || (state.policies.sessionSurface === "segmented_74" && state.modeCSubTab === "threads")) {
+        zone.innerHTML = "";
+        return;
+      }
+
+      const card = focusedCard();
+      if (!card) {
+        zone.innerHTML = `
+          <div class="receipt-pill" style="justify-content:center;color:var(--green);border-color:rgba(50,213,131,0.28);background:rgba(50,213,131,0.06);">
+            ✓ Zero decisions waiting on you — Supervisor is watching 6 active chats.
+          </div>
+        `;
+        return;
+      }
+
+      const total = state.cards.length;
+      const idx = state.deckIndex;
+      const kindClass =
+        card.kind === "halt" ? "kind-halt" :
+        card.kind === "graduation" ? "kind-grad" :
+        card.kind === "ask" ? "kind-ask" : "kind-merge";
+      const extraCardClass =
+        card.kind === "halt" ? "halted" :
+        card.kind === "graduation" ? "graduation" : "";
+
+      zone.innerHTML = `
+        <div class="deck-header">
+          <span><strong>${idx + 1} of ${total}</strong> needing your call · Tap card for context</span>
+          <div class="deck-nav">
+            <button class="deck-arrow" id="prevCardBtn" ${idx === 0 ? "disabled" : ""} aria-label="Previous card">‹</button>
+            <button class="deck-arrow" id="nextCardBtn" ${idx >= total - 1 ? "disabled" : ""} aria-label="Next card">›</button>
+          </div>
+        </div>
+        <div class="duet-card-stack">
+          ${total > 1 ? `<div class="duet-card-peek"></div>` : ""}
+          <div class="duet-card ${extraCardClass}" id="activeDuetCard">
+            <div class="duet-card-body" id="openCardDetailArea">
+              <div class="card-kicker-row">
+                <span class="kind-chip ${kindClass}">${escapeHtml(card.kindLabel)}</span>
+                <span style="color:var(--subtle);">${escapeHtml(card.repo)} ${card.pr ? "· " + escapeHtml(card.pr) : ""}</span>
+              </div>
+              <div class="card-headline">${escapeHtml(card.headline)}</div>
+              <div class="card-summary">${escapeHtml(card.summary)}</div>
+              ${card.scrutiny ? `<div class="scrutiny-hint">✦ ${escapeHtml(card.scrutiny)}</div>` : ""}
+            </div>
+            <div class="duet-actions">
+              <button class="pill-secondary" id="cardSecondaryBtn">${escapeHtml(card.secondaryLabel)}</button>
+              <button class="pill-primary" id="cardPrimaryBtn">${escapeHtml(card.primaryLabel)}</button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      el("prevCardBtn")?.addEventListener("click", () => {
+        state.deckIndex = Math.max(0, state.deckIndex - 1);
+        state.unboundByUser = false;
+        renderDeck();
+        renderBindingChip();
+      });
+      el("nextCardBtn")?.addEventListener("click", () => {
+        state.deckIndex = Math.min(state.cards.length - 1, state.deckIndex + 1);
+        state.unboundByUser = false;
+        renderDeck();
+        renderBindingChip();
+      });
+      el("openCardDetailArea")?.addEventListener("click", () => {
+        state.explicitCardFocused = true;
+        state.unboundByUser = false;
+        openCardDetailSheet(card);
+        renderBindingChip();
+      });
+      el("cardPrimaryBtn")?.addEventListener("click", () => executePrimaryCardAction(card, { source: "tap" }));
+      el("cardSecondaryBtn")?.addEventListener("click", () => executeSecondaryCardAction(card));
+    }
+
+    function renderBindingChip() {
+      const row = el("bindingRow");
+      const card = focusedCard();
+      if (state.activeThread !== "supervisor" || !card) {
+        row.innerHTML = "";
+        return;
+      }
+
+      if (state.policies.replyBinding === "explicit_tap_only" && !state.explicitCardFocused) {
+        row.innerHTML = `<span>Voice/chat unbound (tap a card first under Policy B)</span>`;
+        return;
+      }
+
+      if (state.unboundByUser) {
+        row.innerHTML = `
+          <span>General Supervisor chat (unbound)</span>
+          <button class="mini-undo-btn" id="rebindBtn">Bind to ${escapeHtml(card.pr || card.repo)}</button>
+        `;
+        el("rebindBtn")?.addEventListener("click", () => {
+          state.unboundByUser = false;
+          renderBindingChip();
+        });
+        return;
+      }
+
+      row.innerHTML = `
+        <div class="binding-pill">
+          <span>Replying to: <strong>${escapeHtml(card.pr || card.headline.slice(0, 26))}</strong></span>
+          <button id="unbindCardBtn" title="Unbind reply from top card">×</button>
+        </div>
+        <span style="font-size:11px;color:var(--subtle);">Natural speech enabled</span>
+      `;
+      el("unbindCardBtn")?.addEventListener("click", () => {
+        state.unboundByUser = true;
+        renderBindingChip();
+      });
+    }
+
+    function renderSpecPreview() {
+      el("specPreview").textContent = JSON.stringify({
+        threads: "separate_everything_and_supervisor",
+        rolloutOrder: ["P0: iOS Supervisor", "P2: Paseo Plugin", "P3: Even G2 Voice PM"],
+        routingEngine: "sqlite_fts5_bm25_transcript_index + structured_llm_picker",
+        intentResolution: "semantic_card_context_no_hardcoded_keywords",
+        policies: state.policies
+      }, null, 2);
+    }
+
+    function renderAll() {
+      renderHeader();
+      renderScroll();
+      renderDeck();
+      renderBindingChip();
+      renderSpecPreview();
+    }
+
+    // --- Duet Detail Sheet & Active Sessions Drawer ---
+    function openCardDetailSheet(card) {
+      const backdrop = el("sheetBackdrop");
+      const sheet = el("sheetContent");
+      backdrop.classList.remove("hidden");
+
+      sheet.innerHTML = `
+        <div class="sheet-grabber"></div>
+        <div class="sheet-title-row">
+          <div class="sheet-title">${escapeHtml(card.headline)}</div>
+          <button class="sheet-close" id="closeSheetBtn" aria-label="Close detail sheet">✕</button>
+        </div>
+        <div style="font-size:13.5px;line-height:1.46;color:#d5d9e2;">
+          ${escapeHtml(card.summary)}
+        </div>
+        <div style="font-size:12px;color:var(--muted);">
+          Noticed ${escapeHtml(card.noticedAt)} · <span style="color:var(--green);">Live SSE synced</span>
+        </div>
+        <div class="wavy-divider"></div>
+        <div>
+          <div class="sheet-section-label">Decisions and updates</div>
+          ${(card.timeline || []).map(line => `
+            <div class="timeline-item">
+              <span style="color:var(--subtle);">↗</span>
+              <span>${escapeHtml(line)}</span>
+            </div>
+          `).join("")}
+        </div>
+        <div>
+          <div class="sheet-section-label">Resources</div>
+          <div class="resource-list">
+            ${(card.resources || []).map((r, i) => `
+              <button class="resource-row" data-res-idx="${i}">
+                <div class="resource-icon">${escapeHtml(r.icon)}</div>
+                <div>
+                  <div style="font-size:13.5px;font-weight:600;">${escapeHtml(r.title)}</div>
+                  <div style="font-size:11.5px;color:var(--muted);">${escapeHtml(r.sub)}</div>
+                </div>
+              </button>
+            `).join("")}
+          </div>
+          <div id="resourcePreviewBox" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
+        </div>
+        <button class="pill-primary" id="sheetPrimaryCta" style="width:100%;height:46px;font-size:15px;margin-top:4px;">
+          ${escapeHtml(card.primaryLabel)}
+        </button>
+      `;
+
+      el("closeSheetBtn")?.addEventListener("click", closeSheet);
+      el("sheetPrimaryCta")?.addEventListener("click", () => {
+        closeSheet();
+        executePrimaryCardAction(card, { source: "sheet-cta" });
+      });
+      sheet.querySelectorAll("[data-res-idx]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const box = el("resourcePreviewBox");
+          box.innerHTML = `<div style="padding:9px 11px;border-radius:10px;background:var(--bg-surface);border:1px solid var(--border);">
+            <strong>Changed files:</strong> <code>${escapeHtml(card.filesChanged || "N/A")}</code><br/>
+            <span>Schema touched: <strong>${card.schemaTouched ? "Yes (migration included)" : "No"}</strong> · Deep link opens exact Paseo session on tap.</span>
+          </div>`;
+        });
+      });
+    }
+
+    function openRunningSessionsDrawer(showQuiet = false) {
+      const backdrop = el("sheetBackdrop");
+      const sheet = el("sheetContent");
+      backdrop.classList.remove("hidden");
+
+      const activeOnly = INDEXED_SESSIONS.filter(s => s.state !== "archived");
+      const rows = showQuiet ? [...activeOnly, ...QUIET_SESSIONS.slice(0, 15)] : activeOnly;
+
+      sheet.innerHTML = `
+        <div class="sheet-grabber"></div>
+        <div class="sheet-title-row">
+          <div>
+            <div class="sheet-title">Active Coding Sessions (${activeOnly.length})</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px;">
+              68 idle/completed sessions hidden so you only see live movement.
+            </div>
+          </div>
+          <button class="sheet-close" id="closeSheetBtn">✕</button>
+        </div>
+        <div class="resource-list">
+          ${rows.map(s => `
+            <div class="resource-row" style="cursor:default;justify-content:space-between;">
+              <div style="min-width:0;">
+                <div style="font-size:13px;font-weight:600;">
+                  <span class="dot ${s.health}"></span>${escapeHtml(s.branch)}
+                </div>
+                <div style="font-size:11.5px;color:var(--muted);">${escapeHtml(s.repo)} · ${escapeHtml(s.app)} ${s.pr ? "· " + escapeHtml(s.pr) : ""}</div>
+              </div>
+              <span style="font-size:11px;color:var(--muted);flex-shrink:0;">${escapeHtml(s.state)}</span>
+            </div>
+          `).join("")}
+        </div>
+        <button class="pill-secondary" id="toggleQuietBtn" style="width:100%;">
+          ${showQuiet ? "Hide 68 quiet/idle sessions" : "Show quiet/idle sessions (68)"}
+        </button>
+      `;
+
+      el("closeSheetBtn")?.addEventListener("click", closeSheet);
+      el("toggleQuietBtn")?.addEventListener("click", () => openRunningSessionsDrawer(!showQuiet));
+    }
+
+    function closeSheet() {
+      el("sheetBackdrop").classList.add("hidden");
+    }
+
+    el("sheetBackdrop").addEventListener("click", (e) => {
+      if (e.target === el("sheetBackdrop")) closeSheet();
+    });
+
+    // --- Actions, Preflight Merge Gate, Natural Intent & Deep-Search Routing ---
+    function removeCard(cardId) {
+      state.cards = state.cards.filter(c => c.id !== cardId);
+      if (state.deckIndex >= state.cards.length) {
+        state.deckIndex = Math.max(0, state.cards.length - 1);
+      }
+      state.explicitCardFocused = false;
+    }
+
+    function executePrimaryCardAction(card, { source = "tap", simulatedGitHubState = "green" } = {}) {
+      // Graduation card promotion
+      if (card.primaryOp === "promote_policy") {
+        removeCard(card.id);
+        state.autonomyPct = Math.min(98, state.autonomyPct + 4);
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          html: `🎓 <strong>Learned Policy Active:</strong> Auto-handling lockfile &amp; in-scope test rebases (${state.autonomyPct}% autonomous)`
+        });
+        renderAll();
+        return;
+      }
+
+      // Halted CI card -> Fix CI action
+      if (card.primaryOp === "fix_ci") {
+        removeCard(card.id);
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          undoable: true,
+          cardBackup: card,
+          html: `🔧 Sent CI failure log to <strong>${escapeHtml(card.threadKey)}</strong> · Watching for green re-run`
+        });
+        renderAll();
+        return;
+      }
+
+      // Scope decision card
+      if (card.primaryOp === "answer_backfill") {
+        removeCard(card.id);
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          undoable: true,
+          cardBackup: card,
+          html: `✓ Told <strong>${escapeHtml(card.repo)} (${escapeHtml(card.pr)})</strong>: Backfill Nov 12 events with receipt emails suppressed`
+        });
+        renderAll();
+        return;
+      }
+
+      // Merge PR with Scenario 4 Preflight Gate!
+      const policy = state.policies.mergePreflight;
+
+      if (simulatedGitHubState === "failed") {
+        // Transform card in-place into a Halted Merge Alert!
+        card.kind = "halt";
+        card.kindLabel = "Merge Halted · CI Failed 90s Ago";
+        card.headline = `Hold on — ${card.pr} failed test-sqlite-lock on new commit`;
+        card.summary = `Preflight caught a red check on commit 9f3c1a pushed 90s ago. Merge was halted safely—want me to have the agent fix CI first?`;
+        card.scrutiny = "Preflight safety gate prevented broken main merge";
+        card.primaryLabel = "Have agent fix CI";
+        card.secondaryLabel = "Leave paused";
+        card.primaryOp = "fix_ci";
+        state.messages.push({
+          id: "m_halt_" + Date.now(),
+          role: "assistant",
+          at: "Just now",
+          text: `Held off merging ${card.pr}: GitHub preflight saw test-sqlite-lock fail 90s ago. Tap "Have agent fix CI" or say "yeah fix it" and I'll ping you once it's green again.`
+        });
+        renderAll();
+        return;
+      }
+
+      if (simulatedGitHubState === "running") {
+        if (policy === "strict_green_only") {
+          state.messages.push({
+            id: "m_strict_" + Date.now(),
+            role: "assistant",
+            at: "Just now",
+            text: `Blocked under Strict Green policy: ${card.pr} has a CI run still in progress on commit a81f2c. Leaving card open until checks finish.`
+          });
+          renderAll();
+          return;
+        }
+        // Recommended: queue gh pr merge --auto!
+        removeCard(card.id);
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          undoable: true,
+          cardBackup: card,
+          html: `⏳ CI mid-run on <strong>${escapeHtml(card.pr)}</strong> · Queued <code>gh pr merge --auto</code> once checks pass`
+        });
+        renderAll();
+        return;
+      }
+
+      // Green! Check if 5s countdown policy is enabled
+      if (policy === "countdown_5s") {
+        removeCard(card.id);
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          undoable: true,
+          cardBackup: card,
+          html: `⏱️ Merging <strong>${escapeHtml(card.pr)}</strong> in 5s (${source}) · Tap Undo to cancel`
+        });
+        renderAll();
+        return;
+      }
+
+      // Instant clean merge!
+      removeCard(card.id);
+      state.messages.push({
+        id: "rec_" + Date.now(),
+        role: "receipt",
+        html: `✓ Merged <strong>${escapeHtml(card.pr)}</strong> (${escapeHtml(card.repo)}) via squash · Branch cleaned up`
+      });
+      renderAll();
+    }
+
+    function executeSecondaryCardAction(card) {
+      removeCard(card.id);
+      state.messages.push({
+        id: "rec_" + Date.now(),
+        role: "receipt",
+        undoable: true,
+        cardBackup: card,
+        html: `↷ Deferred <strong>${escapeHtml(card.pr || card.repo)}</strong> · Will re-surface if state changes`
+      });
+      renderAll();
+    }
+
+    function handleUndo(receiptId) {
+      const idx = state.messages.findIndex(m => m.id === receiptId);
+      if (idx === -1) return;
+      const item = state.messages[idx];
+      state.messages.splice(idx, 1);
+      if (item.cardBackup) {
+        state.cards.unshift(item.cardBackup);
+        state.deckIndex = 0;
+      }
+      renderAll();
+    }
+
+    function handleVeto(autoId) {
+      const action = state.autonomyActions.find(a => a.id === autoId);
+      if (!action) return;
+      state.autonomyActions = state.autonomyActions.filter(a => a.id !== autoId);
+      state.autonomyPct = Math.max(50, state.autonomyPct - 5);
+      state.messages.push({
+        id: "m_veto_" + Date.now(),
+        role: "assistant",
+        at: "Just now",
+        text: `Got it — tightened scrutiny on "${action.axis}". I'll ask you with a card next time instead of auto-running that nudge.`
+      });
+      renderAll();
+    }
+
+    // --- Semantic Owner Turn Resolver (Zero Hardcoded Keyword Gates!) ---
+    function handleOwnerMessage(rawText) {
+      const text = rawText.trim();
+      if (!text) return;
+
+      state.activeThread = "supervisor";
+      state.modeCSubTab = "stream";
+      state.messages.push({ id: "u_" + Date.now(), role: "user", text });
+
+      const lower = text.toLowerCase();
+
+      // 1. Meta-learning / Scrutiny rule teaching ("stop asking me about lockfile rebases...")
+      if (/(stop asking|always|automatically|never ask|just do them)/i.test(lower) && /(rebase|lockfile|test)/i.test(lower)) {
+        state.autonomyPct = Math.min(98, state.autonomyPct + 3);
+        state.messages.push({
+          id: "m_" + Date.now(),
+          role: "receipt",
+          html: `🧠 <strong>Playbook &amp; Scrutiny Updated:</strong> Lockfile rebases when CI is green will run automatically (${state.autonomyPct}% autonomous)`
+        });
+        renderAll();
+        return;
+      }
+
+      // 2. "What's running?" query
+      if (/what('?s| is) running|status|active chats/i.test(lower)) {
+        const running = INDEXED_SESSIONS.filter(s => s.state !== "archived");
+        state.messages.push({
+          id: "m_" + Date.now(),
+          role: "assistant",
+          at: "Just now",
+          text: `${running.length} active sessions right now: 2 PRs green to merge (#284 Paseo delivery, #291 Auth refresh), 2 running tests (workspace-routing, ios-chat-duo), 1 waiting CI (#282 G2), and 1 waiting on your Stripe backfill call.`
+        });
+        renderAll();
+        return;
+      }
+
+      // 3. Batch affirmative ("ship all the green PRs" / "merge both green ones")
+      if (/(all|both).*(green|ready|pr)|ship them all/i.test(lower)) {
+        const greenCards = state.cards.filter(c => c.kind === "merge");
+        if (!greenCards.length) {
+          state.messages.push({ id: "m_" + Date.now(), role: "assistant", at: "Just now", text: "No green merge-ready PR cards are waiting right now." });
+          renderAll();
+          return;
+        }
+        const mergedRefs = greenCards.map(c => `${c.pr} (${c.repo})`).join(" & ");
+        state.cards = state.cards.filter(c => c.kind !== "merge");
+        state.deckIndex = 0;
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          html: `✓ Batch-merged <strong>${escapeHtml(mergedRefs)}</strong> after green GitHub preflight`
+        });
+        renderAll();
+        return;
+      }
+
+      // 4. Customer bug / issue routing ("customer hit...", "route...", "ping that chat", "spin that up")
+      if (/(customer|crash|bug|mic drops|route|ping that chat|spin that up|invoice|csv)/i.test(lower)) {
+        routeCustomerIssue(text);
+        return;
+      }
+
+      // 5. Context-anchored follow-up question about the card ("did it touch sqlite?", "any schema changes?")
+      if (/\?$|did it|does it|schema|sqlite|risk|what changed/i.test(lower)) {
+        const card = focusedCard();
+        if (card) {
+          const answer = card.schemaTouched
+            ? `Yes — ${card.pr || card.repo} adds migration 20261114_webhook_idempotency.sql (unique index on idempotency_key). Want to proceed or inspect the diff?`
+            : `No SQLite or DB schema changes on ${card.pr || card.repo} — it only touched ${card.filesChanged}. CI is green; say "go for it" whenever you want me to merge.`;
+          state.messages.push({ id: "m_" + Date.now(), role: "assistant", at: "Just now", text: answer });
+          renderAll();
+          return;
+        }
+      }
+
+      // 6. Natural affirmative intent ("yeah go for it", "ship it", "looks good", "send it", "do it")
+      const isNaturalAffirmative = /(yeah|yep|yes|go for it|ship|do it|looks good|lgtm|send it|merge|proceed|sure)/i.test(lower);
+      if (isNaturalAffirmative && state.cards.length > 0) {
+        // Semantic target check first: did the user name a specific card ("auth", "291", "paseo", "284", "stripe", "webhook")?
+        const namedCard = state.cards.find(c =>
+          (lower.includes("auth") && c.id.includes("291")) ||
+          (lower.includes("291") && c.id.includes("291")) ||
+          (lower.includes("paseo") && c.id.includes("284")) ||
+          (lower.includes("284") && c.id.includes("284")) ||
+          ((lower.includes("stripe") || lower.includes("webhook")) && c.id.includes("webhook"))
+        );
+
+        if (namedCard) {
+          executePrimaryCardAction(namedCard, { source: "semantic-match" });
+          return;
+        }
+
+        // Check Scenario 2 Policy!
+        if (state.policies.replyBinding === "explicit_tap_only" && !state.explicitCardFocused) {
+          state.messages.push({
+            id: "m_" + Date.now(),
+            role: "assistant",
+            at: "Just now",
+            text: `Under Policy B (Explicit Tap Required), I didn't run "${text}" because no card was tapped first. Tap a card or switch Scenario 2 back to Policy A.`
+          });
+          renderAll();
+          return;
+        }
+
+        if (state.policies.replyBinding === "always_confirm_multi" && state.cards.length > 1) {
+          state.messages.push({
+            id: "dis_" + Date.now(),
+            role: "disambig",
+            utterance: text,
+            cards: [...state.cards]
+          });
+          renderAll();
+          return;
+        }
+
+        if (state.unboundByUser && state.cards.length > 1) {
+          state.messages.push({
+            id: "dis_" + Date.now(),
+            role: "disambig",
+            utterance: text,
+            cards: [...state.cards]
+          });
+          renderAll();
+          return;
+        }
+
+        const top = focusedCard();
+        if (top) {
+          executePrimaryCardAction(top, { source: "voice-top-card" });
+          return;
+        }
+      }
+
+      // Fallback natural PM response
+      state.messages.push({
+        id: "m_" + Date.now(),
+        role: "assistant",
+        at: "Just now",
+        text: `Got it. Watching your 6 active sessions—say "what's running?", report a customer bug to route it, or say "yeah go for it" on the current card.`
+      });
+      renderAll();
+    }
+
+    // --- Scenario 3: BM25 Transcript Index + Structured LLM Issue Router ---
+    function routeCustomerIssue(utterance) {
+      const terms = utterance.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2);
+      const scored = INDEXED_SESSIONS.map(s => {
+        let score = 0;
+        for (const t of terms) {
+          if (s.keywords.includes(t)) score += 30;
+          else if (s.branch.toLowerCase().includes(t) || s.summary.toLowerCase().includes(t)) score += 15;
+        }
+        if (s.state !== "archived" && score > 0) score += 12;
+        return { session: s, confidence: Math.min(96, score) };
+      }).filter(x => x.confidence > 0).sort((a, b) => b.confidence - a.confidence);
+
+      const policy = state.policies.bugRouting;
+      const best = scored[0];
+      const second = scored[1];
+
+      // High-confidence single active match (e.g. workspace switching crash -> 93%)
+      if (best && best.confidence >= 85 && (!second || best.confidence - second.confidence >= 20) && best.session.state !== "archived") {
+        if (policy === "always_preview") {
+          state.messages.push({
+            id: "pick_" + Date.now(),
+            role: "picker",
+            title: `Matched ${best.session.branch} (${best.confidence}% confidence)`,
+            subtitle: "Policy B holds dispatch until you confirm:",
+            issue: utterance,
+            options: [
+              { target: best.session.key, label: `Send to ${best.session.branch}`, detail: `${best.session.app} · ${best.session.summary}`, badge: `${best.confidence}% match` }
+            ]
+          });
+          renderAll();
+          return;
+        }
+
+        // Auto-dispatch + 5s Undo receipt!
+        state.messages.push({
+          id: "rec_" + Date.now(),
+          role: "receipt",
+          undoable: true,
+          html: `↗ Routed bug to <strong>${escapeHtml(best.session.branch)}</strong> (${best.confidence}% match · ${escapeHtml(best.session.app)}) · Watching turn`
+        });
+        renderAll();
+        return;
+      }
+
+      // Ambiguous / archived / zero match -> Picker card!
+      const options = scored.slice(0, 2).map(item => ({
+        target: item.session.key,
+        label: `${item.session.state === "archived" ? "Resume " : "Send to "}${item.session.branch}`,
+        detail: `${item.session.app} · ${item.session.summary}`,
+        badge: `${item.confidence}%`
+      }));
+
+      if (policy !== "no_spawn") {
+        const inferredRepo = /invoice|csv|stripe|billing/i.test(utterance) ? "buildbetter" : "openAGI";
+        options.push({
+          target: `spawn:${inferredRepo}`,
+          label: `Start new Paseo chat in ${inferredRepo}`,
+          detail: "Creates a fresh worktree off origin/main with this customer bug context",
+          badge: "New chat"
+        });
+      }
+
+      if (!options.length) {
+        state.messages.push({
+          id: "m_" + Date.now(),
+          role: "assistant",
+          at: "Just now",
+          text: "No active session matched that issue, and spawning new chats is disabled under Policy C."
+        });
+        renderAll();
+        return;
+      }
+
+      state.messages.push({
+        id: "pick_" + Date.now(),
+        role: "picker",
+        title: best ? "Top matching sessions from transcript index" : "No existing chat matched — spin up a fresh Paseo session?",
+        subtitle: best ? "Two sessions touch this area (one archived). Pick where to send it:" : "Indexed 74 transcripts across Paseo, Codex & Claude.",
+        issue: utterance,
+        options
+      });
+      renderAll();
+    }
+
+    function completePickedRoute(msgId, target, issue) {
+      state.messages = state.messages.filter(m => m.id !== msgId);
+      const isSpawn = target.startsWith("spawn:");
+      const label = isSpawn ? `new Paseo worktree in ${target.split(":")[1]}` : target;
+      state.messages.push({
+        id: "rec_" + Date.now(),
+        role: "receipt",
+        undoable: true,
+        html: `↗ ${isSpawn ? "Spawned &amp; dispatched to" : "Routed bug to"} <strong>${escapeHtml(label)}</strong> · Will ping when PR is ready`
+      });
+      renderAll();
+    }
+
+    // --- Scenario Triggers ---
+    function triggerPileup() {
+      state.activeThread = "supervisor";
+      state.modeCSubTab = "stream";
+      const pileupCards = [
+        ...initialCards(),
+        {
+          id: "card_pr289",
+          kind: "merge",
+          kindLabel: "Merge Ready · CI Green",
+          repo: "openAGI",
+          pr: "#289",
+          threadKey: "codex:sqlite-wal-isolation",
+          headline: "Merge PR #289: Isolate SQLite WAL busy_timeout in tests",
+          summary: "Eliminates SQLITE_BUSY flakes across parallel test runs (+19 / -6). Full suite green.",
+          noticedAt: "21:05",
+          scrutiny: "Recommended: Merge PR · Test-isolation fix (96%)",
+          primaryLabel: "Merge PR #289",
+          secondaryLabel: "Defer",
+          primaryOp: "merge",
+          schemaTouched: false,
+          filesChanged: "src/data-dir.js, test/sqlite-isolation.test.js",
+          timeline: ["21:05 · 118 test files passed with zero lock retries"],
+          resources: [{ icon: "🔀", title: "PR #289 · +19 / -6", sub: "GitHub · Checks green" }]
+        }
+      ];
+
+      state.cards = pileupCards;
+      state.deckIndex = 0;
+
+      const mode = state.policies.pileup;
+      if (mode === "deck_coalesced") {
+        // Remove previous catch-up bubbles and post ONE clean coalesced turn!
+        state.messages = state.messages.filter(m => !m.isPileupBubble);
+        state.messages.push({
+          id: "m_coalesced_" + Date.now(),
+          isPileupBubble: true,
+          role: "assistant",
+          at: "Catch-up · 1h away",
+          text: "While you were in your meeting: 3 PRs finished green (#284, #291, #289), 1 Stripe backfill question paused for you, and 5 routine test/rebase nudges ran automatically."
+        });
+      } else if (mode === "chronological_spam") {
+        state.messages = state.messages.filter(m => !m.isPileupBubble);
+        const noisy = [
+          "codex/paseo-delivery finished turn 4 and opened PR #284.",
+          "Auto-nudged spencer/auth-rebase to rebase onto main.",
+          "spencer/auth-rebase finished rebase; CI passed on PR #291.",
+          "Auto-nudged g2-three-modes to run check-bundle.",
+          "claude:billing-stripe-webhooks paused asking whether to backfill Nov 12 events.",
+          "Auto-retried flaky test on observation-retention.",
+          "codex:sqlite-wal-isolation finished turn 2; PR #289 checks passed.",
+          "Auto-nudged ios-chat-duo to verify safe-area insets.",
+          "Scan complete: 4 items in Needs You."
+        ];
+        for (const line of noisy) {
+          state.messages.push({ id: "m_spam_" + Math.random(), isPileupBubble: true, role: "assistant", at: "20:15–21:05", text: line });
+        }
+      } else {
+        // deck_silent: remove proactive catch-up bubbles altogether
+        state.messages = state.messages.filter(m => !m.isPileupBubble && m.id !== "m_intro");
+      }
+
+      renderAll();
+    }
+
+    function triggerExternalResolve() {
+      if (!state.cards.length) return;
+      const resolved = state.cards[0];
+      removeCard(resolved.id);
+      state.messages.push({
+        id: "rec_ext_" + Date.now(),
+        role: "receipt",
+        html: `⚡ Auto-collapsed <strong>${escapeHtml(resolved.pr || resolved.repo)}</strong> — detected resolved directly in Paseo / GitHub via SSE`
+      });
+      renderAll();
+    }
+
+    function triggerGraduationCard() {
+      state.activeThread = "supervisor";
+      const existing = state.cards.find(c => c.id === "card_grad_rebase");
+      if (!existing) {
+        state.cards.unshift({
+          id: "card_grad_rebase",
+          kind: "graduation",
+          kindLabel: "Scrutinizer Graduation · 7/7 Aligned",
+          repo: "All Repos",
+          pr: "Policy",
+          threadKey: "scrutiny:in-scope-rebase",
+          headline: "Auto-handle in-scope rebases & test retries without asking?",
+          summary: "You've approved this exact pattern 7 times in a row with 0 rollbacks. Promoting moves you closer to merge-only supervision.",
+          noticedAt: "Just now",
+          scrutiny: "Confidence 96% · Estimated -9 interruptions/week",
+          primaryLabel: "Auto-handle from now on",
+          secondaryLabel: "Keep asking",
+          primaryOp: "promote_policy",
+          schemaTouched: false,
+          filesChanged: "Scrutiny vector: in-scope-rebase-and-ci",
+          timeline: [
+            "Approved 7/7 matching nudges across openAGI & buildbetter",
+            "Zero owner vetoes or reverted commits in 14 days"
+          ],
+          resources: [
+            { icon: "🧠", title: "Directional Adaptive Scrutiny", sub: "Vector variance 0.03 · Ready to graduate" }
+          ]
+        });
+      }
+      state.deckIndex = 0;
+      renderAll();
+    }
+
+    // --- Wire Up UI Events ---
+    document.querySelectorAll("[data-thread]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        state.activeThread = btn.getAttribute("data-thread");
+        renderAll();
+      });
+    });
+
+    el("runningPillBtn").addEventListener("click", () => openRunningSessionsDrawer(false));
+    el("segStreamBtn").addEventListener("click", () => { state.modeCSubTab = "stream"; renderAll(); });
+    el("segThreadsBtn").addEventListener("click", () => { state.modeCSubTab = "threads"; renderAll(); });
+
+    el("composerInput").addEventListener("input", (e) => {
+      el("sendBtnLabel").textContent = e.target.value.trim() ? "Send" : "Talk";
+    });
+
+    el("composerForm").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = el("composerInput");
+      if (!input.value.trim()) {
+        // Simulate tapping "Talk" voice dictation on the focused card!
+        input.value = "Yeah, go for it";
+      }
+      handleOwnerMessage(input.value);
+      input.value = "";
+      el("sendBtnLabel").textContent = "Talk";
+    });
+
+    document.querySelectorAll("[data-say]").forEach(chip => {
+      chip.addEventListener("click", () => handleOwnerMessage(chip.getAttribute("data-say")));
+    });
+
+    document.querySelectorAll("[data-fire-say]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        highlightScenario(btn);
+        if (!state.cards.length) state.cards = initialCards();
+        handleOwnerMessage(btn.getAttribute("data-fire-say"));
+      });
+    });
+
+    document.querySelectorAll(".policy-options").forEach(group => {
+      const policyKey = group.getAttribute("data-policy");
+      group.querySelectorAll(".policy-opt").forEach(btn => {
+        btn.addEventListener("click", () => {
+          group.querySelectorAll(".policy-opt").forEach(b => b.classList.remove("selected"));
+          btn.classList.add("selected");
+          state.policies[policyKey] = btn.getAttribute("data-val");
+          highlightScenario(btn);
+          if (policyKey === "pileup") triggerPileup();
+          else renderAll();
+        });
+      });
+    });
+
+    function highlightScenario(node) {
+      document.querySelectorAll(".scenario-card").forEach(c => c.classList.remove("active-scenario"));
+      node.closest(".scenario-card")?.classList.add("active-scenario");
+    }
+
+    el("trigPileup").addEventListener("click", (e) => { highlightScenario(e.target); triggerPileup(); });
+    el("trigExternalResolve").addEventListener("click", (e) => { highlightScenario(e.target); triggerExternalResolve(); });
+
+    function ensureMergeCardForTest() {
+      let mergeCard = state.cards.find(c => c.kind === "merge");
+      if (!mergeCard) {
+        state.cards.unshift(initialCards()[0]);
+        mergeCard = state.cards[0];
+      }
+      state.deckIndex = state.cards.indexOf(mergeCard);
+      return mergeCard;
+    }
+
+    el("trigMergeGreen").addEventListener("click", (e) => {
+      highlightScenario(e.target);
+      executePrimaryCardAction(ensureMergeCardForTest(), { source: "voice", simulatedGitHubState: "green" });
+    });
+    el("trigMergeRunning").addEventListener("click", (e) => {
+      highlightScenario(e.target);
+      executePrimaryCardAction(ensureMergeCardForTest(), { source: "voice", simulatedGitHubState: "running" });
+    });
+    el("trigMergeFailed").addEventListener("click", (e) => {
+      highlightScenario(e.target);
+      executePrimaryCardAction(ensureMergeCardForTest(), { source: "voice", simulatedGitHubState: "failed" });
+    });
+
+    el("trigOpenRunning").addEventListener("click", (e) => {
+      highlightScenario(e.target);
+      if (state.policies.sessionSurface === "segmented_74") {
+        state.modeCSubTab = "threads";
+        renderAll();
+      } else if (state.policies.sessionSurface === "chat_only") {
+        handleOwnerMessage("What's running?");
+      } else {
+        openRunningSessionsDrawer(false);
+      }
+    });
+
+    el("trigGraduation").addEventListener("click", (e) => {
+      highlightScenario(e.target);
+      triggerGraduationCard();
+    });
+
+    el("resetDemoBtn").addEventListener("click", resetBaseline);
+
+    el("copySpecBtn").addEventListener("click", async () => {
+      const text = el("specPreview").textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        el("copySpecBtn").textContent = "Copied!";
+        setTimeout(() => { el("copySpecBtn").textContent = "Copy Spec JSON"; }, 1600);
+      } catch {
+        el("copySpecBtn").textContent = "Select below to copy";
+      }
+    });
+
+    // Boot
+    resetBaseline();
+  </script>
+</body>
+</html>

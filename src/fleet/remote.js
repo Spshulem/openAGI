@@ -2,15 +2,20 @@
 // enrolled-node control channel; no owner token, shell, or arbitrary URL crosses it.
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { resolveFleetConfig } from "./contracts.js";
+import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
+import { MODES, resolveFleetConfig } from "./contracts.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
+import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
+import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
+import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
+import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -30,6 +35,28 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/diagnose') for (const key of ['window', 'area']) {
         if (typeof payload.body?.[key] === 'string') url.searchParams.set(key, payload.body[key]);
       }
+      if (payload.path === '/fleet/api/search') {
+        if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/workspaces') {
+        if (typeof payload.body?.query === 'string') url.searchParams.set('query', payload.body.query);
+        if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/hierarchy') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/repo-status') {
+        if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
+        if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (/^\/fleet\/api\/threads\/[^/]+\/transcript$/.test(payload.path) && payload.body?.limit !== undefined) {
+        url.searchParams.set('limit', String(payload.body.limit));
+      }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
@@ -48,7 +75,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -56,7 +83,11 @@ export class RemoteFleetSupervisor {
     this.nodeId = nodeId;
     this.intervalMs = intervalMs;
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
-    this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
+    this.modeFile = dataDir ? path.join(dataDir, "fleet-remote-mode.json") : null;
+    // Only the fleet computer knows its mode. Until it answers, this is the
+    // last mode it reported (kept across restarts), or none: never a guess.
+    this.reportedMode = this.lastReportedMode();
+    this.state = { mode: this.reportedMode, enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.questionsAuthoritative = false;
     this.timer = null;
@@ -64,13 +95,57 @@ export class RemoteFleetSupervisor {
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
     this.lastEmitted = null;
+    this.requestSequence = 0;
+    this.appliedSequence = 0;
+  }
+  lastReportedMode() {
+    if (!this.modeFile) return null;
+    try {
+      const saved = readJsonFile(this.modeFile, null);
+      // Another computer's report says nothing about this one.
+      return saved?.nodeId === this.nodeId && MODES.includes(saved.mode) ? saved.mode : null;
+    } catch {
+      return null;
+    }
+  }
+  noteReportedMode(mode) {
+    if (mode === this.reportedMode || !MODES.includes(mode)) return;
+    try {
+      if (this.modeFile) writeJsonAtomic(this.modeFile, { nodeId: this.nodeId, mode });
+      this.reportedMode = mode;
+    } catch { /* unsaved: the next report writes it */ }
   }
   getState() {
     const state = structuredClone(this.state);
     state.questionsAuthoritative = this.questionsAuthoritative;
+    state.modeConfirmed = this.questionsAuthoritative;
+    const localFixQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
     if (this.selfFixHub) {
       state.fixes = this.selfFixHub.store.fixes();
-      state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
+      state.questions = [...state.questions, ...localFixQuestions];
+    }
+    if (!Array.isArray(state.cards)) {
+      const remoteAutonomy = state.autonomy ?? null;
+      Object.assign(state, buildSupervisorDeck(state, { preferences: state.preferences }));
+      if (remoteAutonomy) state.autonomy = remoteAutonomy;
+    } else if (localFixQuestions.length > 0) {
+      const prefs = normalizePreferences(state.preferences);
+      const rowsByKey = new Map((state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+      const actions = Array.isArray(state.actions) ? state.actions : [];
+      const existingIds = new Set(state.cards.flatMap((c) => [c?.id, c?.questionId].filter(Boolean)));
+      const localCards = localFixQuestions
+        .filter((q) => q?.id && !existingIds.has(q.id) && !isSuppressedByQuietCadence(q, prefs))
+        .map((q) => {
+          const { rank: _rank, ...card } = buildSupervisorCard(q, { rowsByKey, actions, prefs });
+          return card;
+        });
+      if (localCards.length > 0) {
+        const nonPref = state.cards.filter((c) => c.kind !== 'preference');
+        const prefCards = state.cards.filter((c) => c.kind === 'preference');
+        state.cards = [...nonPref, ...localCards, ...prefCards];
+        state.activeSummary = buildActiveSummary(state.snapshot, state.cards);
+        state.catchUpSummary = buildCatchUpSummary(state.cards, state.activeSummary);
+      }
     }
     return state;
   }
@@ -83,23 +158,34 @@ export class RemoteFleetSupervisor {
     else this.pendingOutreachDecisions.set(id, count - 1);
   }
   async request(method, path, body) {
+    const sequence = ++this.requestSequence;
     let reached = false;
     let status = null;
     try {
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
-      this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
-      this.questionsAuthoritative = true;
-      this.mirrorQuestions();
+      if (sequence >= this.appliedSequence) {
+        this.appliedSequence = sequence;
+        this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
+        this.questionsAuthoritative = true;
+        this.noteReportedMode(this.state.mode);
+        this.mirrorQuestions();
+        this.emitIfChanged();
+      }
       status = result.response?.status ?? null;
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
+      const rawMsg = String(error?.message ?? '');
+      const unsupportedRoute = (reached && status === 404 && /unknown fleet route/i.test(rawMsg))
+        || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      if (!missingThread) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
+      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
+      const nonOutageError = missingThread || closedCard || unsupportedRoute;
+      if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(missingThread ? error.message : this.state.lastError), { reached, status });
+      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
     }
   }
   refresh() {
@@ -113,11 +199,19 @@ export class RemoteFleetSupervisor {
     return this.refreshing;
   }
   // The main's push sender listens for "fleet" like a local supervisor's
-  // tick. Only a new snapshot or a changed set of open questions is news.
+  // tick. Only a new snapshot or a changed set of open questions/cards is news.
   emitIfChanged() {
     try {
       const state = this.getState();
-      const signature = JSON.stringify([state.snapshot?.at ?? null, state.questions.map(q => q.id).sort()]);
+      const signature = JSON.stringify([
+        state.mode,
+        state.snapshot?.at ?? null,
+        state.questions.map(q => q.id).sort(),
+        (state.cards ?? []).map(c => c.id).sort(),
+        state.preferences?.mergePolicy ?? null,
+        state.preferences?.cadence ?? null,
+        state.preferences?.autoSlices ?? null
+      ]);
       if (signature === this.lastEmitted) return;
       this.lastEmitted = signature;
       this.runtime?.events?.emit?.("fleet", { at: state.snapshot?.at ?? null, reason: "remote-refresh", counts: state.snapshot?.counts ?? null });
@@ -156,9 +250,11 @@ export class RemoteFleetSupervisor {
     }
   }
   // Brings back a question the computer's review closed.
+  async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}) }); }
+  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(Array.isArray(images) && images.length ? { images } : {}) }); }
+  async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
     return screen;
@@ -171,6 +267,334 @@ export class RemoteFleetSupervisor {
   async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
   async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
+  async searchThreads(options = {}) {
+    const limit = Number.isInteger(options?.limit) ? options.limit : 20;
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    const fetchLimit = peerNodes.length > 0 ? Math.min(50, Math.max(limit, 30)) : limit;
+    const fetchOptions = { ...options, limit: fetchLimit };
+    let primaryRes = null;
+    let primaryError = null;
+    try {
+      primaryRes = await this.request('GET', '/fleet/api/search', fetchOptions);
+    } catch (error) {
+      if (error.unsupportedRoute || error.status === 404) {
+        if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
+        if (this.questionsAuthoritative) this.state.lastError = null;
+        primaryRes = searchFleet(this.getState(), { natural: true, ...fetchOptions });
+      } else if (peerNodes.length === 0 || (error.reached && error.status === 400)) {
+        throw error;
+      } else {
+        primaryError = error;
+      }
+    }
+
+    if (peerNodes.length === 0) {
+      return {
+        ...primaryRes,
+        results: (primaryRes?.results ?? []).slice(0, limit)
+      };
+    }
+
+    let peerResponded = false;
+    const peerLists = await Promise.all(peerNodes.slice(0, 4).map(async (peer) => {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path: '/fleet/api/search', body: fetchOptions },
+          { timeoutMs: 28000 }
+        );
+        if (res?.response?.status === 200 && Array.isArray(res.response.body?.results)) {
+          peerResponded = true;
+          return res.response.body.results;
+        }
+      } catch { /* fall through to state search for older node versions */ }
+      try {
+        const stateRes = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path: '/fleet/api/state' },
+          { timeoutMs: 6000 }
+        );
+        if (stateRes?.state) {
+          peerResponded = true;
+          return searchFleet(stateRes.state, { natural: true, ...fetchOptions, includeScores: true }).scoredResults
+            ?? searchFleet(stateRes.state, { natural: true, ...fetchOptions }).results;
+        }
+      } catch { /* peer offline or unreachable */ }
+      return [];
+    }));
+
+    if (primaryError && !peerResponded) {
+      throw primaryError;
+    }
+
+    let fallbackCachedResults = [];
+    if (primaryError && this.questionsAuthoritative) {
+      try {
+        fallbackCachedResults = searchFleet(this.getState(), { natural: true, ...fetchOptions, includeScores: true }).scoredResults ?? [];
+      } catch (err) {
+        if (/Query must be|Limit must be/i.test(String(err?.message ?? ''))) throw err;
+      }
+    } else if (primaryError) {
+      searchFleet({ snapshot: { threads: [] } }, { natural: true, ...fetchOptions });
+    }
+
+    const ranked = rankCombinedSearchResults(
+      [...(primaryRes?.results ?? fallbackCachedResults), ...peerLists.flat()],
+      options?.query ?? ''
+    );
+    return {
+      query: String(options?.query ?? '').trim(),
+      scannedAt: primaryRes?.scannedAt ?? this.state.snapshot?.at ?? null,
+      scope: primaryRes?.scope ?? 'Peer fleet search (primary fleet computer offline).',
+      ...primaryRes,
+      results: ranked.slice(0, limit),
+      total: ranked.length,
+      ...(primaryError ? { partial: true, primaryError: primaryError.message } : {})
+    };
+  }
+  async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
+  async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
+  async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
+  async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
+  async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
+  async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
+  async batchActCards(input = {}) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw new Error('Pass a JSON object body.');
+    }
+    const { cardOp, explicitIds } = normalizeBatchCardsInput(input);
+    const openLocalQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
+    if (openLocalQuestions.length === 0) {
+      return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+    }
+
+    const localById = new Map();
+    for (const q of openLocalQuestions) {
+      if (q?.id) localById.set(q.id, q);
+    }
+    const matchesLocal = (rawId) => {
+      const clean = String(rawId ?? '').trim();
+      const stripped = clean.replace(/^question:/, '');
+      return localById.has(clean) ? clean : (localById.has(stripped) ? stripped : null);
+    };
+
+    const buildLocalCards = (includeQuietSuppressed = false) => {
+      const prefs = normalizePreferences(this.state.preferences);
+      const rowsByKey = new Map((this.state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+      const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+      return openLocalQuestions
+        .filter((q) => q?.id && (includeQuietSuppressed || !isSuppressedByQuietCadence(q, prefs)))
+        .map((q) => {
+          const { rank: _rank, ...card } = buildSupervisorCard(q, { rowsByKey, actions, prefs });
+          return card;
+        });
+    };
+
+    const combineBatchResults = (remoteRes, localRes, orderedIds = null) => {
+      const remoteItems = Array.isArray(remoteRes?.results) ? remoteRes.results : [];
+      const localItems = Array.isArray(localRes?.results) ? localRes.results : [];
+      let mergedResults = [...remoteItems, ...localItems];
+      if (orderedIds?.length) {
+        const orderIndex = new Map(orderedIds.map((id, idx) => [id.replace(/^question:/, ''), idx]));
+        mergedResults = [...mergedResults].sort(
+          (a, b) => (orderIndex.get(String(a.cardId ?? '').replace(/^question:/, '')) ?? 999)
+            - (orderIndex.get(String(b.cardId ?? '').replace(/^question:/, '')) ?? 999)
+        );
+      }
+      const total = mergedResults.length;
+      if (total === 0) {
+        return {
+          ok: true,
+          op: cardOp,
+          total: 0,
+          succeeded: 0,
+          halted: 0,
+          detail: 'No open decision cards matched that batch filter.',
+          results: []
+        };
+      }
+      const succeeded = mergedResults.filter((r) => r.ok).length;
+      const halted = total - succeeded;
+      return {
+        ok: halted === 0,
+        op: cardOp,
+        total,
+        succeeded,
+        halted,
+        detail: `Processed ${total} card${total === 1 ? '' : 's'}: ${succeeded} succeeded${halted ? `, ${halted} halted` : ''}.`,
+        results: mergedResults
+      };
+    };
+
+    if (explicitIds?.length) {
+      const localIds = [];
+      const remoteIds = [];
+      for (const rawId of explicitIds) {
+        const localKey = matchesLocal(rawId);
+        if (localKey) {
+          if (!localIds.includes(localKey)) localIds.push(localKey);
+        } else {
+          remoteIds.push(rawId);
+        }
+      }
+      const remoteRes = remoteIds.length > 0
+        ? ((await this.request('POST', '/fleet/api/cards/batch', { ...input, cardIds: remoteIds })).result ?? null)
+        : null;
+      const localCards = buildLocalCards(true);
+      const localRes = localIds.length > 0
+        ? await batchActCards(
+            { getState: () => ({ cards: localCards }), actCard: (id, act) => this.actCard(id, act) },
+            { ...input, cardIds: localIds }
+          )
+        : null;
+      if (localRes?.total > 0) this.emitIfChanged();
+      return combineBatchResults(remoteRes, localRes, explicitIds);
+    }
+
+    const remoteRes = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+    const remainingSlots = Math.max(0, 25 - (remoteRes?.total ?? 0));
+    let localRes = null;
+    if (remainingSlots > 0) {
+      const visibleLocalCards = buildLocalCards(false);
+      if (visibleLocalCards.length > 0) {
+        localRes = await batchActCards(
+          { getState: () => ({ cards: visibleLocalCards }), actCard: (id, act) => this.actCard(id, act) },
+          { ...input, maxCards: remainingSlots }
+        );
+      }
+    }
+    if (localRes?.total > 0) this.emitIfChanged();
+    return combineBatchResults(remoteRes, localRes);
+  }
+  async readChatTranscript({ key, limit = 20 } = {}) {
+    const cleanKey = typeof key === 'string' ? key.trim() : '';
+    if (!cleanKey) throw new Error('Pass a session key.');
+    const path = `/fleet/api/threads/${encodeURIComponent(cleanKey)}/transcript`;
+    try {
+      const body = await this.request('GET', path, { limit });
+      if (body?.transcript) return body.transcript;
+    } catch (error) {
+      if (error.status !== 404) throw error;
+    }
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    for (const peer of peerNodes.slice(0, 4)) {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path, body: { limit } },
+          { timeoutMs: 15000 }
+        );
+        if (res?.response?.status === 200 && res.response.body?.transcript) {
+          return res.response.body.transcript;
+        }
+      } catch { /* try next peer */ }
+    }
+    throw new Error(`No session found with key "${cleanKey.slice(0, 120)}".`);
+  }
+  async routeIssue(input = {}) {
+    const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
+    return rest;
+  }
+  async actCard(cardId, input = {}) {
+    if (this.selfFixHub && typeof cardId === 'string') {
+      const qid = cardId.replace(/^question:/, '');
+      const localQuestion = this.selfFixHub.store.question(qid);
+      if (localQuestion && localQuestion.status === 'open') {
+        const prefs = normalizePreferences(this.state.preferences);
+        const rowsByKey = new Map((this.state.snapshot?.threads ?? []).filter((r) => r?.key).map((r) => [r.key, r]));
+        const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+        const localCard = buildSupervisorCard(localQuestion, { rowsByKey, actions, prefs });
+
+        const normalizedOp = String(input?.op ?? 'primary').toLowerCase();
+        const explicitValue = typeof input?.value === 'string' && input.value.trim() ? input.value.trim() : null;
+        const resolvedAction = normalizedOp === 'secondary'
+          ? localCard?.secondaryAction
+          : normalizedOp === 'primary'
+            ? localCard?.primaryAction
+            : (localCard?.extraActions ?? []).find((a) => a.op === normalizedOp && (explicitValue == null || a.value === explicitValue)) ?? null;
+        const effectiveOp = normalizedOp === 'primary' || normalizedOp === 'secondary'
+          ? (resolvedAction?.op ?? 'answer')
+          : normalizedOp;
+        const effectiveValue = explicitValue ?? resolvedAction?.value ?? null;
+
+        if (effectiveOp === 'defer' || effectiveOp === 'dismiss' || effectiveValue === 'dismiss') {
+          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(qid), delivery: null };
+        }
+        if (effectiveOp === 'merge' || effectiveOp === 'fix_ci') {
+          return { ok: false, kind: effectiveOp, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
+        }
+        if (effectiveOp === 'reply' && !explicitValue) return null;
+        const answer = effectiveValue ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
+        if (!answer) return null;
+        const res = await this.selfFixHub.answer(qid, answer);
+        return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;
+      }
+    }
+    try {
+      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+    } catch (error) {
+      const legacyRouteMissing = Boolean(error.unsupportedRoute) || /unknown fleet route|unsupported fleet request/i.test(String(error?.message ?? ''));
+      if (error.status === 404 && !legacyRouteMissing) return null;
+      if (!legacyRouteMissing) throw error;
+      if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
+      if (this.questionsAuthoritative) this.state.lastError = null;
+      const qid = String(cardId ?? '').replace(/^question:/, '');
+      const curState = this.getState();
+      const card = (curState.cards ?? []).find((c) => c.id === cardId || c.id === qid || c.questionId === qid) ?? null;
+      const openQ = (curState.questions ?? []).find((q) => q.id === qid) ?? null;
+      if (!openQ) return null;
+      const op = String(input?.op ?? 'primary').toLowerCase();
+      if (op === 'defer' || op === 'dismiss') {
+        const question = await this.dismissQuestion(qid);
+        return { ok: true, kind: 'defer', status: 'dismissed', question, delivery: null };
+      }
+      if (op === 'reply') {
+        const replyText = typeof input?.value === 'string' ? input.value.trim() : '';
+        if (!replyText) return { ok: false, kind: 'reply', status: 'blocked', detail: 'Enter a reply to send.' };
+        const eligibleForQuestionReply = openQ.canReply === true
+          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1));
+        if (eligibleForQuestionReply) {
+          const replied = await this.replyQuestion(qid, replyText);
+          if (!replied) return { ok: false, kind: 'reply', status: 'closed', detail: 'Question already closed.' };
+          const { state: _state, ...rest } = replied;
+          return {
+            ok: !rest.delivery || ['sent', 'queued'].includes(rest.delivery.status),
+            kind: 'reply',
+            status: rest.delivery?.status ?? 'done',
+            detail: rest.delivery?.detail ?? 'Delivered reply to coding session.',
+            ...rest
+          };
+        }
+        const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
+        if (!threadKey) return { ok: false, kind: 'reply', status: 'blocked', detail: 'No coding session is linked to this card.' };
+        const sent = await this.sendOwnerMessage(threadKey, replyText);
+        return {
+          ok: sent?.delivery?.status === 'sent',
+          kind: 'reply',
+          status: sent?.delivery?.status ?? 'blocked',
+          detail: sent?.delivery?.detail ?? (sent?.delivery?.status === 'sent' ? 'Delivered reply to coding session.' : 'Could not deliver reply.'),
+          delivery: sent?.delivery ?? null
+        };
+      }
+      const chosen = typeof input?.value === 'string' && input.value
+        ? input.value
+        : op === 'secondary'
+          ? card?.secondaryAction?.value
+          : (card?.primaryAction?.value ?? (openQ.options ?? []).find((opt) => opt !== 'dismiss'));
+      if (!chosen) return null;
+      const res = await this.answerQuestion(qid, chosen, { clarification: input?.clarification ?? null });
+      return res ? { ok: res.delivery?.status !== 'blocked', kind: 'answer', status: res.delivery?.status ?? 'done', detail: res.delivery?.detail ?? null, ...res } : null;
+    }
+  }
   async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
   // Fix it queues in this main's hub (where fixes are listed, revised and
   // stopped); the computer only links the suggestion to that fix id.
@@ -189,12 +613,29 @@ export class RemoteFleetSupervisor {
 
   // A thread the computer's last scan does not have is null, not an outage.
   async threadDetail(threadKey) {
+    const path = `/fleet/api/threads/${encodeURIComponent(threadKey)}`;
     try {
-      return (await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}`)).thread ?? null;
+      return (await this.request('GET', path)).thread ?? null;
     } catch (error) {
-      if (error.status === 404) return null;
-      throw error;
+      if (error.status !== 404) throw error;
     }
+    const peerNodes = (this.runtime?.nodeCapabilities?.list?.('fleet-supervisor') ?? [])
+      .filter((n) => n?.nodeId && n.nodeId !== this.nodeId && typeof this.runtime?.nodeCapabilities?.dispatch === 'function');
+    for (const peer of peerNodes.slice(0, 4)) {
+      try {
+        const res = await this.runtime.nodeCapabilities.dispatch(
+          peer.nodeId,
+          'fleet-supervisor',
+          'request',
+          { method: 'GET', path },
+          { timeoutMs: 15000 }
+        );
+        if (res?.response?.status === 200 && res.response.body?.thread) {
+          return res.response.body.thread;
+        }
+      } catch { /* try next peer */ }
+    }
+    return null;
   }
   async pushNow(threadKey) {
     const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/push`);
@@ -223,7 +664,9 @@ export class RemoteFleetSupervisor {
   mirrorQuestions() {
     const outreach = this.runtime.outreach;
     if (!outreach) return;
-    const openIds = new Set(this.getState().questions.map(q => q.id));
+    const currentState = this.getState();
+    const liveQuestions = currentState.questions.filter((q) => !isSuppressedByQuietCadence(q, currentState.preferences));
+    const openIds = new Set(liveQuestions.map(q => q.id));
     for (const item of outreach.list()) {
       if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
           && (item.sourceRef.nodeId !== this.nodeId
@@ -232,7 +675,7 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
-    for (const q of this.getState().questions) {
+    for (const q of liveQuestions) {
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'

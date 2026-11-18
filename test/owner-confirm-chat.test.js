@@ -36,6 +36,16 @@ function harness(t) {
   return { pendingActions, ran, turns, say, card, host };
 }
 
+test("image content taints an owner turn without becoming action authorization", async t => {
+  const h = harness(t);
+  const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
+  await h.host.handleMessage({ text: "Describe this image", sessionId: "image-chat", attachments: [{ id: "synthetic", mimeType: "image/png", data }] },
+    { principal: ownerPrincipal("phone", "synthetic-phone") });
+  assert.equal(h.turns.at(-1).context.__turn.untrusted, true);
+  assert.equal(h.turns.at(-1).context.__turn.intent, "Describe this image");
+  assert.equal(h.ran.length, 0);
+});
+
 test("a bare yes runs the one card this chat raised since the owner last spoke", async (t) => {
   const h = harness(t);
   await h.say("what does the openagi thread need?");

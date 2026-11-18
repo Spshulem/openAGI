@@ -1,3 +1,4 @@
+import type { LiveCue } from './live-cues'
 import type { OpenAGIConfig } from './config'
 import { OpenAGIApiError } from './config'
 import type { InboxItem, MainConsent, ProactiveSettings } from './proactive'
@@ -137,6 +138,9 @@ export class OpenAGIApiClient {
         triggerMode: options.answerQuestions ? 'wake_or_question' : 'wake_only', forceAnswer: options.forceAnswer === true, transcribeOnly: true,
       }),
     })
+  }
+  liveCue(text: string, consentId: string, signal: AbortSignal): Promise<{ cue: LiveCue | null }> {
+    return this.json('/nodes/g2/cues', { method: 'POST', signal, body: JSON.stringify({ text, consentId, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }) })
   }
   private requireCredential(): OpenAGINodeCredential {
     const credential = this.getCredential()

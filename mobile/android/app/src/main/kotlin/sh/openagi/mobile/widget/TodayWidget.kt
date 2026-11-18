@@ -52,27 +52,28 @@ class TodayWidget : GlanceAppWidget() {
         // null rather than throwing, and Credentials.load() returns null
         // rather than a token when nothing is stored, so there is no snapshot
         // shape here that can crash the widget host.
-        val snapshot = SnapshotStore(context.filesDir).load()
-        val paired = Credentials.load(context) != null
+        val credentials = Credentials.load(context)
+        val snapshot = credentials?.let { SnapshotStore(Credentials.workspaceDirectory(context, it)).load() }
+        val paired = credentials != null
         val state = WidgetState.from(snapshot, paired)
 
         provideContent {
             GlanceTheme {
-                WidgetContent(state)
+                WidgetContent(state, credentials?.workspaceId.orEmpty())
             }
         }
     }
 }
 
 @Composable
-private fun WidgetContent(state: WidgetState) {
+private fun WidgetContent(state: WidgetState, workspaceId: String) {
     Column(modifier = GlanceModifier.fillMaxSize().padding(12.dp)) {
         when (state) {
             is WidgetState.Unpaired -> UnpairedContent()
             is WidgetState.Empty -> EmptyContent(state)
-            is WidgetState.Tasks -> TasksContent(state)
+            is WidgetState.Tasks -> TasksContent(state, workspaceId)
             is WidgetState.Stale -> StaleContent(state)
-            is WidgetState.Unreachable -> UnreachableContent(state)
+            is WidgetState.Unreachable -> UnreachableContent(state, workspaceId)
         }
     }
 }
@@ -95,10 +96,10 @@ private fun EmptyContent(state: WidgetState.Empty) {
 }
 
 @Composable
-private fun TasksContent(state: WidgetState.Tasks) {
+private fun TasksContent(state: WidgetState.Tasks, workspaceId: String) {
     // Home-screen real estate is small; three rows is a widget, not the app,
     // and fewer when the widget is sized too short to hold three.
-    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item) }
+    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item, workspaceId) }
     Text(
         text = countsLine(state.counts.today, state.counts.overdue),
         style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant),
@@ -107,7 +108,7 @@ private fun TasksContent(state: WidgetState.Tasks) {
 }
 
 @Composable
-private fun TaskRow(item: TaskItem) {
+private fun TaskRow(item: TaskItem, workspaceId: String) {
     Row(
         modifier = GlanceModifier.fillMaxWidth().padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -122,7 +123,7 @@ private fun TaskRow(item: TaskItem) {
                 .padding(end = 12.dp)
                 .clickable(
                     actionRunCallback<CompleteTaskAction>(
-                        actionParametersOf(CompleteTaskAction.taskIdKey to item.id),
+                        actionParametersOf(CompleteTaskAction.taskIdKey to item.id, CompleteTaskAction.workspaceKey to workspaceId),
                     ),
                 ),
         )
@@ -146,12 +147,12 @@ private fun StaleContent(state: WidgetState.Stale) {
 // fact plainly rather than either hiding the tasks or pretending they're
 // current; do not say "offline" when a failed refresh is all that's known.
 @Composable
-private fun UnreachableContent(state: WidgetState.Unreachable) {
+private fun UnreachableContent(state: WidgetState.Unreachable, workspaceId: String) {
     Text(
         text = "Can't reach OpenAGI",
         style = TextStyle(color = GlanceTheme.colors.error, fontWeight = FontWeight.Bold),
     )
-    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item) }
+    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item, workspaceId) }
     Text(
         text = countsLine(state.counts.today, state.counts.overdue),
         style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant),

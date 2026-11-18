@@ -206,3 +206,48 @@ test("recovery: pre-existing stuck in_progress tasks are reconciled without hand
   assert.equal(reloaded.get("task_agent_stuck").status, "pending");
   assert.equal(reloaded.get("task_user_stuck").sourceMeta.stalledSince, userTask.sourceMeta.stalledSince);
 });
+
+test("recovery: manually resumed deferred tasks retain attempts but cannot hold a permanent lease", (t) => {
+  const { dataDir, tasks } = makeEnv();
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const task = tasks.add({ title: "Resume deferred work" }, { queue: "agent" });
+  tasks.agentClaimNext();
+  tasks.update(task.id, { status: "pending" });
+  tasks.update(task.id, { status: "in_progress" });
+  assert.equal(tasks.get(task.id).sourceMeta.agentLease.expiresAt, undefined);
+  const now = Date.parse(tasks.get(task.id).updatedAt) + 8 * 24 * 60 * MINUTE;
+  const report = tasks.sweepStuckTasks({ now });
+  assert.deepEqual(report.requeued, [task.id]);
+  assert.equal(tasks.get(task.id).sourceMeta.agentLease.attempts, 1);
+  assert.equal(tasks.agentClaimNext({ now }).sourceMeta.agentLease.attempts, 2);
+});
+
+test("recovery: malformed lease expiry cannot wedge stale work or reset its attempt budget", (t) => {
+  const { dataDir, tasks } = makeEnv();
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const task = tasks.add({ title: "Recover interrupted work", status: "in_progress", sourceMeta: {
+    agentLease: { attempts: AGENT_MAX_ATTEMPTS, expiresAt: "invalid" }
+  } }, { queue: "agent" });
+  const now = Date.parse(task.updatedAt) + 8 * 24 * 60 * MINUTE;
+  assert.deepEqual(tasks.sweepStuckTasks({ now }).stalled, [task.id]);
+  assert.equal(tasks.get(task.id).status, "blocked");
+  assert.equal(tasks.get(task.id).sourceMeta.agentStall.attempts, AGENT_MAX_ATTEMPTS);
+});
+
+test("recovery: fresh, user-owned, and draft-backed work is protected without an expiry", (t) => {
+  const { dataDir, tasks, drafts } = makeEnv();
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const create = (title, queue = "agent") => tasks.add({ title, status: "in_progress", sourceMeta: {
+    agentLease: { attempts: 1 }
+  } }, { queue });
+  const fresh = create("Recently resumed");
+  tasks.sweepStuckTasks({ now: Date.parse(fresh.updatedAt) + MINUTE });
+  assert.equal(tasks.get(fresh.id).status, "in_progress");
+  const user = create("User-owned work", "user");
+  const drafted = create("Draft-backed work");
+  drafts.add({ title: "Reviewable result", body: "Synthetic fixture", taskId: drafted.id });
+  const now = Date.parse(drafted.updatedAt) + 8 * 24 * 60 * MINUTE;
+  tasks.sweepStuckTasks({ now });
+  assert.equal(tasks.get(user.id).status, "in_progress");
+  assert.equal(tasks.get(drafted.id).status, "in_progress");
+});
