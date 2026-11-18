@@ -877,6 +877,23 @@ export function buildCatchUpSummary(cards = [], activeSummary = null) {
   return "All clear—no coding sessions need you right now.";
 }
 
+export function deriveCardProject(card = null, thread = null) {
+  const explicit = typeof card?.project === "string" ? card.project.trim() : "";
+  if (explicit && explicit !== "General") return explicit;
+  const repo = String(card?.repo ?? thread?.repo ?? "").trim();
+  if (repo) {
+    const seg = repo.split("/").filter(Boolean).at(-1);
+    if (seg) return seg;
+  }
+  const dir = String(thread?.cwd ?? card?.workspace ?? thread?.workspace ?? "").trim();
+  if (dir) {
+    const clean = dir.replace(/\/+$/, "");
+    const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
+    if (base && base !== "Workspace" && base !== "workspace") return base;
+  }
+  return "general";
+}
+
 export function buildSupervisorDeck(
   state,
   { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map() } = {}
@@ -895,7 +912,10 @@ export function buildSupervisorDeck(
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
 
   const prefCards = buildProgressivePreferenceCards(prefs, { now });
-  const cards = [...questionCards, ...prefCards].map(({ rank: _rank, ...card }) => card);
+  const cards = [...questionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
+    ...card,
+    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null)
+  }));
 
   const activeSummary = buildActiveSummary(snapshot, cards);
   const autonomy = buildAutonomySummary(actions, prefs, questionCards.length, now);

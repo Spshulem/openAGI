@@ -778,6 +778,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var timeline: [SupervisorTimelineItem]
     public var resources: [SupervisorResource]
     public var openChat: FleetOpenChat?
+    public var project: String?
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, sessionTitle: String? = nil,
@@ -790,7 +791,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
                 secondaryAction: SupervisorCardAction? = nil, extraActions: [SupervisorCardAction] = [],
                 prContext: SupervisorPRContext? = nil, recentMessages: [SupervisorRecentMessage] = [],
                 timeline: [SupervisorTimelineItem] = [], resources: [SupervisorResource] = [],
-                openChat: FleetOpenChat? = nil) {
+                openChat: FleetOpenChat? = nil, project: String? = nil) {
         self.id = id
         self.questionId = questionId
         self.kind = kind
@@ -826,13 +827,14 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.timeline = timeline
         self.resources = resources
         self.openChat = openChat
+        self.project = project
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, questionId, kind, kindLabel, slice, headline, sessionTitle, summary, brief, suggestedReplies, canReply, agentSummary, recommendation
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
-        case prContext, recentMessages, timeline, resources, openChat
+        case prContext, recentMessages, timeline, resources, openChat, project
     }
 
     public init(from decoder: Decoder) throws {
@@ -872,6 +874,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         timeline = c.lenientList(SupervisorTimelineItem.self, .timeline)
         resources = c.lenientList(SupervisorResource.self, .resources)
         openChat = c.lenient(FleetOpenChat.self, .openChat)
+        project = c.lenient(String.self, .project)
     }
 }
 

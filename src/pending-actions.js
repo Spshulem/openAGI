@@ -72,6 +72,10 @@ export class PendingActionStore {
   // owner's own instruction ran. Every card gets a short spoken code.
   enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, ownerIntent = null, _reuse = true }) {
     const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
+    const defaultChatTtlMs = 2 * 60 * 60 * 1000;
+    const effectiveTtlMs = (ttlMs === null || ttlMs === undefined) && cardMode === "chat"
+      ? defaultChatTtlMs
+      : ttlMs;
     const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
       ? dedupeKey.slice(0, 500)
       : cardMode === "chat" ? argsDigest(toolName, args, context?.sessionId) : null;
@@ -93,7 +97,7 @@ export class PendingActionStore {
           // reply's preparedAt): renewing past it would leave a card that
           // looks approvable but whose tool refuses to run.
           const sameArgs = argsDigest(toolName, existing.args, null) === argsDigest(toolName, args ?? {}, null);
-          const ttl = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0 ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000) : null;
+          const ttl = Number.isFinite(Number(effectiveTtlMs)) && Number(effectiveTtlMs) > 0 ? Math.min(Math.trunc(Number(effectiveTtlMs)), 24 * 60 * 60 * 1000) : null;
           if (sameArgs && ttl && existing.expiresAt && Date.parse(existing.expiresAt) < nowMs + ttl) {
             existing.expiresAt = new Date(nowMs + ttl).toISOString();
           }
@@ -104,8 +108,8 @@ export class PendingActionStore {
     }
     const createdMs = this.now();
     const createdAt = new Date(createdMs).toISOString();
-    const boundedTtlMs = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0
-      ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000)
+    const boundedTtlMs = Number.isFinite(Number(effectiveTtlMs)) && Number(effectiveTtlMs) > 0
+      ? Math.min(Math.trunc(Number(effectiveTtlMs)), 24 * 60 * 60 * 1000)
       : null;
     const action = {
       id: createId("act"),

@@ -20,7 +20,13 @@ import {
   validateDecisionsUrl
 } from "../src/fleet/decisions-gate.js";
 import { deriveProjectInfo } from "../src/fleet/coordinator.js";
+import { buildSupervisorDeck, deriveCardProject } from "../src/fleet/cards.js";
 import { PASEO_LABEL_COLORS, inferSessionTheme } from "../src/fleet/themes.js";
+import { appendSharedThreadMessages, sharedThreadHistory } from "../src/shared-conversations.js";
+import { InMemoryAgentStore } from "../src/agent-store.js";
+import { G2Channel } from "../src/integrations/g2-channel.js";
+import { NodeRegistry } from "../src/node-registry.js";
+import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-11-17T18:00:00.000Z");
@@ -950,4 +956,195 @@ test("reconcileOpenQuestions closes stale cards deterministically and via /v1/de
   // Second call with unchanged thread state hits questionRelevanceCache -> 0 additional /v1/decisions calls!
   await sup.reconcileOpenQuestions({ force: true });
   assert.equal(decisionsCalls, 1);
+});
+
+test("unified supervisor sync: POST /conversations/supervisor/append deduplicates and allows mobile proxy", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-sync-append-"));
+  const runtime = createDurableRuntime({ dataDir });
+  const store = new InMemoryAgentStore();
+  runtime.agentHost = { store, handleMessage: async () => ({ reply: "ok", session: { id: "devices:supervisor:main" } }) };
+  const app = createHostedInterface(runtime, { dataDir, port: 0, authToken: "" });
+  t.after(async () => { await app.close(); await runtime.observations?.close?.(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const { url } = await app.listen();
+
+  assert.equal(isMobileRouteAllowed("POST", "/conversations/supervisor/append"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/pending-actions/dismiss-all"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/conversations/agent/messages"), false);
+
+  const first = await fetch(`${url}/conversations/supervisor/append`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sourceName: "Paseo",
+      messages: [
+        { id: "paseo_u1", role: "user", text: "What needs attention?" },
+        { id: "paseo_a1", role: "assistant", text: "PR #9958 is green." }
+      ]
+    })
+  });
+  assert.equal(first.status, 200);
+  const firstBody = await first.json();
+  assert.equal(firstBody.appended.length, 2);
+
+  // Repeating same IDs is idempotent and does not duplicate messages
+  const replay = await fetch(`${url}/conversations/supervisor/append`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sourceName: "Paseo",
+      messages: [
+        { id: "paseo_u1", role: "user", text: "What needs attention?" },
+        { id: "paseo_a1", role: "assistant", text: "PR #9958 is green." }
+      ]
+    })
+  });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).appended.length, 0);
+  const hist = sharedThreadHistory(store, "supervisor");
+  assert.deepEqual(hist.messages.map((m) => m.id), ["paseo_u1", "paseo_a1"]);
+});
+
+test("pending-actions: default 2h chat TTL, overlay surface filter, and dismiss-all cleanup", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-pending-cleanup-"));
+  let fakeNow = Date.parse("2026-11-18T00:00:00.000Z");
+  const pendingActions = new PendingActionStore({ dir: path.join(dataDir, "pending-actions"), now: () => fakeNow });
+  const oldChat = pendingActions.enqueue({
+    toolName: "fleet_send",
+    args: { text: "old" },
+    context: { sessionId: "devices:agent:main" },
+    summary: "Old chat confirm",
+    mode: "chat",
+    announce: false
+  });
+  assert.equal(oldChat.expiresAt, "2026-11-18T02:00:00.000Z");
+
+  // Manually backdate raisedAt/createdAt on oldChat to simulate legacy >2h pre-fix record without expiration
+  oldChat.createdAt = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+  oldChat.raisedAt = oldChat.createdAt;
+  oldChat.expiresAt = null;
+  const recentQueue = pendingActions.enqueue({
+    toolName: "computer_click",
+    args: {},
+    context: { sessionId: "devices:agent:main" },
+    summary: "Real computer click",
+    mode: "queue",
+    announce: false
+  });
+
+  const runtime = createDurableRuntime({ dataDir });
+  runtime.pendingActions = pendingActions;
+  const app = createHostedInterface(runtime, { dataDir, port: 0, authToken: "" });
+  t.after(async () => { await app.close(); await runtime.observations?.close?.(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const { url } = await app.listen();
+
+  const overlayList = await (await fetch(`${url}/pending-actions?status=pending&surface=overlay`)).json();
+  assert.deepEqual(overlayList.actions.map((a) => a.id), [recentQueue.id]);
+
+  const dismissRes = await fetch(`${url}/pending-actions/dismiss-all`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "chat", olderThanMs: 2 * 60 * 60 * 1000 })
+  });
+  assert.equal(dismissRes.status, 200);
+  const dismissBody = await dismissRes.json();
+  assert.equal(dismissBody.dismissedCount, 1);
+  assert.equal(pendingActions.get(oldChat.id).status, "denied");
+  assert.equal(pendingActions.get(recentQueue.id).status, "pending");
+});
+
+test("calm overlap detection warns only when >=2 running sessions share a cwd on one host and never warns on multi_host", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-calm-overlaps-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const macAgents = [
+    { id: "a1", title: "Idle 1", cwd: "/Users/dev/Dev/app", status: "idle", updatedAt: "2026-11-18T00:00:00Z" },
+    { id: "a2", title: "Idle 2", cwd: "/Users/dev/Dev/app", status: "idle", updatedAt: "2026-11-18T00:01:00Z" },
+    { id: "a3", title: "Run 1", cwd: "/Users/dev/Dev/api", status: "running", updatedAt: "2026-11-18T00:02:00Z" },
+    { id: "a4", title: "Run 2", cwd: "/Users/dev/Dev/api", status: "running", updatedAt: "2026-11-18T00:03:00Z" }
+  ];
+  const bb3Agents = [
+    { id: "b1", title: "Remote running", cwd: "/home/dev/Dev/app", status: "running", updatedAt: "2026-11-18T00:03:00Z" }
+  ];
+  const makeApi = (serverId) => {
+    const list = serverId === "srv_mac" ? macAgents : bb3Agents;
+    return {
+      projects: { list: async () => ({ projects: [] }) },
+      workspaces: { list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }) },
+      agents: {
+        list: async () => ({
+          entries: list.map((agent) => ({ agent })),
+          pageInfo: { hasMore: false, nextCursor: null }
+        }),
+        ref: (id) => {
+          const found = list.find((a) => a.id === id) ?? { id, status: "closed", cwd: "/Users/dev/Dev/app" };
+          return {
+            id,
+            current: () => found,
+            refresh: async () => ({ agent: found }),
+            timeline: { refetch: async () => ({ agent: found, entries: [] }), append: async () => {} }
+          };
+        }
+      },
+      dispose: async () => {}
+    };
+  };
+  const paseoFactory = () => ({
+    ...makeApi("srv_mac"),
+    connect: async () => {},
+    close: async () => {},
+    hosts: {
+      list: async () => ({
+        self: { serverId: "srv_mac", label: "MacBook", hostname: "macbook" },
+        hosts: [{ serverId: "srv_bb3", label: "BuildBot3", status: "online", enabled: true }]
+      }),
+      client: async (id) => makeApi(id)
+    }
+  });
+  const sup = new FleetSupervisor({
+    dataDir,
+    config: resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { enabled: true, mode: "propose", paseo: { enabled: true }, review: { enabled: false }, storage: { enabled: false } }),
+    deps: { paseoFactory }
+  });
+  const res = await sup.listWorkspaces();
+  const appWs = res.workspaces.find((w) => w.id === "app");
+  const apiWs = res.workspaces.find((w) => w.id === "api");
+  assert.ok(appWs && apiWs, "expected app and api workspaces");
+  assert.equal(appWs.overlaps.length, 0, "no warning for idle sessions or multi_host");
+  assert.equal(apiWs.overlaps.length, 1);
+  assert.equal(apiWs.overlaps[0].kind, "concurrent_cwd");
+  assert.match(apiWs.overlaps[0].detail, /2 running chats are editing api simultaneously/);
+});
+
+test("SupervisorCard.project is populated and G2 even-ai-native receives recent supervisor context", async (t) => {
+  const deck = buildSupervisorDeck({
+    snapshot: {
+      threads: [{ key: "paseo:bb.1", title: "Fix export", repo: "buildbetter-app/buildbetter", state: "needs-human" }]
+    },
+    questions: [{ id: "q_proj", status: "open", title: "Merge #9958?", body: "CI green", options: ["yes", "no"], threadKey: "paseo:bb.1" }]
+  });
+  assert.equal(deck.cards[0].project, "buildbetter");
+  assert.equal(deriveCardProject({ workspace: "/Users/dev/openAGI" }), "openAGI");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-g2-sup-ctx-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new InMemoryAgentStore();
+  appendSharedThreadMessages(store, "supervisor", {
+    messages: [{ role: "user", text: "Deploy bb-recorder v2.14" }, { role: "assistant", text: "Notarized and ready." }]
+  });
+  const nodeRegistry = new NodeRegistry({ dir: path.join(dir, "nodes") });
+  nodeRegistry.enroll("g2-node-1", "g".repeat(43), { platform: "even_g2", name: "Glasses" });
+  const captured = [];
+  const channel = new G2Channel({
+    dir: path.join(dir, "g2"),
+    nodeRegistry,
+    agentHost: {
+      store,
+      handleMessage: async (input, options) => {
+        captured.push({ input, options });
+        return { reply: "Yes, v2.14 is ready.", session: { id: input.sessionId } };
+      }
+    }
+  });
+  await channel.ask({ text: "Status of recorder?", conversationId: "even-ai-native" }, "g2-node-1");
+  assert.equal(captured.length, 1);
+  assert.match(captured[0].options.extraTurnContext ?? "", /Deploy bb-recorder v2\.14/);
 });

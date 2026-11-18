@@ -243,10 +243,14 @@ final class OverlayController {
   /// grows leftward instead of off-screen). Later content changes keep the
   /// expanded panel's top edge and that side. Every frame is clamped inside
   /// the screen's visible frame.
-  private func sizeToContent(animate: Bool = true) {
+  private var resizeRevision: UInt64 = 0
+
+  private func sizeToContent(animate: Bool = true, isFollowUp: Bool = false) {
     // endDrag runs this once at the drop.
     guard !isDragging else { return }
     guard let p = panel, let host = p.contentView else { return }
+    if !isFollowUp { resizeRevision &+= 1 }
+    let rev = resizeRevision
     let old = p.frame
     let base = layoutFrame ?? old
     let expanded = OverlayState.shared.expanded
@@ -290,6 +294,12 @@ final class OverlayController {
       }
     } else {
       p.setFrame(target, display: true)
+    }
+    if expanded && !isFollowUp {
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.resizeRevision == rev, !self.isDragging else { return }
+        self.sizeToContent(animate: false, isFollowUp: true)
+      }
     }
   }
 

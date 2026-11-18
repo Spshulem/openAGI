@@ -287,6 +287,7 @@ data class FleetQuestion(
     // Whether POST /fleet/api/questions/:id takes a free-text { reply }.
     // Absent (false) on a hub from before replies.
     val canReply: Boolean = false,
+    val project: String? = null,
 ) {
     val answeredInAgentApp: Boolean get() = answerIn == "agent app" || (answerIn == null && "open thread" in options)
 }

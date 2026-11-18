@@ -107,6 +107,7 @@ import {
   sharedSessionId,
   sharedThreadForSession,
   sharedThreadHistory,
+  appendSharedThreadMessages,
   sharedConversations,
   createSharedConversation
 } from "./shared-conversations.js";
@@ -1958,6 +1959,29 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
       }
+      if (method === "POST" && pathname === "/conversations/supervisor/append") {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJsonLimited(req, 64 * 1024);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_messages" });
+        }
+        try {
+          return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
+            conversationId: typeof body.conversationId === "string" ? body.conversationId : "main",
+            messages: body.messages,
+            sourceName: typeof body.sourceName === "string" ? body.sourceName : null,
+            sourceNodeId: typeof body.sourceNodeId === "string" ? body.sourceNodeId : null
+          }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
       if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
         res.setHeader("Cache-Control", "no-store");
         if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
@@ -2857,8 +2881,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/pending-actions") {
         const status = url.searchParams.get("status") || undefined;
+        const surface = url.searchParams.get("surface") || String(req.headers["x-openagi-surface"] ?? "");
+        let actions = runtime.pendingActions?.list({ status }) ?? [];
+        if (surface === "overlay") {
+          const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+          actions = actions.filter((a) => {
+            if (a?.mode !== "chat") return true;
+            const raised = Date.parse(a.raisedAt || a.createdAt || "");
+            return Number.isFinite(raised) && raised >= cutoff;
+          });
+        }
         return sendJson(res, 200, {
-          actions: runtime.pendingActions?.list({ status }) ?? []
+          actions
         });
       }
       if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
@@ -2985,6 +3019,34 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 409, { error: `action already ${decided?.status ?? "claimed"}` });
         }
         return sendJson(res, 200, { id, status: "denied" });
+      }
+      if (method === "POST" && pathname === "/pending-actions/dismiss-all") {
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const body = await readJson(req).catch(() => ({}));
+        const modeFilter = typeof body?.mode === "string" && body.mode ? body.mode : null;
+        const olderThanMs = Number.isFinite(Number(body?.olderThanMs)) && Number(body.olderThanMs) > 0
+          ? Number(body.olderThanMs)
+          : null;
+        const nowMs = Date.now();
+        const reason = typeof body?.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 200) : "dismissed all by user";
+        const pending = runtime.pendingActions?.list({ status: "pending" }) ?? [];
+        let dismissedCount = 0;
+        for (const action of pending) {
+          if (modeFilter && action.mode !== modeFilter) continue;
+          if (olderThanMs !== null) {
+            const ageMs = nowMs - Date.parse(action.raisedAt || action.createdAt || "");
+            if (!Number.isFinite(ageMs) || ageMs < olderThanMs) continue;
+          }
+          const decided = runtime.pendingActions.decide(action.id, {
+            decision: "deny",
+            decidedBy: "user",
+            error: reason
+          });
+          if (decided?.status === "denied") dismissedCount += 1;
+        }
+        return sendJson(res, 200, { ok: true, dismissedCount });
       }
       if (method === "GET" && pathname === "/computer-use/log") {
         if (!runtime.computerUseLog) return sendJson(res, 503, { error: "no computer-use log" });

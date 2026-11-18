@@ -581,7 +581,7 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
         list.push({ key: thread.key, title: thread.title, state: sessionState, host: hostLabel });
         group.prSessions.set(ref, list);
       }
-      if (cwd && (sessionState === "running" || sessionState === "waiting" || sessionState === "idle")) {
+      if (cwd && sessionState === "running") {
         const cwdKey = `${serverId}:${cwd}`;
         const list = group.activeCwdSessions.get(cwdKey) ?? [];
         list.push({ key: thread.key, title: thread.title, state: sessionState, host: hostLabel, cwd });
@@ -659,23 +659,16 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
       }
     }
     for (const [, list] of group.activeCwdSessions) {
-      if (list.length >= 2) {
+      const running = list.filter((s) => s.state === "running");
+      if (running.length >= 2) {
+        const dirName = path.basename(running[0].cwd) || running[0].cwd;
         overlaps.push({
           kind: "concurrent_cwd",
-          target: list[0].cwd,
-          detail: `${list.length} loaded sessions share ${list[0].cwd} on ${list[0].host}`,
-          sessions: list.slice(0, 5)
+          target: running[0].cwd,
+          detail: `${running.length} running chats are editing ${dirName} simultaneously`,
+          sessions: running.slice(0, 5)
         });
       }
-    }
-    const activeHosts = [...group.hostsMap.values()].filter((h) => (h.activeCount ?? 0) > 0);
-    if (activeHosts.length >= 2) {
-      overlaps.push({
-        kind: "multi_host",
-        target: group.name,
-        detail: `Loaded sessions across ${activeHosts.map((h) => h.label).join(" + ")}`,
-        sessions: []
-      });
     }
 
     const perWorkspaceSessions = Number.isInteger(maxSessionsPerWorkspace) && maxSessionsPerWorkspace > 0

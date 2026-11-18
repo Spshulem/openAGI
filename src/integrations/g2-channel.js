@@ -160,6 +160,16 @@ export class G2Channel {
       const session = store.getSession(sessionId);
       store.saveSession({ ...session, metadata: { ...session.metadata, g2NodeId: nodeId } });
     }
+    let extraTurnContext = null;
+    if (!options.thread && conversationId === "even-ai-native" && store?.getSession) {
+      try {
+        const recent = sharedThreadHistory(store, "supervisor", { limit: 4 }).messages ?? [];
+        if (recent.length > 0) {
+          const lines = recent.map((m) => `- ${m.role}: ${String(m.text ?? "").replace(/\s+/g, " ").trim().slice(0, 220)}`);
+          extraTurnContext = `Recent Supervisor channel context (Mac/Paseo/Phone sync):\n${lines.join("\n")}`;
+        }
+      } catch { /* supervisor history is best-effort continuity context only */ }
+    }
     const turn = await this.agentHost.handleMessage({
       channel: "g2",
       from: `node:${nodeId}:${conversationNamespace}`,
@@ -174,7 +184,7 @@ export class G2Channel {
         ...(options.thread ? { sourceName: enrollment.name ?? "Even G2", thread: options.thread } : {}),
         audioDurationSeconds: Number(((wav.length - 44) / 32_000).toFixed(3))
       }
-    }, options);
+    }, extraTurnContext ? { ...options, extraTurnContext } : options);
     appendJsonLine(this.eventsPath, {
       at: nowIso(), op: "ask", nodeId, sessionId: turn.session?.id ?? sessionId, audioBytes: wav.length
     });

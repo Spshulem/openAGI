@@ -108,6 +108,76 @@ export function sharedThreadHistory(store, thread, { before, limit, conversation
   return { thread, messages: visible.slice(start, end).map(projectMessage), nextBefore: start > 0 ? visible[start].id : null };
 }
 
+export function appendSharedThreadMessages(
+  store,
+  thread,
+  { conversationId = "main", messages = [], sourceName = null, sourceNodeId = null } = {}
+) {
+  if (!store?.getSession || !store?.appendMessage) {
+    throw fail("history_unavailable", 503, "Main history is not configured.");
+  }
+  const sessionId = sharedSessionId(thread, conversationId);
+  if (!Array.isArray(messages) || messages.length < 1 || messages.length > 20) {
+    throw fail("invalid_messages", 400, "messages must contain 1 to 20 items.");
+  }
+  const normalized = [];
+  for (const item of messages) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw fail("invalid_messages", 400, "Each message must be an object.");
+    }
+    const role = item.role;
+    if (role !== "user" && role !== "assistant") {
+      throw fail("invalid_messages", 400, "Message role must be user or assistant.");
+    }
+    const rawText = typeof item.text === "string" ? item.text : typeof item.content === "string" ? item.content : "";
+    const text = rawText.trim().slice(0, 16000);
+    if (!text) throw fail("invalid_messages", 400, "Message text is required.");
+    let id = null;
+    if (item.id !== undefined && item.id !== null) {
+      if (typeof item.id !== "string" || !MESSAGE_ID.test(item.id)) {
+        throw fail("invalid_messages", 400, "Message id is invalid.");
+      }
+      id = item.id;
+    }
+    const at = typeof item.at === "string" && item.at.trim() ? item.at.trim().slice(0, 64) : null;
+    const itemSourceName = typeof item.sourceName === "string" ? item.sourceName : sourceName;
+    const itemSourceNodeId = typeof item.sourceNodeId === "string" ? item.sourceNodeId : sourceNodeId;
+    normalized.push({ id, role, text, at, sourceName: itemSourceName, sourceNodeId: itemSourceNodeId });
+  }
+  const existingSession = store.getSession(sessionId);
+  const existingIds = new Set((existingSession?.messages ?? []).map((m) => m?.id).filter(Boolean));
+  if (existingSession?.metadata?.historyArchived === true && typeof store.archivedMessages === "function") {
+    for (const m of store.archivedMessages(sessionId)) {
+      if (m?.id) existingIds.add(m.id);
+    }
+  }
+  const appended = [];
+  for (const entry of normalized) {
+    if (entry.id && existingIds.has(entry.id)) continue;
+    const updated = store.appendMessage(sessionId, {
+      ...(entry.id ? { id: entry.id } : {}),
+      role: entry.role,
+      content: entry.text,
+      ...(entry.at ? { createdAt: entry.at } : {}),
+      metadata: {
+        thread,
+        ...(entry.role === "user" && typeof entry.sourceName === "string" && entry.sourceName.trim()
+          ? { sourceName: entry.sourceName.trim().slice(0, 80) }
+          : {}),
+        ...(entry.role === "user" && typeof entry.sourceNodeId === "string" && entry.sourceNodeId.trim()
+          ? { sourceNodeId: entry.sourceNodeId.trim().slice(0, 120) }
+          : {})
+      }
+    });
+    const stored = updated?.messages?.at(-1);
+    if (stored) {
+      if (stored.id) existingIds.add(stored.id);
+      appended.push(projectMessage(stored));
+    }
+  }
+  return { ok: true, thread, conversationId, appended };
+}
+
 function projectMessage(m) {
   const user = m.role === "user";
   return {

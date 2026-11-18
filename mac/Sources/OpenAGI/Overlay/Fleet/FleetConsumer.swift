@@ -14,6 +14,7 @@ final class FleetConsumer: ObservableObject {
   static let shared = FleetConsumer()
 
   @Published private(set) var questions: [FleetQuestion] = []
+  @Published private(set) var openQuestionIDs: Set<String> = []
   /// The last scan's threads, for the Watching list under the questions.
   @Published private(set) var threads: [FleetThread] = []
   /// Watching groups the owner opened that start collapsed (Quiet).
@@ -558,6 +559,7 @@ final class FleetConsumer: ObservableObject {
     notes = notes.filter { open.contains($0.key) }
     let oldQuestions = questions
     questions = state.questions
+    openQuestionIDs = Set(state.questions.map(\.id))
     threads = state.threads
     status = state.status
     // The detail screen stays while its question or thread does; a closed
@@ -614,6 +616,7 @@ final class FleetConsumer: ObservableObject {
   private func clearState() {
     generation &+= 1
     questions = []
+    openQuestionIDs = []
     threads = []
     status = nil
     notes = [:]
@@ -653,14 +656,14 @@ final class FleetConsumer: ObservableObject {
   /// supervisor's open questions, which the Supervisor tab lists itself.
   /// Matched by id: another node's questions stay on the Tasks tab.
   func lists(_ item: OutreachItem) -> Bool {
-    Self.lists(item, available: available, openIDs: Set(questions.map(\.id)))
+    Self.lists(item, available: available, openIDs: openQuestionIDs)
   }
 
   /// The tab that shows these outreach items: Supervisor only when every one
   /// the Tasks tab would list is a question the Supervisor tab has instead.
   /// Approvals ("pending-action") show above both tabs.
   func tab(showing items: [OutreachItem]) -> OverlayTab {
-    Self.tab(showing: items, available: available, openIDs: Set(questions.map(\.id)))
+    Self.tab(showing: items, available: available, openIDs: openQuestionIDs)
   }
 
   static func lists(_ item: OutreachItem, available: Bool, openIDs: Set<String>) -> Bool {

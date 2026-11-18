@@ -1,4 +1,5 @@
 import SwiftUI
+import SupervisorChannelsKit
 
 // mobile/FEATURES.md's Supervisor tab: one fluid conversation with the fleet
 // supervisor ("supervisor" shared thread) paired with a pinned, swipeable
@@ -24,6 +25,7 @@ struct SupervisorView: View {
     @State private var actionNote: (id: String, note: SupervisorFormat.Note)?
     @State private var actionNoteThread: String?
     @State private var selectedCardIndex = 0
+    @State private var selectedProjectChannel: String? = nil
     @State private var clearedFocusCardID: String?
     @State private var selectedMessage: UUID?
     @State private var browserThread: ConversationThread = .supervisor
@@ -56,14 +58,54 @@ struct SupervisorView: View {
         return SupervisorFormat.resolvedCards(state)
     }
 
+    private var channelSummaries: [SupervisorChannelSummary] {
+        let decisionItems = cards.map { card in
+            SupervisorDecisionItem(
+                id: card.id,
+                project: SupervisorChannelGrouping.normalizeProject(
+                    explicit: card.project,
+                    repo: card.repo,
+                    workspace: card.workspace
+                ),
+                headline: card.headline,
+                kindLabel: card.kindLabel ?? "Needs you",
+                risky: card.risky
+            )
+        }
+        let sessionBriefs = (state?.snapshot?.threads ?? []).map { t in
+            SupervisorSessionBrief(
+                id: t.key,
+                project: SupervisorChannelGrouping.normalizeProject(
+                    repo: t.repo,
+                    workspace: t.workspace
+                ),
+                title: SupervisorFormat.name(t),
+                state: t.state ?? "idle"
+            )
+        }
+        return SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+    }
+
+    private var displayedCards: [SupervisorCard] {
+        guard let selectedProjectChannel else { return cards }
+        return cards.filter { card in
+            let proj = SupervisorChannelGrouping.normalizeProject(
+                explicit: card.project,
+                repo: card.repo,
+                workspace: card.workspace
+            )
+            return proj.caseInsensitiveCompare(selectedProjectChannel) == .orderedSame
+        }
+    }
+
     private var clampedCardIndex: Int {
-        guard !cards.isEmpty else { return 0 }
-        return min(max(0, selectedCardIndex), cards.count - 1)
+        guard !displayedCards.isEmpty else { return 0 }
+        return min(max(0, selectedCardIndex), displayedCards.count - 1)
     }
 
     private var currentCard: SupervisorCard? {
-        guard !cards.isEmpty else { return nil }
-        return cards[clampedCardIndex]
+        guard !displayedCards.isEmpty else { return nil }
+        return displayedCards[clampedCardIndex]
     }
 
     var body: some View {
@@ -415,6 +457,50 @@ struct SupervisorView: View {
                 .padding(.horizontal, Theme.gutter)
                 .padding(.vertical, 4)
             }
+            if channelSummaries.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        Button {
+                            selectedProjectChannel = nil
+                            selectedCardIndex = 0
+                        } label: {
+                            Text("All (\(cards.count))")
+                                .font(Theme.Typography.caption.weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    selectedProjectChannel == nil ? Theme.ink : Theme.surface,
+                                    in: Capsule()
+                                )
+                                .foregroundStyle(selectedProjectChannel == nil ? Theme.canvas : Theme.ink)
+                        }
+                        .buttonStyle(.plain)
+
+                        ForEach(channelSummaries) { ch in
+                            let projName: String = {
+                                if case let .project(name) = ch.kind { return name }
+                                return ch.displayName
+                            }()
+                            let isSelected = selectedProjectChannel?.caseInsensitiveCompare(projName) == .orderedSame
+                            Button {
+                                selectedProjectChannel = isSelected ? nil : projName
+                                selectedCardIndex = 0
+                            } label: {
+                                Text(ch.waitingCount > 0 ? "#\(projName) · \(ch.waitingCount)" : "#\(projName)")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(isSelected ? Theme.ink : Theme.surface, in: Capsule())
+                                    .foregroundStyle(isSelected ? Theme.canvas : Theme.ink)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, Theme.gutter)
+                    .padding(.vertical, 6)
+                }
+                .accessibilityIdentifier("supervisor-project-channels")
+            }
         }
     }
 
@@ -483,13 +569,13 @@ struct SupervisorView: View {
                 }
             } else {
                 SupervisorCardDeckView(
-                    cards: cards,
+                    cards: displayedCards,
                     index: clampedCardIndex,
                     focusedCardID: conversation.focusedCardID,
                     busyCardID: busyCardID ?? busyQuestionID,
                     threads: state?.snapshot?.threads ?? [],
                     onSelectIndex: { newIndex in
-                        selectedCardIndex = min(max(0, newIndex), max(0, cards.count - 1))
+                        selectedCardIndex = min(max(0, newIndex), max(0, displayedCards.count - 1))
                     },
                     onOpenContext: { target in openContext(for: target) },
                     onReplyInChat: { target in
@@ -827,6 +913,16 @@ private struct SupervisorCardDeckView: View {
                 Text((card.kindLabel ?? "Needs you").uppercased())
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(isFailureBadge ? Theme.alert : (card.risky ? Theme.caution : Theme.live))
+                let projBadge = SupervisorChannelGrouping.normalizeProject(
+                    explicit: card.project,
+                    repo: card.repo,
+                    workspace: card.workspace
+                )
+                if projBadge != "general" {
+                    Text("#\(projBadge)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                }
 
                 if cards.count > 1 {
                     Text("· \(index + 1) of \(cards.count)")
