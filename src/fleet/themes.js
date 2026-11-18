@@ -801,6 +801,7 @@ export async function dispatchManagerGoal(
     serverId = null,
     cwd = null,
     provider = null,
+    images = null,
     factory = null,
     decisionsFetch = null,
     deadlineAt = null
@@ -827,7 +828,7 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
-    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt });
+    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
     const ok = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
@@ -1024,7 +1025,7 @@ export async function dispatchManagerGoal(
     }
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
-    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt });
+    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images });
     const delivered = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
@@ -1069,6 +1070,7 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        images,
         factory
       })
     : startPaseoSession(supervisor, {
@@ -1078,6 +1080,7 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        images,
         factory
       }));
 

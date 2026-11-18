@@ -27,11 +27,11 @@ import { buildSupervisorDeck } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
-import { createDecisionsKeepAliveGate } from "./decisions-gate.js";
+import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, createDecisionsKeepAliveGate, evaluateQuestionsRelevanceWithDecisions } from "./decisions-gate.js";
 import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } from "./themes.js";
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
-import { createPaseoSource } from "./sources/paseo.js";
+import { createPaseoSource, hostApi, paseoThread, withPaseo } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -321,6 +321,11 @@ export function settledAsk(question, { thread = null, pr = null, prMissing = fal
   if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
   const spokeAt = Date.parse(agentReply(thread).at ?? "");
   if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
+  const ownerAt = Date.parse(thread?.lastUserAt ?? "");
+  const ownerDirect = Boolean(thread && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX));
+  if (!question.mergeAsk && ownerDirect && Number.isFinite(ownerAt) && Number.isFinite(askedAt) && ownerAt > askedAt && thread.agentStatus === "running") {
+    return "owner followed up: agent is working";
+  }
   return null;
 }
 
@@ -1955,7 +1960,7 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -1982,7 +1987,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
@@ -1990,6 +1995,7 @@ export class FleetSupervisor {
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
       ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(delivery.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
@@ -2084,6 +2090,170 @@ export class FleetSupervisor {
       factory: options.factory ?? this.deps.paseoFactory,
       decisionsFetch: options.decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl
     });
+  }
+
+  // Lightweight, event-driven reconciliation of ONLY open questions' watched
+  // threads (never scans the full fleet, never spawns codex exec). Uses fast
+  // Paseo tail reads + /v1/decisions (gpt-6-luna, output_tokens: 0) when a
+  // watched thread has new activity since the question was raised.
+  async reconcileOpenQuestions({ force = false, factory = null, decisionsFetch = null } = {}) {
+    const now = this.now();
+    this.questionRelevanceCache ??= new Map();
+    if (!force && this.lastReconcileAt && now - this.lastReconcileAt < 8_000) {
+      return { checked: 0, closed: [], skippedThrottle: true };
+    }
+    this.lastReconcileAt = now;
+
+    const open = this.store.openQuestions().filter((q) => q?.threadKey && !q.pinned && !SELF_FINDING_KINDS.has(q.kind));
+    if (open.length === 0) return { checked: 0, closed: [] };
+
+    const paseoKeys = [...new Set(open.map((q) => q.threadKey).filter((k) => String(k).startsWith("paseo:")))];
+    const freshByKey = new Map();
+    const resolvedFactory = factory ?? this.deps.paseoFactory;
+
+    if (paseoKeys.length > 0 && this.config?.paseo?.enabled) {
+      try {
+        const probeCfg = {
+          ...this.config,
+          paseo: { ...this.config.paseo, timeoutMs: Math.min(this.config.paseo.timeoutMs ?? 6_000, 6_000) }
+        };
+        await withPaseo(probeCfg, async (client, signal) => {
+          const directory = await client.hosts.list();
+          const apiBySrv = new Map();
+          const getApi = (sid) => {
+            if (!apiBySrv.has(sid)) apiBySrv.set(sid, hostApi(client, sid, directory));
+            return apiBySrv.get(sid);
+          };
+          await Promise.all(paseoKeys.slice(0, 12).map(async (tKey) => {
+            const parsed = parsePaseoThreadKey(tKey);
+            if (!parsed) return;
+            try {
+              const api = await getApi(parsed.serverId);
+              const ref = api.agents.ref(parsed.agentId);
+              const hist = await ref.timeline.refetch({ direction: "tail", limit: 8 });
+              signal.throwIfAborted();
+              const agent = hist?.agent ?? ref.current();
+              if (!agent) return;
+              const fresh = paseoThread(agent, parsed.serverId, Array.isArray(hist?.entries) ? hist.entries : [], true);
+              this.recordDiscoveredThread(fresh);
+              freshByKey.set(tKey, { agent, thread: fresh });
+            } catch { /* ignore single unreachable host/thread */ }
+          }));
+        }, resolvedFactory);
+      } catch { /* Paseo unavailable: fall back to in-memory knownThreads */ }
+    }
+
+    const closed = [];
+    const candidatesForDecisions = [];
+
+    for (const q of open) {
+      const liveEntry = freshByKey.get(q.threadKey);
+      const thread = liveEntry?.thread ?? this.lastThreads.get(q.threadKey) ?? this.knownThreads.get(q.threadKey) ?? null;
+      if (!thread) continue;
+
+      const askedAtMs = Date.parse(q.agentAskedAt ?? q.createdAt ?? "") || 0;
+      const ownerAtMs = Date.parse(thread.lastUserAt ?? "") || 0;
+      const agentAtMs = Date.parse(thread.lastAgentAt ?? "") || 0;
+      const ownerDirect = !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
+
+      // 1. Archived session: close immediately.
+      if (thread.archived || liveEntry?.agent?.archivedAt) {
+        const reason = "session archived";
+        this.store.resolveQuestion(q.id, reason);
+        this.resolveOutreach(q, "resolved", "dismissed");
+        closed.push({ id: q.id, reason });
+        continue;
+      }
+
+      // 2. Permission / agent-card cleared in Paseo: close immediately.
+      if (liveEntry?.agent && (q.kind === "prompt" || q.kind === "agent-card")) {
+        const perms = Array.isArray(liveEntry.agent.pendingPermissions) ? liveEntry.agent.pendingPermissions : [];
+        const hasPendingCard = Boolean(thread.meta?.pendingCard);
+        if (q.kind === "prompt" && perms.length === 0) {
+          const reason = "permission prompt already resolved in Paseo";
+          this.store.resolveQuestion(q.id, reason);
+          this.resolveOutreach(q, "resolved", "dismissed");
+          closed.push({ id: q.id, reason });
+          continue;
+        }
+        if (q.kind === "agent-card" && !hasPendingCard && perms.length === 0) {
+          const reason = "question card already answered in Paseo";
+          this.store.resolveQuestion(q.id, reason);
+          this.resolveOutreach(q, "resolved", "dismissed");
+          closed.push({ id: q.id, reason });
+          continue;
+        }
+      }
+
+      // 3. Owner directly followed up in chat after the ask and the agent is now actively working on it.
+      if (q.kind === "agent-ask" && ownerDirect && askedAtMs > 0 && ownerAtMs > askedAtMs && thread.agentStatus === "running") {
+        const reason = "owner followed up directly in chat";
+        this.store.resolveQuestion(q.id, reason);
+        this.resolveOutreach(q, "resolved", "dismissed");
+        closed.push({ id: q.id, reason });
+        continue;
+      }
+
+      // 4. Thread updated since the ask (owner or agent spoke after askedAt): check semantic relevance via /v1/decisions (gpt-6-luna).
+      const hasNewActivity = askedAtMs > 0 && (ownerAtMs > askedAtMs || agentAtMs > askedAtMs);
+      if (!hasNewActivity || q.kind === "ready") continue;
+
+      const mark = `${activityMark(thread)}|${q.title ?? ""}|${q.body ?? ""}`;
+      if (this.questionRelevanceCache.get(q.id) === mark) continue;
+
+      candidatesForDecisions.push({
+        id: q.id,
+        question: q,
+        mark,
+        kind: q.kind,
+        askedAt: q.agentAskedAt ?? q.createdAt ?? null,
+        title: q.title ?? "",
+        body: q.body ?? "",
+        threadStatus: thread.agentStatus ?? "idle",
+        lastOwnerAt: ownerDirect ? (thread.lastUserAt ?? null) : null,
+        lastOwnerText: ownerDirect ? (thread.lastUserText ?? "") : "",
+        lastAgentAt: thread.lastAgentAt ?? null,
+        lastAgentText: thread.lastAgentFull || thread.lastAgentTail || thread.lastAgentText || "",
+        recentMessages: thread.meta?.conversation ?? []
+      });
+    }
+
+    const decisionsCfg = this.config?.decisions ?? {};
+    if (candidatesForDecisions.length > 0 && decisionsCfg.enabled && decisionsCfg.apiKey) {
+      const evalRes = await evaluateQuestionsRelevanceWithDecisions({
+        items: candidatesForDecisions,
+        apiKey: decisionsCfg.apiKey,
+        url: decisionsCfg.url || DEFAULT_DECISIONS_URL,
+        model: decisionsCfg.model || DEFAULT_DECISIONS_MODEL,
+        timeoutMs: Math.min(decisionsCfg.timeoutMs || DEFAULT_DECISIONS_TIMEOUT_MS, 5_000),
+        fetchImpl: decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl ?? globalThis.fetch
+      });
+      if (evalRes.ok) {
+        for (const cand of candidatesForDecisions) {
+          this.questionRelevanceCache.set(cand.id, cand.mark);
+          const pRelevant = evalRes.scores.get(cand.id);
+          if (typeof pRelevant === "number" && pRelevant < 0.38) {
+            const reason = `auto-closed stale question (p=${pRelevant.toFixed(2)}): thread moved on`;
+            this.store.resolveQuestion(cand.id, reason);
+            this.resolveOutreach(cand.question, "resolved", "dismissed");
+            this.store.recordAction({
+              kind: "review",
+              playbook: "decisions-reconcile",
+              threadKey: cand.question.threadKey,
+              questionId: cand.id,
+              status: "done",
+              reason: clampText(`${reason}: ${cand.title}`, 220)
+            });
+            closed.push({ id: cand.id, reason, probability: pRelevant });
+          }
+        }
+      }
+    }
+
+    if (closed.length > 0) {
+      this.emitFleet("questions-reconciled");
+    }
+    return { checked: open.length, closed };
   }
 
   updatePreferences(patch = {}) {
@@ -3754,7 +3924,7 @@ export class FleetSupervisor {
     // The supervisor's own findings (it can't reach a thread, nudges made no
     // progress) are facts, not guesses about an agent: the review never
     // clears those.
-    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey) && !SELF_FINDING_KINDS.has(question.kind));
+    const open = store.openQuestions().filter((question) => (asked.has(question.dedupeKey) || standing(question)) && !SELF_FINDING_KINDS.has(question.kind));
     if (!open.length) return unsettled;
     if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return unsettled;
     const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));

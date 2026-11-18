@@ -228,6 +228,7 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             ...sendOptions
           });
           return ok({ result, state: state() });
@@ -272,6 +273,7 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             title: typeof body?.title === "string" && body.title.trim() ? body.title.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             prompt
           });
           return ok({ session: started, state: state() });
@@ -368,7 +370,19 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 1 && parts[0] === "state") {
         if (method !== "GET") return fail(405, "Use GET.");
         await supervisor.refresh?.();
+        if (url?.searchParams?.get("reconcile") === "1" && typeof supervisor.reconcileOpenQuestions === "function") {
+          await supervisor.reconcileOpenQuestions().catch(() => {});
+        }
         return ok(state());
+      }
+      if (parts.length === 1 && parts[0] === "reconcile") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.reconcileOpenQuestions !== "function") {
+          return fail(503, "Question reconciliation is not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        const reconciled = await supervisor.reconcileOpenQuestions({ force: body.force === true });
+        return ok({ result: reconciled, state: state() });
       }
       if (parts.length === 1 && parts[0] === "scan") {
         if (method !== "POST") return fail(405, "Use POST.");
@@ -417,7 +431,12 @@ export function createFleetRoute({ supervisor } = {}) {
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
-        const result = await supervisor.sendOwnerMessage(threadKey, message, body?.queue === true ? { ...sendOptions, queue: true } : sendOptions);
+        const extraOpts = {
+          ...sendOptions,
+          ...(body?.queue === true ? { queue: true } : {}),
+          ...(Array.isArray(body?.images) ? { images: body.images } : {})
+        };
+        const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);
         return ok({ delivery: result?.delivery ?? null, state: state() });
       }
       // One thread's screen: its permission card, whether a turn runs, the

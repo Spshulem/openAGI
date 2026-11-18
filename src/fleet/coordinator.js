@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   SUPERVISOR_PREFIX,
   clampText,
@@ -21,6 +22,7 @@ import {
 } from "./contracts.js";
 import { chooseRoute } from "./policy.js";
 import { readThreadConversation } from "./conversation.js";
+import { normalizePaseoImages } from "./paseo-delivery.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
 
@@ -1157,6 +1159,7 @@ export async function startPaseoSession(supervisor, {
   title = null,
   prompt = "",
   provider = null,
+  images = null,
   factory
 } = {}) {
   if (!supervisor?.config?.paseo?.enabled) {
@@ -1166,6 +1169,7 @@ export async function startPaseoSession(supervisor, {
   if (!cleanPrompt || cleanPrompt.length > 4000) {
     throw new Error("Prompt must be 1-4000 characters.");
   }
+  const normalizedImages = normalizePaseoImages(images);
   const cleanTitle = typeof title === "string" && title.trim() ? clampText(title.trim(), 100) : null;
 
   const explicitServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
@@ -1275,6 +1279,15 @@ export async function startPaseoSession(supervisor, {
     const snap = typeof handle?.current === "function" ? handle.current() : null;
     const agentId = handle?.id ?? snap?.id;
     if (!agentId) throw new Error("Paseo host did not return a created agent ID.");
+    if (normalizedImages.length > 0 && typeof api?.agents?.ref === "function") {
+      try {
+        await api.agents.ref(agentId).send("Attached image(s) from the owner.", {
+          messageId: randomUUID(),
+          activeTurnBehavior: "steer",
+          images: normalizedImages
+        });
+      } catch { /* initial prompt already started */ }
+    }
     const agentRecord = snap ?? {
       id: agentId,
       status: "running",

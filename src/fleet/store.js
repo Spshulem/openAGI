@@ -362,7 +362,7 @@ export class FleetStore {
       // scanAskedAt: only a scan asking it sets this (a reopen does not).
       // Asking again does not push its expiry back (liveSinceMs).
       Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
-      if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
+      if (!existing.askContext && (origin.askContext || origin.agentAskedAt)) Object.assign(existing, origin);
       if (cleanContext) existing.contextSnapshot = mergeContext(existing.contextSnapshot, cleanContext, fields.prRef);
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
@@ -400,7 +400,7 @@ export class FleetStore {
     if (resolved) {
       keepReviewWording(resolved, fields);
       const mergedSnap = mergeContext(resolved.contextSnapshot, cleanContext, fields.prRef);
-      Object.assign(resolved, fields, origin.askContext ? origin : {}, mergedSnap ? { contextSnapshot: mergedSnap } : {}, {
+      Object.assign(resolved, fields, (origin.askContext || origin.agentAskedAt) ? origin : {}, mergedSnap ? { contextSnapshot: mergedSnap } : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
         reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
         lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
@@ -412,7 +412,7 @@ export class FleetStore {
       id: makeId("fq"),
       dedupeKey: key,
       ...fields,
-      ...(origin.askContext ? origin : {}),
+      ...((origin.askContext || origin.agentAskedAt) ? origin : {}),
       ...(cleanContext ? { contextSnapshot: cleanContext } : {}),
       ...(head ? { askedHead: head } : {}),
       status: "open",
