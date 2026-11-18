@@ -525,6 +525,9 @@ final class AppState: ObservableObject {
     if event == "pending-action-resolved" {
       Task { await PendingApprovalConsumer.shared.refresh() }
     }
+    if event == "conversation.updated" {
+      Task { await SharedSupervisorClient.shared.refreshMessages() }
+    }
     if event == "computer-use" {
       PendingApprovalConsumer.shared.handleComputerUseEvent(data)
     }

@@ -562,7 +562,7 @@ test("the provider: codex when codex-lb is configured, else Claude; OPENAGI_FLEE
   assert.deepEqual([plain.provider, plain.model], ["claude", "claude-sonnet-5"]);
 });
 
-test("the review's schema and verdict contract are unchanged; the codex form only makes the optional fields nullable", async (t) => {
+test("the review's schema and verdict contract include optional executive brief fields; the codex form makes optional fields nullable", async (t) => {
   assert.deepEqual(REVIEW_SCHEMA, {
     type: "object",
     properties: {
@@ -577,7 +577,12 @@ test("the review's schema and verdict contract are unchanged; the codex form onl
             reason: { type: "string" },
             title: { type: "string" },
             options: { type: "array", items: { type: "string" } },
-            duplicateOf: { type: "string" }
+            duplicateOf: { type: "string" },
+            briefContext: { type: "string" },
+            briefSummary: { type: "string" },
+            briefDecision: { type: "string" },
+            recommendation: { type: "string" },
+            suggestedReplies: { type: "array", items: { type: "string" } }
           },
           required: ["id", "decision", "category", "reason"],
           additionalProperties: false
@@ -588,21 +593,22 @@ test("the review's schema and verdict contract are unchanged; the codex form onl
     additionalProperties: false
   });
   const item = REVIEW_SCHEMA_CODEX.properties.reviews.items;
-  assert.deepEqual(item.required, ["id", "decision", "category", "reason", "title", "options", "duplicateOf"]);
+  assert.deepEqual(item.required, ["id", "decision", "category", "reason", "title", "options", "duplicateOf", "briefContext", "briefSummary", "briefDecision", "recommendation", "suggestedReplies"]);
   assert.deepEqual(item.properties.title, { type: ["string", "null"] });
   assert.deepEqual(item.properties.options, { type: ["array", "null"], items: { type: "string" } });
+  assert.deepEqual(item.properties.suggestedReplies, { type: ["array", "null"], items: { type: "string" } });
   for (const name of ["id", "decision", "category", "reason"]) assert.deepEqual(item.properties[name], REVIEW_SCHEMA.properties.reviews.items.properties[name]);
   assert.equal(item.additionalProperties, false);
   // The same codex answer and Claude answer give the same verdicts.
   const questions = [question({ id: "fq_a" }), question({ id: "fq_b", threadKey: "codex:t2" })];
   const viaCodex = reviewRun({ codexOut: { reviews: [
-    { id: "fq_a", decision: "close", category: "stale", reason: "PR #7 merged", title: null, options: null, duplicateOf: null },
-    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked", title: null, options: null, duplicateOf: null }
+    { id: "fq_a", decision: "close", category: "stale", reason: "PR #7 merged", title: null, options: null, duplicateOf: null, briefContext: null, briefSummary: null, briefDecision: null, recommendation: null, suggestedReplies: null },
+    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked", title: null, options: null, duplicateOf: null, briefContext: "Auth migration", briefSummary: "Tests pass", briefDecision: "Merge?", recommendation: "Safe to merge", suggestedReplies: ["Ship it", "Hold"] }
   ] } });
   const codexVerdicts = await reviewQuestions({ questions, now: NOW, runModel: createReviewRunner({ config: codexConfig(t), run: viaCodex.run, env: { PATH: "/usr/bin" } }) });
   const claudeVerdicts = await reviewQuestions({ questions, now: NOW, runModel: async () => ({ reviews: [
     { id: "fq_a", decision: "close", category: "stale", reason: "PR #7 merged" },
-    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked" }
+    { id: "fq_b", decision: "keep", category: "live", reason: "still blocked", briefContext: "Auth migration", briefSummary: "Tests pass", briefDecision: "Merge?", recommendation: "Safe to merge", suggestedReplies: ["Ship it", "Hold"] }
   ] }) });
   assert.deepEqual(codexVerdicts, claudeVerdicts);
 });

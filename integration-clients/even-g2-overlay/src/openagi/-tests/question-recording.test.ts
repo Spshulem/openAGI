@@ -264,3 +264,32 @@ it('streams tool history without stealing answer pages and confirms cancellation
     await request
   } finally { await app.systemExit(); vi.useRealTimers() }
 })
+
+it('keeps supervisor replies out of the agent chat and its Recent list', async () => {
+  const { app, store, set, renderer } = await fixture()
+  try {
+    await store.remember('Agent question', 'Agent answer')
+    const agentChat = store.snapshot().conversationId
+    await store.remember('Supervisor question', 'Supervisor answer', 'supervisor')
+    expect(store.snapshot().history.map(entry => entry.thread)).toEqual(['agent', 'supervisor'])
+    // Opening a supervisor reply reads it without moving the agent chat.
+    await store.update({ conversationId: crypto.randomUUID() })
+    const current = store.snapshot().conversationId
+    await app.selectAnswer(1)
+    expect(store.snapshot().conversationId).toBe(current)
+    expect(set).toHaveBeenLastCalledWith('Supervisor answer', expect.stringContaining('Supervisor question'))
+    await app.selectAnswer(0)
+    expect(store.snapshot().conversationId).toBe(agentChat)
+    // Talk's Recent on the glasses lists only agent answers.
+    app.doubleTap(); app.scrollDown()
+    await vi.waitFor(() => expect(renderer.recent).toHaveBeenLastCalledWith('Agent question', 1, 1))
+  } finally { await app.systemExit() }
+})
+
+it('reads answers saved before thread tagging as agent answers', async () => {
+  const id = crypto.randomUUID()
+  const saved = { version: 2, nodeId: crypto.randomUUID(), nodeToken: null, node: null, conversationId: id, recordingConsent: false, history: [{ conversationId: id, continuation: null, question: 'Old', reply: 'Answer', at: new Date().toISOString() }] }
+  const store = new OpenAGIStore({ get: () => Promise.resolve(JSON.stringify(saved)), set: () => Promise.resolve(), remove: () => Promise.resolve() })
+  await store.load()
+  expect(store.snapshot().history[0].thread).toBe('agent')
+})

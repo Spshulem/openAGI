@@ -100,12 +100,10 @@ using Computer Use and running repairs have their own controls. See the
 ## Availability
 
 This README describes the repository's current capabilities. Check the
-[release assets](https://github.com/Spshulem/openAGI/releases/latest) for the
-installers actually published. The latest Mac release is **v0.0.58**; newer
-source includes iOS phone-agent/offline-workspace work, additional messaging
-and Google integrations, and the latest provider, cost and approval fixes.
-The mobile apps are source/QA builds; no public store release is linked here.
-Windows/Linux portable downloads depend on a release publishing those assets.
+[latest release](https://github.com/Spshulem/openAGI/releases/latest) for the
+installers and portable downloads actually published. The mobile apps are
+source/QA builds; no public store release is linked here. Windows/Linux
+portable downloads appear when the release workflow publishes those assets.
 
 ## Why a persistent runtime helps
 

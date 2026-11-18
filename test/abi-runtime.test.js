@@ -445,7 +445,7 @@ test("agent turn writes an outcome record into runtime.outcomes", async () => {
 });
 
 test("specialist router scores by text and tag overlap, respects threshold", async () => {
-  const router = new SpecialistRouter({ threshold: 0.4 });
+  const router = new SpecialistRouter({ threshold: 0.4, mode: "live" });
   const specialists = [
     {
       id: "s1",
@@ -585,11 +585,15 @@ test("propagation tracks rolling outcome quality and retires bad specialists", (
     scrutiny: { reasons: [] }
   });
   const sp = r.specialist;
+  // Retirement follows grounded grades (what happened to the work), not the
+  // self-assigned outcome score.
   for (let i = 0; i < 12; i += 1) propagation.recordOutcomeQuality(sp.id, 0.15);
   assert.ok(sp.meanOutcomeQuality < 0.3);
+  assert.equal(propagation.retirementSweep({ dormancyDays: 999, minSamples: 10, qualityFloor: 0.3 }).length, 0);
+  for (let i = 0; i < 12; i += 1) propagation.recordGroundedQuality(sp.id, 0.15);
   const retired = propagation.retirementSweep({ dormancyDays: 999, minSamples: 10, qualityFloor: 0.3 });
   assert.equal(retired.length, 1);
-  assert.match(retired[0].retirementReason, /quality/);
+  assert.match(retired[0].retirementReason, /grounded mean/);
 });
 
 test("recall is scoped per specialist when called with non-main agentId", () => {
@@ -653,7 +657,7 @@ test("specialist router blends keyword and semantic signals", async () => {
     status: "available"
   };
   await vs.upsert("specialist", sp.id, `${sp.name}\n${sp.boundedScope}`);
-  const router = new SpecialistRouter({ vectorStore: vs, threshold: 0.3 });
+  const router = new SpecialistRouter({ vectorStore: vs, threshold: 0.3, mode: "live" });
   const decision = await router.decide(
     "schedule a meeting on my calendar this week",
     ["message", "calendar"],
@@ -677,7 +681,7 @@ test("scrutiny fitter stages proposals during warmup, auto-applies after", () =>
     };
     const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
     // Quality strongly correlated with evidence
-    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+    runtime.outcomes.ground(o.id, { score: Math.min(1, dims.evidence + 0.05 * Math.random()), source: "test", fate: "test" });
   }
 
   const fitter = new ScrutinyFitter({ runtime, dir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-")), warmupCycles: 1 });
@@ -707,7 +711,7 @@ test("fitted scrutiny weights persist to disk and restore into a fresh panel", (
       uncertainty: Math.random()
     };
     const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
-    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+    runtime.outcomes.ground(o.id, { score: Math.min(1, dims.evidence + 0.05 * Math.random()), source: "test", fate: "test" });
   }
   const fitter = new ScrutinyFitter({ runtime, dir, warmupCycles: 0 });
   const r = fitter.fit();

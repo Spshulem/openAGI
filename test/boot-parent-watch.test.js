@@ -60,17 +60,22 @@ test("a real orphaned child sees its parent change", { skip: process.platform ==
   const boot = fileURLToPath(new URL("../src/boot.js", import.meta.url));
   const child = `import { watchParent } from ${JSON.stringify(boot)};
 watchParent(() => { console.log("orphaned"); process.exit(0); }, { intervalMs: 20 });
+process.send("watching");
 setInterval(() => {}, 1000);`;
-  // The middle node starts the watcher, prints its pid, and exits at once.
+  // Exit only after the watcher is installed. A fixed delay can expire before
+  // the child starts under load, making it look like an intentional init child.
   const middle = `const { spawn } = require("node:child_process");
-const c = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(child)}], { stdio: ["ignore", "inherit", "inherit"] });
-console.log(c.pid); setTimeout(() => process.exit(0), 300);`;
+const c = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(child)}], { stdio: ["ignore", "inherit", "inherit", "ipc"] });
+console.log(c.pid); c.once("message", () => process.exit(0));`;
   const proc = spawn(process.execPath, ["-e", middle], { stdio: ["ignore", "pipe", "inherit"] });
   let out = "";
   proc.stdout.on("data", (chunk) => { out += chunk; });
   const deadline = Date.now() + 5_000;
   while (!out.includes("orphaned") && Date.now() < deadline) await wait(50);
   const pid = Number(out.split("\n")[0]);
-  if (!out.includes("orphaned")) try { process.kill(pid); } catch { /* gone */ }
+  if (!out.includes("orphaned")) {
+    try { process.kill(pid); } catch { /* gone */ }
+    proc.kill();
+  }
   assert.match(out, /orphaned/);
 });

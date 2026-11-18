@@ -776,6 +776,22 @@ test("a question reopened after a failed answer delivery gets a fresh day", (t) 
   assert.deepEqual(store.openQuestions().map((one) => one.id), [q.id]);
 });
 
+// PR #278 Bugbot: an immediate owner reply keeps its newlines; the same
+// reply kept for when the Mac can type must not arrive as one line.
+test("a queued owner reply keeps its line breaks, still bounded in length", (t) => {
+  const store = new FleetStore({ dir: tempDir(t), now: clock() });
+  const ask = { kind: "agent-ask", threadKey: "conductor:x", title: "Ship it?", options: ["yes", "no"], agentAskedAt: new Date(T0 - 1000).toISOString() };
+  const q = store.upsertQuestion({ ...ask, dedupeKey: "ask:conductor:x:aaaa" });
+  const message = "Owner says:\r\nFirst do the tests.\n\n\n\n- then  ship\n- then tag";
+  store.queueAnswer(q.id, "reply", message, { messageMax: message.length });
+  assert.equal(store.queuedAnswers()[0].pendingDelivery.message, "Owner says:\nFirst do the tests.\n\n- then ship\n- then tag");
+  const long = store.upsertQuestion({ ...ask, threadKey: "conductor:y", dedupeKey: "ask:conductor:y:bbbb" });
+  store.queueAnswer(long.id, "reply", `line one\n${"x".repeat(20000)}`, { messageMax: 3000 });
+  const kept = store.queuedAnswers().find((one) => one.id === long.id).pendingDelivery.message;
+  assert.ok(kept.startsWith("line one\n"));
+  assert.ok(kept.length <= 3000 && kept.endsWith("…"));
+});
+
 // milan 1941cea4 asked "who gets the free Coda token?" at 04:38Z. A new
 // decision from the same agent 23 h later took that open question over with
 // its push spent and its day nearly gone: it expired an hour later, never

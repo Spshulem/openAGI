@@ -1,4 +1,5 @@
 import AppKit
+import CoreVideo
 import Foundation
 import ScreenCaptureKit
 import Vision
@@ -143,6 +144,10 @@ final class ScreenCapturer {
       cfg.queueDepth = 1
       cfg.scalesToFit = true
       cfg.showsCursor = false
+      // Ask for plain 8-bit BGRA in sRGB, the format the thumbnail and the
+      // text recognizer work from, rather than whatever the display prefers.
+      cfg.pixelFormat = kCVPixelFormatType_32BGRA
+      cfg.colorSpaceName = CGColorSpace.sRGB
 
       let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
       consecutiveFailures = 0
@@ -158,9 +163,12 @@ final class ScreenCapturer {
         maxWidth: 640,
         quality: 0.5) ? thumbPath : nil
 
-      // OCR off the main thread.
+      // OCR off the main thread, on a copy whose pixels this process owns:
+      // the captured image may not still be readable by the time the queue
+      // gets to it (the thumbnail, saved just above, always has the content).
+      let ocrImage = Self.ownedCopyForOCR(cgImage)
       ocrQueue.async {
-        Self.runOcr(image: cgImage) { text, confidence in
+        Self.runOcr(image: ocrImage) { text, confidence in
           CaptureStorage.shared.recordFrame(
             uid: uid,
             capturedAt: Date(),
@@ -278,11 +286,16 @@ final class ScreenCapturer {
       cfg.queueDepth = 1
       cfg.scalesToFit = true
       cfg.showsCursor = false
+      // Ask for plain 8-bit BGRA in sRGB, the format the thumbnail and the
+      // text recognizer work from, rather than whatever the display prefers.
+      cfg.pixelFormat = kCVPixelFormatType_32BGRA
+      cfg.colorSpaceName = CGColorSpace.sRGB
 
       let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+      let ocrImage = Self.ownedCopyForOCR(cgImage)
       let text: String = await withCheckedContinuation { cont in
         ocrQueue.async {
-          Self.runOcr(image: cgImage) { ocrText, _ in cont.resume(returning: ocrText) }
+          Self.runOcr(image: ocrImage) { ocrText, _ in cont.resume(returning: ocrText) }
         }
       }
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -334,6 +347,7 @@ final class ScreenCapturer {
   // it touches no actor state (Vision request + completion callback only).
   nonisolated private static func runOcr(image: CGImage, completion: @escaping (String, Double) -> Void) {
     let req = VNRecognizeTextRequest { request, error in
+      if let error { OCRErrorLog.shared.note("text recognition failed: \(error.localizedDescription)") }
       let observations = request.results as? [VNRecognizedTextObservation] ?? []
       var pieces: [String] = []
       var confSum = 0.0
@@ -347,12 +361,30 @@ final class ScreenCapturer {
       }
       let text = pieces.joined(separator: "\n")
       let avg = n > 0 ? confSum / Double(n) : 0
+      OCRErrorLog.shared.noteResult(empty: n == 0)
       completion(text, avg)
     }
     req.recognitionLevel = .accurate
     req.usesLanguageCorrection = true
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
-    do { try handler.perform([req]) } catch { completion("", 0) }
+    do {
+      try handler.perform([req])
+    } catch {
+      OCRErrorLog.shared.note("text recognition could not run: \(error.localizedDescription)")
+      completion("", 0)
+    }
+  }
+
+  /// An 8-bit sRGB copy in memory this process owns. Made synchronously at
+  /// capture time and handed to the OCR queue instead of the captured image.
+  nonisolated static func ownedCopyForOCR(_ image: CGImage) -> CGImage {
+    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+          let ctx = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: space,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return image }
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return ctx.makeImage() ?? image
   }
 
   private func saveThumbnail(image: NSImage, to path: String, maxWidth: CGFloat, quality: Double) -> Bool {
@@ -387,5 +419,33 @@ final class ScreenCapturer {
       }
     }
     return nil
+  }
+}
+
+/// Logs text-recognition errors from the OCR queue: the first one, then every
+/// 100th, so a failure that hits every frame stays visible without flooding.
+final class OCRErrorLog: @unchecked Sendable {
+  static let shared = OCRErrorLog()
+  private let lock = NSLock()
+  private var count = 0
+
+  private var emptyRun = 0
+
+  /// Counts consecutive frames with no recognized text and logs long runs,
+  /// so a silent failure shows up in the system log.
+  func noteResult(empty: Bool) {
+    lock.lock()
+    emptyRun = empty ? emptyRun + 1 : 0
+    let run = emptyRun
+    lock.unlock()
+    if run > 0 && run % 120 == 0 { NSLog("OpenAGI capture: \(run) frames in a row with no recognized text") }
+  }
+
+  func note(_ message: String) {
+    lock.lock()
+    count += 1
+    let n = count
+    lock.unlock()
+    if n == 1 || n % 100 == 0 { NSLog("OpenAGI capture: \(message) (\(n) so far)") }
   }
 }

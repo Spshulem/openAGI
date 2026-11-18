@@ -55,11 +55,74 @@ enum SupervisorFormat {
         }
     }
 
+    static func cleanWorkspace(_ workspace: String?) -> String? {
+        guard let ws = nonBlank(workspace)?.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
+        if ws.range(of: #"^wks_[0-9a-f]+$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return nil
+        }
+        return ws
+    }
+
+    static func formatOpaqueKey(_ key: String) -> String {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = trimmed.firstIndex(of: ":") else { return trimmed }
+        let prefix = String(trimmed[..<colon]).lowercased()
+        guard ["paseo", "codex", "claude", "conductor", "antigravity"].contains(prefix) else { return trimmed }
+        let rest = String(trimmed[trimmed.index(after: colon)...])
+        guard rest.count >= 8 else { return trimmed }
+        let rawId: String
+        if prefix == "paseo", let dot = rest.firstIndex(of: "."), dot < rest.index(before: rest.endIndex) {
+            rawId = String(rest[rest.index(after: dot)...])
+        } else {
+            rawId = rest
+        }
+        let providerLabel = prefix == "antigravity" ? "Antigravity" : capitalizedFirst(prefix)
+        return "\(providerLabel) session · \(rawId.prefix(8))"
+    }
+
     static func name(_ thread: FleetThread) -> String {
-        if let workspace = nonBlank(thread.workspace) { return workspace }
+        if let workspace = cleanWorkspace(thread.workspace) { return workspace }
         if let title = nonBlank(thread.title) { return title }
-        if let key = nonBlank(thread.key) { return key }
+        if let key = nonBlank(thread.key) { return formatOpaqueKey(key) }
         return "Untitled thread"
+    }
+
+    static func statusBadge(thread: FleetThread, card: SupervisorCard? = nil) -> (health: FleetHealth, label: String) {
+        let ciRaw = card?.ciState ?? card?.prContext?.ciState ?? thread.pr?.ci?.state
+        let ci = ciRaw.flatMap { ciLabel(FleetCI(state: $0)) }
+        if card?.kind == "ci_failed" || (card != nil && ["FAILURE", "ERROR"].contains(ciRaw?.uppercased() ?? "")) {
+            return (.red, [card?.kindLabel ?? "CI Failed", ci].compactMap { $0 }.joined(separator: " · "))
+        }
+        if card?.kind == "merge_ready" || card?.kind == "pr_ready" {
+            return (.green, [card?.kindLabel ?? "PR Ready", ci].compactMap { $0 }.joined(separator: " · "))
+        }
+        if let state = nonBlank(thread.state) {
+            let rawHealth = FleetHealth.of(thread)
+            let health = (rawHealth == .gray && card != nil) ? .yellow : rawHealth
+            return (health, "\(healthLabel(health)) · \(stateLabel(state))")
+        }
+        if ["FAILURE", "ERROR"].contains(ciRaw?.uppercased() ?? "") {
+            return (.red, [card?.kindLabel ?? "CI Failed", ci].compactMap { $0 }.joined(separator: " · "))
+        }
+        if let kindLabel = nonBlank(card?.kindLabel) {
+            return (.yellow, [kindLabel, ci].compactMap { $0 }.joined(separator: " · "))
+        }
+        if let ci {
+            return (.yellow, ci)
+        }
+        return (.gray, "Saved session")
+    }
+
+    static func diffStatLine(_ prContext: SupervisorPRContext?) -> String? {
+        guard let prContext else { return nil }
+        var parts: [String] = []
+        if let add = prContext.additions, let del = prContext.deletions {
+            parts.append("+\(add) / -\(del)")
+        }
+        if let files = prContext.changedFiles, files > 0 {
+            parts.append("\(files) \(files == 1 ? "file" : "files")")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     static func stateLabel(_ state: String?) -> String {
@@ -247,6 +310,154 @@ enum SupervisorFormat {
     static func agoPhrase(_ date: Date, now: Date = Date()) -> String {
         let minutes = Int(now.timeIntervalSince(date) / 60)
         return minutes <= 0 ? "just now" : RelativeTime.compact(minutes: minutes) + " ago"
+    }
+
+    // Duet card deck: uses the daemon's enriched `cards` when present, or
+    // synthesizes equivalent cards from `questions` + `snapshot.threads` when
+    // connected to an older daemon or UI test fixture.
+    static func resolvedCards(_ state: FleetState) -> [SupervisorCard] {
+        let cards = state.cards.filter { !$0.id.isEmpty }
+        if !cards.isEmpty { return cards }
+        let threads = state.snapshot?.threads ?? []
+        return state.questions.filter { !$0.id.isEmpty }.map { question in
+            let keys = threadKeys(question)
+            let primaryKey = question.threadKey ?? keys.first
+            let thread = primaryKey.flatMap { key in threads.first(where: { $0.key == key }) }
+            let options = answerOptions(question)
+            let isReady = question.kind == "ready"
+            let primary: SupervisorCardAction? = if isReady {
+                SupervisorCardAction(op: "merge", label: "Merge PR")
+            } else if let first = options.first {
+                SupervisorCardAction(op: "answer", label: capitalizedFirst(first), value: first)
+            } else {
+                nil
+            }
+            return SupervisorCard(
+                id: "question:\(question.id)",
+                questionId: question.id,
+                kind: isReady ? "merge_ready" : "agent_decision",
+                kindLabel: isReady ? "PR ready" : "Needs your decision",
+                headline: nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
+                sessionTitle: nonBlank(thread?.title),
+                summary: nonBlank(question.body),
+                agentSummary: nonBlank(thread?.lastAgentText),
+                threadKey: primaryKey,
+                threadKeys: keys,
+                repo: thread?.repo,
+                branch: thread?.branch,
+                workspace: cleanWorkspace(thread?.workspace),
+                prRef: question.prRef ?? thread?.pr?.ref,
+                prUrl: thread?.pr?.url,
+                ciState: thread?.pr?.ci?.state,
+                noticedAt: question.createdAt,
+                options: options,
+                primaryAction: primary,
+                secondaryAction: SupervisorCardAction(op: "defer", label: "Later"),
+                prContext: thread?.pr.map {
+                    SupervisorPRContext(
+                        ref: $0.ref,
+                        url: $0.url,
+                        title: $0.title,
+                        bodySummary: $0.bodySummary,
+                        additions: $0.additions,
+                        deletions: $0.deletions,
+                        changedFiles: $0.changedFiles,
+                        files: $0.files,
+                        ciState: $0.ci?.state
+                    )
+                }
+            )
+        }
+    }
+
+    // Compact toolbar pill: "2 running · 1 CI", "3 watched", or "0 active".
+    static func activePill(_ state: FleetState) -> String {
+        let running: Int
+        let waitingCi: Int
+        let total: Int
+        if let summary = state.activeSummary {
+            running = summary.running
+            waitingCi = summary.waitingCi
+            total = summary.total
+        } else {
+            let threads = (state.snapshot?.threads ?? []).filter { $0.state != "excluded" && $0.state != "done" }
+            running = threads.filter { $0.state == "running" || $0.state == "local-verify" }.count
+            waitingCi = threads.filter { $0.state == "waiting-ci" }.count
+            total = threads.count
+        }
+        var parts: [String] = []
+        if running > 0 { parts.append("\(running) running") }
+        if waitingCi > 0 { parts.append("\(waitingCi) CI") }
+        if !parts.isEmpty { return parts.joined(separator: " · ") }
+        return total > 0 ? "\(total) watched" : "0 active"
+    }
+
+    static func autonomyLine(_ autonomy: SupervisorAutonomy?) -> String? {
+        guard let autonomy, autonomy.handledCount > 0 else { return nil }
+        let noun = autonomy.handledCount == 1 ? "decision" : "decisions"
+        return "Handled \(autonomy.handledCount) routine \(noun) · \(autonomy.autonomousPercent)% autonomous"
+    }
+
+    static func cardActNote(_ result: FleetCardActResult) -> Note {
+        let message = nonBlank(result.message)
+        switch result.status {
+        case "merged", "already_merged":
+            return Note(text: message ?? "Merged pull request.", isAlert: false)
+        case "watching_ci", "queued_when_green", "queued_auto_merge", "ci_pending_watch":
+            return Note(text: message ?? "Watching CI — will ping when green.", isAlert: false)
+        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed":
+            return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
+        case "deferred", "dismissed":
+            return Note(text: message ?? "Saved for later.", isAlert: false)
+        case "updated", "preference_saved", "reverted":
+            return Note(text: message ?? "Preference updated.", isAlert: false)
+        default:
+            if !result.ok {
+                return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
+            }
+            return deliveryNote(result.delivery, fallback: message ?? "Sent to the agent.")
+        }
+    }
+
+    static func fallbackSearchHits(_ threads: [FleetThread], query: String) -> [FleetSearchHit] {
+        let lower = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return [] }
+        return threads.filter {
+            ($0.title?.lowercased().contains(lower) ?? false)
+                || ($0.workspace?.lowercased().contains(lower) ?? false)
+                || ($0.repo?.lowercased().contains(lower) ?? false)
+                || ($0.branch?.lowercased().contains(lower) ?? false)
+                || ($0.pr?.ref?.lowercased().contains(lower) ?? false)
+                || ($0.lastAgentText?.lowercased().contains(lower) ?? false)
+        }.map { thread in
+            FleetSearchHit(
+                key: thread.key,
+                title: thread.title,
+                workspace: thread.workspace,
+                repo: thread.repo,
+                branch: thread.branch,
+                state: thread.state,
+                health: thread.health,
+                snippet: nonBlank(thread.lastAgentText) ?? nonBlank(thread.reason),
+                prRef: thread.pr?.ref,
+                live: thread.live || thread.state == "running" || thread.state == "local-verify"
+            )
+        }
+    }
+
+    static func cadenceLabel(_ cadence: String) -> String {
+        switch cadence {
+        case "quiet_until_ready": return "Quiet until ready"
+        case "detailed": return "Detailed updates"
+        default: return "Balanced"
+        }
+    }
+
+    static func mergePolicyLabel(_ policy: String) -> String {
+        switch policy {
+        case "queue_when_green": return "Queue merge when CI passes (after tap)"
+        default: return "Confirm only when CI is green"
+        }
     }
 
     private static func prRefParts(_ ref: String) -> (repo: String, number: String)? {

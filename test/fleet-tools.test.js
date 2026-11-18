@@ -34,6 +34,18 @@ function registry(supervisor) {
   return tools;
 }
 
+test("fleet_status never reports a mode the fleet computer has not confirmed as fact", () => {
+  const base = { enabled: true, running: false, questions: [], actions: [], settings: {} };
+  const waiting = fleetStatus({ getState: () => ({ ...base, mode: null, modeConfirmed: false }) });
+  assert.equal(waiting.mode, "unknown");
+  assert.equal(waiting.modeUnconfirmed, true);
+  const last = fleetStatus({ getState: () => ({ ...base, mode: "auto", modeConfirmed: false }) });
+  assert.equal(last.mode, "auto");
+  assert.equal(last.modeUnconfirmed, true);
+  const live = fleetStatus({ getState: () => ({ ...base, mode: "auto", modeConfirmed: true }) });
+  assert.equal(live.modeUnconfirmed, undefined);
+});
+
 test("past handoffs use target-specific journal evidence, including uncertain deliveries", () => {
   const target = row();
   const actions = [

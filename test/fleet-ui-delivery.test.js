@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
+import { DEFAULTS, UI_APPS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   screenSummary, composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
-  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
+  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController, approvalRows
 } from "../src/fleet/ui-delivery.js";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex").toString("base64");
@@ -2177,6 +2177,35 @@ test("a read that brings the app forward puts the owner's app back", async (t) =
   assert.equal(probe.front, "com.google.Chrome");
 });
 
+test("the Codex sidebar read never leaves Codex in front of an owner working in another app", async (t) => {
+  const codexTarget = { ...UI_APPS.codex };
+  const raise = (probe) => ({ onCall: (name) => { if (name === "get_app_state") probe.front = "com.openai.codex"; } });
+  // Owner typing in Chrome: no read at all, so Codex cannot come forward.
+  const busy = fakeProbe({ front: "com.google.Chrome", idle: 2_000 });
+  const here = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: busy, transportOptions: raise(busy) });
+  const blocked = await here.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(blocked.status, "blocked");
+  assert.match(blocked.detail, /owner at the keyboard/);
+  assert.deepEqual(names(here.calls()), [], "no read under the owner");
+  assert.equal(busy.front, "com.google.Chrome");
+  assert.deepEqual(busy.activated, []);
+
+  // Owner away: the read may raise Codex, and their app goes back after.
+  const away = fakeProbe({ front: "com.google.Chrome" });
+  const idle = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: away, transportOptions: raise(away) });
+  const read = await idle.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(read.status, "read", read.detail);
+  assert.equal(away.front, "com.google.Chrome");
+  assert.deepEqual(away.activated, ["com.google.Chrome"]);
+
+  // Owner already in Codex: reading it moves nothing.
+  const inCodex = fakeProbe({ front: "com.openai.codex", idle: 2_000 });
+  const same = setup(t, { app: fakeApp({ bundleId: "com.openai.codex" }), probe: inCodex });
+  const seen = await same.driver.attention({ target: codexTarget, evidenceName: "attention" });
+  assert.equal(seen.status, "read", seen.detail);
+  assert.deepEqual(inCodex.activated, []);
+});
+
 test("clickLabel clicks one card button through accessibility and confirms the card is gone", async (t) => {
   const f = setup(t, { app: fakeApp({ prompt: true }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
   const { screen } = await f.driver.inspect(f.request());
@@ -2378,4 +2407,40 @@ test("a Conductor draft equal to its placeholder remains a draft", () => {
     assert.equal(composerEmpty(composer), false);
     assert.equal(screenSummary(state).draft, true);
   }
+});
+
+test("approvalRows lists the Codex sidebar chats awaiting approval, by title", () => {
+  const state = stateOf([
+    "App=com.openai.codex (pid 1)",
+    'Window: "Luma", App: ChatGPT.',
+    "0 standard window Luma",
+    "\t1 content list",
+    "\t\t2 button Luma",
+    "\t\t\t3 text Luma",
+    "\t\t\t4 container Working",
+    "\t\t5 button Fix uploads +12 -3",
+    "\t\t\t6 text Unread",
+    "\t\t\t7 text Fix uploads +12 -3",
+    "\t\t\t8 container Awaiting approval",
+    "\t\t9 button Billing",
+    "\t\t\t10 text Billing",
+    "\t\t\t11 container Needs approval"
+  ].join("\n"));
+  assert.deepEqual(approvalRows(state), ["Fix uploads", "Billing"]);
+  assert.deepEqual(approvalRows({ ...state, bundleId: "com.conductor.app" }), [], "Codex only");
+});
+
+test("a Codex card with Allow this conversation is a permission prompt", () => {
+  const state = stateOf([
+    "App=com.openai.codex (pid 1)",
+    'Window: "Luma", App: ChatGPT.',
+    "0 standard window Luma",
+    "\t1 HTML content Luma, URL: app://-/index.html",
+    "\t\t2 container",
+    "\t\t\t3 text Run pnpm test?",
+    "\t\t\t4 button Allow once",
+    "\t\t\t5 button Allow this conversation",
+    "\t\t\t6 button Deny"
+  ].join("\n"));
+  assert.deepEqual(promptButtons(state, "com.openai.codex").buttons, ["Allow once", "Allow this conversation", "Deny"]);
 });

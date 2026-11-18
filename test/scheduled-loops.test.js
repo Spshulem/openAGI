@@ -277,3 +277,48 @@ test("POST /cron marks dashboard-shaped schedules as the owner's", async t => {
     else process.env.OPENAGI_AUTH_TOKEN = prevToken;
   }
 });
+
+test("an approved scheduled card whose tool fails still resumes the run, without rerunning the tool", async t => {
+  const dataDir = tempDir(t, "loops-failed-approval-");
+  const prevToken = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = "test-token-abc";
+  const runtime = createDurableRuntime({ dataDir });
+  let invocations = 0;
+  runtime.tools.register({ name: "fixture_send", description: "fixture", parameters: { type: "object", properties: {} },
+    handler: async () => { invocations += 1; throw new Error("Fixture send failure"); } });
+  const resumed = [];
+  runtime.resumeScheduledRun = async (action, invokeResult) => { resumed.push({ action, invokeResult }); return { reply: "ok" }; };
+  const app = createHostedInterface(runtime, { host: "127.0.0.1", port: 0, channelsDir: path.join(dataDir, "channels") });
+  await app.listen();
+  try {
+    const action = runtime.pendingActions.enqueue({ toolName: "fixture_send", args: {}, summary: "Send the report",
+      context: { sessionId: "s-cron-fail", origin: "cron", scheduledJobId: "job_fail", scheduledJobName: "Inbox sweep" } });
+    const executed = await runtime.executeApprovedAction(action.id, { continuation: runtime.queueApprovalContinuation });
+    assert.equal(executed.invokeResult.ok, false);
+    assert.deepEqual(executed.body.continuation, { status: "queued", sessionId: "s-cron-fail" });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].invokeResult.ok, false);
+    assert.equal(invocations, 1);
+    assert.equal(runtime.pendingActions.get(action.id).continuation.status, "delivered");
+  } finally {
+    await app.close();
+    if (prevToken === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = prevToken;
+  }
+});
+
+test("a failed approval still does not resume a computer-use session", t => {
+  const store = new PendingActionStore({ dir: tempDir(t, "loops-pending-failed-") });
+  const action = store.enqueue({ toolName: "start_computer_use_session", args: {}, summary: "Use the computer", context: { sessionId: "s1" } });
+  const claim = store.claimForExecution(action.id);
+  store.decide(action.id, { decision: "approve", error: "Fixture failure", executionId: claim.executionId });
+  assert.equal(store.prepareContinuation(action.id, { sessionId: "s1" }), null);
+  assert.equal(store.claimContinuation(action.id), null);
+});
+
+test("a scheduled-run notice in the feed can be dismissed", () => {
+  const { self, calls } = scheduledRuntime();
+  self.noticeScheduledRun({ id: "job_n", name: "Reminder" }, "Stretch.");
+  assert.deepEqual(calls.notices[0].actions, ["dismiss"]);
+});

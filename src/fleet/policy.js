@@ -485,20 +485,35 @@ function cardIntent(ctx, card) {
   const oldest = items[0];
   const item = card.app === "codex" ? items.at(-1) : items[0];
   const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
-  const head = clampText(item.header || item.question, 50);
+  const namedHeader = item.header && !/^question\s+\d+$/i.test(String(item.header).trim()) ? item.header : null;
+  const head = clampText(namedHeader || item.question, 50);
   const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
   const extra = item.multiSelect ? " Pick any." : "";
-  const others = items.filter((other) => other !== item).map((other) => clampText(other.header || other.question, 60));
+  const others = items.filter((other) => other !== item).map((other) => {
+    const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
+      ? (other.question || other.header)
+      : (other.header || other.question);
+    return clampText(label, 60);
+  });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
   const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
+  const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
+    ? item.options.slice(0, 3)
+    : [];
+  const clampedChoices = rawChoices.map((opt) => clampText(opt, 40));
+  const needsNumberPrefix = rawChoices.some((opt, idx) => opt.length > 40 || clampedChoices.indexOf(clampedChoices[idx]) !== idx);
+  const inlineOptions = rawChoices.length > 0
+    ? [...rawChoices.map((opt, idx) => (needsNumberPrefix ? clampText(`${idx + 1}. ${opt}`, 40) : opt)), "open thread"]
+    : ["open thread"];
   const question = {
-    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: ["open thread"], dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
-      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options]
+      count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options],
+      ...(card.requestId ? { paseoPermissionId: String(card.requestId) } : {})
     },
     ...(late ? { baseKey: key } : {}),
     agentAskedAt: item.at ?? null
@@ -539,6 +554,31 @@ function agentAskIntent(ctx) {
   const ask = classified.ask ?? {};
   if (ask.card) return cardIntent(ctx, ask.card);
   if (thread.meta?.blockedOnOwner === true) {
+    const paseoPerm = thread.kind === "paseo" ? thread.meta?.pendingPermission : null;
+    if (paseoPerm && paseoPerm.id) {
+      const permWhat = paseoPerm.command
+        ? `Run \`${paseoPerm.command}\``
+        : paseoPerm.filePath
+          ? `Modify \`${paseoPerm.filePath}\``
+          : (paseoPerm.description || paseoPerm.title || paseoPerm.name || "Approve requested tool action");
+      const permLabels = Array.isArray(paseoPerm.actions) && paseoPerm.actions.length >= 2
+        ? paseoPerm.actions.slice(0, 2).map((a) => a.label).filter(Boolean)
+        : ["Allow", "Deny"];
+      return {
+        type: "ask", reason: "blocked on a permission prompt",
+        question: {
+          ...question(
+            ctx,
+            `${ctx.facts.label}: allow ${fact(paseoPerm.name || paseoPerm.kind || "tool", 24)}?`,
+            ownerExcerpt(permWhat, ctx.limits.bodyMax),
+            [...permLabels, "later"],
+            `prompt:${thread.key}:${paseoPerm.id}`,
+            "prompt"
+          ),
+          meta: { paseoPermissionId: paseoPerm.id }
+        }
+      };
+    }
     // A card the supervisor read on screen: its own buttons are the options,
     // and a tap clicks that button (supervisor.answerQuestion). A new card is
     // a new question (its stateId is in the key).
@@ -1407,8 +1447,13 @@ function agentLabel(thread) {
 export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
-  const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
-    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
+  const rawWorkspace = /^(?:wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i.test(String(thread.workspace ?? "").trim()) ? "" : thread.workspace;
+  const rawPaseoTitle = thread.kind === "paseo" ? stripTags(thread.title) : "";
+  const cleanPaseoTitle = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|you are working inside conductor\b.*)$/i.test(rawPaseoTitle.trim()) ? "" : fact(rawPaseoTitle, 36);
+  const place = fact(rawWorkspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
+    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "")
+    || cleanPaseoTitle
+    || (thread.kind === "paseo" ? fact(String(thread.meta?.paseoCwd ?? "").replace(/\/+$/, "").split("/").pop(), 30) : "");
   if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
   return place || `${kindName(thread.kind)} chat`;
 }
@@ -1435,7 +1480,9 @@ function ownerExcerpt(text, max) {
 }
 
 function stripTags(text) {
-  return String(text ?? "").replace(/<[^>]{0,200}>/g, " ");
+  return String(text ?? "")
+    .replace(/<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:<\/(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)/gi, " ")
+    .replace(/<[^>]{0,200}>/g, " ");
 }
 
 function question(ctx, title, body, options, dedupeKey, kind) {

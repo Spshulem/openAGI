@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createPaseoSource, paseoThread, hostApi, withPaseo } from "../src/fleet/sources/paseo.js";
 import { deliverPaseo } from "../src/fleet/paseo-delivery.js";
-import { mergeThreads } from "../src/fleet/classify.js";
+import { classifyThread, mergeThreads, threadHealth } from "../src/fleet/classify.js";
+import { decideThread } from "../src/fleet/policy.js";
 import { openChatFor, resolveFleetConfig } from "../src/fleet/contracts.js";
 
 const config = { paseo: { enabled: true, historyPerScan: 1 } };
@@ -41,9 +42,98 @@ test("pagination includes background chats; bounded history makes fair progress 
 });
 test("registered hosts preserve distinct same-ID chats; unavailable hosts fail closed", async () => {
   const m = mock([agent("same")], { remote: [agent("same")] });
+  const autoRows = await createPaseoSource(m)({ paseo: { enabled: true } });
+  assert.equal(new Set(autoRows.map(t => t.key)).size, 2, "online enabled registered hosts are auto-discovered by default");
   const rows = await createPaseoSource(m)({ paseo: { enabled: true, serverIds: ["remote"] } });
   assert.equal(new Set(rows.map(t => t.key)).size, 2);
   await assert.rejects(hostApi(m.client, "unregistered"), /unavailable/);
+
+  // Auto-discovered host disconnecting mid-scan does not fail self discovery and preserves open remote questions
+  const flaky = mock([agent("local-chat")], { remote: [agent("remote-chat")] });
+  let remoteFail = true;
+  const realRemoteClient = flaky.client.hosts.client;
+  flaky.client.hosts.client = async (...args) => {
+    if (remoteFail) return { agents: { list: async () => { throw new Error("remote host went to sleep"); } } };
+    return realRemoteClient(...args);
+  };
+  const flakySource = createPaseoSource(flaky);
+  const survived = await flakySource({ paseo: { enabled: true } });
+  assert.deepEqual(survived.map(t => t.key), ["paseo:local.local-chat"]);
+  assert.deepEqual(survived.unknownThreadPrefixes, ["paseo:remote."]);
+
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { FleetSupervisor } = await import("../src/fleet/supervisor.js");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-unknown-host-"));
+  try {
+    let remoteOnline = true;
+    const recentIso = new Date().toISOString();
+    const capMsg = "Individual quota reached. Resets in 24h.";
+    const localLim1 = agent("local-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const localLim2 = agent("local-lim-2", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteLim = agent("remote-lim-1", { status: "error", lastError: capMsg, updatedAt: recentIso });
+    const remoteAskAgent = agent("remote-ask", { updatedAt: recentIso });
+    const dynClient = {
+      agents: {
+        list: async () => ({ entries: [{ agent: agent("local-ok") }, { agent: localLim1 }, { agent: localLim2 }], pageInfo: { hasMore: false } }),
+        ref: (id) => ({ timeline: { refetch: async () => ({ agent: id === "local-lim-1" ? localLim1 : id === "local-lim-2" ? localLim2 : agent(id), entries: [{ item: { type: "assistant_message", text: "Completed." }, timestamp: "2026-01-01T00:00:00Z" }] }) } })
+      },
+      connect: async () => {},
+      close: async () => {},
+      hosts: {
+        list: async () => ({
+          self: { serverId: "local" },
+          hosts: [{ serverId: "remote", enabled: true, status: remoteOnline ? "online" : "offline" }]
+        }),
+        client: async () => ({
+          agents: {
+            list: async () => ({ entries: [{ agent: remoteAskAgent }, { agent: remoteLim }], pageInfo: { hasMore: false } }),
+            ref: (id) => ({
+              timeline: {
+                refetch: async () => ({
+                  agent: id === "remote-lim-1" ? remoteLim : remoteAskAgent,
+                  entries: id === "remote-lim-1"
+                    ? [{ item: { type: "assistant_message", text: "Working." }, timestamp: "2026-01-01T00:00:00Z" }]
+                    : [{ item: { type: "assistant_message", text: "Should I run the production migration?" }, timestamp: "2026-01-02T00:00:00Z" }]
+                })
+              }
+            })
+          }
+        })
+      }
+    };
+    const dynSource = createPaseoSource({ factory: () => dynClient });
+    const sup = new FleetSupervisor({
+      dataDir: tmpDir,
+      config: resolveFleetConfig({}, {
+        enabled: true,
+        mode: "observe",
+        paseo: { enabled: true, only: true, historyPerScan: 10 },
+        review: { enabled: false },
+        storage: { enabled: false }
+      }),
+      deps: {
+        listPaseoThreads: (cfg) => dynSource(cfg),
+        run: async () => ({ code: 1, stdout: "", stderr: "" })
+      }
+    });
+    await sup.tick("scan-1");
+    const openAfterOnline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOnline.length, 1, "remote Paseo host ask opens a question when online");
+    const groupAfterOnline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.equal(groupAfterOnline?.threadKeys?.length, 3, "three-member limit:group includes both local and remote members");
+
+    remoteOnline = false;
+    await sup.tick("scan-2");
+    const openAfterOffline = sup.store.openQuestions().filter((q) => q.threadKey === "paseo:remote.remote-ask");
+    assert.equal(openAfterOffline.length, 1, "transiently offline auto-discovered host must not resolve open question as left the scan");
+    const groupAfterOffline = sup.store.openQuestions().find((q) => q.dedupeKey === "limit:group");
+    assert.deepEqual(groupAfterOffline?.threadKeys?.includes("paseo:remote.remote-lim-1"), true, "three-member limit:group retains remote member while optional host is offline");
+    assert.ok(sup.getState().snapshot?.threads?.some((r) => r.key === "paseo:remote.remote-ask"), "snapshot retains warm row while optional host is offline");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 test("failed histories remain excluded, permissions remain owner-blocked, closed stays closed", async () => {
   const m = mock([agent("a")], { failHistory: true });
@@ -140,4 +230,232 @@ test("supervisor nudges never become owner instructions in judge context", () =>
   const row = paseoThread(agent("a"), "host", entries);
   assert.equal(row.lastUserText, "Review only");
   assert.deepEqual(row.meta.conversation.map(m => m.text), ["Review only", "Reviewed"]);
+});
+
+const capacityError = "Selected model is at capacity. Please try a different model.";
+const failureAt = "2026-01-01T00:10:00Z";
+const laterAt = "2026-01-01T00:20:00Z";
+const errorEntry = (message = capacityError) => ({ timestamp: failureAt, item: { type: "error", message } });
+
+test("Paseo system errors reach the existing model-limit question through fresh and cached discovery", async () => {
+  const a = agent("failed", { status: "error", model: "test-model", updatedAt: failureAt });
+  const entries = [
+    { timestamp: "2026-01-01T00:09:00Z", item: { type: "assistant_message", text: "I will finish the verification." } },
+    errorEntry(),
+    { timestamp: failureAt, item: { type: "tool_call", status: "failed", detail: { output: "private tool output" } } }
+  ];
+  const m = mock([a]);
+  m.client.agents.ref = id => ({ timeline: { refetch: async () => {
+    m.reads.push(id);
+    return { agent: a, entries };
+  } } });
+  const source = createPaseoSource(m);
+  for (let scan = 0; scan < 2; scan++) {
+    const [row] = await source(config);
+    assert.equal(row.error?.kind, "model-limit");
+    assert.equal(row.error.text, capacityError);
+    assert.equal(row.meta.model, "test-model");
+    const classified = classifyThread(row);
+    assert.equal(classified.state, "infra-blocked");
+    assert.equal(threadHealth(classified.state, row.error), "red");
+    const decision = decideThread(classified, row, { mode: "auto", now: Date.parse(laterAt) });
+    assert.equal(decision.action, "ask-user");
+    assert.equal(decision.message, null);
+    assert.match(decision.question.title, /test-model capped\. Switch model\?/);
+    assert.deepEqual(decision.question.options, ["switched", "wait"]);
+    assert.deepEqual(row.meta.conversation.map(m => m.text), ["I will finish the verification."]);
+    assert.equal(JSON.stringify(row).includes("private tool output"), false);
+  }
+  assert.equal(m.reads.length, 1, "cached scans retain the error without another history read");
+});
+
+test("Paseo snapshot errors survive a bounded history without an error event", () => {
+  const row = paseoThread(agent("failed", { status: "error", lastError: capacityError, updatedAt: failureAt }), "host");
+  assert.equal(row.error?.kind, "model-limit");
+  const unknown = paseoThread(agent("failed", { status: "error", lastError: "Provider failed unexpectedly" }), "host");
+  assert.equal(unknown.error?.kind, "other");
+  assert.equal(threadHealth(classifyThread(unknown).state, unknown.error), "red");
+  const unread = paseoThread(agent("failed", { status: "error", lastError: capacityError }), "host", [], false);
+  assert.equal(classifyThread(unread).state, "excluded", "an error cannot bypass unknown-history exclusion");
+});
+
+test("Paseo idle failures remain detectable and a newer failure replaces the older one", () => {
+  const row = paseoThread(agent("a"), "host", [errorEntry()]);
+  assert.equal(row.error?.kind, "model-limit");
+  const newer = paseoThread(agent("a"), "host", [errorEntry(), errorEntry("Connection failed")]);
+  assert.equal(newer.error?.kind, "network");
+});
+
+test("Paseo error notices clear after a newer message or a new active turn", () => {
+  for (const type of ["user_message", "assistant_message"]) {
+    const row = paseoThread(agent("a"), "host", [errorEntry(), { timestamp: laterAt, item: { type, text: "Continue" } }]);
+    assert.equal(row.error, null, type);
+  }
+  const entries = [errorEntry()];
+  const retry = paseoThread(agent("a", { lastUserMessageAt: laterAt }), "host", entries);
+  assert.equal(retry.error, null, "a retry outside the history page supersedes the old failure");
+  for (const extra of [
+    { status: "running" }, { status: "initializing" }, { status: "closed" },
+    { archivedAt: laterAt }, { status: "error", activeTurn: { startedAt: laterAt } }
+  ]) {
+    const row = paseoThread(agent("a", { lastError: capacityError, ...extra }), "host", entries);
+    assert.equal(row.error, null, JSON.stringify(extra));
+  }
+  assert.equal(paseoThread(agent("a", { lastError: capacityError }), "host").error, null,
+    "idle snapshot lastError alone is not evidence of a current failure");
+});
+
+test("Paseo detects only structured provider errors, not quoted errors or tool failures", () => {
+  const entries = [
+    { item: { type: "user_message", text: capacityError } },
+    { item: { type: "assistant_message", text: capacityError } },
+    { item: { type: "tool_call", status: "failed", error: capacityError } },
+    { item: { type: "notification", level: "info", message: capacityError } }
+  ];
+  assert.equal(paseoThread(agent("a"), "host", entries).error, null);
+});
+
+test("Paseo failure details are bounded and redacted without replacing the assistant report", () => {
+  const secret = "sk-" + "test".repeat(10);
+  const message = capacityError + " key=" + secret + " ".repeat(9000);
+  const row = paseoThread(agent("a"), "host", [
+    { item: { type: "assistant_message", text: "Work in progress." } }, errorEntry(message)
+  ]);
+  assert.equal(row.error?.kind, "model-limit");
+  assert.equal(row.error.text.includes(secret), false);
+  assert.match(row.error.text, /\[redacted\]/);
+  assert.ok(row.error.text.length <= 1000);
+  assert.equal(row.lastAgentFull, "Work in progress.");
+  assert.equal(row.meta.conversation.length, 1);
+});
+
+test("Paseo relative quota reset uses the failure time", () => {
+  const message = "Individual quota reached. Resets in 2h.";
+  for (const extra of [{}, { status: "error", lastError: message }]) {
+    const row = paseoThread(agent("a", { updatedAt: laterAt, ...extra }), "host", [errorEntry(message)]);
+    assert.equal(row.error?.kind, "usage-limit");
+    assert.equal(row.error.resetAt, "2026-01-01T02:10:00.000Z");
+  }
+});
+
+test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, gh --repo PRs, and prioritizes attention", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-home-"));
+  try {
+    const paseoDir = path.join(tmpHome, ".paseo");
+    fs.mkdirSync(paseoDir, { recursive: true });
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "127.0.0.1:6767" }));
+    fs.writeFileSync(path.join(paseoDir, "config.json"), JSON.stringify({ tls: { enabled: false } }));
+    fs.writeFileSync(path.join(paseoDir, "pilot-password"), "local-secret-pw\n");
+
+    const cfg = resolveFleetConfig({}, { home: tmpHome });
+    assert.equal(cfg.paseo.enabled, false, "Paseo remains opt-in when env flag is unset");
+    assert.equal(cfg.paseo.url, "ws://127.0.0.1:6767/ws");
+    assert.equal(cfg.paseo.password, "local-secret-pw");
+
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "6770" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6770/ws");
+
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "/tmp/paseo.sock" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6767/ws");
+
+    fs.writeFileSync(path.join(paseoDir, "paseo.pid"), JSON.stringify({ pid: 123, listen: "unix:///tmp/paseo.sock" }));
+    assert.equal(resolveFleetConfig({}, { home: tmpHome }).paseo.url, "ws://127.0.0.1:6767/ws");
+
+    const withConductorLabel = paseoThread(
+      agent("migrated", {
+        title: "Success pages — consolidation #5560",
+        labels: { "migration.source": "Conductor", "migration.sourceId": "cond-123" },
+        requiresAttention: true,
+        attentionReason: "async_question",
+        persistence: {
+          metadata: {
+            asyncQuestions: [
+              { id: "aq-1", question: "Where should we deploy first?", options: ["Staging only", "Staging, then production"], resolution: null },
+              { id: "aq-0", question: "Old resolved question", options: ["Yes"], resolution: "Yes" }
+            ]
+          }
+        }
+      }),
+      "local",
+      [
+        { item: { type: "assistant_message", text: "Checked gh pr checks 5560 --repo acme/webapp and waiting on you." } }
+      ]
+    );
+    assert.ok(withConductorLabel.meta.aliases.includes("conductor:cond-123"));
+    assert.deepEqual(withConductorLabel.prRefs, ["acme/webapp#5560"]);
+    assert.equal(withConductorLabel.meta.requiresAttention, true);
+    assert.equal(withConductorLabel.meta.pendingCard?.app, "paseo");
+    assert.equal(withConductorLabel.meta.pendingCard?.items.length, 1);
+    assert.deepEqual(withConductorLabel.meta.pendingCard?.items[0].options, ["Staging only", "Staging, then production"]);
+
+    const classified = classifyThread(withConductorLabel);
+    const decision = decideThread(classified, withConductorLabel, { mode: "auto", now: Date.now() });
+    const cardQ = decision.cardQuestion ?? decision.question;
+    assert.equal(cardQ.kind, "agent-card");
+    assert.deepEqual(cardQ.options, ["Staging only", "Staging, then production", "open thread"]);
+
+    // Scan prioritizes requiresAttention and newest updatedAt first while breaking ties cleanly
+    const m = mock([
+      agent("old-quiet", { updatedAt: "2026-01-01T00:00:00Z", requiresAttention: false }),
+      agent("newer-idle", { updatedAt: "2026-01-03T00:00:00Z", requiresAttention: false }),
+      agent("attention-chat", { updatedAt: "2026-01-02T00:00:00Z", requiresAttention: true })
+    ]);
+    const source = createPaseoSource(m);
+    await source({ paseo: { enabled: true, historyPerScan: 1 } });
+    assert.deepEqual(m.reads, ["attention-chat"]);
+    await source({ paseo: { enabled: true, historyPerScan: 1 } });
+    assert.deepEqual(m.reads, ["attention-chat", "newer-idle"]);
+
+    // Long-prefix (>40 char) Paseo asyncQuestions stay distinct after clamping
+    const longA = "Deploy to staging environment first and run full regression suite";
+    const longB = "Deploy to staging environment first and skip regression suite";
+    const longThread = paseoThread(
+      agent("long-opts", {
+        persistence: { metadata: { asyncQuestions: [{ id: "aq-l", question: "Pick rollout", options: [longA, longB], resolution: null }] } }
+      }),
+      "local",
+      []
+    );
+    const longDecision = decideThread(classifyThread(longThread), longThread, { mode: "auto", now: Date.now() });
+    const longQ = longDecision.cardQuestion ?? longDecision.question;
+    assert.equal(longQ.options.length, 3);
+    assert.notEqual(longQ.options[0], longQ.options[1]);
+    assert.deepEqual(longQ.meta.labels, [longA, longB]);
+
+    // 36 hanging histories (9 batches * 35ms = 315ms > 160ms) stay bounded inside timeoutMs instead of rejecting the scan
+    const slowAgents = Array.from({ length: 36 }, (_, idx) => agent(`slow-${idx}`));
+    const slowMock = mock(slowAgents);
+    slowMock.client.agents.ref = () => ({ timeline: { refetch: () => new Promise(() => {}) } });
+    const slowSource = createPaseoSource(slowMock);
+    const slowRows = await slowSource({ paseo: { enabled: true, timeoutMs: 160, historyTimeoutMs: 35, historyPerScan: 48 } });
+    assert.equal(slowRows.length, 36);
+
+    // Opaque wks_* workspaceId extracts human conductor workspace name, and connect latency shares scanStartedAt budget cleanly
+    const migratedWorkspaceThread = paseoThread(
+      agent("cond-ws", {
+        workspaceId: "wks_9f8e7d6c5b4a",
+        cwd: "/home/dev/paseo/migrated/mac/Users/shooby/Dev/bbapp/.conductor/bilbao",
+        labels: { "migration.conductorWorkspaceName": "bilbao" }
+      }),
+      "local",
+      []
+    );
+    assert.equal(migratedWorkspaceThread.workspace, "bilbao");
+
+    const delayedConnectMock = mock(Array.from({ length: 20 }, (_, idx) => agent(`dc-${idx}`)));
+    delayedConnectMock.client.agents.ref = () => ({ timeline: { refetch: () => new Promise(() => {}) } });
+    const origConnect = delayedConnectMock.connect;
+    delayedConnectMock.connect = async (...args) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return origConnect(...args);
+    };
+    const delayedSource = createPaseoSource(delayedConnectMock);
+    const delayedRows = await delayedSource({ paseo: { enabled: true, timeoutMs: 180, historyTimeoutMs: 120, historyPerScan: 20 } });
+    assert.equal(delayedRows.length, 20);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
 });

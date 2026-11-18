@@ -234,6 +234,7 @@ test("G2 HTTP enrollment uses bounded node authority and revocation", async () =
     assert.equal(directResponse.headers.get("cache-control"), "no-store");
     const direct = await directResponse.json();
     assert.equal(direct.agentUrl, "https://openagi.example.test");
+    assert.equal(direct.evenAiUrl, "https://openagi.example.test/nodes/g2/chat/completions");
     assert.match(direct.token, /^[a-zA-Z0-9_-]{43}$/);
     assert.equal(nodeRegistry.authenticate(direct.node.id, direct.token), true);
     assert.equal(fs.readFileSync(nodeRegistry.storePath, "utf8").includes(direct.token), false);

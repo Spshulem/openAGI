@@ -235,6 +235,7 @@ struct TrayMenu: View {
       // force: the button replaces an adopted bundle-owned listener. A
       // terminal-managed listener is preserved and explained instead.
       Button(restartLabel) { restartDaemon() }
+      Button("Open Supervisor Workspace…") { SupervisorWindowController.shared.show() }
       Button("Open dashboard…") { state.openDashboard() }
       Button("Connect a phone…") { openPhonePairing() }
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }

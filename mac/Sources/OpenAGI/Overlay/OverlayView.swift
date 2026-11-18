@@ -183,12 +183,14 @@ struct OverlayView: View {
     .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
   }
 
-  // An opened Watching row or question card: its detail lands, its Push now
+  // The detail screen of a question or In progress thread: its chat lands, its Push now
   // or Mute runs and leaves a note, each a height change.
   private func fleetDetailWatchers<V: View>(_ content: V) -> some View {
     content
-    .onChange(of: fleet.expandedThread) { _, _ in onContentChange() }
-    .onChange(of: fleet.expandedQuestions) { _, _ in onContentChange() }
+    .onChange(of: fleet.openItem) { _, _ in onContentChange() }
+    .onChange(of: fleet.drafts) { _, _ in onContentChange() }
+    .onChange(of: fleet.replyInFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.replyNotes) { _, _ in onContentChange() }
     .onChange(of: fleet.details) { _, _ in onContentChange() }
     .onChange(of: fleet.detailLoading) { _, _ in onContentChange() }
     .onChange(of: fleet.threadInFlight) { _, _ in onContentChange() }
@@ -279,6 +281,15 @@ struct OverlayView: View {
           .fixedSize()
         }
         Spacer()
+        Button {
+          SupervisorWindowController.shared.show()
+        } label: {
+          Image(systemName: "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Open Supervisor Workspace window")
         Button(action: {
           withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = false }
           onCollapse()
@@ -296,11 +307,97 @@ struct OverlayView: View {
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
       }
-      TextField(askPlaceholder, text: $state.question)
-        .textFieldStyle(.roundedBorder)
-        .focused($fieldFocused)
-        .disabled(app.status == .down || state.isLoading || state.isDetached)
-        .onSubmit { Task { await state.ask() } }
+      if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
+        Divider()
+        HStack {
+          Text(approvals.items.isEmpty
+               ? "Computer Use"
+               : approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
+            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          Spacer()
+          if !approvals.items.isEmpty {
+            Button("Dismiss all") {
+              Task { await approvals.dismissAll() }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            Text("\(approvals.items.count)")
+              .font(.system(size: 9, weight: .bold))
+              .foregroundStyle(.white)
+              .padding(.horizontal, 6).padding(.vertical, 2)
+              .background(Capsule().fill(Color.accentColor))
+          }
+        }
+        if let outcome = approvals.lastOutcome {
+          HStack(spacing: 6) {
+            Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
+            Spacer()
+            if approvals.lastChatSessionId != nil {
+              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
+                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
+            }
+            Button("Dismiss") { approvals.clearOutcome() }
+              .buttonStyle(.borderless).font(.system(size: 10))
+          }
+        }
+        if let error = approvals.lastError {
+          HStack(spacing: 6) {
+            Text(error).font(.system(size: 11)).foregroundStyle(.red)
+            Spacer()
+            if approvals.lastChatSessionId != nil {
+              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
+                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
+            }
+            Button("Dismiss") { approvals.clearOutcome() }
+              .buttonStyle(.borderless).font(.system(size: 10))
+          }
+        }
+        if !approvals.items.isEmpty {
+          ScrollView {
+            VStack(alignment: .leading, spacing: 7) {
+              ForEach(approvals.items) { approval in
+                approvalRow(approval)
+              }
+            }
+          }
+          .frame(maxHeight: 230)
+          if approvals.items.count > 1 {
+            Button("Open all approvals in main app") {
+              app.openDashboard(path: "/?tab=approvals")
+            }
+            .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.blue)
+          }
+        }
+      }
+      if state.tab == .supervisor {
+        Divider()
+        SupervisorSection()
+      } else {
+        let needsYou = visibleOutreach
+        if !needsYou.isEmpty {
+          Divider()
+          Text("Notifications").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+              ForEach(needsYou.prefix(6)) { item in
+                outreachRow(item)
+              }
+            }
+          }
+          .frame(maxHeight: 240)
+        }
+        // Gate on everything BriefSection can render, not just the rows. Gating on
+        // items alone hid the section the instant the last item was acted on —
+        // which is exactly when "Task added" / "Skill created" lands, so the
+        // confirmation for the final decision was never visible. It also hid a
+        // failed refresh's error and the "N older" count on an empty brief.
+        if brief.hasContent {
+          Divider()
+          BriefSection()
+        }
+      }
+      Divider()
       if let selected = state.activeContext {
         HStack(spacing: 5) {
           Text("About: \(selected.title)")
@@ -400,90 +497,25 @@ struct OverlayView: View {
           .help("Clear the answer")
         }
       }
-      if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
-        Divider()
-        HStack {
-          Text(approvals.items.isEmpty
-               ? "Computer Use"
-               : approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
-            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-          Spacer()
-          if !approvals.items.isEmpty {
-            Text("\(approvals.items.count)")
-              .font(.system(size: 9, weight: .bold))
-              .foregroundStyle(.white)
-              .padding(.horizontal, 6).padding(.vertical, 2)
-              .background(Capsule().fill(Color.accentColor))
+      HStack(spacing: 6) {
+        Text(state.tab == .supervisor ? "Target: #supervisor · Synced" : "Target: Quick Ask")
+          .font(.system(size: 9))
+          .foregroundStyle(.secondary)
+        Spacer()
+        if state.tab == .supervisor {
+          Button("Workspace ⤢") {
+            SupervisorWindowController.shared.show()
           }
-        }
-        if let outcome = approvals.lastOutcome {
-          HStack(spacing: 6) {
-            Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
-            Spacer()
-            if approvals.lastChatSessionId != nil {
-              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
-                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
-            }
-            Button("Dismiss") { approvals.clearOutcome() }
-              .buttonStyle(.borderless).font(.system(size: 10))
-          }
-        }
-        if let error = approvals.lastError {
-          HStack(spacing: 6) {
-            Text(error).font(.system(size: 11)).foregroundStyle(.red)
-            Spacer()
-            if approvals.lastChatSessionId != nil {
-              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
-                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
-            }
-            Button("Dismiss") { approvals.clearOutcome() }
-              .buttonStyle(.borderless).font(.system(size: 10))
-          }
-        }
-        if !approvals.items.isEmpty {
-          ScrollView {
-            VStack(alignment: .leading, spacing: 7) {
-              ForEach(approvals.items) { approval in
-                approvalRow(approval)
-              }
-            }
-          }
-          .frame(maxHeight: 230)
-          if approvals.items.count > 1 {
-            Button("Open all approvals in main app") {
-              app.openDashboard(path: "/?tab=approvals")
-            }
-            .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.blue)
-          }
+          .buttonStyle(.plain)
+          .font(.system(size: 9, weight: .medium))
+          .foregroundStyle(.blue)
         }
       }
-      if state.tab == .supervisor {
-        Divider()
-        SupervisorSection()
-      } else {
-        let needsYou = visibleOutreach
-        if !needsYou.isEmpty {
-          Divider()
-          Text("Notifications").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-          ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-              ForEach(needsYou.prefix(6)) { item in
-                outreachRow(item)
-              }
-            }
-          }
-          .frame(maxHeight: 240)
-        }
-        // Gate on everything BriefSection can render, not just the rows. Gating on
-        // items alone hid the section the instant the last item was acted on —
-        // which is exactly when "Task added" / "Skill created" lands, so the
-        // confirmation for the final decision was never visible. It also hid a
-        // failed refresh's error and the "N older" count on an empty brief.
-        if brief.hasContent {
-          Divider()
-          BriefSection()
-        }
-      }
+      TextField(askPlaceholder, text: $state.question)
+        .textFieldStyle(.roundedBorder)
+        .focused($fieldFocused)
+        .disabled(app.status == .down || state.isLoading || state.isDetached)
+        .onSubmit { Task { await state.ask() } }
     }
     .padding(12)
     .frame(width: 320)

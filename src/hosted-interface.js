@@ -1,6 +1,8 @@
 import { renderPhonePairingPage } from "./phone-pairing-page.js";
 import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
+import { isSavedMemory, isProtectedMemory } from "./memory-system.js";
+import { getStartedStatus } from "./get-started-status.js";
 import http from "node:http";
 import { normalizeMessageImages, MAX_IMAGE_MESSAGE_BODY } from "./message-attachments.js";
 import fsSync from "node:fs";
@@ -12,6 +14,7 @@ import { attachVoiceRelay } from "./voice/relay.js";
 import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
+import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
@@ -105,6 +108,7 @@ import {
   sharedSessionId,
   sharedThreadForSession,
   sharedThreadHistory,
+  appendSharedThreadMessages,
   sharedConversations,
   createSharedConversation
 } from "./shared-conversations.js";
@@ -254,6 +258,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   const events = new EventEmitter();
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
+  const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;
   try { g2Requests = channels?.g2 ? new G2Requests({ channel: channels.g2, dir: path.join(dataDir, "g2-requests"),
     onCancel: async record => {
@@ -657,7 +663,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   }
 
   async function deliverScheduledContinuation(action, invokeResult) {
-    const claim = runtime.pendingActions?.claimContinuation?.(action.id, { maxAttempts: 1 });
+    const claim = runtime.pendingActions?.claimContinuation?.(action.id, { maxAttempts: 1, allowFailedExecution: true });
     if (!claim) return;
     try {
       await runtime.resumeScheduledRun(action, invokeResult);
@@ -674,9 +680,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   function queueApprovalContinuation(action, invokeResult, { resetFailed = false } = {}) {
     if (action?.context?.scheduledJobId && action.toolName !== "start_computer_use_session" && action.context.sessionId && runtime.resumeScheduledRun) {
+      // A failed approved tool still resumes the run, so it can report the
+      // failure and finish; the tool itself is not retried.
       const continuation = runtime.pendingActions?.prepareContinuation?.(action.id, {
         requestId: "approval_" + action.id,
-        sessionId: action.context.sessionId
+        sessionId: action.context.sessionId,
+        allowFailedExecution: true
       });
       if (!continuation) return null;
       if (continuation.status === "pending") deliverScheduledContinuation(action, invokeResult).catch(() => {});
@@ -967,7 +976,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
+        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
       const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
@@ -983,14 +992,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // the G2 voice routes; all generic node/control routes still require
       // the explicit X-OpenAGI-Node-ID header.
       const tokenOnlyG2Enrollment = !headerNodeId
-        && ["/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        && ["/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         ? nodeRegistry.enrollmentForToken(scopedBearer)
         : null;
       const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         || sharedHistoryRoute;
       // A mobile credential is accepted on its enumerated allowlist and
       // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
@@ -1014,7 +1023,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -1164,6 +1173,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
           }
           const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
+          const keyName = preference === "openai" ? "OPENAI_API_KEY" : preference === "anthropic" ? "ANTHROPIC_API_KEY" : null;
+          if (keyName && !value(keyName)) return sendJson(res, 400, { ok: false, error: `Enter your ${preference === "openai" ? "OpenAI" : "Anthropic"} API key to continue.` });
           const { createModelProvider } = await import("./model-provider.js");
           // Verify a candidate without changing live credentials or the provider
           // used by existing chats and background jobs. Mobile fallback is off.
@@ -1235,11 +1246,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // i.e. it is the constant false on exactly the exposed installs this is
       // protecting. The Mac tray reads provider/memory out of `status` and DOES
       // send its bearer token (AppState.get), so it keeps the full body.
+      if (method === "GET" && pathname === "/health" && url.searchParams.get("client") === "g2") {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "no-store");
+        return sendJson(res, 200, { service: "openagi", pairing: "even_g2", role: readNodeConfig(dataDir)?.remote ? "node" : "main" });
+      }
       if (method === "GET" && pathname === "/health") {
         const probe = { ok: true, firstRun: isFirstRun() };
         if (checkAuth(req, url, getAuthToken()).ok) probe.status = runtime.status();
         return sendJson(res, 200, probe);
       }
+      if (method === "GET" && pathname === "/getting-started") return sendJson(res, 200, getStartedStatus(runtime));
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
       if (method === "POST" && pathname === "/memory/remember") {
         // Direct memory import (auth-gated) — for migrations from another
@@ -1401,6 +1418,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("cache-control", "no-store");
         return sendJson(res, 201, {
           agentUrl,
+          evenAiUrl: new URL("/nodes/g2/chat/completions", agentUrl).href,
           token: nodeToken,
           node: {
             id: nodeId,
@@ -1957,7 +1975,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // so its platform is checked here.
       if (sharedHistoryRoute) {
         res.setHeader("Cache-Control", "no-store");
-        if (requestNodeId && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestNodeId && !ownerProxyRoute && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
         if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
@@ -1970,9 +1988,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
       }
+      if (method === "POST" && pathname === "/conversations/supervisor/append") {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJsonLimited(req, 64 * 1024);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_messages" });
+        }
+        try {
+          return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
+            conversationId: typeof body.conversationId === "string" ? body.conversationId : "main",
+            messages: body.messages,
+            sourceName: typeof body.sourceName === "string" ? body.sourceName : null,
+            sourceNodeId: typeof body.sourceNodeId === "string" ? body.sourceNodeId : null
+          }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
       if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
         res.setHeader("Cache-Control", "no-store");
-        if (requestNodeId && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
         try {
@@ -2006,7 +2047,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, lifelogPage);
       }
       if (method === "GET" && pathname === "/g2/connect") {
-        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ConnectPage);
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return sendHtml(res, 200, g2ConnectPage);
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -2029,6 +2072,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 200, await g2Proactive.screenContext(nodeId, body.id));
           }
           if (body.op === "answer") return sendG2NodeJson(res, 200, await g2Proactive.answerFleet(nodeId, body));
+          if (body.op === "act-card") return sendG2NodeJson(res, 200, await g2Proactive.actFleetCard(nodeId, body));
           if (body.op === "fleet-status") return sendG2NodeJson(res, 200, g2Proactive.fleetStatus());
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
         } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
@@ -2061,6 +2105,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, question));
           }
           return sendG2NodeJson(res, 200, g2Requests[body.op](requestNodeId, body.id));
+        } catch (error) { return sendG2NodeError(res, error); }
+      }
+      if (method === "POST" && ["/nodes/g2/chat/completions", "/nodes/g2/cues"].includes(pathname)) {
+        if (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        if (!evenAIAgent) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 24 * 1024);
+          if (pathname.endsWith("/chat/completions")) return sendG2NodeJson(res, 200, await evenAIAgent.complete(body, requestNodeId));
+          const consent = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!consent || consent.id !== body?.consentId) return sendG2NodeJson(res, 403, { error: "Start consented lifelog before live cues" });
+          const controller = new AbortController();
+          res.once("close", () => { if (!res.writableEnded) controller.abort(); });
+          const result = await g2LiveCues.suggest(body, requestNodeId, AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]));
+          const current = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!nodeRegistry.authenticate(requestNodeId, scopedBearer) || current?.id !== consent.id) return sendG2NodeJson(res, 403, { error: "Live cue consent ended" });
+          return sendG2NodeJson(res, 200, result);
         } catch (error) { return sendG2NodeError(res, error); }
       }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
@@ -2144,10 +2204,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
+          }
+          if (body.focusedCardId !== undefined && (typeof body.focusedCardId !== "string" || !/^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId))) {
+            return sendJson(res, 400, { error: "focusedCardId must be a valid card id" });
           }
           if (typeof body.text !== "string" || !body.text.trim()
               || body.text.includes("\0") || Buffer.byteLength(body.text, "utf8") > 64 * 1024) {
@@ -2175,8 +2238,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // Shared threads are for paired devices (phones here; a G2 joins
             // through /nodes/g2/experience). Generic nodes, such as the
             // iMessage bridge, stay in their own node-scoped conversations.
-            if (requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "shared threads are for paired phones and G2" });
-            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name)); }
+            if (requestEnrollment?.platform !== MOBILE_PLATFORM && !ownerProxyRoute) return sendJson(res, 403, { error: "shared threads are for paired phones and owner proxies" });
+            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment?.name)); }
             catch (error) {
               if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
               throw error;
@@ -2184,6 +2247,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           } else {
             if (body.conversationId !== undefined) return sendJson(res, 400, { error: "conversationId requires a thread" });
             body = bindScopedNodeMessage(body, requestNodeId);
+          }
+        }
+        // An owner UI such as Paseo joins the same named shared thread as
+        // paired devices. Resolve its identity here, never in the client.
+        if (!requestNodeId && body?.thread !== undefined) {
+          try {
+            const safeFocusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
+              ? body.focusedCardId
+              : undefined;
+            body = {
+              ...body,
+              sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
+              metadata: { ...body.metadata, thread: body.thread, ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}) }
+            };
+          } catch (error) {
+            if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+            throw error;
           }
         }
         // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
@@ -2205,7 +2285,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // decides.)
         const principal = !requestNodeId
           ? (relayedSender(body?.from) ? null : ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner"))
-          : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
+          : ownerProxyRoute ? ownerPrincipal("owner", requestNodeId)
+            : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
         // Opt-in streaming keeps the existing JSON contract untouched. The
         // same auth and Origin gates above protect both forms; this is a direct
         // response stream, not a broadcast that another signed-in client can
@@ -2683,6 +2764,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           + (id === "backlog-triage" ? "?source=main" : "");
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
+        // Optional { input: {...} } overrides the job's input for this run only
+        // (for example { "input": { "apply": true } } on grounded-backfill).
+        // The stored job is unchanged; no body means a normal run.
+        let runInput = null;
+        try {
+          const body = await readJsonLimited(req, 64 * 1024);
+          if (body && typeof body.input === "object" && body.input !== null && !Array.isArray(body.input)) runInput = body.input;
+        } catch {
+          return sendJson(res, 400, { error: "invalid JSON body" });
+        }
 
         // Grace window: a job that finishes fast returns its result inline
         // (what the dashboard wants); anything slower gets a 202 + runId. The
@@ -2690,7 +2781,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const requested = Number.parseInt(url.searchParams.get("wait") ?? "", 10);
         const graceMs = Math.min(Number.isFinite(requested) && requested >= 0 ? requested : 1500, 10_000);
 
-        const started = runtime.cron.runJobNow((j) => runtime.runJobTask(j), id, {
+        const started = runtime.cron.runJobNow((j) => runtime.runJobTask(runInput ? { ...j, input: { ...(j.input ?? {}), ...runInput } } : j), id, {
           source: "manual",
           onTimeout: (timedOutJob, timeoutMs) => {
             events.emit("cron-job-timeout", {
@@ -2828,8 +2919,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/pending-actions") {
         const status = url.searchParams.get("status") || undefined;
+        const surface = url.searchParams.get("surface") || String(req.headers["x-openagi-surface"] ?? "");
+        let actions = runtime.pendingActions?.list({ status }) ?? [];
+        if (surface === "overlay") {
+          const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+          actions = actions.filter((a) => {
+            if (a?.mode !== "chat") return true;
+            const raised = Date.parse(a.raisedAt || a.createdAt || "");
+            return Number.isFinite(raised) && raised >= cutoff;
+          });
+        }
         return sendJson(res, 200, {
-          actions: runtime.pendingActions?.list({ status }) ?? []
+          actions
         });
       }
       if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
@@ -2956,6 +3057,34 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 409, { error: `action already ${decided?.status ?? "claimed"}` });
         }
         return sendJson(res, 200, { id, status: "denied" });
+      }
+      if (method === "POST" && pathname === "/pending-actions/dismiss-all") {
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const body = await readJson(req).catch(() => ({}));
+        const modeFilter = typeof body?.mode === "string" && body.mode ? body.mode : null;
+        const olderThanMs = Number.isFinite(Number(body?.olderThanMs)) && Number(body.olderThanMs) > 0
+          ? Number(body.olderThanMs)
+          : null;
+        const nowMs = Date.now();
+        const reason = typeof body?.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 200) : "dismissed all by user";
+        const pending = runtime.pendingActions?.list({ status: "pending" }) ?? [];
+        let dismissedCount = 0;
+        for (const action of pending) {
+          if (modeFilter && action.mode !== modeFilter) continue;
+          if (olderThanMs !== null) {
+            const ageMs = nowMs - Date.parse(action.raisedAt || action.createdAt || "");
+            if (!Number.isFinite(ageMs) || ageMs < olderThanMs) continue;
+          }
+          const decided = runtime.pendingActions.decide(action.id, {
+            decision: "deny",
+            decidedBy: "user",
+            error: reason
+          });
+          if (decided?.status === "denied") dismissedCount += 1;
+        }
+        return sendJson(res, 200, { ok: true, dismissedCount });
       }
       if (method === "GET" && pathname === "/computer-use/log") {
         if (!runtime.computerUseLog) return sendJson(res, 503, { error: "no computer-use log" });
@@ -4107,6 +4236,9 @@ function acceptsEventStream(req) {
 // owner-approved computer-use lease is inherited.
 function bindSharedThreadMessage(body, requestNodeId, sourceName) {
   const conversationNamespace = createHash("sha256").update(`thread:${body.thread}`, "utf8").digest("base64url");
+  const focusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
+    ? body.focusedCardId
+    : undefined;
   return {
     text: body.text,
     ...(body.attachments?.length ? { attachments: body.attachments } : {}),
@@ -4114,7 +4246,7 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
     sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
-    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread }
+    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread, ...(focusedCardId ? { focusedCardId } : {}) }
   };
 }
 
@@ -4351,7 +4483,7 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/enroll/exchange",
     "/nodes/heartbeat",
     "/nodes/revoke",
-    "/nodes/g2/ask",
+    "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask",
     "/nodes/g2/experience",
     "/nodes/g2/listen",
     "/nodes/g2/speech-token",
@@ -4609,7 +4741,12 @@ async function applyOutreachFeedback(runtime, item, verdict, note = null) {
     resolved = runtime.outcomes.resolve(fresh.id, score, "explicit-rating", resolutionNote);
   }
   if (item.sourceRef?.kind === "suggestion" && runtime.proactiveObserver?.resolve) {
+    // The observer's resolve grades the suggestion itself (accepted / rejected).
     runtime.proactiveObserver.resolve(item.sourceRef.id, verdict === "up" ? "accepted" : "rejected", resolutionNote);
+  } else if (item.sourceRef?.kind === "draft") {
+    runtime.grounded?.onRated?.(runtime.outcomes?.byWorkRef?.("work-draft", item.sourceRef.id), verdict);
+  } else {
+    runtime.grounded?.onRated?.(resolved, verdict);
   }
   return resolved;
 }
@@ -5284,6 +5421,8 @@ const state = {
   }
 };
 
+${isProtectedMemory.toString()}
+${isSavedMemory.toString()}
 const $ = (id) => document.getElementById(id);
 const main = $("main");
 const sidebar = $("sidebar");
@@ -5319,7 +5458,7 @@ async function restoreHistoryLocation() {
   const isCurrent = () => state.historyRestorationGeneration === generation && window.location.search === search;
   const requestedTab = new URLSearchParams(search).get("tab");
   const tab = VALID_TABS.has(requestedTab) ? requestedTab : "chat";
-  await switchTab(tab);
+  await switchTab(tab, { historyMode: "none" });
   if (!isCurrent()) return;
   const session = deepLinkSessionId(search);
   if (tab === "chat" && session) {
@@ -5365,6 +5504,7 @@ function safeLinkHref(rawUrl) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&amp;/g, "&");
+  if (["/fleet", "/setup", "/?tab=coding-agents", "/?tab=memory", "/?tab=get-started", "/?tab=computer-use", "/?tab=nodes"].includes(decoded)) return escapeHtml(decoded);
   let parsed;
   try { parsed = new URL(decoded); } catch (e) { return null; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
@@ -5454,6 +5594,7 @@ function renderMarkdown(input) {
   const blocks = [];
   let paragraph = [];
   let listTag = null;
+  let listStart = 1;
   let listItems = [];
 
   const flushParagraph = () => {
@@ -5463,7 +5604,7 @@ function renderMarkdown(input) {
   };
   const flushList = () => {
     if (!listTag) return;
-    blocks.push("<" + listTag + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
+    blocks.push("<" + listTag + (listTag === "ol" && listStart !== 1 ? ' start="' + listStart + '"' : "") + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
     listTag = null;
     listItems = [];
   };
@@ -5536,13 +5677,14 @@ function renderMarkdown(input) {
     }
 
     const unordered = /^ {0,3}[-*+]\\s+(.*)$/.exec(line);
-    const ordered = /^ {0,3}\\d+[.)]\\s+(.*)$/.exec(line);
+    const ordered = /^ {0,3}(\\d+)[.)]\\s+(.*)$/.exec(line);
     if (unordered || ordered) {
       flushParagraph();
       const nextTag = unordered ? "ul" : "ol";
       if (listTag && listTag !== nextTag) flushList();
+      if (!listTag && ordered) listStart = Math.min(2147483647, Number(ordered[1]));
       listTag = nextTag;
-      listItems.push((unordered ?? ordered)[1]);
+      listItems.push(unordered ? unordered[1] : ordered[2]);
       i += 1;
       continue;
     }
@@ -5715,10 +5857,27 @@ newBtn.addEventListener("click", async () => {
   }
 });
 
-async function switchTab(tab) {
+function showSidebar(yes) {
+  sidebar.style.display = yes ? "" : "none";
+  document.querySelector(".body").classList.toggle("no-sidebar", !yes);
+}
+
+async function switchTab(tab, { historyMode = "push" } = {}) {
   if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
   if (tab !== "activity") state.historyObserver?.disconnect();
   if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
+  const tabUrl = new URL(window.location.href);
+  if (historyMode !== "none" && tabUrl.searchParams.get("tab") !== tab) {
+    tabUrl.searchParams.set("tab", tab);
+    // Initial URL normalization must keep incoming conversation and composer
+    // handoffs. Only a new tab navigation clears the previous tab's handoff.
+    if (historyMode === "push") {
+      for (const key of ["session", "request", "compose", "pending"]) tabUrl.searchParams.delete(key);
+      history.pushState(null, "", tabUrl);
+    } else {
+      history.replaceState(null, "", tabUrl);
+    }
+  }
   state.tab = tab;
   main.dataset.tab = tab;
   $("pageTitle").textContent = document.querySelector('nav button[data-tab="' + tab + '"] span')?.textContent || "Chat";
@@ -5730,17 +5889,12 @@ async function switchTab(tab) {
   closeNavigation();
   syncNodesAutoRefresh();
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  const body = document.querySelector(".body");
-  const showSidebar = (yes) => {
-    sidebar.style.display = yes ? "" : "none";
-    body.classList.toggle("no-sidebar", !yes);
-  };
-
   if (tab === "chat") {
-    showSidebar(true);
+    showSidebar(state.sessions.length > 0);
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
+    if (state.tab !== "chat") return;
     // A bare Chat open should look like chat history, not an unexplained blank
     // composer. Select the newest human-facing session unless the user
     // explicitly pressed + New or a specific ?session= handoff is about to be
@@ -5838,6 +5992,7 @@ async function refreshSessions() {
   // A session refresh can finish after the user has switched to another tab.
   // Keep the cached list current, but never replace another tab's sidebar.
   if (state.tab !== "chat") return sessions;
+  showSidebar(sessions.length > 0);
   sidebarList.innerHTML = "";
   if (sessions.length === 0) {
     sidebarList.innerHTML = '<li class="empty">No sessions yet</li>';
@@ -6262,7 +6417,9 @@ function renderChat() {
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
   updateModelNotice();
-  document.querySelectorAll("[data-starter]").forEach(button => { button.onclick = () => startGettingStartedChat(button.dataset.starter); });
+  document.querySelectorAll("[data-starter]").forEach(button => {
+    button.onclick = () => button.dataset.starter === "agents" ? switchTab("supervisor") : startGettingStartedChat(button.dataset.starter);
+  });
   const input = $("input");
   input.value = state.chatDraft || "";
   try {
@@ -6585,7 +6742,7 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   div.className = "msg " + (runtimeApproval ? "runtime" : msg.role === "user" ? "user" : "assistant");
   const meta = runtimeApproval
     ? "OpenAGI approval"
-    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.role === "user" && /^browser(?:-|$)/.test(msg.from ?? "") ? "You" : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
   const body = msg.role === "assistant" && !runtimeApproval ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
@@ -7250,7 +7407,8 @@ async function renderAgents() {
 async function renderMemory() {
   const snap = await fetchJson("/memory");
   state.memorySnap = snap;
-  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "" };
+  if (!state.memoryFilter) state.memoryFilter = { tier: "all", query: "", view: "saved" };
+  if (!state.memoryFilter.view) state.memoryFilter.view = "saved";
   renderMemoryView();
 }
 
@@ -7261,6 +7419,7 @@ function renderMemoryView() {
   const counts = { short: active(snap.short).length, medium: active(snap.medium).length, long: active(snap.long).length };
   const total = counts.short + counts.medium + counts.long;
   const allActive = [...active(snap.short), ...active(snap.medium), ...active(snap.long)];
+  const savedCount = allActive.filter(isSavedMemory).length;
   const principles = allActive.filter((m) => m.kind === "principle").length;
   const corrections = allActive.filter((m) => m.kind === "correction" || m.locked).length;
   const recalled = allActive.filter((m) => (m.metadata?.recallCount ?? 0) > 0 || (m.lastAccessedAt || "") > (m.lastObservedAt || "")).length;
@@ -7269,9 +7428,17 @@ function renderMemoryView() {
   main.innerHTML = \`
     <div class="pane">
       <div class="row between" style="margin-bottom:14px;align-items:center;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} active · \${principles} principle\${principles===1?"":"s"} · \${corrections} correction\${corrections===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. Corrections are locked and replace stale facts.")}</span></h2>
+        <h2 style="margin:0;">Saved preferences</h2>
+        <span class="muted">\${savedCount} saved facts and preferences</span>
       </div>
+      <p class="muted">What you asked your agent to keep. Update a fact here, then try recalling it in a new chat.</p>
       <div id="memoryPageChat"></div>
+      <div class="memory-views" role="group" aria-label="Memory view">
+        <button type="button" data-memory-view="saved" aria-pressed="\${f.view === 'saved'}">Saved preferences</button>
+        <button type="button" data-memory-view="all" aria-pressed="\${f.view === 'all'}">All active memories</button>
+        <button type="button" data-memory-view="history" aria-pressed="\${f.view === 'history'}">Correction history</button>
+      </div>
+      <details class="memory-diagnostics"><summary>Advanced memory diagnostics</summary>
       <div class="grid stats" style="margin-bottom:14px;">
         <div class="card"><span class="desc">Recall coverage</span><div class="stat-value">\${recallCoverage}%</div><div class="desc">\${recalled} of \${total} active memories have been used</div></div>
         <div class="card"><span class="desc">Corrections locked</span><div class="stat-value">\${corrections}</div><div class="desc">Superseded facts stay hidden from recall</div></div>
@@ -7284,7 +7451,8 @@ function renderMemoryView() {
           <button data-tier="medium" class="\${f.tier==='medium'?'active':''}" title="Day-to-day. Promoted from short-tier when repeated; demoted to long if it sticks.">Medium <span class="count">\${counts.medium}</span></button>
           <button data-tier="long" class="\${f.tier==='long'?'active':''}" title="Lava — durable truths. Raw items + condensed principles that survived multiple reinforcements.">Long <span class="count">\${counts.long}</span></button>
         </div>
-        <input type="search" id="memSearch" placeholder="search content or tags…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
+      </div></details>
+      <div class="row" style="margin-bottom:16px"><input type="search" id="memSearch" aria-label="Search memories" placeholder="Search saved facts…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
       </div>
       <div class="mem-grid" id="memList"></div>
     </div>
@@ -7298,6 +7466,11 @@ function renderMemoryView() {
       renderMemoryView();
     }
   });
+  document.querySelectorAll("[data-memory-view]").forEach(button => button.addEventListener("click", () => {
+    state.memoryFilter.view = button.dataset.memoryView;
+    state.memoryFilter.tier = "all";
+    renderMemoryView();
+  }));
   document.querySelectorAll("[data-tier]").forEach((b) =>
     b.addEventListener("click", () => { state.memoryFilter.tier = b.dataset.tier; renderMemoryView(); })
   );
@@ -7321,7 +7494,8 @@ function fillMemoryGrid() {
   if (f.tier === "all" || f.tier === "short") items = items.concat((snap.short ?? []).map((m) => ({ ...m, _tier: "short" })));
   if (f.tier === "all" || f.tier === "medium") items = items.concat((snap.medium ?? []).map((m) => ({ ...m, _tier: "medium" })));
   if (f.tier === "all" || f.tier === "long") items = items.concat((snap.long ?? []).map((m) => ({ ...m, _tier: "long" })));
-  items = items.filter((m) => !m.metadata?.supersededBy);
+  items = items.filter(m => f.view === "history" ? Boolean(m.metadata?.supersededBy) : !m.metadata?.supersededBy);
+  if (f.view === "saved") items = items.filter(isSavedMemory);
 
   if (f.query) {
     const q = f.query.toLowerCase();
@@ -7334,12 +7508,12 @@ function fillMemoryGrid() {
   items.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 
   if (items.length === 0) {
-    list.innerHTML = '<div class="empty">No memory items match this filter.</div>';
+    list.innerHTML = '<div class="empty">' + (f.view === "saved" && !f.query ? 'No saved preferences yet. Try: “Remember that I prefer short checklists.”' : 'No memory items match this view.') + '</div>';
     return;
   }
 
   list.innerHTML = items.map((m) => {
-    const tags = (m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
+    const tags = (f.view === "saved" ? [] : m.tags || []).slice(0, 6).map((t) => \`<span class="chip">\${escapeHtml(t)}</span>\`).join("");
     const kindBadge = m.kind === "principle" ? '<span class="badge ok">principle</span>' : "";
     const dangerBadge = (m.dangerLevel || 0) > 0.7 ? '<span class="badge err">⚠ danger</span>' : "";
     const scopeBadge = m.scope && m.scope !== "main" ? \`<span class="badge">\${escapeHtml(m.scope)}</span>\` : "";
@@ -7350,14 +7524,12 @@ function fillMemoryGrid() {
     return \`
       <div class="mem-card tier-\${m._tier}" data-memory-id="\${escapeHtml(m.id)}">
         <div class="mem-head">
-          <span class="badge tier-\${m._tier}">\${m._tier}</span>
-          \${kindBadge}\${correctionBadge}\${dangerBadge}\${scopeBadge}\${recallBadge}
-          <span class="badge">str \${(m.strength ?? 0).toFixed(2)}</span>
+          \${f.view === "saved" ? correctionBadge + recallBadge : '<span class="badge">' + m._tier + '</span>' + kindBadge + correctionBadge + dangerBadge + scopeBadge + recallBadge + '<span class="badge">str ' + (m.strength ?? 0).toFixed(2) + '</span>'}
           <span class="mem-age">\${escapeHtml(age)}</span>
         </div>
         <div class="mem-content">\${escapeHtml(m.content || "")}</div>
         \${tags ? \`<div class="mem-tags">\${tags}</div>\` : ""}
-        <div class="mem-actions"><button type="button" data-memory-correct="\${escapeHtml(m.id)}">Correct this memory</button><span class="muted" data-memory-status></span></div>
+        <div class="mem-actions">\${m.metadata?.supersededBy ? '<span class="muted">Replaced by a newer fact · excluded from recall</span>' : '<button type="button" data-memory-correct="' + escapeHtml(m.id) + '">Update this fact</button>'}<span class="muted" role="status" data-memory-status></span></div>
         <form class="mem-correction" data-memory-form="\${escapeHtml(m.id)}" hidden>
           <label class="desc" for="memory-correction-\${escapeHtml(m.id)}">Replace it with the complete corrected fact</label>
           <textarea id="memory-correction-\${escapeHtml(m.id)}" name="correction" required>\${escapeHtml(m.content || "")}</textarea>
@@ -7652,6 +7824,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
       <div class="card">
         <div class="name">Add an Even Realities G2 node</div>
         <div class="desc">The glasses receive their own revocable node identity with voice-input and text-display capabilities only.</div>
+        <div class="desc"><a href="/g2/connect">Use OpenAGI with “Hey Even” in native Even AI →</a></div>
         <div class="row" style="margin-top:10px; gap:8px;">
           <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn">Generate pairing code</button>
           <button class="ui-btn ui-btn-sm" id="g2DirectTokenBtn">Generate agent URL + token</button>
@@ -10175,17 +10348,20 @@ async function refreshAmbientBadge() {
     const apps = ctx.apps?.length ?? 0;
     const snippets = ctx.snippets?.length ?? 0;
     if (apps === 0 && snippets === 0) {
-      host.textContent = "👀 capture idle";
+      host.hidden = true;
+      host.textContent = "No recent screen context";
       host.style.color = "var(--muted)";
       host.style.borderColor = "var(--line)";
     } else {
+      host.hidden = false;
       const topApp = ctx.apps?.[0]?.app?.split(".").pop() ?? "";
       host.textContent = \`👀 \${apps} app\${apps === 1 ? "" : "s"} · \${snippets} snippet\${snippets === 1 ? "" : "s"}\${topApp ? " · " + topApp : ""}\`;
       host.style.color = "var(--accent)";
       host.style.borderColor = "var(--accent)";
     }
   } catch {
-    host.textContent = "👀 capture off";
+    host.hidden = true;
+    host.textContent = "Screen context unavailable";
     host.style.color = "var(--muted)";
     host.style.borderColor = "var(--line)";
   }
@@ -10424,7 +10600,7 @@ const initialTab = (() => {
 const initialSession = deepLinkSessionId(window.location.search);
 const initialRequest = deepLinkRequestId(window.location.search);
 (async () => {
-  await switchTab(initialTab);
+  await switchTab(initialTab, { historyMode: "replace" });
   if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession, initialRequest);
 })();
 </script>
