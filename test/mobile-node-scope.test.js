@@ -75,6 +75,7 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/fleet/api/scan"],
     ["POST", "/fleet/api/mode"],
     ["POST", "/fleet/api/send"],
+    ["POST", "/fleet/api/tasks/claim"],
     ["POST", "/fleet/api/questions/fq_abc-1"],
     ["POST", "/fleet/api/actions/fa_abc-1/send"],
     ["GET", "/fleet/api/threads/antigravity:a1"],

@@ -92,6 +92,7 @@ const EXACT = new Set([
   "POST /fleet/api/route",
   "POST /fleet/api/dispatch",
   "POST /fleet/api/themes/sync",
+  "POST /fleet/api/tasks/claim",
   "POST /fleet/api/sessions/start",
   "POST /fleet/api/cards/batch",
   // The owner's own message to one fleet thread (its chat's reply box).

@@ -23,7 +23,7 @@ import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
-import { buildSupervisorDeck } from "./cards.js";
+import { buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
@@ -986,16 +986,23 @@ export class FleetSupervisor {
     // A read can expire a question too (the /fleet page, the main's refresh)
     // while no tick runs.
     this.closeExpired();
-    const snapshot = this.liveSnapshot(withHealth(store.snapshot), open);
+    const lastTickIso = this.lastTickAt ?? store.snapshot?.at ?? null;
+    const baseTickMs = Number.isFinite(Date.parse(lastTickIso ?? "")) ? Date.parse(lastTickIso) : this.now();
+    const nextTickAt = this.config?.enabled ? new Date(baseTickMs + this.scanIntervalMs).toISOString() : null;
+    const snapshot = this.liveSnapshot(withHealth(store.snapshot), open, { nextTickAt });
     for (const r of snapshot?.threads ?? []) if (r?.key) setBounded(this.knownRows, r.key, r);
     const rows = new Map([...this.knownRows, ...(snapshot?.threads ?? []).map((row) => [row?.key, row])]);
-    const questions = open.map((question) => this.questionView(question, rows));
+    const blockingResolver = (threadKey) => this.runtime?.tasks?.blockingImpactFor?.({ threadKey })
+      ?? { count: 0, blockingTaskIds: [], blockingTitles: [] };
+    const questions = open.map((question) => this.enrichQuestionView(this.questionView(question, rows), rows, blockingResolver));
     const actions = store.actions(50);
+    const activityEvents = this.buildActivityEvents({ open, actions, rows, fixes: store.fixes() });
     const baseState = {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
       running: Boolean(this.running),
-      lastTickAt: this.lastTickAt ?? store.snapshot?.at ?? null,
+      lastTickAt: lastTickIso,
+      nextTickAt,
       lastError: this.lastError,
       snapshot,
       questions,
@@ -1003,6 +1010,7 @@ export class FleetSupervisor {
       // So the owner can reopen a wrong close.
       reviewClosed: store.reviewClosed(),
       actions,
+      activityEvents,
       suggestions: store.suggestions(),
       diagnosis: structuredClone(store.state.diagnosis),
       settings: {
@@ -1038,9 +1046,167 @@ export class FleetSupervisor {
       now: this.now(),
       threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
       prsByKey: this.lastPrs,
-      knownRows: this.knownRows
+      knownRows: this.knownRows,
+      blockingResolver
     });
     return { ...baseState, ...deck };
+  }
+
+  enrichQuestionView(questionView, rows, blockingResolver) {
+    const key = questionView?.threadKey ?? null;
+    const row = key ? rows.get(key) ?? null : null;
+    const thread = key ? (this.lastThreads.get(key) ?? this.knownThreads.get(key) ?? null) : null;
+    const project = deriveCardProject({ project: questionView?.project ?? null, repo: row?.repo ?? thread?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? null }, thread ?? row);
+    const actorLabel = deriveActorLabel(row, thread);
+    const subchannel = deriveSubchannel(row, thread, project);
+    const impact = computeBlockingImpact({
+      threadKey: key,
+      prRef: questionView?.prRef ?? row?.pr?.ref ?? null,
+      branch: row?.branch ?? thread?.branch ?? null,
+      rowsByKey: rows,
+      blockingResolver
+    });
+    const labels = deriveBoardLabels({
+      row,
+      thread,
+      question: questionView,
+      prRef: questionView?.prRef ?? null,
+      ciState: row?.pr?.ci?.state ?? null,
+      subchannel,
+      blockingCount: impact.blockingCount
+    });
+    return {
+      ...questionView,
+      actorLabel,
+      subchannel,
+      labels,
+      blockingCount: impact.blockingCount,
+      blockingSummary: impact.blockingSummary
+    };
+  }
+
+  buildActivityEvents({ open = [], actions = [], rows = new Map(), fixes = [] } = {}) {
+    const events = [];
+    const inferMeta = (threadKey) => {
+      const row = threadKey ? (rows.get(threadKey) ?? this.knownRows.get(threadKey) ?? null) : null;
+      const thread = threadKey ? (this.lastThreads.get(threadKey) ?? this.knownThreads.get(threadKey) ?? null) : null;
+      const project = deriveCardProject({ repo: row?.repo ?? thread?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? null }, thread ?? row);
+      const subchannel = deriveSubchannel(row, thread, project);
+      const actor = deriveActorLabel(row, thread);
+      return { row, thread, project, subchannel, actor };
+    };
+
+    for (const act of actions.slice(0, 20)) {
+      if (!act?.id) continue;
+      const { row, project, subchannel, actor } = inferMeta(act.threadKey ?? null);
+      const prRef = act.prRef ?? row?.pr?.ref ?? null;
+      events.push({
+        id: `act:${act.id}`,
+        kind: act.kind ?? "action",
+        actor: actor || (act.by === "owner" ? "Owner" : "Supervisor"),
+        project,
+        subchannel,
+        title: clampText(redactSecrets(act.playbook ? `${act.kind ?? "action"} · ${act.playbook}` : (act.kind ?? "Supervisor action")), 90),
+        detail: clampText(redactSecrets(act.reason || act.detail || act.message || act.status || "Updated"), 180),
+        threadKey: act.threadKey ?? null,
+        taskId: act.taskId ?? null,
+        prRef,
+        labels: deriveBoardLabels({ row, prRef, ciState: row?.pr?.ci?.state ?? null, subchannel }),
+        at: act.at ?? null
+      });
+    }
+
+    for (const q of open.slice(0, 12)) {
+      const { row, project, subchannel, actor } = inferMeta(q.threadKey ?? null);
+      const prRef = q.prRef ?? row?.pr?.ref ?? null;
+      events.push({
+        id: `q:${q.id}`,
+        kind: "held_question",
+        actor: actor || "Coding agent",
+        project,
+        subchannel,
+        title: clampText(redactSecrets(q.title || "Needs decision"), 90),
+        detail: clampText(redactSecrets(q.body || q.askContext || "Held for owner input"), 180),
+        threadKey: q.threadKey ?? null,
+        taskId: null,
+        prRef,
+        labels: deriveBoardLabels({ row, question: q, prRef, subchannel }),
+        at: q.agentAskedAt ?? q.updatedAt ?? q.createdAt ?? null
+      });
+    }
+
+    for (const fix of (fixes ?? []).slice(0, 8)) {
+      if (!fix?.id) continue;
+      events.push({
+        id: `fix:${fix.id}`,
+        kind: `fix_${fix.state ?? "queued"}`,
+        actor: "Self-fix worker",
+        project: "openAGI",
+        subchannel: "openagi/self-fix",
+        title: clampText(redactSecrets(fix.area ? `Self-fix · ${fix.area}` : "Self-fix"), 90),
+        detail: clampText(redactSecrets(fix.summary || fix.reason || fix.state || "Running"), 180),
+        threadKey: fix.threadKey ?? null,
+        taskId: null,
+        prRef: fix.prRef ?? null,
+        labels: fix.state ? [`state=${String(fix.state).toLowerCase()}`] : [],
+        at: fix.updatedAt ?? fix.createdAt ?? null
+      });
+    }
+
+    const taskStore = this.runtime?.tasks;
+    if (taskStore) {
+      for (const unblocked of (taskStore.recentUnblocks ?? []).slice(-6)) {
+        const t = unblocked?.task;
+        if (!t?.id) continue;
+        events.push({
+          id: `unblock:${t.id}:${unblocked.at ?? ""}`,
+          kind: "task_unblocked",
+          actor: t.sourceMeta?.actor || "Task graph",
+          project: t.sourceMeta?.project || "general",
+          subchannel: t.sourceMeta?.subchannel || null,
+          title: clampText(`Unblocked: ${t.title}`, 90),
+          detail: "All prerequisite tasks completed; moved to pending.",
+          threadKey: t.sourceMeta?.threadKey ?? null,
+          taskId: t.id,
+          prRef: null,
+          labels: Array.isArray(t.tags) ? t.tags.filter((tag) => tag.includes("=")).slice(0, 4) : [],
+          at: unblocked.at ?? t.updatedAt ?? null
+        });
+      }
+      const recentTasks = [...(taskStore.tasks?.values?.() ?? [])]
+        .filter((t) => t?.sourceMeta?.agentLease?.claimedAt || t?.sourceMeta?.threadKey)
+        .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")))
+        .slice(0, 8);
+      for (const t of recentTasks) {
+        const tKey = t.sourceMeta?.threadKey ?? null;
+        const meta = inferMeta(tKey);
+        const leasedAt = t.sourceMeta?.agentLease?.claimedAt ?? null;
+        events.push({
+          id: `task:${t.id}:${t.status}`,
+          kind: t.status === "completed" ? "task_completed" : (leasedAt ? "task_claimed" : "task_linked"),
+          actor: t.sourceMeta?.actor || meta.actor || "Agent",
+          project: t.sourceMeta?.project || meta.project || "general",
+          subchannel: t.sourceMeta?.subchannel || meta.subchannel || null,
+          title: clampText(`${t.status === "completed" ? "Done" : (leasedAt ? "Claimed" : "Task")}: ${t.title}`, 90),
+          detail: t.sourceMeta?.blockedReason || (leasedAt ? "Active agent lease attached to coding thread." : "Linked to coding session."),
+          threadKey: tKey,
+          taskId: t.id,
+          prRef: meta.row?.pr?.ref ?? null,
+          labels: Array.isArray(t.tags) ? t.tags.filter((tag) => tag.includes("=")).slice(0, 4) : [],
+          at: t.completedAt ?? leasedAt ?? t.updatedAt ?? t.createdAt ?? null
+        });
+      }
+    }
+
+    const deduped = [];
+    const seen = new Set();
+    for (const ev of events.sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")))) {
+      if (seen.has(ev.id)) continue;
+      seen.add(ev.id);
+      deduped.push(ev);
+      if (deduped.length >= 30) break;
+    }
+    return deduped;
   }
 
   // The last scan's rows brought up to now. Watching follows the questions
@@ -1048,11 +1214,14 @@ export class FleetSupervisor {
   // "Waiting on you" at once (codex:01a13388 sat there 3 minutes after its
   // only question was dismissed, until the next scan), and a new one puts
   // it in. Each row also says whether the owner muted it, and what opens it.
-  liveSnapshot(snapshot, open) {
+  liveSnapshot(snapshot, open, { nextTickAt = null } = {}) {
     if (!Array.isArray(snapshot?.threads)) return snapshot;
     const askedAt = askTimes(open);
     const closedAt = this.store.closedAtByThread();
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
+    const fallbackNextTick = nextTickAt ?? (this.config?.enabled
+      ? new Date((Number.isFinite(Date.parse(this.lastTickAt ?? snapshot?.at ?? "")) ? Date.parse(this.lastTickAt ?? snapshot.at) : this.now()) + this.scanIntervalMs).toISOString()
+      : null);
     const threads = snapshot.threads.map((row) => {
       if (!row?.key) return row;
       const muted = this.store.mutedUntil(row.key);
@@ -1061,11 +1230,20 @@ export class FleetSupervisor {
       // A snapshot saved before rows carried openChat: this process's read.
       const openChat = row.openChat !== undefined ? row.openChat : openChatFor(this.lastThreads.get(row.key));
       const preview = this.lastItems.get(row.key)?.pushPreview;
-      const thread = this.lastThreads.get(row.key);
+      const thread = this.lastThreads.get(row.key) ?? this.knownThreads.get(row.key);
       const pending = this.store.openQuestions().some((q) => q.threadKey === row.key || (q.threadKeys ?? []).includes(row.key));
       const canPush = preview?.action === "nudge" && preview.message && !muted && !pending
         && !this.ownerAnswerThreads(Infinity).has(row.key) && !repeatsLastSend(thread, this.store.ledgerFor(row.key), preview.messageHash);
+      const actorLabel = row.actorLabel ?? deriveActorLabel(row, thread);
+      const project = deriveCardProject({ repo: row.repo ?? thread?.repo ?? null, workspace: row.workspace ?? thread?.workspace ?? null }, thread ?? row);
+      const subchannel = row.subchannel ?? deriveSubchannel(row, thread, project);
+      const labels = Array.isArray(row.labels) && row.labels.length > 0
+        ? row.labels
+        : deriveBoardLabels({ row: { ...row, watch }, thread, prRef: row.pr?.ref ?? null, ciState: row.pr?.ci?.state ?? null, subchannel });
+      const activeQuietWatch = !muted && (row.live || row.agentStatus === "running" || ["working", "waiting", "push", "you"].includes(watch?.group) || row.pr?.state === "OPEN");
+      const nextCheckAt = activeQuietWatch ? fallbackNextTick : null;
       return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
+        actorLabel, subchannel, labels, nextCheckAt,
         pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
     });
     return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.length } };
@@ -2072,6 +2250,104 @@ export class FleetSupervisor {
     return startPaseoSession(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
   }
 
+  async claimTask({
+    taskId = null,
+    title = null,
+    description = "",
+    workspace = null,
+    cwd = null,
+    serverId = null,
+    provider = null,
+    model = null,
+    effort = null,
+    prompt = null,
+    project = null,
+    subchannel = null,
+    labels = null,
+    dependsOn = null,
+    priority = 70,
+    images = null
+  } = {}) {
+    const taskStore = this.runtime?.tasks;
+    if (!taskStore) throw new Error("Task store is not available.");
+
+    let task = taskId ? taskStore.get(taskId) : null;
+    if (taskId && !task) throw new Error("No task with that id.");
+    const cleanTitle = String(title ?? task?.title ?? "").trim();
+    if (!cleanTitle || cleanTitle.length > 300) {
+      throw new Error("Task title must be 1-300 characters.");
+    }
+
+    if (!task) {
+      task = taskStore.add({
+        title: cleanTitle,
+        description: String(description ?? "").trim(),
+        bucket: "today",
+        priority,
+        ...(Array.isArray(dependsOn) ? { dependsOn } : {}),
+        ...(labels ? { labels } : {}),
+        project: project || workspace || null,
+        subchannel: subchannel || null
+      }, { source: "supervisor", queue: "agent" });
+    } else if (task.queue !== "agent" && typeof taskStore.setQueue === "function") {
+      task = taskStore.setQueue(task.id, "agent") ?? task;
+    }
+
+    const sessionPrompt = String(prompt ?? "").trim()
+      || (task.description ? `${task.title}\n\n${task.description}` : task.title);
+    const session = await this.startPaseoSession({
+      workspace: workspace || project || task.sourceMeta?.project || null,
+      cwd: cwd || null,
+      serverId: serverId || null,
+      title: task.title,
+      provider: provider || null,
+      model: model || null,
+      effort: effort || null,
+      ...(images ? { images } : {}),
+      prompt: sessionPrompt.slice(0, 4000)
+    });
+
+    const nowMs = this.now();
+    const leaseMs = Number(taskStore.leaseMs) > 0 ? Number(taskStore.leaseMs) : 30 * MIN;
+    const prevAttempts = Number(task.sourceMeta?.agentLease?.attempts ?? 0);
+    const attempts = Number.isFinite(prevAttempts) ? prevAttempts + 1 : 1;
+    const actor = [session.provider || provider, session.model || model]
+      .filter((v) => typeof v === "string" && v.trim())
+      .join(" · ")
+      || "paseo";
+    const resolvedProject = project || session.workspace || deriveCardProject({ workspace: session.workspace }, { cwd: session.cwd });
+
+    const updatedTask = taskStore.update(task.id, {
+      status: "in_progress",
+      ...(labels ? { labels } : {}),
+      sourceMeta: {
+        ...(task.sourceMeta ?? {}),
+        threadKey: session.key,
+        project: resolvedProject || null,
+        subchannel: subchannel || task.sourceMeta?.subchannel || null,
+        actor,
+        agentLease: {
+          claimedAt: new Date(nowMs).toISOString(),
+          expiresAt: new Date(nowMs + leaseMs).toISOString(),
+          attempts
+        }
+      }
+    }) ?? task;
+
+    this.store?.recordAction?.({
+      kind: "task-claim",
+      playbook: "board-claim-task",
+      threadKey: session.key,
+      taskId: updatedTask.id,
+      route: "paseo-create",
+      status: "sent",
+      by: "owner",
+      reason: clampText(`Claimed task "${updatedTask.title}" in ${session.workspace || session.cwd || "Paseo"}`, 240)
+    });
+    this.emitFleet("task-claimed");
+    return { task: updatedTask, session };
+  }
+
   async batchActCards(options = {}) {
     return batchActCards(this, options);
   }
@@ -2563,8 +2839,20 @@ export class FleetSupervisor {
         }
       } : null);
     if (!thread) return null;
-    try { return await readThreadConversation(thread, this.config); }
-    catch { return unavailableConversation(thread); }
+    const row = state.snapshot?.threads?.find((r) => r?.key === threadKey) ?? this.knownRows.get(threadKey) ?? null;
+    const assistantActor = deriveActorLabel(row, thread);
+    const annotate = (conv) => {
+      if (!conv || !Array.isArray(conv.messages)) return conv;
+      return {
+        ...conv,
+        messages: conv.messages.map((m) => ({
+          ...m,
+          actor: m.actor ?? (m.role === "assistant" ? assistantActor : (String(m.text ?? "").startsWith(SUPERVISOR_PREFIX) ? "Supervisor" : "You"))
+        }))
+      };
+    };
+    try { return annotate(await readThreadConversation(thread, this.config)); }
+    catch { return annotate(unavailableConversation(thread)); }
   }
 
   threadDetail(threadKey) {

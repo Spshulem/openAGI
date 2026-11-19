@@ -271,6 +271,45 @@ export function createFleetRoute({ supervisor } = {}) {
           return fail(400, String(err?.message ?? "Could not inspect repository.").slice(0, 200));
         }
       }
+      if (parts.length === 2 && parts[0] === "tasks" && parts[1] === "claim") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.claimTask !== "function") {
+          return fail(503, "Claiming tasks into coding sessions is not available.");
+        }
+        const body = await readObject(readBody);
+        const taskId = typeof body?.taskId === "string" ? body.taskId.trim() : "";
+        const title = typeof body?.title === "string" ? body.title.trim() : "";
+        if (!taskId && (!title || title.length > 300)) {
+          return fail(400, "Pass taskId or a title of 1-300 characters.");
+        }
+        if (taskId && !ID_PATTERN.test(taskId)) {
+          return fail(400, "Bad taskId.");
+        }
+        const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
+        if (prompt.length > 4000) return fail(400, "prompt must be up to 4000 characters.");
+        try {
+          const claimed = await supervisor.claimTask({
+            taskId: taskId || null,
+            title: title || null,
+            description: typeof body?.description === "string" ? body.description.trim().slice(0, 4000) : "",
+            workspace: typeof body?.workspace === "string" && body.workspace.trim() ? body.workspace.trim().slice(0, 160) : null,
+            cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim().slice(0, 400) : null,
+            serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
+            project: typeof body?.project === "string" && body.project.trim() ? body.project.trim().slice(0, 120) : null,
+            subchannel: typeof body?.subchannel === "string" && body.subchannel.trim() ? body.subchannel.trim().slice(0, 120) : null,
+            provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim().slice(0, 80) : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
+            labels: body?.labels ?? null,
+            dependsOn: Array.isArray(body?.dependsOn) ? body.dependsOn.filter((id) => typeof id === "string" && ID_PATTERN.test(id)).slice(0, 20) : null,
+            ...(Array.isArray(body?.images) ? { images: body.images } : {}),
+            prompt: prompt || null
+          });
+          return ok({ task: claimed.task, session: claimed.session, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Could not claim task into Paseo session.").slice(0, 220));
+        }
+      }
       if (parts.length === 2 && parts[0] === "sessions" && parts[1] === "start") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (typeof supervisor.startPaseoSession !== "function") {

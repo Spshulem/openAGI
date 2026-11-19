@@ -1,3 +1,4 @@
+import SupervisorChannelsKit
 import SwiftUI
 
 struct FleetConversationView: View {
@@ -16,6 +17,16 @@ struct FleetConversationView: View {
                 Text(SupervisorFormat.name(thread))
                     .font(Theme.Typography.section)
                     .foregroundStyle(Theme.ink)
+                if thread.actorLabel != nil || thread.nextCheckAt != nil {
+                    HStack(spacing: 6) {
+                        if let actor = thread.actorLabel, !actor.isEmpty {
+                            BoardActorPill(actor: actor)
+                        }
+                        if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
+                            BoardQuietCheckPill(label: check)
+                        }
+                    }
+                }
                 if let conversation = detail?.conversation {
                     if let reason = conversation.unavailableReason {
                         Text(reason).font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
@@ -26,11 +37,15 @@ struct FleetConversationView: View {
                     ForEach(conversation.messages) { message in
                         VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
                             HStack {
-                                Text(message.role == "user" ? "You" : "Agent")
+                                BoardActorPill(
+                                    actor: message.actor ?? (message.role == "user" ? "You" : (thread.actorLabel ?? "Agent")),
+                                    isOwner: message.role == "user"
+                                )
                                 Spacer()
                                 if let at = message.at { Text(at, format: .dateTime.month(.abbreviated).day().hour().minute()) }
                             }
                             .font(Theme.Typography.caption).foregroundStyle(Theme.muted)
+                            BoardMilestoneStrip(milestones: SupervisorMilestoneParser.parse(from: message.text))
                             MarkdownContent(blocks: MarkdownParser.parse(message.text))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -47,11 +62,15 @@ struct FleetConversationView: View {
                     ForEach(fallbackMessages) { message in
                         VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
                             HStack {
-                                Text(message.role == "user" ? "You" : "Agent")
+                                BoardActorPill(
+                                    actor: message.role == "user" ? "You" : (thread.actorLabel ?? "Agent"),
+                                    isOwner: message.role == "user"
+                                )
                                 Spacer()
                                 if let at = message.at { Text(at, format: .dateTime.month(.abbreviated).day().hour().minute()) }
                             }
                             .font(Theme.Typography.caption).foregroundStyle(Theme.muted)
+                            BoardMilestoneStrip(milestones: SupervisorMilestoneParser.parse(from: message.text))
                             MarkdownContent(blocks: MarkdownParser.parse(message.text))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)

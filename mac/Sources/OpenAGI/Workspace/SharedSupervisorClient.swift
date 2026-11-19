@@ -412,13 +412,59 @@ private struct SupervisorStreamFailure: Decodable {
   let error: String?
 }
 
+struct MacTaskLease: Decodable, Equatable, Sendable {
+  let claimedAt: String?
+  let expiresAt: String?
+  let attempts: Int?
+}
+
+struct MacTaskSourceMeta: Decodable, Equatable, Sendable {
+  let threadKey: String?
+  let project: String?
+  let subchannel: String?
+  let actor: String?
+  let blockedReason: String?
+  let agentLease: MacTaskLease?
+
+  private enum CodingKeys: String, CodingKey {
+    case threadKey, project, subchannel, actor, blockedReason, agentLease
+  }
+
+  init(threadKey: String? = nil, project: String? = nil, subchannel: String? = nil,
+       actor: String? = nil, blockedReason: String? = nil, agentLease: MacTaskLease? = nil) {
+    self.threadKey = threadKey
+    self.project = project
+    self.subchannel = subchannel
+    self.actor = actor
+    self.blockedReason = blockedReason
+    self.agentLease = agentLease
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try? decoder.container(keyedBy: CodingKeys.self)
+    threadKey = (try? c?.decodeIfPresent(String.self, forKey: .threadKey)) ?? nil
+    project = (try? c?.decodeIfPresent(String.self, forKey: .project)) ?? nil
+    subchannel = (try? c?.decodeIfPresent(String.self, forKey: .subchannel)) ?? nil
+    actor = (try? c?.decodeIfPresent(String.self, forKey: .actor)) ?? nil
+    blockedReason = (try? c?.decodeIfPresent(String.self, forKey: .blockedReason)) ?? nil
+    agentLease = (try? c?.decodeIfPresent(MacTaskLease.self, forKey: .agentLease)) ?? nil
+  }
+}
+
 struct MacTaskItem: Identifiable, Decodable, Equatable, Sendable {
   let id: String
+  let queue: String?
   let title: String
+  let description: String?
   let status: String
   let priority: Int?
   let dueAt: String?
   let notes: String?
+  let tags: [String]?
+  let dependsOn: [String]?
+  let sourceMeta: MacTaskSourceMeta?
+  let updatedAt: String?
+  let completedAt: String?
 }
 
 private struct SyncedHistoryResponse: Decodable {
@@ -444,6 +490,7 @@ final class SharedSupervisorClient: ObservableObject {
 
   @Published private(set) var messages: [SyncedSupervisorMessage] = []
   @Published private(set) var tasks: [MacTaskItem] = []
+  @Published private(set) var allTasks: [MacTaskItem] = []
   @Published private(set) var isSending = false
   @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
   @Published private(set) var streamingReplyText: String? = nil
@@ -621,19 +668,33 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   func refreshTasks() async {
-    var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
-      path: "/tasks?queue=user"))
-    authed(&req)
-    req.timeoutInterval = 8
-    do {
-      let (data, response) = try await URLSession.shared.data(for: req)
-      try AppState.ensureOK(response, data)
-      let decoded = try JSONDecoder().decode(TasksListResponse.self, from: data)
-      tasks = decoded.tasks.filter { $0.status != "done" && $0.status != "completed" }
-    } catch {
-      // Non-fatal while daemon starts up.
+    func fetchQueue(_ queue: String) async -> [MacTaskItem] {
+      var req = URLRequest(url: AppState.buildURL(
+        base: AppState.shared.baseURL,
+        path: "/tasks?queue=\(queue)&limit=100"))
+      authed(&req)
+      req.timeoutInterval = 8
+      do {
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try AppState.ensureOK(response, data)
+        return try JSONDecoder().decode(TasksListResponse.self, from: data).tasks
+      } catch {
+        return []
+      }
     }
+
+    async let userTasks = fetchQueue("user")
+    async let agentTasks = fetchQueue("agent")
+    let combined = await (userTasks + agentTasks)
+    guard !combined.isEmpty || tasks.isEmpty else { return }
+    var seen = Set<String>()
+    let deduped = combined.filter { seen.insert($0.id).inserted }
+    let active = deduped.filter { !["done", "completed", "cancelled"].contains($0.status.lowercased()) }
+    let done = deduped
+      .filter { ["done", "completed", "cancelled"].contains($0.status.lowercased()) }
+      .prefix(30)
+    tasks = active
+    allTasks = active + done
   }
 
   @discardableResult
@@ -860,19 +921,119 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   func createTask(title: String) async {
+    await createBoardTask(title: title, startSession: false)
+  }
+
+  @discardableResult
+  func createBoardTask(
+    title: String,
+    description: String = "",
+    project: String? = nil,
+    subchannel: String? = nil,
+    labels: [String] = [],
+    startSession: Bool = false,
+    workspace: String? = nil,
+    cwd: String? = nil,
+    model: String? = nil,
+    effort: String? = nil
+  ) async -> Bool {
     let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
-    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/tasks"))
-    req.httpMethod = "POST"
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+    guard !trimmed.isEmpty else { return false }
+    lastError = nil
+
+    if startSession {
+      var body: [String: Any] = [
+        "title": trimmed,
+        "prompt": description.isEmpty ? trimmed : description
+      ]
+      if !description.isEmpty { body["description"] = description }
+      if let project, !project.isEmpty { body["project"] = project }
+      if let subchannel, !subchannel.isEmpty { body["subchannel"] = subchannel }
+      if !labels.isEmpty { body["labels"] = labels }
+      if let workspace, !workspace.isEmpty { body["workspace"] = workspace }
+      if let cwd, !cwd.isEmpty { body["cwd"] = cwd }
+      if let model, !model.isEmpty { body["model"] = model }
+      if let effort, !effort.isEmpty { body["effort"] = effort }
+
+      var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/fleet/api/tasks/claim"))
+      req.httpMethod = "POST"
+      req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+      req.timeoutInterval = 45
+      authed(&req)
+      do {
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try AppState.ensureOK(response, data)
+        await refreshTasks()
+        await FleetConsumer.shared.refresh()
+        return true
+      } catch {
+        lastError = error.localizedDescription
+        return false
+      }
+    }
+
+    var body: [String: Any] = [
       "title": trimmed,
       "queue": "user",
       "source": "supervisor"
-    ])
+    ]
+    if !description.isEmpty { body["description"] = description }
+    if let project, !project.isEmpty { body["project"] = project }
+    if let subchannel, !subchannel.isEmpty { body["subchannel"] = subchannel }
+    if !labels.isEmpty { body["labels"] = labels }
+    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/tasks"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     authed(&req)
-    _ = try? await URLSession.shared.data(for: req)
-    await refreshTasks()
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      await refreshTasks()
+      return true
+    } catch {
+      lastError = error.localizedDescription
+      return false
+    }
+  }
+
+  @discardableResult
+  func claimTaskInPaseo(
+    _ task: MacTaskItem,
+    workspace: String? = nil,
+    model: String? = nil,
+    effort: String? = nil
+  ) async -> String? {
+    lastError = nil
+    var body: [String: Any] = ["taskId": task.id]
+    if let ws = workspace ?? task.sourceMeta?.project, !ws.isEmpty { body["workspace"] = ws }
+    if let proj = task.sourceMeta?.project, !proj.isEmpty { body["project"] = proj }
+    if let sub = task.sourceMeta?.subchannel, !sub.isEmpty { body["subchannel"] = sub }
+    if let model, !model.isEmpty { body["model"] = model }
+    if let effort, !effort.isEmpty { body["effort"] = effort }
+
+    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/fleet/api/tasks/claim"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    req.timeoutInterval = 45
+    authed(&req)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      await refreshTasks()
+      await FleetConsumer.shared.refresh()
+      if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let sess = obj["session"] as? [String: Any],
+         let key = sess["key"] as? String {
+        return key
+      }
+      return nil
+    } catch {
+      lastError = error.localizedDescription
+      return nil
+    }
   }
 
   func completeTask(_ id: String) async {

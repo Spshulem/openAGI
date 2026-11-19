@@ -1,3 +1,4 @@
+import SupervisorChannelsKit
 import SwiftUI
 
 /// One "Needs you" question or "In progress" thread, opened from its row:
@@ -258,14 +259,15 @@ struct FleetConversationList: View {
   }
 
   private func messageView(_ message: FleetConversationMessage) -> some View {
-    VStack(alignment: .leading, spacing: 1) {
+    let milestones = SupervisorMilestoneParser.parse(from: message.text)
+    return VStack(alignment: .leading, spacing: 3) {
       HStack(spacing: 4) {
-        Text(message.speaker).font(.system(size: 10, weight: .semibold))
-          .foregroundStyle(message.isOwner ? Color.accentColor : Color.secondary)
+        WorkspaceActorPill(actor: message.displaySpeaker, isOwner: message.isOwner)
         if let at = message.at.flatMap(FleetWatching.parseDate) {
           Text(FleetThreadSummary.ago(at, now: Date())).font(.system(size: 9)).foregroundStyle(.tertiary)
         }
       }
+      WorkspaceMilestoneStrip(milestones: milestones)
       WorkspaceMarkdownContent(
         blocks: WorkspaceMarkdownParser.parse(FleetThreadSummary.tail(message.text, Self.shownCharacters)),
         bodyFont: .system(size: 11),
