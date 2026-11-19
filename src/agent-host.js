@@ -284,10 +284,17 @@ export class AgentHost {
       ? {
           untrusted: contextUntrusted,
           intent: ownerIntentText(text),
-          previousAssistantText: lastAssistantMsg ? String(lastAssistantMsg.content).slice(-1200) : "",
           ...(supervisorAutoApprove ? { supervisorAutoApprove: true } : {}),
         }
       : null;
+    if (turnState) {
+      Object.defineProperty(turnState, "previousAssistantText", {
+        value: lastAssistantMsg ? String(lastAssistantMsg.content).slice(-1200) : "",
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
     let confirmation = null;
     if (principal && !ephemeral) {
       if (principal.via === "voice") {

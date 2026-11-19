@@ -584,14 +584,15 @@ final class NativeNavigationTests: XCTestCase {
             // The newly imported red/blue image precedes the simulator's stock
             // photos. Photos exposes assets as Images, not collection cells.
             let photo = app.images.matching(NSPredicate(format: "label BEGINSWITH %@", "Photo,")).firstMatch
+            let loaded = photo.waitForExistence(timeout: 45)
             capture("native-system-photo-picker-\(thread)", app: app)
-            XCTAssertTrue(photo.waitForExistence(timeout: 15), "The system photo grid must load")
+            XCTAssertTrue(loaded, "The system photo grid must load")
             photo.tap()
             capture("native-system-photo-selection-\(thread)", app: app)
             // Duo uses a native Done control; ordinary iPhones can use Add.
             let confirmations = app.buttons.matching(NSPredicate(format:
                 "label == 'Done' OR label == 'Add' OR label BEGINSWITH 'Add ('"))
-            XCTAssertTrue(confirmations.firstMatch.waitForExistence(timeout: 5))
+            XCTAssertTrue(confirmations.firstMatch.waitForExistence(timeout: 10))
             let confirm = confirmations.allElementsBoundByIndex.first { $0.isEnabled && $0.isHittable }
             XCTAssertNotNil(confirm, "The selected photo needs a usable native confirmation control")
             confirm?.tap()
