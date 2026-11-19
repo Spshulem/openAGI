@@ -69,4 +69,27 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertEqual(SkillName.slug("  --grocery__list-- "), "grocery-list")
         XCTAssertEqual(SkillName.slug("!!!"), "")
     }
+
+    func testSupervisorCardDecodesSuggestionPlan() throws {
+        let json = """
+        {
+          "id": "card:fq_1",
+          "questionId": "fq_1",
+          "kind": "suggestion",
+          "headline": "Needs owner answer before acting",
+          "options": ["Answer question", "Review plan", "Not now", "Never"],
+          "plan": {
+            "remedy": "clarification",
+            "label": "Clarify retry backoff",
+            "nextAction": "Should automated retries cap backoff at 60s?",
+            "acceptance": "Cap retry delay at 60s."
+          }
+        }
+        """
+        let card = try ProtocolDecoder.json.decode(SupervisorCard.self, from: Data(json.utf8))
+        XCTAssertEqual(card.plan?.remedy, "clarification")
+        XCTAssertEqual(card.plan?.label, "Clarify retry backoff")
+        XCTAssertEqual(card.plan?.nextAction, "Should automated retries cap backoff at 60s?")
+        XCTAssertEqual(card.plan?.acceptance, "Cap retry delay at 60s.")
+    }
 }

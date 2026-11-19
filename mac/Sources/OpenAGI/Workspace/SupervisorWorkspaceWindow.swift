@@ -111,13 +111,25 @@ struct SupervisorWorkspaceView: View {
   @State private var pasteKeyMonitor: Any?
 
   @State private var expandedQuestionIDs: Set<String> = []
+  @State private var revealedPlanQuestionIDs: Set<String> = []
   @State private var expandedThreadKeys: Set<String> = []
   @State private var threadReplyText: [String: String] = [:]
   @State private var threadReplyImages: [String: [WorkspaceImageAttachment]] = [:]
+  @State private var threadReplyQueues: [String: [QueuedSupervisorMessage]] = [:]
   @State private var threadReplyBusy: Set<String> = []
   @State private var threadReplyFeedback: [String: FleetNote] = [:]
   @State private var threadAttachPopoverSlot: String? = nil
   @FocusState private var focusedThreadSlot: String?
+
+  @State private var showNewSessionCreator = false
+  @State private var newSessionWorkspace = ""
+  @State private var newSessionModel = "gpt-5.4"
+  @State private var newSessionEffort = "medium"
+  @State private var newSessionTitle = ""
+  @State private var newSessionPrompt = ""
+  @State private var newSessionImages: [WorkspaceImageAttachment] = []
+  @State private var isStartingSession = false
+  @State private var newSessionNote: FleetNote? = nil
 
   private var activeChannel: WorkspaceChannel {
     nav.selectedChannel ?? .general
@@ -790,13 +802,14 @@ struct SupervisorWorkspaceView: View {
 
   @ViewBuilder
   private var sessionsStage: some View {
+    newSessionBar(defaultWorkspace: nil)
     let filtered = sessionBriefs.filter { matchesQuery([$0.title, $0.project, $0.host, $0.cwd]) }
     if filtered.isEmpty {
       VStack(spacing: WorkspaceTheme.Spacing.x2) {
         Text(trimmedQuery.isEmpty ? "No coding sessions loaded." : "No sessions matching \"\(trimmedQuery)\".")
           .font(WorkspaceTheme.Typography.body.weight(.medium))
           .foregroundStyle(WorkspaceTheme.ink)
-        Text("Press Scan in the toolbar to discover active Paseo, Conductor, or Codex threads.")
+        Text("Press Scan in the toolbar to discover active Paseo, Conductor, or Codex threads, or start a new one above.")
           .font(WorkspaceTheme.Typography.secondary)
           .foregroundStyle(WorkspaceTheme.muted)
       }
@@ -811,6 +824,168 @@ struct SupervisorWorkspaceView: View {
       }
       ForEach(runningFirst) { session in
         sessionCardView(session, showProjectTag: true)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func newSessionBar(defaultWorkspace: String?) -> some View {
+    VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
+      HStack {
+        Text(defaultWorkspace.map { "New Session in #\($0)" } ?? "Start Paseo Session")
+          .font(WorkspaceTheme.Typography.section)
+          .foregroundStyle(WorkspaceTheme.ink)
+        Spacer()
+        WorkspaceActionButton(prominent: !showNewSessionCreator, small: true) {
+          withAnimation(.easeOut(duration: 0.16)) {
+            showNewSessionCreator.toggle()
+          }
+          if showNewSessionCreator {
+            if let defaultWorkspace, newSessionWorkspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              newSessionWorkspace = defaultWorkspace
+            }
+            newSessionNote = nil
+            Task { await fleet.loadWorkspaces() }
+          }
+        } label: {
+          Label(showNewSessionCreator ? "Close" : "+ New Session", systemImage: showNewSessionCreator ? "xmark" : "plus.circle.fill")
+        }
+      }
+
+      if let note = newSessionNote {
+        FleetNoteRow(note: note) { newSessionNote = nil }
+      }
+
+      if showNewSessionCreator {
+        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+          HStack(spacing: WorkspaceTheme.Spacing.x2) {
+            TextField("Workspace (blank = auto-pick active)", text: $newSessionWorkspace)
+              .textFieldStyle(.roundedBorder)
+              .font(WorkspaceTheme.Typography.secondary)
+
+            if !fleet.workspaces.isEmpty {
+              Menu("Pick Workspace") {
+                Button("Auto-select active workspace") { newSessionWorkspace = defaultWorkspace ?? "" }
+                Divider()
+                ForEach(fleet.workspaces) { ws in
+                  Button(ws.name) { newSessionWorkspace = ws.name }
+                }
+              }
+              .font(WorkspaceTheme.Typography.caption)
+            }
+          }
+
+          HStack(spacing: WorkspaceTheme.Spacing.x3) {
+            Picker("Model", selection: $newSessionModel) {
+              Text("GPT-5.4").tag("gpt-5.4")
+              Text("GPT-6.2 Sol").tag("gpt-6.2-sol")
+              Text("Claude Sonnet 4.6").tag("claude-sonnet-4-6")
+              Text("Claude Opus 4.7").tag("claude-opus-4-7")
+            }
+            .pickerStyle(.menu)
+            .frame(maxWidth: 220)
+
+            Picker("Effort", selection: $newSessionEffort) {
+              Text("Low").tag("low")
+              Text("Medium").tag("medium")
+              Text("High").tag("high")
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 220)
+          }
+
+          TextField("Optional session title", text: $newSessionTitle)
+            .textFieldStyle(.roundedBorder)
+            .font(WorkspaceTheme.Typography.secondary)
+
+          TextField("What should the Paseo coding session work on?", text: $newSessionPrompt, axis: .vertical)
+            .textFieldStyle(.roundedBorder)
+            .font(WorkspaceTheme.Typography.secondary)
+            .lineLimit(2...6)
+
+          if !newSessionImages.isEmpty {
+            attachmentStrip(newSessionImages) { removeId in
+              newSessionImages.removeAll { $0.id == removeId }
+            }
+          }
+
+          HStack(spacing: WorkspaceTheme.Spacing.x2) {
+            Button {
+              let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - newSessionImages.count))
+              appendAttachments(picked, to: &newSessionImages)
+            } label: {
+              Label("Attach Photo", systemImage: "photo.on.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isStartingSession || newSessionImages.count >= 4)
+
+            Button {
+              let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - newSessionImages.count))
+              if pasted.isEmpty {
+                newSessionNote = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
+              } else {
+                appendAttachments(pasted, to: &newSessionImages)
+              }
+            } label: {
+              Label("Paste Image", systemImage: "doc.on.clipboard")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isStartingSession || newSessionImages.count >= 4)
+
+            Spacer()
+
+            let canLaunch = !isStartingSession
+              && (!newSessionPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !newSessionImages.isEmpty)
+            WorkspaceActionButton(prominent: true, small: false) {
+              Task {
+                isStartingSession = true
+                defer { isStartingSession = false }
+                let rawWs = newSessionWorkspace.trimmingCharacters(in: .whitespacesAndNewlines)
+                let chosenWs = rawWs.isEmpty ? defaultWorkspace : rawWs
+                let matched = chosenWs.flatMap { name in
+                  fleet.workspaces.first {
+                    $0.name.caseInsensitiveCompare(name) == .orderedSame
+                      || $0.id.caseInsensitiveCompare(name) == .orderedSame
+                  }
+                }
+                let res = await fleet.startWorkspaceSession(
+                  workspace: chosenWs,
+                  cwd: matched?.defaultTarget?.cwd,
+                  serverId: matched?.defaultTarget?.serverId,
+                  title: newSessionTitle,
+                  model: newSessionModel,
+                  effort: newSessionEffort,
+                  prompt: newSessionPrompt,
+                  images: newSessionImages.map(\.fleetPayload)
+                )
+                newSessionNote = FleetNote(text: res.message, isError: !res.ok)
+                if res.ok {
+                  newSessionTitle = ""
+                  newSessionPrompt = ""
+                  newSessionImages = []
+                  showNewSessionCreator = false
+                  if let tk = res.threadKey {
+                    expandedThreadKeys.insert(tk)
+                  }
+                }
+              }
+            } label: {
+              if isStartingSession {
+                HStack(spacing: 6) {
+                  ProgressView().controlSize(.small)
+                  Text("Starting…")
+                }
+              } else {
+                Text("Start in Paseo")
+              }
+            }
+            .disabled(!canLaunch)
+          }
+        }
+        .padding(WorkspaceTheme.Spacing.x4)
+        .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
       }
     }
   }
@@ -850,6 +1025,8 @@ struct SupervisorWorkspaceView: View {
         }
       }
     }
+
+    newSessionBar(defaultWorkspace: projName)
 
     let projSessions = projectSessionsAll.filter { matchesQuery([$0.title, $0.host, $0.cwd]) }
     if projSessions.isEmpty {
@@ -912,6 +1089,16 @@ struct SupervisorWorkspaceView: View {
           }
         }
         Spacer()
+        if let tk = q.threadKey, !tk.isEmpty {
+          WorkspaceActionButton(small: true) {
+            nav.selectedChannel = .sessions
+            expandedThreadKeys.insert(tk)
+            Task { await fleet.loadDetail(tk) }
+          } label: {
+            Text("View Session")
+          }
+          .help("Jump to this coding session's live transcript and composer")
+        }
         if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
           WorkspaceActionButton(small: true) {
             fleet.openChat(chat)
@@ -928,20 +1115,82 @@ struct SupervisorWorkspaceView: View {
       }
 
       if !q.body.isEmpty {
-        Text(q.body)
-          .font(WorkspaceTheme.Typography.secondary)
-          .foregroundStyle(WorkspaceTheme.muted)
-          .textSelection(.enabled)
+        WorkspaceMarkdownContent(
+          blocks: WorkspaceMarkdownParser.parse(q.body),
+          bodyFont: WorkspaceTheme.Typography.secondary,
+          textColor: WorkspaceTheme.muted
+        )
+      }
+
+      if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
+        VStack(alignment: .leading, spacing: 4) {
+          Text(q.isClarificationQuestion ? "Question to unblock" : "Next step")
+            .font(WorkspaceTheme.Typography.caption.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.live)
+          WorkspaceMarkdownContent(
+            blocks: WorkspaceMarkdownParser.parse(nextAction),
+            bodyFont: WorkspaceTheme.Typography.secondary,
+            textColor: WorkspaceTheme.ink
+          )
+          if let answered = q.clarificationAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answered.isEmpty {
+            Text("Your answer: \(answered)")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+        .padding(WorkspaceTheme.Spacing.x3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WorkspaceTheme.live.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+      }
+
+      if revealedPlanQuestionIDs.contains(q.id), let plan = q.plan {
+        VStack(alignment: .leading, spacing: 6) {
+          Text(plan.label ?? "Fix Plan")
+            .font(WorkspaceTheme.Typography.caption.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.ink)
+          if let acceptance = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acceptance.isEmpty {
+            Text("Acceptance: \(acceptance)")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          if let issueTitle = plan.issueDraft?.title?.trimmingCharacters(in: .whitespacesAndNewlines), !issueTitle.isEmpty {
+            Text("Issue: \(issueTitle)")
+              .font(WorkspaceTheme.Typography.caption.weight(.medium))
+              .foregroundStyle(WorkspaceTheme.ink)
+          }
+          if let issueBody = plan.issueDraft?.body?.trimmingCharacters(in: .whitespacesAndNewlines), !issueBody.isEmpty {
+            WorkspaceMarkdownContent(
+              blocks: WorkspaceMarkdownParser.parse(issueBody),
+              bodyFont: WorkspaceTheme.Typography.caption,
+              textColor: WorkspaceTheme.muted
+            )
+          }
+        }
+        .padding(WorkspaceTheme.Spacing.x3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
       }
 
       HStack(spacing: WorkspaceTheme.Spacing.x2) {
         ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { index, opt in
+          let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
           WorkspaceActionButton(prominent: index == 0 && !q.risky, small: true) {
-            Task { await fleet.answer(q, option: opt) }
+            if opt == "Answer question" {
+              expandedQuestionIDs.insert(q.id)
+              focusedThreadSlot = slotKey
+            } else if opt == "Review plan", q.plan != nil {
+              if revealedPlanQuestionIDs.contains(q.id) {
+                revealedPlanQuestionIDs.remove(q.id)
+              } else {
+                revealedPlanQuestionIDs.insert(q.id)
+              }
+            } else {
+              Task { await fleet.answer(q, option: opt) }
+            }
           } label: {
             Text(q.label(for: opt))
           }
-          .disabled(busy)
+          .disabled(busy && !handlesLocally)
         }
 
         Button("Ask Supervisor") {
@@ -975,10 +1224,11 @@ struct SupervisorWorkspaceView: View {
             Text("Agent context")
               .font(WorkspaceTheme.Typography.caption.weight(.semibold))
               .foregroundStyle(WorkspaceTheme.muted)
-            Text(context)
-              .font(WorkspaceTheme.Typography.secondary)
-              .foregroundStyle(WorkspaceTheme.ink)
-              .textSelection(.enabled)
+            WorkspaceMarkdownContent(
+              blocks: WorkspaceMarkdownParser.parse(context),
+              bodyFont: WorkspaceTheme.Typography.secondary,
+              textColor: WorkspaceTheme.ink
+            )
               .padding(WorkspaceTheme.Spacing.x3)
               .frame(maxWidth: .infinity, alignment: .leading)
               .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -998,7 +1248,9 @@ struct SupervisorWorkspaceView: View {
 
         directThreadComposer(
           slotKey: slotKey,
-          placeholder: "Reply directly to this session…",
+          placeholder: q.isClarificationQuestion
+            ? "Type your answer to unblock this plan…"
+            : "Reply directly to this session…",
           onRefresh: q.threadKey.map { tk in { Task { await fleet.loadDetail(tk) } } }
         ) { text, payloadImages in
           await fleet.sendWorkspaceQuestionReply(q, message: text, images: payloadImages)
@@ -1128,12 +1380,38 @@ struct SupervisorWorkspaceView: View {
       set: { threadReplyText[slotKey] = $0 }
     )
     let attached = threadReplyImages[slotKey] ?? []
+    let queued = threadReplyQueues[slotKey] ?? []
     let isBusy = threadReplyBusy.contains(slotKey)
     let hasTextOrPhoto = !(threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attached.isEmpty
 
     VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
       if let note = threadReplyFeedback[slotKey] {
         FleetNoteRow(note: note) { threadReplyFeedback[slotKey] = nil }
+      }
+      if !queued.isEmpty {
+        queuedMessagesTray(
+          items: queued,
+          onEdit: { id in
+            guard var list = threadReplyQueues[slotKey],
+                  let idx = list.firstIndex(where: { $0.id == id }) else { return }
+            let popped = list.remove(at: idx)
+            threadReplyQueues[slotKey] = list.isEmpty ? nil : list
+            if (threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              threadReplyText[slotKey] = popped.text
+            } else {
+              threadReplyText[slotKey] = (threadReplyText[slotKey] ?? "") + "\n" + popped.text
+            }
+            if !popped.attachments.isEmpty {
+              appendAttachments(popped.attachments, to: &threadReplyImages[slotKey, default: []])
+            }
+            focusedThreadSlot = slotKey
+          },
+          onRemove: { id in
+            guard var list = threadReplyQueues[slotKey] else { return }
+            list.removeAll { $0.id == id }
+            threadReplyQueues[slotKey] = list.isEmpty ? nil : list
+          }
+        )
       }
       if !attached.isEmpty {
         attachmentStrip(attached) { removeId in
@@ -1159,7 +1437,7 @@ struct SupervisorWorkspaceView: View {
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .disabled(isBusy || attached.count >= 4)
+        .disabled(attached.count >= 4)
         .help("Attach or paste up to 4 images")
         .popover(isPresented: attachPopoverBinding, arrowEdge: .top) {
           VStack(alignment: .leading, spacing: 4) {
@@ -1201,7 +1479,6 @@ struct SupervisorWorkspaceView: View {
           .font(WorkspaceTheme.Typography.secondary)
           .lineLimit(1...4)
           .focused($focusedThreadSlot, equals: slotKey)
-          .disabled(isBusy)
           .onChange(of: draft.wrappedValue) { _, newValue in
             let remaining = max(0, 4 - (threadReplyImages[slotKey]?.count ?? 0))
             guard remaining > 0 else { return }
@@ -1231,7 +1508,7 @@ struct SupervisorWorkspaceView: View {
         Button {
           sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
         } label: {
-          if isBusy {
+          if isBusy && !hasTextOrPhoto {
             ProgressView().controlSize(.small)
               .frame(width: 26, height: 26)
           } else {
@@ -1246,7 +1523,8 @@ struct SupervisorWorkspaceView: View {
           }
         }
         .buttonStyle(.plain)
-        .disabled(isBusy || !hasTextOrPhoto)
+        .disabled(!hasTextOrPhoto)
+        .help(isBusy ? "Queue next reply" : "Send reply")
       }
       .padding(.horizontal, 10)
       .padding(.vertical, 6)
@@ -1280,23 +1558,84 @@ struct SupervisorWorkspaceView: View {
     if !extracted.attachments.isEmpty {
       rawText = extracted.cleanedText
       appendAttachments(extracted.attachments, to: &imgs)
-      threadReplyText[slotKey] = rawText
-      threadReplyImages[slotKey] = imgs
     }
     let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty || !imgs.isEmpty else { return }
-    guard !threadReplyBusy.contains(slotKey) else { return }
     let effectiveText = text.isEmpty ? "Please inspect the attached image(s)." : text
-    threadReplyBusy.insert(slotKey)
+    threadReplyText[slotKey] = ""
+    threadReplyImages[slotKey] = []
     threadReplyFeedback[slotKey] = nil
-    let payloads = imgs.map(\.fleetPayload)
+
+    if threadReplyBusy.contains(slotKey) {
+      threadReplyQueues[slotKey, default: []].append(
+        QueuedSupervisorMessage(id: "tq-\(UUID().uuidString)", text: effectiveText, focusedCardId: nil, attachments: imgs)
+      )
+      return
+    }
+
+    threadReplyBusy.insert(slotKey)
     Task {
-      let note = await onSubmitReply(effectiveText, payloads)
-      threadReplyBusy.remove(slotKey)
-      threadReplyFeedback[slotKey] = note
-      if !note.isError {
-        threadReplyText[slotKey] = ""
-        threadReplyImages[slotKey] = []
+      defer { threadReplyBusy.remove(slotKey) }
+      var currentText = effectiveText
+      var currentImgs = imgs
+      var isInitial = true
+      while true {
+        let note = await onSubmitReply(currentText, currentImgs.map(\.fleetPayload))
+        threadReplyFeedback[slotKey] = note
+        if isInitial, note.isError {
+          if (threadReplyText[slotKey] ?? "").isEmpty { threadReplyText[slotKey] = currentText }
+          if (threadReplyImages[slotKey] ?? []).isEmpty && !currentImgs.isEmpty { threadReplyImages[slotKey] = currentImgs }
+        }
+        isInitial = false
+        guard var queue = threadReplyQueues[slotKey], !queue.isEmpty else { break }
+        let next = queue.removeFirst()
+        threadReplyQueues[slotKey] = queue.isEmpty ? nil : queue
+        currentText = next.text
+        currentImgs = next.attachments
+      }
+    }
+  }
+
+  @ViewBuilder
+  private func queuedMessagesTray(
+    items: [QueuedSupervisorMessage],
+    onEdit: @escaping (String) -> Void,
+    onRemove: @escaping (String) -> Void
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      Text("Queued (\(items.count))")
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(WorkspaceTheme.muted)
+      ForEach(items) { item in
+        HStack(spacing: 8) {
+          Image(systemName: "clock")
+            .font(.caption2)
+            .foregroundStyle(WorkspaceTheme.live)
+          Text(item.text)
+            .font(WorkspaceTheme.Typography.caption)
+            .foregroundStyle(WorkspaceTheme.ink)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+          if !item.attachments.isEmpty {
+            Text("\(item.attachments.count) img")
+              .font(.caption2)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          Button("Edit") { onEdit(item.id) }
+            .buttonStyle(.borderless)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(WorkspaceTheme.live)
+          Button { onRemove(item.id) } label: {
+            Image(systemName: "xmark")
+              .font(.caption2.weight(.semibold))
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          .buttonStyle(.plain)
+          .help("Remove from queue")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
       }
     }
   }
@@ -1463,6 +1802,27 @@ struct SupervisorWorkspaceView: View {
         .padding(.horizontal, 10)
       }
 
+      if !supervisor.queuedMessages.isEmpty {
+        queuedMessagesTray(
+          items: supervisor.queuedMessages,
+          onEdit: { id in
+            guard let popped = supervisor.popQueuedForEdit(id: id) else { return }
+            if composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              composerText = popped.text
+            } else {
+              composerText += "\n" + popped.text
+            }
+            if !popped.attachments.isEmpty {
+              appendAttachments(popped.attachments, to: &composerImages)
+            }
+            composerFocused = true
+          },
+          onRemove: { id in
+            supervisor.removeQueued(id: id)
+          }
+        )
+      }
+
       if !composerImages.isEmpty {
         attachmentStrip(composerImages) { removeId in
           composerImages.removeAll { $0.id == removeId }
@@ -1484,7 +1844,7 @@ struct SupervisorWorkspaceView: View {
 
   private var floatingPillBar: some View {
     let trimmed = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-    let canSend = !supervisor.isSending && (!trimmed.isEmpty || !composerImages.isEmpty)
+    let canSend = !trimmed.isEmpty || !composerImages.isEmpty
     let isMultiline = composerText.contains("\n") || composerText.count > 72
 
     return HStack(alignment: isMultiline ? .bottom : .center, spacing: 8) {
@@ -1502,7 +1862,7 @@ struct SupervisorWorkspaceView: View {
           .contentShape(Circle())
       }
       .buttonStyle(.plain)
-      .disabled(supervisor.isSending || composerImages.count >= 4)
+      .disabled(composerImages.count >= 4)
       .help("Attach or paste up to 4 images")
       .popover(isPresented: $showAttachPopover, arrowEdge: .top) {
         VStack(alignment: .leading, spacing: 4) {
@@ -1545,7 +1905,6 @@ struct SupervisorWorkspaceView: View {
         .font(WorkspaceTheme.Typography.chatBody)
         .lineLimit(1...6)
         .focused($composerFocused)
-        .disabled(supervisor.isSending)
         .padding(.vertical, 7)
         .onChange(of: composerText) { _, newValue in
           let remaining = max(0, 4 - composerImages.count)
@@ -1589,7 +1948,7 @@ struct SupervisorWorkspaceView: View {
         sendFromWorkspace()
       } label: {
         Group {
-          if supervisor.isSending {
+          if supervisor.isSending && !canSend {
             ProgressView()
               .controlSize(.small)
           } else {
@@ -1606,7 +1965,7 @@ struct SupervisorWorkspaceView: View {
       }
       .buttonStyle(.plain)
       .disabled(!canSend)
-      .help("Send to Supervisor")
+      .help(supervisor.isSending ? "Queue message for Supervisor" : "Send to Supervisor")
     }
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
@@ -1784,14 +2143,14 @@ struct SupervisorWorkspaceView: View {
     }
     if let slot = focusedThreadSlot {
       let current = threadReplyImages[slot] ?? []
-      guard !threadReplyBusy.contains(slot), current.count < 4 else { return event }
+      guard current.count < 4 else { return event }
       let pasted = WorkspaceImageAttachment.pasteboardImagesForCommandV(limit: 4 - current.count)
       guard !pasted.isEmpty else { return event }
       appendAttachments(pasted, to: &threadReplyImages[slot, default: []])
       threadReplyFeedback[slot] = nil
       return nil
     }
-    guard !supervisor.isSending, composerImages.count < 4 else { return event }
+    guard composerImages.count < 4 else { return event }
     let pasted = WorkspaceImageAttachment.pasteboardImagesForCommandV(limit: 4 - composerImages.count)
     guard !pasted.isEmpty else { return event }
     appendAttachments(pasted, to: &composerImages)

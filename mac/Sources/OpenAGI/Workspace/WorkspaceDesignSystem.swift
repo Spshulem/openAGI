@@ -149,6 +149,9 @@ enum WorkspaceMarkdownBlock: Equatable {
   case heading(level: Int, text: String)
   case bulletList([String])
   case numberedList([String])
+  case blockquote(String)
+  case thematicBreak
+  case table(headers: [String], rows: [[String]])
   case codeBlock(language: String?, code: String)
 }
 
@@ -193,11 +196,46 @@ enum WorkspaceMarkdownParser {
         continue
       }
 
+      if let parsedTable = parseTable(from: lines, startIndex: index) {
+        flushParagraph()
+        flushList()
+        blocks.append(.table(headers: parsedTable.headers, rows: parsedTable.rows))
+        index = parsedTable.nextIndex
+        continue
+      }
+
       if let heading = headingText(line) {
         flushParagraph()
         flushList()
         blocks.append(.heading(level: heading.level, text: heading.text))
         index += 1
+        continue
+      }
+
+      if isThematicBreak(line) {
+        flushParagraph()
+        flushList()
+        blocks.append(.thematicBreak)
+        index += 1
+        continue
+      }
+
+      if line.hasPrefix(">") {
+        flushParagraph()
+        flushList()
+        var quoteLines: [String] = []
+        while index < lines.count {
+          let trimmedQuote = lines[index].trimmingCharacters(in: .whitespaces)
+          guard trimmedQuote.hasPrefix(">") else { break }
+          var body = trimmedQuote.dropFirst()
+          if body.first == " " { body = body.dropFirst() }
+          quoteLines.append(String(body))
+          index += 1
+        }
+        let joinedQuote = quoteLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !joinedQuote.isEmpty {
+          blocks.append(.blockquote(joinedQuote))
+        }
         continue
       }
 
@@ -234,6 +272,83 @@ enum WorkspaceMarkdownParser {
     flushParagraph()
     flushList()
     return blocks
+  }
+
+  private static func isThematicBreak(_ line: String) -> Bool {
+    guard !line.isEmpty else { return false }
+    let compact = line.filter { !$0.isWhitespace }
+    guard compact.count >= 3, let marker = compact.first, marker == "-" || marker == "*" || marker == "_" else {
+      return false
+    }
+    return compact.allSatisfy { $0 == marker }
+  }
+
+  private static func parseTable(from lines: [String], startIndex: Int) -> (headers: [String], rows: [[String]], nextIndex: Int)? {
+    guard startIndex + 1 < lines.count else { return nil }
+    let headerRaw = lines[startIndex].trimmingCharacters(in: .whitespaces)
+    let sepRaw = lines[startIndex + 1].trimmingCharacters(in: .whitespaces)
+    guard headerRaw.contains("|"), sepRaw.contains("|") else { return nil }
+    let headers = parseTableCells(headerRaw)
+    let separators = parseTableCells(sepRaw)
+    guard !headers.isEmpty, headers.count == separators.count, separators.allSatisfy(isSeparatorCell) else {
+      return nil
+    }
+    var rows: [[String]] = []
+    var idx = startIndex + 2
+    while idx < lines.count {
+      let rowLine = lines[idx].trimmingCharacters(in: .whitespaces)
+      guard !rowLine.isEmpty,
+            rowLine.contains("|"),
+            !rowLine.hasPrefix("```"),
+            !isThematicBreak(rowLine),
+            headingText(rowLine) == nil else {
+        break
+      }
+      var cells = parseTableCells(rowLine)
+      if cells.count < headers.count {
+        cells.append(contentsOf: Array(repeating: "", count: headers.count - cells.count))
+      } else if cells.count > headers.count {
+        cells = Array(cells.prefix(headers.count))
+      }
+      rows.append(cells)
+      idx += 1
+    }
+    return (headers, rows, idx)
+  }
+
+  private static func isSeparatorCell(_ cell: String) -> Bool {
+    let trimmed = cell.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return false }
+    var slice = trimmed[...]
+    if slice.first == ":" { slice = slice.dropFirst() }
+    if slice.last == ":" { slice = slice.dropLast() }
+    return !slice.isEmpty && slice.allSatisfy { $0 == "-" }
+  }
+
+  private static func parseTableCells(_ raw: String) -> [String] {
+    var content = raw.trimmingCharacters(in: .whitespaces)
+    if content.hasPrefix("|") { content.removeFirst() }
+    if content.hasSuffix("|"), !content.hasSuffix("\\|") { content.removeLast() }
+    var cells: [String] = []
+    var current = ""
+    var escaped = false
+    for ch in content {
+      if escaped {
+        if ch != "|" { current.append("\\") }
+        current.append(ch)
+        escaped = false
+      } else if ch == "\\" {
+        escaped = true
+      } else if ch == "|" {
+        cells.append(current.trimmingCharacters(in: .whitespaces))
+        current.removeAll(keepingCapacity: true)
+      } else {
+        current.append(ch)
+      }
+    }
+    if escaped { current.append("\\") }
+    cells.append(current.trimmingCharacters(in: .whitespaces))
+    return cells
   }
 
   private static func headingText(_ line: String) -> (level: Int, text: String)? {
@@ -328,6 +443,8 @@ struct WorkspaceCodeBlockView: View {
 
 struct WorkspaceMarkdownContent: View {
   let blocks: [WorkspaceMarkdownBlock]
+  var bodyFont: Font = WorkspaceTheme.Typography.chatBody
+  var textColor: Color = WorkspaceTheme.ink
 
   var body: some View {
     VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
@@ -344,13 +461,13 @@ struct WorkspaceMarkdownContent: View {
     switch block {
     case let .paragraph(raw):
       Text(WorkspaceMarkdownParser.inline(raw))
-        .font(WorkspaceTheme.Typography.chatBody)
-        .foregroundStyle(WorkspaceTheme.ink)
+        .font(bodyFont)
+        .foregroundStyle(textColor)
         .textSelection(.enabled)
     case let .heading(level, raw):
       Text(WorkspaceMarkdownParser.inline(raw))
-        .font(level <= 2 ? WorkspaceTheme.Typography.section : WorkspaceTheme.Typography.chatBody.weight(.semibold))
-        .foregroundStyle(WorkspaceTheme.ink)
+        .font(level <= 2 ? WorkspaceTheme.Typography.section : bodyFont.weight(.semibold))
+        .foregroundStyle(textColor)
         .textSelection(.enabled)
         .padding(.top, 2)
     case let .bulletList(items):
@@ -365,6 +482,24 @@ struct WorkspaceMarkdownContent: View {
           listRow(marker: "\(index + 1).", raw: item)
         }
       }
+    case let .blockquote(raw):
+      HStack(alignment: .top, spacing: WorkspaceTheme.Spacing.x2) {
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+          .fill(WorkspaceTheme.live.opacity(0.6))
+          .frame(width: 3)
+        Text(WorkspaceMarkdownParser.inline(raw))
+          .font(bodyFont)
+          .foregroundStyle(textColor.opacity(0.9))
+          .textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+      .padding(.vertical, 2)
+    case .thematicBreak:
+      WorkspaceHairline(leadingInset: 0)
+        .padding(.vertical, 4)
+    case let .table(headers, rows):
+      WorkspaceMarkdownTableView(headers: headers, rows: rows, bodyFont: bodyFont, textColor: textColor)
     case let .codeBlock(language, code):
       WorkspaceCodeBlockView(language: language, code: code)
     }
@@ -373,15 +508,76 @@ struct WorkspaceMarkdownContent: View {
   private func listRow(marker: String, raw: String) -> some View {
     HStack(alignment: .top, spacing: WorkspaceTheme.Spacing.x2) {
       Text(marker)
-        .font(WorkspaceTheme.Typography.chatBody)
+        .font(bodyFont)
         .foregroundStyle(WorkspaceTheme.muted)
       Text(WorkspaceMarkdownParser.inline(raw))
-        .font(WorkspaceTheme.Typography.chatBody)
-        .foregroundStyle(WorkspaceTheme.ink)
+        .font(bodyFont)
+        .foregroundStyle(textColor)
         .textSelection(.enabled)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
     .fixedSize(horizontal: false, vertical: true)
+  }
+}
+
+private struct WorkspaceMarkdownTableView: View {
+  let headers: [String]
+  let rows: [[String]]
+  let bodyFont: Font
+  let textColor: Color
+
+  var body: some View {
+    ScrollView(.horizontal, showsIndicators: true) {
+      Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+        GridRow {
+          ForEach(Array(headers.enumerated()), id: \.offset) { colIndex, header in
+            Text(WorkspaceMarkdownParser.inline(header))
+              .font(bodyFont.weight(.semibold))
+              .foregroundStyle(textColor)
+              .textSelection(.enabled)
+              .padding(.horizontal, 10)
+              .padding(.vertical, 7)
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .overlay(alignment: .trailing) {
+                if colIndex + 1 < headers.count {
+                  Rectangle().fill(WorkspaceTheme.edge).frame(width: 0.5)
+                }
+              }
+          }
+        }
+        .background(WorkspaceTheme.edge.opacity(0.45))
+
+        ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+          GridRow {
+            ForEach(0..<headers.count, id: \.self) { colIndex in
+              let cell = colIndex < row.count ? row[colIndex] : ""
+              Text(WorkspaceMarkdownParser.inline(cell))
+                .font(bodyFont)
+                .foregroundStyle(textColor)
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .trailing) {
+                  if colIndex + 1 < headers.count {
+                    Rectangle().fill(WorkspaceTheme.edge).frame(width: 0.5)
+                  }
+                }
+            }
+          }
+          .background(rowIndex.isMultiple(of: 2) ? Color.clear : WorkspaceTheme.edge.opacity(0.18))
+          .overlay(alignment: .top) {
+            Rectangle().fill(WorkspaceTheme.edge).frame(height: 0.5)
+          }
+        }
+      }
+      .background(WorkspaceTheme.surfaceFill)
+      .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+      .overlay(
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .strokeBorder(WorkspaceTheme.edge, lineWidth: 0.5)
+      )
+    }
   }
 }

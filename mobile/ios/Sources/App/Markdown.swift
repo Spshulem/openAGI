@@ -19,15 +19,15 @@ public enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case bulletList([String])
     case numberedList([String])
+    case blockquote(String)
+    case thematicBreak
+    case table(headers: [String], rows: [[String]])
     case codeBlock(language: String?, code: String)
 }
 
 public enum MarkdownParser {
-    // Line-based block splitter. Deliberately simple: this is chat prose
-    // from one model, not arbitrary CommonMark input, so it covers exactly
-    // what DESIGN.md asks for -- paragraphs, fenced code, and the two list
-    // styles -- rather than the full spec (block quotes, tables, nested
-    // lists, setext headings, etc).
+    // Line-based block splitter covering paragraphs, headings, lists,
+    // blockquotes, thematic breaks, GFM pipe tables, and fenced code blocks.
     public static func parse(_ text: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         let lines = text.components(separatedBy: "\n")
@@ -67,11 +67,46 @@ public enum MarkdownParser {
                 continue
             }
 
+            if let parsedTable = parseTable(from: lines, startIndex: index) {
+                flushParagraph()
+                flushList()
+                blocks.append(.table(headers: parsedTable.headers, rows: parsedTable.rows))
+                index = parsedTable.nextIndex
+                continue
+            }
+
             if let heading = headingText(line) {
                 flushParagraph()
                 flushList()
                 blocks.append(.heading(level: heading.level, text: heading.text))
                 index += 1
+                continue
+            }
+
+            if isThematicBreak(line) {
+                flushParagraph()
+                flushList()
+                blocks.append(.thematicBreak)
+                index += 1
+                continue
+            }
+
+            if line.hasPrefix(">") {
+                flushParagraph()
+                flushList()
+                var quoteLines: [String] = []
+                while index < lines.count {
+                    let trimmedQuote = lines[index].trimmingCharacters(in: .whitespaces)
+                    guard trimmedQuote.hasPrefix(">") else { break }
+                    var body = trimmedQuote.dropFirst()
+                    if body.first == " " { body = body.dropFirst() }
+                    quoteLines.append(String(body))
+                    index += 1
+                }
+                let joinedQuote = quoteLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !joinedQuote.isEmpty {
+                    blocks.append(.blockquote(joinedQuote))
+                }
                 continue
             }
 
@@ -107,6 +142,83 @@ public enum MarkdownParser {
         flushParagraph()
         flushList()
         return blocks
+    }
+
+    private static func isThematicBreak(_ line: String) -> Bool {
+        guard !line.isEmpty else { return false }
+        let compact = line.filter { !$0.isWhitespace }
+        guard compact.count >= 3, let marker = compact.first, marker == "-" || marker == "*" || marker == "_" else {
+            return false
+        }
+        return compact.allSatisfy { $0 == marker }
+    }
+
+    private static func parseTable(from lines: [String], startIndex: Int) -> (headers: [String], rows: [[String]], nextIndex: Int)? {
+        guard startIndex + 1 < lines.count else { return nil }
+        let headerRaw = lines[startIndex].trimmingCharacters(in: .whitespaces)
+        let sepRaw = lines[startIndex + 1].trimmingCharacters(in: .whitespaces)
+        guard headerRaw.contains("|"), sepRaw.contains("|") else { return nil }
+        let headers = parseTableCells(headerRaw)
+        let separators = parseTableCells(sepRaw)
+        guard !headers.isEmpty, headers.count == separators.count, separators.allSatisfy(isSeparatorCell) else {
+            return nil
+        }
+        var rows: [[String]] = []
+        var idx = startIndex + 2
+        while idx < lines.count {
+            let rowLine = lines[idx].trimmingCharacters(in: .whitespaces)
+            guard !rowLine.isEmpty,
+                  rowLine.contains("|"),
+                  !rowLine.hasPrefix("```"),
+                  !isThematicBreak(rowLine),
+                  headingText(rowLine) == nil else {
+                break
+            }
+            var cells = parseTableCells(rowLine)
+            if cells.count < headers.count {
+                cells.append(contentsOf: Array(repeating: "", count: headers.count - cells.count))
+            } else if cells.count > headers.count {
+                cells = Array(cells.prefix(headers.count))
+            }
+            rows.append(cells)
+            idx += 1
+        }
+        return (headers, rows, idx)
+    }
+
+    private static func isSeparatorCell(_ cell: String) -> Bool {
+        let trimmed = cell.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        var slice = trimmed[...]
+        if slice.first == ":" { slice = slice.dropFirst() }
+        if slice.last == ":" { slice = slice.dropLast() }
+        return !slice.isEmpty && slice.allSatisfy { $0 == "-" }
+    }
+
+    private static func parseTableCells(_ raw: String) -> [String] {
+        var content = raw.trimmingCharacters(in: .whitespaces)
+        if content.hasPrefix("|") { content.removeFirst() }
+        if content.hasSuffix("|"), !content.hasSuffix("\\|") { content.removeLast() }
+        var cells: [String] = []
+        var current = ""
+        var escaped = false
+        for ch in content {
+            if escaped {
+                if ch != "|" { current.append("\\") }
+                current.append(ch)
+                escaped = false
+            } else if ch == "\\" {
+                escaped = true
+            } else if ch == "|" {
+                cells.append(current.trimmingCharacters(in: .whitespaces))
+                current.removeAll(keepingCapacity: true)
+            } else {
+                current.append(ch)
+            }
+        }
+        if escaped { current.append("\\") }
+        cells.append(current.trimmingCharacters(in: .whitespaces))
+        return cells
     }
 
     private static func headingText(_ line: String) -> (level: Int, text: String)? {
@@ -210,6 +322,25 @@ struct MarkdownContent: View {
                     listRow(marker: "\(index + 1).", raw: item)
                 }
             }
+        case .blockquote(let raw):
+            HStack(alignment: .top, spacing: Theme.Spacing.x2) {
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(Theme.live.opacity(0.65))
+                    .frame(width: 3)
+                Text(MarkdownParser.inline(raw))
+                    .font(chatFont)
+                    .foregroundStyle(Theme.ink.opacity(0.9))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.vertical, 2)
+        case .thematicBreak:
+            Rectangle()
+                .fill(Theme.edge)
+                .frame(height: 1)
+                .padding(.vertical, 4)
+        case .table(let headers, let rows):
+            MarkdownTableView(headers: headers, rows: rows, font: chatFont)
         case .codeBlock(_, let code):
             CodeBlockView(code: code)
         }
@@ -227,5 +358,63 @@ struct MarkdownContent: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct MarkdownTableView: View {
+    let headers: [String]
+    let rows: [[String]]
+    let font: Font
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: true) {
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    ForEach(Array(headers.enumerated()), id: \.offset) { colIndex, header in
+                        Text(MarkdownParser.inline(header))
+                            .font(font.weight(.semibold))
+                            .foregroundStyle(Theme.ink)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .overlay(alignment: .trailing) {
+                                if colIndex + 1 < headers.count {
+                                    Rectangle().fill(Theme.edge).frame(width: 1)
+                                }
+                            }
+                    }
+                }
+                .background(Theme.edge.opacity(0.45))
+
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                    GridRow {
+                        ForEach(0..<headers.count, id: \.self) { colIndex in
+                            let cell = colIndex < row.count ? row[colIndex] : ""
+                            Text(MarkdownParser.inline(cell))
+                                .font(font)
+                                .foregroundStyle(Theme.ink)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .overlay(alignment: .trailing) {
+                                    if colIndex + 1 < headers.count {
+                                        Rectangle().fill(Theme.edge).frame(width: 1)
+                                    }
+                                }
+                        }
+                    }
+                    .background(rowIndex.isMultiple(of: 2) ? Color.clear : Theme.edge.opacity(0.18))
+                    .overlay(alignment: .top) {
+                        Rectangle().fill(Theme.edge).frame(height: 1)
+                    }
+                }
+            }
+            .background(Theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(Theme.edge, lineWidth: 1)
+            )
+        }
     }
 }

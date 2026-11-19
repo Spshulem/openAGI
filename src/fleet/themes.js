@@ -801,6 +801,9 @@ export async function dispatchManagerGoal(
     serverId = null,
     cwd = null,
     provider = null,
+    model = null,
+    effort = null,
+    modeId = null,
     images = null,
     factory = null,
     decisionsFetch = null,
@@ -1070,6 +1073,9 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        model,
+        effort,
+        modeId,
         images,
         factory
       })
@@ -1080,6 +1086,9 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        model,
+        effort,
+        modeId,
         images,
         factory
       }));

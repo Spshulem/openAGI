@@ -1118,10 +1118,67 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
   };
 }
 
-async function resolvePaseoProviderSpec(api, cwd, requestedProvider = null) {
-  const raw = typeof requestedProvider === "string" ? requestedProvider.trim() : "";
-  if (raw && raw.includes("/")) return raw;
-  const preferredFamily = (raw || "codex").toLowerCase();
+function tokenizeMatchQuery(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function normalizeEffortId(raw) {
+  const clean = String(raw ?? "").trim().toLowerCase();
+  if (!clean) return null;
+  if (clean === "med") return "medium";
+  if (clean === "maximum") return "max";
+  return clean;
+}
+
+function matchThinkingOptionId(modelObj, effort) {
+  const norm = normalizeEffortId(effort);
+  if (!norm) return null;
+  const opts = Array.isArray(modelObj?.thinkingOptions) ? modelObj.thinkingOptions : [];
+  if (opts.length === 0) return norm;
+  const aliases = norm === "max" ? ["max", "xhigh", "high"]
+    : norm === "xhigh" ? ["xhigh", "max", "high"]
+      : [norm];
+  for (const candidate of aliases) {
+    const exact = opts.find((o) => String(o?.id ?? "").toLowerCase() === candidate
+      || String(o?.label ?? "").toLowerCase() === candidate);
+    if (exact?.id) return exact.id;
+  }
+  const fuzzy = opts.find((o) => {
+    const hay = `${o?.id ?? ""} ${o?.label ?? ""}`.toLowerCase();
+    return aliases.some((a) => hay.includes(a));
+  });
+  return fuzzy?.id ?? norm;
+}
+
+export async function resolvePaseoAgentConfig(api, cwd, {
+  provider = null,
+  model = null,
+  effort = null,
+  modeId = null
+} = {}) {
+  const rawProv = typeof provider === "string" ? provider.trim() : "";
+  const rawModel = typeof model === "string" ? model.trim() : "";
+  const KNOWN_PROVIDERS = new Set(["codex", "claude", "opencode", "gemini", "cursor"]);
+
+  let explicitFamily = null;
+  let modelQuery = rawModel || null;
+  if (rawProv.includes("/")) {
+    const slashIdx = rawProv.indexOf("/");
+    explicitFamily = rawProv.slice(0, slashIdx).trim().toLowerCase() || null;
+    modelQuery = modelQuery ?? (rawProv.slice(slashIdx + 1).trim() || null);
+  } else if (rawProv) {
+    const lowerProv = rawProv.toLowerCase();
+    if (KNOWN_PROVIDERS.has(lowerProv)) {
+      explicitFamily = lowerProv;
+    } else if (!modelQuery) {
+      modelQuery = rawProv;
+    }
+  }
 
   let snap = null;
   if (typeof api?.providers?.waitForReady === "function") {
@@ -1133,16 +1190,85 @@ async function resolvePaseoProviderSpec(api, cwd, requestedProvider = null) {
 
   const entries = Array.isArray(snap?.entries) ? snap.entries.filter((e) => e?.status === "ready") : [];
   if (entries.length > 0) {
-    const picked = entries.find((e) => String(e.provider ?? "").toLowerCase() === preferredFamily)
-      ?? entries.find((e) => String(e.provider ?? "").toLowerCase() === "codex")
-      ?? entries.find((e) => String(e.provider ?? "").toLowerCase() === "claude")
-      ?? entries[0];
-    const model = picked.models?.find((m) => m?.isDefault) ?? picked.models?.[0] ?? null;
-    if (picked?.provider && model?.id) {
-      return `${picked.provider}/${model.id}`;
+    const orderedEntries = explicitFamily
+      ? [
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === explicitFamily),
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() !== explicitFamily)
+        ]
+      : [
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "codex"),
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "claude"),
+          ...entries.filter((e) => !["codex", "claude"].includes(String(e.provider ?? "").toLowerCase()))
+        ];
+
+    if (modelQuery) {
+      const qLower = modelQuery.toLowerCase();
+      const qTokens = tokenizeMatchQuery(modelQuery);
+      let bestMatch = null;
+      let bestScore = 0;
+
+      for (const entry of orderedEntries) {
+        const famMatchBonus = explicitFamily && String(entry.provider ?? "").toLowerCase() === explicitFamily ? 2 : 0;
+        for (const m of entry.models ?? []) {
+          const mid = String(m?.id ?? "").trim();
+          const mlabel = String(m?.label ?? "").trim();
+          if (!mid) continue;
+          const midLower = mid.toLowerCase();
+          const labelLower = mlabel.toLowerCase();
+          if (midLower === qLower || labelLower === qLower) {
+            bestMatch = { entry, model: m };
+            bestScore = 100 + famMatchBonus;
+            break;
+          }
+          const hayTokens = tokenizeMatchQuery(`${mid} ${mlabel} ${entry.provider ?? ""}`);
+          if (qTokens.length > 0 && qTokens.every((t) => hayTokens.includes(t) || midLower.includes(t) || labelLower.includes(t))) {
+            const score = 50 + qTokens.length + famMatchBonus + (m?.isDefault ? 1 : 0);
+            if (score > bestScore) {
+              bestScore = score;
+              bestMatch = { entry, model: m };
+            }
+          }
+        }
+        if (bestScore >= 100) break;
+      }
+
+      if (bestMatch) {
+        const thinkingOptionId = matchThinkingOptionId(bestMatch.model, effort);
+        return {
+          provider: `${bestMatch.entry.provider}/${bestMatch.model.id}`,
+          model: bestMatch.model.id,
+          ...(thinkingOptionId ? { thinkingOptionId } : {}),
+          ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+        };
+      }
+    }
+
+    const picked = (explicitFamily
+      ? entries.find((e) => String(e.provider ?? "").toLowerCase() === explicitFamily)
+      : null)
+      ?? orderedEntries[0];
+    const pickedModel = picked?.models?.find((m) => m?.isDefault) ?? picked?.models?.[0] ?? null;
+    if (picked?.provider && (modelQuery || pickedModel?.id)) {
+      const chosenModelId = modelQuery || pickedModel.id;
+      const thinkingOptionId = matchThinkingOptionId(pickedModel, effort);
+      return {
+        provider: `${picked.provider}/${chosenModelId}`,
+        model: chosenModelId,
+        ...(thinkingOptionId ? { thinkingOptionId } : {}),
+        ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+      };
     }
   }
-  return raw || "codex";
+
+  const fallbackFamily = explicitFamily || (modelQuery && /claude|sonnet|opus|haiku/i.test(modelQuery) ? "claude" : "codex");
+  const fallbackSpec = modelQuery ? `${fallbackFamily}/${modelQuery}` : (rawProv || fallbackFamily);
+  const thinkingOptionId = normalizeEffortId(effort);
+  return {
+    provider: fallbackSpec,
+    ...(modelQuery ? { model: modelQuery } : {}),
+    ...(thinkingOptionId ? { thinkingOptionId } : {}),
+    ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+  };
 }
 
 export async function startPaseoSession(supervisor, {
@@ -1152,6 +1278,9 @@ export async function startPaseoSession(supervisor, {
   title = null,
   prompt = "",
   provider = null,
+  model = null,
+  effort = null,
+  modeId = null,
   images = null,
   factory
 } = {}) {
@@ -1169,10 +1298,7 @@ export async function startPaseoSession(supervisor, {
   let resolvedServerId = explicitServerId;
   let resolvedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   let workspaceLabel = cleanName(workspace);
-
-  if (!workspaceLabel && !resolvedCwd) {
-    throw new Error("Pass workspace (e.g. 'recorder-app') or explicit serverId + cwd.");
-  }
+  let inferredWorkspace = false;
 
   if (!resolvedServerId || !resolvedCwd) {
     const inventory = await listWorkspaces(supervisor, {
@@ -1182,7 +1308,32 @@ export async function startPaseoSession(supervisor, {
       factory
     });
 
-    if (resolvedCwd && !resolvedServerId) {
+    if (!workspaceLabel && !resolvedCwd) {
+      const candidates = (inventory.workspaces ?? []).filter((w) => w?.defaultTarget?.cwd && w?.defaultTarget?.serverId
+        && (!explicitServerId || w.hosts?.some((h) => h.serverId === explicitServerId && h.preferredCwd)));
+      if (candidates.length === 0) {
+        throw new Error("No online Paseo workspace was found. Call fleet_workspaces or pass workspace/cwd explicitly.");
+      }
+      const promptHay = `${cleanTitle ?? ""} ${cleanPrompt}`.toLowerCase();
+      const promptTokens = new Set(tokenizeMatchQuery(promptHay));
+      const matched = candidates.find((w) => {
+        const idTok = tokenizeMatchQuery(w.id).join(" ");
+        const nameTok = tokenizeMatchQuery(w.name).join(" ");
+        const repoLeaf = w.repo ? String(w.repo).split("/").pop().toLowerCase() : "";
+        return (idTok && promptTokens.has(idTok))
+          || (nameTok && promptTokens.has(nameTok))
+          || (repoLeaf && promptTokens.has(repoLeaf));
+      }) ?? candidates
+        .slice()
+        .sort((a, b) => ((b.activeCount ?? 0) * 4 + (b.totalChats ?? 0)) - ((a.activeCount ?? 0) * 4 + (a.totalChats ?? 0)))[0];
+      const hostMatch = explicitServerId
+        ? matched.hosts?.find((h) => h.serverId === explicitServerId && h.preferredCwd)
+        : null;
+      resolvedServerId = explicitServerId ?? matched.defaultTarget.serverId;
+      resolvedCwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
+      workspaceLabel = matched.name;
+      inferredWorkspace = true;
+    } else if (resolvedCwd && !resolvedServerId) {
       const exactHosts = new Map();
       const relatedHosts = new Map();
       const noteCandidate = (hostId, rawCandidateCwd, wsName) => {
@@ -1261,10 +1412,10 @@ export async function startPaseoSession(supervisor, {
   const created = await withPaseo(createCfg, async (client, signal) => {
     const directory = await client.hosts.list();
     const api = await hostApi(client, resolvedServerId, directory);
-    const providerSpec = await resolvePaseoProviderSpec(api, resolvedCwd, provider);
+    const agentConfig = await resolvePaseoAgentConfig(api, resolvedCwd, { provider, model, effort, modeId });
     signal.throwIfAborted();
     const handle = await api.agents.create({
-      config: { provider: providerSpec },
+      config: agentConfig,
       cwd: resolvedCwd,
       ...(cleanTitle ? { title: cleanTitle } : {}),
       prompt: cleanPrompt
@@ -1281,19 +1432,21 @@ export async function startPaseoSession(supervisor, {
         });
       } catch { /* initial prompt already started */ }
     }
+    const providerSpec = agentConfig.provider;
+    const modelSpec = agentConfig.model ?? providerSpec.split("/")[1] ?? null;
     const agentRecord = snap ?? {
       id: agentId,
       status: "running",
       cwd: resolvedCwd,
       title: cleanTitle ?? `${workspaceLabel || path.basename(resolvedCwd)} coordinator`,
       provider: providerSpec.split("/")[0],
-      model: providerSpec.split("/")[1] ?? null,
+      model: modelSpec,
       updatedAt: new Date().toISOString()
     };
     const thread = paseoThread(agentRecord, resolvedServerId, [
       { item: { type: "user_message", text: cleanPrompt }, timestamp: new Date().toISOString() }
     ], true);
-    return { thread, agentId, providerSpec };
+    return { thread, agentId, providerSpec, modelSpec, effortSpec: agentConfig.thinkingOptionId ?? null };
   }, factory);
 
   mergeDiscoveredIntoKnown(supervisor, created.thread);
@@ -1315,8 +1468,11 @@ export async function startPaseoSession(supervisor, {
     agentId: created.agentId,
     title: created.thread.title,
     workspace: workspaceLabel ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+    inferredWorkspace,
     cwd: resolvedCwd,
     provider: created.providerSpec,
+    model: created.modelSpec,
+    effort: created.effortSpec,
     openChat: openChatFor(created.thread)
   };
 }

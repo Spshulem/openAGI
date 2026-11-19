@@ -801,11 +801,54 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_mcp_tools",
     sideEffects: false,
-    description: "List tools exposed by connected MCP servers — INCLUDING ones not advertised directly as functions (large servers are capped to keep the tool list within provider limits). Use this to discover a tool, then call it with run_mcp_tool.",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-    handler: async () => {
-      const tools = runtime.mcp?.listTools?.() ?? [];
-      return { count: tools.length, items: tools };
+    description: "List tools exposed by connected MCP servers — INCLUDING ones not advertised directly as functions (large servers are capped to keep the tool list within provider limits). Returns compact summaries by default so output stays within size limits; pass { server, tool } to inspect a specific tool's full schema and instructions, or { query, server } to search.",
+    parameters: {
+      type: "object",
+      properties: {
+        server: { type: "string", description: "Optional MCP server name filter (case-insensitive)." },
+        tool: { type: "string", description: "Optional exact tool name; when provided, returns full description and inputSchema." },
+        query: { type: "string", description: "Optional substring filter matching server, tool name, or description." }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const all = runtime.mcp?.listTools?.() ?? [];
+      const serverFilter = typeof args?.server === "string" ? args.server.trim().toLowerCase() : "";
+      const toolFilter = typeof args?.tool === "string" ? args.tool.trim().toLowerCase() : "";
+      const queryFilter = typeof args?.query === "string" ? args.query.trim().toLowerCase() : "";
+      const matched = all.filter((item) => {
+        if (serverFilter && String(item?.server ?? "").toLowerCase() !== serverFilter) return false;
+        if (toolFilter && String(item?.name ?? "").toLowerCase() !== toolFilter) return false;
+        if (queryFilter) {
+          const hay = `${item?.server ?? ""} ${item?.name ?? ""} ${item?.description ?? ""}`.toLowerCase();
+          if (!hay.includes(queryFilter)) return false;
+        }
+        return true;
+      });
+      if (toolFilter) {
+        return { count: matched.length, totalCount: all.length, items: matched };
+      }
+      const items = matched.slice(0, 80).map((item) => {
+        const desc = String(item?.description ?? "").replace(/\s+/g, " ").trim();
+        const props = item?.inputSchema?.properties && typeof item.inputSchema.properties === "object"
+          ? Object.keys(item.inputSchema.properties).slice(0, 20)
+          : [];
+        const req = Array.isArray(item?.inputSchema?.required) ? item.inputSchema.required.slice(0, 20) : [];
+        return {
+          server: item?.server ?? null,
+          name: item?.name ?? null,
+          description: desc.length > 180 ? `${desc.slice(0, 179)}…` : desc,
+          ...(req.length ? { required: req } : {}),
+          ...(props.length ? { params: props } : {})
+        };
+      });
+      return {
+        count: matched.length,
+        totalCount: all.length,
+        compact: true,
+        hint: "Compact summary view. Pass { server, tool } to inspect a tool's full schema and instructions, or invoke with run_mcp_tool.",
+        items
+      };
     }
   });
 

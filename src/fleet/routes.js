@@ -78,7 +78,23 @@ export function createFleetRoute({ supervisor } = {}) {
       const reply = typeof body.reply === "string" ? body.reply.trim() : "";
       if (!reply || reply.length > REPLY_MAX) return fail(400, `Reply must be 1-${REPLY_MAX} characters.`);
       if (!open) return fail(404, "No open question with that id.");
-      if (open.canReply !== true) return fail(409, "This question takes no typed reply. Pick an option, or answer it in its chat.");
+      if (open.canReply !== true) {
+        if (open.kind === "suggestion" && Array.isArray(open.options) && open.options.includes("Answer question")) {
+          if (typeof supervisor.answerQuestion !== "function") return fail(503, "Questions are not available.");
+          const result = await supervisor.answerQuestion(id, "Answer question", {
+            ...sendOptions,
+            clarification: reply.slice(0, 2000)
+          });
+          if (!result) return fail(409, "Question already closed.");
+          return ok({
+            question: result.question ?? null,
+            delivery: result.delivery ?? null,
+            ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}),
+            state: state()
+          });
+        }
+        return fail(409, "This question takes no typed reply. Pick an option, or answer it in its chat.");
+      }
       if (typeof supervisor.replyQuestion !== "function") return fail(503, "Replies are not available.");
       const result = await supervisor.replyQuestion(id, reply, sendOptions);
       if (!result) return fail(409, "Question already closed.");
@@ -228,6 +244,8 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
             ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             ...sendOptions
           });
@@ -263,8 +281,8 @@ export function createFleetRoute({ supervisor } = {}) {
         const workspace = typeof body?.workspace === "string" ? body.workspace.trim() : "";
         const cwd = typeof body?.cwd === "string" ? body.cwd.trim() : "";
         if (!prompt || prompt.length > 4000) return fail(400, "prompt must be 1-4000 characters.");
-        if ((!workspace && !cwd) || workspace.length > 160 || cwd.length > 400) {
-          return fail(400, "Pass workspace or cwd.");
+        if (workspace.length > 160 || cwd.length > 400) {
+          return fail(400, "workspace or cwd is too long.");
         }
         try {
           const started = await supervisor.startPaseoSession({
@@ -273,6 +291,9 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             title: typeof body?.title === "string" && body.title.trim() ? body.title.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
+            modeId: typeof body?.modeId === "string" && body.modeId.trim() ? body.modeId.trim().slice(0, 60) : null,
             ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             prompt
           });

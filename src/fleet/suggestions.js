@@ -19,7 +19,7 @@ const clean = (value, max = 2000) => clampText(redactSecrets(value), max);
 
 function suggestionQuestion(s) {
   const remedy = remedyOf(s);
-  return { kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 100), body: clean(s.rootCause, 220),
+  return { kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 240), body: clean(s.rootCause, 800),
     options: [...(remedy === "code" ? ["Fix it"] : remedy === "clarification" ? ["Answer question"] : []), "Review plan", "Not now", "Never"],
     meta: { suggestionId: s.id, plan: suggestionPlan(s), clarification: s.clarification } };
 }

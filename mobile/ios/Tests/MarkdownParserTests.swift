@@ -106,4 +106,24 @@ final class MarkdownParserTests: XCTestCase {
         ])
         XCTAssertEqual(MarkdownParser.parse("### Next ###"), [.heading(level: 3, text: "Next")])
     }
+
+    func testGfmTableBlockquoteAndThematicBreak() {
+        let md = """
+        | Chat | Status | My take |
+        | --- | :---: | ---: |
+        | Bob | Open | Check `Staging` |
+
+        > Owner clarification needed.
+
+        ---
+
+        Done.
+        """
+        XCTAssertEqual(MarkdownParser.parse(md), [
+            .table(headers: ["Chat", "Status", "My take"], rows: [["Bob", "Open", "Check `Staging`"]]),
+            .blockquote("Owner clarification needed."),
+            .thematicBreak,
+            .paragraph("Done.")
+        ])
+    }
 }

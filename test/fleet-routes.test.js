@@ -425,3 +425,33 @@ test("a reply to a question closed mid-request is 409", async () => {
   const res = await createFleetRoute({ supervisor: sup })("POST", "/fleet/api/questions/fq_open1", url("/fleet/api/questions/fq_open1"), body({ reply: "hi" }));
   assert.equal(res.status, 409);
 });
+
+test("POST questions/:id { reply } on a suggestion clarification question routes through Answer question", async () => {
+  const sup = fakeSupervisor();
+  sup.state.questions[0] = {
+    id: "fq_sug1",
+    kind: "suggestion",
+    title: "Needs owner answer before acting",
+    body: "Should retry use exponential backoff?",
+    options: ["Answer question", "Review plan", "Not now", "Never"],
+    canReply: false
+  };
+  sup.answerQuestion = async (id, answer, opts) => {
+    sup.calls.push(["answerQuestion", id, answer, opts]);
+    return {
+      question: sup.state.questions[0],
+      nonResolving: true,
+      plan: { remedy: "clarification", nextAction: "Answered" }
+    };
+  };
+  const route = createFleetRoute({ supervisor: sup });
+  const res = await route("POST", "/fleet/api/questions/fq_sug1", url("/fleet/api/questions/fq_sug1"), body({ reply: "Yes, cap at 60s." }));
+  assert.equal(res.status, 200);
+  assert.equal(res.body.nonResolving, true);
+  assert.deepEqual(sup.calls.find((c) => c[0] === "answerQuestion"), [
+    "answerQuestion",
+    "fq_sug1",
+    "Answer question",
+    { deadlineAt: null, clarification: "Yes, cap at 60s." }
+  ]);
+});
