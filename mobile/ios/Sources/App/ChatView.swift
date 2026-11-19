@@ -635,10 +635,6 @@ struct ChatConversationView: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .onDrop(of: [.image], isTargeted: nil) { providers in
-            Task { await importDroppedProviders(providers) }
-            return true
-        }
     }
 
     private var composerLayout: ComposerLayout {
@@ -768,30 +764,6 @@ struct ChatConversationView: View {
             }
             appendImages(prepared)
         } catch { attachmentError = error.localizedDescription }
-    }
-
-    private func importDroppedProviders(_ providers: [NSItemProvider]) async {
-        guard !isPreparingImages else { return }
-        let remaining = ChatAttachment.maximumCount - conversation.draftAttachments.count
-        guard remaining > 0 else { return }
-        isPreparingImages = true
-        attachmentError = nil
-        defer { isPreparingImages = false }
-        var prepared: [ChatAttachment] = []
-        for provider in providers.prefix(remaining) {
-            guard provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) else { continue }
-            let data: Data? = await withCheckedContinuation { cont in
-                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { raw, _ in
-                    cont.resume(returning: raw)
-                }
-            }
-            if let data, let att = try? await ChatAttachmentPreparation.prepare(data, name: "Dropped image.jpg") {
-                prepared.append(att)
-            }
-        }
-        if !prepared.isEmpty {
-            appendImages(prepared)
-        }
     }
 
     #if DEBUG
