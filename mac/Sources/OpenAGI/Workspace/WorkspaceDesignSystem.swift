@@ -541,12 +541,12 @@ private struct WorkspaceMarkdownTableView: View {
               .frame(maxWidth: .infinity, alignment: .leading)
               .overlay(alignment: .trailing) {
                 if colIndex + 1 < headers.count {
-                  Rectangle().fill(WorkspaceTheme.hairline).frame(width: 0.5)
+                  Rectangle().fill(WorkspaceTheme.edge).frame(width: 0.5)
                 }
               }
           }
         }
-        .background(WorkspaceTheme.hairline.opacity(0.35))
+        .background(WorkspaceTheme.edge.opacity(0.45))
 
         ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
           GridRow {
@@ -561,14 +561,14 @@ private struct WorkspaceMarkdownTableView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .overlay(alignment: .trailing) {
                   if colIndex + 1 < headers.count {
-                    Rectangle().fill(WorkspaceTheme.hairline).frame(width: 0.5)
+                    Rectangle().fill(WorkspaceTheme.edge).frame(width: 0.5)
                   }
                 }
             }
           }
-          .background(rowIndex.isMultiple(of: 2) ? Color.clear : WorkspaceTheme.hairline.opacity(0.14))
+          .background(rowIndex.isMultiple(of: 2) ? Color.clear : WorkspaceTheme.edge.opacity(0.18))
           .overlay(alignment: .top) {
-            Rectangle().fill(WorkspaceTheme.hairline).frame(height: 0.5)
+            Rectangle().fill(WorkspaceTheme.edge).frame(height: 0.5)
           }
         }
       }
@@ -576,7 +576,7 @@ private struct WorkspaceMarkdownTableView: View {
       .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
       .overlay(
         RoundedRectangle(cornerRadius: 10, style: .continuous)
-          .strokeBorder(WorkspaceTheme.hairline, lineWidth: 0.5)
+          .strokeBorder(WorkspaceTheme.edge, lineWidth: 0.5)
       )
     }
   }
