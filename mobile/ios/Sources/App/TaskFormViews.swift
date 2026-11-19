@@ -1,3 +1,4 @@
+import SupervisorChannelsKit
 import SwiftUI
 
 // mobile/FEATURES.md: "Create: title, bucket, priority, optional due date."
@@ -97,6 +98,9 @@ struct TaskDetailView: View {
     @State private var hasDueDate: Bool
     @State private var dueDate: Date
     @State private var isSaving = false
+    @State private var claimingSession = false
+    @State private var claimStatusNote: String?
+    @State private var linkedSessionSheetThread: FleetThread?
     @State private var errorMessage: String?
     @State private var showingDeleteConfirmation = false
 
@@ -144,6 +148,64 @@ struct TaskDetailView: View {
                 }
                 .padding(.horizontal, Theme.gutter)
 
+                if !["completed", "cancelled"].contains(task.status) || task.sourceMeta?.threadKey != nil {
+                    RowGroup {
+                        VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
+                            Text("Coding Session (Board)")
+                                .font(Theme.Typography.caption.weight(.semibold))
+                                .foregroundStyle(Theme.muted)
+
+                            if let threadKey = task.sourceMeta?.threadKey {
+                                HStack(spacing: 6) {
+                                    if let actor = task.sourceMeta?.actor, !actor.isEmpty {
+                                        BoardActorPill(actor: actor)
+                                    }
+                                    if let lease = SupervisorBoardTaskClassifier.leaseBadgeText(expiresAtISO: task.sourceMeta?.agentLease?.expiresAt) {
+                                        Text(lease)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(Theme.live)
+                                    }
+                                }
+                                Text(threadKey)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(Theme.muted)
+                                Button {
+                                    linkedSessionSheetThread = FleetThread(
+                                        key: threadKey,
+                                        title: task.title,
+                                        workspace: task.sourceMeta?.project,
+                                        actorLabel: task.sourceMeta?.actor
+                                    )
+                                } label: {
+                                    Label("Open Live Thread", systemImage: "text.bubble")
+                                        .font(Theme.Typography.secondary.weight(.semibold))
+                                        .foregroundStyle(Theme.live)
+                                }
+                            } else if !model.isOnPhone {
+                                Button {
+                                    Task { await claimSession() }
+                                } label: {
+                                    HStack {
+                                        Label(claimingSession ? "Claiming in Paseo…" : "Claim & Start in Paseo", systemImage: "bolt.fill")
+                                            .font(Theme.Typography.secondary.weight(.semibold))
+                                            .foregroundStyle(Theme.live)
+                                        Spacer()
+                                        if claimingSession { ProgressView().controlSize(.small) }
+                                    }
+                                }
+                                .disabled(claimingSession || isSaving)
+                            }
+                            if let claimStatusNote {
+                                Text(claimStatusNote)
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+                        .padding(Theme.Spacing.x4)
+                    }
+                    .padding(.horizontal, Theme.gutter)
+                }
+
                 if let errorMessage {
                     Text(errorMessage).font(Theme.Typography.secondary).foregroundStyle(Theme.alert)
                         .padding(.horizontal, Theme.gutter)
@@ -166,6 +228,31 @@ struct TaskDetailView: View {
         .confirmationDialog("Delete this task?", isPresented: $showingDeleteConfirmation, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { Task { await delete() } }
             Button("Cancel", role: .cancel) {}
+        }
+        .sheet(item: $linkedSessionSheetThread) { thread in
+            NavigationStack {
+                FleetConversationView(thread: thread, fallbackSummary: task.description.isEmpty ? nil : task.description)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { linkedSessionSheetThread = nil }
+                        }
+                    }
+            }
+        }
+    }
+
+    private func claimSession() async {
+        claimingSession = true
+        claimStatusNote = nil
+        defer { claimingSession = false }
+        do {
+            let res = try await model.claimTaskInPaseo(task)
+            if let key = res.session?.key ?? res.task?.sourceMeta?.threadKey {
+                claimStatusNote = "Claimed in Paseo (\(key))."
+            }
+            await onChanged()
+        } catch {
+            errorMessage = "Couldn't claim task in Paseo right now."
         }
     }
 

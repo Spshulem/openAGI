@@ -38,16 +38,70 @@ public extension JSONValue {
     }
 }
 
+public struct FleetActivityEvent: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var kind: String
+    public var actor: String?
+    public var project: String?
+    public var subchannel: String?
+    public var title: String
+    public var detail: String?
+    public var threadKey: String?
+    public var taskId: String?
+    public var prRef: String?
+    public var labels: [String]
+    public var at: Date?
+
+    public init(id: String, kind: String = "action", actor: String? = nil, project: String? = nil,
+                subchannel: String? = nil, title: String, detail: String? = nil, threadKey: String? = nil,
+                taskId: String? = nil, prRef: String? = nil, labels: [String] = [], at: Date? = nil) {
+        self.id = id
+        self.kind = kind
+        self.actor = actor
+        self.project = project
+        self.subchannel = subchannel
+        self.title = title
+        self.detail = detail
+        self.threadKey = threadKey
+        self.taskId = taskId
+        self.prRef = prRef
+        self.labels = labels
+        self.at = at
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, actor, project, subchannel, title, detail, threadKey, taskId, prRef, labels, at
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? ""
+        kind = c.lenient(String.self, .kind) ?? "action"
+        actor = c.lenient(String.self, .actor)
+        project = c.lenient(String.self, .project)
+        subchannel = c.lenient(String.self, .subchannel)
+        title = c.lenient(String.self, .title) ?? "Activity"
+        detail = c.lenient(String.self, .detail)
+        threadKey = c.lenient(String.self, .threadKey)
+        taskId = c.lenient(String.self, .taskId)
+        prRef = c.lenient(String.self, .prRef)
+        labels = c.lenientList(String.self, .labels)
+        at = c.lenient(Date.self, .at)
+    }
+}
+
 public struct FleetState: Decodable, Sendable, Equatable {
     public var mode: String?
     public var enabled: Bool
     public var running: Bool
     public var lastTickAt: Date?
+    public var nextTickAt: Date?
     public var lastError: JSONValue?
     public var snapshot: FleetSnapshot?
     public var questions: [FleetQuestion]
     public var actions: [FleetAction]
     public var cards: [SupervisorCard]
+    public var activityEvents: [FleetActivityEvent]
     public var preferences: SupervisorPreferences?
     public var autonomy: SupervisorAutonomy?
     public var activeSummary: SupervisorActiveSummary?
@@ -56,20 +110,24 @@ public struct FleetState: Decodable, Sendable, Equatable {
     public var lastErrorText: String? { lastError?.fleetText }
 
     public init(mode: String? = nil, enabled: Bool = false, running: Bool = false, lastTickAt: Date? = nil,
+                nextTickAt: Date? = nil,
                 lastError: JSONValue? = nil, snapshot: FleetSnapshot? = nil,
                 questions: [FleetQuestion] = [], actions: [FleetAction] = [],
-                cards: [SupervisorCard] = [], preferences: SupervisorPreferences? = nil,
+                cards: [SupervisorCard] = [], activityEvents: [FleetActivityEvent] = [],
+                preferences: SupervisorPreferences? = nil,
                 autonomy: SupervisorAutonomy? = nil, activeSummary: SupervisorActiveSummary? = nil,
                 catchUpSummary: String? = nil) {
         self.mode = mode
         self.enabled = enabled
         self.running = running
         self.lastTickAt = lastTickAt
+        self.nextTickAt = nextTickAt
         self.lastError = lastError
         self.snapshot = snapshot
         self.questions = questions
         self.actions = actions
         self.cards = cards
+        self.activityEvents = activityEvents
         self.preferences = preferences
         self.autonomy = autonomy
         self.activeSummary = activeSummary
@@ -77,8 +135,8 @@ public struct FleetState: Decodable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case mode, enabled, running, lastTickAt, lastError, snapshot, questions, actions
-        case cards, preferences, autonomy, activeSummary, catchUpSummary
+        case mode, enabled, running, lastTickAt, nextTickAt, lastError, snapshot, questions, actions
+        case cards, activityEvents, preferences, autonomy, activeSummary, catchUpSummary
     }
 
     public init(from decoder: Decoder) throws {
@@ -87,11 +145,13 @@ public struct FleetState: Decodable, Sendable, Equatable {
         enabled = c.lenient(Bool.self, .enabled) ?? false
         running = c.lenient(Bool.self, .running) ?? false
         lastTickAt = c.lenient(Date.self, .lastTickAt)
+        nextTickAt = c.lenient(Date.self, .nextTickAt)
         lastError = c.lenient(JSONValue.self, .lastError)
         snapshot = c.lenient(FleetSnapshot.self, .snapshot)
         questions = c.lenientList(FleetQuestion.self, .questions)
         actions = c.lenientList(FleetAction.self, .actions)
         cards = c.lenientList(SupervisorCard.self, .cards)
+        activityEvents = c.lenientList(FleetActivityEvent.self, .activityEvents)
         preferences = c.lenient(SupervisorPreferences.self, .preferences)
         autonomy = c.lenient(SupervisorAutonomy.self, .autonomy)
         activeSummary = c.lenient(SupervisorActiveSummary.self, .activeSummary)
@@ -144,6 +204,26 @@ public struct FleetConversationMessage: Decodable, Sendable, Identifiable {
     public var role: String
     public var text: String
     public var at: Date?
+    public var actor: String?
+
+    public init(id: String, role: String, text: String, at: Date? = nil, actor: String? = nil) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.at = at
+        self.actor = actor
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, role, text, at, actor }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? ""
+        role = c.lenient(String.self, .role) ?? "assistant"
+        text = c.lenient(String.self, .text) ?? ""
+        at = c.lenient(Date.self, .at)
+        actor = c.lenient(String.self, .actor)
+    }
 }
 
 public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
@@ -166,6 +246,10 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     public var error: FleetThreadError?
     public var live: Bool
     public var decision: FleetDecision?
+    public var nextCheckAt: Date?
+    public var actorLabel: String?
+    public var subchannel: String?
+    public var labels: [String]
 
     public var id: String { key }
 
@@ -173,7 +257,8 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
                 branch: String? = nil, agentStatus: String? = nil, state: String? = nil, health: String? = nil,
                 reason: String? = nil, blockers: [String] = [], pr: FleetPR? = nil, lastActivityAt: Date? = nil,
                 lastAgentText: String? = nil, error: FleetThreadError? = nil, live: Bool = false,
-                decision: FleetDecision? = nil) {
+                decision: FleetDecision? = nil, nextCheckAt: Date? = nil, actorLabel: String? = nil,
+                subchannel: String? = nil, labels: [String] = []) {
         self.key = key
         self.kind = kind
         self.title = title
@@ -191,11 +276,16 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         self.error = error
         self.live = live
         self.decision = decision
+        self.nextCheckAt = nextCheckAt
+        self.actorLabel = actorLabel
+        self.subchannel = subchannel
+        self.labels = labels
     }
 
     private enum CodingKeys: String, CodingKey {
         case key, kind, title, workspace, repo, branch, agentStatus, state, health, reason, blockers, pr
         case lastActivityAt, lastAgentText, error, live, decision
+        case nextCheckAt, actorLabel, subchannel, labels
     }
 
     public init(from decoder: Decoder) throws {
@@ -217,6 +307,10 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         error = c.lenient(FleetThreadError.self, .error)
         live = c.lenient(Bool.self, .live) ?? false
         decision = c.lenient(FleetDecision.self, .decision)
+        nextCheckAt = c.lenient(Date.self, .nextCheckAt)
+        actorLabel = c.lenient(String.self, .actorLabel)
+        subchannel = c.lenient(String.self, .subchannel)
+        labels = c.lenientList(String.self, .labels)
     }
 }
 
@@ -806,6 +900,11 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var openChat: FleetOpenChat?
     public var project: String?
     public var plan: SupervisorSuggestionPlan?
+    public var blockingCount: Int
+    public var blockingSummary: String?
+    public var actorLabel: String?
+    public var subchannel: String?
+    public var labels: [String]
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, sessionTitle: String? = nil,
@@ -818,7 +917,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
                 secondaryAction: SupervisorCardAction? = nil, extraActions: [SupervisorCardAction] = [],
                 prContext: SupervisorPRContext? = nil, recentMessages: [SupervisorRecentMessage] = [],
                 timeline: [SupervisorTimelineItem] = [], resources: [SupervisorResource] = [],
-                openChat: FleetOpenChat? = nil, project: String? = nil, plan: SupervisorSuggestionPlan? = nil) {
+                openChat: FleetOpenChat? = nil, project: String? = nil, plan: SupervisorSuggestionPlan? = nil,
+                blockingCount: Int = 0, blockingSummary: String? = nil, actorLabel: String? = nil,
+                subchannel: String? = nil, labels: [String] = []) {
         self.id = id
         self.questionId = questionId
         self.kind = kind
@@ -856,6 +957,11 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.openChat = openChat
         self.project = project
         self.plan = plan
+        self.blockingCount = blockingCount
+        self.blockingSummary = blockingSummary
+        self.actorLabel = actorLabel
+        self.subchannel = subchannel
+        self.labels = labels
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -863,6 +969,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
         case prContext, recentMessages, timeline, resources, openChat, project, plan
+        case blockingCount, blockingSummary, actorLabel, subchannel, labels
     }
 
     public init(from decoder: Decoder) throws {
@@ -904,6 +1011,11 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         openChat = c.lenient(FleetOpenChat.self, .openChat)
         project = c.lenient(String.self, .project)
         plan = c.lenient(SupervisorSuggestionPlan.self, .plan)
+        blockingCount = c.lenient(Int.self, .blockingCount) ?? 0
+        blockingSummary = c.lenient(String.self, .blockingSummary)
+        actorLabel = c.lenient(String.self, .actorLabel)
+        subchannel = c.lenient(String.self, .subchannel)
+        labels = c.lenientList(String.self, .labels)
     }
 }
 
@@ -1353,6 +1465,42 @@ public struct FleetDispatchGoalResponse: Decodable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         result = c.lenient(Outcome.self, .result)
+        state = c.lenient(FleetState.self, .state)
+    }
+}
+
+public struct FleetClaimedSession: Decodable, Sendable, Equatable {
+    public var key: String
+    public var title: String?
+    public var workspace: String?
+    public var cwd: String?
+    public var provider: String?
+    public var model: String?
+
+    private enum CodingKeys: String, CodingKey { case key, title, workspace, cwd, provider, model }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        key = c.lenient(String.self, .key) ?? ""
+        title = c.lenient(String.self, .title)
+        workspace = c.lenient(String.self, .workspace)
+        cwd = c.lenient(String.self, .cwd)
+        provider = c.lenient(String.self, .provider)
+        model = c.lenient(String.self, .model)
+    }
+}
+
+public struct FleetTaskClaimResponse: Decodable, Sendable {
+    public var task: TaskRecord?
+    public var session: FleetClaimedSession?
+    public var state: FleetState?
+
+    private enum CodingKeys: String, CodingKey { case task, session, state }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        task = c.lenient(TaskRecord.self, .task)
+        session = c.lenient(FleetClaimedSession.self, .session)
         state = c.lenient(FleetState.self, .state)
     }
 }

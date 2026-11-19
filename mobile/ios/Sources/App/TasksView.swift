@@ -1,10 +1,35 @@
+import SupervisorChannelsKit
 import SwiftUI
 
 struct TasksView: View {
     @Environment(AppModel.self) private var model
     @State private var queue: TaskQueue = .user
+    @State private var stateFilter: SupervisorBoardTaskState = .all
+    @State private var activeLabelFilters: Set<String> = []
+    private var rawQueueTasks: [TaskRecord] {
+        model.workspace.tasks[queue.rawValue] ?? []
+    }
+    private var availableLabels: [SupervisorBoardLabel] {
+        Array(SupervisorBoardLabel.extract(from: rawQueueTasks.flatMap(\.tags)).prefix(12))
+    }
+    private func boardState(for task: TaskRecord) -> SupervisorBoardTaskState {
+        SupervisorBoardTaskClassifier.classify(
+            status: task.status,
+            queue: task.queue,
+            hasUnmetDeps: !task.dependsOn.isEmpty && task.status.lowercased() == "blocked",
+            leaseExpiresAtISO: task.sourceMeta?.agentLease?.expiresAt
+        )
+    }
+    private var filteredTasks: [TaskRecord] {
+        rawQueueTasks.filter { task in
+            if stateFilter != .all && boardState(for: task) != stateFilter {
+                return false
+            }
+            return SupervisorBoardLabel.matches(tags: task.tags, activeFilters: activeLabelFilters)
+        }
+    }
     private var tasksByBucket: [TaskBucket: [TaskRecord]] {
-        Dictionary(grouping: model.workspace.tasks[queue.rawValue] ?? []) { TaskBucket(rawValue: $0.bucket) ?? .someday }
+        Dictionary(grouping: filteredTasks) { TaskBucket(rawValue: $0.bucket) ?? .someday }
             .mapValues { $0.sorted { $0.priority > $1.priority } }
     }
     private var isLoading: Bool { model.loadingQueues.contains(queue.rawValue) }
@@ -23,6 +48,30 @@ struct TasksView: View {
                     }
                     .pickerStyle(.segmented)
                     .accessibilityIdentifier("tasks-queue")
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(SupervisorBoardTaskState.allCases) { state in
+                                let active = stateFilter == state
+                                Button {
+                                    stateFilter = state
+                                } label: {
+                                    Label(state.label, systemImage: state.systemImage)
+                                        .font(.caption2.weight(.semibold))
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 5)
+                                        .background(active ? Theme.live : Theme.canvas, in: Capsule())
+                                        .foregroundStyle(active ? Color.white : Theme.ink)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .accessibilityIdentifier("tasks-board-filters")
+
+                    if !availableLabels.isEmpty {
+                        BoardLabelChipsRow(labels: availableLabels, activeFilters: $activeLabelFilters)
+                    }
                 }
                 if let errorHeadline {
                     Section {
@@ -52,10 +101,35 @@ struct TasksView: View {
                                         await load()
                                     })
                                 } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
+                                    VStack(alignment: .leading, spacing: 5) {
                                         Text(task.title).foregroundStyle(.primary)
-                                        if isOverdue(task) {
-                                            Text("Overdue").font(.caption).foregroundStyle(.red)
+                                        let st = boardState(for: task)
+                                        let leaseText = SupervisorBoardTaskClassifier.leaseBadgeText(expiresAtISO: task.sourceMeta?.agentLease?.expiresAt)
+                                        if isOverdue(task) || st != .ready || task.sourceMeta?.threadKey != nil || task.sourceMeta?.actor != nil {
+                                            HStack(spacing: 6) {
+                                                if isOverdue(task) {
+                                                    Text("Overdue").font(.caption2.weight(.semibold)).foregroundStyle(.red)
+                                                }
+                                                if st != .ready {
+                                                    Text(leaseText ?? st.label)
+                                                        .font(.caption2.weight(.semibold))
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(Theme.live.opacity(0.12), in: Capsule())
+                                                        .foregroundStyle(st == .blocked ? Theme.alert : Theme.live)
+                                                }
+                                                if let actor = task.sourceMeta?.actor, !actor.isEmpty {
+                                                    BoardActorPill(actor: actor)
+                                                } else if task.sourceMeta?.threadKey != nil {
+                                                    Text("Session linked")
+                                                        .font(.caption2)
+                                                        .foregroundStyle(Theme.muted)
+                                                }
+                                            }
+                                        }
+                                        let rowLabels = SupervisorBoardLabel.extract(from: task.tags)
+                                        if !rowLabels.isEmpty {
+                                            BoardReadOnlyLabelsRow(labels: rowLabels)
                                         }
                                     }
                                 }

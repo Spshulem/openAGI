@@ -17,6 +17,8 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var openQuestionIDs: Set<String> = []
   /// The last scan's threads, for the Watching list under the questions.
   @Published private(set) var threads: [FleetThread] = []
+  @Published private(set) var activityEvents: [FleetActivityEvent] = []
+  @Published private(set) var nextTickAt: String? = nil
   /// Watching groups the owner opened that start collapsed (Quiet).
   @Published private(set) var openWatchGroups: Set<String> = []
   @Published private(set) var status: FleetStatus? = nil
@@ -761,6 +763,8 @@ final class FleetConsumer: ObservableObject {
     }
     openQuestionIDs = Set(state.questions.map(\.id))
     threads = state.threads
+    activityEvents = state.activityEvents
+    nextTickAt = state.nextTickAt
     status = state.status
     // The detail screen stays while its question or thread does; a closed
     // question falls back to its thread.
@@ -818,6 +822,8 @@ final class FleetConsumer: ObservableObject {
     questions = []
     openQuestionIDs = []
     threads = []
+    activityEvents = []
+    nextTickAt = nil
     status = nil
     notes = [:]
     stillSending = []

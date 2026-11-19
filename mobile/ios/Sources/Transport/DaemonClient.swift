@@ -654,6 +654,37 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetDispatchGoalResponse.self, from: data)
     }
 
+    public func fleetClaimTask(
+        taskId: String? = nil,
+        title: String? = nil,
+        description: String? = nil,
+        workspace: String? = nil,
+        project: String? = nil,
+        subchannel: String? = nil,
+        model: String? = nil,
+        effort: String? = nil,
+        prompt: String? = nil,
+        labels: [String] = []
+    ) async throws -> FleetTaskClaimResponse {
+        var request = try authorizedRequest(path: "/fleet/api/tasks/claim", method: "POST")
+        var body: [String: Any] = [:]
+        if let taskId, !taskId.isEmpty { body["taskId"] = taskId }
+        if let title, !title.isEmpty { body["title"] = title }
+        if let description, !description.isEmpty { body["description"] = description }
+        if let workspace, !workspace.isEmpty { body["workspace"] = workspace }
+        if let project, !project.isEmpty { body["project"] = project }
+        if let subchannel, !subchannel.isEmpty { body["subchannel"] = subchannel }
+        if let model, !model.isEmpty { body["model"] = model }
+        if let effort, !effort.isEmpty { body["effort"] = effort }
+        if let prompt, !prompt.isEmpty { body["prompt"] = prompt }
+        if !labels.isEmpty { body["labels"] = labels }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 60
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetTaskClaimResponse.self, from: data)
+    }
+
     // MARK: - Supervisor push (docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md)
 
     // Hands this phone's relay pass and push key to its own daemon, over the

@@ -558,7 +558,7 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
 
 export function buildSupervisorCard(
   question,
-  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null) } = {}
+  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null } = {}
 ) {
   const primaryKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
@@ -714,6 +714,29 @@ export function buildSupervisorCard(
       : null
   } : null;
 
+  const project = deriveCardProject(
+    { repo: row?.repo ?? thread?.repo ?? snap?.repo ?? parsedPr?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? snap?.workspace ?? null, project: question?.project ?? null },
+    thread ?? row
+  );
+  const actorLabel = deriveActorLabel(row, thread);
+  const subchannel = deriveSubchannel(row, thread, project);
+  const blockingImpact = computeBlockingImpact({
+    threadKey: primaryKey,
+    prRef,
+    branch: row?.branch ?? thread?.branch ?? snap?.branch ?? livePr?.headRef ?? null,
+    rowsByKey,
+    blockingResolver
+  });
+  const labels = deriveBoardLabels({
+    row,
+    thread,
+    question,
+    prRef,
+    ciState,
+    subchannel,
+    blockingCount: blockingImpact.blockingCount
+  });
+
   return {
     id: question.id,
     questionId: question.id,
@@ -751,7 +774,13 @@ export function buildSupervisorCard(
     extraActions,
     timeline: buildTimeline(question, row, actions, prMeta),
     resources: buildResources(question, row, prRef, { openChat, sessionTitle, prUrlOverride: prUrl }),
-    openChat
+    openChat,
+    project,
+    actorLabel,
+    subchannel,
+    labels,
+    blockingCount: blockingImpact.blockingCount,
+    blockingSummary: blockingImpact.blockingSummary
   };
 }
 
@@ -793,7 +822,11 @@ export function buildActiveSummary(snapshot, liveCards = []) {
         prRef: row.pr?.ref ?? null,
         ciState: row.pr?.ci?.state ?? null,
         lastActivityAt: row.lastActivityAt ?? null,
-        openChat: row.openChat ?? null
+        openChat: row.openChat ?? null,
+        actorLabel: row.actorLabel ?? null,
+        subchannel: row.subchannel ?? null,
+        labels: Array.isArray(row.labels) ? row.labels : [],
+        nextCheckAt: row.nextCheckAt ?? null
       });
     }
   }
@@ -907,9 +940,170 @@ export function deriveCardProject(card = null, thread = null) {
   return "general";
 }
 
+function cleanSubAreaSlug(raw) {
+  const clean = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^#/, "")
+    .replace(/[^a-z0-9/_-]+/g, "-")
+    .replace(/\/{2,}/g, "/")
+    .replace(/^[-/]+|[-/]+$/g, "");
+  if (!clean || OPAQUE_SESSION_ID_RE.test(clean) || clean === "general" || clean === "workspace") return null;
+  return clean.slice(0, 32);
+}
+
+export function deriveActorLabel(row = null, thread = null) {
+  const rawKind = String(thread?.kind ?? row?.kind ?? parsePaseoThreadKey(row?.key ?? thread?.key)?.kind ?? "").trim().toLowerCase();
+  const isPaseo = rawKind === "paseo" || Boolean(parsePaseoThreadKey(row?.key ?? thread?.key));
+  const providerRaw = String(thread?.meta?.provider ?? row?.provider ?? rawKind).trim();
+  const providerLeaf = providerRaw.includes("/") ? providerRaw.split("/")[0] : providerRaw;
+  const engine = (providerLeaf && providerLeaf !== "paseo" ? providerLeaf : null)
+    ?? (thread?.openChat?.app && thread.openChat.app !== "paseo" ? thread.openChat.app : null)
+    ?? (isPaseo ? "paseo" : rawKind || null);
+  const model = clampText(String(thread?.meta?.model ?? row?.model ?? "").trim(), 48) || null;
+  const hostVia = isPaseo
+    ? "Paseo"
+    : (rawKind === "conductor"
+        ? "Conductor"
+        : (rawKind === "codex"
+            ? "Codex"
+            : (rawKind === "claude"
+                ? "Claude Code"
+                : (rawKind === "antigravity" ? "Antigravity" : null))));
+  const head = [engine, model && !engine?.includes(model) ? model : null].filter(Boolean).join(" · ");
+  if (!head) return hostVia ?? null;
+  if (hostVia && hostVia.toLowerCase() !== engine?.toLowerCase()) {
+    return `${head} via ${hostVia}`;
+  }
+  return head;
+}
+
+export function deriveSubchannel(row = null, thread = null, explicitProject = null) {
+  const proj = cleanSubAreaSlug(explicitProject || deriveCardProject(row, thread)) || "general";
+  const explicitSub = typeof (row?.subchannel ?? thread?.meta?.subchannel) === "string"
+    ? row?.subchannel ?? thread?.meta?.subchannel
+    : null;
+  if (explicitSub) {
+    const cleaned = cleanSubAreaSlug(explicitSub);
+    if (cleaned) {
+      return cleaned.includes("/") ? cleaned : `${proj}/${cleaned}`;
+    }
+  }
+  const theme = cleanSubAreaSlug(row?.theme ?? thread?.theme ?? thread?.meta?.theme);
+  if (theme && theme !== proj) {
+    return theme.includes("/") ? theme : `${proj}/${theme}`;
+  }
+  const rawCwd = String(thread?.cwd ?? thread?.meta?.paseoCwd ?? row?.cwd ?? "").trim().replace(/\/+$/, "");
+  if (rawCwd) {
+    const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/i.exec(rawCwd)
+      ?? /\/conductor\/workspaces\/([^/]+)\/([^/]+)/i.exec(rawCwd);
+    if (wtMatch?.[2]) {
+      const wt = cleanSubAreaSlug(wtMatch[2]);
+      if (wt && wt !== proj) return `${proj}/${wt}`;
+    }
+    const base = cleanSubAreaSlug(rawCwd.split("/").filter(Boolean).at(-1));
+    if (base && base !== proj && rawCwd.toLowerCase().includes(`/${proj}/`)) {
+      return `${proj}/${base}`;
+    }
+  }
+  return null;
+}
+
+export function deriveBoardLabels({
+  row = null,
+  thread = null,
+  question = null,
+  prRef = null,
+  ciState = null,
+  subchannel = null,
+  blockingCount = 0
+} = {}) {
+  const out = [];
+  const seen = new Set();
+  const push = (key, value) => {
+    const k = String(key ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    const v = String(value ?? "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_./#-]/g, "");
+    if (!k || !v) return;
+    const token = `${k}=${v}`.slice(0, 64);
+    if (seen.has(token)) return;
+    seen.add(token);
+    out.push(token);
+  };
+
+  const watchGroup = row?.watch?.group ?? null;
+  const rawState = String(row?.state ?? thread?.agentStatus ?? "").toLowerCase();
+  if (blockingCount > 0 || question?.kind === "blocked" || ciState === "FAILURE" || ciState === "ERROR" || row?.health === "red" || watchGroup === "blocked") {
+    push("state", "blocked");
+  } else if (watchGroup === "you" || question?.status === "open" || rawState === "waiting" || rawState === "needs-human") {
+    push("state", "waiting");
+  } else if (question?.kind === "ready" || rawState === "ready-needs-human") {
+    push("state", "ready");
+  } else if (row?.agentStatus === "running" || rawState === "running" || watchGroup === "working") {
+    push("state", "running");
+  } else if (rawState && rawState !== "unknown") {
+    push("state", rawState);
+  }
+
+  const providerRaw = String(thread?.meta?.provider ?? row?.provider ?? thread?.kind ?? row?.kind ?? "").trim();
+  const agentLeaf = providerRaw.includes("/") ? providerRaw.split("/")[0] : providerRaw;
+  if (agentLeaf) push("agent", agentLeaf);
+
+  const parsedPr = parsePrRef(prRef ?? row?.pr?.ref ?? thread?.prRefs?.[0]);
+  if (parsedPr?.number) push("pr", `#${parsedPr.number}`);
+
+  const ci = String(ciState ?? row?.pr?.ci?.state ?? "").toUpperCase();
+  if (ci === "SUCCESS") push("ci", "passing");
+  else if (ci === "FAILURE" || ci === "ERROR") push("ci", "failing");
+  else if (ci === "PENDING" || ci === "IN_PROGRESS") push("ci", "pending");
+
+  if (subchannel && subchannel.includes("/")) {
+    push("area", subchannel.split("/").slice(1).join("/"));
+  }
+  return out;
+}
+
+export function computeBlockingImpact({
+  threadKey = null,
+  prRef = null,
+  branch = null,
+  rowsByKey = new Map(),
+  blockingResolver = null
+} = {}) {
+  const taskImpact = typeof blockingResolver === "function" && threadKey
+    ? (blockingResolver(threadKey) ?? { count: 0, blockingTitles: [] })
+    : { count: 0, blockingTitles: [] };
+  const taskCount = Number.isFinite(taskImpact?.count) ? Math.max(0, taskImpact.count) : 0;
+  const titles = Array.isArray(taskImpact?.blockingTitles) ? taskImpact.blockingTitles.filter(Boolean) : [];
+
+  let peerWaitingCount = 0;
+  for (const [k, r] of rowsByKey ?? []) {
+    if (!k || !r || k === threadKey || r.muted) continue;
+    const samePr = Boolean(prRef && r.pr?.ref && r.pr.ref === prRef);
+    const sameBranch = Boolean(branch && r.branch && r.branch === branch);
+    if (!samePr && !sameBranch) continue;
+    const waitingLike = r.watch?.group === "waiting" || r.watch?.group === "blocked" || r.state === "waiting" || r.health === "red";
+    if (waitingLike) peerWaitingCount += 1;
+  }
+
+  const blockingCount = taskCount + peerWaitingCount;
+  if (blockingCount <= 0) return { blockingCount: 0, blockingSummary: null };
+  if (taskCount > 0) {
+    const sample = titles[0] ? ` (${clampText(titles[0], 42)})` : "";
+    return {
+      blockingCount,
+      blockingSummary: `Blocking ${blockingCount} downstream item${blockingCount === 1 ? "" : "s"}${sample}`
+    };
+  }
+  const target = prRef || branch || "downstream work";
+  return {
+    blockingCount,
+    blockingSummary: `Blocking ${peerWaitingCount} waiting session${peerWaitingCount === 1 ? "" : "s"} on ${target}`
+  };
+}
+
 export function buildSupervisorDeck(
   state,
-  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map() } = {}
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null } = {}
 ) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
@@ -921,7 +1115,7 @@ export function buildSupervisorDeck(
 
   const questionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs }))
+    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
 
   const prefCards = buildProgressivePreferenceCards(prefs, { now });

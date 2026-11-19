@@ -105,14 +105,16 @@ struct FleetConversationMessage: Decodable, Equatable, Identifiable {
   let role: String
   let text: String
   let at: String?
+  let actor: String?
 
-  enum CodingKeys: String, CodingKey { case id, role, text, at }
+  enum CodingKeys: String, CodingKey { case id, role, text, at, actor }
 
-  init(id: String, role: String, text: String, at: String? = nil) {
+  init(id: String, role: String, text: String, at: String? = nil, actor: String? = nil) {
     self.id = id
     self.role = role
     self.text = text
     self.at = at
+    self.actor = actor
   }
 
   init(from decoder: Decoder) throws {
@@ -124,12 +126,19 @@ struct FleetConversationMessage: Decodable, Equatable, Identifiable {
     text = raw
     role = (try? c.decodeIfPresent(String.self, forKey: .role)) ?? "assistant"
     at = try? c.decodeIfPresent(String.self, forKey: .at)
+    actor = try? c.decodeIfPresent(String.self, forKey: .actor)
     // A hub without ids: the list index stands in (FleetConversation).
     id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
   }
 
   var isOwner: Bool { role == "user" }
   var speaker: String { isOwner ? "You" : "Agent" }
+  var displaySpeaker: String {
+    if let clean = actor?.trimmingCharacters(in: .whitespacesAndNewlines), !clean.isEmpty {
+      return clean
+    }
+    return speaker
+  }
 }
 
 /// A thread's recent chat, oldest first. `unavailableReason`: why the hub
@@ -156,7 +165,7 @@ struct FleetConversation: Decodable, Equatable {
       guard let message = item.value else { return nil }
       let id = message.id.isEmpty || seen.contains(message.id) ? "#\(index)" : message.id
       seen.insert(id)
-      return FleetConversationMessage(id: id, role: message.role, text: message.text, at: message.at)
+      return FleetConversationMessage(id: id, role: message.role, text: message.text, at: message.at, actor: message.actor)
     }
     truncated = (try? c.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
     let reason = (try? c.decodeIfPresent(String.self, forKey: .unavailableReason))?.trimmingCharacters(in: .whitespacesAndNewlines)

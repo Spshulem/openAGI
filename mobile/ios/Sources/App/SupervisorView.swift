@@ -4,6 +4,14 @@ import SupervisorChannelsKit
 import UIKit
 import UniformTypeIdentifiers
 
+fileprivate enum BoardBrowseMode: String, CaseIterable, Identifiable {
+    case themes = "Projects"
+    case sessions = "Sessions"
+    case tasks = "Tasks"
+    case activity = "Activity"
+    var id: String { rawValue }
+}
+
 // mobile/FEATURES.md's Supervisor tab: one fluid conversation with the fleet
 // supervisor ("supervisor" shared thread) paired with a pinned, swipeable
 // Decision Card deck above the composer (Claude Duet style), a compact active
@@ -37,6 +45,9 @@ struct SupervisorView: View {
     @State private var actionNoteThread: String?
     @State private var selectedCardIndex = 0
     @State private var selectedProjectChannel: String? = nil
+    @State private var selectedSubchannel: String? = nil
+    @State private var activeLabelFilters: Set<String> = []
+    @State private var initialBrowseMode: BoardBrowseMode = .themes
     @State private var clearedFocusCardID: String?
     @State private var selectedMessage: UUID?
     @State private var browserThread: ConversationThread = .supervisor
@@ -69,8 +80,8 @@ struct SupervisorView: View {
         return SupervisorFormat.resolvedCards(state)
     }
 
-    private var channelSummaries: [SupervisorChannelSummary] {
-        let decisionItems = cards.map { card in
+    private var decisionItems: [SupervisorDecisionItem] {
+        cards.map { card in
             SupervisorDecisionItem(
                 id: card.id,
                 project: SupervisorChannelGrouping.normalizeProject(
@@ -78,34 +89,74 @@ struct SupervisorView: View {
                     repo: card.repo,
                     workspace: card.workspace
                 ),
+                subchannel: card.subchannel,
                 headline: card.headline,
                 kindLabel: card.kindLabel ?? "Needs you",
                 risky: card.risky
             )
         }
-        let sessionBriefs = (state?.snapshot?.threads ?? []).map { t in
+    }
+
+    private var sessionBriefs: [SupervisorSessionBrief] {
+        (state?.snapshot?.threads ?? []).map { t in
             SupervisorSessionBrief(
                 id: t.key,
                 project: SupervisorChannelGrouping.normalizeProject(
                     repo: t.repo,
                     workspace: t.workspace
                 ),
+                subchannel: t.subchannel,
                 title: SupervisorFormat.name(t),
                 state: t.state ?? "idle"
             )
         }
-        return SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+    }
+
+    private var channelSummaries: [SupervisorChannelSummary] {
+        SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+    }
+
+    private var subchannelSummaries: [SupervisorSubchannelSummary] {
+        guard let selectedProjectChannel else { return [] }
+        return SupervisorChannelGrouping.subchannels(
+            forProject: selectedProjectChannel,
+            from: decisionItems,
+            sessions: sessionBriefs
+        )
+    }
+
+    private var availableLabels: [SupervisorBoardLabel] {
+        Array(SupervisorBoardLabel.extract(from: cards.flatMap(\.labels)).prefix(10))
+    }
+
+    private func normalizedSubLeaf(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        let clean = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        let parts = clean.split(separator: "/").map(String.init)
+        return parts.count > 1 ? parts.dropFirst().joined(separator: "/") : clean
     }
 
     private var displayedCards: [SupervisorCard] {
-        guard let selectedProjectChannel else { return cards }
-        return cards.filter { card in
-            let proj = SupervisorChannelGrouping.normalizeProject(
-                explicit: card.project,
-                repo: card.repo,
-                workspace: card.workspace
-            )
-            return proj.caseInsensitiveCompare(selectedProjectChannel) == .orderedSame
+        cards.filter { card in
+            if let selectedProjectChannel {
+                let proj = SupervisorChannelGrouping.normalizeProject(
+                    explicit: card.project,
+                    repo: card.repo,
+                    workspace: card.workspace
+                )
+                guard proj.caseInsensitiveCompare(selectedProjectChannel) == .orderedSame else {
+                    return false
+                }
+            }
+            if let selectedSubchannel, let targetSub = normalizedSubLeaf(selectedSubchannel) {
+                guard let cardSub = normalizedSubLeaf(card.subchannel),
+                      cardSub.caseInsensitiveCompare(targetSub) == .orderedSame else {
+                    return false
+                }
+            }
+            return SupervisorBoardLabel.matches(tags: card.labels, activeFilters: activeLabelFilters)
         }
     }
 
@@ -258,6 +309,7 @@ struct SupervisorView: View {
             case .sessions:
                 ActiveSessionsSheet(
                     state: state,
+                    initialMode: initialBrowseMode,
                     scanning: scanning || state?.running == true,
                     onScan: { Task { await scan() } },
                     onAcceptState: { fresh in accept(nextSequence(), fresh) },
@@ -325,6 +377,7 @@ struct SupervisorView: View {
         let label = state.map(SupervisorFormat.activePill) ?? (loadError != nil ? "Offline" : "Loading…")
         let isLive = (state?.running == true) || scanning || (state?.activeSummary?.running ?? 0) > 0
         return Button {
+            initialBrowseMode = .sessions
             activeSheet = .sessions
         } label: {
             HStack(spacing: 6) {
@@ -380,6 +433,7 @@ struct SupervisorView: View {
             }
 
             Button("Active sessions & search", systemImage: "magnifyingglass") {
+                initialBrowseMode = .themes
                 activeSheet = .sessions
             }
 
@@ -496,29 +550,51 @@ struct SupervisorView: View {
                 .padding(.vertical, 4)
             }
             if state != nil || modelSettings != nil {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        Button {
-                            selectedProjectChannel = nil
-                            selectedCardIndex = 0
-                        } label: {
-                            Text(cards.isEmpty ? "#general" : "#general · \(cards.count)")
-                                .font(Theme.Typography.caption.weight(.semibold))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    selectedProjectChannel == nil ? Theme.ink : Theme.surface,
-                                    in: Capsule()
-                                )
-                                .foregroundStyle(selectedProjectChannel == nil ? Theme.canvas : Theme.ink)
-                        }
-                        .buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 4) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            if let checkLabel = SupervisorQuietCheckFormatter.badge(nextCheckDate: state?.nextTickAt) {
+                                BoardQuietCheckPill(label: checkLabel)
+                            }
 
-                        if let sessionsTotal = state?.activeSummary?.total ?? state?.snapshot?.threads.count, sessionsTotal > 0 {
                             Button {
+                                selectedProjectChannel = nil
+                                selectedSubchannel = nil
+                                selectedCardIndex = 0
+                            } label: {
+                                Text(cards.isEmpty ? "#general" : "#general · \(cards.count)")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(
+                                        selectedProjectChannel == nil ? Theme.ink : Theme.surface,
+                                        in: Capsule()
+                                    )
+                                    .foregroundStyle(selectedProjectChannel == nil ? Theme.canvas : Theme.ink)
+                            }
+                            .buttonStyle(.plain)
+
+                            if let sessionsTotal = state?.activeSummary?.total ?? state?.snapshot?.threads.count, sessionsTotal > 0 {
+                                Button {
+                                    initialBrowseMode = .sessions
+                                    activeSheet = .sessions
+                                } label: {
+                                    Text("#sessions · \(sessionsTotal)")
+                                        .font(Theme.Typography.caption.weight(.semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Theme.surface, in: Capsule())
+                                        .foregroundStyle(Theme.ink)
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            Button {
+                                initialBrowseMode = .activity
                                 activeSheet = .sessions
                             } label: {
-                                Text("#sessions · \(sessionsTotal)")
+                                let count = state?.activityEvents.count ?? 0
+                                Text(count > 0 ? "#activity · \(count)" : "#activity")
                                     .font(Theme.Typography.caption.weight(.semibold))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
@@ -526,34 +602,77 @@ struct SupervisorView: View {
                                     .foregroundStyle(Theme.ink)
                             }
                             .buttonStyle(.plain)
-                        }
 
-                        quickModelMenuPill
-
-                        ForEach(channelSummaries) { ch in
-                            let projName: String = {
-                                if case let .project(name) = ch.kind { return name }
-                                return ch.displayName
-                            }()
-                            let isSelected = selectedProjectChannel?.caseInsensitiveCompare(projName) == .orderedSame
                             Button {
-                                selectedProjectChannel = isSelected ? nil : projName
-                                selectedCardIndex = 0
+                                initialBrowseMode = .tasks
+                                activeSheet = .sessions
                             } label: {
-                                Text(ch.waitingCount > 0 ? "#\(projName) · \(ch.waitingCount)" : "#\(projName)")
+                                Label("Board", systemImage: "checklist")
                                     .font(Theme.Typography.caption.weight(.semibold))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(isSelected ? Theme.ink : Theme.surface, in: Capsule())
-                                    .foregroundStyle(isSelected ? Theme.canvas : Theme.ink)
+                                    .background(Theme.surface, in: Capsule())
+                                    .foregroundStyle(Theme.ink)
                             }
                             .buttonStyle(.plain)
+
+                            quickModelMenuPill
+
+                            ForEach(channelSummaries) { ch in
+                                let projName: String = {
+                                    if case let .project(name) = ch.kind { return name }
+                                    return ch.displayName
+                                }()
+                                let isSelected = selectedProjectChannel?.caseInsensitiveCompare(projName) == .orderedSame
+                                Button {
+                                    selectedProjectChannel = isSelected ? nil : projName
+                                    selectedSubchannel = nil
+                                    selectedCardIndex = 0
+                                } label: {
+                                    Text(ch.waitingCount > 0 ? "#\(projName) · \(ch.waitingCount)" : "#\(projName)")
+                                        .font(Theme.Typography.caption.weight(.semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(isSelected ? Theme.ink : Theme.surface, in: Capsule())
+                                        .foregroundStyle(isSelected ? Theme.canvas : Theme.ink)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, Theme.gutter)
+                        .padding(.vertical, 6)
+                    }
+                    .accessibilityIdentifier("supervisor-project-channels")
+
+                    if !subchannelSummaries.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(subchannelSummaries) { sub in
+                                    let isSelected = selectedSubchannel?.caseInsensitiveCompare(sub.displayName) == .orderedSame
+                                    Button {
+                                        selectedSubchannel = isSelected ? nil : sub.displayName
+                                        selectedCardIndex = 0
+                                    } label: {
+                                        Text(sub.waitingCount > 0 ? "\(sub.displayName) · \(sub.waitingCount)" : sub.displayName)
+                                            .font(.caption2.weight(.semibold))
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                            .background(isSelected ? Color.accentColor : Theme.surface, in: Capsule())
+                                            .foregroundStyle(isSelected ? Color.white : Theme.ink)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, Theme.gutter)
                         }
                     }
-                    .padding(.horizontal, Theme.gutter)
-                    .padding(.vertical, 6)
+
+                    if !availableLabels.isEmpty {
+                        BoardLabelChipsRow(labels: availableLabels, activeFilters: $activeLabelFilters)
+                            .padding(.horizontal, Theme.gutter)
+                            .padding(.bottom, 4)
+                    }
                 }
-                .accessibilityIdentifier("supervisor-project-channels")
             }
         }
     }
@@ -1244,6 +1363,39 @@ private struct SupervisorCardDeckView: View {
                     .foregroundStyle(Theme.muted)
                     .lineLimit(1)
             }
+            if card.blockingCount > 0 {
+                BoardBlockingPill(summary: card.blockingSummary ?? "Blocking \(card.blockingCount) downstream")
+            }
+            let subSlug = card.subchannel.flatMap { raw -> String? in
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                let clean = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+                return clean.split(separator: "/").last.map(String.init) ?? clean
+            }
+            let cardLabels = Array(SupervisorBoardLabel.extract(from: card.labels).prefix(6))
+            if card.actorLabel != nil || subSlug != nil || !cardLabels.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    if card.actorLabel != nil || subSlug != nil {
+                        HStack(spacing: 6) {
+                            if let actor = card.actorLabel, !actor.isEmpty {
+                                BoardActorPill(actor: actor)
+                            }
+                            if let subSlug {
+                                Text("/\(subSlug)")
+                                    .font(.caption2.weight(.semibold))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(Theme.surface, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 0.5))
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+                    }
+                    if !cardLabels.isEmpty {
+                        BoardReadOnlyLabelsRow(labels: cardLabels)
+                    }
+                }
+            }
             if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
                 Text(ctx)
                     .font(Theme.Typography.caption)
@@ -1446,20 +1598,15 @@ private struct DeckPillButton: View {
 
 private struct ActiveSessionsSheet: View {
     let state: FleetState?
+    var initialMode: BoardBrowseMode = .themes
     let scanning: Bool
     let onScan: () -> Void
     var onAcceptState: ((FleetState) -> Void)? = nil
     let onSelectThread: (FleetThread) -> Void
 
-    private enum BrowseMode: String, CaseIterable, Identifiable {
-        case themes = "Projects & Themes"
-        case sessions = "Sessions"
-        var id: String { rawValue }
-    }
-
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    @State private var browseMode: BrowseMode = .themes
+    @State private var browseMode: BoardBrowseMode
     @State private var query = ""
     @State private var searchHits: [FleetSearchHit] = []
     @State private var isSearching = false
@@ -1471,6 +1618,31 @@ private struct ActiveSessionsSheet: View {
     @State private var dispatchingGoal = false
     @State private var dispatchOutcomeNote: String?
 
+    @State private var taskStateFilter: SupervisorBoardTaskState = .all
+    @State private var taskLabelFilters: Set<String> = []
+    @State private var newTaskTitle = ""
+    @State private var creatingBoardTask = false
+    @State private var claimingTaskID: String?
+    @State private var boardTaskNote: String?
+    @State private var inspectedThread: FleetThread?
+
+    init(
+        state: FleetState?,
+        initialMode: BoardBrowseMode = .themes,
+        scanning: Bool,
+        onScan: @escaping () -> Void,
+        onAcceptState: ((FleetState) -> Void)? = nil,
+        onSelectThread: @escaping (FleetThread) -> Void
+    ) {
+        self.state = state
+        self.initialMode = initialMode
+        self.scanning = scanning
+        self.onScan = onScan
+        self.onAcceptState = onAcceptState
+        self.onSelectThread = onSelectThread
+        _browseMode = State(initialValue: initialMode)
+    }
+
     private var threads: [FleetThread] {
         SupervisorFormat.sorted(state?.snapshot?.threads ?? [])
     }
@@ -1480,112 +1652,75 @@ private struct ActiveSessionsSheet: View {
         return hierarchy.projects.first(where: { $0.id == selectedProjectId })
     }
 
+    private var combinedBoardTasks: [TaskRecord] {
+        let user = model.workspace.tasks[TaskQueue.user.rawValue] ?? []
+        let agent = model.workspace.tasks[TaskQueue.agent.rawValue] ?? []
+        return (user + agent).sorted { lhs, rhs in
+            if lhs.queue != rhs.queue { return lhs.queue == TaskQueue.agent.rawValue }
+            return lhs.priority > rhs.priority
+        }
+    }
+
+    private var availableBoardTaskLabels: [SupervisorBoardLabel] {
+        Array(SupervisorBoardLabel.extract(from: combinedBoardTasks.flatMap(\.tags)).prefix(12))
+    }
+
+    private var filteredBoardTasks: [TaskRecord] {
+        combinedBoardTasks.filter { task in
+            if let activeProject, let taskProj = task.sourceMeta?.project, !taskProj.isEmpty {
+                guard taskProj.caseInsensitiveCompare(activeProject.name) == .orderedSame else {
+                    return false
+                }
+            }
+            let st = SupervisorBoardTaskClassifier.classify(
+                status: task.status,
+                queue: task.queue,
+                hasUnmetDeps: !task.dependsOn.isEmpty && task.status.lowercased() == "blocked",
+                leaseExpiresAtISO: task.sourceMeta?.agentLease?.expiresAt
+            )
+            if taskStateFilter != .all && st != taskStateFilter {
+                return false
+            }
+            return SupervisorBoardLabel.matches(tags: task.tags, activeFilters: taskLabelFilters)
+        }
+    }
+
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let state {
-                            HStack {
-                                Text(SupervisorFormat.scanLine(lastTickAt: state.lastTickAt, autoScan: state.enabled, now: Date()))
-                                    .font(Theme.Typography.caption)
-                                    .foregroundStyle(Theme.muted)
-                                Spacer()
-                                Button(scanning ? "Scanning…" : "Scan now") { onScan() }
-                                    .font(Theme.Typography.caption.weight(.semibold))
-                                    .disabled(scanning)
+            GeometryReader { geo in
+                let isWide = geo.size.width >= 660
+                Group {
+                    if isWide {
+                        HStack(spacing: 0) {
+                            sessionsList(isWide: true)
+                                .frame(width: min(390, max(300, geo.size.width * 0.43)))
+                            Divider()
+                            BoardThreadInspectorPane(
+                                orderedThreads: threads,
+                                selectedThread: $inspectedThread,
+                                onExpand: onSelectThread,
+                                onAcceptState: onAcceptState
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .onAppear {
+                            if inspectedThread == nil, let first = threads.first {
+                                inspectedThread = first
                             }
                         }
-                        Picker("Browse", selection: $browseMode) {
-                            ForEach(BrowseMode.allCases) { item in
-                                Text(item.rawValue).tag(item)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-                }
-
-                if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Section("Search across all sessions") {
-                        if isSearching && searchHits.isEmpty {
-                            ProgressView("Searching transcripts…")
-                        } else if let searchError {
-                            Text(searchError).font(.footnote).foregroundStyle(Theme.muted)
-                        } else if searchHits.isEmpty {
-                            Text("No matching sessions found.").font(.footnote).foregroundStyle(Theme.muted)
-                        } else {
-                            ForEach(searchHits) { hit in
-                                Button {
-                                    let existing = threads.first(where: { $0.key == hit.key })
-                                    let thread = existing ?? FleetThread(
-                                        key: hit.key,
-                                        title: hit.title,
-                                        workspace: hit.workspace,
-                                        repo: hit.repo,
-                                        branch: hit.branch,
-                                        state: hit.state,
-                                        health: hit.health,
-                                        pr: hit.prRef.map { FleetPR(ref: $0) },
-                                        live: hit.live
-                                    )
-                                    onSelectThread(thread)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        let hitTitle = SupervisorFormat.cleanWorkspace(hit.workspace)
-                                            ?? hit.title.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
-                                            ?? SupervisorFormat.formatOpaqueKey(hit.key)
-                                        Text(hitTitle)
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(Theme.ink)
-                                        if let meta = [hit.repo, hit.branch, SupervisorFormat.prNumber(hit.prRef)].compactMap({ $0 }).joined(separator: " · ") as String?, !meta.isEmpty {
-                                            Text(meta).font(.caption).foregroundStyle(Theme.muted)
-                                        }
-                                        if let snippet = hit.snippet, !snippet.isEmpty {
-                                            Text(snippet)
-                                                .font(.caption)
-                                                .foregroundStyle(Theme.muted)
-                                                .lineLimit(2)
-                                        }
-                                    }
-                                    .padding(.vertical, 2)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                } else if browseMode == .themes {
-                    themesContent
-                } else {
-                    Section(threads.isEmpty ? "Sessions" : SupervisorFormat.summary(threads)) {
-                        if state?.snapshot == nil {
-                            Text("No scan yet. Tap Scan now.")
-                                .font(.footnote)
-                                .foregroundStyle(Theme.muted)
-                        } else if threads.isEmpty {
-                            Text("No recent coding threads.")
-                                .font(.footnote)
-                                .foregroundStyle(Theme.muted)
-                        } else {
-                            let proposing = state?.mode == FleetMode.propose.rawValue
-                            ForEach(threads) { thread in
-                                Button {
-                                    onSelectThread(thread)
-                                } label: {
-                                    ThreadRow(
-                                        thread: thread,
-                                        hasProposal: proposing && !SupervisorFormat.proposed(for: thread, in: state?.actions ?? []).isEmpty
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
+                    } else {
+                        sessionsList(isWide: false)
                     }
                 }
             }
-            .listStyle(.insetGrouped)
             .searchable(text: $query, prompt: "Search repos, PRs, branches, transcripts")
             .task {
                 await loadHierarchy()
+            }
+            .task(id: browseMode) {
+                if browseMode == .tasks {
+                    await refreshBoardTasks(force: true)
+                }
             }
             .task(id: query) {
                 let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1610,7 +1745,7 @@ private struct ActiveSessionsSheet: View {
                     searchError = "Couldn't search sessions right now."
                 }
             }
-            .navigationTitle(activeProject?.supervisorTitle ?? "Supervisor Map")
+            .navigationTitle(activeProject?.supervisorTitle ?? "Supervisor Board")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if activeProject != nil {
@@ -1628,8 +1763,153 @@ private struct ActiveSessionsSheet: View {
         }
     }
 
+    private func resolveThread(
+        key: String,
+        title: String? = nil,
+        workspace: String? = nil,
+        repo: String? = nil,
+        branch: String? = nil,
+        state: String? = nil,
+        health: String? = nil,
+        prRef: String? = nil,
+        live: Bool = false
+    ) -> FleetThread {
+        if let existing = threads.first(where: { $0.key == key }) {
+            return existing
+        }
+        return FleetThread(
+            key: key,
+            title: title,
+            workspace: workspace,
+            repo: repo,
+            branch: branch,
+            state: state,
+            health: health,
+            pr: prRef.map { FleetPR(ref: $0) },
+            live: live
+        )
+    }
+
+    private func selectThread(_ thread: FleetThread, isWide: Bool) {
+        if isWide {
+            inspectedThread = thread
+        } else {
+            onSelectThread(thread)
+        }
+    }
+
+    private func sessionsList(isWide: Bool) -> some View {
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let state {
+                        HStack {
+                            Text(SupervisorFormat.scanLine(lastTickAt: state.lastTickAt, autoScan: state.enabled, now: Date()))
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(Theme.muted)
+                            Spacer()
+                            Button(scanning ? "Scanning…" : "Scan now") { onScan() }
+                                .font(Theme.Typography.caption.weight(.semibold))
+                                .disabled(scanning)
+                        }
+                    }
+                    Picker("Browse", selection: $browseMode) {
+                        ForEach(BoardBrowseMode.allCases) { item in
+                            Text(item.rawValue).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+
+            if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Section("Search across all sessions") {
+                    if isSearching && searchHits.isEmpty {
+                        ProgressView("Searching transcripts…")
+                    } else if let searchError {
+                        Text(searchError).font(.footnote).foregroundStyle(Theme.muted)
+                    } else if searchHits.isEmpty {
+                        Text("No matching sessions found.").font(.footnote).foregroundStyle(Theme.muted)
+                    } else {
+                        ForEach(searchHits) { hit in
+                            Button {
+                                let thread = resolveThread(
+                                    key: hit.key,
+                                    title: hit.title,
+                                    workspace: hit.workspace,
+                                    repo: hit.repo,
+                                    branch: hit.branch,
+                                    state: hit.state,
+                                    health: hit.health,
+                                    prRef: hit.prRef,
+                                    live: hit.live
+                                )
+                                selectThread(thread, isWide: isWide)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    let hitTitle = SupervisorFormat.cleanWorkspace(hit.workspace)
+                                        ?? hit.title.flatMap({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 })
+                                        ?? SupervisorFormat.formatOpaqueKey(hit.key)
+                                    Text(hitTitle)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(Theme.ink)
+                                    if let meta = [hit.repo, hit.branch, SupervisorFormat.prNumber(hit.prRef)].compactMap({ $0 }).joined(separator: " · ") as String?, !meta.isEmpty {
+                                        Text(meta).font(.caption).foregroundStyle(Theme.muted)
+                                    }
+                                    if let snippet = hit.snippet, !snippet.isEmpty {
+                                        Text(snippet)
+                                            .font(.caption)
+                                            .foregroundStyle(Theme.muted)
+                                            .lineLimit(2)
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            } else {
+                switch browseMode {
+                case .themes:
+                    themesContent(isWide: isWide)
+                case .sessions:
+                    Section(threads.isEmpty ? "Sessions" : SupervisorFormat.summary(threads)) {
+                        if state?.snapshot == nil {
+                            Text("No scan yet. Tap Scan now.")
+                                .font(.footnote)
+                                .foregroundStyle(Theme.muted)
+                        } else if threads.isEmpty {
+                            Text("No recent coding threads.")
+                                .font(.footnote)
+                                .foregroundStyle(Theme.muted)
+                        } else {
+                            let proposing = state?.mode == FleetMode.propose.rawValue
+                            ForEach(threads) { thread in
+                                Button {
+                                    selectThread(thread, isWide: isWide)
+                                } label: {
+                                    ThreadRow(
+                                        thread: thread,
+                                        hasProposal: proposing && !SupervisorFormat.proposed(for: thread, in: state?.actions ?? []).isEmpty
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                case .tasks:
+                    boardTasksContent(isWide: isWide)
+                case .activity:
+                    boardActivityContent(isWide: isWide)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+    }
+
     @ViewBuilder
-    private var themesContent: some View {
+    private func themesContent(isWide: Bool) -> some View {
         if loadingHierarchy && hierarchy == nil {
             Section {
                 ProgressView("Loading projects & themes…")
@@ -1662,17 +1942,16 @@ private struct ActiveSessionsSheet: View {
                 Section("\(theme.name) (\(theme.counts.total))") {
                     ForEach(theme.sessions) { item in
                         Button {
-                            let existing = threads.first(where: { $0.key == item.key })
-                            let mapped = existing ?? FleetThread(
+                            let mapped = resolveThread(
                                 key: item.key,
                                 title: item.title,
                                 workspace: project.name,
                                 repo: project.repo,
                                 state: item.state,
-                                pr: item.prRefs.first.map { FleetPR(ref: $0) },
+                                prRef: item.prRefs.first,
                                 live: item.state == "running"
                             )
-                            onSelectThread(mapped)
+                            selectThread(mapped, isWide: isWide)
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
                                 let nonEmptyTitle = item.title.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
@@ -1743,6 +2022,264 @@ private struct ActiveSessionsSheet: View {
         }
     }
 
+    @ViewBuilder
+    private func boardTasksContent(isWide: Bool) -> some View {
+        Section("Start Task in Paseo") {
+            HStack(spacing: 8) {
+                TextField("New task title — start coding session…", text: $newTaskTitle)
+                Button(creatingBoardTask ? "Starting…" : "Start") {
+                    Task { await startNewBoardTask(isWide: isWide) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(creatingBoardTask || newTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(SupervisorBoardTaskState.allCases) { item in
+                        let selected = taskStateFilter == item
+                        Button {
+                            taskStateFilter = item
+                        } label: {
+                            Label(item.label, systemImage: item.systemImage)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(selected ? Theme.live : Theme.surface, in: Capsule())
+                                .foregroundStyle(selected ? Color.white : Theme.ink)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            if !availableBoardTaskLabels.isEmpty {
+                BoardLabelChipsRow(labels: availableBoardTaskLabels, activeFilters: $taskLabelFilters)
+            }
+
+            if let boardTaskNote {
+                Text(boardTaskNote)
+                    .font(.caption)
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+
+        Section("Board Tasks (\(filteredBoardTasks.count))") {
+            if filteredBoardTasks.isEmpty {
+                Text("No tasks match the current Board filter.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+            } else {
+                ForEach(filteredBoardTasks) { task in
+                    let taskState = SupervisorBoardTaskClassifier.classify(
+                        status: task.status,
+                        queue: task.queue,
+                        hasUnmetDeps: !task.dependsOn.isEmpty && task.status.lowercased() == "blocked",
+                        leaseExpiresAtISO: task.sourceMeta?.agentLease?.expiresAt
+                    )
+                    let leaseBadge = SupervisorBoardTaskClassifier.leaseBadgeText(expiresAtISO: task.sourceMeta?.agentLease?.expiresAt)
+                    let rowLabels = SupervisorBoardLabel.extract(from: task.tags)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(task.title)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Theme.ink)
+                            Spacer()
+                            Text(leaseBadge ?? taskState.label)
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Theme.live.opacity(0.12), in: Capsule())
+                                .foregroundStyle(taskState == .blocked ? Theme.alert : Theme.live)
+                        }
+
+                        if let blockedReason = task.sourceMeta?.blockedReason, !blockedReason.isEmpty {
+                            BoardBlockingPill(summary: blockedReason)
+                        }
+
+                        HStack(spacing: 6) {
+                            if let actor = task.sourceMeta?.actor, !actor.isEmpty {
+                                BoardActorPill(actor: actor)
+                            }
+                            if let project = task.sourceMeta?.project, !project.isEmpty {
+                                let sub = task.sourceMeta?.subchannel.flatMap { $0.isEmpty ? nil : "/\($0)" } ?? ""
+                                Text("#\(project)\(sub)")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+
+                        if !rowLabels.isEmpty {
+                            BoardReadOnlyLabelsRow(labels: rowLabels)
+                        }
+
+                        HStack(spacing: 8) {
+                            if let threadKey = task.sourceMeta?.threadKey, !threadKey.isEmpty {
+                                Button("Inspect session") {
+                                    let resolved = resolveThread(
+                                        key: threadKey,
+                                        title: task.title,
+                                        workspace: task.sourceMeta?.project
+                                    )
+                                    selectThread(resolved, isWide: isWide)
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption.weight(.semibold))
+                            } else if !["completed", "cancelled"].contains(task.status.lowercased()) {
+                                Button(claimingTaskID == task.id ? "Claiming…" : "Claim in Paseo") {
+                                    Task { await claimExistingTask(task, isWide: isWide) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .font(.caption.weight(.semibold))
+                                .disabled(claimingTaskID != nil)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func boardActivityContent(isWide: Bool) -> some View {
+        let events = state?.activityEvents ?? []
+        Section("Recent Activity (\(events.count))") {
+            if events.isEmpty {
+                Text("No recent board activity recorded yet.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+            } else {
+                ForEach(events) { event in
+                    let rowLabels = SupervisorBoardLabel.extract(from: event.labels)
+                    let content = VStack(alignment: .leading, spacing: 5) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(event.title)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Theme.ink)
+                                .lineLimit(2)
+                            Spacer()
+                            if let at = event.at {
+                                Text(SupervisorFormat.clockTime(at))
+                                    .font(.caption2)
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+                        if let detail = event.detail, !detail.isEmpty {
+                            Text(detail)
+                                .font(.caption)
+                                .foregroundStyle(Theme.muted)
+                                .lineLimit(2)
+                        }
+                        HStack(spacing: 6) {
+                            if let actor = event.actor, !actor.isEmpty {
+                                BoardActorPill(actor: actor)
+                            }
+                            if let proj = event.project, !proj.isEmpty {
+                                let sub = event.subchannel.flatMap { $0.isEmpty ? nil : "/\($0)" } ?? ""
+                                Text("#\(proj)\(sub)")
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(Theme.muted)
+                            }
+                            if let pr = SupervisorFormat.prNumber(event.prRef) {
+                                Text(pr)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(Theme.muted)
+                            }
+                        }
+                        if !rowLabels.isEmpty {
+                            BoardReadOnlyLabelsRow(labels: rowLabels)
+                        }
+                    }
+                    .padding(.vertical, 3)
+
+                    if let threadKey = event.threadKey, !threadKey.isEmpty {
+                        Button {
+                            let resolved = resolveThread(
+                                key: threadKey,
+                                title: event.title,
+                                workspace: event.project,
+                                prRef: event.prRef
+                            )
+                            selectThread(resolved, isWide: isWide)
+                        } label: {
+                            content
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        content
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshBoardTasks(force: Bool) async {
+        async let userRefresh: Void = model.refreshTasks(queue: .user, force: force)
+        async let agentRefresh: Void = model.refreshTasks(queue: .agent, force: force)
+        _ = await (userRefresh, agentRefresh)
+    }
+
+    private func startNewBoardTask(isWide: Bool) async {
+        let trimmed = newTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !creatingBoardTask else { return }
+        creatingBoardTask = true
+        boardTaskNote = nil
+        defer { creatingBoardTask = false }
+        do {
+            let res = try await model.client.fleetClaimTask(
+                title: trimmed,
+                workspace: activeProject?.name,
+                project: activeProject?.name
+            )
+            newTaskTitle = ""
+            if let fresh = res.state {
+                onAcceptState?(fresh)
+            }
+            await refreshBoardTasks(force: true)
+            if let session = res.session, !session.key.isEmpty {
+                let target = resolveThread(
+                    key: session.key,
+                    title: session.title ?? trimmed,
+                    workspace: session.workspace ?? activeProject?.name,
+                    state: "running",
+                    live: true
+                )
+                selectThread(target, isWide: isWide)
+            } else {
+                boardTaskNote = "Task created."
+            }
+        } catch {
+            boardTaskNote = "Could not start task right now."
+        }
+    }
+
+    private func claimExistingTask(_ task: TaskRecord, isWide: Bool) async {
+        guard claimingTaskID == nil else { return }
+        claimingTaskID = task.id
+        boardTaskNote = nil
+        defer { claimingTaskID = nil }
+        do {
+            let res = try await model.claimTaskInPaseo(task, workspace: activeProject?.name)
+            if let fresh = res.state {
+                onAcceptState?(fresh)
+            }
+            await refreshBoardTasks(force: true)
+            if let session = res.session, !session.key.isEmpty {
+                let target = resolveThread(
+                    key: session.key,
+                    title: session.title ?? task.title,
+                    workspace: session.workspace ?? task.sourceMeta?.project ?? activeProject?.name,
+                    state: "running",
+                    live: true
+                )
+                selectThread(target, isWide: isWide)
+            }
+        } catch {
+            boardTaskNote = "Could not claim task in Paseo."
+        }
+    }
+
     private func loadHierarchy() async {
         guard !loadingHierarchy else { return }
         loadingHierarchy = true
@@ -1750,11 +2287,11 @@ private struct ActiveSessionsSheet: View {
         do {
             let loaded = try await model.client.fleetHierarchy(limit: 40)
             hierarchy = loaded
-            if loaded.projects.isEmpty {
+            if loaded.projects.isEmpty && browseMode == .themes {
                 browseMode = .sessions
             }
         } catch {
-            if hierarchy == nil {
+            if hierarchy == nil && browseMode == .themes {
                 browseMode = .sessions
             }
         }
@@ -1795,6 +2332,147 @@ private struct ActiveSessionsSheet: View {
             }
         } catch {
             dispatchOutcomeNote = "Could not dispatch directive right now."
+        }
+    }
+}
+
+private struct BoardThreadInspectorPane: View {
+    @Environment(AppModel.self) private var model
+    let orderedThreads: [FleetThread]
+    @Binding var selectedThread: FleetThread?
+    let onExpand: (FleetThread) -> Void
+    var onAcceptState: ((FleetState) -> Void)? = nil
+
+    @State private var replyDraft = ""
+    @State private var sendingReply = false
+    @State private var replyStatus: String?
+
+    private var activeIndex: Int? {
+        guard let selectedThread else { return nil }
+        return orderedThreads.firstIndex(where: { $0.key == selectedThread.key })
+    }
+
+    var body: some View {
+        if let thread = selectedThread {
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(SupervisorFormat.name(thread))
+                            .font(.headline)
+                            .lineLimit(1)
+                        Spacer()
+                        if orderedThreads.count > 1, let idx = activeIndex {
+                            Text("\(idx + 1)/\(orderedThreads.count)")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(Theme.muted)
+                            Button {
+                                step(-1, from: idx)
+                            } label: {
+                                Image(systemName: "chevron.up")
+                            }
+                            .disabled(idx <= 0)
+                            Button {
+                                step(1, from: idx)
+                            } label: {
+                                Image(systemName: "chevron.down")
+                            }
+                            .disabled(idx >= orderedThreads.count - 1)
+                        }
+                        Button {
+                            onExpand(thread)
+                        } label: {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        }
+                        .accessibilityLabel("Expand thread")
+                    }
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            HealthAndState(thread: thread, font: Theme.Typography.caption)
+                            if let actor = thread.actorLabel, !actor.isEmpty {
+                                BoardActorPill(actor: actor)
+                            }
+                            if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
+                                BoardQuietCheckPill(label: check)
+                            }
+                            if let prChip = SupervisorFormat.prChip(thread.pr) {
+                                Chip(text: prChip, color: SupervisorFormat.ciFailing(thread.pr?.ci) ? Theme.alert : Theme.ink)
+                            }
+                        }
+                    }
+
+                    if let line = thread.reason.flatMap({ $0.isEmpty ? nil : $0 }) ?? thread.blockers.first {
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(Theme.muted)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Theme.surface)
+
+                Divider()
+
+                FleetConversationView(thread: thread, fallbackSummary: thread.lastAgentText)
+                    .padding(.horizontal, 16)
+                    .id(thread.key)
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    if let replyStatus {
+                        Text(replyStatus)
+                            .font(.caption)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    HStack(alignment: .bottom, spacing: 8) {
+                        TextField("Send follow-up to \(SupervisorFormat.name(thread))…", text: $replyDraft, axis: .vertical)
+                            .lineLimit(1...4)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            Task { await sendReply(to: thread) }
+                        } label: {
+                            Image(systemName: sendingReply ? "hourglass" : "arrow.up.circle.fill")
+                                .font(.title2)
+                        }
+                        .disabled(sendingReply || replyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+                .padding(12)
+                .background(Theme.surface)
+            }
+        } else {
+            ContentUnavailableView(
+                "Select a Thread",
+                systemImage: "sidebar.right",
+                description: Text("Pick a session, task, or activity item on the left to inspect its live conversation.")
+            )
+        }
+    }
+
+    private func step(_ delta: Int, from idx: Int) {
+        let next = idx + delta
+        guard orderedThreads.indices.contains(next) else { return }
+        selectedThread = orderedThreads[next]
+        replyStatus = nil
+    }
+
+    private func sendReply(to thread: FleetThread) async {
+        let trimmed = replyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !sendingReply else { return }
+        sendingReply = true
+        replyStatus = nil
+        defer { sendingReply = false }
+        do {
+            let res = try await model.client.fleetSendMessage(threadKey: thread.key, message: trimmed)
+            replyDraft = ""
+            if let fresh = res.state {
+                onAcceptState?(fresh)
+            }
+            replyStatus = res.delivery?.detail ?? res.delivery?.status ?? "Delivered to session."
+        } catch {
+            replyStatus = "Couldn't send right now."
         }
     }
 }
@@ -1976,14 +2654,37 @@ private struct ThreadRow: View {
                         .lineLimit(1)
                 }
                 let chip = SupervisorFormat.prChip(thread.pr)
-                if chip != nil || hasProposal {
-                    HStack(spacing: Theme.Spacing.x2) {
-                        if let chip {
-                            Chip(text: chip, color: SupervisorFormat.ciFailing(thread.pr?.ci) ? Theme.alert : Theme.ink)
+                let checkBadge = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt)
+                let threadLabels = Array(SupervisorBoardLabel.extract(from: thread.labels).prefix(3))
+                let subSlug = thread.subchannel.flatMap { raw -> String? in
+                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return nil }
+                    let clean = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+                    return clean.split(separator: "/").last.map(String.init) ?? clean
+                }
+                if chip != nil || hasProposal || thread.actorLabel != nil || checkBadge != nil || subSlug != nil {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: Theme.Spacing.x2) {
+                            if let actor = thread.actorLabel, !actor.isEmpty {
+                                BoardActorPill(actor: actor)
+                            }
+                            if let subSlug {
+                                Chip(text: "/\(subSlug)", color: Theme.muted)
+                            }
+                            if let chip {
+                                Chip(text: chip, color: SupervisorFormat.ciFailing(thread.pr?.ci) ? Theme.alert : Theme.ink)
+                            }
+                            if let checkBadge {
+                                BoardQuietCheckPill(label: checkBadge)
+                            }
+                            if hasProposal { Chip(text: "Nudge ready to send", color: Theme.live) }
                         }
-                        if hasProposal { Chip(text: "Nudge ready to send", color: Theme.live) }
                     }
                     .padding(.top, Theme.Spacing.x1)
+                }
+                if !threadLabels.isEmpty {
+                    BoardReadOnlyLabelsRow(labels: threadLabels)
+                        .padding(.top, 2)
                 }
             }
             .padding(.leading, 18)
@@ -2652,6 +3353,10 @@ private struct ThreadDetailSheet: View {
                 if let at { Text(SupervisorFormat.clockTime(at)).font(.caption).foregroundStyle(.secondary) }
             }
             MarkdownContent(blocks: MarkdownParser.parse(text)).textSelection(.enabled)
+            let milestones = SupervisorMilestoneParser.parse(from: text)
+            if !milestones.isEmpty {
+                BoardMilestoneStrip(milestones: milestones)
+            }
         }
         .accessibilityIdentifier("thread-activity-\(speaker.lowercased())")
     }

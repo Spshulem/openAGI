@@ -272,6 +272,18 @@ final class AppModel {
         workspace.tasksFetchedAt = [:]
         tasksGeneration += 1
     }
+
+    func claimTaskInPaseo(_ task: TaskRecord, workspace: String? = nil) async throws -> FleetTaskClaimResponse {
+        let res = try await client.fleetClaimTask(
+            taskId: task.id,
+            workspace: workspace ?? task.sourceMeta?.project,
+            project: task.sourceMeta?.project,
+            subchannel: task.sourceMeta?.subchannel
+        )
+        bumpTasksGeneration()
+        fleetGeneration += 1
+        return res
+    }
     func bumpInboxGeneration() {
         workspace.inboxFetchedAt = nil
         inboxGeneration += 1
