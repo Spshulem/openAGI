@@ -302,7 +302,7 @@ final class FleetConsumer: ObservableObject {
     var target = replyTarget(item)
     if case let .question(id) = item, !attachedImages.isEmpty {
       if let tk = question(id)?.threadKey {
-        target = .thread(tk)
+        target = .thread(key: tk)
       } else {
         replyNotes[slot] = FleetNote(text: "This question isn't linked to a coding thread for image attachments.", isError: true)
         return
