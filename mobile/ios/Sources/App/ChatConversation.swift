@@ -12,6 +12,20 @@ import Observation
 // `/events` says the thread changed, and merges it into the local cache (see
 // `ChatHistoryMerge`). The cache (`ChatHistoryStore`) is what shows while
 // the daemon is out of reach, and on a main too old to have shared threads.
+struct QueuedChatSubmission: Identifiable, Equatable {
+    let id: UUID
+    var text: String
+    var attachments: [ChatAttachment]
+    var focusedCardID: String?
+
+    init(id: UUID = UUID(), text: String, attachments: [ChatAttachment], focusedCardID: String?) {
+        self.id = id
+        self.text = text
+        self.attachments = attachments
+        self.focusedCardID = focusedCardID
+    }
+}
+
 @Observable
 @MainActor
 final class ChatConversation {
@@ -31,6 +45,7 @@ final class ChatConversation {
     var identity: String { "\(thread.rawValue):\(conversationID)" }
     private(set) var messages: [ChatMessage]
     private(set) var isSending = false
+    private(set) var queuedSubmissions: [QueuedChatSubmission] = []
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
@@ -72,7 +87,18 @@ final class ChatConversation {
     // MARK: - Sending
 
     var canSubmitDraft: Bool {
-        !isReadOnly && !isSending && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
+        !isReadOnly
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
+            && draftAttachments.allSatisfy { $0.data != nil }
+    }
+
+    func removeQueuedSubmission(id: UUID) {
+        queuedSubmissions.removeAll { $0.id == id }
+    }
+
+    func popQueuedSubmissionForEdit(id: UUID) -> QueuedChatSubmission? {
+        guard let index = queuedSubmissions.firstIndex(where: { $0.id == id }) else { return nil }
+        return queuedSubmissions.remove(at: index)
     }
 
     // Reserve the turn and reset the native editor in the same main-actor
@@ -82,17 +108,30 @@ final class ChatConversation {
         guard canSubmitDraft else { return false }
         let text = draft
         let attachments = draftAttachments
+        if isSending {
+            guard !forgotten else { return false }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+            draft = ""
+            draftAttachments = []
+            composerRevision += 1
+            queuedSubmissions.append(
+                QueuedChatSubmission(text: effective, attachments: attachments, focusedCardID: focusedCardID)
+            )
+            return true
+        }
         guard let turn = beginSend(text, attachments: attachments) else { return false }
         draft = ""
         draftAttachments = []
         composerRevision += 1
-        Task { await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID) }
+        let capturedFocus = focusedCardID
+        Task { await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID, focusedCardID: capturedFocus) }
         return true
     }
 
     func send(_ rawText: String, attachments: [ChatAttachment] = []) async {
         guard let turn = beginSend(rawText, attachments: attachments) else { return }
-        await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID)
+        await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID, focusedCardID: focusedCardID)
     }
 
     private func beginSend(_ rawText: String, attachments: [ChatAttachment]) -> (text: String, replyID: UUID)? {
@@ -108,9 +147,17 @@ final class ChatConversation {
         return (text, reply.id)
     }
 
-    private func finishSend(text: String, attachments: [ChatAttachment], replyID: UUID) async {
+    private func finishSend(text: String, attachments: [ChatAttachment], replyID: UUID, focusedCardID: String?) async {
         defer { isSending = false }
-        await streamReply(text: text, attachments: attachments, replyID: replyID)
+        await streamReply(text: text, attachments: attachments, replyID: replyID, focusedCardID: focusedCardID)
+        while !forgotten, !queuedSubmissions.isEmpty {
+            let next = queuedSubmissions.removeFirst()
+            messages.append(ChatMessage(role: .user, text: next.text, attachments: next.attachments))
+            let nextReply = ChatMessage(role: .assistant, text: "", isStreaming: true)
+            messages.append(nextReply)
+            persist()
+            await streamReply(text: next.text, attachments: next.attachments, replyID: nextReply.id, focusedCardID: next.focusedCardID)
+        }
     }
 
     // Re-sends the user message that preceded a failed reply, replacing just
@@ -124,14 +171,14 @@ final class ChatConversation {
         let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
         messages[target.index] = fresh
         persist()
-        await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id)
+        await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id, focusedCardID: focusedCardID)
     }
 
     func requestComposerFocus() {
         composerFocusRequest += 1
     }
 
-    private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
+    private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID, focusedCardID: String? = nil) async {
         var sawTerminalFrame = false
         var openedStream = false
         do {
@@ -289,6 +336,7 @@ final class ChatConversation {
     func forget() {
         draft = ""
         draftAttachments = []
+        queuedSubmissions = []
         focusedCardID = nil
         composerRevision += 1
         forgotten = true

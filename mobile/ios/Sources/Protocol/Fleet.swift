@@ -742,6 +742,32 @@ public struct SupervisorCardBrief: Decodable, Sendable, Equatable {
     }
 }
 
+public struct SupervisorSuggestionPlan: Decodable, Sendable, Equatable {
+    public var remedy: String?
+    public var label: String?
+    public var nextAction: String?
+    public var acceptance: String?
+
+    public init(remedy: String? = nil, label: String? = nil, nextAction: String? = nil, acceptance: String? = nil) {
+        self.remedy = remedy
+        self.label = label
+        self.nextAction = nextAction
+        self.acceptance = acceptance
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case remedy, label, nextAction, acceptance
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        remedy = c.lenient(String.self, .remedy)
+        label = c.lenient(String.self, .label)
+        nextAction = c.lenient(String.self, .nextAction)
+        acceptance = c.lenient(String.self, .acceptance)
+    }
+}
+
 public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var id: String
     public var questionId: String?
@@ -779,6 +805,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var resources: [SupervisorResource]
     public var openChat: FleetOpenChat?
     public var project: String?
+    public var plan: SupervisorSuggestionPlan?
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, sessionTitle: String? = nil,
@@ -791,7 +818,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
                 secondaryAction: SupervisorCardAction? = nil, extraActions: [SupervisorCardAction] = [],
                 prContext: SupervisorPRContext? = nil, recentMessages: [SupervisorRecentMessage] = [],
                 timeline: [SupervisorTimelineItem] = [], resources: [SupervisorResource] = [],
-                openChat: FleetOpenChat? = nil, project: String? = nil) {
+                openChat: FleetOpenChat? = nil, project: String? = nil, plan: SupervisorSuggestionPlan? = nil) {
         self.id = id
         self.questionId = questionId
         self.kind = kind
@@ -828,13 +855,14 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.resources = resources
         self.openChat = openChat
         self.project = project
+        self.plan = plan
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, questionId, kind, kindLabel, slice, headline, sessionTitle, summary, brief, suggestedReplies, canReply, agentSummary, recommendation
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
-        case prContext, recentMessages, timeline, resources, openChat, project
+        case prContext, recentMessages, timeline, resources, openChat, project, plan
     }
 
     public init(from decoder: Decoder) throws {
@@ -875,6 +903,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         resources = c.lenientList(SupervisorResource.self, .resources)
         openChat = c.lenient(FleetOpenChat.self, .openChat)
         project = c.lenient(String.self, .project)
+        plan = c.lenient(SupervisorSuggestionPlan.self, .plan)
     }
 }
 

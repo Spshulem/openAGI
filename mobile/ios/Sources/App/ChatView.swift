@@ -601,6 +601,7 @@ struct ChatConversationView: View {
                 .accessibilityIdentifier("chat-continue-web")
                 if let error = model.conversations.error { Text(error).font(.footnote).foregroundStyle(.red) }
             } else {
+            if !conversation.queuedSubmissions.isEmpty { queuedSubmissionsTray }
             if !conversation.draftAttachments.isEmpty { attachmentStrip }
             if isPreparingImages { ProgressView("Preparing images…").font(.caption) }
             if let attachmentError {
@@ -655,7 +656,6 @@ struct ChatConversationView: View {
         .accessibilityLabel(dictation.isListening || dictation.isStarting ? "Stop dictation" : "Dictate message")
         .accessibilityValue(dictation.isListening ? "Listening" : "")
         .accessibilityHint("Dictation appears in the message field. Review it before sending.")
-        .disabled(conversation.isSending)
         .accessibilityIdentifier("chat-dictation")
     }
 
@@ -678,6 +678,61 @@ struct ChatConversationView: View {
         .menuIndicator(.hidden)
         .accessibilityIdentifier("chat-attach")
         .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
+    }
+
+    private var queuedSubmissionsTray: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Queued (\(conversation.queuedSubmissions.count))")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Theme.muted)
+            ForEach(conversation.queuedSubmissions) { item in
+                HStack(spacing: 8) {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.live)
+                    Text(item.text)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if !item.attachments.isEmpty {
+                        Text("\(item.attachments.count) img")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    Button("Edit") {
+                        guard let popped = conversation.popQueuedSubmissionForEdit(id: item.id) else { return }
+                        if conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            conversation.draft = popped.text
+                        } else {
+                            conversation.draft += "\n" + popped.text
+                        }
+                        if !popped.attachments.isEmpty {
+                            let available = max(0, ChatAttachment.maximumCount - conversation.draftAttachments.count)
+                            conversation.draftAttachments.append(contentsOf: popped.attachments.prefix(available))
+                        }
+                        composerFocused = true
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Theme.live)
+                    .buttonStyle(.plain)
+                    Button {
+                        conversation.removeQueuedSubmission(id: item.id)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Remove queued message")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
+            }
+        }
+        .padding(.horizontal, 14)
     }
 
     private var attachmentStrip: some View {

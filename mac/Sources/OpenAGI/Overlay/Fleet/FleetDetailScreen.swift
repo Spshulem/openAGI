@@ -266,10 +266,13 @@ struct FleetConversationList: View {
           Text(FleetThreadSummary.ago(at, now: Date())).font(.system(size: 9)).foregroundStyle(.tertiary)
         }
       }
-      Text(FleetThreadSummary.tail(message.text, Self.shownCharacters))
-        .font(.system(size: 11))
-        .fixedSize(horizontal: false, vertical: true)
-        .textSelection(.enabled)
+      WorkspaceMarkdownContent(
+        blocks: WorkspaceMarkdownParser.parse(FleetThreadSummary.tail(message.text, Self.shownCharacters)),
+        bodyFont: .system(size: 11),
+        textColor: .primary
+      )
+      .fixedSize(horizontal: false, vertical: true)
+      .textSelection(.enabled)
     }
   }
 

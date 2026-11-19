@@ -383,24 +383,26 @@ export function registerFleetTools(registry, supervisor) {
       limit: Number.isInteger(args?.limit) ? args.limit : 15
     }) });
   if (typeof supervisor.startPaseoSession === "function") registry.register({ name: "fleet_start_session", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Start a new Paseo coding session in a target workspace (resolved automatically across online Paseo hosts from `workspace`, or via explicit `serverId` + `cwd`) and send its initial prompt (plus any attached images). Use when the owner asks to spin up a new chat/coordinator/worker or when needed follow-up/release work has no active session.",
+    description: "Start a new Paseo coding session in a target workspace (auto-resolved across online Paseo hosts when omitted, or via `workspace` / `serverId` + `cwd`), choosing the requested `model` (e.g. 'gpt-6.2-sol', 'sol 6-2', 'claude-sonnet-4-6') and `effort` ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'), and send its initial prompt (plus any attached images).",
     parameters: {
       type: "object",
       properties: {
-        workspace: { type: "string", maxLength: 160 },
+        workspace: { type: "string", maxLength: 160, description: "Optional workspace/project name (auto-inferred from prompt or primary workspace when omitted)" },
         cwd: { type: "string", maxLength: 400 },
         serverId: { type: "string", maxLength: 120 },
         title: { type: "string", maxLength: 120 },
         provider: { type: "string", maxLength: 80, description: "Optional provider ('codex', 'claude', or 'provider/model')" },
+        model: { type: "string", maxLength: 120, description: "Optional model name or alias (e.g. 'gpt-6.2-sol', 'sol 6-2', 'claude-sonnet-4-6')" },
+        effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max"], description: "Optional reasoning/thinking effort level" },
         prompt: { type: "string", minLength: 1, maxLength: 4000 },
         attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
       required: ["prompt"],
       additionalProperties: false
     },
-    prepareApprovalArgs: (args) => fleetStartSessionTarget(args),
+    prepareApprovalArgs: (args) => fleetStartSessionTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.prompt, args.attachRecentImages === true])}`,
+    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.provider ?? null, args.model ?? null, args.effort ?? null, args.prompt, args.attachRecentImages === true])}`,
     summarize: (args) => `Start Paseo session in ${args.targetLabel}${args.title ? ` ("${args.title}")` : ""}:\n${clip(args.prompt, 240)}`,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
@@ -411,6 +413,8 @@ export function registerFleetTools(registry, supervisor) {
         serverId: args.serverId ?? null,
         title: args.title ?? null,
         provider: args.provider ?? null,
+        model: args.model ?? null,
+        effort: args.effort ?? null,
         prompt: args.prompt,
         ...(images ? { images } : {})
       });
@@ -504,6 +508,8 @@ export function registerFleetTools(registry, supervisor) {
         serverId: { type: "string", maxLength: 120 },
         cwd: { type: "string", maxLength: 400 },
         provider: { type: "string", maxLength: 80 },
+        model: { type: "string", maxLength: 120, description: "Optional model name or alias (e.g. 'gpt-6.2-sol', 'sol 6-2')" },
+        effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max"], description: "Optional reasoning/thinking effort level" },
         attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
       required: ["goal"],
@@ -511,7 +517,7 @@ export function registerFleetTools(registry, supervisor) {
     },
     prepareApprovalArgs: (args) => fleetDispatchGoalTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.goal, args.attachRecentImages === true])}`,
+    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.model ?? null, args.effort ?? null, args.goal, args.attachRecentImages === true])}`,
     summarize: (args) => args.summaryLabel,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
@@ -535,6 +541,8 @@ export function registerFleetTools(registry, supervisor) {
         serverId: args.serverId ?? null,
         cwd: args.cwd ?? null,
         provider: args.provider ?? null,
+        model: args.model ?? null,
+        effort: args.effort ?? null,
         ...(images ? { images } : {})
       });
     } });
@@ -571,6 +579,8 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
   const explicitKey = typeof args?.targetKey === "string" && args.targetKey.trim() ? args.targetKey.trim() : null;
   const forceNew = args?.mode === "force_new";
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
+  const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
+  const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
 
   if (explicitKey && !forceNew) {
     const validated = await Promise.resolve(fleetTarget(supervisor, { key: explicitKey, message: goal }));
@@ -617,6 +627,8 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
     ...(target.serverId ? { serverId: target.serverId } : {}),
     cwd,
     ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
     goal,
     summaryLabel: `Start new Paseo session in ${resolvedProject}${hostSuffix} (${clip(cwd, 80)}):\n${clip(goal, 220)}`
   };
@@ -637,21 +649,44 @@ async function fleetSyncThemesTarget(supervisor, args = {}) {
   };
 }
 
-function fleetStartSessionTarget(args = {}) {
+async function fleetStartSessionTarget(supervisor, args = {}) {
   const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
   if (!prompt || prompt.length > 4000) throw new Error("Prompt must be 1-4000 characters.");
-  const workspace = typeof args?.workspace === "string" && args.workspace.trim() ? args.workspace.trim() : null;
-  const cwd = typeof args?.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : null;
-  const serverId = typeof args?.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : null;
-  if (!workspace && !cwd) throw new Error("Provide workspace (e.g. 'bb-recorder') or cwd.");
+  let workspace = typeof args?.workspace === "string" && args.workspace.trim() ? args.workspace.trim() : null;
+  let cwd = typeof args?.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : null;
+  let serverId = typeof args?.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : null;
   const title = typeof args?.title === "string" && args.title.trim() ? clip(args.title.trim(), 120) : null;
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
+  const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
+  const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
+
+  if (!workspace && !cwd) {
+    const inv = typeof supervisor?.listWorkspaces === "function"
+      ? await supervisor.listWorkspaces({ includeArchived: true, limit: 60 }).catch(() => null)
+      : null;
+    const candidates = (inv?.workspaces ?? []).filter((w) => w?.defaultTarget?.cwd && w?.defaultTarget?.serverId
+      && (!serverId || w.hosts?.some((h) => h.serverId === serverId && h.preferredCwd)));
+    if (candidates.length === 0) {
+      throw new Error("Provide workspace (e.g. 'bb-recorder') or cwd.");
+    }
+    const hay = `${title ?? ""} ${prompt}`.toLowerCase();
+    const matched = candidates.find((w) => hay.includes(w.name.toLowerCase()) || hay.includes(w.id.toLowerCase())
+      || (w.repo && hay.includes(String(w.repo).split("/").pop().toLowerCase())))
+      ?? candidates.slice().sort((a, b) => ((b.activeCount ?? 0) * 4 + (b.totalChats ?? 0)) - ((a.activeCount ?? 0) * 4 + (a.totalChats ?? 0)))[0];
+    const hostMatch = serverId ? matched.hosts?.find((h) => h.serverId === serverId && h.preferredCwd) : null;
+    workspace = matched.name;
+    serverId = serverId ?? matched.defaultTarget.serverId;
+    cwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
+  }
+
   return {
     ...(workspace ? { workspace } : {}),
     ...(cwd ? { cwd } : {}),
     ...(serverId ? { serverId } : {}),
     ...(title ? { title } : {}),
     ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
     prompt,
     targetLabel: clip(workspace || cwd || "workspace", 80)
   };

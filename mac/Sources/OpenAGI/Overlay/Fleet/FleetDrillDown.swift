@@ -50,7 +50,7 @@ enum FleetReplyTarget: Equatable {
   /// (only the hub's question route is held to typing it as the owner) and
   /// an app card or prompt (a typed message doesn't press its buttons).
   static func of(_ question: FleetQuestion) -> FleetReplyTarget {
-    if question.canReply { return .question(id: question.id) }
+    if question.canReply || question.isClarificationQuestion { return .question(id: question.id) }
     let app = (question.openChat ?? question.chats.first)?.appName ?? "the agent's app"
     if question.kind == "agent-card" || question.kind == "prompt" { return .none(why: "Answer it in \(app).") }
     if question.risky { return .none(why: "Answer this one in \(app), or with its buttons.") }

@@ -14,6 +14,32 @@ private struct Lossy<T: Decodable>: Decodable {
 }
 
 /// One open "needs you" question from the coding-agent supervisor.
+struct FleetSuggestionIssueDraft: Decodable, Equatable {
+  let title: String?
+  let body: String?
+}
+
+struct FleetSuggestionPlan: Decodable, Equatable {
+  let remedy: String?
+  let label: String?
+  let nextAction: String?
+  let acceptance: String?
+  let issueDraft: FleetSuggestionIssueDraft?
+}
+
+struct FleetWorkspaceEntry: Decodable, Equatable, Identifiable {
+  struct Target: Decodable, Equatable {
+    let serverId: String?
+    let hostLabel: String?
+    let cwd: String?
+  }
+
+  let id: String
+  let name: String
+  let repo: String?
+  let defaultTarget: Target?
+}
+
 struct FleetQuestion: Decodable, Equatable, Identifiable {
   let id: String
   let kind: String?
@@ -47,11 +73,16 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   /// { reply }). False from a hub before it.
   var canReply: Bool = false
   let project: String?
+  let plan: FleetSuggestionPlan?
+  let clarificationAnswer: String?
 
   enum CodingKeys: String, CodingKey {
     case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
-    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project
+    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project, meta
   }
+
+  private enum MetaKeys: String, CodingKey { case plan, clarification }
+  private enum ClarificationKeys: String, CodingKey { case answer }
 
   /// Why the supervisor's review kept it, or the close the owner overrode
   /// with Reopen. Same wording as the /fleet page.
@@ -69,6 +100,10 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
 extension FleetQuestion {
   /// Options the owner can tap. "open thread" is left out: the supervisor
   /// can't carry it to the agent and always hands it back.
+  var isClarificationQuestion: Bool {
+    kind == "suggestion" && options.contains("Answer question")
+  }
+
   var tappableOptions: [String] { options.filter { $0 != Self.openThread } }
 
   var displayAskContext: String? {
@@ -131,6 +166,17 @@ extension FleetQuestion {
     askContext = try? c.decodeIfPresent(String.self, forKey: .askContext)
     canReply = (try? c.decodeIfPresent(Bool.self, forKey: .canReply)) ?? false
     project = try? c.decodeIfPresent(String.self, forKey: .project)
+    if let mc = try? c.nestedContainer(keyedBy: MetaKeys.self, forKey: .meta) {
+      plan = try? mc.decodeIfPresent(FleetSuggestionPlan.self, forKey: .plan)
+      if let cc = try? mc.nestedContainer(keyedBy: ClarificationKeys.self, forKey: .clarification) {
+        clarificationAnswer = try? cc.decodeIfPresent(String.self, forKey: .answer)
+      } else {
+        clarificationAnswer = nil
+      }
+    } else {
+      plan = nil
+      clarificationAnswer = nil
+    }
   }
 }
 

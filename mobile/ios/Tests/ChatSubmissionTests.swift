@@ -185,4 +185,48 @@ final class ChatSubmissionTests: XCTestCase {
         XCTAssertFalse(ChatScrollGeometry(contentHeight: 700, viewportHeight: 300, offset: -100, bottomInset: 40).isAtBottom)
         XCTAssertTrue(ChatScrollGeometry(contentHeight: 700, viewportHeight: 900, offset: -100, bottomInset: 40).isAtBottom)
     }
+
+    @MainActor
+    func testQueueingBackToBackMessagesSupportsEditRemoveAndFIFODrain() async throws {
+        let sent = OSAllocatedUnfairLock<[String]>(initialState: [])
+        StubProtocol.handler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url!.path == "/message" {
+                let body = try? Self.body(request)
+                let text = (body?["text"] as? String) ?? ""
+                sent.withLock { $0.append(text) }
+                return (response, Data("event: final\ndata: {\"reply\":\"Ack: \(text)\"}\n\n".utf8))
+            }
+            return (response, Data("{\"messages\":[]}".utf8))
+        }
+        let conversation = ChatConversation(thread: .supervisor, client: client(),
+            store: ChatHistoryStore(thread: "queue-fifo", directory: directory), nodeID: "mobile:test")
+
+        conversation.draft = "First turn"
+        XCTAssertTrue(conversation.submitDraft())
+        XCTAssertTrue(conversation.isSending)
+
+        conversation.draft = "Second queued"
+        XCTAssertTrue(conversation.submitDraft())
+        conversation.draft = "Third queued"
+        XCTAssertTrue(conversation.submitDraft())
+        conversation.draft = "Cancel me"
+        XCTAssertTrue(conversation.submitDraft())
+        XCTAssertEqual(conversation.queuedSubmissions.count, 3)
+
+        let cancelID = conversation.queuedSubmissions[2].id
+        conversation.removeQueuedSubmission(id: cancelID)
+        XCTAssertEqual(conversation.queuedSubmissions.map(\.text), ["Second queued", "Third queued"])
+
+        let editID = conversation.queuedSubmissions[0].id
+        let popped = conversation.popQueuedSubmissionForEdit(id: editID)
+        XCTAssertEqual(popped?.text, "Second queued")
+        conversation.draft = "Second edited"
+        XCTAssertTrue(conversation.submitDraft())
+
+        for _ in 0..<200 where conversation.isSending { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(conversation.isSending)
+        XCTAssertTrue(conversation.queuedSubmissions.isEmpty)
+        XCTAssertEqual(sent.withLock { $0 }, ["First turn", "Third queued", "Second edited"])
+    }
 }

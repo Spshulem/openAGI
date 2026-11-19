@@ -313,10 +313,12 @@ function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle =
     fallbackDecision = prMeta?.mergeState === "DIRTY"
       ? `Have the session rebase ${prMeta?.ref ?? "this PR"} onto base and re-verify, or reply with guidance.`
       : `Have the session fix failing checks on ${prMeta?.ref ?? "this PR"}, or reply with specific instructions.`;
+  } else if (question.kind === "suggestion" && question.meta?.plan?.nextAction) {
+    fallbackDecision = clampTextLines(cleanBriefProse(question.meta.plan.nextAction), 600);
   } else if (question.card) {
     fallbackDecision = clampTextLines(cleanBriefProse(question.card), 260);
   } else if (question.body && !isMechanicalReadyBody(question.body)) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 260);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 480);
   } else {
     fallbackDecision = headline;
   }
@@ -701,6 +703,16 @@ export function buildSupervisorCard(
     && answerIn === "here";
   const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages });
   const suggestedReplies = buildSuggestedReplies(question, { kind, canReply });
+  const rawPlan = question.meta?.plan && typeof question.meta.plan === "object" ? question.meta.plan : null;
+  const plan = rawPlan ? {
+    remedy: clampText(redactSecrets(String(rawPlan.remedy ?? "")), 40) || null,
+    label: clampText(redactSecrets(String(rawPlan.label ?? "")), 80) || null,
+    nextAction: clampTextLines(redactSecrets(String(rawPlan.nextAction ?? "")), 1200) || null,
+    acceptance: clampTextLines(redactSecrets(String(rawPlan.acceptance ?? "")), 1200) || null,
+    issueDraft: rawPlan.issueDraft
+      ? clampTextLines(redactSecrets(typeof rawPlan.issueDraft === "string" ? rawPlan.issueDraft : JSON.stringify(rawPlan.issueDraft, null, 2)), 2000) || null
+      : null
+  } : null;
 
   return {
     id: question.id,
@@ -713,6 +725,7 @@ export function buildSupervisorCard(
     summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
     recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
     brief,
+    ...(plan ? { plan } : {}),
     suggestedReplies,
     canReply,
     agentSummary,

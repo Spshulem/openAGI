@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ToolRegistry } from "../src/tool-registry.js";
+import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
 import { fleetScan, fleetStatus, fleetThread, registerFleetTools } from "../src/fleet/tools.js";
+import { resolvePaseoAgentConfig, startPaseoSession } from "../src/fleet/coordinator.js";
+import { buildSupervisorCard } from "../src/fleet/cards.js";
 import { createDefaultRuntime } from "../src/index.js";
 
 function row(overrides = {}) {
@@ -506,4 +508,109 @@ test("fleet_send_message forwards current-turn images and resolves prior-turn im
   assert.equal(intentRes.ok, true);
   assert.equal(deliveries.length, 2);
   assert.equal(deliveries[1].opts.images?.length, 1);
+});
+
+test("list_mcp_tools returns compact inventory by default and full schema on targeted lookup", async () => {
+  const hugeDesc = "PostHog analytics query tool. " + "x".repeat(55_000);
+  const tools = new ToolRegistry();
+  registerCoreTools(tools, {
+    mcp: {
+      listTools: () => [
+        { server: "posthog", name: "run_query", description: hugeDesc, inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" } } } },
+        { server: "bb-staging", name: "search_calls", description: "Search recorded calls", inputSchema: { type: "object", properties: { q: { type: "string" } } } }
+      ]
+    }
+  });
+  const compact = await tools.invoke("list_mcp_tools", {}, {});
+  assert.equal(compact.ok, true);
+  assert.equal(compact.result.compact, true);
+  assert.equal(compact.result.count, 2);
+  assert.ok(JSON.stringify(compact.result).length < 4000);
+
+  const detailed = await tools.invoke("list_mcp_tools", { server: "posthog", tool: "run_query" }, {});
+  assert.equal(detailed.ok, true);
+  assert.equal(detailed.result.count, 1);
+  assert.equal(detailed.result.items[0].description.length, hugeDesc.length);
+});
+
+test("resolvePaseoAgentConfig, startPaseoSession auto-workspace, and fleet_start_session support model and effort", async () => {
+  let capturedCreate = null;
+  const api = {
+    projects: { list: async () => ({ projects: [] }) },
+    workspaces: { list: async () => ({ entries: [{ id: "wks_1", name: "BuildBetter", path: "/Users/dev/buildbetter", repo: "buildbetter-app/buildbetter" }], pageInfo: { hasMore: false } }) },
+    providers: {
+      waitForReady: async () => ({
+        entries: [{
+          provider: "codex",
+          status: "ready",
+          models: [{
+            id: "gpt-6.2-sol",
+            label: "GPT-6.2 Sol",
+            thinkingOptions: [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }]
+          }]
+        }]
+      })
+    },
+    agents: {
+      list: async () => ({
+        entries: [{ agent: { id: "ag_1", cwd: "/Users/dev/buildbetter", status: "running", updatedAt: "2026-11-19T03:00:00Z", title: "Main chat" } }],
+        pageInfo: { hasMore: false }
+      }),
+      create: async (opts) => {
+        capturedCreate = opts;
+        return { id: "ag_new", current: () => ({ id: "ag_new", status: "running", cwd: opts.cwd, title: opts.title, provider: "codex", model: "gpt-6.2-sol" }) };
+      }
+    }
+  };
+  const cfg = await resolvePaseoAgentConfig(api, "/Users/dev/buildbetter", { model: "sol 6-2", effort: "medium" });
+  assert.equal(cfg.provider, "codex/gpt-6.2-sol");
+  assert.equal(cfg.model, "gpt-6.2-sol");
+  assert.equal(cfg.thinkingOptionId, "medium");
+
+  const factory = () => ({
+    ...api,
+    connect: async () => {},
+    close: async () => {},
+    hosts: {
+      list: async () => ({ self: { serverId: "srv_mac", label: "MacBook" }, hosts: [] }),
+      client: async () => api
+    }
+  });
+  const sup = {
+    config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+    getState: () => ({ mode: "propose", enabled: true, questions: [], cards: [], actions: [], snapshot: { threads: [] } })
+  };
+  const started = await startPaseoSession(sup, {
+    prompt: "Scope existing integrations vs Enterpret and Unwrap.",
+    model: "gpt 6.2 sol",
+    effort: "medium",
+    factory
+  });
+  assert.equal(started.status, "started");
+  assert.equal(started.inferredWorkspace, true);
+  assert.equal(started.cwd, "/Users/dev/buildbetter");
+  assert.equal(started.model, "gpt-6.2-sol");
+  assert.equal(started.effort, "medium");
+  assert.equal(capturedCreate.config.model, "gpt-6.2-sol");
+  assert.equal(capturedCreate.config.thinkingOptionId, "medium");
+
+  // SupervisorCard exposes clarification question plan details
+  const card = buildSupervisorCard({
+    id: "fq_s1",
+    kind: "suggestion",
+    title: "Clarify reopened questions before changing code",
+    body: "200 of 209 questions closed unanswered.",
+    options: ["Answer question", "Review plan", "Not now", "Never"],
+    meta: {
+      suggestionId: "sg_1",
+      plan: {
+        remedy: "clarification",
+        label: "Ask a question",
+        nextAction: "Ask: Can you provide one representative reopened question history?",
+        acceptance: "Obtain one representative question history."
+      }
+    }
+  });
+  assert.equal(card.plan.nextAction, "Ask: Can you provide one representative reopened question history?");
+  assert.match(card.brief.decision, /representative reopened question history/);
 });

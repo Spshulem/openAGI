@@ -822,7 +822,7 @@ final class AppState: ObservableObject {
     }
 
     var parser = ServerSentEventParser()
-    for try await line in bytes.lines {
+    for try await line in ServerSentEventParser.lines(of: bytes) {
       guard let event = parser.consume(line: line) else { continue }
       let data = Data(event.data.utf8)
       switch event.name {

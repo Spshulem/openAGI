@@ -33,4 +33,39 @@ struct ServerSentEventParser {
     if field == "data" { dataLines.append(value) }
     return nil
   }
+
+  /// Flushes any trailing buffered event lines if the SSE stream closed without a trailing blank line.
+  mutating func finish() -> ServerSentEvent? {
+    consume(line: "")
+  }
+
+  /// Splits raw bytes on `0x0A` while preserving empty lines (`""`) that mark SSE `\n\n` boundaries.
+  /// (`URLSession.AsyncBytes.lines` skips zero-length lines and silently drops SSE frame delimiters.)
+  static func lines(of bytes: URLSession.AsyncBytes) -> AsyncThrowingStream<String, Error> {
+    AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          var buffer = Data()
+          for try await byte in bytes {
+            if byte == 0x0A {
+              if buffer.last == 0x0D { buffer.removeLast() }
+              let line = String(decoding: buffer, as: UTF8.self)
+              buffer.removeAll(keepingCapacity: true)
+              continuation.yield(line)
+            } else {
+              buffer.append(byte)
+            }
+          }
+          if !buffer.isEmpty {
+            if buffer.last == 0x0D { buffer.removeLast() }
+            continuation.yield(String(decoding: buffer, as: UTF8.self))
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
 }

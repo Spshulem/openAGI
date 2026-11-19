@@ -1052,6 +1052,8 @@ private struct SupervisorCardDeckView: View {
     let onClearFocus: (SupervisorCard) -> Void
     let onAct: (SupervisorCard, SupervisorCardAction) -> Void
 
+    @State private var revealedPlanCardIDs: Set<String> = []
+
     private var card: SupervisorCard { cards[index] }
     private var isBusy: Bool { busyCardID != nil }
     private var hasThreadContext: Bool {
@@ -1252,11 +1254,16 @@ private struct SupervisorCardDeckView: View {
             let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
             if let summary = mainSummary {
-                Text(MarkdownParser.inline(summary))
-                    .font(Theme.Typography.secondary)
-                    .foregroundStyle(Theme.ink.opacity(0.92))
-                    .lineLimit(5)
-                    .multilineTextAlignment(.leading)
+                if summary.contains("\n") || summary.contains("|") {
+                    MarkdownContent(blocks: MarkdownParser.parse(summary))
+                        .lineLimit(nil)
+                } else {
+                    Text(MarkdownParser.inline(summary))
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.ink.opacity(0.92))
+                        .lineLimit(5)
+                        .multilineTextAlignment(.leading)
+                }
             }
             if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
                !decision.isEmpty,
@@ -1266,6 +1273,33 @@ private struct SupervisorCardDeckView: View {
                     .foregroundStyle(Theme.ink)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
+            } else if let nextAction = card.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !nextAction.isEmpty {
+                Text("Question: \(nextAction)")
+                    .font(Theme.Typography.caption.weight(.medium))
+                    .foregroundStyle(Theme.live)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+            }
+            if revealedPlanCardIDs.contains(card.id), let plan = card.plan {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(plan.label ?? "Fix Plan")
+                        .font(Theme.Typography.caption.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                    if let next = plan.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty {
+                        Text(next)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.ink)
+                    }
+                    if let acc = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acc.isEmpty {
+                        Text("Acceptance: \(acc)")
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.muted)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
             if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
                 Text(rec)
@@ -1349,7 +1383,17 @@ private struct SupervisorCardDeckView: View {
                 // Fleet-wide question without a specific thread
                 ForEach(Array(card.options.prefix(2).enumerated()), id: \.offset) { idx, option in
                     DeckPillButton(title: option, filled: idx == 0, enabled: !isBusy) {
-                        onAct(card, SupervisorCardAction(op: "answer", label: option, value: option))
+                        if option == "Answer question" {
+                            onReplyInChat(card)
+                        } else if option == "Review plan", card.plan != nil {
+                            if revealedPlanCardIDs.contains(card.id) {
+                                revealedPlanCardIDs.remove(card.id)
+                            } else {
+                                revealedPlanCardIDs.insert(card.id)
+                            }
+                        } else {
+                            onAct(card, SupervisorCardAction(op: "answer", label: option, value: option))
+                        }
                     }
                 }
                 Spacer(minLength: 0)
@@ -2577,7 +2621,11 @@ private struct ThreadDetailSheet: View {
                 }
                 ForEach(Array(options.enumerated()), id: \.element) { idx, option in
                     DeckPillButton(title: option, filled: !isMergeOrCiCard && idx == 0, enabled: !questionBusy) {
-                        onAnswer(option)
+                        if option == "Answer question" {
+                            replyOpen = true
+                        } else {
+                            onAnswer(option)
+                        }
                     }
                 }
                 if card != nil {

@@ -55,6 +55,7 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var threadInFlight: Set<String> = []
   /// Each thread's last Push now, Mute or Unmute result, in its row.
   @Published private(set) var threadNotes: [String: FleetNote] = [:]
+  @Published private(set) var workspaces: [FleetWorkspaceEntry] = []
   /// Active index in the compact overlay single-card deck.
   @Published var currentQuestionIndex: Int = 0
   /// Whether the collapsible session list in the overlay is expanded.
@@ -263,7 +264,133 @@ final class FleetConsumer: ObservableObject {
 
   /// Reply to a Needs-You card with optional photo attachments via `sendReply`.
   func sendWorkspaceQuestionReply(_ question: FleetQuestion, message: String, images: [[String: Any]] = []) async -> FleetNote {
-    await sendWorkspaceReply(for: .question(question.id), message: message, images: images)
+    if question.isClarificationQuestion {
+      return await answerClarification(question, clarification: message)
+    }
+    return await sendWorkspaceReply(for: .question(question.id), message: message, images: images)
+  }
+
+  /// Answers a `suggestion` clarification card via `/fleet/api/questions/:id` with `{ answer: "Answer question", clarification }`.
+  func answerClarification(_ question: FleetQuestion, clarification: String) async -> FleetNote {
+    let trimmed = String(clarification.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2000))
+    guard !trimmed.isEmpty else {
+      return FleetNote(text: "Enter an answer first.", isError: true)
+    }
+    let id = question.id
+    guard !inFlight.contains(id) else {
+      return FleetNote(text: "Already sending an answer for this question.", isError: false)
+    }
+    inFlight.insert(id)
+    defer { inFlight.remove(id) }
+    notes[id] = nil
+
+    var req = request(path: "/fleet/api/questions/\(id)", method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "answer": "Answer question",
+      "clarification": trimmed
+    ])
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      if (200..<300).contains(code) {
+        if let decoded = try? JSONDecoder().decode(FleetQuestionResponse.self, from: data),
+           let state = decoded.state {
+          apply(state)
+        } else {
+          await refresh()
+        }
+        let note = FleetNote(text: "Clarification saved to plan.", isError: false)
+        report(question, note.text, isError: false)
+        return note
+      }
+      await refresh()
+      let msg = Self.serverError(data) ?? "Couldn't save clarification."
+      let note = FleetNote(text: msg, isError: true)
+      report(question, msg, isError: true)
+      return note
+    } catch {
+      let msg = "Couldn't reach the supervisor. Try again."
+      report(question, msg, isError: true)
+      return FleetNote(text: msg, isError: true)
+    }
+  }
+
+  func loadWorkspaces() async {
+    let req = request(path: "/fleet/api/workspaces?limit=40", method: "GET", timeout: 15)
+    do {
+      let (data, response) = try await fetchDetail(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return }
+      struct WorkspacesResp: Decodable { let workspaces: [FleetWorkspaceEntry]? }
+      if let decoded = try? JSONDecoder().decode(WorkspacesResp.self, from: data),
+         let list = decoded.workspaces {
+        workspaces = list
+      }
+    } catch {
+      // Non-fatal: manual workspace or auto-resolve still works.
+    }
+  }
+
+  func startWorkspaceSession(
+    workspace: String?,
+    cwd: String?,
+    serverId: String? = nil,
+    title: String?,
+    model: String?,
+    effort: String?,
+    prompt: String,
+    images: [[String: Any]] = []
+  ) async -> (ok: Bool, threadKey: String?, message: String) {
+    let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    let effectivePrompt = trimmedPrompt.isEmpty && !images.isEmpty ? "Please inspect the attached image(s)." : trimmedPrompt
+    guard !effectivePrompt.isEmpty else {
+      return (false, nil, "Enter a starting prompt first.")
+    }
+    var payload: [String: Any] = ["prompt": effectivePrompt]
+    if let ws = workspace?.trimmingCharacters(in: .whitespacesAndNewlines), !ws.isEmpty {
+      payload["workspace"] = ws
+    }
+    if let c = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+      payload["cwd"] = c
+    }
+    if let srv = serverId?.trimmingCharacters(in: .whitespacesAndNewlines), !srv.isEmpty {
+      payload["serverId"] = srv
+    }
+    if let t = title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+      payload["title"] = t
+    }
+    if let m = model?.trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty {
+      payload["model"] = m
+    }
+    if let e = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty {
+      payload["effort"] = e
+    }
+    if !images.isEmpty {
+      payload["images"] = images
+    }
+    var req = request(path: "/fleet/api/sessions/start", method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else {
+        return (false, nil, Self.serverError(data) ?? "Couldn't start Paseo session.")
+      }
+      struct SessionObj: Decodable { let threadKey: String? }
+      struct StartResp: Decodable { let session: SessionObj?; let state: FleetState? }
+      let decoded = try? JSONDecoder().decode(StartResp.self, from: data)
+      if let state = decoded?.state {
+        apply(state)
+      } else {
+        await refresh()
+      }
+      if let tk = decoded?.session?.threadKey {
+        await loadDetail(tk)
+      }
+      return (true, decoded?.session?.threadKey, "Started Paseo session.")
+    } catch {
+      return (false, nil, "Couldn't reach the supervisor. Try again.")
+    }
   }
 
   private func sendWorkspaceReply(for item: FleetOpenItem, message: String, images: [[String: Any]]) async -> FleetNote {
@@ -312,8 +439,13 @@ final class FleetConsumer: ObservableObject {
     var body: [String: Any]
     switch target {
     case let .question(id):
-      path = "/fleet/api/questions/\(id)"
-      body = ["reply": message]
+      if let q = question(id), q.isClarificationQuestion {
+        path = "/fleet/api/questions/\(id)"
+        body = ["answer": "Answer question", "clarification": message]
+      } else {
+        path = "/fleet/api/questions/\(id)"
+        body = ["reply": message]
+      }
     case let .thread(key):
       path = "/fleet/api/send"
       body = ["threadKey": key, "message": message]

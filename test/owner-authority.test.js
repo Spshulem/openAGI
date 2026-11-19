@@ -223,3 +223,14 @@ test("attach image follow-ups authorize fleet messaging while passive questions 
     assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
   }
 });
+
+test("in-Paseo session creation follow-ups authorize fleet_start_session while passive questions stay blocked", () => {
+  for (const text of ["yes gpt 6.2 sol on medium effort in paseo", "run this with claude sonnet in paseo"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_start_session"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["what is running in paseo?", "what did the paseo session say?"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_start_session"), false, passive);
+    assert.equal(isSupervisorActionableDirective(passive), false, passive);
+  }
+});

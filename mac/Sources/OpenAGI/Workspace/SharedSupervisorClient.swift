@@ -429,6 +429,13 @@ private struct TasksListResponse: Decodable {
   let tasks: [MacTaskItem]
 }
 
+struct QueuedSupervisorMessage: Identifiable, Equatable {
+  let id: String
+  var text: String
+  var focusedCardId: String?
+  var attachments: [WorkspaceImageAttachment]
+}
+
 /// Keeps Mac Supervisor Quick Ask, Supervisor Workspace Window, Paseo, iPhone,
 /// and Even G2 synced via `devices:supervisor:main` + `/tasks`.
 @MainActor
@@ -438,6 +445,7 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var messages: [SyncedSupervisorMessage] = []
   @Published private(set) var tasks: [MacTaskItem] = []
   @Published private(set) var isSending = false
+  @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
   @Published private(set) var streamingReplyText: String? = nil
   @Published private(set) var progressStage: String? = nil
   @Published private(set) var activeModelId: String? = nil
@@ -468,6 +476,15 @@ final class SharedSupervisorClient: ObservableObject {
 
   func clearError() {
     lastError = nil
+  }
+
+  func removeQueued(id: String) {
+    queuedMessages.removeAll { $0.id == id }
+  }
+
+  func popQueuedForEdit(id: String) -> QueuedSupervisorMessage? {
+    guard let index = queuedMessages.firstIndex(where: { $0.id == id }) else { return nil }
+    return queuedMessages.remove(at: index)
   }
 
   private init() {}
@@ -622,16 +639,36 @@ final class SharedSupervisorClient: ObservableObject {
   @discardableResult
   func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard (!trimmed.isEmpty || !attachments.isEmpty), !isSending else { return false }
+    guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+    if isSending {
+      queuedMessages.append(QueuedSupervisorMessage(
+        id: "q-\(UUID().uuidString)",
+        text: text,
+        focusedCardId: focusedCardId,
+        attachments: attachments
+      ))
+      return true
+    }
     isSending = true
-    lastError = nil
-    streamingReplyText = nil
-    progressStage = "queued"
     defer {
       isSending = false
       streamingReplyText = nil
       progressStage = nil
     }
+    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments)
+    while !queuedMessages.isEmpty {
+      let next = queuedMessages.removeFirst()
+      _ = await executeSingleMessage(next.text, focusedCardId: next.focusedCardId, attachments: next.attachments)
+    }
+    return ok
+  }
+
+  private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
+    lastError = nil
+    streamingReplyText = nil
+    progressStage = "queued"
 
     let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
     let localId = "local_\(UUID().uuidString)"
@@ -694,6 +731,16 @@ final class SharedSupervisorClient: ObservableObject {
       await refreshTasks()
       return true
     } catch {
+      await refreshMessages()
+      let persistedAssistantReply = messages.contains {
+        $0.role == "assistant" && !previousAssistantIds.contains($0.id)
+      }
+      if persistedAssistantReply {
+        messages.removeAll { $0.id == localId }
+        lastError = nil
+        await refreshTasks()
+        return true
+      }
       messages.removeAll { $0.id == localId }
       lastError = error.localizedDescription
       return false
@@ -740,7 +787,7 @@ final class SharedSupervisorClient: ObservableObject {
     }
 
     var parser = ServerSentEventParser()
-    for try await line in bytes.lines {
+    for try await line in ServerSentEventParser.lines(of: bytes) {
       guard let event = parser.consume(line: line) else { continue }
       let data = Data(event.data.utf8)
       switch event.name {
@@ -767,6 +814,15 @@ final class SharedSupervisorClient: ObservableObject {
       default:
         continue
       }
+    }
+
+    if let trailing = parser.finish(),
+       trailing.name == "reply",
+       let data = trailing.data.data(using: .utf8),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let text = (json["reply"] as? String) ?? (json["text"] as? String),
+       !text.isEmpty {
+      return text
     }
 
     if let partial = streamingReplyText, !partial.isEmpty {

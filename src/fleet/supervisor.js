@@ -2485,6 +2485,20 @@ export class FleetSupervisor {
       const hasImages = Array.isArray(images) && images.length > 0;
       const replyText = String(effectiveValue ?? "").trim() || (hasImages ? "Please inspect the attached image(s)." : "");
       if (!replyText) return { ok: false, kind: "reply", status: "blocked", detail: "Enter a reply to send." };
+      if (question.kind === "suggestion" && (question.options ?? []).includes("Answer question")) {
+        const result = await this.answerQuestion(question.id, "Answer question", {
+          deadlineAt,
+          clarification: replyText.slice(0, 2000)
+        });
+        if (!result) return { ok: false, kind: "reply", status: "closed", detail: "Question already closed." };
+        return {
+          ok: true,
+          kind: "reply",
+          status: "done",
+          detail: "Clarification saved on suggestion plan.",
+          ...result
+        };
+      }
       if (!hasImages && canReplyTo(question)) {
         const replied = await this.replyQuestion(question.id, replyText, { deadlineAt });
         if (!replied) return { ok: false, kind: "reply", status: "closed", detail: "Question already closed." };
