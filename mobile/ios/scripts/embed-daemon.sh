@@ -28,7 +28,7 @@ esac
 mkdir -p "$frameworks"
 rsync -a --delete "$xcframework/$slice/NodeMobile.framework" "$frameworks/"
 if [[ "${CODE_SIGNING_ALLOWED:-NO}" == "YES" ]]; then
-  codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --timestamp=none --preserve-metadata=identifier,entitlements "$frameworks/NodeMobile.framework"
+  codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --timestamp=none --preserve-metadata=identifier "$frameworks/NodeMobile.framework"
 fi
 
 # The daemon: src/, the mobile entry, package.json (ESM "type" and version),

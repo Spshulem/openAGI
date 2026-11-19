@@ -2712,6 +2712,7 @@ export class FleetSupervisor {
         if (mergeOutcome.promptPreference) {
           this.store.savePreferences(recordPreferenceSignal(prefs, { type: "ci_merge_attempt", prRef, now: this.now() }));
         }
+        this.dismissQuestion(question.id);
         this.store.recordAction({
           kind: "pr-watch",
           playbook: "owner-merge-watch",
@@ -2725,6 +2726,7 @@ export class FleetSupervisor {
       }
 
       if (mergeOutcome.status === "queued_when_green") {
+        this.dismissQuestion(question.id);
         this.store.recordAction({
           kind: "pr-merge-queued",
           playbook: "owner-merge",

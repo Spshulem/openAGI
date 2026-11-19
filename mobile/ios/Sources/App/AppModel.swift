@@ -11,6 +11,30 @@ nonisolated enum AppTab: Hashable, Sendable {
     case today, tasks, inbox, chat, supervisor
 }
 
+nonisolated enum iOSWorkspaceChannel: Hashable, Sendable {
+    case general
+    case needsYou
+    case tasks
+    case sessions
+    case activity
+    case project(String)
+    case subchannel(project: String, subchannel: String)
+
+    var title: String {
+        switch self {
+        case .general: return "#general"
+        case .needsYou: return "#needs-you"
+        case .tasks: return "#tasks"
+        case .sessions: return "#sessions"
+        case .activity: return "#activity"
+        case .project(let name): return "#\(name)"
+        case .subchannel(let project, let sub):
+            let clean = sub.hasPrefix("/") ? String(sub.dropFirst()) : sub
+            return "#\(project)/\(clean)"
+        }
+    }
+}
+
 // The one piece of shared state behind the tab bar: the paired credential,
 // the daemon client built from it, the locally-cached snapshot, and the
 // Inbox badge count. Every tab reads this rather than each building its own
@@ -47,6 +71,8 @@ final class AppModel {
     var selectedTab: AppTab = .today
     var requestedChatThread: ConversationThread? = nil
     var requestedFocusCardID: String? = nil
+    var workspaceChannel: iOSWorkspaceChannel = .general
+    var latestFleetState: FleetState? = nil
 
     private(set) var pendingActionsCount = 0
     private(set) var clarificationsCount = 0

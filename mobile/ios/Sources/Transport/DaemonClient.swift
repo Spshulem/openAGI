@@ -766,6 +766,31 @@ public actor DaemonClient {
         }
     }
 
+    // Nudges an open desktop OpenAGI app on the target host to display its
+    // native "Connect a phone" window with a fresh 6-digit code. Never returns
+    // any credential or code over HTTP.
+    public static func requestPairingPrompt(
+        server: URL,
+        deviceName: String,
+        session: URLSession = .shared
+    ) async throws {
+        let validated = try HostAllowlist.validate(server)
+        var request = URLRequest(url: validated.appending(path: "/nodes/enroll/prompt"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["deviceName": deviceName])
+        let (_, response) = try await networkCall(request, session: session)
+        guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
+        switch http.statusCode {
+        case 200...299: return
+        case 404: throw DaemonError.notFound
+        case 429: throw DaemonError.conflict
+        case 401, 403: throw DaemonError.unauthorized
+        default: throw DaemonError.server(http.statusCode)
+        }
+    }
+
     // `URL.appending(path:)` percent-encodes its argument as a single path
     // component -- a literal "?status=pending" passed as `path` becomes the
     // literal characters "%3Fstatus=pending" in the URL's path, never a real

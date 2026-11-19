@@ -12,6 +12,31 @@ struct TodayView: View {
                 Section {
                     AgentConnectionRow()
                 }
+                if !model.isOnPhone && !ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+                    Section("OpenAGI Workspace") {
+                        let cardsCount = model.latestFleetState.map { SupervisorFormat.resolvedCards($0).count } ?? 0
+                        let runningCount = model.latestFleetState?.activeSummary?.running ?? 0
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Supervisor Workspace")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(cardsCount > 0
+                                     ? "\(cardsCount) decision\(cardsCount == 1 ? "" : "s") waiting · \(runningCount) running"
+                                     : "\(runningCount) active coding session\(runningCount == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(cardsCount > 0 ? "Review" : "Open") {
+                                model.workspaceChannel = cardsCount > 0 ? .needsYou : .general
+                                model.requestedChatThread = .supervisor
+                                model.selectedTab = .chat
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                    }
+                }
                 if let issue = model.mainConnectionIssue {
                     Section {
                         Label("Main connection needs attention", systemImage: "exclamationmark.icloud")

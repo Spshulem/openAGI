@@ -16,6 +16,8 @@ struct PairingView: View {
     @State private var errorDetail: String?
     @State private var discovery = ServerDiscovery()
     @State private var showingFallback = false
+    @State private var promptingHost = false
+    @State private var promptNotice: String?
     @FocusState private var codeFocused: Bool
     private let savedServer: URL?
     private let canResumeServer: Bool
@@ -49,29 +51,39 @@ struct PairingView: View {
                                 .foregroundStyle(Theme.muted)
                         }
 
-                        if let savedServer {
-                            Text("Your saved server is \(savedServer.absoluteString). Reconnect with the saved pairing; you don't need a new code after a disconnection.")
-                                .font(.footnote).foregroundStyle(.secondary)
-                        }
-                        if canResumeServer {
-                            Button("Return to saved server · no new code needed", systemImage: "server.rack") {
-                                Task {
-                                    isPairing = true
-                                    defer { isPairing = false }
-                                    do {
-                                        if Credentials.load(from: .server) != nil {
-                                            try await AppSession.shared.switchBackToServer()
-                                            onPaired()
-                                        } else {
-                                            AppSession.shared.goBack()
+                        if canResumeServer, let savedServer {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Saved server ready")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(Theme.live)
+                                Text(savedServer.absoluteString)
+                                    .font(Theme.Typography.dataMono)
+                                    .foregroundStyle(Theme.ink)
+                                PrimaryButton(title: "Return to saved server · no new code needed", isLoading: isPairing) {
+                                    Task {
+                                        isPairing = true
+                                        defer { isPairing = false }
+                                        do {
+                                            if Credentials.load(from: .server) != nil {
+                                                try await AppSession.shared.switchBackToServer()
+                                                onPaired()
+                                            } else {
+                                                AppSession.shared.goBack()
+                                            }
+                                        } catch {
+                                            errorHeadline = "Can't return to the saved server yet."
+                                            errorDetail = ServerConnectionGuidance.savedPairingFailure(error, server: savedServer)
                                         }
-                                    } catch {
-                                        errorHeadline = "Can't return to the saved server yet."
-                                        if let savedServer { errorDetail = ServerConnectionGuidance.savedPairingFailure(error, server: savedServer) }
                                     }
                                 }
+                                .disabled(isPairing)
                             }
-                            .disabled(isPairing)
+                            .padding(Theme.Spacing.x4)
+                            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.live.opacity(0.35), lineWidth: 1))
+                        } else if let savedServer {
+                            Text("Your saved server is \(savedServer.absoluteString). Reconnect with the saved pairing; you don't need a new code after a disconnection.")
+                                .font(.footnote).foregroundStyle(.secondary)
                         }
                         Button("Use a local or hosted model", systemImage: "iphone") { showingFallback = true }
                             .buttonStyle(.bordered)
@@ -89,16 +101,29 @@ struct PairingView: View {
                                     discovery.stop()
                                     scroll.scrollTo("pairing-code", anchor: .center)
                                     codeFocused = true
+                                    Task { await triggerMacPairingPopup(for: server.address) }
                                 } label: {
-                                    VStack(alignment: .leading) {
-                                        Text(server.name)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack {
+                                            Text(server.name).font(.subheadline.weight(.semibold))
+                                            Spacer()
+                                            Text("Tap to show code")
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(Theme.live)
+                                        }
                                         Text(server.address.absoluteString).font(.caption)
-                                        Text(server.reachable.map { $0 ? "Server reachable · pairing not checked" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
+                                        Text(server.reachable.map { $0 ? "Server reachable · tap to request code on Mac" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
                                             .font(.caption).foregroundStyle(.secondary)
                                     }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 .buttonStyle(.bordered)
                                 .accessibilityIdentifier("pairing-discovered-server-\(server.id)")
+                            }
+                            if let promptNotice {
+                                Label(promptNotice, systemImage: "macbook.and.iphone")
+                                    .font(.footnote.weight(.medium))
+                                    .foregroundStyle(Theme.live)
                             }
                             if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
                             Text("Tailscale does not broadcast servers. In Tailscale, open the device list → your Mac or Distiller → copy DNS name. Enter it below, then tap Find servers. Keep Tailscale and Use Tailscale DNS enabled on both devices.")
@@ -130,6 +155,18 @@ struct PairingView: View {
                                     Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
                                         .font(.footnote)
                                         .accessibilityIdentifier("pairing-tailscale-required")
+                                }
+                                if let parsedServer = TailscaleServerAddress.parse(serverText), parsedServer.host != nil {
+                                    Button {
+                                        codeFocused = true
+                                        Task { await triggerMacPairingPopup(for: parsedServer) }
+                                    } label: {
+                                        Label(promptingHost ? "Sending prompt to Mac…" : "Pop up pairing code on this computer", systemImage: "macbook.and.iphone")
+                                            .font(.footnote.weight(.semibold))
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(promptingHost || isPairing)
+                                    .padding(.top, 4)
                                 }
                             }
                             .padding(Theme.Spacing.x4)
@@ -181,6 +218,11 @@ struct PairingView: View {
                 .background(Theme.canvas)
                 .accessibilityIdentifier("pairing-form")
                 .sheet(isPresented: $showingFallback) { FallbackChatView() }
+                .task {
+                    if !ProcessInfo.processInfo.arguments.contains("--ui-testing") && !discovery.searching && discovery.servers.isEmpty {
+                        discovery.start(addresses: [savedServer, TailscaleServerAddress.parse(serverText)].compactMap { $0 })
+                    }
+                }
                 .onDisappear { discovery.stop() }
                 .toolbar {
                     if let onCancel {
@@ -191,6 +233,21 @@ struct PairingView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func triggerMacPairingPopup(for server: URL) async {
+        guard !promptingHost else { return }
+        promptingHost = true
+        promptNotice = nil
+        defer { promptingHost = false }
+        do {
+            try await DaemonClient.requestPairingPrompt(server: server, deviceName: Self.deviceName())
+            promptNotice = "Check your Mac — the 6-digit pairing code window just popped up."
+        } catch DaemonError.conflict {
+            promptNotice = "Pairing window already requested — check your Mac screen."
+        } catch {
+            promptNotice = "On your Mac menu bar, click OpenAGI → Connect a phone… to view the 6-digit code."
         }
     }
 
@@ -214,6 +271,7 @@ struct PairingView: View {
             )
             let credentials = Credentials(server: server, nodeID: enrollment.node.id, token: enrollment.nodeToken)
             try credentials.save()
+            try? credentials.save(to: .server)
             AppSession.shared.prepareForPairing()
             // Kick the first refresh so the day's tasks are already on disk
             // by the time the tab bar appears; failure here is not fatal to
