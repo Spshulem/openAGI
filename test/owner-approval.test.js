@@ -280,3 +280,41 @@ test("a voice turn always asks for the spoken code, even on a clean owner instru
   assert.equal(card.context.sessionId, "devices:supervisor:main");
   assert.equal(announced(h.emitted).length, 0, "a chat card is not pushed as an inbox approval");
 });
+
+test("spokenSummary trims trailing colons and 'try again' after a dropped computer-use session resumes without a second code", async (t) => {
+  const h = harness(t);
+  let startedComputer = 0;
+  h.registry.register({
+    name: "fleet_send_message",
+    needsConfirmation: true,
+    summarize: (args) => `Send to ${args.name} (${args.key}):\n${args.message}`,
+    handler: async () => ({ ok: true })
+  });
+  h.registry.register({
+    name: "start_computer_use_session",
+    needsConfirmation: true,
+    summarize: (args) => `Open computer-use session: "${args.goal}"`,
+    handler: async () => { startedComputer += 1; return { sessionId: "cu-1" }; }
+  });
+
+  const passiveCtx = h.ownerContext("phone", "what's the latest?");
+  passiveCtx.__turn.untrusted = true;
+  const held = await h.registry.invoke("fleet_send_message", { name: "AI SEO audit", key: "paseo:srv.1", message: "hello" }, passiveCtx);
+  assert.equal(held.result.status, "awaiting_owner_confirmation");
+  assert.ok(!held.result.say.endsWith(":."), `must not end with ':.': ${held.result.say}`);
+
+  const retryCtx = h.ownerContext("phone", "try again");
+  retryCtx.__turn.untrusted = true;
+  retryCtx.__turn.previousAssistantText = "The computer-control session dropped before I could finish.";
+  const retried = await h.registry.invoke("start_computer_use_session", { goal: "Inspect window" }, retryCtx);
+  assert.equal(retried.ok, true);
+  assert.equal(retried.result.sessionId, "cu-1");
+  assert.equal(startedComputer, 1);
+
+  // Unrelated previous assistant message still blocks start_computer_use_session on "try again".
+  const unrelatedCtx = h.ownerContext("phone", "try again");
+  unrelatedCtx.__turn.untrusted = true;
+  unrelatedCtx.__turn.previousAssistantText = "I fetched the latest status summary.";
+  const blocked = await h.registry.invoke("start_computer_use_session", { goal: "Inspect window" }, unrelatedCtx);
+  assert.equal(blocked.result.status, "awaiting_owner_confirmation");
+});

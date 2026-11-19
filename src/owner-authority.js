@@ -83,7 +83,8 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`(?:co+rdinate|cordinate)\b[^.!?\n]{0,120}?\b(?:workspaces?|chats?|threads?|sessions?|agents?|paseo|codex|claude|conductor|repos?|prs?|releases?|supervisors?)\b`,
       String.raw`(?:check(?:\s+in)?|follow\s+up|work|reach\s+out)\s+with\s+${TO_RECIPIENT}`,
       String.raw`(?:have|get|make|let)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:check(?!\s+the\s+(?:news|weather|stock|email|calendar)\b)|verify|test|finish|complete|ship|merge|rebase|update|report|sync|co+rdinate|cordinate|wrap\s+up|cut|prepare|deploy|continue|run|push)\b`,
-      String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`,
+      String.raw`(?:start|create|open|spin\s+up|launch|kick\s+off|fire\s+up)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\b`,
+      String.raw`(?:kick|spin|fire)\s+${ARTICLES}(?:(?:paseo|new|fresh|coordinator|release|qa)\s+)*(?:chats?|sessions?|threads?|coordinators?|workers?)\s+(?:off|up)\b`,
       String.raw`(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b[,!.\s]+)?(?:gpt|claude|sonnet|opus|haiku|codex|gemini|o[134]\b|sol\b|model\b|(?:low|medium|high|max)\s+effort\b)(?:[^.!?\n]|\.(?=\d)){0,80}?\bin\s+paseo\b`,
       String.raw`(?:start|create|open|run|use)\b(?:[^.!?\n]|\.(?=\d)){0,80}?\bin\s+paseo\b`,
       String.raw`(?:in|inside|for)\s+(?:(?:the|my)\s+)?[\w-]+\s+(?:workspace|project|repo|supervisor)\b\s*[,;:]?\s*(?:(?:please|go|let['’]?s|lets)\s+)*(?:work\s+on|implement|build|fix|add|ship|update)\b`,
@@ -175,7 +176,8 @@ const SUPERVISOR_DIRECTIVE_RE = new RegExp(
   `${LEAD}(?:` + [
     String.raw`(?:ask|tell|have|get|make|let)\s+(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who)\b)\S`,
     String.raw`(?:send|attach|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
-    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto)\b`,
+    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto|retry|try\s+again)\b`,
+    String.raw`(?:kick|spin|fire)\s+[^.!?\n]{1,40}?\b(?:off|up)\b`,
     String.raw`(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b[,!.\s]+)?(?:gpt|claude|sonnet|opus|haiku|codex|gemini|o[134]\b|sol\b|model\b|(?:low|medium|high|max)\s+effort\b)(?:[^.!?\n]|\.(?=\d)){0,80}?\bin\s+paseo\b`,
     String.raw`(?:go\s+ahead|go\s+for\s+it|do\s+(?:it|that)|sounds\s+(?:good|fine)|looks\s+(?:good|fine)|fine\s+(?:with|by)\s+me|works\s+for\s+me|lgtm)\b`
   ].join("|") + `)`,
@@ -183,10 +185,10 @@ const SUPERVISOR_DIRECTIVE_RE = new RegExp(
 );
 
 const PROPOSED_ACTION_RE =
-  /\?|\b(?:my recommendation|recommended|want me to|would you like|should i|shall i|continue,\s*inspect|or skip|reply with|choose one|option\s*[1-4a-d])\b/i;
+  /\?|\b(?:my recommendation|recommended|want me to|would you like|should i|shall i|continue,\s*inspect|or skip|reply with|choose one|option\s*[1-4a-d]|pending confirmation|delivery is pending|dropped before|no new chat was created|brief (?:has not been|was not) sent|timed out|could not|couldn['’]t)\b/i;
 
 const CONVERSATIONAL_ASSENT_RE =
-  /^\s*(?:yes|yeah|yep|yup|sure|ok|okay|alright|continue|proceed|go ahead|do it|do that|sounds good|looks good|lgtm|skip(?:\s+it)?|defer(?:\s+it)?|next(?:\s+one)?|(?:the\s+)?(?:first|second|third)(?:\s+one)?|option\s*[1-4a-d]|[1-4])(?:\s*[.!])?(?:\s+(?:please|now|and\s+(?:continue|move\s+on|next)))?\s*$/i;
+  /^\s*(?:yes|yeah|yep|yup|sure|ok|okay|alright|continue|proceed|go ahead|do it|do that|do it again|run it again|try again|retry|sounds good|looks good|lgtm|skip(?:\s+it)?|defer(?:\s+it)?|next(?:\s+one)?|(?:the\s+)?(?:first|second|third)(?:\s+one)?|option\s*[1-4a-d]|[1-4])(?:\s*[.!])?(?:\s+(?:please|now|and\s+(?:continue|move\s+on|next)))?\s*$/i;
 
 const CONVERSATIONAL_REFUSAL_RE =
   /\b(?:no|nope|don['’]?t|do not|wait|hold off|stop|cancel)\b/i;

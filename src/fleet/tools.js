@@ -383,10 +383,11 @@ export function registerFleetTools(registry, supervisor) {
       limit: Number.isInteger(args?.limit) ? args.limit : 15
     }) });
   if (typeof supervisor.startPaseoSession === "function") registry.register({ name: "fleet_start_session", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Start a new Paseo coding session in a target workspace (auto-resolved across online Paseo hosts when omitted, or via `workspace` / `serverId` + `cwd`), choosing the requested `model` (e.g. 'gpt-6.2-sol', 'sol 6-2', 'claude-sonnet-4-6') and `effort` ('minimal', 'low', 'medium', 'high', 'xhigh', 'max'), and send its initial prompt (plus any attached images).",
+    description: "Start a new Paseo coding session in a target workspace—either matching an existing thread's exact host and workspace directory via `fromThreadKey` (e.g. 'create a new chat in the same workspace as AI SEO audit'), or by `workspace` / `serverId` + `cwd` (auto-resolved across online Paseo hosts when omitted). Always picks a healthy ready provider/model (never inheriting a broken provider from an older chat) and sends the initial prompt (plus any attached images). NEVER use computer-use tools to create a Paseo chat; always use this tool.",
     parameters: {
       type: "object",
       properties: {
+        fromThreadKey: { type: "string", maxLength: KEY_MAX, description: "Optional existing thread key (e.g. paseo:<serverId>.<agentId>) whose exact host and workspace directory the new Paseo chat should be created inside." },
         workspace: { type: "string", maxLength: 160, description: "Optional workspace/project name (auto-inferred from prompt or primary workspace when omitted)" },
         cwd: { type: "string", maxLength: 400 },
         serverId: { type: "string", maxLength: 120 },
@@ -402,12 +403,13 @@ export function registerFleetTools(registry, supervisor) {
     },
     prepareApprovalArgs: (args) => fleetStartSessionTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.provider ?? null, args.model ?? null, args.effort ?? null, args.prompt, args.attachRecentImages === true])}`,
+    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.fromThreadKey ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.provider ?? null, args.model ?? null, args.effort ?? null, args.prompt, args.attachRecentImages === true])}`,
     summarize: (args) => `Start Paseo session in ${args.targetLabel}${args.title ? ` ("${args.title}")` : ""}:\n${clip(args.prompt, 240)}`,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
       const images = resolveFleetTurnImages(args, context);
       return supervisor.startPaseoSession({
+        fromThreadKey: args.fromThreadKey ?? null,
         workspace: args.workspace ?? null,
         cwd: args.cwd ?? null,
         serverId: args.serverId ?? null,
@@ -652,6 +654,7 @@ async function fleetSyncThemesTarget(supervisor, args = {}) {
 async function fleetStartSessionTarget(supervisor, args = {}) {
   const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
   if (!prompt || prompt.length > 4000) throw new Error("Prompt must be 1-4000 characters.");
+  const fromThreadKey = typeof args?.fromThreadKey === "string" && args.fromThreadKey.trim() ? args.fromThreadKey.trim() : null;
   let workspace = typeof args?.workspace === "string" && args.workspace.trim() ? args.workspace.trim() : null;
   let cwd = typeof args?.cwd === "string" && args.cwd.trim() ? args.cwd.trim() : null;
   let serverId = typeof args?.serverId === "string" && args.serverId.trim() ? args.serverId.trim() : null;
@@ -660,7 +663,22 @@ async function fleetStartSessionTarget(supervisor, args = {}) {
   const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
   const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
 
-  if (!workspace && !cwd) {
+  if (fromThreadKey && (!cwd || !serverId)) {
+    const refThread = supervisor?.lastThreads?.get?.(fromThreadKey)
+      ?? supervisor?.knownThreads?.get?.(fromThreadKey)
+      ?? null;
+    if (refThread) {
+      serverId ??= refThread.meta?.serverId ?? null;
+      cwd ??= refThread.meta?.paseoCwd ?? refThread.cwd ?? null;
+      workspace ??= refThread.workspace ?? refThread.title ?? null;
+    } else if (fromThreadKey.startsWith("paseo:")) {
+      const rest = fromThreadKey.slice("paseo:".length);
+      const dot = rest.indexOf(".");
+      if (dot > 0) serverId ??= rest.slice(0, dot);
+    }
+  }
+
+  if (!fromThreadKey && !workspace && !cwd) {
     const inv = typeof supervisor?.listWorkspaces === "function"
       ? await supervisor.listWorkspaces({ includeArchived: true, limit: 60 }).catch(() => null)
       : null;
@@ -680,6 +698,7 @@ async function fleetStartSessionTarget(supervisor, args = {}) {
   }
 
   return {
+    ...(fromThreadKey ? { fromThreadKey } : {}),
     ...(workspace ? { workspace } : {}),
     ...(cwd ? { cwd } : {}),
     ...(serverId ? { serverId } : {}),
@@ -687,8 +706,9 @@ async function fleetStartSessionTarget(supervisor, args = {}) {
     ...(provider ? { provider } : {}),
     ...(model ? { model } : {}),
     ...(effort ? { effort } : {}),
+    ...(args?.attachRecentImages === true ? { attachRecentImages: true } : {}),
     prompt,
-    targetLabel: clip(workspace || cwd || "workspace", 80)
+    targetLabel: clip(workspace || cwd || fromThreadKey || "workspace", 80)
   };
 }
 

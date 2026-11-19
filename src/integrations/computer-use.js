@@ -545,7 +545,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
 
   registry.register({
     name: "start_computer_use_session",
-    description: "Open a computer-use session for a user-stated goal. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise call it once: on the owner's own instruction it starts the session at once; from anyone else it creates ONE approval request with a code (the owner approves by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab) and approval resumes the chat. Subsequent computer_* actions in the session won't re-prompt. To type into, click in, open, quit or restart a Conductor or Codex chat the fleet supervisor watches, use fleet_send_message, fleet_click or fleet_app instead. " + SAFETY_NOTE,
+    description: "Open a computer-use session for a user-stated GUI goal outside coding chats. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise call it once: on the owner's own instruction it starts the session at once; from anyone else it creates ONE approval request with a code (the owner approves by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab) and approval resumes the chat. Subsequent computer_* actions in the session won't re-prompt. NEVER use this tool to inspect, create, or message a Paseo, Conductor, Claude, or Codex chat—use fleet_start_session (with fromThreadKey to match an existing chat's workspace), fleet_send_message, fleet_dispatch_goal, fleet_click, or fleet_app instead. " + SAFETY_NOTE,
     parameters: {
       type: "object",
       properties: {

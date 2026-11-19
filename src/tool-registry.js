@@ -300,12 +300,16 @@ export class ToolRegistry {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
     const prevAssistant = typeof turn.previousAssistantText === "string" ? turn.previousAssistantText : "";
-    const conversationalCover = (
+    const retryComputerSession = tool.name === "start_computer_use_session"
+      && /\b(?:computer[- ]?(?:use|control)|screenshot)\b/i.test(prevAssistant)
+      && /\b(?:dropped|failed|ended|timed out|could not|couldn['’]t)\b/i.test(prevAssistant)
+      && /^\s*(?:try again|retry|run it again|do it again)(?:\s*[.!])?\s*$/i.test(String(turn.intent ?? ""));
+    const conversationalCover = ((
       tool.supervisorAutoApprove === true
       || intentCovers("approve", tool.name)
       || tool.name === "fleet_send_message"
       || tool.name === "reply_to_coding_agent"
-    ) && isConversationalAssentOrChoice(turn.intent ?? "", prevAssistant);
+    ) && isConversationalAssentOrChoice(turn.intent ?? "", prevAssistant)) || retryComputerSession;
     const autoApproved = (
       turn.supervisorAutoApprove === true
       && tool.supervisorAutoApprove === true
@@ -404,7 +408,7 @@ function safeOwnerConfirm(fn, args, context) {
 }
 
 function spokenSummary(summary) {
-  const line = String(summary ?? "").split("\n")[0].trim();
+  const line = String(summary ?? "").split("\n")[0].trim().replace(/[:;.\s]+$/, "");
   return (line.length > 120 ? `${line.slice(0, 117)}...` : line) || "run it";
 }
 
