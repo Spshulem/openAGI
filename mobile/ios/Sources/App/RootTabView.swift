@@ -107,8 +107,15 @@ struct RootTabView: View {
         .task { if runsBackgroundServices { await PushRegistrar.shared.start() } }
         .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in
             guard wants else { return }
-            model.selectedTab = .supervisor
+            model.requestedChatThread = .supervisor
+            model.selectedTab = .chat
             PushRouter.shared.wantsSupervisor = false
+        }
+        .onChange(of: model.selectedTab, initial: true) { _, nextTab in
+            if nextTab == .supervisor {
+                model.requestedChatThread = .supervisor
+                model.selectedTab = .chat
+            }
         }
         .onChange(of: PushRouter.shared.wantsTab, initial: true) { _, tab in
             guard let tab else { return }
@@ -136,9 +143,6 @@ struct RootTabView: View {
                 withSupportingChat(InboxView())
             }.badge(model.inboxBadgeCount)
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) { ChatView() }
-            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
-                SupervisorView()
-            }
         }
         // iOS 27.1 places the system tab and navigation bars around Duo's
         // status bar and camera. Keep this same hierarchy across every pose

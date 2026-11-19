@@ -411,3 +411,97 @@ export async function evaluateQuestionsRelevanceWithDecisions({
   });
   return { ok: true, scores, inputTokens: res.inputTokens };
 }
+
+const ownerIntentClarityCache = new Map();
+const OWNER_INTENT_CACHE_TTL_MS = 30 * 60_000;
+const OWNER_INTENT_CACHE_MAX = 400;
+
+// Evaluates whether the authenticated owner's words clearly authorize a
+// side-effecting tool call in light of the immediately preceding assistant
+// question/recommendation, using OpenAI's `/v1/decisions` predicate endpoint.
+// Never includes untrusted third-party tool outputs in `input`.
+export async function evaluateOwnerIntentClarityWithDecisions({
+  ownerIntent,
+  previousAssistantText = "",
+  toolName,
+  actionSummary = "",
+  apiKey,
+  url = DEFAULT_DECISIONS_URL,
+  model = DEFAULT_DECISIONS_MODEL,
+  timeoutMs = 4_500,
+  threshold = 0.5,
+  fetchImpl = globalThis.fetch
+} = {}) {
+  const intent = String(ownerIntent ?? "").trim();
+  const tool = String(toolName ?? "").trim();
+  const cleanKey = typeof apiKey === "string" ? apiKey.trim() : "";
+  if (!intent || !tool || !cleanKey) {
+    return { ok: false, clear: false, error: "missing owner intent clarity arguments" };
+  }
+  if (
+    fetchImpl === globalThis.fetch
+    && (!url || url === DEFAULT_DECISIONS_URL)
+    && !(cleanKey.startsWith("sk-") && cleanKey.length >= 20)
+  ) {
+    return { ok: false, clear: false, error: "non-live test key" };
+  }
+
+  const nowTs = Date.now();
+  const cKey = cacheDigest([
+    intent,
+    String(previousAssistantText ?? "").slice(-800),
+    tool,
+    String(actionSummary ?? "").slice(0, 300)
+  ]);
+  const hit = ownerIntentClarityCache.get(cKey);
+  if (hit && nowTs - hit.at < OWNER_INTENT_CACHE_TTL_MS) {
+    return hit.value;
+  }
+
+  const inputPayload = {
+    previous_assistant_message: clampTail(redactSecrets(String(previousAssistantText ?? "")), 800),
+    authenticated_owner_message: clampText(redactSecrets(intent), 500),
+    proposed_tool_action: {
+      tool,
+      summary: clampText(redactSecrets(String(actionSummary ?? "")), 300)
+    }
+  };
+  const res = await callDecisionsEndpoint({
+    input: inputPayload,
+    questions: [
+      {
+        type: "predicate",
+        name: "owner_clearly_authorized",
+        instructions:
+          "Did `authenticated_owner_message` clearly authorize, confirm, select, or ask the assistant to execute " +
+          "`proposed_tool_action` (for example saying 'yes', 'ok', 'continue', 'skip', choosing an option, or giving " +
+          "a clear follow-up instruction directly in response to `previous_assistant_message`), as opposed to " +
+          "asking a passive read-only status/summary question where this action was never requested?"
+      }
+    ],
+    apiKey: cleanKey,
+    url,
+    model,
+    timeoutMs,
+    fetchImpl
+  });
+  if (!res.ok) {
+    return { ok: false, clear: false, error: res.error };
+  }
+  const prob = res.probabilities.get("owner_clearly_authorized");
+  if (typeof prob !== "number") {
+    return { ok: false, clear: false, error: "decisions omitted probability" };
+  }
+  const result = {
+    ok: true,
+    clear: prob >= threshold,
+    probability: prob,
+    model: res.model
+  };
+  if (ownerIntentClarityCache.size >= OWNER_INTENT_CACHE_MAX) {
+    const oldest = ownerIntentClarityCache.keys().next().value;
+    if (oldest) ownerIntentClarityCache.delete(oldest);
+  }
+  ownerIntentClarityCache.set(cKey, { at: nowTs, value: result });
+  return result;
+}

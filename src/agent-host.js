@@ -272,6 +272,9 @@ export class AgentHost {
       || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
       || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
     const isSupervisorThread = metadata.thread === "supervisor" || agent?.id === "supervisor";
+    const lastAssistantMsg = sessionBefore.messages
+      .slice(0, -1)
+      .findLast((m) => m?.role === "assistant" && typeof m?.content === "string");
     const supervisorAutoApprove = Boolean(
       principal
       && isSupervisorThread
@@ -284,6 +287,14 @@ export class AgentHost {
           ...(supervisorAutoApprove ? { supervisorAutoApprove: true } : {}),
         }
       : null;
+    if (turnState) {
+      Object.defineProperty(turnState, "previousAssistantText", {
+        value: lastAssistantMsg ? String(lastAssistantMsg.content).slice(-1200) : "",
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
     let confirmation = null;
     if (principal && !ephemeral) {
       if (principal.via === "voice") {

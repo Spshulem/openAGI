@@ -45,6 +45,8 @@ final class AppModel {
     // Plain UI state, not persisted -- which tab RootTabView's `TabView` is
     // showing. Any view behind the tab bar can set this directly.
     var selectedTab: AppTab = .today
+    var requestedChatThread: ConversationThread? = nil
+    var requestedFocusCardID: String? = nil
 
     private(set) var pendingActionsCount = 0
     private(set) var clarificationsCount = 0

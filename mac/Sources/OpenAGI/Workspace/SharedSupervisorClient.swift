@@ -230,11 +230,18 @@ struct MacModelOption: Identifiable, Equatable, Sendable {
     MacModelOption(id: "gpt-4.1", label: "GPT-4.1")
   ]
 
+  static let curatedClaude: [MacModelOption] = [
+    MacModelOption(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6"),
+    MacModelOption(id: "claude-opus-4-7", label: "Claude Opus 4.7")
+  ]
+
   static func displayName(for modelId: String?) -> String {
     guard let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else {
       return "Model"
     }
-    return curatedOpenAI.first(where: { $0.id == id })?.label ?? id
+    return curatedOpenAI.first(where: { $0.id == id })?.label
+      ?? curatedClaude.first(where: { $0.id == id })?.label
+      ?? id
   }
 }
 
@@ -243,8 +250,28 @@ private struct ModelSettingsResponse: Decodable {
     let provider: String?
     let model: String?
   }
+  struct KeyProvider: Decodable {
+    let configured: Bool
+    let model: String?
+  }
+  struct CliProvider: Decodable {
+    let available: Bool
+    let model: String?
+  }
+  struct ChatGPTProvider: Decodable {
+    let signedIn: Bool
+    let email: String?
+  }
+  struct Providers: Decodable {
+    let anthropic: KeyProvider?
+    let openai: KeyProvider?
+    let chatgpt: ChatGPTProvider?
+    let claudeCli: CliProvider?
+    let codexCli: CliProvider?
+  }
   let preference: String?
   let active: Active?
+  let providers: Providers?
 }
 
 private struct SupervisorStreamStatus: Decodable {
@@ -290,11 +317,26 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var progressStage: String? = nil
   @Published private(set) var activeModelId: String? = nil
   @Published private(set) var activeProvider: String? = nil
+  @Published private(set) var modelPreference: String = "auto"
+  @Published private(set) var claudeCliAvailable = false
+  @Published private(set) var codexCliAvailable = false
+  @Published private(set) var chatgptSignedIn = false
+  @Published private(set) var anthropicConfigured = false
   @Published private(set) var isSwitchingModel = false
   @Published private(set) var lastError: String? = nil
 
   var activeModelLabel: String {
-    MacModelOption.displayName(for: activeModelId)
+    let base = MacModelOption.displayName(for: activeModelId)
+    switch activeProvider {
+    case "claude-cli":
+      return activeModelId == nil ? "Claude Account" : "Claude CLI · \(base)"
+    case "codex-cli":
+      return activeModelId == nil ? "Codex Account" : "Codex CLI · \(base)"
+    case "chatgpt":
+      return activeModelId == nil ? "ChatGPT Plan" : "ChatGPT · \(base)"
+    default:
+      return base
+    }
   }
 
   private struct UnsupportedFieldsError: Error {}
@@ -352,34 +394,49 @@ final class SharedSupervisorClient: ObservableObject {
       let (data, response) = try await URLSession.shared.data(for: req)
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
-      activeProvider = decoded.active?.provider
-      activeModelId = decoded.active?.model
+      applyModelSettings(decoded)
     } catch {
       // Non-fatal while daemon or main restarts.
     }
   }
 
+  private func applyModelSettings(_ decoded: ModelSettingsResponse) {
+    modelPreference = decoded.preference ?? "auto"
+    activeProvider = decoded.active?.provider
+    activeModelId = decoded.active?.model
+    claudeCliAvailable = decoded.providers?.claudeCli?.available ?? false
+    codexCliAvailable = decoded.providers?.codexCli?.available ?? false
+    chatgptSignedIn = decoded.providers?.chatgpt?.signedIn ?? false
+    anthropicConfigured = decoded.providers?.anthropic?.configured ?? false
+  }
+
   func selectOpenAIModel(_ modelId: String) async {
+    await selectModelPreference(preference: "openai", modelField: "openaiModel", modelId: modelId)
+  }
+
+  func selectModelPreference(preference: String, modelField: String? = nil, modelId: String? = nil) async {
     guard !isSwitchingModel else { return }
     isSwitchingModel = true
     defer { isSwitchingModel = false }
+    var body: [String: Any] = ["preference": preference]
+    if let modelField, let modelId {
+      body[modelField] = modelId
+    }
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
       path: "/settings/models"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try? JSONSerialization.data(withJSONObject: [
-      "preference": "openai",
-      "openaiModel": modelId
-    ])
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     req.timeoutInterval = 15
     authed(&req)
     do {
       let (data, response) = try await URLSession.shared.data(for: req)
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
-      activeProvider = decoded.active?.provider ?? "openai"
-      activeModelId = decoded.active?.model ?? modelId
+      applyModelSettings(decoded)
+      if activeProvider == nil { activeProvider = preference }
+      if activeModelId == nil, let modelId { activeModelId = modelId }
       lastError = nil
     } catch {
       lastError = error.localizedDescription

@@ -6,12 +6,16 @@ final class WorkspaceProtocolTests: XCTestCase {
         let json = """
         {"preference":"auto","active":{"provider":"anthropic","model":"claude-sonnet-4-6","offlineFallback":true},
          "providers":{"anthropic":{"configured":true,"model":null},"openai":{"configured":false,"model":"gpt-5"},
-                      "onDevice":{"available":true,"connected":false}}}
+                      "onDevice":{"available":true,"connected":false},
+                      "claudeCli":{"available":true,"model":"claude-sonnet-4-6"},
+                      "codexCli":{"available":true,"model":"gpt-5.4"}}}
         """
         let settings = try ProtocolDecoder.json.decode(ModelSettings.self, from: Data(json.utf8))
         XCTAssertEqual(settings.active.provider, "anthropic")
         XCTAssertEqual(settings.active.offlineFallback, true)
         XCTAssertTrue(settings.providers.anthropic.configured)
+        XCTAssertEqual(settings.providers.claudeCli?.available, true)
+        XCTAssertEqual(settings.providers.codexCli?.model, "gpt-5.4")
         XCTAssertNil(settings.providers.chatgpt)
         XCTAssertTrue(settings.hasUsableCloudModel)
     }
@@ -21,13 +25,19 @@ final class WorkspaceProtocolTests: XCTestCase {
         let missing = ModelSettings.KeyProvider(configured: false, model: nil)
         func settings(_ provider: String?, anthropic: ModelSettings.KeyProvider = .init(configured: false, model: nil),
                       openai: ModelSettings.KeyProvider = .init(configured: false, model: nil),
-                      signedIn: Bool? = nil) -> ModelSettings {
+                      signedIn: Bool? = nil,
+                      claudeCli: ModelSettings.CliProvider? = nil,
+                      codexCli: ModelSettings.CliProvider? = nil) -> ModelSettings {
             ModelSettings(preference: "auto", active: .init(provider: provider, model: nil, offlineFallback: false),
                           providers: .init(anthropic: anthropic, openai: openai, onDevice: nil,
-                                           chatgpt: signedIn.map { .init(signedIn: $0, email: nil) }))
+                                           chatgpt: signedIn.map { .init(signedIn: $0, email: nil) },
+                                           claudeCli: claudeCli, codexCli: codexCli))
         }
         XCTAssertTrue(settings("openai", openai: configured).hasUsableCloudModel)
         XCTAssertTrue(settings("chatgpt", signedIn: true).hasUsableCloudModel)
+        XCTAssertTrue(settings("claude-cli", claudeCli: .init(available: true)).hasUsableCloudModel)
+        XCTAssertTrue(settings("codex-cli", codexCli: .init(available: true)).hasUsableCloudModel)
+        XCTAssertFalse(settings("claude-cli", claudeCli: .init(available: false)).hasUsableCloudModel)
         XCTAssertFalse(settings("anthropic", anthropic: missing, openai: configured).hasUsableCloudModel)
         XCTAssertFalse(settings("openai", anthropic: configured).hasUsableCloudModel)
         XCTAssertFalse(settings("chatgpt", signedIn: false).hasUsableCloudModel)

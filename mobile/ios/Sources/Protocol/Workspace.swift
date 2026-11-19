@@ -22,11 +22,32 @@ public struct ModelSettings: Decodable, Sendable, Equatable {
         public let signedIn: Bool
         public let email: String?
     }
+    public struct CliProvider: Decodable, Sendable, Equatable {
+        public let available: Bool
+        public let model: String?
+
+        public init(available: Bool, model: String? = nil) {
+            self.available = available
+            self.model = model
+        }
+    }
     public struct Providers: Decodable, Sendable, Equatable {
         public let anthropic: KeyProvider
         public let openai: KeyProvider
         public let onDevice: OnDevice?
         public let chatgpt: ChatGPT?
+        public let claudeCli: CliProvider?
+        public let codexCli: CliProvider?
+
+        public init(anthropic: KeyProvider, openai: KeyProvider, onDevice: OnDevice? = nil,
+                    chatgpt: ChatGPT? = nil, claudeCli: CliProvider? = nil, codexCli: CliProvider? = nil) {
+            self.anthropic = anthropic
+            self.openai = openai
+            self.onDevice = onDevice
+            self.chatgpt = chatgpt
+            self.claudeCli = claudeCli
+            self.codexCli = codexCli
+        }
     }
     public let preference: String
     public let active: Active
@@ -37,7 +58,9 @@ public struct ModelSettings: Decodable, Sendable, Equatable {
     public var hasUsableCloudModel: Bool {
         switch active.provider {
         case "anthropic": providers.anthropic.configured
+        case "claude-cli": providers.claudeCli?.available == true
         case "openai": providers.openai.configured
+        case "codex-cli": providers.codexCli?.available == true
         case "chatgpt": providers.chatgpt?.signedIn == true
         default: false
         }
@@ -50,15 +73,20 @@ public struct ModelSettingsUpdate: Encodable, Sendable, Equatable {
     public var openaiKey: String?
     public var anthropicModel: String?
     public var openaiModel: String?
+    public var claudeCliModel: String?
+    public var codexCliModel: String?
     public var clear: [String]?
 
     public init(preference: String? = nil, anthropicKey: String? = nil, openaiKey: String? = nil,
-                anthropicModel: String? = nil, openaiModel: String? = nil, clear: [String]? = nil) {
+                anthropicModel: String? = nil, openaiModel: String? = nil,
+                claudeCliModel: String? = nil, codexCliModel: String? = nil, clear: [String]? = nil) {
         self.preference = preference
         self.anthropicKey = anthropicKey
         self.openaiKey = openaiKey
         self.anthropicModel = anthropicModel
         self.openaiModel = openaiModel
+        self.claudeCliModel = claudeCliModel
+        self.codexCliModel = codexCliModel
         self.clear = clear
     }
 }
