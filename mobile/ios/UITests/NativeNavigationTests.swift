@@ -330,7 +330,7 @@ final class NativeNavigationTests: XCTestCase {
         capture("redesign-chat-composer", app: app)
         tap(app, "chat-send")
         XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
-        XCTAssertTrue(element(app, "chat-reply-copy").waitForExistence(timeout: 5), "The newest reply offers Copy")
+        XCTAssertTrue(app.buttons["chat-reply-copy"].waitForExistence(timeout: 10), "The newest reply offers Copy")
         XCTAssertTrue(element(app, "chat-approval-raised-approval").waitForExistence(timeout: 10),
                       "An approval raised by the turn shows under its reply")
         capture("redesign-chat-approval", app: app)

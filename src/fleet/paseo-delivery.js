@@ -469,6 +469,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
               status: "sent",
               route: "paseo-send",
               actionId,
+              ...(normalizedImages.length ? { attachedImages: normalizedImages.length } : {}),
               recoveredSession: recovered,
               detail: `Session runtime disconnected (${errReason}); started fresh Paseo session in ${path.basename(recovered.cwd)} (${recovered.key}) and delivered message`
             };
@@ -511,6 +512,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
               status: "sent",
               route: "paseo-send",
               actionId,
+              ...(normalizedImages.length ? { attachedImages: normalizedImages.length } : {}),
               recoveredSession: recovered,
               detail: `Session runtime disconnected (${turnOutcome.systemError}); started fresh Paseo session in ${path.basename(recovered.cwd)} (${recovered.key}) and delivered message`
             };
@@ -520,7 +522,13 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       }
       if (!turnOutcome.confirmed) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
       writeJsonAtomic(file, { ...correlated, pending: false });
-      return { status: "sent", route: "paseo-send", actionId, detail: "Paseo message and turn confirmed" };
+      return {
+        status: "sent",
+        route: "paseo-send",
+        actionId,
+        ...(normalizedImages.length ? { attachedImages: normalizedImages.length } : {}),
+        detail: normalizedImages.length ? `Paseo message, ${normalizedImages.length} image(s), and turn confirmed` : "Paseo message and turn confirmed"
+      };
     }, factory);
   } catch (err) {
     const errMsg = ownerInitiated && err?.message ? `: ${clampText(redactSecrets(String(err.message)), 120)}` : "";

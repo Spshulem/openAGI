@@ -125,6 +125,40 @@ struct WorkspaceImageAttachment: Identifiable, Equatable {
   }
 
   @MainActor
+  static func fromLocalImagePath(_ raw: String) -> WorkspaceImageAttachment? {
+    var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if (trimmed.hasPrefix("\"") && trimmed.hasSuffix("\""))
+        || (trimmed.hasPrefix("'") && trimmed.hasSuffix("'")),
+       trimmed.count >= 2 {
+      trimmed = String(trimmed.dropFirst().dropLast())
+    }
+    guard !trimmed.isEmpty else { return nil }
+    let filePath: String
+    if trimmed.lowercased().hasPrefix("file://"),
+       let fileURL = URL(string: trimmed),
+       fileURL.isFileURL {
+      filePath = fileURL.path
+    } else if trimmed.hasPrefix("/") {
+      filePath = trimmed
+    } else if trimmed.hasPrefix("~/") {
+      filePath = NSString(string: trimmed).expandingTildeInPath
+    } else {
+      return nil
+    }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir), !isDir.boolValue else {
+      return nil
+    }
+    let url = URL(fileURLWithPath: filePath)
+    guard let uti = UTType(filenameExtension: url.pathExtension),
+          uti.conforms(to: .image),
+          let img = NSImage(contentsOf: url) else {
+      return nil
+    }
+    return encode(img, name: url.lastPathComponent)
+  }
+
+  @MainActor
   static func fromPasteboard(_ pb: NSPasteboard = .general, limit: Int = 4) -> [WorkspaceImageAttachment] {
     if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
       let fromURLs = urls.prefix(limit).compactMap { url -> WorkspaceImageAttachment? in
@@ -135,11 +169,102 @@ struct WorkspaceImageAttachment: Identifiable, Equatable {
       }
       if !fromURLs.isEmpty { return fromURLs }
     }
+    if let str = pb.string(forType: .string), let fromPath = fromLocalImagePath(str) {
+      return [fromPath]
+    }
     if let img = NSImage(pasteboard: pb),
        let encoded = encode(img, name: "Pasted image.jpg") {
       return [encoded]
     }
     return []
+  }
+
+  /// Resolves image attachments on `Cmd+V` without hijacking normal prose paste
+  /// (e.g. rich-text copies that include a string alongside non-image formatting).
+  @MainActor
+  static func pasteboardImagesForCommandV(_ pb: NSPasteboard = .general, limit: Int = 4) -> [WorkspaceImageAttachment] {
+    guard limit > 0 else { return [] }
+    if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+      let fromURLs = urls.prefix(limit).compactMap { url -> WorkspaceImageAttachment? in
+        guard let uti = UTType(filenameExtension: url.pathExtension),
+              uti.conforms(to: .image),
+              let img = NSImage(contentsOf: url) else { return nil }
+        return encode(img, name: url.lastPathComponent)
+      }
+      if !fromURLs.isEmpty { return fromURLs }
+    }
+    let rawString = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !rawString.isEmpty, let fromPath = fromLocalImagePath(rawString) {
+      return [fromPath]
+    }
+    let rasterTypes: [NSPasteboard.PasteboardType] = [
+      .png,
+      .tiff,
+      NSPasteboard.PasteboardType("public.jpeg"),
+      NSPasteboard.PasteboardType("org.webmproject.webp"),
+      NSPasteboard.PasteboardType("public.heic")
+    ]
+    if pb.availableType(from: rasterTypes) != nil {
+      let stringIsFilenameOrEmpty = rawString.isEmpty
+        || rawString.lowercased().hasPrefix("http://")
+        || rawString.lowercased().hasPrefix("https://")
+        || rawString.lowercased().hasPrefix("file://")
+        || fromLocalImagePath(rawString) != nil
+        || (!rawString.contains(" ") && !rawString.contains("\n") && rawString.count <= 120)
+      if stringIsFilenameOrEmpty,
+         let img = NSImage(pasteboard: pb),
+         let encoded = encode(img, name: "Pasted image.jpg") {
+        return [encoded]
+      }
+    }
+    return []
+  }
+
+  @MainActor
+  static func extractInlineLocalImages(from text: String, limit: Int = 4) -> (cleanedText: String, attachments: [WorkspaceImageAttachment]) {
+    guard limit > 0, text.contains("/") else { return (text, []) }
+    let pattern = #"(?i)(?:(?<=^)|(?<=[\s"'(]))(?:file://)?((?:~|/)[^\n\r]*?\.(?:png|jpe?g|webp|gif|heic))(?=$|[\s"')\]])"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else {
+      return (text, [])
+    }
+    let nsText = text as NSString
+    let fullRange = NSRange(location: 0, length: nsText.length)
+    let matches = regex.matches(in: text, options: [], range: fullRange)
+    guard !matches.isEmpty else { return (text, []) }
+
+    var attachments: [WorkspaceImageAttachment] = []
+    var rangesToRemove: [NSRange] = []
+    for match in matches {
+      guard attachments.count < limit else { break }
+      let pathRange = match.range(at: 1)
+      guard pathRange.location != NSNotFound else { continue }
+      let rawPath = nsText.substring(with: pathRange)
+      let decoded = rawPath.removingPercentEncoding ?? rawPath
+      guard let att = fromLocalImagePath(decoded) ?? fromLocalImagePath(rawPath) else { continue }
+      if !attachments.contains(att) {
+        attachments.append(att)
+      }
+      var removeRange = match.range(at: 0)
+      // Also strip wrapping quotes around the matched path when present.
+      if removeRange.location > 0 && removeRange.location + removeRange.length < nsText.length {
+        let prev = nsText.substring(with: NSRange(location: removeRange.location - 1, length: 1))
+        let next = nsText.substring(with: NSRange(location: removeRange.location + removeRange.length, length: 1))
+        if (prev == "'" && next == "'") || (prev == "\"" && next == "\"") {
+          removeRange = NSRange(location: removeRange.location - 1, length: removeRange.length + 2)
+        }
+      }
+      rangesToRemove.append(removeRange)
+    }
+    guard !rangesToRemove.isEmpty else { return (text, []) }
+
+    let mutable = NSMutableString(string: text)
+    for r in rangesToRemove.reversed() {
+      mutable.replaceCharacters(in: r, with: " ")
+    }
+    let cleaned = (mutable as String)
+      .replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
+      .replacingOccurrences(of: #"^\s+|\s+$"#, with: "", options: .regularExpression)
+    return (cleaned, attachments)
   }
 
   static func fromDropProviders(_ providers: [NSItemProvider], limit: Int = 4) async -> [WorkspaceImageAttachment] {

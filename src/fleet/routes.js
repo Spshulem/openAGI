@@ -362,6 +362,7 @@ export function createFleetRoute({ supervisor } = {}) {
           value,
           clarification: typeof body.clarification === "string" ? body.clarification : null,
           instructions: typeof body.instructions === "string" ? body.instructions : null,
+          ...(Array.isArray(body.images) ? { images: body.images } : {}),
           ...sendOptions
         });
         if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
@@ -427,14 +428,16 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
-        const message = typeof body?.message === "string" ? body.message.trim() : "";
+        const images = Array.isArray(body?.images) ? body.images : null;
+        const rawMessage = typeof body?.message === "string" ? body.message.trim() : "";
+        const message = rawMessage || (images?.length ? "Please inspect the attached image(s)." : "");
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
         const extraOpts = {
           ...sendOptions,
           ...(body?.queue === true ? { queue: true } : {}),
-          ...(Array.isArray(body?.images) ? { images: body.images } : {})
+          ...(images?.length ? { images } : {})
         };
         const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);
         return ok({ delivery: result?.delivery ?? null, state: state() });

@@ -105,6 +105,7 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`(?:reply|respond|write back|answer back)\s+to\s+(?!(?:me|us)\b)\w`,
       String.raw`(?:send|write|reply|respond|answer)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
       String.raw`(?:forward|pass along|route)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
+      String.raw`attach\s+(?:the\s+|this\s+|that\s+|my\s+)?(?:it|that|this|these|images?|photos?|pics?|pictures?|screenshots?|screen\s*shots?|screen\s*grabs?)(?!\s+to\s+me\b)\b`,
       String.raw`(?:in|on)\s+${NAMED_RECIPIENT}\s*[,;:]?\s*(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:send|forward)\s+(?:it|this|that|these)\b`,
       String.raw`(?:ask|answer)\s+${NAMED_RECIPIENT}`,
       String.raw`(?:have|get)\s+${NAMED_RECIPIENT}\s+(?:to\s+)?(?:fix|solve|patch|debug|investigate|repair|handle)\b`,
@@ -171,7 +172,7 @@ export function intentCovers(intent, toolName) {
 const SUPERVISOR_DIRECTIVE_RE = new RegExp(
   `${LEAD}(?:` + [
     String.raw`(?:ask|tell|have|get|make|let)\s+(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who)\b)\S`,
-    String.raw`(?:send|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
+    String.raw`(?:send|attach|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
     String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto)\b`,
     String.raw`(?:go\s+ahead|go\s+for\s+it|do\s+(?:it|that)|sounds\s+(?:good|fine)|looks\s+(?:good|fine)|fine\s+(?:with|by)\s+me|works\s+for\s+me|lgtm)\b`
   ].join("|") + `)`,

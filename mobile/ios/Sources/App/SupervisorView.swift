@@ -1,5 +1,8 @@
+import PhotosUI
 import SwiftUI
 import SupervisorChannelsKit
+import UIKit
+import UniformTypeIdentifiers
 
 // mobile/FEATURES.md's Supervisor tab: one fluid conversation with the fleet
 // supervisor ("supervisor" shared thread) paired with a pinned, swipeable
@@ -245,8 +248,8 @@ struct SupervisorView: View {
                 onCardPrimary: { targetCard, action in
                     Task { await act(targetCard, action: action) }
                 },
-                onCardReply: { targetCard, text in
-                    await act(targetCard, action: SupervisorCardAction(op: "reply", label: "Reply", value: text))
+                onCardReply: { targetCard, text, attachments in
+                    await act(targetCard, action: SupervisorCardAction(op: "reply", label: "Reply", value: text), images: attachments)
                 }
             )
         }
@@ -917,7 +920,7 @@ struct SupervisorView: View {
     }
 
     @discardableResult
-    private func act(_ card: SupervisorCard, action: SupervisorCardAction) async -> Bool {
+    private func act(_ card: SupervisorCard, action: SupervisorCardAction, images: [ChatAttachment] = []) async -> Bool {
         guard busyCardID == nil && busyQuestionID == nil else { return false }
         busyCardID = card.id
         statusNote = nil
@@ -926,7 +929,7 @@ struct SupervisorView: View {
         let noteTargetID = card.questionId ?? card.id
         let daemonHasCards = !(state?.cards.isEmpty ?? true)
         do {
-            let result = try await model.client.fleetActCard(id: card.id, op: action.op, value: action.value)
+            let result = try await model.client.fleetActCard(id: card.id, op: action.op, value: action.value, images: images)
             let note = SupervisorFormat.cardActNote(result)
             statusNote = note
             questionNote = (noteTargetID, note)
@@ -1976,7 +1979,7 @@ private struct ThreadDetailSheet: View {
     var onDefer: () -> Void = {}
     var card: SupervisorCard? = nil
     var onCardPrimary: (SupervisorCard, SupervisorCardAction) -> Void = { _, _ in }
-    var onCardReply: ((SupervisorCard, String) async -> Bool)? = nil
+    var onCardReply: ((SupervisorCard, String, [ChatAttachment]) async -> Bool)? = nil
 
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -1987,6 +1990,14 @@ private struct ThreadDetailSheet: View {
     @State private var isNotFoundActivity = false
     @State private var replyOpen = false
     @State private var replyText = ""
+    @State private var replyAttachments: [ChatAttachment] = []
+    @State private var replySelectedPhotos: [PhotosPickerItem] = []
+    @State private var showingReplyPhotos = false
+    @State private var showingReplyFiles = false
+    @State private var preparingReplyImages = false
+    @State private var replyAttachmentError: String?
+    @State private var directSendBusy = false
+    @State private var directSendNote: SupervisorFormat.Note?
 
     private static let redundantMergeOptions: Set<String> = [
         "approved", "approve", "merge", "merged", "merge pr", "yes", "fix ci", "later", "dismiss", "hold", "open thread", "opened"
@@ -2185,29 +2196,34 @@ private struct ThreadDetailSheet: View {
 
                         if replyOpen, let card {
                             VStack(alignment: .leading, spacing: 8) {
-                                TextField("Send instructions to this coding session…", text: $replyText, axis: .vertical)
+                                TextField("Send instructions or screenshots to this coding session…", text: $replyText, axis: .vertical)
                                     .lineLimit(2...5)
                                     .textFieldStyle(.roundedBorder)
+                                replyAttachmentSection(disabled: questionBusy || preparingReplyImages)
                                 HStack(spacing: 10) {
+                                    let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let canSendReply = !questionBusy && !preparingReplyImages && (!trimmed.isEmpty || !replyAttachments.isEmpty)
                                     Button("Send to session") {
-                                        let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        guard !trimmed.isEmpty else { return }
+                                        let effectiveText = trimmed.isEmpty ? "Please inspect the attached image(s)." : trimmed
+                                        let sentImages = replyAttachments
                                         if let onCardReply {
                                             Task {
-                                                let delivered = await onCardReply(card, trimmed)
+                                                let delivered = await onCardReply(card, effectiveText, sentImages)
                                                 if delivered {
                                                     replyText = ""
+                                                    replyAttachments = []
                                                     replyOpen = false
                                                 }
                                             }
                                         } else {
-                                            onCardPrimary(card, SupervisorCardAction(op: "reply", label: "Reply", value: trimmed))
+                                            onCardPrimary(card, SupervisorCardAction(op: "reply", label: "Reply", value: effectiveText))
                                             replyText = ""
+                                            replyAttachments = []
                                             replyOpen = false
                                         }
                                     }
                                     .buttonStyle(.borderedProminent)
-                                    .disabled(questionBusy || replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                    .disabled(!canSendReply)
 
                                     Button("Cancel") {
                                         replyOpen = false
@@ -2372,17 +2388,175 @@ private struct ThreadDetailSheet: View {
                 if let actionNote, !proposed.contains(where: { $0.id == actionNote.id }) {
                     NoteLine(note: actionNote.note)
                 }
+                if card == nil && thread.key.hasPrefix("paseo:") {
+                    Section("Message coding session") {
+                        TextField("Send message or attach images…", text: $replyText, axis: .vertical)
+                            .lineLimit(2...5)
+                        replyAttachmentSection(disabled: directSendBusy || preparingReplyImages)
+                        let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let canDirectSend = !directSendBusy && !preparingReplyImages && (!trimmed.isEmpty || !replyAttachments.isEmpty)
+                        Button {
+                            let effectiveText = trimmed.isEmpty ? "Please inspect the attached image(s)." : trimmed
+                            let sentImages = replyAttachments
+                            Task {
+                                directSendBusy = true
+                                directSendNote = nil
+                                defer { directSendBusy = false }
+                                do {
+                                    let res = try await model.client.fleetSendMessage(
+                                        threadKey: thread.key,
+                                        message: effectiveText,
+                                        images: sentImages
+                                    )
+                                    let note = SupervisorFormat.deliveryNote(res.delivery, fallback: "Sent to coding session.")
+                                    directSendNote = note
+                                    if !note.isAlert {
+                                        replyText = ""
+                                        replyAttachments = []
+                                    }
+                                } catch let err as DaemonError {
+                                    directSendNote = SupervisorFormat.failureNote(err)
+                                } catch {
+                                    directSendNote = .init(text: "Couldn't reach OpenAGI.", isAlert: true)
+                                }
+                            }
+                        } label: {
+                            Label(directSendBusy ? "Sending…" : "Send to session", systemImage: "paperplane.fill")
+                        }
+                        .disabled(!canDirectSend)
+                        if let directSendNote {
+                            NoteLine(note: directSendNote)
+                        }
+                    }
+                }
             }
             .accessibilityIdentifier("supervisor-thread-details")
             .listStyle(.insetGrouped)
             .navigationTitle("Thread")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .photosPicker(
+                isPresented: $showingReplyPhotos,
+                selection: $replySelectedPhotos,
+                maxSelectionCount: max(1, ChatAttachment.maximumCount - replyAttachments.count),
+                matching: .images
+            )
+            .onChange(of: replySelectedPhotos) { _, items in
+                guard !items.isEmpty else { return }
+                Task { await importReplyPhotos(items) }
+            }
+            .fileImporter(isPresented: $showingReplyFiles, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+                Task { await importReplyFiles(result) }
+            }
             .refreshable { await loadActivity() }
             .task(id: thread.key) { await loadActivity() }
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+    }
+
+    @ViewBuilder
+    private func replyAttachmentSection(disabled: Bool) -> some View {
+        if !replyAttachments.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(replyAttachments) { attachment in
+                        ZStack(alignment: .topTrailing) {
+                            ChatAttachmentImage(attachment: attachment)
+                                .frame(width: 68, height: 68)
+                                .clipShape(.rect(cornerRadius: 10))
+                            Button("Remove image", systemImage: "xmark.circle.fill") {
+                                replyAttachments.removeAll { $0.id == attachment.id }
+                            }
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.bordered)
+                            .buttonBorderShape(.circle)
+                        }
+                    }
+                }
+            }
+        }
+        Menu {
+            Button("Photo Library", systemImage: "photo.on.rectangle") { showingReplyPhotos = true }
+            Button("Paste Image", systemImage: "doc.on.clipboard") {
+                Task { await pasteReplyImages() }
+            }
+            Button("Choose Image File", systemImage: "folder") { showingReplyFiles = true }
+        } label: {
+            Label("Attach or paste image", systemImage: "plus.circle")
+                .font(.footnote.weight(.medium))
+        }
+        .disabled(disabled || replyAttachments.count >= ChatAttachment.maximumCount)
+        if preparingReplyImages {
+            ProgressView("Preparing images…").font(.caption)
+        }
+        if let replyAttachmentError {
+            Text(replyAttachmentError).font(.caption).foregroundStyle(.red)
+        }
+    }
+
+    private func importReplyPhotos(_ photos: [PhotosPickerItem]) async {
+        guard !preparingReplyImages else { return }
+        preparingReplyImages = true
+        replyAttachmentError = nil
+        defer {
+            preparingReplyImages = false
+            replySelectedPhotos = []
+        }
+        do {
+            let remaining = ChatAttachment.maximumCount - replyAttachments.count
+            for photo in photos.prefix(max(0, remaining)) {
+                guard let data = try await photo.loadTransferable(type: Data.self) else {
+                    throw ChatAttachmentPreparation.Failure.unreadable
+                }
+                replyAttachments.append(try await ChatAttachmentPreparation.prepare(data, name: "Photo.jpg"))
+            }
+        } catch {
+            replyAttachmentError = error.localizedDescription
+        }
+    }
+
+    private func importReplyFiles(_ result: Result<[URL], Error>) async {
+        guard !preparingReplyImages else { return }
+        preparingReplyImages = true
+        replyAttachmentError = nil
+        defer { preparingReplyImages = false }
+        do {
+            let urls = try result.get()
+            let remaining = ChatAttachment.maximumCount - replyAttachments.count
+            for url in urls.prefix(max(0, remaining)) {
+                replyAttachments.append(try await ChatAttachmentPreparation.file(url))
+            }
+        } catch {
+            replyAttachmentError = error.localizedDescription
+        }
+    }
+
+    private func pasteReplyImages() async {
+        guard !preparingReplyImages else { return }
+        let remaining = ChatAttachment.maximumCount - replyAttachments.count
+        guard remaining > 0 else {
+            replyAttachmentError = "Attach up to four images per message."
+            return
+        }
+        let rawImages: [UIImage] = UIPasteboard.general.images ?? (UIPasteboard.general.image.map { [$0] } ?? [])
+        guard !rawImages.isEmpty else {
+            replyAttachmentError = "Clipboard doesn't contain an image."
+            return
+        }
+        preparingReplyImages = true
+        replyAttachmentError = nil
+        defer { preparingReplyImages = false }
+        do {
+            for img in rawImages.prefix(remaining) {
+                guard let data = img.pngData() ?? img.jpegData(compressionQuality: 0.9) else {
+                    throw ChatAttachmentPreparation.Failure.unreadable
+                }
+                replyAttachments.append(try await ChatAttachmentPreparation.prepare(data, name: "Pasted image.jpg"))
+            }
+        } catch {
+            replyAttachmentError = error.localizedDescription
+        }
     }
 
     @ViewBuilder

@@ -143,7 +143,22 @@ jobs:
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+            -resultBundlePath "$RUNNER_TEMP/OpenAGI-unit-tests.xcresult" \
+            -only-testing:OpenAGITests \
+            -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES
+          xcrun simctl terminate "$simulator_id" sh.openagi.OpenAGI >/dev/null 2>&1 || true
+          sleep 2
+          xcodebuild test \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
+            -only-testing:OpenAGIUITests \
             -skip-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
             -parallel-testing-enabled NO \
             -collect-test-diagnostics never \

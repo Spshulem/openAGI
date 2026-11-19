@@ -1148,3 +1148,77 @@ test("SupervisorCard.project is populated and G2 even-ai-native receives recent 
   assert.equal(captured.length, 1);
   assert.match(captured[0].options.extraTurnContext ?? "", /Deploy bb-recorder v2\.14/);
 });
+
+test("fleet image endpoints accept >32KB image payloads and paired Mac proxy records sourceName Mac", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-fleet-img-"));
+  const runtime = createDurableRuntime({ dataDir });
+  const store = new InMemoryAgentStore();
+  runtime.agentHost = {
+    store,
+    handleMessage: async (input) => {
+      store.appendMessage(input.sessionId, {
+        role: "user",
+        content: input.text,
+        metadata: input.metadata
+      });
+      return { reply: "ok", session: { id: input.sessionId } };
+    }
+  };
+  const calls = [];
+  runtime.fleetSupervisor = {
+    start: () => {},
+    stop: () => {},
+    getState: () => ({ mode: "propose", enabled: true, questions: [], cards: [], snapshot: { threads: [] } }),
+    sendOwnerMessage: async (threadKey, message, opts = {}) => {
+      calls.push({ kind: "send", threadKey, message, imageCount: opts.images?.length ?? 0 });
+      return { delivery: { status: "sent", attachedImages: opts.images?.length ?? 0 } };
+    },
+    actCard: async (cardId, opts = {}) => {
+      calls.push({ kind: "act", cardId, op: opts.op, value: opts.value, imageCount: opts.images?.length ?? 0 });
+      return { ok: true, kind: "reply", status: "sent" };
+    }
+  };
+  const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
+  nodeRegistry.enroll("mac-worker-1", "w".repeat(43), { ownerProxyToken: "p".repeat(43) });
+  const app = createHostedInterface(runtime, { dataDir, port: 0, authToken: "", nodeRegistry });
+  t.after(async () => { await app.close(); await runtime.observations?.close?.(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const { url } = await app.listen();
+
+  // >32KB base64 image must pass both /fleet/api/send and /fleet/api/cards/:id/act (previously failed 8KB cap)
+  const bigBase64 = Buffer.alloc(24 * 1024, 0xaa).toString("base64");
+  const bigImg = { id: "img_big", name: "CleanShot.png", mimeType: "image/jpeg", data: bigBase64 };
+  const sendRes = await fetch(`${url}/fleet/api/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ threadKey: "paseo:srv_1.ag_1", images: [bigImg] })
+  });
+  assert.equal(sendRes.status, 200);
+  const sendBody = await sendRes.json();
+  assert.equal(sendBody.delivery.status, "sent");
+  assert.equal(calls[0].kind, "send");
+  assert.equal(calls[0].message, "Please inspect the attached image(s).");
+  assert.equal(calls[0].imageCount, 1);
+
+  const actRes = await fetch(`${url}/fleet/api/cards/q_1/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: "reply", value: "See screenshot", images: [bigImg] })
+  });
+  assert.equal(actRes.status, 200);
+  assert.equal(calls[1].kind, "act");
+  assert.equal(calls[1].imageCount, 1);
+
+  // Paired Mac owner-proxy POST /message defaults sourceName to "Mac" instead of "Phone"
+  const proxyMsg = await fetch(`${url}/message`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${"p".repeat(43)}`,
+      "x-openagi-node-id": "mac-worker-1"
+    },
+    body: JSON.stringify({ text: "hello from mac", thread: "supervisor", from: "mac-supervisor" })
+  });
+  assert.equal(proxyMsg.status, 200);
+  const hist = sharedThreadHistory(store, "supervisor");
+  assert.equal(hist.messages.at(-1).sourceName, "Mac");
+});
