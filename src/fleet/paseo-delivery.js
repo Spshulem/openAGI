@@ -104,18 +104,21 @@ function detectImmediatePaseoSystemError(history, receipt) {
   return null;
 }
 
-function confirmedOwnerTurnlessMessage(history, receipt) {
+function confirmedOwnerSteeredOrQueuedMessage(history, receipt) {
   if (history?.error || receipt?.correlationMismatch) return false;
   const entries = history?.entries ?? [];
   const ids = receiptIds(receipt);
   const ownIdx = entries.findIndex((e) => e?.item?.type === "user_message" && entryIds(e).some((id) => ids.has(id)));
   if (ownIdx < 0) return false;
-  const own = entries[ownIdx];
-  if (nonEmpty(own?.turnId) || nonEmpty(receipt?.turnId)) return false;
   if (detectImmediatePaseoSystemError(history, receipt)) return false;
   const after = entries.slice(ownIdx + 1);
   if (after.some((e) => ["assistant_message", "tool_call"].includes(e?.item?.type))) return true;
-  return history?.agent?.status === "running" && !history?.agent?.activeTurn?.turnId;
+  // When steering/messaging an actively running Paseo session, the host
+  // frequently retains the prior activeTurn.turnId (or queues our message with
+  // a different/pending turnId) until the in-flight step yields. Seeing our
+  // exact clientMessageId/messageId in the running session's timeline proves
+  // delivery without guessing from unrelated activity.
+  return history?.agent?.status === "running";
 }
 
 async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEntries, text, images, serverId }) {
@@ -201,11 +204,12 @@ async function readPaseoConfirmation(ref, receipt, signal, save, deadline = Infi
       return { confirmed: false, systemError: sysErr };
     }
     const own = receiptMessage(history, receipt);
+    const sawOwn = Boolean(own);
     const ownTurn = nonEmpty(own?.turnId);
     if (ownTurn && receipt.turnId && ownTurn !== receipt.turnId) {
       receipt.correlationMismatch = true;
       save(receipt);
-      return { confirmed: false, systemError: null };
+      return { confirmed: false, systemError: null, sawOwn };
     }
     const providerMessageId = nonEmpty(own?.item?.messageId);
     const learnedProvider = !receipt.providerMessageId && providerMessageId
@@ -215,33 +219,38 @@ async function readPaseoConfirmation(ref, receipt, signal, save, deadline = Infi
       if (learnedProvider) receipt.providerMessageId = providerMessageId;
       save(receipt); // Survives timeout, restart, and projection/history churn.
     }
-    if (confirmedPaseoTurn(history, receipt)) return { confirmed: true, systemError: null };
-    if (ownerInitiated && confirmedOwnerTurnlessMessage(history, receipt)) {
-      return { confirmed: true, systemError: null };
+    if (confirmedPaseoTurn(history, receipt)) return { confirmed: true, systemError: null, sawOwn: true };
+    if (ownerInitiated && confirmedOwnerSteeredOrQueuedMessage(history, receipt)) {
+      return { confirmed: true, systemError: null, sawOwn: true };
     }
-    if (!history.hasNewer) return { confirmed: false, systemError: null };
+    if (!history.hasNewer) return { confirmed: false, systemError: null, sawOwn };
     const next = timelineCursor(history);
     if (!next || (options.cursor && (next.epoch !== options.cursor.epoch || next.seq <= options.cursor.seq))) {
-      return { confirmed: false, systemError: null };
+      return { confirmed: false, systemError: null, sawOwn };
     }
     options = { direction: "after", cursor: next, limit: 80 };
   }
-  return { confirmed: false, systemError: null };
+  return { confirmed: false, systemError: null, sawOwn: false };
 }
 
-async function waitForPaseoTurn(ref, receipt, signal, save, { ownerInitiated = false } = {}) {
+async function waitForPaseoTurn(ref, receipt, signal, save, { ownerInitiated = false, onSawOwn = null } = {}) {
   // The send acknowledgment can arrive before the message or provider turn
   // reaches the timeline. Recheck only this receipt; never repeat the send.
   // The surrounding Paseo request deadline also bounds every read and delay.
-  const deadline = performance.now() + 5000;
+  const deadline = performance.now() + (ownerInitiated ? 15_000 : 5_000);
+  let sawOwn = false;
   for (;;) {
     signal.throwIfAborted();
     const outcome = await readPaseoConfirmation(ref, receipt, signal, save, deadline, { ownerInitiated });
     signal.throwIfAborted();
-    if (outcome.confirmed || outcome.systemError) return outcome;
-    if (receipt.correlationMismatch) return { confirmed: false, systemError: null };
+    if (outcome.sawOwn) {
+      sawOwn = true;
+      onSawOwn?.();
+    }
+    if (outcome.confirmed || outcome.systemError) return { ...outcome, sawOwn };
+    if (receipt.correlationMismatch) return { confirmed: false, systemError: null, sawOwn };
     const remaining = deadline - performance.now();
-    if (remaining <= 0) return { confirmed: false, systemError: null };
+    if (remaining <= 0) return { confirmed: false, systemError: null, sawOwn };
     await delay(Math.min(250, remaining), undefined, { signal });
   }
 }
@@ -313,7 +322,7 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
   if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
-  if (ownerInitiated && !["idle", "running", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
+  if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
   if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) return "Paseo chat changed; scan again before sending";
   if (!ownerInitiated && agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
@@ -335,8 +344,11 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   if (!store?.dir) return blocked("Paseo delivery needs durable storage");
   const digest = createHash("sha256").update(thread.key).digest("hex");
   const file = path.join(store.dir, "paseo-deliveries", `${digest}.json`);
-  if (active.has(file)) return blocked("A send to this Paseo chat is already in progress");
-  active.add(file);
+  const activeKey = file;
+  if (active.has(activeKey)) return blocked("A send to this Paseo chat is already in progress");
+  active.add(activeKey);
+  let dispatched = false;
+  let sawOwnBeforeAbort = false;
   try {
     return await withPaseo(config, async (client, signal) => {
       const api = await hostApi(client, thread.meta.serverId);
@@ -449,6 +461,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         ...(normalizedImages.length ? { images: normalizedImages } : {})
       };
       let response;
+      dispatched = true;
       try {
         response = await ref.send(text, sendOptions);
       } catch (sendErr) {
@@ -494,7 +507,10 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         ...(nonEmpty(response?.turnId) ? { turnId: response.turnId } : {}),
       };
       writeJsonAtomic(file, correlated);
-      const turnOutcome = await waitForPaseoTurn(ref, correlated, signal, save, { ownerInitiated });
+      const turnOutcome = await waitForPaseoTurn(ref, correlated, signal, save, {
+        ownerInitiated,
+        onSawOwn: () => { sawOwnBeforeAbort = true; }
+      });
       if (turnOutcome.systemError) {
         writeJsonAtomic(file, { ...correlated, pending: false });
         if (ownerInitiated) {
@@ -520,7 +536,20 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         }
         return blocked(`Paseo session runtime error: ${turnOutcome.systemError}`);
       }
-      if (!turnOutcome.confirmed) return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
+      if (!turnOutcome.confirmed) {
+        if (ownerInitiated) {
+          return {
+            status: "blocked",
+            unconfirmed: true,
+            route: "paseo-send",
+            actionId,
+            detail: turnOutcome.sawOwn
+              ? "Message accepted by Paseo and visible in timeline; agent turn has not started yet. No automatic resend."
+              : "Message accepted by Paseo; turn start unconfirmed. No automatic resend."
+          };
+        }
+        return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
+      }
       writeJsonAtomic(file, { ...correlated, pending: false });
       return {
         status: "sent",
@@ -532,7 +561,18 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
     }, factory);
   } catch (err) {
     const errMsg = ownerInitiated && err?.message ? `: ${clampText(redactSecrets(String(err.message)), 120)}` : "";
+    if (ownerInitiated && dispatched) {
+      return {
+        status: "blocked",
+        unconfirmed: true,
+        route: "paseo-send",
+        actionId,
+        detail: sawOwnBeforeAbort
+          ? `Message accepted by Paseo and visible in timeline; turn confirmation timed out${errMsg}. No automatic resend.`
+          : `Paseo delivery unavailable or uncertain${errMsg}; no provider fallback or automatic resend`
+      };
+    }
     return blocked(`Paseo delivery unavailable or uncertain${errMsg}; no provider fallback or automatic resend`);
   }
-  finally { active.delete(file); }
+  finally { active.delete(activeKey); }
 }

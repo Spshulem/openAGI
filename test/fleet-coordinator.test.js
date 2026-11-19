@@ -990,3 +990,71 @@ test("Round 2 review regressions: migrated alias dedupe and local git origin hos
     /exists on multiple Paseo hosts/
   );
 });
+
+test("startPaseoSession with fromThreadKey resolves the exact Paseo host and workspace directory without Computer Use", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-from-thread-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = resolveFleetConfig({}, {
+    dataDir: dir,
+    paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" }
+  });
+  const sup = new FleetSupervisor({ config, dataDir: dir });
+
+  const createdCalls = [];
+  const factory = () => {
+    const makeApi = (hostId) => ({
+      providers: {
+        waitForReady: async () => ({
+          entries: [{ provider: "codex", status: "ready", models: [{ id: "gpt-5.4", isDefault: true }] }]
+        })
+      },
+      agents: {
+        list: async () => ({ entries: [], pageInfo: { hasMore: false } }),
+        ref: (agentId) => {
+          let snap = null;
+          return {
+            refresh: async () => {
+              if (hostId === "srv_4x2" && agentId === "ai-seo-audit") {
+                snap = { id: agentId, title: "AI SEO audit", cwd: "/home/dev/general/bullard", status: "closed", provider: "broken-provider" };
+              }
+            },
+            current: () => snap
+          };
+        },
+        create: async (req) => {
+          createdCalls.push({ hostId, ...req });
+          return {
+            id: "fresh-chat-1",
+            current: () => ({ id: "fresh-chat-1", status: "running", cwd: req.cwd, title: req.title ?? "Fresh chat", provider: "codex" })
+          };
+        }
+      }
+    });
+    return {
+      connect: async () => {},
+      close: async () => {},
+      ...makeApi("srv_local"),
+      hosts: {
+        list: async () => ({
+          self: { serverId: "srv_local", label: "local" },
+          hosts: [{ serverId: "srv_4x2", label: "distiller", enabled: true, status: "online" }]
+        }),
+        client: (id) => makeApi(id)
+      }
+    };
+  };
+
+  const started = await sup.startPaseoSession({
+    fromThreadKey: "paseo:srv_4x2.ai-seo-audit",
+    title: "Website hero + switching pages",
+    prompt: "Create new hero and switching pages using AI SEO audit context.",
+    factory
+  });
+  assert.equal(started.status, "started");
+  assert.equal(started.serverId, "srv_4x2");
+  assert.equal(started.cwd, "/home/dev/general/bullard");
+  assert.equal(started.provider, "codex/gpt-5.4");
+  assert.equal(createdCalls.length, 1);
+  assert.equal(createdCalls[0].hostId, "srv_4x2");
+  assert.equal(createdCalls[0].cwd, "/home/dev/general/bullard");
+});

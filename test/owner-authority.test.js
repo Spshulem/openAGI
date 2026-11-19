@@ -234,3 +234,17 @@ test("in-Paseo session creation follow-ups authorize fleet_start_session while p
     assert.equal(isSupervisorActionableDirective(passive), false, passive);
   }
 });
+
+test("split phrasal verbs like 'kick a new chat off' and 'try again' after a dropped attempt authorize without code friction", () => {
+  const splitPhrase = "eh lets kick a new chat off INSIDE of that workspace BUT give it context of ai seo audit";
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_start_session"), true);
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_send_message"), true);
+  assert.equal(isSupervisorActionableDirective(splitPhrase), true);
+
+  const droppedMsg = "The computer-control session dropped before I could create the chat. No new chat was created or brief sent.";
+  assert.equal(isConversationalAssentOrChoice("try again", droppedMsg), true);
+  assert.equal(isConversationalAssentOrChoice("retry", droppedMsg), true);
+  assert.equal(isSupervisorActionableDirective("try again", { previousAssistantText: droppedMsg }), true);
+  // Passive reads stay blocked even after a dropped message.
+  assert.equal(isConversationalAssentOrChoice("what happened?", droppedMsg), false);
+});

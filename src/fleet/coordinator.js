@@ -1273,6 +1273,7 @@ export async function resolvePaseoAgentConfig(api, cwd, {
 
 export async function startPaseoSession(supervisor, {
   workspace = null,
+  fromThreadKey = null,
   cwd = null,
   serverId = null,
   title = null,
@@ -1294,11 +1295,48 @@ export async function startPaseoSession(supervisor, {
   const normalizedImages = normalizePaseoImages(images);
   const cleanTitle = typeof title === "string" && title.trim() ? clampText(title.trim(), 100) : null;
 
-  const explicitServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
+  const cleanFromKey = typeof fromThreadKey === "string" && fromThreadKey.trim() ? fromThreadKey.trim() : null;
+  let explicitServerId = typeof serverId === "string" && serverId.trim() ? serverId.trim() : null;
   let resolvedServerId = explicitServerId;
   let resolvedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   let workspaceLabel = cleanName(workspace);
   let inferredWorkspace = false;
+
+  if (cleanFromKey && (!resolvedServerId || !resolvedCwd)) {
+    const cached = supervisor?.lastThreads?.get?.(cleanFromKey)
+      ?? supervisor?.knownThreads?.get?.(cleanFromKey)
+      ?? null;
+    const parsedFrom = parsePaseoThreadKey(cleanFromKey);
+    if (!resolvedServerId) {
+      resolvedServerId = cached?.meta?.serverId ?? parsedFrom?.serverId ?? null;
+      explicitServerId ??= resolvedServerId;
+    }
+    const cachedCwd = typeof (cached?.meta?.paseoCwd ?? cached?.cwd) === "string"
+      ? String(cached?.meta?.paseoCwd ?? cached?.cwd).trim().replace(/\/+$/, "")
+      : null;
+    if (!resolvedCwd && cachedCwd) resolvedCwd = cachedCwd;
+    if (!workspaceLabel) {
+      workspaceLabel = cleanName(cached?.workspace ?? cached?.title ?? null);
+    }
+    // Live fallback when the reference Paseo chat wasn't cached in lastThreads.
+    if (!resolvedCwd && parsedFrom?.serverId && parsedFrom?.agentId) {
+      try {
+        const probeCfg = {
+          ...supervisor.config,
+          paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 12_000, 12_000) }
+        };
+        const liveRef = await withPaseo(probeCfg, async (client) => {
+          const api = await hostApi(client, parsedFrom.serverId);
+          const ref = api.agents.ref(parsedFrom.agentId);
+          await ref.refresh();
+          return ref.current();
+        }, factory);
+        const liveCwd = typeof liveRef?.cwd === "string" ? liveRef.cwd.trim().replace(/\/+$/, "") : null;
+        if (liveCwd) resolvedCwd = liveCwd;
+        if (!workspaceLabel && liveRef?.title) workspaceLabel = cleanName(liveRef.title);
+      } catch { /* fall through to workspace inventory lookup */ }
+    }
+  }
 
   if (!resolvedServerId || !resolvedCwd) {
     const inventory = await listWorkspaces(supervisor, {
