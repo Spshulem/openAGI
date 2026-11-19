@@ -25,14 +25,18 @@ function loadWebGlobals() {
   if (webGlobalsLoaded) return;
   webGlobalsLoaded = true;
   if (typeof WebAssembly !== "undefined") return;
+  // Under nodejs-mobile --jitless, WebAssembly is undefined and undici's lazy
+  // llhttp initializer rejects asynchronously on first touch of Response/Headers
+  // (which can occur later during boot). Keep this narrow guard active for the
+  // process lifetime so only that specific undici rejection is swallowed.
   const swallow = (reason) => {
-    if (reason instanceof ReferenceError && /WebAssembly/.test(reason.message)) return stop();
+    if (reason instanceof ReferenceError && /WebAssembly/.test(reason.message)) return;
     throw reason;
   };
-  const stop = () => process.off("unhandledRejection", swallow);
   process.on("unhandledRejection", swallow);
   void globalThis.Response;
-  setImmediate(stop);
+  void globalThis.Headers;
+  void globalThis.Request;
 }
 
 function abortReason(signal) {

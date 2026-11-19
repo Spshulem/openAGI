@@ -51,6 +51,24 @@ struct SupervisorView: View {
     @State private var clearedFocusCardID: String?
     @State private var selectedMessage: UUID?
     @State private var browserThread: ConversationThread = .supervisor
+    @State private var isDeckExpanded: Bool = ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    @State private var optimisticallyDismissedCardIDs: Set<String> = []
+    @State private var inFlightCardIDs: Set<String> = []
+    @State private var toastBanner: SupervisorToast? = nil
+    @State private var toastDismissTask: Task<Void, Never>? = nil
+    @State private var showingQuickTaskBar = false
+    @State private var quickTaskTitle = ""
+    @State private var creatingQuickTask = false
+
+    private struct SupervisorToast: Equatable, Identifiable {
+        let id = UUID()
+        let text: String
+        let isError: Bool
+    }
+
+    private var isUITesting: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    }
 
     private struct ThreadPresentation: Identifiable {
         let thread: FleetThread
@@ -138,8 +156,12 @@ struct SupervisorView: View {
         return parts.count > 1 ? parts.dropFirst().joined(separator: "/") : clean
     }
 
+    private var activeCards: [SupervisorCard] {
+        cards.filter { !optimisticallyDismissedCardIDs.contains($0.id) }
+    }
+
     private var displayedCards: [SupervisorCard] {
-        cards.filter { card in
+        activeCards.filter { card in
             if let selectedProjectChannel {
                 let proj = SupervisorChannelGrouping.normalizeProject(
                     explicit: card.project,
@@ -157,6 +179,18 @@ struct SupervisorView: View {
                 }
             }
             return SupervisorBoardLabel.matches(tags: card.labels, activeFilters: activeLabelFilters)
+        }
+    }
+
+    private var workspaceNavigationTitle: String {
+        if isUITesting {
+            return navigationTitle
+        }
+        switch model.workspaceChannel {
+        case .general:
+            return "OpenAGI"
+        default:
+            return model.workspaceChannel.title
         }
     }
 
@@ -197,20 +231,17 @@ struct SupervisorView: View {
 
     private var duetNavigation: some View {
         NavigationStack {
-            ChatConversationView(
-                conversation: conversation,
-                title: navigationTitle,
-                scrollToMessageID: selectedMessage ?? externalScrollToMessageID,
-                placeholder: focusedPlaceholder,
-                emptyDetail: "One project manager across your coding agents. Review decisions below, route a bug, or ask about any repo.",
-                topAccessory: AnyView(topBannerStack),
-                composerAccessory: { focused in AnyView(deckAccessory(composerFocused: focused)) },
-                onHistorySelectionConsumed: {
-                    selectedMessage = nil
-                    onExternalScrollConsumed()
+            ZStack(alignment: .top) {
+                workspaceMainContent
+                if let toast = toastBanner {
+                    toastOverlayView(toast)
+                        .padding(.horizontal, 14)
+                        .padding(.top, 8)
+                        .zIndex(20)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                 }
-            )
-            .id(conversation.identity)
+            }
+            .animation(.spring(duration: 0.25), value: toastBanner?.id)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     activeSessionsPill
@@ -235,6 +266,9 @@ struct SupervisorView: View {
         .onChange(of: model.requestedFocusCardID, initial: true) { _, cardID in
             applyRequestedFocus(cardID)
         }
+        .onChange(of: model.workspaceChannel, initial: true) { _, channel in
+            applyWorkspaceChannelSelection(channel)
+        }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(state?.running == true ? 5 : 25))
@@ -242,7 +276,7 @@ struct SupervisorView: View {
                 await refresh()
             }
         }
-        .onChange(of: cards.map(\.id)) { _, ids in
+        .onChange(of: displayedCards.map(\.id)) { _, ids in
             if selectedCardIndex >= ids.count {
                 selectedCardIndex = max(0, ids.count - 1)
             }
@@ -352,6 +386,147 @@ struct SupervisorView: View {
         }
     }
 
+    @ViewBuilder
+    private var workspaceMainContent: some View {
+        switch model.workspaceChannel {
+        case .general, .project, .subchannel:
+            ChatConversationView(
+                conversation: conversation,
+                title: workspaceNavigationTitle,
+                scrollToMessageID: selectedMessage ?? externalScrollToMessageID,
+                placeholder: focusedPlaceholder,
+                emptyDetail: "One OpenAGI supervisor across your coding agents. Review decisions, route a bug, or ask about any repo.",
+                topAccessory: AnyView(topBannerStack),
+                composerAccessory: { focused in AnyView(deckAccessory(composerFocused: focused)) },
+                onHistorySelectionConsumed: {
+                    selectedMessage = nil
+                    onExternalScrollConsumed()
+                }
+            )
+            .id(conversation.identity)
+        case .needsYou:
+            VStack(spacing: 0) {
+                topBannerStack
+                Divider()
+                BoardNeedsYouStage(
+                    cards: activeCards,
+                    threads: state?.snapshot?.threads ?? [],
+                    inFlightCardIDs: inFlightCardIDs,
+                    scanning: scanning || state?.running == true,
+                    greenMergeableCount: greenMergeableCount,
+                    onScan: { Task { await scan() } },
+                    onMergeGreen: { Task { await batchAct(op: "merge_green", filter: "green_prs") } },
+                    onOpenContext: { card in openContext(for: card) },
+                    onReplyInChat: { card in
+                        model.workspaceChannel = .general
+                        clearedFocusCardID = nil
+                        conversation.focusedCardID = card.id
+                        conversation.requestComposerFocus()
+                    },
+                    onAct: { card, action in
+                        Task { await act(card, action: action) }
+                    },
+                    onBackToGeneral: {
+                        model.workspaceChannel = .general
+                    }
+                )
+            }
+            .background(Theme.canvas)
+            .navigationTitle(workspaceNavigationTitle)
+            .navigationBarTitleDisplayMode(.inline)
+        case .tasks, .sessions, .activity:
+            let mappedMode: BoardBrowseMode = {
+                switch model.workspaceChannel {
+                case .tasks: return .tasks
+                case .sessions: return .sessions
+                case .activity: return .activity
+                default: return .themes
+                }
+            }()
+            VStack(spacing: 0) {
+                topBannerStack
+                Divider()
+                ActiveSessionsSheet(
+                    state: state,
+                    initialMode: mappedMode,
+                    embeddedInWorkspace: true,
+                    scanning: scanning || state?.running == true,
+                    onScan: { Task { await scan() } },
+                    onAcceptState: { fresh in accept(nextSequence(), fresh) },
+                    onSelectThread: { thread in
+                        openThread = ThreadPresentation(thread: thread)
+                        actionNote = nil
+                    }
+                )
+            }
+            .background(Theme.canvas)
+            .navigationTitle(workspaceNavigationTitle)
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func toastOverlayView(_ toast: SupervisorToast) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: toast.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(toast.isError ? Theme.alert : Color.green)
+            Text(toast.text)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(Theme.ink)
+                .lineLimit(2)
+            Spacer(minLength: 4)
+            Button {
+                toastDismissTask?.cancel()
+                toastBanner = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Theme.muted)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 520)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder((toast.isError ? Theme.alert : Color.green).opacity(0.45), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.14), radius: 10, y: 4)
+        .accessibilityIdentifier("supervisor-toast-banner")
+    }
+
+    private func showToast(_ text: String, isError: Bool = false) {
+        toastDismissTask?.cancel()
+        let next = SupervisorToast(text: text, isError: isError)
+        toastBanner = next
+        toastDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(isError ? 5.0 : 3.5))
+            guard !Task.isCancelled, toastBanner?.id == next.id else { return }
+            toastBanner = nil
+        }
+    }
+
+    private func applyWorkspaceChannelSelection(_ channel: iOSWorkspaceChannel) {
+        switch channel {
+        case .general:
+            selectedProjectChannel = nil
+            selectedSubchannel = nil
+            selectedCardIndex = 0
+        case .project(let name):
+            selectedProjectChannel = name
+            selectedSubchannel = nil
+            selectedCardIndex = 0
+        case .subchannel(let project, let sub):
+            selectedProjectChannel = project
+            selectedSubchannel = sub
+            selectedCardIndex = 0
+        case .needsYou, .tasks, .sessions, .activity:
+            break
+        }
+    }
+
     private var focusedPlaceholder: String {
         if let card = currentCard, conversation.focusedCardID == card.id {
             return "Reply to decision or ask Supervisor…"
@@ -377,8 +552,12 @@ struct SupervisorView: View {
         let label = state.map(SupervisorFormat.activePill) ?? (loadError != nil ? "Offline" : "Loading…")
         let isLive = (state?.running == true) || scanning || (state?.activeSummary?.running ?? 0) > 0
         return Button {
-            initialBrowseMode = .sessions
-            activeSheet = .sessions
+            if isUITesting {
+                initialBrowseMode = .sessions
+                activeSheet = .sessions
+            } else {
+                model.workspaceChannel = (model.workspaceChannel == .sessions) ? .general : .sessions
+            }
         } label: {
             HStack(spacing: 6) {
                 Circle()
@@ -557,64 +736,100 @@ struct SupervisorView: View {
                                 BoardQuietCheckPill(label: checkLabel)
                             }
 
+                            let isGeneral = model.workspaceChannel == .general
                             Button {
-                                selectedProjectChannel = nil
-                                selectedSubchannel = nil
-                                selectedCardIndex = 0
+                                model.workspaceChannel = .general
                             } label: {
-                                Text(cards.isEmpty ? "#general" : "#general · \(cards.count)")
+                                Text("#general")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(isGeneral ? Theme.ink : Theme.surface, in: Capsule())
+                                    .foregroundStyle(isGeneral ? Theme.canvas : Theme.ink)
+                            }
+                            .buttonStyle(.plain)
+
+                            let isNeedsYou = model.workspaceChannel == .needsYou
+                            Button {
+                                model.workspaceChannel = .needsYou
+                            } label: {
+                                Text(activeCards.isEmpty ? "#needs-you" : "#needs-you · \(activeCards.count)")
                                     .font(Theme.Typography.caption.weight(.semibold))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
                                     .background(
-                                        selectedProjectChannel == nil ? Theme.ink : Theme.surface,
+                                        isNeedsYou
+                                            ? Theme.ink
+                                            : (activeCards.isEmpty ? Theme.surface : Theme.caution.opacity(0.16)),
                                         in: Capsule()
                                     )
-                                    .foregroundStyle(selectedProjectChannel == nil ? Theme.canvas : Theme.ink)
+                                    .foregroundStyle(
+                                        isNeedsYou
+                                            ? Theme.canvas
+                                            : (activeCards.isEmpty ? Theme.ink : Theme.caution)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("supervisor-channel-needs-you")
+
+                            let isTasks = model.workspaceChannel == .tasks
+                            Button {
+                                model.workspaceChannel = .tasks
+                            } label: {
+                                Label("#tasks", systemImage: "checklist")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(isTasks ? Theme.ink : Theme.surface, in: Capsule())
+                                    .foregroundStyle(isTasks ? Theme.canvas : Theme.ink)
                             }
                             .buttonStyle(.plain)
 
-                            if let sessionsTotal = state?.activeSummary?.total ?? state?.snapshot?.threads.count, sessionsTotal > 0 {
+                            let isSessions = model.workspaceChannel == .sessions
+                            let sessionsTotal = state?.activeSummary?.total ?? state?.snapshot?.threads.count ?? 0
+                            if sessionsTotal > 0 || isSessions {
                                 Button {
-                                    initialBrowseMode = .sessions
-                                    activeSheet = .sessions
+                                    model.workspaceChannel = .sessions
                                 } label: {
-                                    Text("#sessions · \(sessionsTotal)")
+                                    Text(sessionsTotal > 0 ? "#sessions · \(sessionsTotal)" : "#sessions")
                                         .font(Theme.Typography.caption.weight(.semibold))
                                         .padding(.horizontal, 10)
                                         .padding(.vertical, 5)
-                                        .background(Theme.surface, in: Capsule())
-                                        .foregroundStyle(Theme.ink)
+                                        .background(isSessions ? Theme.ink : Theme.surface, in: Capsule())
+                                        .foregroundStyle(isSessions ? Theme.canvas : Theme.ink)
                                 }
                                 .buttonStyle(.plain)
                             }
 
+                            let isActivity = model.workspaceChannel == .activity
                             Button {
-                                initialBrowseMode = .activity
-                                activeSheet = .sessions
+                                model.workspaceChannel = .activity
                             } label: {
                                 let count = state?.activityEvents.count ?? 0
                                 Text(count > 0 ? "#activity · \(count)" : "#activity")
                                     .font(Theme.Typography.caption.weight(.semibold))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(Theme.surface, in: Capsule())
-                                    .foregroundStyle(Theme.ink)
+                                    .background(isActivity ? Theme.ink : Theme.surface, in: Capsule())
+                                    .foregroundStyle(isActivity ? Theme.canvas : Theme.ink)
                             }
                             .buttonStyle(.plain)
 
-                            Button {
-                                initialBrowseMode = .tasks
-                                activeSheet = .sessions
-                            } label: {
-                                Label("Board", systemImage: "checklist")
-                                    .font(Theme.Typography.caption.weight(.semibold))
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(Theme.surface, in: Capsule())
-                                    .foregroundStyle(Theme.ink)
+                            if case .general = model.workspaceChannel {
+                                Button {
+                                    withAnimation(.spring(duration: 0.2)) {
+                                        showingQuickTaskBar.toggle()
+                                    }
+                                } label: {
+                                    Label("Task", systemImage: "plus")
+                                        .font(Theme.Typography.caption.weight(.semibold))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(showingQuickTaskBar ? Theme.live.opacity(0.2) : Theme.surface, in: Capsule())
+                                        .foregroundStyle(showingQuickTaskBar ? Theme.live : Theme.ink)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
 
                             quickModelMenuPill
 
@@ -623,11 +838,16 @@ struct SupervisorView: View {
                                     if case let .project(name) = ch.kind { return name }
                                     return ch.displayName
                                 }()
-                                let isSelected = selectedProjectChannel?.caseInsensitiveCompare(projName) == .orderedSame
+                                let isSelected: Bool = {
+                                    switch model.workspaceChannel {
+                                    case .project(let active), .subchannel(let active, _):
+                                        return active.caseInsensitiveCompare(projName) == .orderedSame
+                                    default:
+                                        return false
+                                    }
+                                }()
                                 Button {
-                                    selectedProjectChannel = isSelected ? nil : projName
-                                    selectedSubchannel = nil
-                                    selectedCardIndex = 0
+                                    model.workspaceChannel = isSelected ? .general : .project(projName)
                                 } label: {
                                     Text(ch.waitingCount > 0 ? "#\(projName) · \(ch.waitingCount)" : "#\(projName)")
                                         .font(Theme.Typography.caption.weight(.semibold))
@@ -644,36 +864,44 @@ struct SupervisorView: View {
                     }
                     .accessibilityIdentifier("supervisor-project-channels")
 
-                    if !subchannelSummaries.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 6) {
-                                ForEach(subchannelSummaries) { sub in
-                                    let isSelected = selectedSubchannel?.caseInsensitiveCompare(sub.displayName) == .orderedSame
-                                    Button {
-                                        selectedSubchannel = isSelected ? nil : sub.displayName
-                                        selectedCardIndex = 0
-                                    } label: {
-                                        Text(sub.waitingCount > 0 ? "\(sub.displayName) · \(sub.waitingCount)" : sub.displayName)
-                                            .font(.caption2.weight(.semibold))
-                                            .padding(.horizontal, 9)
-                                            .padding(.vertical, 4)
-                                            .background(isSelected ? Color.accentColor : Theme.surface, in: Capsule())
-                                            .foregroundStyle(isSelected ? Color.white : Theme.ink)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.horizontal, Theme.gutter)
-                        }
+                    if case .project = model.workspaceChannel, !subchannelSummaries.isEmpty {
+                        subchannelStrip
+                    } else if case .subchannel = model.workspaceChannel, !subchannelSummaries.isEmpty {
+                        subchannelStrip
                     }
 
-                    if !availableLabels.isEmpty {
+                    if !availableLabels.isEmpty,
+                       (model.workspaceChannel == .needsYou || isDeckExpanded) {
                         BoardLabelChipsRow(labels: availableLabels, activeFilters: $activeLabelFilters)
                             .padding(.horizontal, Theme.gutter)
                             .padding(.bottom, 4)
                     }
                 }
             }
+        }
+    }
+
+    private var subchannelStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(subchannelSummaries) { sub in
+                    let isSelected = selectedSubchannel?.caseInsensitiveCompare(sub.displayName) == .orderedSame
+                    Button {
+                        if let proj = selectedProjectChannel {
+                            model.workspaceChannel = isSelected ? .project(proj) : .subchannel(project: proj, subchannel: sub.displayName)
+                        }
+                    } label: {
+                        Text(sub.waitingCount > 0 ? "\(sub.displayName) · \(sub.waitingCount)" : sub.displayName)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(isSelected ? Color.accentColor : Theme.surface, in: Capsule())
+                            .foregroundStyle(isSelected ? Color.white : Theme.ink)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, Theme.gutter)
         }
     }
 
@@ -795,60 +1023,186 @@ struct SupervisorView: View {
 
     @ViewBuilder
     private func deckAccessory(composerFocused: Bool) -> some View {
-        if let card = currentCard {
-            if composerFocused {
-                // Collapse deck into a sleek 1-line focus bar while typing so
-                // history and composer stay comfortable above the keyboard.
-                if conversation.focusedCardID == card.id {
-                    HStack(spacing: 8) {
-                        Image(systemName: "arrowshape.turn.up.left.fill")
-                            .font(.caption2)
-                            .foregroundStyle(Theme.live)
-                        Text("Replying to: \(card.headline)")
-                            .font(Theme.Typography.caption.weight(.medium))
-                            .foregroundStyle(Theme.ink)
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Button {
-                            clearedFocusCardID = card.id
-                            conversation.focusedCardID = nil
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(Theme.muted)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Clear card focus")
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
-                }
-            } else {
-                SupervisorCardDeckView(
-                    cards: displayedCards,
-                    index: clampedCardIndex,
-                    focusedCardID: conversation.focusedCardID,
-                    busyCardID: busyCardID ?? busyQuestionID,
-                    threads: state?.snapshot?.threads ?? [],
-                    onSelectIndex: { newIndex in
-                        selectedCardIndex = min(max(0, newIndex), max(0, displayedCards.count - 1))
-                    },
-                    onOpenContext: { target in openContext(for: target) },
-                    onReplyInChat: { target in
-                        clearedFocusCardID = nil
-                        conversation.focusedCardID = target.id
-                        conversation.requestComposerFocus()
-                    },
-                    onClearFocus: { target in
-                        clearedFocusCardID = target.id
-                        conversation.focusedCardID = nil
-                    },
-                    onAct: { target, action in
-                        Task { await act(target, action: action) }
-                    }
-                )
-                .padding(.horizontal, 12)
+        VStack(spacing: 6) {
+            if showingQuickTaskBar && !composerFocused {
+                quickTaskComposerBar
+                    .padding(.horizontal, 12)
             }
+            if let card = currentCard {
+                if composerFocused {
+                    // Collapse deck into a sleek 1-line focus bar while typing so
+                    // history and composer stay comfortable above the keyboard.
+                    if conversation.focusedCardID == card.id {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrowshape.turn.up.left.fill")
+                                .font(.caption2)
+                                .foregroundStyle(Theme.live)
+                            Text("Replying to: \(card.headline)")
+                                .font(Theme.Typography.caption.weight(.medium))
+                                .foregroundStyle(Theme.ink)
+                                .lineLimit(1)
+                            Spacer(minLength: 4)
+                            Button {
+                                clearedFocusCardID = card.id
+                                conversation.focusedCardID = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.muted)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Clear card focus")
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                    }
+                } else if isDeckExpanded {
+                    SupervisorCardDeckView(
+                        cards: displayedCards,
+                        index: clampedCardIndex,
+                        focusedCardID: conversation.focusedCardID,
+                        busyCardID: busyCardID ?? busyQuestionID,
+                        threads: state?.snapshot?.threads ?? [],
+                        onSelectIndex: { newIndex in
+                            selectedCardIndex = min(max(0, newIndex), max(0, displayedCards.count - 1))
+                        },
+                        onCollapse: {
+                            withAnimation(.spring(duration: 0.22)) {
+                                isDeckExpanded = false
+                            }
+                        },
+                        onOpenAll: {
+                            model.workspaceChannel = .needsYou
+                        },
+                        onOpenContext: { target in openContext(for: target) },
+                        onReplyInChat: { target in
+                            clearedFocusCardID = nil
+                            conversation.focusedCardID = target.id
+                            conversation.requestComposerFocus()
+                        },
+                        onClearFocus: { target in
+                            clearedFocusCardID = target.id
+                            conversation.focusedCardID = nil
+                        },
+                        onAct: { target, action in
+                            Task { await act(target, action: action) }
+                        }
+                    )
+                    .padding(.horizontal, 12)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else {
+                    collapsedDeckBar(card: card, count: displayedCards.count)
+                        .padding(.horizontal, 12)
+                }
+            }
+        }
+        .animation(.spring(duration: 0.22), value: isDeckExpanded)
+    }
+
+    private func collapsedDeckBar(card: SupervisorCard, count: Int) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(card.risky || card.kind == "ci_failed" ? Theme.caution : Theme.live)
+                .frame(width: 8, height: 8)
+            Text("\(count) waiting")
+                .font(Theme.Typography.caption.weight(.bold))
+                .foregroundStyle(Theme.ink)
+                .fixedSize()
+            Text(card.headline)
+                .font(Theme.Typography.caption)
+                .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Button {
+                withAnimation(.spring(duration: 0.22)) {
+                    isDeckExpanded = true
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text("Review")
+                    Image(systemName: "chevron.up")
+                        .font(.caption2.weight(.semibold))
+                }
+                .font(Theme.Typography.caption.weight(.semibold))
+                .foregroundStyle(Color(uiColor: .systemBackground))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Theme.ink, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("supervisor-expand-deck")
+
+            if count > 1 {
+                Button("All") {
+                    model.workspaceChannel = .needsYou
+                }
+                .font(Theme.Typography.caption.weight(.semibold))
+                .foregroundStyle(Theme.live)
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 720)
+        .background(Theme.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+        .accessibilityIdentifier("supervisor-collapsed-deck-bar")
+    }
+
+    private var quickTaskComposerBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checklist")
+                .font(.caption)
+                .foregroundStyle(Theme.live)
+            TextField("Start task in Paseo…", text: $quickTaskTitle)
+                .font(.footnote)
+                .submitLabel(.go)
+                .onSubmit {
+                    Task { await startQuickTask() }
+                }
+            Button(creatingQuickTask ? "Starting…" : "Start") {
+                Task { await startQuickTask() }
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.mini)
+            .disabled(creatingQuickTask || quickTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button {
+                withAnimation(.spring(duration: 0.2)) {
+                    showingQuickTaskBar = false
+                }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 720)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1)
+        )
+    }
+
+    private func startQuickTask() async {
+        let title = quickTaskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !creatingQuickTask else { return }
+        creatingQuickTask = true
+        defer { creatingQuickTask = false }
+        do {
+            let res = try await model.client.fleetClaimTask(title: title, project: selectedProjectChannel)
+            quickTaskTitle = ""
+            showingQuickTaskBar = false
+            showToast("Started “\(res.session?.title ?? title)” in Paseo ✓")
+            await refresh()
+        } catch let error as DaemonError {
+            showToast(SupervisorFormat.failureNote(error).text, isError: true)
+        } catch {
+            showToast("Couldn't start task in Paseo.", isError: true)
         }
     }
 
@@ -908,6 +1262,9 @@ struct SupervisorView: View {
         guard sequence >= applied else { return }
         applied = sequence
         state = fresh
+        model.latestFleetState = fresh
+        let liveIDs = Set(SupervisorFormat.resolvedCards(fresh).map(\.id))
+        optimisticallyDismissedCardIDs = optimisticallyDismissedCardIDs.filter { liveIDs.contains($0) || inFlightCardIDs.contains($0) }
         loadError = nil
         lastLoadFailed = false
         syncFocusedCard()
@@ -916,11 +1273,15 @@ struct SupervisorView: View {
 
     private func applyRequestedFocus(_ cardID: String?) {
         guard let cardID, !cardID.isEmpty else { return }
-        guard let idx = cards.firstIndex(where: { $0.id == cardID }) else { return }
+        optimisticallyDismissedCardIDs.remove(cardID)
+        guard let idx = displayedCards.firstIndex(where: { $0.id == cardID }) else { return }
+        model.workspaceChannel = .general
         selectedProjectChannel = nil
+        selectedSubchannel = nil
         selectedCardIndex = idx
+        isDeckExpanded = true
         clearedFocusCardID = nil
-        conversation.focusedCardID = cards[idx].id
+        conversation.focusedCardID = displayedCards[idx].id
         model.requestedFocusCardID = nil
     }
 
@@ -972,10 +1333,13 @@ struct SupervisorView: View {
         do {
             modelSettings = try await model.client.updateModelSettings(update)
             statusNote = nil
+            showToast("Switched model to \(modelSettings?.active.model ?? preference)")
         } catch let error as DaemonError {
             statusNote = SupervisorFormat.failureNote(error)
+            showToast(SupervisorFormat.failureNote(error).text, isError: true)
         } catch {
             statusNote = .init(text: "Couldn't switch models.", isAlert: true)
+            showToast("Couldn't switch models.", isError: true)
         }
     }
 
@@ -983,10 +1347,12 @@ struct SupervisorView: View {
         guard !scanning else { return }
         scanning = true
         statusNote = nil
+        optimisticallyDismissedCardIDs = optimisticallyDismissedCardIDs.intersection(inFlightCardIDs)
         defer { scanning = false }
         do {
             let fresh = try await model.client.fleetScan()
             accept(nextSequence(), fresh)
+            showToast("Scan complete")
         } catch let error as DaemonError {
             statusNote = SupervisorFormat.isTimeout(error)
                 ? .init(text: "The scan is taking a while. It will update automatically when ready.", isAlert: false)
@@ -1010,15 +1376,18 @@ struct SupervisorView: View {
         do {
             let fresh = try await model.client.fleetSetMode(mode)
             accept(nextSequence(), fresh)
+            showToast("Mode: \(SupervisorFormat.modeLabel(mode))")
         } catch let error as DaemonError {
             statusNote = .init(text: SupervisorFormat.errorCopy(error).headline, isAlert: true)
+            showToast(SupervisorFormat.errorCopy(error).headline, isError: true)
         } catch {
             statusNote = .init(text: "Can't reach OpenAGI.", isAlert: true)
+            showToast("Can't reach OpenAGI.", isError: true)
         }
     }
 
     private func batchAct(op: String, filter: String? = nil) async {
-        guard !batchBusy && busyCardID == nil else { return }
+        guard !batchBusy else { return }
         batchBusy = true
         statusNote = nil
         defer { batchBusy = false }
@@ -1030,28 +1399,76 @@ struct SupervisorView: View {
                 await refresh()
             }
             let detail = res.result?.detail ?? "Batch action completed."
-            statusNote = .init(text: detail, isAlert: res.result?.ok == false)
+            let isErr = res.result?.ok == false
+            statusNote = .init(text: detail, isAlert: isErr)
+            showToast(detail, isError: isErr)
         } catch let error as DaemonError {
-            statusNote = SupervisorFormat.failureNote(error)
+            let note = SupervisorFormat.failureNote(error)
+            statusNote = note
+            showToast(note.text, isError: true)
         } catch {
             statusNote = .init(text: "Can't reach OpenAGI.", isAlert: true)
+            showToast("Can't reach OpenAGI.", isError: true)
         }
+    }
+
+    private func optimisticToastText(for card: SupervisorCard, action: SupervisorCardAction) -> String {
+        let prShort = SupervisorFormat.prNumber(card.prRef) ?? "PR"
+        let lowerLabel = action.label.lowercased()
+        let lowerOp = action.op.lowercased()
+        if lowerOp == "watch_ci" || action.value == "watch_ci" || lowerLabel.contains("watch ci") {
+            return "Watching CI on \(prShort) — I'll ping you when green"
+        }
+        if lowerOp == "merge" {
+            return "Merging \(prShort)…"
+        }
+        if lowerOp == "defer" || lowerOp == "dismiss" {
+            return "Saved for later"
+        }
+        if lowerOp == "fix_ci" {
+            return "Asked agent to fix CI"
+        }
+        if lowerOp == "approve" || lowerLabel.contains("approve") {
+            return "Approved"
+        }
+        if lowerOp == "reply" || lowerOp == "answer" {
+            return "Sent reply"
+        }
+        return "\(action.label)…"
     }
 
     @discardableResult
     private func act(_ card: SupervisorCard, action: SupervisorCardAction, images: [ChatAttachment] = []) async -> Bool {
-        guard busyCardID == nil && busyQuestionID == nil else { return false }
-        busyCardID = card.id
+        guard !inFlightCardIDs.contains(card.id) else { return false }
+        inFlightCardIDs.insert(card.id)
+        withAnimation(.spring(duration: 0.22)) {
+            optimisticallyDismissedCardIDs.insert(card.id)
+            if selectedCardIndex >= displayedCards.count {
+                selectedCardIndex = max(0, displayedCards.count - 1)
+            }
+        }
+        showToast(optimisticToastText(for: card, action: action))
         statusNote = nil
-        defer { busyCardID = nil }
+        defer {
+            inFlightCardIDs.remove(card.id)
+            if busyCardID == card.id { busyCardID = nil }
+        }
 
         let noteTargetID = card.questionId ?? card.id
         let daemonHasCards = !(state?.cards.isEmpty ?? true)
         do {
             let result = try await model.client.fleetActCard(id: card.id, op: action.op, value: action.value, images: images)
             let note = SupervisorFormat.cardActNote(result)
-            statusNote = note
             questionNote = (noteTargetID, note)
+            if note.isAlert {
+                withAnimation(.spring(duration: 0.22)) {
+                    optimisticallyDismissedCardIDs.remove(card.id)
+                }
+                statusNote = note
+                showToast(note.text, isError: true)
+            } else {
+                showToast(note.text, isError: false)
+            }
             if let fresh = result.state {
                 accept(nextSequence(), fresh)
             } else {
@@ -1061,24 +1478,41 @@ struct SupervisorView: View {
         } catch DaemonError.notFound where !daemonHasCards && card.questionId != nil {
             // Older daemon fallback: translate card action to legacy /fleet/api/questions/:id.
             if let qid = card.questionId, let q = state?.questions.first(where: { $0.id == qid }) {
-                busyCardID = nil
+                let ok: Bool
                 if action.op == "defer" || action.op == "dismiss" {
-                    return await decide(q, answer: nil)
+                    ok = await decide(q, answer: nil)
                 } else {
-                    return await decide(q, answer: action.value ?? SupervisorFormat.answerOptions(q).first)
+                    ok = await decide(q, answer: action.value ?? SupervisorFormat.answerOptions(q).first)
                 }
+                if !ok {
+                    withAnimation(.spring(duration: 0.22)) {
+                        optimisticallyDismissedCardIDs.remove(card.id)
+                    }
+                }
+                return ok
+            }
+            withAnimation(.spring(duration: 0.22)) {
+                optimisticallyDismissedCardIDs.remove(card.id)
             }
             return false
         } catch let error as DaemonError {
+            withAnimation(.spring(duration: 0.22)) {
+                optimisticallyDismissedCardIDs.remove(card.id)
+            }
             let note = SupervisorFormat.failureNote(error)
             statusNote = note
             questionNote = (noteTargetID, note)
+            showToast(note.text, isError: true)
             if error == .conflict || error == .notFound { await refresh() }
             return false
         } catch {
+            withAnimation(.spring(duration: 0.22)) {
+                optimisticallyDismissedCardIDs.remove(card.id)
+            }
             let note = SupervisorFormat.Note(text: "Can't reach OpenAGI.", isAlert: true)
             statusNote = note
             questionNote = (noteTargetID, note)
+            showToast(note.text, isError: true)
             return false
         }
     }
@@ -1102,18 +1536,21 @@ struct SupervisorView: View {
                 : SupervisorFormat.deliveryNote(result.delivery, fallback: "Answered.")
             questionNote = (question.id, note)
             statusNote = note
+            showToast(note.text, isError: note.isAlert)
             if let fresh = result.state { accept(nextSequence(), fresh) } else { await refresh() }
             return !note.isAlert
         } catch let error as DaemonError {
             let note = SupervisorFormat.failureNote(error)
             questionNote = (question.id, note)
             statusNote = note
+            showToast(note.text, isError: true)
             if error == .conflict || error == .notFound { await refresh() }
             return false
         } catch {
             let note = SupervisorFormat.Note(text: "Can't reach OpenAGI.", isAlert: true)
             questionNote = (question.id, note)
             statusNote = note
+            showToast(note.text, isError: true)
             return false
         }
     }
@@ -1129,13 +1566,16 @@ struct SupervisorView: View {
             let note = SupervisorFormat.deliveryNote(result.delivery, fallback: "Sent.")
             actionNote = (action.id, note)
             statusNote = note
+            showToast(note.text, isError: note.isAlert)
             if let fresh = result.state { accept(nextSequence(), fresh) } else { await refresh() }
         } catch let error as DaemonError {
             let note = SupervisorFormat.failureNote(error)
             actionNote = (action.id, note)
+            showToast(note.text, isError: true)
             if error == .conflict || error == .notFound { await refresh() }
         } catch {
             actionNote = (action.id, .init(text: "Can't reach OpenAGI.", isAlert: true))
+            showToast("Can't reach OpenAGI.", isError: true)
         }
     }
 
@@ -1166,6 +1606,8 @@ private struct SupervisorCardDeckView: View {
     let busyCardID: String?
     let threads: [FleetThread]
     let onSelectIndex: (Int) -> Void
+    let onCollapse: () -> Void
+    let onOpenAll: () -> Void
     let onOpenContext: (SupervisorCard) -> Void
     let onReplyInChat: (SupervisorCard) -> Void
     let onClearFocus: (SupervisorCard) -> Void
@@ -1174,7 +1616,7 @@ private struct SupervisorCardDeckView: View {
     @State private var revealedPlanCardIDs: Set<String> = []
 
     private var card: SupervisorCard { cards[index] }
-    private var isBusy: Bool { busyCardID != nil }
+    private var isBusy: Bool { busyCardID == card.id }
     private var hasThreadContext: Bool {
         card.threadKey != nil || !card.threadKeys.isEmpty
     }
@@ -1207,12 +1649,13 @@ private struct SupervisorCardDeckView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Deck header: kind badge + 1 of N stepper + focus chip
-            HStack(spacing: 8) {
+            // Deck header: kind badge + 1 of N stepper + collapse button (fixed Y position!)
+            HStack(spacing: 6) {
                 let isFailureBadge = card.kind == "ci_failed" || ["FAILURE", "ERROR"].contains(card.ciState?.uppercased() ?? "")
                 Text((card.kindLabel ?? "Needs you").uppercased())
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(isFailureBadge ? Theme.alert : (card.risky ? Theme.caution : Theme.live))
+                    .lineLimit(1)
                 let projBadge = SupervisorChannelGrouping.normalizeProject(
                     explicit: card.project,
                     repo: card.repo,
@@ -1222,14 +1665,21 @@ private struct SupervisorCardDeckView: View {
                     Text("#\(projBadge)")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
                 }
 
                 if cards.count > 1 {
-                    Text("· \(index + 1) of \(cards.count)")
+                    Text("· \(index + 1)/\(cards.count)")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(Theme.muted)
-                    Spacer(minLength: 4)
-                    HStack(spacing: 4) {
+                        .monospacedDigit()
+                        .fixedSize()
+                }
+
+                Spacer(minLength: 4)
+
+                if cards.count > 1 {
+                    HStack(spacing: 2) {
                         Button {
                             onSelectIndex(index - 1)
                         } label: {
@@ -1239,6 +1689,7 @@ private struct SupervisorCardDeckView: View {
                                 .contentShape(Rectangle())
                         }
                         .disabled(index == 0)
+                        .opacity(index == 0 ? 0.35 : 1)
                         .accessibilityLabel("Previous decision")
 
                         Button {
@@ -1250,48 +1701,67 @@ private struct SupervisorCardDeckView: View {
                                 .contentShape(Rectangle())
                         }
                         .disabled(index >= cards.count - 1)
+                        .opacity(index >= cards.count - 1 ? 0.35 : 1)
                         .accessibilityLabel("Next decision")
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Theme.ink)
-                } else {
-                    Spacer(minLength: 4)
                 }
 
-                if focusedCardID == card.id && card.kind != "preference" {
-                    Button {
-                        onClearFocus(card)
-                    } label: {
-                        HStack(spacing: 3) {
-                            Text("Focused")
-                            Image(systemName: "xmark")
-                        }
-                        .font(.caption2)
-                        .foregroundStyle(Theme.muted)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Theme.canvas, in: Capsule())
+                if cards.count > 1 {
+                    Button("All") {
+                        onOpenAll()
                     }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Theme.live)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Theme.canvas, in: Capsule())
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Clear focus from card")
                 }
+
+                Button {
+                    onCollapse()
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("Hide")
+                        Image(systemName: "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Theme.muted)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.canvas, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide decision card")
+                .accessibilityIdentifier("supervisor-collapse-deck")
             }
 
-            // Tappable card body -> opens Duet ThreadDetailSheet (read-only context)
+            // Dedicated tappable headline row -> opens ThreadDetailSheet without conflicting with horizontal swipe
             let contextID = "supervisor-question-context-\(card.questionId ?? card.id)"
             if hasThreadContext || card.kind == "preference" {
                 Button {
                     onOpenContext(card)
                 } label: {
-                    cardSummaryContent(showsChevron: true)
+                    headlineRow(showsChevron: true)
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier(contextID)
                 .accessibilityHint("Read the question and recent thread activity before answering")
             } else {
-                cardSummaryContent(showsChevron: false)
+                headlineRow(showsChevron: false)
                     .accessibilityIdentifier(contextID)
             }
+
+            // Fixed-height scrollable body so stepper controls never jump vertically
+            // and horizontal swipes over card content never accidentally trigger taps.
+            ScrollView(.vertical, showsIndicators: true) {
+                cardDetailsContent
+                    .padding(.trailing, 2)
+            }
+            .frame(height: 145)
 
             if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -1327,10 +1797,11 @@ private struct SupervisorCardDeckView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1)
         )
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 28, coordinateSpace: .local)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 24, coordinateSpace: .local)
                 .onEnded { value in
-                    guard cards.count > 1, abs(value.translation.width) > abs(value.translation.height) else { return }
+                    guard cards.count > 1, abs(value.translation.width) > abs(value.translation.height) * 1.2 else { return }
                     if value.translation.width < -28, index < cards.count - 1 {
                         onSelectIndex(index + 1)
                     } else if value.translation.width > 28, index > 0 {
@@ -1342,21 +1813,26 @@ private struct SupervisorCardDeckView: View {
         .accessibilityIdentifier("supervisor-card-deck")
     }
 
-    private func cardSummaryContent(showsChevron: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(card.headline)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                Spacer(minLength: 4)
-                if showsChevron {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Theme.muted)
-                }
+    private func headlineRow(showsChevron: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(card.headline)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Theme.ink)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 4)
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.muted)
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private var cardDetailsContent: some View {
+        VStack(alignment: .leading, spacing: 5) {
             if !subtitleLine.isEmpty {
                 Text(subtitleLine)
                     .font(Theme.Typography.caption)
@@ -1594,11 +2070,254 @@ private struct DeckPillButton: View {
     }
 }
 
+// MARK: - Inline #needs-you Triage Stage
+
+private struct BoardNeedsYouStage: View {
+    let cards: [SupervisorCard]
+    let threads: [FleetThread]
+    let inFlightCardIDs: Set<String>
+    let scanning: Bool
+    let greenMergeableCount: Int
+    let onScan: () -> Void
+    let onMergeGreen: () -> Void
+    let onOpenContext: (SupervisorCard) -> Void
+    let onReplyInChat: (SupervisorCard) -> Void
+    let onAct: (SupervisorCard, SupervisorCardAction) -> Void
+    let onBackToGeneral: () -> Void
+
+    @State private var inspectedThread: FleetThread?
+
+    var body: some View {
+        GeometryReader { geo in
+            let isWide = geo.size.width >= 660
+            if cards.isEmpty {
+                VStack(spacing: 12) {
+                    Image(systemName: "checkmark.circle")
+                        .font(.system(size: 36, weight: .light))
+                        .foregroundStyle(Color.green)
+                    Text("All caught up")
+                        .font(.headline)
+                        .foregroundStyle(Theme.ink)
+                    Text("No agent questions or PR approvals are waiting on you right now.")
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.muted)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 320)
+                    HStack(spacing: 10) {
+                        Button("Back to #general", action: onBackToGeneral)
+                            .buttonStyle(.borderedProminent)
+                        Button(scanning ? "Scanning…" : "Scan now", action: onScan)
+                            .buttonStyle(.bordered)
+                            .disabled(scanning)
+                    }
+                    .padding(.top, 4)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
+            } else if isWide {
+                HStack(spacing: 0) {
+                    cardsScrollList(isWide: true)
+                        .frame(width: min(440, max(320, geo.size.width * 0.46)))
+                    Divider()
+                    BoardThreadInspectorPane(
+                        orderedThreads: threads,
+                        selectedThread: $inspectedThread,
+                        onExpand: { thread in
+                            if let matchingCard = cards.first(where: { $0.threadKey == thread.key || $0.threadKeys.contains(thread.key) }) {
+                                onOpenContext(matchingCard)
+                            }
+                        },
+                        onAcceptState: nil
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                .onAppear {
+                    syncInitialInspectedThread()
+                }
+            } else {
+                cardsScrollList(isWide: false)
+            }
+        }
+    }
+
+    private func syncInitialInspectedThread() {
+        guard inspectedThread == nil else { return }
+        if let firstKey = cards.first?.threadKey ?? cards.first?.threadKeys.first,
+           let match = threads.first(where: { $0.key == firstKey }) {
+            inspectedThread = match
+        } else {
+            inspectedThread = threads.first
+        }
+    }
+
+    private func cardsScrollList(isWide: Bool) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Text("\(cards.count) waiting on you")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                    Spacer()
+                    if greenMergeableCount > 0 {
+                        Button("Merge green (\(greenMergeableCount))", action: onMergeGreen)
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                    }
+                    Button(scanning ? "Scanning…" : "Scan", action: onScan)
+                        .font(.caption.weight(.semibold))
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(scanning)
+                }
+                .padding(.horizontal, 4)
+
+                ForEach(cards) { card in
+                    needsYouRowCard(card, isWide: isWide)
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    private func needsYouRowCard(_ card: SupervisorCard, isWide: Bool) -> some View {
+        let isBusy = inFlightCardIDs.contains(card.id)
+        let isFailureBadge = card.kind == "ci_failed" || ["FAILURE", "ERROR"].contains(card.ciState?.uppercased() ?? "")
+        let projBadge = SupervisorChannelGrouping.normalizeProject(
+            explicit: card.project,
+            repo: card.repo,
+            workspace: card.workspace
+        )
+        let hasThread = card.threadKey != nil || !card.threadKeys.isEmpty
+        let isExplicitAction = card.kind == "merge_ready" || card.kind == "pr_ready"
+            || card.kind == "ci_failed" || card.kind == "preference"
+            || card.primaryAction?.op == "merge" || card.primaryAction?.op == "fix_ci"
+            || card.primaryAction?.op == "preference" || card.primaryAction?.op == "set_preference"
+        let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let meta = [
+            SupervisorFormat.cleanWorkspace(card.workspace) ?? card.repo,
+            SupervisorFormat.prNumber(card.prRef),
+            card.ciState.flatMap { SupervisorFormat.ciLabel(FleetCI(state: $0)) },
+            card.noticedAt.map { SupervisorFormat.agoPhrase($0) }
+        ].compactMap { $0 }.joined(separator: " · ")
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text((card.kindLabel ?? "Needs you").uppercased())
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(isFailureBadge ? Theme.alert : (card.risky ? Theme.caution : Theme.live))
+                if projBadge != "general" {
+                    Text("#\(projBadge)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                }
+                Spacer()
+                if hasThread {
+                    Button {
+                        if isWide, let key = card.threadKey ?? card.threadKeys.first,
+                           let match = threads.first(where: { $0.key == key }) {
+                            inspectedThread = match
+                        } else {
+                            onOpenContext(card)
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("Details")
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Button {
+                if isWide, let key = card.threadKey ?? card.threadKeys.first,
+                   let match = threads.first(where: { $0.key == key }) {
+                    inspectedThread = match
+                } else {
+                    onOpenContext(card)
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(card.headline)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                        .multilineTextAlignment(.leading)
+                    if !meta.isEmpty {
+                        Text(meta)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.muted)
+                    }
+                    if let summary = mainSummary {
+                        Text(MarkdownParser.inline(summary))
+                            .font(Theme.Typography.secondary)
+                            .foregroundStyle(Theme.ink.opacity(0.9))
+                            .lineLimit(4)
+                            .multilineTextAlignment(.leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if card.blockingCount > 0 {
+                BoardBlockingPill(summary: card.blockingSummary ?? "Blocking \(card.blockingCount) downstream")
+            }
+
+            HStack(spacing: 8) {
+                if isExplicitAction, let primary = card.primaryAction, !primary.label.isEmpty {
+                    DeckPillButton(title: primary.label, filled: true, enabled: !isBusy) {
+                        onAct(card, primary)
+                    }
+                    if let extra = card.extraActions.first(where: { $0.op != "defer" && $0.op != "dismiss" && !$0.label.isEmpty }) {
+                        DeckPillButton(title: extra.label, filled: false, enabled: !isBusy) {
+                            onAct(card, extra)
+                        }
+                    }
+                } else if hasThread {
+                    DeckPillButton(title: "Review & decide", filled: true, enabled: !isBusy) {
+                        onOpenContext(card)
+                    }
+                    DeckPillButton(title: "Reply", filled: false, enabled: !isBusy) {
+                        onReplyInChat(card)
+                    }
+                } else if let firstOpt = card.options.first {
+                    DeckPillButton(title: firstOpt, filled: true, enabled: !isBusy) {
+                        onAct(card, SupervisorCardAction(op: "answer", label: firstOpt, value: firstOpt))
+                    }
+                }
+                Spacer(minLength: 0)
+                let secondary = card.secondaryAction ?? SupervisorCardAction(op: "defer", label: "Later")
+                Button(secondary.label) {
+                    onAct(card, secondary)
+                }
+                .font(Theme.Typography.caption.weight(.medium))
+                .foregroundStyle(Theme.muted)
+                .frame(minHeight: 36)
+                .padding(.horizontal, 6)
+                .disabled(isBusy)
+            }
+        }
+        .padding(14)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1)
+        )
+    }
+}
+
 // MARK: - Active Sessions & BM25 Search Sheet
 
 private struct ActiveSessionsSheet: View {
     let state: FleetState?
     var initialMode: BoardBrowseMode = .themes
+    var embeddedInWorkspace: Bool = false
     let scanning: Bool
     let onScan: () -> Void
     var onAcceptState: ((FleetState) -> Void)? = nil
@@ -1629,6 +2348,7 @@ private struct ActiveSessionsSheet: View {
     init(
         state: FleetState?,
         initialMode: BoardBrowseMode = .themes,
+        embeddedInWorkspace: Bool = false,
         scanning: Bool,
         onScan: @escaping () -> Void,
         onAcceptState: ((FleetState) -> Void)? = nil,
@@ -1636,6 +2356,7 @@ private struct ActiveSessionsSheet: View {
     ) {
         self.state = state
         self.initialMode = initialMode
+        self.embeddedInWorkspace = embeddedInWorkspace
         self.scanning = scanning
         self.onScan = onScan
         self.onAcceptState = onAcceptState
@@ -1686,79 +2407,90 @@ private struct ActiveSessionsSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            GeometryReader { geo in
-                let isWide = geo.size.width >= 660
-                Group {
-                    if isWide {
-                        HStack(spacing: 0) {
-                            sessionsList(isWide: true)
-                                .frame(width: min(390, max(300, geo.size.width * 0.43)))
-                            Divider()
-                            BoardThreadInspectorPane(
-                                orderedThreads: threads,
-                                selectedThread: $inspectedThread,
-                                onExpand: onSelectThread,
-                                onAcceptState: onAcceptState
-                            )
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                        .onAppear {
-                            if inspectedThread == nil, let first = threads.first {
-                                inspectedThread = first
+        if embeddedInWorkspace {
+            boardContent
+        } else {
+            NavigationStack {
+                boardContent
+                    .navigationTitle(activeProject?.supervisorTitle ?? "Supervisor Board")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        if activeProject != nil {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("All Projects") {
+                                    selectedProjectId = nil
+                                    dispatchOutcomeNote = nil
+                                }
                             }
                         }
-                    } else {
-                        sessionsList(isWide: false)
-                    }
-                }
-            }
-            .searchable(text: $query, prompt: "Search repos, PRs, branches, transcripts")
-            .task {
-                await loadHierarchy()
-            }
-            .task(id: browseMode) {
-                if browseMode == .tasks {
-                    await refreshBoardTasks(force: true)
-                }
-            }
-            .task(id: query) {
-                let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else {
-                    searchHits = []
-                    searchError = nil
-                    return
-                }
-                try? await Task.sleep(for: .milliseconds(250))
-                guard !Task.isCancelled else { return }
-                isSearching = true
-                defer { isSearching = false }
-                do {
-                    let response = try await model.client.fleetSearch(query: trimmed, limit: 20)
-                    searchHits = response.results
-                    searchError = nil
-                } catch DaemonError.notFound {
-                    // Fallback to local thread filtering against an older daemon
-                    searchHits = SupervisorFormat.fallbackSearchHits(threads, query: trimmed)
-                    searchError = nil
-                } catch {
-                    searchError = "Couldn't search sessions right now."
-                }
-            }
-            .navigationTitle(activeProject?.supervisorTitle ?? "Supervisor Board")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if activeProject != nil {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("All Projects") {
-                            selectedProjectId = nil
-                            dispatchOutcomeNote = nil
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { dismiss() }
                         }
                     }
+            }
+        }
+    }
+
+    private var boardContent: some View {
+        GeometryReader { geo in
+            let isWide = geo.size.width >= 660
+            Group {
+                if isWide {
+                    HStack(spacing: 0) {
+                        sessionsList(isWide: true)
+                            .frame(width: min(390, max(300, geo.size.width * 0.43)))
+                        Divider()
+                        BoardThreadInspectorPane(
+                            orderedThreads: threads,
+                            selectedThread: $inspectedThread,
+                            onExpand: onSelectThread,
+                            onAcceptState: onAcceptState
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    .onAppear {
+                        if inspectedThread == nil, let first = threads.first {
+                            inspectedThread = first
+                        }
+                    }
+                } else {
+                    sessionsList(isWide: false)
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
+            }
+        }
+        .searchable(text: $query, prompt: "Search repos, PRs, branches, transcripts")
+        .onChange(of: initialMode) { _, next in
+            browseMode = next
+        }
+        .task {
+            await loadHierarchy()
+        }
+        .task(id: browseMode) {
+            if browseMode == .tasks {
+                await refreshBoardTasks(force: true)
+            }
+        }
+        .task(id: query) {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                searchHits = []
+                searchError = nil
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            isSearching = true
+            defer { isSearching = false }
+            do {
+                let response = try await model.client.fleetSearch(query: trimmed, limit: 20)
+                searchHits = response.results
+                searchError = nil
+            } catch DaemonError.notFound {
+                // Fallback to local thread filtering against an older daemon
+                searchHits = SupervisorFormat.fallbackSearchHits(threads, query: trimmed)
+                searchError = nil
+            } catch {
+                searchError = "Couldn't search sessions right now."
             }
         }
     }

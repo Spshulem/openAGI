@@ -25,8 +25,9 @@ final class AppSession {
     private(set) var mode: AppMode?
     private(set) var setupError: String?
     private(set) var pairingServer: URL?
-    // The tab a freshly set-up agent opens on.
-    private(set) var initialTab: AppTab = .today
+    // The tab a freshly set-up agent opens on. Default to the unified OpenAGI
+    // Supervisor Workspace for real usage while keeping UI tests on Today.
+    private(set) var initialTab: AppTab = ProcessInfo.processInfo.arguments.contains("--ui-testing") ? .today : .chat
     @ObservationIgnored private var onboardingSource: AppModel?
 
     init(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
@@ -191,7 +192,7 @@ final class AppSession {
         DailyDigestNotifier.cancelAll()
         AppMode.current = .server
         mode = .server
-        initialTab = .today
+        initialTab = ProcessInfo.processInfo.arguments.contains("--ui-testing") ? .today : .chat
         Task { await DeviceModelBridge.shared.disconnect() }
         phase = Credentials.load().map(Phase.ready) ?? .pairing
     }

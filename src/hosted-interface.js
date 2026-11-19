@@ -319,6 +319,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("tunnel", (data) => broadcast("tunnel", data));
   events.on("replay", (data) => broadcast("replay", data));
   events.on("skill-candidate", (data) => broadcast("skill-candidate", data));
+  events.on("pair-phone-requested", (data) => broadcast("pair-phone-requested", data));
+  let lastPairPromptAtMs = 0;
   events.on("miner-result", (data) => broadcast("miner-result", data));
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   events.on("cron-job-timeout", (data) => broadcast("cron-job-timeout", data));
@@ -1431,6 +1433,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           },
           capabilities: EVEN_G2_CAPABILITIES
         });
+      }
+      if (method === "POST" && pathname === "/nodes/enroll/prompt") {
+        // Unauthenticated native-app nudge asking the Mac desktop (which holds
+        // owner authority) to pop open its "Connect a phone" window. Never
+        // returns a code, token, or secret, and still enforces browser CSRF
+        // origin checks + a 15-second cooldown.
+        const origin = checkOrigin(req);
+        if (!origin.ok) {
+          return sendJson(res, 403, { error: "forbidden", reason: origin.reason });
+        }
+        const nowMs = Date.now();
+        const cooldownMs = 15_000;
+        if (lastPairPromptAtMs > 0 && nowMs - lastPairPromptAtMs < cooldownMs) {
+          const retryAfterSeconds = Math.max(1, Math.ceil((cooldownMs - (nowMs - lastPairPromptAtMs)) / 1000));
+          return sendJson(res, 429, { error: "rate_limited", retryAfterSeconds });
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
+        const rawName = typeof body?.deviceName === "string" ? body.deviceName : "";
+        const deviceName = rawName.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 60) || "iPhone";
+        lastPairPromptAtMs = nowMs;
+        events.emit("pair-phone-requested", {
+          deviceName,
+          requestedAt: new Date(nowMs).toISOString()
+        });
+        return sendJson(res, 200, { ok: true, prompted: true });
       }
       if (method === "POST" && pathname === "/nodes/enroll/exchange") {
         const body = await readJsonLimited(req, 16 * 1024).catch(() => ({}));

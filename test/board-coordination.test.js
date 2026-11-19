@@ -9,6 +9,7 @@ import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { isMobileRouteAllowed } from "../src/mobile-node.js";
+import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 
 function makeTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -252,4 +253,122 @@ test("FleetSupervisor exposes nextTickAt, quiet nextCheckAt, blockingCount, acti
   });
   assert.equal(capRes.response.status, 200);
   assert.equal(capRes.response.body.task.status, "in_progress");
+});
+
+test("Watch CI on a pending PR card dismisses it from the active deck", async (t) => {
+  const dir = makeTempDir("openagi-board-watchci-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const nowMs = Date.parse("2026-11-19T12:00:00.000Z");
+  const supervisor = new FleetSupervisor({
+    dataDir: dir,
+    config: resolveFleetConfig({}, { enabled: true, mode: "propose", tickMs: 120_000 }),
+    deps: {
+      now: () => nowMs,
+      run: async (_bin, args) => {
+        if (args[0] === "pr" && args[1] === "view") {
+          return {
+            ok: true,
+            code: 0,
+            stdout: JSON.stringify({
+              number: 10221,
+              state: "OPEN",
+              isDraft: false,
+              mergeable: "MERGEABLE",
+              mergeStateStatus: "BLOCKED",
+              headRefOid: "abc1234",
+              statusCheckRollup: [{ name: "CI", status: "IN_PROGRESS", conclusion: "" }]
+            }),
+            stderr: ""
+          };
+        }
+        return { ok: true, code: 0, stdout: "", stderr: "" };
+      }
+    }
+  });
+
+  supervisor.store.recordSnapshot({
+    at: "2026-11-19T12:00:00.000Z",
+    mode: "propose",
+    counts: { threads: 1, eligible: 1, inScope: 1, deferred: 0 },
+    threads: [{
+      key: "paseo:srv_local:agi-ci",
+      kind: "paseo",
+      title: "Promote durable webhooks",
+      workspace: "buildbetter",
+      repo: "buildbetter-app/buildbetter",
+      state: "waiting",
+      health: "needs_human",
+      pr: { ref: "buildbetter-app/buildbetter#10221", state: "OPEN", ci: { state: "PENDING" } }
+    }]
+  });
+
+  const q = supervisor.store.upsertQuestion({
+    dedupeKey: "pr-pending:10221",
+    threadKey: "paseo:srv_local:agi-ci",
+    prRef: "buildbetter-app/buildbetter#10221",
+    kind: "ci_pending",
+    title: "Checks running on #10221",
+    body: "Checks are still running on #10221. Tap Watch CI or wait before merging.",
+    options: ["Watch CI", "Later"]
+  });
+
+  const before = supervisor.getState();
+  assert.equal(before.cards.some((c) => c.questionId === q.id), true);
+
+  const outcome = await supervisor.actCard(q.id, { op: "merge", value: "buildbetter-app/buildbetter#10221" });
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.status, "watching_ci");
+
+  const after = supervisor.getState();
+  assert.equal(after.cards.some((c) => c.questionId === q.id), false);
+});
+
+test("POST /nodes/enroll/prompt triggers Mac pairing event with rate-limit, CSRF check, and no secret leak", async (t) => {
+  const dir = makeTempDir("openagi-pair-prompt-");
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const runtime = createDurableRuntime({ dataDir: dir });
+  const app = createHostedInterface(runtime, {
+    host: "127.0.0.1",
+    port: 0,
+    tickerMs: 0,
+    dataDir: dir,
+    authToken: "owner-secret-token-for-prompt-test"
+  });
+  const listened = await app.listen();
+  t.after(() => app.close());
+
+  const base = listened.url ?? `http://127.0.0.1:${listened.port}`;
+  const received = [];
+  runtime.events.on("pair-phone-requested", (evt) => received.push(evt));
+
+  // Cross-origin browser request must still be rejected.
+  const badOrigin = await fetch(`${base}/nodes/enroll/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://evil.example" },
+    body: JSON.stringify({ deviceName: "Evil" })
+  });
+  assert.equal(badOrigin.status, 403);
+  assert.equal(received.length, 0);
+
+  // Native app request succeeds without auth, leaks zero secrets, emits SSE event.
+  const okRes = await fetch(`${base}/nodes/enroll/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceName: "Peri" })
+  });
+  assert.equal(okRes.status, 200);
+  const okBody = await okRes.json();
+  assert.deepEqual(okBody, { ok: true, prompted: true });
+  assert.equal(received.length, 1);
+  assert.equal(received[0].deviceName, "Peri");
+
+  // Immediate repeat is rate-limited.
+  const limited = await fetch(`${base}/nodes/enroll/prompt`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ deviceName: "Peri" })
+  });
+  assert.equal(limited.status, 429);
 });

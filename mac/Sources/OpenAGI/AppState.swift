@@ -475,6 +475,12 @@ final class AppState: ObservableObject {
       }()
       notify(title: title, body: body, path: "/?tab=skills")
     }
+    if event == "pair-phone-requested" {
+      let device = parseField(data, "deviceName") ?? "Your phone"
+      NSApp.activate(ignoringOtherApps: true)
+      PhonePairingWindowController.shared.show(state: self)
+      notify(title: "Connect a phone", body: "\(device) requested a pairing code — check the OpenAGI window.", path: "/phone-pairing")
+    }
     if event == "task-reminder" {
       // Morning digest or due-date reminder — fire native notification.
       let title = parseField(data, "title") ?? "OpenAGI"

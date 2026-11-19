@@ -227,4 +227,81 @@ final class SupervisorBoardTests: XCTestCase {
         XCTAssertEqual(req.httpMethod, "POST")
         XCTAssertEqual(req.url?.path, "/fleet/api/tasks/claim")
     }
+
+    func testPendingActionDisplayTitleAndSubtitleHumanizeComputerUseAndTools() throws {
+        let computerUseJSON = #"""
+        {
+          "id": "pa-1",
+          "toolName": "start_computer_use_session",
+          "args": { "goal": "Open Xcode and run OpenAGI on Peri", "nodeName": "spencer-mac" },
+          "summary": "open computer use",
+          "status": "pending",
+          "createdAt": "2026-11-19T12:00:00Z"
+        }
+        """#
+        let computerUse = try ProtocolDecoder.json.decode(PendingAction.self, from: Data(computerUseJSON.utf8))
+        XCTAssertEqual(computerUse.displayTitle, "Open Xcode and run OpenAGI on Peri")
+        XCTAssertEqual(computerUse.displaySubtitle, "Computer Use · spencer-mac")
+
+        let genericComputerJSON = #"""
+        {
+          "id": "pa-2",
+          "toolName": "start_computer_use_session",
+          "args": { "nodeName": "distiller-a270" },
+          "summary": "start_computer_use_session",
+          "status": "pending",
+          "createdAt": "2026-11-19T12:00:00Z"
+        }
+        """#
+        let genericComputer = try ProtocolDecoder.json.decode(PendingAction.self, from: Data(genericComputerJSON.utf8))
+        XCTAssertEqual(genericComputer.displayTitle, "Control distiller-a270")
+        XCTAssertEqual(genericComputer.displaySubtitle, "Computer Use · distiller-a270")
+
+        let supervisorJSON = #"""
+        {
+          "id": "pa-3",
+          "toolName": "fleet_act_card",
+          "summary": "Merge PR #309",
+          "status": "pending",
+          "createdAt": "2026-11-19T12:00:00Z"
+        }
+        """#
+        let supervisorAction = try ProtocolDecoder.json.decode(PendingAction.self, from: Data(supervisorJSON.utf8))
+        XCTAssertEqual(supervisorAction.displayTitle, "Merge PR #309")
+        XCTAssertEqual(supervisorAction.displaySubtitle, "Coding Supervisor")
+    }
+
+    func testRequestPairingPromptPostsDeviceName() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubProtocol.self]
+        let session = URLSession(configuration: config)
+        let server = URL(string: "http://mac.tail1234.ts.net:43210")!
+
+        var capturedBody = Data()
+        StubProtocol.handler = { request in
+            if let body = request.httpBody {
+                capturedBody = body
+            } else if let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 1024)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count > 0 { capturedBody.append(buffer, count: count) }
+                    else { break }
+                }
+            }
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"ok":true,"prompted":true}"#.utf8)
+            )
+        }
+
+        try await DaemonClient.requestPairingPrompt(server: server, deviceName: "Peri", session: session)
+        let req = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(req.httpMethod, "POST")
+        XCTAssertEqual(req.url?.path, "/nodes/enroll/prompt")
+        let decoded = try JSONDecoder().decode([String: String].self, from: capturedBody)
+        XCTAssertEqual(decoded["deviceName"], "Peri")
+    }
 }
