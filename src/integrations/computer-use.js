@@ -31,6 +31,7 @@
 import crypto from "node:crypto";
 import { pinnedRemoteOrigin } from "../node-control.js";
 import { isOwnerPrincipal } from "../owner-authority.js";
+import { SCREENSHOT_FOCUS_UNAVAILABLE } from "./computer-server.js";
 
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
@@ -303,6 +304,9 @@ async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, op
   if (!res.ok) {
     const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
     const error = new Error(publicError);
+    if (json?.code === SCREENSHOT_FOCUS_UNAVAILABLE && json.sequenceConsumed === true) {
+      error.code = SCREENSHOT_FOCUS_UNAVAILABLE;
+    }
     error.nodeAcknowledged = true;
     // Current nodes state this explicitly. Older compatible node services used
     // 5xx for executor failures after entering a lease, so retain that legacy
@@ -707,6 +711,21 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
             note: "Live screenshot and fresh Accessibility state from the computer-use node. Element indices are valid only for this frameId."
           };
         } catch (error) {
+          // The local executor and the authenticated relay/HTTP transport
+          // identify a completed, read-only refusal. Keep the same lease and
+          // target; the node has already invalidated its previous frame.
+          if (!context.signal?.aborted && runtime.computerUseLog.getSession(session.id)?.status === "active"
+              && error?.nodeSequenceConsumed === true
+              && (error.code === SCREENSHOT_FOCUS_UNAVAILABLE
+                || (error.nodeAcknowledged === true && error.message === SCREENSHOT_FOCUS_UNAVAILABLE))) {
+            runtime.computerUseLog.markActionResult(action.id, { status: "error", error: SCREENSHOT_FOCUS_UNAVAILABLE });
+            return {
+              actionId: action.id,
+              ok: false,
+              error: SCREENSHOT_FOCUS_UNAVAILABLE,
+              note: "No screenshot was captured. The current approval is still active on this node. If the intended app is not focused, activate it if available, or ask the user to focus its allowed window on the main display. Then take a fresh screenshot before input. Do not retry repeatedly with the same focus, use an older frame, or request another approval while this one is active."
+            };
+          }
           runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
           await abortSession(session, "computer-use node action failed; approval must be renewed", "aborted");
           throw new Error(`computer-use node screenshot failed: ${error.message}`);

@@ -249,7 +249,8 @@ public enum ComputerScreenshot {
   /// not capture pixels; it proves the focused AX window maps uniquely to one
   /// on-screen CoreGraphics window and passes the persisted privacy policy.
   public static func focusedWindowPrivacyReady(
-    privacy: ComputerCapturePrivacy = .load()
+    privacy: ComputerCapturePrivacy = .load(),
+    requiresMainDisplay: Bool = false
   ) -> Bool {
     guard privacy.settingsReadable,
           AXIsProcessTrusted(),
@@ -257,6 +258,9 @@ public enum ComputerScreenshot {
           let bundleId = app.bundleIdentifier,
           let focused = focusedWindowIdentity(processIdentifier: app.processIdentifier),
           privacy.permits(bundleId: bundleId, title: focused.title) else { return false }
+    if requiresMainDisplay && !isCapturableWindowFrame(focused.frame, on: CGDisplayBounds(CGMainDisplayID())) {
+      return false
+    }
     return exactFocusedWindowID(
       focused: focused,
       candidates: windowListIdentities(processIdentifier: app.processIdentifier)
@@ -305,9 +309,7 @@ public enum ComputerScreenshot {
         && $0.owningApplication?.processID == app.processIdentifier
         && $0.title == focused.title
         && framesReferToSameWindow($0.frame, focused.frame)
-        && $0.frame.width >= 32
-        && $0.frame.height >= 32
-        && mainDisplay.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
+        && isCapturableWindowFrame($0.frame, on: mainDisplay.frame)
     }), privacy.permits(bundleId: window.owningApplication?.bundleIdentifier, title: window.title) else {
       throw ComputerScreenshotError.focusedWindowUnavailable
     }
@@ -385,6 +387,13 @@ public enum ComputerScreenshot {
   public static func imageToPointScale(imagePixelWidth: Int, windowPointWidth: Double) -> Double {
     guard imagePixelWidth > 0, windowPointWidth.isFinite, windowPointWidth > 0 else { return 1 }
     return windowPointWidth / Double(imagePixelWidth)
+  }
+
+  /// Match the primary-display restriction of coordinate input. A window on
+  /// another display can be focused and privacy-safe without being capturable.
+  public static func isCapturableWindowFrame(_ frame: CGRect, on mainDisplay: CGRect) -> Bool {
+    frame.width >= 32 && frame.height >= 32
+      && mainDisplay.contains(CGPoint(x: frame.midX, y: frame.midY))
   }
 
   /// Resolve one—and only one—window number from the AX focused identity. This
