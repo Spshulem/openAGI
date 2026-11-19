@@ -58,6 +58,14 @@ struct ModelSettingsView: View {
 
     private var choices: [(id: String, label: String)] {
         var list = [("auto", "Automatic"), ("anthropic", "Claude"), ("openai", "OpenAI"), ("chatgpt", "ChatGPT")]
+        if !model.isOnPhone {
+            if settings?.providers.claudeCli?.available == true {
+                list.append(("claude-cli", "Claude Account (Pass-Through)"))
+            }
+            if settings?.providers.codexCli?.available == true {
+                list.append(("codex-cli", "Codex Account (Pass-Through)"))
+            }
+        }
         if model.isOnPhone { list.append(("on-device", "Apple Intelligence")) }
         return list
     }
@@ -108,6 +116,28 @@ struct ModelSettingsView: View {
                         } footer: {
                             Text("To sign in with ChatGPT, open OpenAGI's setup page on your Mac.")
                         }
+                    }
+                }
+
+                if !model.isOnPhone,
+                   (settings.providers.claudeCli?.available == true || settings.providers.codexCli?.available == true) {
+                    Section {
+                        if let claudeCli = settings.providers.claudeCli, claudeCli.available {
+                            LabeledContent("Claude Account", value: claudeCli.model ?? "claude-sonnet-4-6")
+                            Button("Use Claude Account (Pass-Through)") {
+                                Task { await save(ModelSettingsUpdate(preference: "claude-cli")) }
+                            }
+                        }
+                        if let codexCli = settings.providers.codexCli, codexCli.available {
+                            LabeledContent("Codex Account", value: codexCli.model ?? "gpt-5.4")
+                            Button("Use Codex Account (Pass-Through)") {
+                                Task { await save(ModelSettingsUpdate(preference: "codex-cli")) }
+                            }
+                        }
+                    } header: {
+                        Text("Host Accounts (Pass-Through)")
+                    } footer: {
+                        Text("Runs turns through your paired Mac or server's signed-in Claude Code or Codex account without billing API credits.")
                     }
                 }
 
@@ -188,7 +218,9 @@ struct ModelSettingsView: View {
         let name: String
         switch settings.active.provider {
         case "anthropic": name = "Claude"
+        case "claude-cli": name = "Claude Account"
         case "openai": name = "OpenAI"
+        case "codex-cli": name = "Codex Account"
         case "chatgpt": name = "ChatGPT"
         case "on-device": return "This iPhone's model"
         case "none", nil: return "No model set up"

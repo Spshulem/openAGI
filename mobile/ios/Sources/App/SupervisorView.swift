@@ -8,9 +8,17 @@ import SupervisorChannelsKit
 // preferences, and a Scrutinizer autonomy banner with 1-tap veto.
 struct SupervisorView: View {
     var showsInlineChat = true
+    var navigationTitle: String = "Supervisor chat"
+    var externalScrollToMessageID: UUID? = nil
+    var onExternalScrollConsumed: () -> Void = {}
+    var onOpenConversations: (() -> Void)? = nil
+    var onOpenModel: (() -> Void)? = nil
+    var onOpenSettings: (() -> Void)? = nil
     @Environment(AppModel.self) private var model
 
     @State private var state: FleetState?
+    @State private var modelSettings: ModelSettings?
+    @State private var isSwitchingModel = false
     @State private var loadError: DaemonError?
     @State private var lastLoadFailed = false
     @State private var scanning = false
@@ -137,23 +145,42 @@ struct SupervisorView: View {
         NavigationStack {
             ChatConversationView(
                 conversation: conversation,
-                title: "Supervisor",
-                scrollToMessageID: selectedMessage,
+                title: navigationTitle,
+                scrollToMessageID: selectedMessage ?? externalScrollToMessageID,
                 placeholder: focusedPlaceholder,
                 emptyDetail: "One project manager across your coding agents. Review decisions below, route a bug, or ask about any repo.",
                 topAccessory: AnyView(topBannerStack),
                 composerAccessory: { focused in AnyView(deckAccessory(composerFocused: focused)) },
-                onHistorySelectionConsumed: { selectedMessage = nil }
+                onHistorySelectionConsumed: {
+                    selectedMessage = nil
+                    onExternalScrollConsumed()
+                }
             )
             .id(conversation.identity)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     activeSessionsPill
+                    Button("Conversations", systemImage: "text.bubble") {
+                        if let onOpenConversations {
+                            onOpenConversations()
+                        } else {
+                            browserThread = .supervisor
+                            activeSheet = .conversations
+                        }
+                    }
+                    .accessibilityIdentifier("chat-conversations")
+                    if let onOpenModel {
+                        Button("Model", systemImage: "cpu", action: onOpenModel)
+                            .accessibilityIdentifier("chat-model")
+                    }
                     overflowMenu
                 }
             }
         }
         .task(id: model.fleetGeneration) { await refresh() }
+        .onChange(of: model.requestedFocusCardID, initial: true) { _, cardID in
+            applyRequestedFocus(cardID)
+        }
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(state?.running == true ? 5 : 25))
@@ -382,10 +409,18 @@ struct SupervisorView: View {
             Divider()
 
             Button("Conversations", systemImage: "text.bubble") {
-                browserThread = .supervisor
-                activeSheet = .conversations
+                if let onOpenConversations {
+                    onOpenConversations()
+                } else {
+                    browserThread = .supervisor
+                    activeSheet = .conversations
+                }
             }
             .accessibilityIdentifier("supervisor-conversations")
+
+            if let onOpenSettings {
+                Button("Settings", systemImage: "gearshape", action: onOpenSettings)
+            }
         } label: {
             Label("Supervisor options", systemImage: "ellipsis")
         }
@@ -457,14 +492,14 @@ struct SupervisorView: View {
                 .padding(.horizontal, Theme.gutter)
                 .padding(.vertical, 4)
             }
-            if channelSummaries.count > 1 {
+            if state != nil || modelSettings != nil {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         Button {
                             selectedProjectChannel = nil
                             selectedCardIndex = 0
                         } label: {
-                            Text("All (\(cards.count))")
+                            Text(cards.isEmpty ? "#general" : "#general · \(cards.count)")
                                 .font(Theme.Typography.caption.weight(.semibold))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 5)
@@ -475,6 +510,22 @@ struct SupervisorView: View {
                                 .foregroundStyle(selectedProjectChannel == nil ? Theme.canvas : Theme.ink)
                         }
                         .buttonStyle(.plain)
+
+                        if let sessionsTotal = state?.activeSummary?.total ?? state?.snapshot?.threads.count, sessionsTotal > 0 {
+                            Button {
+                                activeSheet = .sessions
+                            } label: {
+                                Text("#sessions · \(sessionsTotal)")
+                                    .font(Theme.Typography.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Theme.surface, in: Capsule())
+                                    .foregroundStyle(Theme.ink)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        quickModelMenuPill
 
                         ForEach(channelSummaries) { ch in
                             let projName: String = {
@@ -501,6 +552,89 @@ struct SupervisorView: View {
                 }
                 .accessibilityIdentifier("supervisor-project-channels")
             }
+        }
+    }
+
+    @ViewBuilder
+    private var quickModelMenuPill: some View {
+        let activeLabel: String = {
+            if isSwitchingModel { return "Switching…" }
+            switch modelSettings?.active.provider {
+            case "claude-cli": return "Claude CLI"
+            case "codex-cli": return "Codex CLI"
+            case "chatgpt": return "ChatGPT Plan"
+            case "anthropic": return modelSettings?.active.model ?? "Claude"
+            case "openai": return modelSettings?.active.model ?? "OpenAI"
+            default: return modelSettings?.active.model ?? "Model"
+            }
+        }()
+        Menu {
+            if modelSettings?.providers.claudeCli?.available == true {
+                Button {
+                    Task { await selectModelPreference(preference: "claude-cli", claudeCliModel: "claude-sonnet-4-6") }
+                } label: {
+                    modelMenuRow("Claude Account (Pass-Through)", selected: modelSettings?.active.provider == "claude-cli")
+                }
+            }
+            if modelSettings?.providers.codexCli?.available == true {
+                Button {
+                    Task { await selectModelPreference(preference: "codex-cli", codexCliModel: "gpt-5.4") }
+                } label: {
+                    modelMenuRow("Codex Account (Pass-Through)", selected: modelSettings?.active.provider == "codex-cli")
+                }
+            }
+            if modelSettings?.providers.chatgpt?.signedIn == true {
+                Button {
+                    Task { await selectModelPreference(preference: "chatgpt") }
+                } label: {
+                    modelMenuRow("ChatGPT Plan", selected: modelSettings?.active.provider == "chatgpt")
+                }
+            }
+            if modelSettings?.providers.openai.configured == true {
+                Section("OpenAI API") {
+                    ForEach(["gpt-6.2-sol", "gpt-6.1-sol", "gpt-5.4"], id: \.self) { mId in
+                        Button {
+                            Task { await selectModelPreference(preference: "openai", openaiModel: mId) }
+                        } label: {
+                            modelMenuRow(mId, selected: modelSettings?.active.provider == "openai" && modelSettings?.active.model == mId)
+                        }
+                    }
+                }
+            }
+            if modelSettings?.providers.anthropic.configured == true {
+                Button {
+                    Task { await selectModelPreference(preference: "anthropic", anthropicModel: "claude-sonnet-4-6") }
+                } label: {
+                    modelMenuRow("Claude API (Sonnet 4.6)", selected: modelSettings?.active.provider == "anthropic")
+                }
+            }
+            if let onOpenModel {
+                Divider()
+                Button("Model & Keys Settings…", systemImage: "slider.horizontal.3", action: onOpenModel)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "sparkles")
+                    .font(.caption2)
+                Text(activeLabel)
+                    .font(Theme.Typography.caption.weight(.semibold))
+                Image(systemName: "chevron.down")
+                    .font(.caption2)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Theme.live.opacity(0.14), in: Capsule())
+            .foregroundStyle(Theme.live)
+        }
+        .accessibilityIdentifier("supervisor-quick-model-pill")
+    }
+
+    @ViewBuilder
+    private func modelMenuRow(_ label: String, selected: Bool) -> some View {
+        if selected {
+            Label(label, systemImage: "checkmark")
+        } else {
+            Text(label)
         }
     }
 
@@ -655,6 +789,17 @@ struct SupervisorView: View {
         loadError = nil
         lastLoadFailed = false
         syncFocusedCard()
+        applyRequestedFocus(model.requestedFocusCardID)
+    }
+
+    private func applyRequestedFocus(_ cardID: String?) {
+        guard let cardID, !cardID.isEmpty else { return }
+        guard let idx = cards.firstIndex(where: { $0.id == cardID }) else { return }
+        selectedProjectChannel = nil
+        selectedCardIndex = idx
+        clearedFocusCardID = nil
+        conversation.focusedCardID = cards[idx].id
+        model.requestedFocusCardID = nil
     }
 
     private func reject(_ sequence: Int, _ error: DaemonError) {
@@ -671,6 +816,7 @@ struct SupervisorView: View {
 
     private func refresh() async {
         let sequence = nextSequence()
+        async let freshModelSettings = try? model.client.modelSettings()
         do {
             let fresh = try await model.client.fleetState()
             accept(sequence, fresh)
@@ -678,6 +824,36 @@ struct SupervisorView: View {
             reject(sequence, error)
         } catch {
             reject(sequence, .transport(error))
+        }
+        if let updatedModels = await freshModelSettings {
+            modelSettings = updatedModels
+        }
+    }
+
+    private func selectModelPreference(
+        preference: String,
+        anthropicModel: String? = nil,
+        openaiModel: String? = nil,
+        claudeCliModel: String? = nil,
+        codexCliModel: String? = nil
+    ) async {
+        guard !isSwitchingModel else { return }
+        isSwitchingModel = true
+        defer { isSwitchingModel = false }
+        let update = ModelSettingsUpdate(
+            preference: preference,
+            anthropicModel: anthropicModel,
+            openaiModel: openaiModel,
+            claudeCliModel: claudeCliModel,
+            codexCliModel: codexCliModel
+        )
+        do {
+            modelSettings = try await model.client.updateModelSettings(update)
+            statusNote = nil
+        } catch let error as DaemonError {
+            statusNote = SupervisorFormat.failureNote(error)
+        } catch {
+            statusNote = .init(text: "Couldn't switch models.", isAlert: true)
         }
     }
 

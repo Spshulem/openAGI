@@ -2,6 +2,7 @@ import SwiftUI
 
 struct InboxView: View {
     @Environment(AppModel.self) private var model
+    @State private var fleetCards: [SupervisorCard] = []
     private var pendingActions: [PendingAction] { model.workspace.pendingActions ?? [] }
     private var pendingActionsError: String? { model.pendingActionsError }
     private var clarifications: [Clarification] { model.workspace.clarifications ?? [] }
@@ -15,6 +16,23 @@ struct InboxView: View {
                 Section { AgentConnectionRow() }
                 if !hasLoaded && isLoading {
                     ProgressView("Loading inbox…").frame(maxWidth: .infinity)
+                }
+                if !fleetCards.isEmpty {
+                    Section("Coding Fleet · Needs You") {
+                        ForEach(fleetCards) { card in
+                            Button {
+                                model.requestedFocusCardID = card.id
+                                model.requestedChatThread = .supervisor
+                                model.selectedTab = .chat
+                            } label: {
+                                inboxRow(
+                                    title: card.headline,
+                                    secondary: [card.project, card.kindLabel, card.prRef].compactMap { $0 }.joined(separator: " · ")
+                                )
+                            }
+                            .accessibilityIdentifier("inbox-fleet-\(card.id)")
+                        }
+                    }
                 }
                 if isEverythingEmpty {
                     ContentUnavailableView("Nothing waiting on you", systemImage: "tray",
@@ -56,7 +74,7 @@ struct InboxView: View {
     }
 
     private var isEverythingEmpty: Bool {
-        pendingActions.isEmpty && clarifications.isEmpty
+        fleetCards.isEmpty && pendingActions.isEmpty && clarifications.isEmpty
             && pendingActionsError == nil && clarificationsError == nil
             && hasLoaded && !isLoading
     }
@@ -77,5 +95,12 @@ struct InboxView: View {
 
     private func load(force: Bool = false) async {
         await model.refreshInbox(force: force)
+        if !model.isOnPhone && !ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+            if let fleet = try? await model.client.fleetState() {
+                fleetCards = SupervisorFormat.resolvedCards(fleet)
+            }
+        } else {
+            fleetCards = []
+        }
     }
 }

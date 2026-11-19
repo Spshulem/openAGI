@@ -165,10 +165,10 @@ final class NativeNavigationTests: XCTestCase {
             capture("native-supporting-chat", app: app)
             // The tabs must not move when a tab with the supporting chat gives
             // way to one without it (the rail jumped to the hinge on a Duo).
-            let withPane = tabButton(app, "Supervisor").frame
+            let withPane = tabButton(app, "Inbox").frame
             tab(app, "Chat")
             XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
-            let withoutPane = tabButton(app, "Supervisor").frame
+            let withoutPane = tabButton(app, "Inbox").frame
             XCTAssertEqual(withPane.midX, withoutPane.midX, accuracy: 1, "The tabs stay put across tabs")
             XCTAssertEqual(withPane.midY, withoutPane.midY, accuracy: 1, "The tabs stay put across tabs")
             tab(app, "Tasks")
@@ -263,7 +263,9 @@ final class NativeNavigationTests: XCTestCase {
 
     func testQuestionOpensReadOnlyThreadActivityWithoutSubmittingAnAnswer() {
         let app = launch()
-        tab(app, "Supervisor")
+        tab(app, "Chat")
+        tap(app, "chat-conversations")
+        tap(app, "conversation-supervisor")
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 10))
         XCTAssertFalse(app.buttons["yes"].exists, "Read the full context before a thread decision")
         XCTAssertFalse(app.buttons["no"].exists)
@@ -545,13 +547,9 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Chat")
         for thread in ["agent", "supervisor"] {
             if thread == "supervisor" {
-                tab(app, "Supervisor")
-                let composer = element(app, "chat-composer")
-                if !composer.exists || !composer.isHittable {
-                    let ask = app.buttons["Ask supervisor"].firstMatch
-                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
-                    ask.tap()
-                }
+                tap(app, "chat-conversations")
+                tap(app, "conversation-supervisor")
+                XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 5))
             }
             tap(app, "chat-attach")
             XCTAssertTrue(app.buttons["Photo Library"].exists)
@@ -577,13 +575,9 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Chat")
         for thread in ["agent", "supervisor"] {
             if thread == "supervisor" {
-                tab(app, "Supervisor")
-                let composer = element(app, "chat-composer")
-                if !composer.exists || !composer.isHittable {
-                    let ask = app.buttons["Ask supervisor"].firstMatch
-                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
-                    ask.tap()
-                }
+                tap(app, "chat-conversations")
+                tap(app, "conversation-supervisor")
+                XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 5))
             }
             tap(app, "chat-attach")
             app.buttons["Photo Library"].tap()

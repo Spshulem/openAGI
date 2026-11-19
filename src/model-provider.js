@@ -5,6 +5,7 @@ import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputToke
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
+import { ClaudeCliProvider, CodexCliProvider } from "./cli-subscription-providers.js";
 import { isMobileProfile } from "./mobile-profile.js";
 import { LocalModelProvider } from "./local-model-provider.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
@@ -768,7 +769,7 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | chatgpt | local | on-device | auto (default).
+  // Explicit preference wins. anthropic | claude-cli | openai | chatgpt | codex-cli | local | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
   // Phone-only mode (the daemon inside the phone app): with nothing
   // configured the agent thinks with the phone's own model, and a cloud model
@@ -781,6 +782,14 @@ export function createModelProvider(options = {}) {
   if (preference === "on-device") return onDevice();
   if (preference === "openai" && openai.isConfigured()) return cloud(openai);
   if (preference === "anthropic" && anthropic.isConfigured()) return cloud(anthropic);
+  if (preference === "claude-cli") {
+    const claudeCli = new ClaudeCliProvider({ ...(options.claudeCli ?? {}) });
+    if (claudeCli.isConfigured()) return cloud(claudeCli);
+  }
+  if (preference === "codex-cli") {
+    const codexCli = new CodexCliProvider({ ...(options.codexCli ?? {}) });
+    if (codexCli.isConfigured()) return cloud(codexCli);
+  }
   // Sign in with ChatGPT: billed to the owner's plan, so no budget guard.
   const chatgpt = new ChatGPTPlanProvider({ ...(options.chatgpt ?? {}) });
   if (preference === "chatgpt" && chatgpt.isConfigured()) return cloud(chatgpt);
@@ -1208,6 +1217,8 @@ function parseSseJson(data) {
   try { return JSON.parse(data); }
   catch { return null; }
 }
+
+export { ClaudeCliProvider, CodexCliProvider };
 
 async function maybeInvoke(toolRegistry, name, args, context) {
   if (!toolRegistry?.invoke) return null;

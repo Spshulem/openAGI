@@ -104,6 +104,7 @@ struct SupervisorWorkspaceView: View {
   @State private var composerStatusNote: String? = nil
   @State private var isDropTargeted = false
   @State private var inlineChatOpen = false
+  @State private var showAttachPopover = false
   @State private var newTaskTitle = ""
   @FocusState private var composerFocused: Bool
 
@@ -360,21 +361,95 @@ struct SupervisorWorkspaceView: View {
       .help("Jump to Needs You or active sessions")
 
       Menu {
-        ForEach(MacModelOption.curatedOpenAI) { option in
-          Button {
-            Task { await supervisor.selectOpenAIModel(option.id) }
-          } label: {
-            if supervisor.activeModelId == option.id {
-              Label(option.label, systemImage: "checkmark")
-            } else {
-              Text(option.label)
+        if supervisor.claudeCliAvailable || supervisor.codexCliAvailable || supervisor.chatgptSignedIn {
+          Section("Accounts (Pass-Through)") {
+            if supervisor.claudeCliAvailable {
+              ForEach(MacModelOption.curatedClaude) { option in
+                Button {
+                  Task {
+                    await supervisor.selectModelPreference(
+                      preference: "claude-cli",
+                      modelField: "claudeCliModel",
+                      modelId: option.id
+                    )
+                  }
+                } label: {
+                  if supervisor.activeProvider == "claude-cli" && supervisor.activeModelId == option.id {
+                    Label("Claude Account · \(option.label)", systemImage: "checkmark")
+                  } else {
+                    Text("Claude Account · \(option.label)")
+                  }
+                }
+              }
+            }
+            if supervisor.codexCliAvailable {
+              Button {
+                Task {
+                  await supervisor.selectModelPreference(
+                    preference: "codex-cli",
+                    modelField: "codexCliModel",
+                    modelId: "gpt-5.4"
+                  )
+                }
+              } label: {
+                if supervisor.activeProvider == "codex-cli" {
+                  Label("Codex Account · GPT-5.4", systemImage: "checkmark")
+                } else {
+                  Text("Codex Account · GPT-5.4")
+                }
+              }
+            }
+            if supervisor.chatgptSignedIn {
+              Button {
+                Task { await supervisor.selectModelPreference(preference: "chatgpt") }
+              } label: {
+                if supervisor.activeProvider == "chatgpt" {
+                  Label("ChatGPT Plan", systemImage: "checkmark")
+                } else {
+                  Text("ChatGPT Plan")
+                }
+              }
+            }
+          }
+        }
+        Section("OpenAI API") {
+          ForEach(MacModelOption.curatedOpenAI) { option in
+            Button {
+              Task { await supervisor.selectOpenAIModel(option.id) }
+            } label: {
+              if supervisor.activeProvider == "openai" && supervisor.activeModelId == option.id {
+                Label(option.label, systemImage: "checkmark")
+              } else {
+                Text(option.label)
+              }
+            }
+          }
+        }
+        if supervisor.anthropicConfigured {
+          Section("Claude API") {
+            ForEach(MacModelOption.curatedClaude) { option in
+              Button {
+                Task {
+                  await supervisor.selectModelPreference(
+                    preference: "anthropic",
+                    modelField: "anthropicModel",
+                    modelId: option.id
+                  )
+                }
+              } label: {
+                if supervisor.activeProvider == "anthropic" && supervisor.activeModelId == option.id {
+                  Label(option.label, systemImage: "checkmark")
+                } else {
+                  Text(option.label)
+                }
+              }
             }
           }
         }
       } label: {
         Label(supervisor.isSwitchingModel ? "Switching…" : supervisor.activeModelLabel, systemImage: "cpu")
       }
-      .help("Select active Supervisor model")
+      .help("Select active Supervisor model or account pass-through")
 
       Button {
         Task { await fleet.scan() }
@@ -1331,35 +1406,60 @@ struct SupervisorWorkspaceView: View {
   private var floatingPillBar: some View {
     let trimmed = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
     let canSend = !supervisor.isSending && (!trimmed.isEmpty || !composerImages.isEmpty)
+    let isMultiline = composerText.contains("\n") || composerText.count > 72
 
-    return HStack(alignment: .bottom, spacing: 8) {
-      Menu {
-        Button("Photo or Screenshot…", systemImage: "photo.on.rectangle") {
-          composerStatusNote = nil
-          let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - composerImages.count))
-          appendAttachments(picked, to: &composerImages)
-        }
-        Button("Paste Image from Clipboard", systemImage: "doc.on.clipboard") {
-          let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - composerImages.count))
-          if pasted.isEmpty {
-            composerStatusNote = "Clipboard has no image to attach."
-          } else {
-            composerStatusNote = nil
-            appendAttachments(pasted, to: &composerImages)
-          }
-        }
+    return HStack(alignment: isMultiline ? .bottom : .center, spacing: 8) {
+      Button {
+        showAttachPopover.toggle()
       } label: {
         Image(systemName: "plus")
-          .font(.system(size: 16, weight: .semibold))
-          .foregroundStyle(composerImages.isEmpty ? WorkspaceTheme.muted : WorkspaceTheme.live)
-          .frame(width: 34, height: 34)
+          .font(.system(size: 15, weight: .semibold))
+          .foregroundStyle(composerImages.isEmpty ? WorkspaceTheme.ink.opacity(0.75) : WorkspaceTheme.live)
+          .frame(width: 32, height: 32)
+          .background(
+            (composerImages.isEmpty ? WorkspaceTheme.muted : WorkspaceTheme.live).opacity(0.14),
+            in: Circle()
+          )
           .contentShape(Circle())
       }
-      .menuStyle(.borderlessButton)
-      .menuIndicator(.hidden)
-      .fixedSize()
+      .buttonStyle(.plain)
       .disabled(supervisor.isSending || composerImages.count >= 4)
       .help("Attach or paste up to 4 images")
+      .popover(isPresented: $showAttachPopover, arrowEdge: .top) {
+        VStack(alignment: .leading, spacing: 4) {
+          Button {
+            showAttachPopover = false
+            composerStatusNote = nil
+            let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - composerImages.count))
+            appendAttachments(picked, to: &composerImages)
+          } label: {
+            Label("Photo or Screenshot…", systemImage: "photo.on.rectangle")
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(.horizontal, 10)
+              .padding(.vertical, 6)
+          }
+          .buttonStyle(.plain)
+
+          Button {
+            showAttachPopover = false
+            let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - composerImages.count))
+            if pasted.isEmpty {
+              composerStatusNote = "Clipboard has no image to attach."
+            } else {
+              composerStatusNote = nil
+              appendAttachments(pasted, to: &composerImages)
+            }
+          } label: {
+            Label("Paste Image from Clipboard", systemImage: "doc.on.clipboard")
+              .frame(maxWidth: .infinity, alignment: .leading)
+              .padding(.horizontal, 10)
+              .padding(.vertical, 6)
+          }
+          .buttonStyle(.plain)
+        }
+        .padding(6)
+        .frame(width: 230)
+      }
 
       TextField(composerPlaceholder, text: $composerText, axis: .vertical)
         .textFieldStyle(.plain)

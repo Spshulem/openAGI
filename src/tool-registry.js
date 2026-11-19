@@ -1,7 +1,13 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { describeSchedule, parseScheduleDays, scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
-import { intentCovers, isOwnerPrincipal, isSupervisorActionableDirective } from "./owner-authority.js";
+import {
+  intentCovers,
+  isConversationalAssentOrChoice,
+  isOwnerPrincipal,
+  isSupervisorActionableDirective
+} from "./owner-authority.js";
+import { evaluateOwnerIntentClarityWithDecisions } from "./fleet/decisions-gate.js";
 import { argsDigest } from "./pending-actions.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
@@ -293,11 +299,43 @@ export class ToolRegistry {
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
-    const autoApproved = turn.supervisorAutoApprove === true
+    const prevAssistant = typeof turn.previousAssistantText === "string" ? turn.previousAssistantText : "";
+    const conversationalCover = (
+      tool.supervisorAutoApprove === true
+      || intentCovers("approve", tool.name)
+      || tool.name === "fleet_send_message"
+      || tool.name === "reply_to_coding_agent"
+    ) && isConversationalAssentOrChoice(turn.intent ?? "", prevAssistant);
+    const autoApproved = (
+      turn.supervisorAutoApprove === true
       && tool.supervisorAutoApprove === true
-      && isSupervisorActionableDirective(turn.intent ?? "");
-    const tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
+      && isSupervisorActionableDirective(turn.intent ?? "", { previousAssistantText: prevAssistant })
+    ) || conversationalCover;
+    let tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
     const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
+    let approvedBy = `owner:${owner.via}`;
+    if (
+      tainted
+      && !insist
+      && String(process.env.OPENAGI_DECISIONS_OWNER_INTENT ?? "").trim().toLowerCase() !== "off"
+    ) {
+      const decisionsCfg = context?.runtime?.fleetSupervisor?.config?.decisions ?? {};
+      const decisionsKey = String(decisionsCfg.apiKey ?? process.env.OPENAI_API_KEY ?? "").trim();
+      const clarity = await evaluateOwnerIntentClarityWithDecisions({
+        ownerIntent: turn.intent ?? "",
+        previousAssistantText: prevAssistant,
+        toolName: tool.name,
+        actionSummary: summary,
+        apiKey: decisionsKey,
+        url: decisionsCfg.url,
+        model: decisionsCfg.model,
+        fetchImpl: context?.decisionsFetch ?? decisionsCfg.fetchImpl ?? globalThis.fetch
+      });
+      if (clarity.ok && clarity.clear) {
+        tainted = false;
+        approvedBy = `owner:${owner.via}:decisions`;
+      }
+    }
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({
@@ -319,7 +357,7 @@ export class ToolRegistry {
     }
     const claim = this.pendingActions.recordOwnerApproved({
       toolName: tool.name, args, context, summary, reason: context.__reason ?? null,
-      dedupeKey: chatKey, approvedBy: `owner:${owner.via}`
+      dedupeKey: chatKey, approvedBy
     });
     if (!claim) return { ok: false, error: "Could not record the owner's approval; nothing was run." };
     // The owner's instruction runs what an earlier code card in this chat
@@ -338,11 +376,11 @@ export class ToolRegistry {
       __turn: turn,
       __confirmed: true,
       __confirmationActionId: claim.action.id,
-      __approvedBy: `owner:${owner.via}`
+      __approvedBy: approvedBy
     });
     this.pendingActions.decide(claim.action.id, {
       decision: "approve",
-      decidedBy: `owner:${owner.via}`,
+      decidedBy: approvedBy,
       result: outcome.ok ? outcome.result : null,
       error: outcome.ok ? null : outcome.error,
       executionId: claim.executionId

@@ -272,6 +272,9 @@ export class AgentHost {
       || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
       || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
     const isSupervisorThread = metadata.thread === "supervisor" || agent?.id === "supervisor";
+    const lastAssistantMsg = sessionBefore.messages
+      .slice(0, -1)
+      .findLast((m) => m?.role === "assistant" && typeof m?.content === "string");
     const supervisorAutoApprove = Boolean(
       principal
       && isSupervisorThread
@@ -281,6 +284,7 @@ export class AgentHost {
       ? {
           untrusted: contextUntrusted,
           intent: ownerIntentText(text),
+          previousAssistantText: lastAssistantMsg ? String(lastAssistantMsg.content).slice(-1200) : "",
           ...(supervisorAutoApprove ? { supervisorAutoApprove: true } : {}),
         }
       : null;

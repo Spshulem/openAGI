@@ -34,6 +34,7 @@ import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js"
 import { applyPersona, personaPath } from "./persona.js";
 import { deleteSkill, listSkills, readSkill, writeSkill } from "./skill-files.js";
 import { handleChatGPTAuthRoute, onChatGPTSignedOut, status as chatgptStatus } from "./chatgpt-auth.js";
+import { claudeCliStatus, codexCliStatus } from "./cli-subscription-providers.js";
 import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
@@ -153,7 +154,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         openai: { configured: Boolean(process.env.OPENAI_API_KEY), model: process.env.OPENAI_MODEL ?? null },
         onDevice: { available: isMobileProfile() || process.platform === "darwin", connected: Boolean(deviceModelHub.connected && deviceModelHub.info && deviceModelHub.info.model !== "unavailable") },
         local: { configured: Boolean(process.env.OPENAGI_LOCAL_MODEL), model: process.env.OPENAGI_LOCAL_MODEL ?? null, baseUrl: process.env.OPENAGI_LOCAL_BASE_URL ?? "http://localhost:11434/v1" },
-        chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })()
+        chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })(),
+        claudeCli: claudeCliStatus(),
+        codexCli: codexCliStatus()
       }
     };
   };
@@ -1131,7 +1134,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req);
         if (body.setupModel === true) {
           const choice = body.OPENAGI_PROVIDER;
-          if (!["anthropic", "openai", "local", "on-device", "chatgpt"].includes(choice)) {
+          if (!["anthropic", "claude-cli", "openai", "chatgpt", "codex-cli", "local", "on-device"].includes(choice)) {
             return sendJson(res, 400, { error: "Choose a model provider." });
           }
           const required = { anthropic: "ANTHROPIC_API_KEY", openai: "OPENAI_API_KEY", local: "OPENAGI_LOCAL_MODEL" }[choice];
@@ -1147,7 +1150,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         try {
           const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|OPENAGI_LOCAL_)/.test(key))) {
+          if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|CLAUDE_CLI_|CODEX_CLI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
           }
         } catch { /* swallow */ }
@@ -1169,7 +1172,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         let provider = runtime.agentHost?.modelProvider;
         const preference = (body.setupModel === true ? String(body.OPENAGI_PROVIDER || "") : process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
         if (body.setupModel === true) {
-          if (!["anthropic", "openai", "local", "on-device", "chatgpt"].includes(preference)) {
+          if (!["anthropic", "claude-cli", "openai", "chatgpt", "codex-cli", "local", "on-device"].includes(preference)) {
             return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
           }
           const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
@@ -2568,11 +2571,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             take("openaiKey", "OPENAI_API_KEY", 400);
             take("anthropicModel", "ANTHROPIC_MODEL", 120);
             take("openaiModel", "OPENAI_MODEL", 120);
+            take("claudeCliModel", "CLAUDE_CLI_MODEL", 120);
+            take("codexCliModel", "CODEX_CLI_MODEL", 120);
           } catch (error) {
             return sendJson(res, 400, { error: "invalid_field", field: error.message });
           }
           if (preference) values.OPENAGI_PROVIDER = preference;
-          const CLEARABLE = { anthropicKey: "ANTHROPIC_API_KEY", openaiKey: "OPENAI_API_KEY", anthropicModel: "ANTHROPIC_MODEL", openaiModel: "OPENAI_MODEL" };
+          const CLEARABLE = {
+            anthropicKey: "ANTHROPIC_API_KEY",
+            openaiKey: "OPENAI_API_KEY",
+            anthropicModel: "ANTHROPIC_MODEL",
+            openaiModel: "OPENAI_MODEL",
+            claudeCliModel: "CLAUDE_CLI_MODEL",
+            codexCliModel: "CODEX_CLI_MODEL"
+          };
           const clear = (Array.isArray(body.clear) ? body.clear : []).map((name) => CLEARABLE[name]).filter(Boolean);
           saveEnv({ dataDir, values, clear });
           await rebuildModelProvider();
@@ -2605,15 +2617,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           preference: process.env.OPENAGI_PROVIDER ?? "auto",
           available: {
             anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
-            openai: Boolean(process.env.OPENAI_API_KEY)
+            claudeCli: claudeCliStatus().available,
+            openai: Boolean(process.env.OPENAI_API_KEY),
+            codexCli: codexCliStatus().available
           }
         });
       }
       if (method === "POST" && pathname === "/admin/provider") {
         const body = await readJson(req);
         const choice = String(body.preference ?? "").toLowerCase();
-        if (!["auto", "anthropic", "openai"].includes(choice)) {
-          return sendJson(res, 400, { error: "preference must be one of: auto, anthropic, openai" });
+        if (!["auto", "anthropic", "claude-cli", "openai", "chatgpt", "codex-cli"].includes(choice)) {
+          return sendJson(res, 400, { error: "preference must be one of: auto, anthropic, claude-cli, openai, chatgpt, codex-cli" });
         }
         process.env.OPENAGI_PROVIDER = choice;
         try {
@@ -4766,13 +4780,15 @@ function readJson(req) {
   });
 }
 
-const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "chatgpt", "on-device", "local"];
+const MODEL_PREFERENCES = ["auto", "anthropic", "claude-cli", "openai", "chatgpt", "codex-cli", "on-device", "local"];
 const MIRROR_BODY_LIMIT = 6 * 1024 * 1024;
 
 function providerKind(provider) {
   const name = provider?.constructor?.name ?? "";
   if (name === "AnthropicProvider") return "anthropic";
+  if (name === "ClaudeCliProvider") return "claude-cli";
   if (name === "OpenAIResponsesProvider") return "openai";
+  if (name === "CodexCliProvider") return "codex-cli";
   if (name === "LocalModelProvider") return "local";
   if (name === "OnDeviceModelProvider") return "on-device";
   if (name === "ChatGPTPlanProvider") return "chatgpt";

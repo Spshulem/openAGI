@@ -10,6 +10,7 @@ struct ChatView: View {
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var thread: ConversationThread = .agent
+    @State private var didResolveInitialThread = false
     @State private var destination: ChatSheet?
     @State private var selectedMessage: UUID?
     var onClose: (() -> Void)? = nil
@@ -53,6 +54,28 @@ struct ChatView: View {
             }
         }
         .task { await model.conversations.refresh() }
+        .onAppear {
+            if !didResolveInitialThread {
+                didResolveInitialThread = true
+                if let requested = model.requestedChatThread {
+                    thread = requested
+                    model.requestedChatThread = nil
+                } else if !ProcessInfo.processInfo.arguments.contains("--ui-testing") && !model.isOnPhone {
+                    thread = .supervisor
+                }
+            }
+        }
+        .onChange(of: model.requestedChatThread, initial: true) { _, requested in
+            guard let requested else { return }
+            didResolveInitialThread = true
+            thread = requested
+            model.requestedChatThread = nil
+        }
+        .onChange(of: model.isOnPhone) { _, isOnPhone in
+            if !didResolveInitialThread && !ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+                thread = isOnPhone ? .agent : .supervisor
+            }
+        }
     }
 
     // Unfolded like a book, the conversation list fills the leading page
@@ -69,8 +92,24 @@ struct ChatView: View {
                 }
                 .navigationSplitViewColumnWidth(min: page ?? 220, ideal: page ?? 270, max: page ?? 320)
             } detail: {
-                conversationNavigation
+                chatDetailView
             }
+        }
+    }
+
+    @ViewBuilder
+    private var chatDetailView: some View {
+        if thread == .supervisor && !model.isOnPhone && onClose == nil {
+            SupervisorView(
+                navigationTitle: "Supervisor chat",
+                externalScrollToMessageID: selectedMessage,
+                onExternalScrollConsumed: { selectedMessage = nil },
+                onOpenConversations: { destination = .conversations },
+                onOpenModel: { destination = .model },
+                onOpenSettings: { destination = .settings }
+            )
+        } else {
+            conversationNavigation
         }
     }
 

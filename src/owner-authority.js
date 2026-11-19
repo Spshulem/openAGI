@@ -65,7 +65,7 @@ const TO_RECIPIENT = String.raw`(?:${NAMED_RECIPIENT}|(?!${NOT_NAME})[\w-]+(?:['
 export const INTENT_FAMILIES = Object.freeze({
   approve: {
     pattern: [
-      String.raw`(?:click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer|defer|dismiss|skip|veto)\b`,
+      String.raw`(?:click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer|defer|dismiss|skip|veto|continue|proceed)\b`,
       String.raw`(?:merge|ship)\s+(?:it|this|that|all|every|green|ready|the\s+(?:pr|pull request|prs|pull requests|[\w-]+\s+one)|prs?\b|#\d+|and\s+deploy\b)`,
       String.raw`(?:batch|triage|clear|sweep)\b[^.!?\n]{0,80}?\b(?:cards?|prs?|pull requests?|questions?|approvals?|queue)\b`,
       String.raw`(?:go for it|go ahead|do (?:it|that)|looks (?:good|fine)|sounds (?:good|fine)|fine (?:with|by) me|works for me|lgtm|hold off|not yet|ping me less|make (?:this|that|it) (?:my )?(?:default|automatic)|keep current|(?:use\s+(?:the\s+)?)?recommended(?:\s+(?:one|option))?)\b`,
@@ -178,14 +178,44 @@ const SUPERVISOR_DIRECTIVE_RE = new RegExp(
   "i"
 );
 
+const PROPOSED_ACTION_RE =
+  /\?|\b(?:my recommendation|recommended|want me to|would you like|should i|shall i|continue,\s*inspect|or skip|reply with|choose one|option\s*[1-4a-d])\b/i;
+
+const CONVERSATIONAL_ASSENT_RE =
+  /^\s*(?:yes|yeah|yep|yup|sure|ok|okay|alright|continue|proceed|go ahead|do it|do that|sounds good|looks good|lgtm|skip(?:\s+it)?|defer(?:\s+it)?|next(?:\s+one)?|(?:the\s+)?(?:first|second|third)(?:\s+one)?|option\s*[1-4a-d]|[1-4])(?:\s*[.!])?(?:\s+(?:please|now|and\s+(?:continue|move\s+on|next)))?\s*$/i;
+
+const CONVERSATIONAL_REFUSAL_RE =
+  /\b(?:no|nope|don['’]?t|do not|wait|hold off|stop|cancel)\b/i;
+
+export function assistantProposedActionOrQuestion(previousAssistantText) {
+  const prev = String(previousAssistantText ?? "").trim();
+  if (!prev) return false;
+  return PROPOSED_ACTION_RE.test(prev);
+}
+
+// When the assistant just asked a clear question or recommended a concrete action
+// (e.g. "Continue, inspect the thread further, or skip?"), short owner replies
+// like "yes", "continue", "skip", or "option 1" count as clear authorization
+// without requiring a confirmation code.
+export function isConversationalAssentOrChoice(intent, previousAssistantText) {
+  const value = String(intent ?? "").trim();
+  if (!value || value.length > 120) return false;
+  if (!assistantProposedActionOrQuestion(previousAssistantText)) return false;
+  if (CONVERSATIONAL_REFUSAL_RE.test(value)) return false;
+  if (matchConfirmation(value)?.decision === "approve") return true;
+  return CONVERSATIONAL_ASSENT_RE.test(value);
+}
+
 // Principle-based Supervisor Auto-Approve check: allows natural owner directives
-// (including pronouns like "have them run that" or typos) in the Supervisor chat
-// while still blocking passive status queries ("what's going on?", "what did X say?")
-// from executing side-effecting tools on untrusted transcript reads.
-export function isSupervisorActionableDirective(intent) {
+// (including pronouns like "have them run that", conversational "yes" to a
+// question, or typos) in the Supervisor chat while still blocking passive
+// status queries ("what's going on?", "what did X say?") from executing
+// side-effecting tools on untrusted transcript reads.
+export function isSupervisorActionableDirective(intent, options = {}) {
   const value = String(intent ?? "").trim();
   if (!value) return false;
   if (intentFamilies(value).length > 0) return true;
+  if (isConversationalAssentOrChoice(value, options.previousAssistantText)) return true;
   return SUPERVISOR_DIRECTIVE_RE.test(value);
 }
 
