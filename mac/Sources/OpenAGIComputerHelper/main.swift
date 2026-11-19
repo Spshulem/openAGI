@@ -59,7 +59,7 @@ do {
     let accessibility = ComputerInput.accessibilityGranted
     let display = ComputerInput.displayAvailable
     let privacyReady = screenRecording && display && console && !locked
-      ? ComputerScreenshot.focusedWindowPrivacyReady()
+      ? ComputerScreenshot.focusedWindowPrivacyReady(requiresMainDisplay: true)
       : false
     let screen = screenRecording && display && console && !locked
     let input = accessibility && console && !locked && !secureInput
@@ -72,7 +72,7 @@ do {
     if !console { blockers.append("sign in to the active console session") }
     if locked { blockers.append("unlock the screen") }
     if secureInput { blockers.append("disable Secure Input") }
-    if screen && !privacyReady { blockers.append("focus a window allowed by Capture privacy settings") }
+    if screen && !privacyReady { blockers.append("focus a window on the main display that is allowed by Capture privacy settings") }
     try writeJSON([
       "screenRecording": screen,
       "capturePrerequisitesReady": screen,
@@ -94,7 +94,17 @@ do {
     exit(0)
   }
   if operation == "screenshot" {
-    let screenshot = try await ComputerScreenshot.captureFrontmostWindow()
+    let focusUnavailableExitCode: Int32 = 75 // EX_TEMPFAIL, read by runComputerHelper
+    let screenshot: ComputerScreenshotResult
+    do {
+      screenshot = try await ComputerScreenshot.captureFrontmostWindow()
+    } catch ComputerScreenshotError.focusedWindowUnavailable {
+      // EX_TEMPFAIL: no pixels or AX state were sent. The executor can safely
+      // request a fresh frame after the owner or agent restores eligible focus.
+      exit(focusUnavailableExitCode)
+    } catch ComputerScreenshotError.focusedWindowExcluded {
+      exit(focusUnavailableExitCode)
+    }
     let encoded = try JSONEncoder().encode(screenshot)
     FileHandle.standardOutput.write(encoded)
     FileHandle.standardOutput.write(Data("\n".utf8))

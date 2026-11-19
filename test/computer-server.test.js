@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createComputerExecutor, createComputerServer, runComputerHelper } from "../src/integrations/computer-server.js";
+import { createComputerExecutor, createComputerServer, runComputerHelper, SCREENSHOT_FOCUS_UNAVAILABLE } from "../src/integrations/computer-server.js";
 
 const FULL_INPUT_OPERATIONS = [
   "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste",
@@ -128,13 +128,33 @@ test("a privacy-excluded foreground window keeps app activation ready until scre
     goalHash: "a".repeat(64),
     allowedOperations: ["session.end", "screenshot", "list_apps", "activate_app"]
   });
-  await assert.rejects(() => action(computer, active, 1, "screenshot"), /privacy-excluded/);
+  await assert.rejects(() => action(computer, active, 1, "screenshot"), { code: SCREENSHOT_FOCUS_UNAVAILABLE });
   const apps = await action(computer, active, 2, "list_apps");
   assert.equal(apps.apps[0].bundleIdentifier, "com.example.Editor");
   await action(computer, active, 3, "activate_app", { bundleIdentifier: "com.example.Editor" });
   const shot = await action(computer, active, 4, "screenshot");
   assert.equal(typeof shot.frameId, "string");
   assert.deepEqual(calls, ["list_apps", "activate_app", "screenshot"]);
+});
+
+test("a refused screenshot consumes its sequence, invalidates old frames, and stays refused on replay", async () => {
+  let screenshotReady = true;
+  const computer = executor({
+    capabilityStatus: async () => ({ ...await ready(), screenshotReady, capturePrerequisitesReady: true }),
+    screenshot: async () => screenshotResult()
+  });
+  const active = await lease(computer);
+  const old = await action(computer, active, 1, "screenshot");
+  screenshotReady = false;
+  const refused = { code: SCREENSHOT_FOCUS_UNAVAILABLE, nodeSequenceConsumed: true };
+  await assert.rejects(() => action(computer, active, 2, "screenshot"), refused);
+  screenshotReady = true;
+  await assert.rejects(() => action(computer, active, 2, "screenshot"), refused);
+  await assert.rejects(() => action(computer, active, 3, "click", {
+    frameId: old.frameId, x: 5, y: 5, button: "left"
+  }), /unknown, stale, or expired/);
+  const fresh = await action(computer, active, 4, "screenshot");
+  assert.notEqual(fresh.frameId, old.frameId);
 });
 
 test("health rejects input-only nodes when capture prerequisites are missing", async () => {
