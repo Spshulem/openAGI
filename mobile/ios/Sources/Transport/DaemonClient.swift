@@ -541,19 +541,50 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetMutationResult.self, from: data)
     }
 
+    public func fleetSendMessage(threadKey: String, message: String,
+                                 images: [ChatAttachment] = []) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/send", method: "POST")
+        let encodedImages = Self.encodedFleetImages(images)
+        let effectiveMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !encodedImages.isEmpty
+            ? "Please inspect the attached image(s)."
+            : message
+        var body: [String: Any] = ["threadKey": threadKey, "message": effectiveMessage]
+        if !encodedImages.isEmpty { body["images"] = encodedImages }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
     public func fleetActCard(id: String, op: String, value: String? = nil,
-                             clarification: String? = nil, instructions: String? = nil) async throws -> FleetCardActResult {
+                             clarification: String? = nil, instructions: String? = nil,
+                             images: [ChatAttachment] = []) async throws -> FleetCardActResult {
         guard !id.isEmpty, !id.contains("/") else { throw DaemonError.malformedResponse }
         var request = try authorizedRequest(path: "/fleet/api/cards/\(id)/act", method: "POST")
         var body: [String: Any] = ["op": op]
         if let value { body["value"] = value }
         if let clarification { body["clarification"] = clarification }
         if let instructions { body["instructions"] = instructions }
+        let encodedImages = Self.encodedFleetImages(images)
+        if !encodedImages.isEmpty { body["images"] = encodedImages }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 200
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(FleetCardActResult.self, from: data)
+    }
+
+    private static func encodedFleetImages(_ images: [ChatAttachment]) -> [[String: Any]] {
+        images.compactMap { att in
+            guard let data = att.data, !data.isEmpty else { return nil }
+            return [
+                "id": att.id,
+                "name": att.name,
+                "mimeType": att.mimeType,
+                "data": data
+            ]
+        }
     }
 
     public func fleetBatchCards(op: String, filter: String? = nil) async throws -> FleetBatchCardsResult {

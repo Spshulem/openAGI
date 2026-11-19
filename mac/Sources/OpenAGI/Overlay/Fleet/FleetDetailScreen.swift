@@ -303,6 +303,20 @@ struct FleetReplyBox: View {
       case let .none(why):
         Text(why).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
       case .question, .thread:
+        let attachedCount = fleet.pendingReplyImages[item.key]?.count ?? 0
+        if attachedCount > 0 {
+          HStack(spacing: 6) {
+            Label("\(attachedCount) image\(attachedCount == 1 ? "" : "s") attached", systemImage: "photo.fill")
+              .font(.system(size: 10, weight: .medium))
+              .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            Button("Clear") {
+              fleet.pendingReplyImages[item.key] = nil
+            }
+            .buttonStyle(.borderless)
+            .font(.system(size: 10))
+          }
+        }
         TextField("Reply to the agent", text: Binding(
           get: { fleet.drafts[item.key] ?? "" },
           set: { fleet.setDraft($0, for: item) }
@@ -312,6 +326,31 @@ struct FleetReplyBox: View {
         .font(.system(size: 11))
         .disabled(sending)
         HStack(spacing: 6) {
+          Menu {
+            Button("Attach Image…", systemImage: "photo.on.rectangle") {
+              let existing = fleet.pendingReplyImages[item.key] ?? []
+              let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - existing.count))
+              if !picked.isEmpty {
+                fleet.pendingReplyImages[item.key] = Array((existing + picked.map(\.fleetPayload)).prefix(4))
+              }
+            }
+            Button("Paste Image from Clipboard", systemImage: "doc.on.clipboard") {
+              let existing = fleet.pendingReplyImages[item.key] ?? []
+              let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - existing.count))
+              if !pasted.isEmpty {
+                fleet.pendingReplyImages[item.key] = Array((existing + pasted.map(\.fleetPayload)).prefix(4))
+              }
+            }
+          } label: {
+            Image(systemName: "plus.circle")
+              .font(.system(size: 12))
+              .foregroundStyle(.secondary)
+          }
+          .menuStyle(.borderlessButton)
+          .menuIndicator(.hidden)
+          .fixedSize()
+          .disabled(sending || attachedCount >= 4)
+          .help("Attach or paste images")
           if risky {
             Text("Typed into the chat as you").font(.system(size: 10)).foregroundStyle(.orange)
           }
@@ -320,10 +359,15 @@ struct FleetReplyBox: View {
           }
           Spacer(minLength: 0)
           if sending { ProgressView().controlSize(.small) }
-          Button("Send") { Task { await fleet.sendReply(item) } }
+          Button("Send") {
+            if FleetReplyTarget.message(draft) == nil && attachedCount > 0 {
+              fleet.setDraft("Please inspect the attached image(s).", for: item)
+            }
+            Task { await fleet.sendReply(item) }
+          }
             .controlSize(.small)
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(sending || app.status == .down || FleetReplyTarget.message(draft) == nil)
+            .disabled(sending || app.status == .down || (FleetReplyTarget.message(draft) == nil && attachedCount == 0))
             .help("Send to the agent (⌘↩)")
         }
       }

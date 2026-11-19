@@ -2321,7 +2321,7 @@ export class FleetSupervisor {
     return { ...routed, dispatched: false, delivery: null };
   }
 
-  async actCard(cardId, { op = "primary", value = null, clarification = null, instructions = null, deadlineAt = null } = {}) {
+  async actCard(cardId, { op = "primary", value = null, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
 
@@ -2482,9 +2482,10 @@ export class FleetSupervisor {
     }
 
     if (effectiveOp === "reply") {
-      const replyText = String(effectiveValue ?? "").trim();
+      const hasImages = Array.isArray(images) && images.length > 0;
+      const replyText = String(effectiveValue ?? "").trim() || (hasImages ? "Please inspect the attached image(s)." : "");
       if (!replyText) return { ok: false, kind: "reply", status: "blocked", detail: "Enter a reply to send." };
-      if (canReplyTo(question)) {
+      if (!hasImages && canReplyTo(question)) {
         const replied = await this.replyQuestion(question.id, replyText, { deadlineAt });
         if (!replied) return { ok: false, kind: "reply", status: "closed", detail: "Question already closed." };
         return {
@@ -2497,7 +2498,7 @@ export class FleetSupervisor {
       }
       const targetKey = card?.threadKey ?? question.threadKey ?? null;
       if (!targetKey) return { ok: false, kind: "reply", status: "blocked", detail: "No coding session is linked to this card." };
-      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt });
+      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt, ...(hasImages ? { images } : {}) });
       const deliveredOk = sent?.delivery?.status === "sent";
       if (deliveredOk) {
         this.store.answerQuestion(question.id, replyText);

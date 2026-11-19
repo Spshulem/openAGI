@@ -208,18 +208,16 @@ export function registerFleetTools(registry, supervisor) {
     parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX } }, required: ["key"], additionalProperties: false },
     handler: (args) => fleetThread(supervisor, args) });
   if (typeof supervisor.sendOwnerMessage === "function") registry.register({ name: "fleet_send_message", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Send the owner's own message to one coding thread the supervisor watches (key from fleet_status or fleet_search). For Paseo sessions (`paseo:<serverId>.<agentId>`), any images attached to this Supervisor turn are automatically forwarded alongside the message unless `forwardImages: false` is set; for non-Paseo targets, images are not forwarded. Runs immediately on the owner's instruction when Auto-Approve is on. Write the message as the owner wants it sent. A blocked or failed delivery is NOT success; report the detail.",
-    parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX }, message: { type: "string", minLength: 1, maxLength: MESSAGE_MAX }, queue: { type: "boolean", description: "Conductor only: true queues it behind the chat's running background tasks (its Send button); default sends it now (⌘↩)." }, forwardImages: { type: "boolean", description: "Paseo only: forward images attached to this Supervisor turn (default true)." } }, required: ["key", "message"], additionalProperties: false },
+    description: "Send the owner's own message to one coding thread the supervisor watches (key from fleet_status or fleet_search). For Paseo sessions (`paseo:<serverId>.<agentId>`), images attached to this Supervisor turn are automatically forwarded alongside the message (unless `forwardImages: false`), and setting `attachRecentImages: true` attaches images from an earlier message in this Supervisor conversation (use when the owner asks to 'attach it' or send an earlier screenshot). Never claim you cannot attach images to Paseo sessions. Runs immediately on the owner's instruction when Auto-Approve is on. A blocked or failed delivery is NOT success; report the detail.",
+    parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX }, message: { type: "string", minLength: 1, maxLength: MESSAGE_MAX }, queue: { type: "boolean", description: "Conductor only: true queues it behind the chat's running background tasks (its Send button); default sends it now (⌘↩)." }, forwardImages: { type: "boolean", description: "Paseo only: forward images attached to this Supervisor turn (default true)." }, attachRecentImages: { type: "boolean", description: "Paseo only: attach image(s) from the owner's recent message in this conversation when none are attached on this exact turn (e.g. 'can you attach it?')." } }, required: ["key", "message"], additionalProperties: false },
     prepareApprovalArgs: (args) => fleetTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
     // One card per chat, thread and text: a repeated ask reuses it.
-    approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message, args.queue === true])}`,
+    approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message, args.queue === true, args.attachRecentImages === true])}`,
     summarize: (args) => `Send to ${args.name} (${args.key})${args.queue === true ? ", queued behind its background tasks" : ""}:\n${args.message}`,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
-      const images = args.forwardImages !== false && String(args.key ?? "").startsWith("paseo:") && Array.isArray(context?.__attachments) && context.__attachments.length > 0
-        ? context.__attachments
-        : null;
+      const images = String(args.key ?? "").startsWith("paseo:") ? resolveFleetTurnImages(args, context) : null;
       return deliveryReceipt(await supervisor.sendOwnerMessage(args.key, args.message, { queue: args.queue === true, ...(images ? { images } : {}) }));
     } });
   if (typeof supervisor.screenThread === "function") registry.register({ name: "fleet_screen", source: SOURCE, sideEffects: false, untrustedOutput: true,
@@ -394,18 +392,19 @@ export function registerFleetTools(registry, supervisor) {
         serverId: { type: "string", maxLength: 120 },
         title: { type: "string", maxLength: 120 },
         provider: { type: "string", maxLength: 80, description: "Optional provider ('codex', 'claude', or 'provider/model')" },
-        prompt: { type: "string", minLength: 1, maxLength: 4000 }
+        prompt: { type: "string", minLength: 1, maxLength: 4000 },
+        attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
       required: ["prompt"],
       additionalProperties: false
     },
     prepareApprovalArgs: (args) => fleetStartSessionTarget(args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.prompt])}`,
+    approvalDedupeKey: (args, context) => `fleet-start:${digest([context?.sessionId ?? null, args.workspace ?? null, args.cwd ?? null, args.serverId ?? null, args.prompt, args.attachRecentImages === true])}`,
     summarize: (args) => `Start Paseo session in ${args.targetLabel}${args.title ? ` ("${args.title}")` : ""}:\n${clip(args.prompt, 240)}`,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
-      const images = Array.isArray(context?.__attachments) && context.__attachments.length > 0 ? context.__attachments : null;
+      const images = resolveFleetTurnImages(args, context);
       return supervisor.startPaseoSession({
         workspace: args.workspace ?? null,
         cwd: args.cwd ?? null,
@@ -504,18 +503,19 @@ export function registerFleetTools(registry, supervisor) {
         targetKey: { type: "string", maxLength: KEY_MAX, description: "Optional explicit session key to route to" },
         serverId: { type: "string", maxLength: 120 },
         cwd: { type: "string", maxLength: 400 },
-        provider: { type: "string", maxLength: 80 }
+        provider: { type: "string", maxLength: 80 },
+        attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
       required: ["goal"],
       additionalProperties: false
     },
     prepareApprovalArgs: (args) => fleetDispatchGoalTarget(supervisor, args),
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.goal])}`,
+    approvalDedupeKey: (args, context) => `fleet-goal:${digest([context?.sessionId ?? null, args.pinnedAction, args.targetKey ?? null, args.project ?? null, args.serverId ?? null, args.cwd ?? null, args.provider ?? null, args.goal, args.attachRecentImages === true])}`,
     summarize: (args) => args.summaryLabel,
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
-      const images = Array.isArray(context?.__attachments) && context.__attachments.length > 0 ? context.__attachments : null;
+      const images = resolveFleetTurnImages(args, context);
       if (args.pinnedAction === "route_existing" && args.targetKey) {
         const res = await supervisor.dispatchGoal({
           project: args.project ?? null,
@@ -878,6 +878,38 @@ function fleetAnswerTarget(supervisor, args = {}) {
   return { questionId: id, answer: args.answer, title: clip(question.title, 120) };
 }
 
+const IMAGE_INTENT_RE = /\b(attach(?:ed|ing|ment|ments)?|screenshot|screenshots|screen\s*shot|screen\s*grab|image|images|photo|photos|pic|pics|picture|pictures)\b/i;
+
+function resolveFleetTurnImages(args, context) {
+  if (args?.forwardImages === false) return null;
+  if (Array.isArray(context?.__attachments) && context.__attachments.length > 0) {
+    return context.__attachments;
+  }
+  const wantsRecent = args?.attachRecentImages === true
+    || IMAGE_INTENT_RE.test(String(context?.__turn?.intent ?? ""));
+  if (!wantsRecent && args?.forwardImages !== true) return null;
+  const sessionId = context?.sessionId;
+  const store = context?.runtime?.agentHost?.store;
+  if (!sessionId || typeof store?.getSession !== "function") return null;
+  let session;
+  try { session = store.getSession(sessionId); } catch { return null; }
+  const messages = Array.isArray(session?.messages) ? session.messages : [];
+  const cutoff = Date.now() - 60 * 60_000;
+  for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i -= 1) {
+    const msg = messages[i];
+    if (msg?.role !== "user") continue;
+    if (msg.createdAt) {
+      const ts = Date.parse(msg.createdAt);
+      if (Number.isFinite(ts) && ts < cutoff) continue;
+    }
+    const atts = Array.isArray(msg?.metadata?.attachments)
+      ? msg.metadata.attachments.filter((a) => a && typeof a.data === "string" && a.data.length > 0)
+      : [];
+    if (atts.length > 0) return atts;
+  }
+  return null;
+}
+
 function deliveryReceipt(result) {
   const delivery = result?.delivery ?? null;
   const status = delivery?.status ?? "unknown";
@@ -892,6 +924,7 @@ function deliveryReceipt(result) {
     throw new Error(`${uncertain ? "Delivery unconfirmed" : "Not delivered"} (${status}): ${clip(delivery?.detail ?? "no detail", 200)}${waiting}`);
   }
   return { status, route: delivery?.route ?? null, detail: clip(delivery?.detail ?? "", 200),
+    ...(Number.isInteger(delivery?.attachedImages) && delivery.attachedImages > 0 ? { attachedImages: delivery.attachedImages } : {}),
     ...(delivery?.actionId ? { actionId: delivery.actionId } : {}),
     ...(delivery?.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}) };
 }

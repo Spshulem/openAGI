@@ -1,5 +1,6 @@
 import SwiftUI
 import PhotosUI
+import UIKit
 import UniformTypeIdentifiers
 
 // Native SwiftUI navigation, text entry and controls. Conversation state stays
@@ -634,6 +635,10 @@ struct ChatConversationView: View {
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
+        .onDrop(of: [.image], isTargeted: nil) { providers in
+            Task { await importDroppedProviders(providers) }
+            return true
+        }
     }
 
     private var composerLayout: ComposerLayout {
@@ -661,6 +666,9 @@ struct ChatConversationView: View {
     private var attachmentMenu: some View {
         Menu {
             Button("Photo Library", systemImage: "photo.on.rectangle") { showingPhotos = true }
+            Button("Paste Image", systemImage: "doc.on.clipboard") {
+                Task { await pasteImagesFromClipboard() }
+            }
             Button("Choose Image File", systemImage: "folder") { showingFiles = true }
             #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--ui-attachment-fixture") {
@@ -733,6 +741,57 @@ struct ChatConversationView: View {
             for url in urls { prepared.append(try await ChatAttachmentPreparation.file(url)) }
             appendImages(prepared)
         } catch { attachmentError = error.localizedDescription }
+    }
+
+    private func pasteImagesFromClipboard() async {
+        guard !isPreparingImages else { return }
+        let remaining = ChatAttachment.maximumCount - conversation.draftAttachments.count
+        guard remaining > 0 else {
+            attachmentError = "Attach up to four images per message."
+            return
+        }
+        let rawImages: [UIImage] = UIPasteboard.general.images ?? (UIPasteboard.general.image.map { [$0] } ?? [])
+        guard !rawImages.isEmpty else {
+            attachmentError = "Clipboard doesn't contain an image."
+            return
+        }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false }
+        do {
+            var prepared: [ChatAttachment] = []
+            for img in rawImages.prefix(remaining) {
+                guard let rawData = img.pngData() ?? img.jpegData(compressionQuality: 0.9) else {
+                    throw ChatAttachmentPreparation.Failure.unreadable
+                }
+                prepared.append(try await ChatAttachmentPreparation.prepare(rawData, name: "Pasted image.jpg"))
+            }
+            appendImages(prepared)
+        } catch { attachmentError = error.localizedDescription }
+    }
+
+    private func importDroppedProviders(_ providers: [NSItemProvider]) async {
+        guard !isPreparingImages else { return }
+        let remaining = ChatAttachment.maximumCount - conversation.draftAttachments.count
+        guard remaining > 0 else { return }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false }
+        var prepared: [ChatAttachment] = []
+        for provider in providers.prefix(remaining) {
+            guard provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) else { continue }
+            let data: Data? = await withCheckedContinuation { cont in
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { raw, _ in
+                    cont.resume(returning: raw)
+                }
+            }
+            if let data, let att = try? await ChatAttachmentPreparation.prepare(data, name: "Dropped image.jpg") {
+                prepared.append(att)
+            }
+        }
+        if !prepared.isEmpty {
+            appendImages(prepared)
+        }
     }
 
     #if DEBUG

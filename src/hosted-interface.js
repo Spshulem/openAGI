@@ -2242,7 +2242,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // through /nodes/g2/experience). Generic nodes, such as the
             // iMessage bridge, stay in their own node-scoped conversations.
             if (requestEnrollment?.platform !== MOBILE_PLATFORM && !ownerProxyRoute) return sendJson(res, 403, { error: "shared threads are for paired phones and owner proxies" });
-            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment?.name)); }
+            const sharedSourceName = ownerProxyRoute
+              ? (typeof requestEnrollment?.name === "string" && requestEnrollment.name.trim() ? boundedMobileNodeName(requestEnrollment.name) : "Mac")
+              : boundedMobileNodeName(requestEnrollment?.name);
+            try { body = bindSharedThreadMessage(body, requestNodeId, sharedSourceName); }
             catch (error) {
               if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
               throw error;
@@ -2959,7 +2962,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
-        const result = await fleetRoute(method, pathname, url, () => readJsonLimited(req, 8 * 1024));
+        const acceptsImages = method === "POST" && (
+          pathname === "/fleet/api/send"
+          || pathname === "/fleet/api/sessions/start"
+          || pathname === "/fleet/api/dispatch"
+          || /^\/fleet\/api\/cards\/[^/]+\/act$/.test(pathname)
+        );
+        const bodyLimit = acceptsImages ? MAX_IMAGE_MESSAGE_BODY : 32 * 1024;
+        const result = await fleetRoute(method, pathname, url, () => readJsonLimited(req, bodyLimit));
         return sendJson(res, result.status, result.body);
       }
       if (pathname.startsWith("/integrations/vocaleo/")) {
@@ -4094,8 +4104,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
-          if (!mobileProfile) runtime.codingSupervisor?.start();
-          runtime.fleetSupervisor?.start();
+          if (!mobileProfile) runtime.codingSupervisor?.start?.();
+          runtime.fleetSupervisor?.start?.();
           mobilePush?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
@@ -4197,10 +4207,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
         const channelsStopped = channels?.stop?.();
-        runtime.codingSupervisor?.stop();
+        runtime.codingSupervisor?.stop?.();
         codingNode?.stop?.();
         selfFixNode?.stop?.();
-        runtime.fleetSupervisor?.stop();
+        runtime.fleetSupervisor?.stop?.();
         mobilePush?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();

@@ -558,10 +558,11 @@ export class RemoteFleetSupervisor {
         return { ok: true, kind: 'defer', status: 'dismissed', question, delivery: null };
       }
       if (op === 'reply') {
-        const replyText = typeof input?.value === 'string' ? input.value.trim() : '';
+        const hasImages = Array.isArray(input?.images) && input.images.length > 0;
+        const replyText = (typeof input?.value === 'string' ? input.value.trim() : '') || (hasImages ? 'Please inspect the attached image(s).' : '');
         if (!replyText) return { ok: false, kind: 'reply', status: 'blocked', detail: 'Enter a reply to send.' };
-        const eligibleForQuestionReply = openQ.canReply === true
-          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1));
+        const eligibleForQuestionReply = !hasImages && (openQ.canReply === true
+          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1)));
         if (eligibleForQuestionReply) {
           const replied = await this.replyQuestion(qid, replyText);
           if (!replied) return { ok: false, kind: 'reply', status: 'closed', detail: 'Question already closed.' };
@@ -576,7 +577,7 @@ export class RemoteFleetSupervisor {
         }
         const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
         if (!threadKey) return { ok: false, kind: 'reply', status: 'blocked', detail: 'No coding session is linked to this card.' };
-        const sent = await this.sendOwnerMessage(threadKey, replyText);
+        const sent = await this.sendOwnerMessage(threadKey, replyText, { ...(hasImages ? { images: input.images } : {}) });
         return {
           ok: sent?.delivery?.status === 'sent',
           kind: 'reply',

@@ -43,7 +43,7 @@ final class FleetConsumer: ObservableObject {
   /// a failed send; cleared once the hub takes it.
   @Published private(set) var drafts: [String: String] = [:]
   /// Optional image payloads attached to a workspace reply, keyed by FleetOpenItem.key.
-  private var pendingReplyImages: [String: [[String: Any]]] = [:]
+  @Published var pendingReplyImages: [String: [[String: Any]]] = [:]
   /// FleetOpenItem keys with a reply in flight.
   @Published private(set) var replyInFlight: Set<String> = []
   /// Each item's last reply result, under its reply box.
@@ -299,7 +299,15 @@ final class FleetConsumer: ObservableObject {
     let slot = item.key
     guard !replyInFlight.contains(slot), let submitted = drafts[slot], let message = FleetReplyTarget.message(submitted) else { return }
     let attachedImages = pendingReplyImages[slot] ?? []
-    let target = replyTarget(item)
+    var target = replyTarget(item)
+    if case let .question(id) = item, !attachedImages.isEmpty {
+      if let tk = question(id)?.threadKey {
+        target = .thread(tk)
+      } else {
+        replyNotes[slot] = FleetNote(text: "This question isn't linked to a coding thread for image attachments.", isError: true)
+        return
+      }
+    }
     let path: String
     var body: [String: Any]
     switch target {

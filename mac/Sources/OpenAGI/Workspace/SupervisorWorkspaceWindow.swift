@@ -107,6 +107,8 @@ struct SupervisorWorkspaceView: View {
   @State private var showAttachPopover = false
   @State private var newTaskTitle = ""
   @FocusState private var composerFocused: Bool
+  @State private var hostWindow: NSWindow?
+  @State private var pasteKeyMonitor: Any?
 
   @State private var expandedQuestionIDs: Set<String> = []
   @State private var expandedThreadKeys: Set<String> = []
@@ -114,6 +116,8 @@ struct SupervisorWorkspaceView: View {
   @State private var threadReplyImages: [String: [WorkspaceImageAttachment]] = [:]
   @State private var threadReplyBusy: Set<String> = []
   @State private var threadReplyFeedback: [String: FleetNote] = [:]
+  @State private var threadAttachPopoverSlot: String? = nil
+  @FocusState private var focusedThreadSlot: String?
 
   private var activeChannel: WorkspaceChannel {
     nav.selectedChannel ?? .general
@@ -223,6 +227,13 @@ struct SupervisorWorkspaceView: View {
     }
     .onChange(of: waitingTotal) { _, count in
       AppDelegate.updateDockBadge(count: count)
+    }
+    .background(WorkspaceWindowAccessor(window: $hostWindow))
+    .onAppear {
+      installPasteMonitor()
+    }
+    .onDisappear {
+      removePasteMonitor()
     }
   }
 
@@ -1129,35 +1140,78 @@ struct SupervisorWorkspaceView: View {
           threadReplyImages[slotKey] = (threadReplyImages[slotKey] ?? []).filter { $0.id != removeId }
         }
       }
-      HStack(spacing: 8) {
-        Menu {
-          Button("Attach Image File…", systemImage: "photo.on.rectangle") {
-            let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - attached.count))
-            appendAttachments(picked, to: &threadReplyImages[slotKey, default: []])
-          }
-          Button("Paste Image from Clipboard", systemImage: "doc.on.clipboard") {
-            let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - attached.count))
-            if pasted.isEmpty {
-              threadReplyFeedback[slotKey] = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
-            } else {
-              appendAttachments(pasted, to: &threadReplyImages[slotKey, default: []])
-            }
-          }
+      HStack(alignment: .center, spacing: 8) {
+        let attachPopoverBinding = Binding<Bool>(
+          get: { threadAttachPopoverSlot == slotKey },
+          set: { threadAttachPopoverSlot = $0 ? slotKey : nil }
+        )
+        Button {
+          threadAttachPopoverSlot = (threadAttachPopoverSlot == slotKey) ? nil : slotKey
         } label: {
           Image(systemName: "plus")
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(WorkspaceTheme.muted)
-            .frame(width: 26, height: 26)
+            .foregroundStyle(attached.isEmpty ? WorkspaceTheme.ink.opacity(0.75) : WorkspaceTheme.live)
+            .frame(width: 28, height: 28)
+            .background(
+              (attached.isEmpty ? WorkspaceTheme.muted : WorkspaceTheme.live).opacity(0.14),
+              in: Circle()
+            )
+            .contentShape(Circle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
+        .buttonStyle(.plain)
         .disabled(isBusy || attached.count >= 4)
+        .help("Attach or paste up to 4 images")
+        .popover(isPresented: attachPopoverBinding, arrowEdge: .top) {
+          VStack(alignment: .leading, spacing: 4) {
+            Button {
+              threadAttachPopoverSlot = nil
+              let picked = WorkspaceImageAttachment.pickImages(limit: max(1, 4 - attached.count))
+              appendAttachments(picked, to: &threadReplyImages[slotKey, default: []])
+            } label: {
+              Label("Photo or Screenshot…", systemImage: "photo.on.rectangle")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
 
-        TextField(placeholder, text: draft)
+            Button {
+              threadAttachPopoverSlot = nil
+              let pasted = WorkspaceImageAttachment.fromPasteboard(limit: max(1, 4 - attached.count))
+              if pasted.isEmpty {
+                threadReplyFeedback[slotKey] = FleetNote(text: "Clipboard doesn't have an image.", isError: true)
+              } else {
+                threadReplyFeedback[slotKey] = nil
+                appendAttachments(pasted, to: &threadReplyImages[slotKey, default: []])
+              }
+            } label: {
+              Label("Paste Image from Clipboard", systemImage: "doc.on.clipboard")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+          }
+          .padding(6)
+          .frame(width: 230)
+        }
+
+        TextField(placeholder, text: draft, axis: .vertical)
           .textFieldStyle(.plain)
           .font(WorkspaceTheme.Typography.secondary)
+          .lineLimit(1...4)
+          .focused($focusedThreadSlot, equals: slotKey)
           .disabled(isBusy)
+          .onChange(of: draft.wrappedValue) { _, newValue in
+            let remaining = max(0, 4 - (threadReplyImages[slotKey]?.count ?? 0))
+            guard remaining > 0 else { return }
+            let extracted = WorkspaceImageAttachment.extractInlineLocalImages(from: newValue, limit: remaining)
+            if !extracted.attachments.isEmpty {
+              threadReplyText[slotKey] = extracted.cleanedText
+              appendAttachments(extracted.attachments, to: &threadReplyImages[slotKey, default: []])
+              threadReplyFeedback[slotKey] = nil
+            }
+          }
           .onSubmit {
             sendDirectReply(slotKey: slotKey, onSubmitReply: onSubmitReply)
           }
@@ -1196,7 +1250,23 @@ struct SupervisorWorkspaceView: View {
       }
       .padding(.horizontal, 10)
       .padding(.vertical, 6)
-      .workspaceGlassCapsule(cornerRadius: 18, focused: false)
+      .workspaceGlassCapsule(cornerRadius: 18, focused: focusedThreadSlot == slotKey)
+      .onDrop(of: [.fileURL, .image], isTargeted: nil) { providers in
+        Task {
+          let currentCount = await MainActor.run { threadReplyImages[slotKey]?.count ?? 0 }
+          let dropped = await WorkspaceImageAttachment.fromDropProviders(
+            providers,
+            limit: max(1, 4 - currentCount)
+          )
+          await MainActor.run {
+            if !dropped.isEmpty {
+              threadReplyFeedback[slotKey] = nil
+              appendAttachments(dropped, to: &threadReplyImages[slotKey, default: []])
+            }
+          }
+        }
+        return true
+      }
     }
   }
 
@@ -1204,15 +1274,24 @@ struct SupervisorWorkspaceView: View {
     slotKey: String,
     onSubmitReply: @escaping (String, [[String: Any]]) async -> FleetNote
   ) {
-    let text = (threadReplyText[slotKey] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let imgs = threadReplyImages[slotKey] ?? []
+    var rawText = threadReplyText[slotKey] ?? ""
+    var imgs = threadReplyImages[slotKey] ?? []
+    let extracted = WorkspaceImageAttachment.extractInlineLocalImages(from: rawText, limit: max(0, 4 - imgs.count))
+    if !extracted.attachments.isEmpty {
+      rawText = extracted.cleanedText
+      appendAttachments(extracted.attachments, to: &imgs)
+      threadReplyText[slotKey] = rawText
+      threadReplyImages[slotKey] = imgs
+    }
+    let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty || !imgs.isEmpty else { return }
     guard !threadReplyBusy.contains(slotKey) else { return }
+    let effectiveText = text.isEmpty ? "Please inspect the attached image(s)." : text
     threadReplyBusy.insert(slotKey)
     threadReplyFeedback[slotKey] = nil
     let payloads = imgs.map(\.fleetPayload)
     Task {
-      let note = await onSubmitReply(text, payloads)
+      let note = await onSubmitReply(effectiveText, payloads)
       threadReplyBusy.remove(slotKey)
       threadReplyFeedback[slotKey] = note
       if !note.isError {
@@ -1468,6 +1547,16 @@ struct SupervisorWorkspaceView: View {
         .focused($composerFocused)
         .disabled(supervisor.isSending)
         .padding(.vertical, 7)
+        .onChange(of: composerText) { _, newValue in
+          let remaining = max(0, 4 - composerImages.count)
+          guard remaining > 0 else { return }
+          let extracted = WorkspaceImageAttachment.extractInlineLocalImages(from: newValue, limit: remaining)
+          if !extracted.attachments.isEmpty {
+            composerText = extracted.cleanedText
+            composerStatusNote = nil
+            appendAttachments(extracted.attachments, to: &composerImages)
+          }
+        }
         .onSubmit {
           sendFromWorkspace()
         }
@@ -1633,16 +1722,21 @@ struct SupervisorWorkspaceView: View {
   }
 
   private func sendFromWorkspace() {
-    let rawDraft = composerText
+    var rawDraft = composerText
+    var imgs = composerImages
+    let extracted = WorkspaceImageAttachment.extractInlineLocalImages(from: rawDraft, limit: max(0, 4 - imgs.count))
+    if !extracted.attachments.isEmpty {
+      rawDraft = extracted.cleanedText
+      appendAttachments(extracted.attachments, to: &imgs)
+    }
     let raw = rawDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-    let imgs = composerImages
     guard !raw.isEmpty || !imgs.isEmpty else { return }
     let textToSend: String
     if case let .project(projName) = activeChannel {
       textToSend = raw.isEmpty ? "[\(projName)] Please inspect the attached screenshot(s)." : "[\(projName)] \(raw)"
       inlineChatOpen = true
     } else if activeChannel != .general {
-      textToSend = raw
+      textToSend = raw.isEmpty ? "Please inspect the attached screenshot(s)." : raw
       inlineChatOpen = true
     } else {
       textToSend = raw
@@ -1659,6 +1753,71 @@ struct SupervisorWorkspaceView: View {
         if composerImages.isEmpty && !imgs.isEmpty {
           composerImages = imgs
         }
+      }
+    }
+  }
+
+  private func installPasteMonitor() {
+    guard pasteKeyMonitor == nil else { return }
+    pasteKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+      MainActor.assumeIsolated {
+        handleCommandVPaste(event)
+      }
+    }
+  }
+
+  private func removePasteMonitor() {
+    if let monitor = pasteKeyMonitor {
+      NSEvent.removeMonitor(monitor)
+      pasteKeyMonitor = nil
+    }
+  }
+
+  @MainActor
+  private func handleCommandVPaste(_ event: NSEvent) -> NSEvent? {
+    let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    guard flags == .command,
+          event.charactersIgnoringModifiers?.lowercased() == "v",
+          let win = hostWindow,
+          event.window === win else {
+      return event
+    }
+    if let slot = focusedThreadSlot {
+      let current = threadReplyImages[slot] ?? []
+      guard !threadReplyBusy.contains(slot), current.count < 4 else { return event }
+      let pasted = WorkspaceImageAttachment.pasteboardImagesForCommandV(limit: 4 - current.count)
+      guard !pasted.isEmpty else { return event }
+      appendAttachments(pasted, to: &threadReplyImages[slot, default: []])
+      threadReplyFeedback[slot] = nil
+      return nil
+    }
+    guard !supervisor.isSending, composerImages.count < 4 else { return event }
+    let pasted = WorkspaceImageAttachment.pasteboardImagesForCommandV(limit: 4 - composerImages.count)
+    guard !pasted.isEmpty else { return event }
+    appendAttachments(pasted, to: &composerImages)
+    composerStatusNote = nil
+    composerFocused = true
+    return nil
+  }
+}
+
+private struct WorkspaceWindowAccessor: NSViewRepresentable {
+  @Binding var window: NSWindow?
+
+  func makeNSView(context: Context) -> NSView {
+    let view = NSView(frame: .zero)
+    DispatchQueue.main.async {
+      if self.window !== view.window {
+        self.window = view.window
+      }
+    }
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    DispatchQueue.main.async {
+      if self.window !== nsView.window {
+        self.window = nsView.window
       }
     }
   }

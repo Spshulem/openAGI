@@ -213,3 +213,13 @@ test("conversational assent 'yes' / 'continue' / 'skip' following a supervisor q
   assert.equal(isConversationalAssentOrChoice("yes", "BuildBot3 tests passed earlier today."), false);
   assert.equal(intentCovers("continue", "fleet_answer_question"), true);
 });
+
+test("attach image follow-ups authorize fleet messaging while passive questions stay blocked", () => {
+  for (const text of ["can you attach it?", "please attach the screenshot", "attach this image", "attach it to the Bob chat"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["What did the agent attach?", "Did the user attach a photo?", "Send it", "Forward the screenshot to me"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
+  }
+});

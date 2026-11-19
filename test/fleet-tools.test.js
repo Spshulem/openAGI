@@ -450,3 +450,60 @@ test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix t
   assert.equal(tools.has("self_fix_start"), false);
   assert.ok(!tools.list().some((tool) => /merge|release|deploy/.test(tool.name)));
 });
+
+test("fleet_send_message forwards current-turn images and resolves prior-turn images on attach requests", async () => {
+  const deliveries = [];
+  const sampleImg = { id: "img_1", name: "CleanShot.png", mimeType: "image/jpeg", data: "/9j/4AAQSkZJRg==" };
+  const sessionStore = new Map([
+    ["devices:supervisor:main", {
+      id: "devices:supervisor:main",
+      messages: [
+        { role: "user", content: "Look at this bug screenshot", createdAt: new Date().toISOString(), metadata: { attachments: [sampleImg] } },
+        { role: "assistant", content: "I sent the message without the screenshot." },
+        { role: "user", content: "can you attach it?" }
+      ]
+    }]
+  ]);
+  const supervisor = {
+    ...fakeSupervisor({
+      snapshot: {
+        at: "2026-11-19T04:00:00.000Z",
+        counts: {},
+        threads: [row({ key: "paseo:srv_mac.ag_bob", kind: "paseo", title: "Bob unified chat" })],
+        infra: {},
+        sourceErrors: {}
+      }
+    }),
+    sendOwnerMessage: async (key, message, opts = {}) => {
+      deliveries.push({ key, message, opts });
+      return { delivery: { status: "sent", route: "paseo-send", attachedImages: opts.images?.length ?? 0, detail: "Paseo message, 1 image(s), and turn confirmed" } };
+    }
+  };
+  const tools = registry(supervisor);
+  const baseCtx = {
+    sessionId: "devices:supervisor:main",
+    __confirmed: true,
+    __turn: { untrusted: false, intent: "can you attach it?" },
+    runtime: { agentHost: { store: { getSession: (id) => sessionStore.get(id) } } }
+  };
+
+  // Explicit attachRecentImages: true pulls prior-turn images even when __attachments is empty
+  const recentRes = await tools.invoke("fleet_send_message", {
+    key: "paseo:srv_mac.ag_bob",
+    message: "Attaching screenshot from earlier turn.",
+    attachRecentImages: true
+  }, baseCtx);
+  assert.equal(recentRes.ok, true);
+  assert.equal(recentRes.result.attachedImages, 1);
+  assert.equal(deliveries[0].opts.images?.length, 1);
+  assert.equal(deliveries[0].opts.images?.[0].id, "img_1");
+
+  // Implicit intent match ("can you attach it?") also recovers recent images automatically
+  const intentRes = await tools.invoke("fleet_send_message", {
+    key: "paseo:srv_mac.ag_bob",
+    message: "Attaching screenshot."
+  }, baseCtx);
+  assert.equal(intentRes.ok, true);
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[1].opts.images?.length, 1);
+});
