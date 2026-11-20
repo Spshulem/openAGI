@@ -84,7 +84,7 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
 // Same projection as the G2 history view: user and assistant text only, never
 // tool calls, tool results or private metadata. Oldest-first; `before` pages
 // toward older messages and `nextBefore` is the cursor for the next page.
-export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main" } = {}) {
+export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main", liveTurns = null } = {}) {
   if (!store?.getSession) throw fail("history_unavailable", 503, "Main history is not configured.");
   const sessionId = visibleSessionID(store, thread, conversationId);
   const size = limit === undefined || limit === null ? 50 : limit;
@@ -105,7 +105,15 @@ export function sharedThreadHistory(store, thread, { before, limit, conversation
   }
   if (end < 0) throw fail("unknown_message", 404, "That message is no longer in this thread's history.");
   const start = Math.max(0, end - size);
-  return { thread, messages: visible.slice(start, end).map(projectMessage), nextBefore: start > 0 ? visible[start].id : null };
+  return {
+    thread,
+    messages: visible.slice(start, end).map(projectMessage),
+    nextBefore: start > 0 ? visible[start].id : null,
+    // Turns still running here with no client attached (the phone that sent
+    // one was backgrounded or lost its stream): "still working", not gone.
+    // Only the latest page can contain them.
+    ...(before || !liveTurns ? {} : { inFlight: liveTurns.list(sessionId) })
+  };
 }
 
 export function appendSharedThreadMessages(
@@ -184,7 +192,11 @@ function projectMessage(m) {
     id: m.id, role: m.role, text: m.content.slice(0, 16000), at: m.createdAt,
     sourceNodeId: user && typeof m.metadata?.sourceNodeId === "string" ? m.metadata.sourceNodeId : null,
     sourceName: user && typeof m.metadata?.sourceName === "string" ? m.metadata.sourceName : null,
-    ...(user && m.metadata?.attachments?.length ? { attachments: imageHistoryPreview(m.metadata.attachments) } : {})
+    ...(user && m.metadata?.attachments?.length ? { attachments: imageHistoryPreview(m.metadata.attachments) } : {}),
+    // The turn this line belongs to: a client matches its own send and the
+    // reply to it by this, never by text.
+    ...(typeof m.metadata?.requestId === "string" && /^[A-Za-z0-9_.:-]{1,200}$/.test(m.metadata.requestId) ? { requestId: m.metadata.requestId } : {}),
+    ...(!user && m.metadata?.status === "failed" ? { status: "failed" } : {})
   };
 }
 
