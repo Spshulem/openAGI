@@ -149,7 +149,7 @@ const PATTERNS = [
   // One fleet thread's detail/transcript, and the owner's Push now, Mute, Unmute, and OpenAGI Project/Theme organization.
   { method: "DELETE", re: /^\/fleet\/api\/projects\/[A-Za-z0-9_-]{1,80}$/ },
   { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}(?:/transcript)?$`) },
-  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute|organize)$`) }
+  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute|organize|archive|unarchive)$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {

@@ -405,10 +405,14 @@ enum SupervisorFormat {
             return Note(text: message ?? "Merged pull request.", isAlert: false)
         case "watching_ci", "queued_when_green", "queued_auto_merge", "ci_pending_watch":
             return Note(text: message ?? "Watching CI — will ping when green.", isAlert: false)
-        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed":
+        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed", "confirmation_required":
             return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
+        case "archived_session":
+            return Note(text: message ?? "Archived coding chat in Paseo.", isAlert: false)
+        case "unarchived_session":
+            return Note(text: message ?? "Restored coding chat in Paseo.", isAlert: false)
         case "deferred", "dismissed":
-            return Note(text: message ?? "Saved for later.", isAlert: false)
+            return Note(text: message ?? "Dismissed notification.", isAlert: false)
         case "updated", "preference_saved", "reverted":
             return Note(text: message ?? "Preference updated.", isAlert: false)
         default:

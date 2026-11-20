@@ -1811,11 +1811,24 @@ struct SupervisorWorkspaceView: View {
       }
 
       if !q.body.isEmpty {
-        WorkspaceMarkdownContent(
-          blocks: WorkspaceMarkdownParser.parse(q.body),
-          bodyFont: WorkspaceTheme.Typography.secondary,
-          textColor: WorkspaceTheme.muted
-        )
+        Button {
+          if let tk = q.threadKey, !tk.isEmpty {
+            openInspector(.session(tk))
+            Task { await fleet.loadDetail(tk) }
+          } else {
+            openInspector(.question(q.id))
+          }
+        } label: {
+          WorkspaceMarkdownContent(
+            blocks: WorkspaceMarkdownParser.parse(q.body),
+            bodyFont: WorkspaceTheme.Typography.secondary,
+            textColor: WorkspaceTheme.muted
+          )
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Click to inspect full thread context and conversation")
       }
 
       if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {

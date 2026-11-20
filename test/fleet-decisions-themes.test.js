@@ -1388,6 +1388,11 @@ test("completion & Proceed plan cards, oai-mem-citation cleanup, and junk-folder
       }),
       ref: (id) => ({
         archive: async () => { archivedIds.push(id); },
+        reload: async () => {
+          const idx = archivedIds.indexOf(id);
+          if (idx >= 0) archivedIds.splice(idx, 1);
+          return { agent: { id, archivedAt: null } };
+        },
         timeline: {
           refetch: async () => {
             if (id === "plan-agent-1") {
@@ -1477,13 +1482,21 @@ test("completion & Proceed plan cards, oai-mem-citation cleanup, and junk-folder
   assert.equal(planCard.primaryAction.label, "Proceed");
   assert.equal(planCard.project, "openAGI");
 
-  // 2. Finished session surfaced as "Finished · Review" (NOT dropped as idle-no-pr!),
+  // 2. Finished session surfaced as "Finished" with safe "View Chat" + "Dismiss" (NEVER unconfirmed "Archive" in options!),
   //    junk hash folder "6baf" ignored in favor of migration.originalCwd ("webapp-client"),
   //    and <oai-mem-citation> + duplicate messages stripped!
   const doneCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2");
-  assert.ok(doneCard, "expected Finished · Review card for done-agent-2");
+  assert.ok(doneCard, "expected Finished card for done-agent-2");
   assert.equal(doneCard.kind, "completed");
-  assert.equal(doneCard.kindLabel, "Finished · Review");
+  assert.equal(doneCard.kindLabel, "Finished");
+  assert.equal(doneCard.headline, "SEO skills audit: finished");
+  assert.deepEqual(doneCard.options, ["Got it"], "push/card options must never include unconfirmed Archive");
+  assert.equal(doneCard.primaryAction.op, "open_chat");
+  assert.equal(doneCard.primaryAction.label, "View Chat");
+  assert.equal(doneCard.secondaryAction.op, "dismiss");
+  assert.equal(doneCard.secondaryAction.label, "Dismiss");
+  assert.equal(doneCard.extraActions[0]?.op, "archive_session");
+  assert.equal(doneCard.extraActions[0]?.destructive, true);
   assert.equal(doneCard.project, "webapp-client");
   assert.ok(!String(doneCard.agentSummary ?? "").includes("oai-mem-citation"), "oai-mem-citation must be stripped");
   assert.equal(doneCard.recentMessages.filter((m) => m.role === "assistant").length, 1, "consecutive duplicate assistant messages must be deduplicated");
@@ -1500,10 +1513,49 @@ test("completion & Proceed plan cards, oai-mem-citation cleanup, and junk-folder
   assert.equal(aliasedState.cards.find((c) => c.id === doneCard.id).project, "MainProduct");
   assert.equal(aliasedState.snapshot.threads.find((r) => r.key === "paseo:srv_bb3.done-agent-2").project, "MainProduct");
 
-  // 5. Clicking "Archive" on doneCard archives in Paseo AND marks completion reviewed across future ticks!
-  const actRes = await sup.actCard(doneCard.id, { op: "answer", value: "Archive" });
+  // 5. Unconfirmed archive_session is rejected safely without touching Paseo!
+  const unconfirmedRes = await sup.actCard(doneCard.id, { op: "archive_session" });
+  assert.equal(unconfirmedRes.ok, false);
+  assert.equal(unconfirmedRes.status, "confirmation_required");
+  assert.deepEqual(archivedIds, [], "unconfirmed archive must never archive Paseo chat");
+
+  // 6. Dismissing errCard clears ONLY the notification in OpenAGI across ticks without archiving Paseo!
+  const dismissErrRes = await sup.actCard(errCard.id, { op: "dismiss" });
+  assert.equal(dismissErrRes.ok, true);
+  assert.deepEqual(archivedIds, [], "dismissing notification must never archive Paseo chat");
+
+  // 7. Confirmed archive_session archives in Paseo, marks completion reviewed, AND unarchiveThread restores it!
+  const actRes = await sup.actCard(doneCard.id, { op: "archive_session", confirmed: true });
   assert.equal(actRes.ok, true);
+  assert.equal(actRes.status, "archived_session");
   assert.deepEqual(archivedIds, ["done-agent-2"]);
   await sup.tick();
   assert.equal(sup.getState().cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2"), undefined, "reviewed completion stays closed on next scan");
+  assert.equal(sup.getState().cards.find((c) => c.threadKey === "paseo:srv_bb3.err-agent-3"), undefined, "dismissed error notification stays closed on next scan");
+
+  const undoRes = await sup.unarchiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(undoRes.ok, true);
+  assert.equal(undoRes.status, "unarchived_session");
+  assert.deepEqual(archivedIds, [], "unarchiveThread restores archived Paseo session");
+
+  // 8. Verify RemoteFleetSupervisor + createFleetCapability forward archive & unarchive across main relay!
+  const remoteCap = createFleetCapability(sup);
+  const remoteProxy = new RemoteFleetSupervisor({
+    nodeId: "mac-node",
+    dataDir: tmpDir,
+    runtime: {
+      nodeCapabilities: {
+        dispatch: async (_nodeId, _cap, op, payload) => remoteCap.invoke(op, payload)
+      }
+    }
+  });
+  const unconfRemote = await remoteProxy.archiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(unconfRemote.ok, false);
+  assert.equal(unconfRemote.status, "confirmation_required");
+  const confRemote = await remoteProxy.archiveThread("paseo:srv_bb3.done-agent-2", { confirmed: true });
+  assert.equal(confRemote.ok, true);
+  assert.deepEqual(archivedIds, ["done-agent-2"]);
+  const undoRemote = await remoteProxy.unarchiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(undoRemote.ok, true);
+  assert.deepEqual(archivedIds, []);
 });

@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -75,7 +75,7 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive))$/;
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -653,6 +653,25 @@ export class RemoteFleetSupervisor {
   async unmuteThread(threadKey) {
     await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unmute`);
     return { until: null };
+  }
+  async archiveThread(threadKey, { confirmed = false } = {}) {
+    if (confirmed !== true) {
+      return { ok: false, status: 'confirmation_required', detail: 'Confirm archiving this coding chat first.' };
+    }
+    try {
+      const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/archive`, { confirmed: true });
+      return body.result ?? { ok: true, status: 'archived_session', threadKey, detail: 'Archived coding chat in Paseo.' };
+    } catch (error) {
+      return { ok: false, status: 'blocked', detail: String(error?.message ?? 'Could not archive coding chat.').slice(0, 200) };
+    }
+  }
+  async unarchiveThread(threadKey) {
+    try {
+      const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unarchive`, {});
+      return body.result ?? { ok: true, status: 'unarchived_session', threadKey, detail: 'Restored coding chat in Paseo.' };
+    } catch (error) {
+      return { ok: false, status: 'blocked', detail: String(error?.message ?? 'Could not restore coding chat.').slice(0, 200) };
+    }
   }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;

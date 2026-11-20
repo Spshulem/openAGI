@@ -22,7 +22,7 @@ const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
-const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive"]);
 const BATCH_OPS = new Set([
   "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
 ]);
@@ -456,6 +456,7 @@ export function createFleetRoute({ supervisor } = {}) {
         const outcome = await supervisor.actCard(cardId, {
           op,
           value,
+          confirmed: body.confirmed === true,
           clarification: typeof body.clarification === "string" ? body.clarification : null,
           instructions: typeof body.instructions === "string" ? body.instructions : null,
           ...(Array.isArray(body.images) ? { images: body.images } : {}),
@@ -666,6 +667,21 @@ export function createFleetRoute({ supervisor } = {}) {
           if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
           const result = await supervisor.pushNow(threadKey, sendOptions);
           return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (parts[2] === "archive") {
+          if (typeof supervisor.archiveThread !== "function") return fail(503, "Session archiving is not available.");
+          const body = (await readObject(readBody)) ?? {};
+          const result = await supervisor.archiveThread(threadKey, { confirmed: body.confirmed === true });
+          if (!result?.ok) {
+            return fail(result?.status === "confirmation_required" ? 409 : 400, result?.detail ?? "Could not archive coding session.", { status: result?.status ?? "blocked", state: state() });
+          }
+          return ok({ result, state: state() });
+        }
+        if (parts[2] === "unarchive") {
+          if (typeof supervisor.unarchiveThread !== "function") return fail(503, "Session restore is not available.");
+          const result = await supervisor.unarchiveThread(threadKey);
+          if (!result?.ok) return fail(400, result?.detail ?? "Could not restore coding session.", { state: state() });
+          return ok({ result, state: state() });
         }
         if (typeof supervisor.muteThread !== "function") return fail(503, "Muting is not available.");
         if (parts[2] === "unmute") return ok({ muted: (await supervisor.unmuteThread(threadKey))?.until ?? null, state: state() });

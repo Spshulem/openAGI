@@ -25,6 +25,7 @@ const OPTION_LABELS = Object.freeze({
   retry: "Retry",
   restart: "Restart app",
   done: "Done",
+  "got it": "Got it",
   "mark done": "Mark Done",
   archive: "Archive",
   proceed: "Proceed",
@@ -90,7 +91,7 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
     return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
   }
   if (question.kind === "completed") {
-    return { kind: "completed", kindLabel: "Finished · Review", rank: 2 };
+    return { kind: "completed", kindLabel: "Finished", rank: 2 };
   }
   if (question.kind === "session-error") {
     return { kind: "blocker", kindLabel: "Session Error", rank: 1 };
@@ -185,6 +186,18 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
       primaryAction: { op: "open_chat", label: chatLabel, value: options.includes("open thread") ? "open thread" : "opened", destructive: false },
       secondaryAction: { op: "defer", label: "Later", value: "dismiss", destructive: false },
       extraActions: []
+    };
+  }
+
+  if (question.kind === "completed" || question.kind === "session-error") {
+    const isPaseo = Boolean(parsePaseoThreadKey(question.threadKey ?? row?.key));
+    const extraActions = isPaseo
+      ? [{ op: "archive_session", label: "Archive Chat…", value: "archive_session", destructive: true }]
+      : [];
+    return {
+      primaryAction: { op: "open_chat", label: "View Chat", value: "open thread", destructive: false },
+      secondaryAction: { op: "dismiss", label: "Dismiss", value: "dismiss", destructive: false },
+      extraActions
     };
   }
 
@@ -287,6 +300,9 @@ function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
       : "";
     return `CI green${gatePass}${threads === 0 ? " · 0 open threads" : ` · ${threads} review thread(s)`}. Ready for your merge confirmation.`;
   }
+  if (question.kind === "completed") {
+    return "Tap View Chat to inspect the full conversation, reply below to follow up, or Dismiss to clear this notification.";
+  }
   if (parsePaseoThreadKey(question.threadKey ?? row?.key)) {
     return "Reply right below to answer or steer this session directly without opening the chat.";
   }
@@ -325,6 +341,8 @@ function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle =
     fallbackDecision = prMeta?.mergeState === "DIRTY"
       ? `Have the session rebase ${prMeta?.ref ?? "this PR"} onto base and re-verify, or reply with guidance.`
       : `Have the session fix failing checks on ${prMeta?.ref ?? "this PR"}, or reply with specific instructions.`;
+  } else if (kind === "completed") {
+    fallbackDecision = "Session finished. Tap View Chat to read the result or reply, or Dismiss to clear this notification.";
   } else if (question.kind === "suggestion" && question.meta?.plan?.nextAction) {
     fallbackDecision = clampTextLines(cleanBriefProse(question.meta.plan.nextAction), 600);
   } else if (question.card) {

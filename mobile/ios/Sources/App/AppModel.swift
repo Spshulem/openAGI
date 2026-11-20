@@ -71,6 +71,8 @@ final class AppModel {
     var selectedTab: AppTab = .today
     var requestedChatThread: ConversationThread? = nil
     var requestedFocusCardID: String? = nil
+    var requestedOpenContextCardID: String? = nil
+    var requestedOpenThreadKey: String? = nil
     var workspaceChannel: iOSWorkspaceChannel = .general
     var latestFleetState: FleetState? = nil
     var latestFleetHierarchy: FleetHierarchyResponse? = nil
@@ -315,6 +317,10 @@ final class AppModel {
         workspace.inboxFetchedAt = nil
         inboxGeneration += 1
         Task { await refreshInbox(force: true) }
+    }
+
+    func bumpFleetGeneration() {
+        fleetGeneration += 1
     }
 
     // MARK: - Live events

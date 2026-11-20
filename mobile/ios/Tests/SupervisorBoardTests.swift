@@ -255,6 +255,17 @@ final class SupervisorBoardTests: XCTestCase {
         let orgReq = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(orgReq.httpMethod, "POST")
         XCTAssertEqual(orgReq.url?.path, "/fleet/api/threads/codex:thread-1/organize")
+
+        _ = try await client.fleetActCard(id: "card-done-1", op: "archive_session", value: "archive_session", confirmed: true)
+        let archReq = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(archReq.httpMethod, "POST")
+        XCTAssertEqual(archReq.url?.path, "/fleet/api/cards/card-done-1/act")
+
+        let undoRes = try await client.fleetUnarchiveThread(key: "paseo:srv.agent-1")
+        XCTAssertTrue(undoRes.ok)
+        let undoReq = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(undoReq.httpMethod, "POST")
+        XCTAssertEqual(undoReq.url?.path, "/fleet/api/threads/paseo:srv.agent-1/unarchive")
     }
 
     func testPendingActionDisplayTitleAndSubtitleHumanizeComputerUseAndTools() throws {
