@@ -1,7 +1,80 @@
 // Native Paseo reads. Never creates/imports/reloads an agent or changes its mode.
+import fs from "node:fs";
 import os from "node:os";
-import { SUPERVISOR_PREFIX, clampText, cleanCardItem, redactSecrets, parsePrRef } from "../contracts.js";
+import path from "node:path";
+import { SUPERVISOR_PREFIX, clampTailLines, clampText, cleanCardItem, redactSecrets, parsePrRef } from "../contracts.js";
 import { classifyErrorText } from "../errors.js";
+
+export function stripAgentInternalMarkup(raw) {
+  return String(raw ?? "")
+    .replace(/<oai-mem-citation\b[\s\S]*?(?:<\/oai-mem-citation>|$)/gi, "")
+    .replace(/<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:<\/(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+export function dedupeConsecutiveMessages(messages = []) {
+  const out = [];
+  for (const m of messages) {
+    if (!m || typeof m.text !== "string") continue;
+    const cleaned = stripAgentInternalMarkup(m.text);
+    if (!cleaned) continue;
+    const norm = cleaned.replace(/\s+/g, " ").trim();
+    const prev = out.at(-1);
+    if (prev && prev.role === m.role && prev._norm === norm) {
+      prev.at = m.at ?? prev.at;
+      continue;
+    }
+    out.push({ ...m, text: cleaned, _norm: norm });
+  }
+  return out.map(({ _norm: _ignored, ...rest }) => rest);
+}
+
+let paseoMetaCache = { dir: null, wsMtime: 0, prjMtime: 0, workspacesById: new Map(), projectsById: new Map() };
+
+function readLocalPaseoWorkspaceIndex(config) {
+  const explicitHome = typeof config?.paseo?.homeDir === "string" && config.paseo.homeDir.trim()
+    ? config.paseo.homeDir.trim()
+    : null;
+  if (!explicitHome && (process.env.NODE_TEST_CONTEXT || process.env.OPENAGI_TEST_ISOLATION === "1" || config?.paseo?.projectsDir === false)) {
+    return null;
+  }
+  const baseDir = path.join(explicitHome || path.join(os.homedir(), ".paseo"), "projects");
+  try {
+    const wsPath = path.join(baseDir, "workspaces.json");
+    const prjPath = path.join(baseDir, "projects.json");
+    const wsStat = fs.existsSync(wsPath) ? fs.statSync(wsPath) : null;
+    const prjStat = fs.existsSync(prjPath) ? fs.statSync(prjPath) : null;
+    if (!wsStat && !prjStat) return null;
+    const wsMtime = wsStat?.mtimeMs ?? 0;
+    const prjMtime = prjStat?.mtimeMs ?? 0;
+    if (paseoMetaCache.dir === baseDir && paseoMetaCache.wsMtime === wsMtime && paseoMetaCache.prjMtime === prjMtime) {
+      return paseoMetaCache;
+    }
+    const projectsById = new Map();
+    if (prjStat) {
+      const prjList = JSON.parse(fs.readFileSync(prjPath, "utf8"));
+      if (Array.isArray(prjList)) {
+        for (const p of prjList) {
+          if (p?.projectId) projectsById.set(String(p.projectId), p);
+        }
+      }
+    }
+    const workspacesById = new Map();
+    if (wsStat) {
+      const wsList = JSON.parse(fs.readFileSync(wsPath, "utf8"));
+      if (Array.isArray(wsList)) {
+        for (const w of wsList) {
+          if (w?.workspaceId) workspacesById.set(String(w.workspaceId), w);
+        }
+      }
+    }
+    paseoMetaCache = { dir: baseDir, wsMtime, prjMtime, workspacesById, projectsById };
+    return paseoMetaCache;
+  } catch {
+    return null;
+  }
+}
 
 const CODE_PATH_OWNERS = new Set(["src", "app", "packages", "apps", "lib", "test", "tests", "server", "client", "docs", "scripts"]);
 
@@ -258,7 +331,7 @@ function currentError(agent, entries) {
   return { ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }), text: clampText(message, 1000) };
 }
 
-export function paseoThread(agent, serverId, entries = [], historyKnown = true) {
+export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null } = {}) {
   const messages = entries.filter(e => ["user_message", "assistant_message"].includes(e.item?.type));
   const users = messages.filter(e => e.item.type === "user_message");
   const owner = users.findLast(e => !e.item.text?.startsWith(SUPERVISOR_PREFIX));
@@ -271,7 +344,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const nativeId = agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId;
   const rawProvider = String(agent.provider ?? "").trim().toLowerCase();
   if (["codex", "claude", "antigravity"].includes(rawProvider) && nativeId) aliases.push(`${rawProvider}:${nativeId}`);
-  const text = redactSecrets(assistant?.item.text ?? "").slice(-8000);
+  const text = stripAgentInternalMarkup(redactSecrets(assistant?.item.text ?? "")).slice(-8000);
   const prRefs = extractPaseoPrRefs(messages, agent.title ?? "");
   const pendingCard = extractPaseoPendingCard(agent);
   const pendingPermission = extractPaseoPendingPermission(agent);
@@ -282,28 +355,50 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const cleanWorkspace = rawWorkspace && !OPAQUE_PASEO_ID.test(rawWorkspace)
     ? clampText(rawWorkspace, 80)
     : (conductorWorkspace ? clampText(conductorWorkspace, 80) : null);
+  const agentLabels = {};
+  if (agent.labels && typeof agent.labels === "object") {
+    for (const k of ["theme", "migration.originalCwd", "migration.conductorWorkspaceName"]) {
+      if (typeof agent.labels[k] === "string" && agent.labels[k].trim()) {
+        agentLabels[k] = clampText(agent.labels[k].trim(), 200);
+      }
+    }
+  }
+  const paseoLabels = Array.isArray(workspaceMeta?.labels)
+    ? workspaceMeta.labels.filter((l) => typeof l === "string" && l.trim()).slice(0, 8)
+    : [];
+  const conversation = dedupeConsecutiveMessages(
+    messages
+      .filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX))
+      .map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp }))
+  );
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
-    cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
+    cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? workspaceMeta?.repo ?? null, branch: workspaceMeta?.branch ?? null,
     agentStatus: hasBlockingPermission ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status : "unknown",
     archived: Boolean(agent.archivedAt),
     excluded: agent.archivedAt || agent.status === "closed" ? "closed" : !historyKnown ? "history-unavailable" : null,
     lastActivityAt: agent.updatedAt, lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
-    lastUserText: redactSecrets(owner?.item.text ?? "").slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
-    lastAgentText: text.slice(-600), lastAgentTail: text, lastAgentFull: text,
+    lastUserText: stripAgentInternalMarkup(redactSecrets(owner?.item.text ?? "")).slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
+    lastAgentText: clampTailLines(text, 900), lastAgentTail: text, lastAgentFull: text,
     error: currentError(agent, entries), openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
       requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
+      ...(Object.keys(agentLabels).length ? { agentLabels } : {}),
+      ...(agentLabels.theme ? { theme: agentLabels.theme } : {}),
+      ...(paseoLabels.length ? { paseoLabels } : {}),
+      ...(workspaceMeta?.projectName ? { paseoProjectName: workspaceMeta.projectName } : {}),
+      ...(workspaceMeta?.projectRoot ? { paseoProjectRoot: workspaceMeta.projectRoot } : {}),
+      ...(planArtifactPath ? { hasPlanArtifact: true, planArtifactPath } : {}),
       ...(pendingCard ? { pendingCard } : {}),
       ...(pendingPermission ? { pendingPermission } : {}),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,
-      conversation: messages.filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX)).map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
+      conversation }
   };
 }
 
@@ -393,6 +488,20 @@ export function createPaseoSource({ factory } = {}) {
             ]).finally(() => clearTimeout(historyTimer));
             signal.throwIfAborted();
             row.agent = history.agent ?? a;
+            let lastUserIdx = -1;
+            for (let i = history.entries.length - 1; i >= 0; i--) {
+              if (history.entries[i]?.item?.type === "user_message") { lastUserIdx = i; break; }
+            }
+            let planArtifactPath = null;
+            for (let i = Math.max(0, lastUserIdx + 1); i < history.entries.length; i++) {
+              const it = history.entries[i]?.item;
+              if (it?.type === "tool_call" && ["write_file", "edit_file"].includes(it.name)) {
+                const targetPath = String(it.detail?.input?.Path ?? it.detail?.input?.path ?? "");
+                if (/\/brain\/[^/]+\/[^/]+\.md$/i.test(targetPath) && !/\/scratch\//i.test(targetPath)) {
+                  planArtifactPath = targetPath;
+                }
+              }
+            }
             // Cache bounded messages and provider errors, never tool output or
             // images. Dropping error items hides failures from the next scan.
             const entries = history.entries.filter(e => ["user_message", "assistant_message", "error"].includes(e.item?.type))
@@ -400,16 +509,33 @@ export function createPaseoSource({ factory } = {}) {
               .map(e => ({ timestamp: e.timestamp, item: e.item.type === "error"
                 ? { type: "error", message: redactSecrets(e.item.message ?? "").slice(0, 8000) }
                 : { type: e.item.type, text: redactSecrets(e.item.text ?? "").slice(-8000) } }));
-            cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries });
+            cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries, planArtifactPath });
           } catch { /* uncertain history stays excluded and is tried later */ }
         }));
       }
       signal.throwIfAborted();
       const selfIsLocal = isLocalPaseoUrl(config.paseo?.url);
+      const localIndex = selfIsLocal || config.paseo?.homeDir ? readLocalPaseoWorkspaceIndex(config) : null;
       const out = inventory.map(({ agent: a, id, key }) => {
         const history = cache.get(key);
         const known = ["running", "initializing", "closed"].includes(a.status) || (history?.stamp === a.updatedAt);
-        const row = paseoThread(a, id, known ? history?.entries ?? [] : [], known);
+        let workspaceMeta = null;
+        if (localIndex && id === directory.self?.serverId && a.workspaceId) {
+          const wsObj = localIndex.workspacesById.get(String(a.workspaceId));
+          const prjObj = wsObj?.projectId ? localIndex.projectsById.get(String(wsObj.projectId)) : null;
+          const remoteMatch = /^remote:github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/i.exec(String(prjObj?.projectKey ?? ""));
+          workspaceMeta = {
+            labels: Array.isArray(wsObj?.labels) ? wsObj.labels : [],
+            projectName: prjObj?.customName || prjObj?.displayName || null,
+            projectRoot: prjObj?.rootPath || wsObj?.mainRepoRoot || null,
+            repo: remoteMatch?.[1] ?? null,
+            branch: wsObj?.branch ?? null
+          };
+        }
+        const row = paseoThread(a, id, known ? history?.entries ?? [] : [], known, {
+          planArtifactPath: known ? history?.planArtifactPath ?? null : null,
+          workspaceMeta
+        });
         row.meta.isLocalHost = Boolean(selfIsLocal && id === directory.self?.serverId);
         return row;
       });
@@ -422,4 +548,17 @@ export function createPaseoSource({ factory } = {}) {
       return out;
     }, factory);
   };
+}
+
+export async function archivePaseoAgent(config, serverId, agentId, factory) {
+  if (!config?.paseo?.enabled || !serverId || !agentId) return { ok: false, detail: "Paseo not configured." };
+  return withPaseo(config, async (client) => {
+    const api = await hostApi(client, serverId);
+    const ref = api.agents.ref(agentId);
+    if (typeof ref?.archive !== "function") {
+      return { ok: false, detail: "Paseo host does not support agent archive." };
+    }
+    await ref.archive();
+    return { ok: true, detail: "Archived in Paseo." };
+  }, factory);
 }

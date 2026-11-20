@@ -2,7 +2,7 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampTailLines, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -93,7 +93,9 @@ const NEED_YOU_PATTERNS = [
   /\bwithout your (?:go|approval|ok|okay|confirmation|sign-?off)\b/i,
   /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
   /(?<!\b(?:not|no longer|never)\s+)\bstill need your\b/i,
-  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i
+  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i,
+  /\b(?:hit|click|tap)\s+proceed\b/i,
+  /\blet me know your preference\b/i
 ];
 
 // The agent ended its turn saying it will keep going ("Next: wire the
@@ -409,7 +411,23 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
     });
   }
 
-  const ask = settled ? null : detectAsk(askText);
+  let ask = settled ? null : detectAsk(askText);
+  const proceedCall = !settled && Boolean(text) && (
+    thread.meta?.hasPlanArtifact === true
+    || /\b(?:hit|click|tap)\s+(?:\*\*)?proceed(?:\*\*)?\b/i.test(full)
+  );
+  if (!ask && proceedCall) {
+    ask = detectAsk(clampTailLines(full, 2600)) ?? {
+      kind: "needs-human",
+      topic: "decision",
+      options: ["Proceed", "later"],
+      text: clampText(stripMarkdown(closingSentences(full).at(-1) || "Plan ready — hit Proceed to execute."), 240)
+    };
+  }
+  if (ask && proceedCall && !(ask.options ?? []).some((opt) => /^proceed$/i.test(String(opt)))) {
+    const tailOpts = (ask.options ?? []).length ? ask.options : ["later"];
+    ask = { ...ask, options: ["Proceed", ...tailOpts].slice(0, 4) };
+  }
   // "Blocked on: your decision": the owner's, whatever else the list holds.
   // Its own answers beat a plain "your call" read from the same words; a
   // named topic (a merge, prod, creds) keeps the ask it came with.

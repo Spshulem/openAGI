@@ -5,6 +5,11 @@ struct TodayView: View {
     @Environment(\.appCanvas) private var canvas
     var onRevoked: () -> Void = {}
     @State private var settingsShown = false
+    @State private var showOlderOverdue = false
+
+    private var isUITesting: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    }
 
     var body: some View {
         NavigationStack {
@@ -12,28 +17,43 @@ struct TodayView: View {
                 Section {
                     AgentConnectionRow()
                 }
-                if !model.isOnPhone && !ProcessInfo.processInfo.arguments.contains("--ui-testing") {
+                if !model.isOnPhone && !isUITesting {
                     Section("OpenAGI Workspace") {
                         let cardsCount = model.latestFleetState.map { SupervisorFormat.resolvedCards($0).count } ?? 0
                         let runningCount = model.latestFleetState?.activeSummary?.running ?? 0
+                        let inboxCount = model.inboxBadgeCount
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Supervisor Workspace")
+                                Text("Coding Supervisor")
                                     .font(.subheadline.weight(.semibold))
                                 Text(cardsCount > 0
-                                     ? "\(cardsCount) decision\(cardsCount == 1 ? "" : "s") waiting · \(runningCount) running"
+                                     ? "\(cardsCount) coding decision\(cardsCount == 1 ? "" : "s") · \(runningCount) running"
                                      : "\(runningCount) active coding session\(runningCount == 1 ? "" : "s")")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button(cardsCount > 0 ? "Review" : "Open") {
+                            Button(cardsCount > 0 ? "Review (\(cardsCount))" : "Open") {
                                 model.workspaceChannel = cardsCount > 0 ? .needsYou : .general
                                 model.requestedChatThread = .supervisor
                                 model.selectedTab = .chat
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
+                        }
+                        if inboxCount > 0 {
+                            Button {
+                                model.selectedTab = .inbox
+                            } label: {
+                                HStack {
+                                    Label("\(inboxCount) agent approval\(inboxCount == 1 ? "" : "s") & question\(inboxCount == 1 ? "" : "s") in Inbox", systemImage: "tray.full")
+                                        .font(.caption.weight(.medium))
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
                 }

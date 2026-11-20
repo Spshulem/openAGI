@@ -614,7 +614,8 @@ function agentAskIntent(ctx) {
       mergeAsk: MERGE_TOPICS.has(ask.topic) || asksToMergePr(ask.text),
       // The body is only the ask sentence; the review needs what it is about.
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
-      agentAskedAt: thread.lastAgentAt ?? null
+      agentAskedAt: thread.lastAgentAt ?? null,
+      ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
     }
   };
 }
@@ -647,8 +648,16 @@ function resolveIntent(ctx, intent) {
   if (intent.type === "none") return { ...base, reason: intent.reason ?? base.reason };
   if (intent.type === "wait") return { ...base, action: "wait", reason: intent.reason, notBefore: intent.notBefore ?? null };
   if (intent.type === "escalate") return resolveEscalation(ctx, intent, base);
-  // Typing in the composer does not answer a card: it is asked whatever the owner does.
-  if (intent.type === "ask" && intent.card) return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: null };
+  // Typing in the composer does not answer a card, nor does an earlier user
+  // prompt suppress a fresh ask that the agent emitted AFTER the owner spoke.
+  const agentAskedAfterOwner = intent.type === "ask"
+    && ctx.thread?.agentStatus === "idle"
+    && Number.isFinite(Date.parse(ctx.thread?.lastAgentAt ?? ""))
+    && Number.isFinite(Date.parse(ctx.thread?.lastUserAt ?? ""))
+    && Date.parse(ctx.thread.lastAgentAt) > Date.parse(ctx.thread.lastUserAt);
+  if (intent.type === "ask" && (intent.card || agentAskedAfterOwner)) {
+    return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: intent.notBefore ?? null };
+  }
   // The owner typing into this thread outranks anything that touches it.
   const ownerUntil = ctx.ownerPush ? null : ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
@@ -860,7 +869,8 @@ function ownerHoldDecision(ctx, decision, hold) {
       ...question(ctx, `${facts.label}: waits on your go. OK?`, `${facts.prRef} at ${facts.head}: the agent answered and waits on you.${agent} Left: ${left || "nothing"}.`,
         ["go ahead", "wait"], dedupeKey, "agent-ask"),
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
-      agentAskedAt: thread.lastAgentAt ?? null
+      agentAskedAt: thread.lastAgentAt ?? null,
+      ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
     }
   };
 }

@@ -1327,3 +1327,183 @@ test("OpenAGI-native project/theme organization works without Paseo, preserves p
   assert.equal(delRes.status, 200);
   assert.equal(delRes.body.deleted, true);
 });
+
+test("completion & Proceed plan cards, oai-mem-citation cleanup, and junk-folder project aliasing", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-completion-ux-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  let archivedIds = [];
+  const fakePaseoFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+    agents: {
+      list: async () => ({
+        entries: [
+          {
+            agent: {
+              id: "plan-agent-1",
+              title: "Supervisor roadmap & audit",
+              provider: "antigravity",
+              status: "idle",
+              cwd: "/home/dev/paseo/worktrees/openAGI/amman",
+              workspaceId: "wks_f7143ae5747f958b",
+              requiresAttention: false,
+              lastUserMessageAt: "2026-11-20T03:56:00Z",
+              updatedAt: "2026-11-20T04:03:20Z"
+            }
+          },
+          {
+            agent: {
+              id: "done-agent-2",
+              title: "SEO skills audit",
+              provider: "codex",
+              status: "idle",
+              cwd: "/Volumes/Xtra/codex-worktrees/6baf",
+              workspaceId: "wks_6ff24b2c6fd8058f",
+              labels: { "migration.originalCwd": "/Users/owner/Dev/webapp-client", theme: "seo" },
+              requiresAttention: true,
+              attentionReason: "finished",
+              lastUserMessageAt: "2026-11-20T03:49:00Z",
+              updatedAt: "2026-11-20T03:52:26Z"
+            }
+          },
+          {
+            agent: {
+              id: "err-agent-3",
+              title: "YouTube content strategy",
+              provider: "claude",
+              status: "idle",
+              cwd: "/home/dev/.paseo/imported-history",
+              workspaceId: "wks_b382aa8ff3a3a9bf",
+              labels: { theme: "marketing" },
+              requiresAttention: true,
+              attentionReason: "error",
+              lastUserMessageAt: "2026-11-20T02:00:00Z",
+              updatedAt: "2026-11-20T02:05:00Z"
+            }
+          }
+        ],
+        pageInfo: { hasMore: false, nextCursor: null }
+      }),
+      ref: (id) => ({
+        archive: async () => { archivedIds.push(id); },
+        timeline: {
+          refetch: async () => {
+            if (id === "plan-agent-1") {
+              const longAudit = Array.from({ length: 12 }, (_, i) => `Section ${i + 1}: Verified subsystem health and metrics across nodes.`).join("\n\n");
+              return {
+                agent: {
+                  id,
+                  title: "Supervisor roadmap & audit",
+                  provider: "antigravity",
+                  status: "idle",
+                  cwd: "/home/dev/paseo/worktrees/openAGI/amman",
+                  workspaceId: "wks_f7143ae5747f958b",
+                  updatedAt: "2026-11-20T04:03:20Z"
+                },
+                entries: [
+                  { timestamp: "2026-11-20T03:56:00Z", item: { type: "user_message", text: "What's left to build?" } },
+                  { timestamp: "2026-11-20T04:02:59Z", item: { type: "tool_call", name: "write_file", detail: { input: { Path: "/home/dev/.gemini/antigravity-cli/brain/abc-123/roadmap_plan.md" } } } },
+                  { timestamp: "2026-11-20T04:03:20Z", item: { type: "assistant_message", text: `${longAudit}\n\nHit **Proceed** on the plan and I'll build v0.0.82.` } }
+                ]
+              };
+            }
+            if (id === "done-agent-2") {
+              return {
+                agent: {
+                  id,
+                  title: "SEO skills audit",
+                  provider: "codex",
+                  status: "idle",
+                  cwd: "/Volumes/Xtra/codex-worktrees/6baf",
+                  workspaceId: "wks_6ff24b2c6fd8058f",
+                  labels: { "migration.originalCwd": "/Users/owner/Dev/webapp-client", theme: "seo" },
+                  requiresAttention: true,
+                  attentionReason: "finished",
+                  updatedAt: "2026-11-20T03:52:26Z"
+                },
+                entries: [
+                  { timestamp: "2026-11-20T03:49:00Z", item: { type: "user_message", text: "Check phone/SMS links" } },
+                  { timestamp: "2026-11-20T03:52:25Z", item: { type: "assistant_message", text: "Added call and SMS links throughout the footer.\n<oai-mem-citation> <citation_entries> rollout_summaries/secret.md </citation_entries> </oai-mem-citation>" } },
+                  { timestamp: "2026-11-20T03:52:26Z", item: { type: "assistant_message", text: "Added call and SMS links throughout the footer.\n<oai-mem-citation> <citation_entries> rollout_summaries/secret.md </citation_entries> </oai-mem-citation>" } }
+                ]
+              };
+            }
+            return {
+              agent: {
+                id,
+                title: "YouTube content strategy",
+                provider: "claude",
+                status: "idle",
+                cwd: "/home/dev/.paseo/imported-history",
+                workspaceId: "wks_b382aa8ff3a3a9bf",
+                labels: { theme: "marketing" },
+                requiresAttention: true,
+                attentionReason: "error",
+                updatedAt: "2026-11-20T02:05:00Z"
+              },
+              entries: [
+                { timestamp: "2026-11-20T02:00:00Z", item: { type: "user_message", text: "Generate outline" } },
+                { timestamp: "2026-11-20T02:05:00Z", item: { type: "error", message: "API Error 400: unknown model provider" } }
+              ]
+            };
+          }
+        }
+      })
+    }
+  });
+
+  const sup = new FleetSupervisor({
+    dataDir: tmpDir,
+    config: {
+      enabled: true,
+      mode: "observe",
+      paseo: { enabled: true, only: true, url: "ws://127.0.0.1:6767/ws", projectsDir: false }
+    },
+    deps: {
+      now: () => Date.parse("2026-11-20T04:05:00Z"),
+      paseoFactory: fakePaseoFactory
+    }
+  });
+
+  await sup.tick();
+  const state = sup.getState();
+
+  // 1. Plan Ready / Proceed card surfaced for Antigravity brain plan artifact!
+  const planCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.plan-agent-1");
+  assert.ok(planCard, "expected Plan Ready card for plan-agent-1");
+  assert.equal(planCard.kindLabel, "Plan Ready");
+  assert.equal(planCard.primaryAction.label, "Proceed");
+  assert.equal(planCard.project, "openAGI");
+
+  // 2. Finished session surfaced as "Finished · Review" (NOT dropped as idle-no-pr!),
+  //    junk hash folder "6baf" ignored in favor of migration.originalCwd ("webapp-client"),
+  //    and <oai-mem-citation> + duplicate messages stripped!
+  const doneCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2");
+  assert.ok(doneCard, "expected Finished · Review card for done-agent-2");
+  assert.equal(doneCard.kind, "completed");
+  assert.equal(doneCard.kindLabel, "Finished · Review");
+  assert.equal(doneCard.project, "webapp-client");
+  assert.ok(!String(doneCard.agentSummary ?? "").includes("oai-mem-citation"), "oai-mem-citation must be stripped");
+  assert.equal(doneCard.recentMessages.filter((m) => m.role === "assistant").length, 1, "consecutive duplicate assistant messages must be deduplicated");
+
+  // 3. Error session surfaced as "Session Error" and "imported-history" ignored in favor of theme ("marketing")!
+  const errCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.err-agent-3");
+  assert.ok(errCard, "expected Session Error card for err-agent-3");
+  assert.equal(errCard.kindLabel, "Session Error");
+  assert.equal(errCard.project, "marketing");
+
+  // 4. Aliasing "webapp-client" -> "MainProduct" updates card & thread project everywhere
+  sup.upsertProject({ name: "MainProduct", alias: "webapp-client" });
+  const aliasedState = sup.getState();
+  assert.equal(aliasedState.cards.find((c) => c.id === doneCard.id).project, "MainProduct");
+  assert.equal(aliasedState.snapshot.threads.find((r) => r.key === "paseo:srv_bb3.done-agent-2").project, "MainProduct");
+
+  // 5. Clicking "Archive" on doneCard archives in Paseo AND marks completion reviewed across future ticks!
+  const actRes = await sup.actCard(doneCard.id, { op: "answer", value: "Archive" });
+  assert.equal(actRes.ok, true);
+  assert.deepEqual(archivedIds, ["done-agent-2"]);
+  await sup.tick();
+  assert.equal(sup.getState().cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2"), undefined, "reviewed completion stays closed on next scan");
+});

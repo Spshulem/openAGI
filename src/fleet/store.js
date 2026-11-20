@@ -80,13 +80,15 @@ function emptyState() {
     fixCommands: {},
     selfSessions: [],
     preferences: defaultPreferences(),
-    organization: { projects: [], threadAssignments: {} }
+    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} }
   };
 }
 
 const ORG_PROJECTS_MAX = 60;
 const ORG_THEMES_MAX = 24;
 const ORG_ASSIGNMENTS_MAX = 400;
+const ORG_ALIASES_MAX = 120;
+const ORG_REVIEWED_MAX = 500;
 
 function slugifyOrgName(raw) {
   return String(raw ?? "")
@@ -99,7 +101,7 @@ function slugifyOrgName(raw) {
 }
 
 function normalizeOrganization(raw) {
-  const out = { projects: [], threadAssignments: {} };
+  const out = { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} };
   if (!isObject(raw)) return out;
   const seenProjects = new Set();
   if (Array.isArray(raw.projects)) {
@@ -142,6 +144,20 @@ function normalizeOrganization(raw) {
         theme,
         updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : null
       };
+    }
+  }
+  if (isObject(raw.projectAliases)) {
+    for (const [aliasKey, canonical] of Object.entries(raw.projectAliases).slice(0, ORG_ALIASES_MAX)) {
+      const cleanAlias = slugifyOrgName(aliasKey);
+      const cleanTarget = clampText(String(canonical ?? "").trim().replace(/^#/, ""), 80);
+      if (!cleanAlias || !cleanTarget || cleanAlias === "general") continue;
+      out.projectAliases[cleanAlias] = cleanTarget;
+    }
+  }
+  if (isObject(raw.reviewedCompletions)) {
+    for (const [tKey, stamp] of Object.entries(raw.reviewedCompletions).slice(-ORG_REVIEWED_MAX)) {
+      if (!tKey || typeof stamp !== "string" || !Number.isFinite(Date.parse(stamp))) continue;
+      out.reviewedCompletions[tKey] = stamp;
     }
   }
   return out;
@@ -1331,8 +1347,63 @@ export class FleetStore {
       projects: org.projects.map((p) => ({ ...p, themes: p.themes.map((t) => ({ ...t })) })),
       threadAssignments: Object.fromEntries(
         Object.entries(org.threadAssignments).map(([k, v]) => [k, { ...v }])
-      )
+      ),
+      projectAliases: { ...org.projectAliases },
+      reviewedCompletions: { ...org.reviewedCompletions }
     };
+  }
+
+  projectAliases() {
+    return { ...(this.state.organization?.projectAliases ?? {}) };
+  }
+
+  projectAlias(rawName) {
+    const slug = slugifyOrgName(rawName);
+    if (!slug) return null;
+    return this.state.organization?.projectAliases?.[slug] ?? null;
+  }
+
+  setProjectAlias(aliasName, canonicalName) {
+    const aliasSlug = slugifyOrgName(aliasName);
+    if (!aliasSlug || aliasSlug === "general") throw new Error("Pass a valid project alias.");
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const cleanTarget = clampText(String(canonicalName ?? "").trim().replace(/^#/, ""), 80);
+    if (!cleanTarget || slugifyOrgName(cleanTarget) === aliasSlug) {
+      delete this.state.organization.projectAliases[aliasSlug];
+      this._save();
+      return null;
+    }
+    this.state.organization.projectAliases[aliasSlug] = cleanTarget;
+    const keys = Object.keys(this.state.organization.projectAliases);
+    if (keys.length > ORG_ALIASES_MAX) {
+      delete this.state.organization.projectAliases[keys[0]];
+    }
+    try {
+      this.upsertProject({ name: cleanTarget });
+    } catch {
+      this._save();
+    }
+    return { alias: aliasSlug, target: cleanTarget };
+  }
+
+  reviewedCompletionAt(threadKey) {
+    if (!threadKey) return 0;
+    const stamp = this.state.organization?.reviewedCompletions?.[threadKey];
+    return stamp ? toMs(stamp, 0) : 0;
+  }
+
+  markCompletionReviewed(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const stamp = iso(toMs(at, this.now()));
+    this.state.organization.reviewedCompletions[key] = stamp;
+    const keys = Object.keys(this.state.organization.reviewedCompletions);
+    if (keys.length > ORG_REVIEWED_MAX) {
+      delete this.state.organization.reviewedCompletions[keys[0]];
+    }
+    this._save();
+    return stamp;
   }
 
   threadAssignment(threadKey) {

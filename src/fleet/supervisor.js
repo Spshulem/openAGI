@@ -31,7 +31,7 @@ import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISION
 import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } from "./themes.js";
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
-import { createPaseoSource, hostApi, paseoThread, withPaseo } from "./sources/paseo.js";
+import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, withPaseo } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -198,7 +198,10 @@ const GROUPED_KINDS = Object.freeze({
 });
 // A question card item is the agent's own words, read from the card itself:
 // the review never closes or rewrites one either.
-export const SELF_FINDING_KINDS = new Set(["self-fix", "suggestion", "open", "deliver", "stuck", "paused", "storage", "agent-card"]);
+export const SELF_FINDING_KINDS = new Set(["self-fix", "suggestion", "open", "deliver", "stuck", "paused", "storage", "agent-card", "completed", "session-error"]);
+function bypassesBackgroundReview(question) {
+  return SELF_FINDING_KINDS.has(question?.kind) || question?.meta?.hasPlanArtifact === "true";
+}
 // The owner's Scan now reviews at most this many batches (15 questions each).
 const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
@@ -546,7 +549,7 @@ const MUTE_HOURS_DEFAULT = 24;
 // The asks the owner may answer in their own words: one thread's own
 // question, a stuck thread, a ready-to-merge ask. Not a card only the app
 // takes, a permission prompt, or a group.
-const REPLY_KINDS = new Set(["agent-ask", "stuck", "ready"]);
+const REPLY_KINDS = new Set(["agent-ask", "stuck", "ready", "completed", "session-error"]);
 export const REPLY_MAX = 2000;
 
 // questionView's risky flag: a release, deploy, delete or merge ask.
@@ -1041,13 +1044,15 @@ export class FleetSupervisor {
         }
       }
     };
+    const projectAliases = store.projectAliases?.() ?? null;
     const deck = buildSupervisorDeck(baseState, {
       preferences: store.preferences(),
       now: this.now(),
       threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
       prsByKey: this.lastPrs,
       knownRows: this.knownRows,
-      blockingResolver
+      blockingResolver,
+      projectAliases
     });
     return { ...baseState, ...deck };
   }
@@ -1056,7 +1061,10 @@ export class FleetSupervisor {
     const key = questionView?.threadKey ?? null;
     const row = key ? rows.get(key) ?? null : null;
     const thread = key ? (this.lastThreads.get(key) ?? this.knownThreads.get(key) ?? null) : null;
-    const project = deriveCardProject({ project: questionView?.project ?? null, repo: row?.repo ?? thread?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? null }, thread ?? row);
+    const rawOverride = key ? this.store?.threadAssignment?.(key) ?? null : null;
+    const projectAliases = this.store?.projectAliases?.() ?? null;
+    const orgOverride = (rawOverride || projectAliases) ? { ...(rawOverride ?? {}), projectAliases } : null;
+    const project = deriveCardProject({ project: questionView?.project ?? null, repo: row?.repo ?? thread?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? null }, thread ?? row, orgOverride);
     const actorLabel = deriveActorLabel(row, thread);
     const subchannel = deriveSubchannel(row, thread, project);
     const impact = computeBlockingImpact({
@@ -1235,7 +1243,9 @@ export class FleetSupervisor {
       const canPush = preview?.action === "nudge" && preview.message && !muted && !pending
         && !this.ownerAnswerThreads(Infinity).has(row.key) && !repeatsLastSend(thread, this.store.ledgerFor(row.key), preview.messageHash);
       const actorLabel = row.actorLabel ?? deriveActorLabel(row, thread);
-      const orgOverride = this.store?.threadAssignment?.(row.key) ?? null;
+      const rawOverride = this.store?.threadAssignment?.(row.key) ?? null;
+      const projectAliases = this.store?.projectAliases?.() ?? null;
+      const orgOverride = (rawOverride || projectAliases) ? { ...(rawOverride ?? {}), projectAliases } : null;
       const project = deriveCardProject(
         { repo: row.repo ?? thread?.repo ?? null, workspace: row.workspace ?? thread?.workspace ?? null, project: row.project ?? null, cwd: row.cwd ?? null },
         thread ?? row,
@@ -1329,6 +1339,12 @@ export class FleetSupervisor {
       return closed;
     }
     this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "dismiss", question, answer: "dismiss", now: this.now() }));
+    if (["completed", "session-error"].includes(question.kind) && question.threadKey) {
+      this.store.markCompletionReviewed(
+        question.threadKey,
+        question.contextSnapshot?.lastAgentAt ?? question.lastAskedAt ?? question.createdAt ?? this.now()
+      );
+    }
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     const dismissed = this.store.dismissQuestion(id);
@@ -1933,6 +1949,31 @@ export class FleetSupervisor {
     try {
       let delivery = null;
       const settling = [];
+      // Completed / session-error review cards: "Mark done" marks the turn
+      // reviewed in OpenAGI; "Archive" also archives the Paseo session.
+      if (["completed", "session-error"].includes(question.kind)) {
+        if (question.threadKey) {
+          this.store.markCompletionReviewed(
+            question.threadKey,
+            question.contextSnapshot?.lastAgentAt ?? question.lastAskedAt ?? question.createdAt ?? this.now()
+          );
+        }
+        if (String(answer).toLowerCase() === "archive" && String(question.threadKey ?? "").startsWith("paseo:")) {
+          const parsed = parsePaseoThreadKey(question.threadKey);
+          if (parsed) {
+            try {
+              const archRes = await archivePaseoAgent(this.config, parsed.serverId, parsed.agentId, this.deps.paseoFactory);
+              delivery = {
+                status: "sent",
+                route: "paseo-archive",
+                detail: archRes?.ok ? "Archived in OpenAGI and Paseo." : `Marked done in OpenAGI (${archRes?.detail || "Paseo archive unavailable"}).`
+              };
+            } catch {
+              delivery = { status: "sent", route: "paseo-archive", detail: "Marked done in OpenAGI." };
+            }
+          }
+        }
+      }
       // A tap on one of a permission card's buttons clicks that button in
       // the thread (the card the question was raised for: its stateId).
       if (question.kind === "prompt" && question.threadKey && !["later", "opened"].includes(answer)) {
@@ -2173,6 +2214,15 @@ export class FleetSupervisor {
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    if (delivery.status === "sent") {
+      this.store.markCompletionReviewed(thread.key, this.now());
+      for (const q of this.store.openQuestions()) {
+        if (["completed", "session-error"].includes(q.kind) && q.threadKey === thread.key) {
+          this.store.answerQuestion(q.id, text);
+          this.resolveOutreach(q, "reply", "acted");
+        }
+      }
+    }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
@@ -2365,8 +2415,11 @@ export class FleetSupervisor {
     return this.store.organization();
   }
 
-  upsertProject({ name, theme = null } = {}) {
+  upsertProject({ name, theme = null, alias = null } = {}) {
     const project = this.store.upsertProject({ name, theme });
+    if (typeof alias === "string" && alias.trim()) {
+      this.store.setProjectAlias(alias, project.name);
+    }
     this.emitFleet("organization-updated");
     return { project, organization: this.store.organization() };
   }
@@ -2872,10 +2925,12 @@ export class FleetSupervisor {
     const assistantActor = deriveActorLabel(row, thread);
     const annotate = (conv) => {
       if (!conv || !Array.isArray(conv.messages)) return conv;
+      const cleaned = dedupeConsecutiveMessages(conv.messages);
       return {
         ...conv,
-        messages: conv.messages.map((m) => ({
+        messages: cleaned.map((m) => ({
           ...m,
+          text: stripAgentInternalMarkup(m.text),
           actor: m.actor ?? (m.role === "assistant" ? assistantActor : (String(m.text ?? "").startsWith(SUPERVISOR_PREFIX) ? "Supervisor" : "You"))
         }))
       };
@@ -3128,7 +3183,7 @@ export class FleetSupervisor {
       paseoOnly ? [] : guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       paseoOnly ? [] : guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
       paseoOnly ? [] : guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
-      guard("paseo", () => (d.listPaseoThreads ?? (this.paseoSource ??= createPaseoSource()))(config), []),
+      guard("paseo", () => (d.listPaseoThreads ?? (this.paseoSource ??= createPaseoSource({ factory: d.paseoFactory })))(config), []),
       paseoOnly ? [] : guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
       paseoOnly ? [] : guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
       paseoOnly || this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
@@ -3917,6 +3972,47 @@ export class FleetSupervisor {
       ...(decision.action === "ask-user" && decision.question ? [decision] : []),
       ...(decision.cardQuestion ? [{ ...decision, action: "ask-user", question: decision.cardQuestion, playbook: null }] : [])
     ]);
+    // Surface unreviewed session completions and errors ("a chat isn't done
+    // until marked done or archived") whenever Paseo flags requiresAttention
+    // ("finished" / "error") or completionCards is explicitly enabled.
+    const askedThreadKeys = new Set(asks.flatMap((a) => [a.threadKey, ...(a.question?.threadKeys ?? [])]).filter(Boolean));
+    for (const { thread, classified } of items) {
+      if (!thread?.key || thread.excluded || thread.archived) continue;
+      if (askedThreadKeys.has(thread.key) || store.mutedUntil(thread.key)) continue;
+      if (classified.state === "running" || classified.state === "waiting-ci") continue;
+      const attnReason = thread.meta?.requiresAttention === true ? String(thread.meta?.attentionReason ?? "") : "";
+      const isPaseoAttention = attnReason === "finished" || attnReason === "error";
+      const isConfiguredCompletion = this.config?.completionCards === true
+        && ["idle-no-pr", "done"].includes(classified.state)
+        && Boolean(thread.lastAgentAt && (!thread.lastUserAt || Date.parse(thread.lastAgentAt) >= Date.parse(thread.lastUserAt)));
+      if (!isPaseoAttention && !isConfiguredCompletion) continue;
+      const bodySource = stripAgentInternalMarkup(thread.error?.text || thread.lastAgentFull || thread.lastAgentText || "");
+      if (!bodySource) continue;
+      const stampIso = thread.lastAgentAt || thread.lastActivityAt || null;
+      const stampMs = Date.parse(stampIso ?? "") || 0;
+      const reviewedMs = store.reviewedCompletionAt(thread.key);
+      if (reviewedMs > 0 && stampMs > 0 && reviewedMs >= stampMs - 500) continue;
+      const isErr = attnReason === "error" || Boolean(thread.error);
+      const qKind = isErr ? "session-error" : "completed";
+      const label = clampText(redactSecrets(thread.title || thread.workspace || thread.key), 72);
+      const isPaseo = String(thread.key).startsWith("paseo:");
+      asks.push({
+        threadKey: thread.key,
+        action: "ask-user",
+        playbook: null,
+        question: {
+          kind: qKind,
+          dedupeKey: `${qKind}:${thread.key}:${stampIso || "latest"}`,
+          threadKey: thread.key,
+          prRef: thread.prRefs?.[0] ?? null,
+          title: isErr ? `${label}: session hit an error` : `${label}: finished — review & archive?`,
+          body: clampTailLines(redactSecrets(bodySource), 900),
+          options: isPaseo ? ["Mark done", "Archive", "later"] : ["Mark done", "later"],
+          ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
+        }
+      });
+      askedThreadKeys.add(thread.key);
+    }
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
@@ -4036,7 +4132,9 @@ export class FleetSupervisor {
     }
     // The supervisor reviews its own list before a new question reaches the
     // owner, so junk never pings; the main does not see it before then either.
-    this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
+    this.awaitingReview = this.config.review?.enabled
+      ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id) && !bypassesBackgroundReview(store.question(id))))
+      : new Set();
     let unsettled = new Set();
     try {
       // A scan the idle watcher started is for sends: the review waits for

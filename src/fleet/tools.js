@@ -581,8 +581,9 @@ export function registerFleetTools(registry, supervisor) {
       type: "object",
       properties: {
         action: { type: "string", enum: ["upsert_project", "assign_thread", "delete_project"], description: "Whether to create/update a project/theme, assign a thread to a project/theme, or delete a custom project" },
-        project: { type: "string", maxLength: 80, description: "Project name (e.g. 'openAGI', 'Marketing', 'bb-recorder')" },
+        project: { type: "string", maxLength: 80, description: "Project name (e.g. 'openAGI', 'Marketing', 'WebApp')" },
         theme: { type: "string", maxLength: 80, description: "Optional theme/subchannel inside the project (e.g. 'Mobile', 'SEO', 'CI')" },
+        alias: { type: "string", maxLength: 80, description: "Optional legacy folder/repo alias to merge into this project (e.g. alias='web-client' into project='WebApp')" },
         threadKey: { type: "string", maxLength: KEY_MAX, description: "Required for action='assign_thread': the session key to organize" }
       },
       required: ["action"],
@@ -592,27 +593,29 @@ export function registerFleetTools(registry, supervisor) {
       const action = String(args?.action ?? "").trim();
       const project = typeof args?.project === "string" ? args.project.trim().slice(0, 80) : null;
       const theme = typeof args?.theme === "string" ? args.theme.trim().slice(0, 80) : null;
+      const alias = typeof args?.alias === "string" ? args.alias.trim().slice(0, 80) : null;
       const threadKey = typeof args?.threadKey === "string" ? args.threadKey.trim().slice(0, KEY_MAX) : null;
       if (action === "upsert_project" && !project) throw new Error("Pass a project name.");
       if (action === "delete_project" && !project) throw new Error("Pass a project name or id to delete.");
       if (action === "assign_thread" && !threadKey) throw new Error("Pass threadKey to organize.");
-      return { action, ...(project ? { project } : {}), ...(theme ? { theme } : {}), ...(threadKey ? { threadKey } : {}) };
+      return { action, ...(project ? { project } : {}), ...(theme ? { theme } : {}), ...(alias ? { alias } : {}), ...(threadKey ? { threadKey } : {}) };
     },
     approvalTtlMs: 10 * 60_000,
-    approvalDedupeKey: (args, context) => `fleet-org:${digest([context?.sessionId ?? null, args.action, args.project ?? null, args.theme ?? null, args.threadKey ?? null])}`,
+    approvalDedupeKey: (args, context) => `fleet-org:${digest([context?.sessionId ?? null, args.action, args.project ?? null, args.theme ?? null, args.alias ?? null, args.threadKey ?? null])}`,
     summarize: (args) => {
       if (args.action === "delete_project") return `Delete OpenAGI project "${args.project}"`;
       if (args.action === "assign_thread") {
         const dest = [args.project, args.theme].filter(Boolean).join(" / ") || "auto";
         return `Assign session ${args.threadKey} to ${dest}`;
       }
+      if (args.alias) return `Merge alias "${args.alias}" into OpenAGI project "${args.project}"`;
       return `Create OpenAGI project "${args.project}"${args.theme ? ` / ${args.theme}` : ""}`;
     },
     handler: async (args, context) => {
       if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
       if (args.action === "delete_project") return supervisor.deleteProject(args.project);
       if (args.action === "assign_thread") return supervisor.organizeThread(args.threadKey, { project: args.project ?? null, theme: args.theme ?? null });
-      return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null });
+      return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null, alias: args.alias ?? null });
     }
   });
 }

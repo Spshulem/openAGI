@@ -350,12 +350,15 @@ final class FleetConsumer: ObservableObject {
   }
 
   @discardableResult
-  func upsertProject(name: String, theme: String? = nil) async -> Bool {
+  func upsertProject(name: String, theme: String? = nil, alias: String? = nil) async -> Bool {
     let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanName.isEmpty else { return false }
     var payload: [String: Any] = ["name": cleanName]
     if let cleanTheme = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanTheme.isEmpty {
       payload["theme"] = cleanTheme
+    }
+    if let cleanAlias = alias?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanAlias.isEmpty {
+      payload["alias"] = cleanAlias
     }
     var req = request(path: "/fleet/api/projects", method: "POST", timeout: 15)
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")

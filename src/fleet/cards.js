@@ -25,6 +25,9 @@ const OPTION_LABELS = Object.freeze({
   retry: "Retry",
   restart: "Restart app",
   done: "Done",
+  "mark done": "Mark Done",
+  archive: "Archive",
+  proceed: "Proceed",
   opened: "Opened",
   "open thread": "Open chat",
   "keep going": "Keep going",
@@ -85,6 +88,15 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
   }
   if (question.kind === "stuck" && (ciState === "FAILURE" || ciState === "ERROR")) {
     return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
+  }
+  if (question.kind === "completed") {
+    return { kind: "completed", kindLabel: "Finished · Review", rank: 2 };
+  }
+  if (question.kind === "session-error") {
+    return { kind: "blocker", kindLabel: "Session Error", rank: 1 };
+  }
+  if (question.meta?.hasPlanArtifact || (Array.isArray(question.options) && question.options.some((o) => /^proceed$/i.test(String(o))))) {
+    return { kind: "approval", kindLabel: "Plan Ready", rank: 0 };
   }
   if (["prompt", "agent-ask", "agent-card", "self-fix"].includes(question.kind)) {
     return { kind: "approval", kindLabel: "Needs Decision", rank: 1 };
@@ -923,50 +935,89 @@ export function buildCatchUpSummary(cards = [], activeSummary = null) {
   return "All clear—no coding sessions need you right now.";
 }
 
+const JUNK_PROJECT_NAMES = new Set([
+  "general", "workspace", "workspaces", "worktree", "worktrees", "codex-worktrees",
+  "imported-history", "imported history", "history", "tmp", "temp", "private", "var",
+  "folders", "outputs", "migrated", "mac", "users", "home", "dev", "documents",
+  "downloads", "desktop", "repos", "projects", "code", "src", "main", "master", "smoke"
+]);
+
+function isJunkProjectToken(token) {
+  const clean = String(token ?? "").trim();
+  if (!clean) return true;
+  const lower = clean.toLowerCase();
+  if (JUNK_PROJECT_NAMES.has(lower)) return true;
+  if (OPAQUE_SESSION_ID_RE.test(clean)) return true;
+  if (/^\d{3,8}$/.test(clean)) return true;
+  if (/^[0-9a-f]{4,16}$/i.test(clean)) return true;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) return true;
+  return false;
+}
+
+function applyProjectAlias(name, aliases = null) {
+  const clean = String(name ?? "").trim().replace(/^#/, "");
+  if (!clean) return "general";
+  if (aliases && typeof aliases === "object") {
+    const slug = clean.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (slug && typeof aliases[slug] === "string" && aliases[slug].trim()) {
+      return aliases[slug].trim();
+    }
+  }
+  return clean;
+}
+
 function extractProjectFromPath(rawPath) {
   const clean = String(rawPath ?? "").trim().replace(/\/+$/, "");
   if (!clean) return null;
   const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/.exec(clean)
     ?? /\/conductor\/workspaces\/([^/]+)\/([^/]+)/.exec(clean)
     ?? /\/([^/]+)\/\.conductor\/([^/]+)/.exec(clean);
-  if (wtMatch?.[1]) return wtMatch[1];
+  if (wtMatch?.[1] && !isJunkProjectToken(wtMatch[1])) return wtMatch[1];
   const repoMatch = /\/conductor\/repos\/([^/]+)/.exec(clean)
-    ?? /\/codex-worktrees\/[0-9a-f]+\/([^/]+)/i.exec(clean)
+    ?? /\/codex-worktrees\/[0-9a-f_-]+\/([^/]+)/i.exec(clean)
     ?? /(?:\/Users\/[^/]+|\/home\/[^/]+)\/(?:Dev|Developer|Code|Projects|Repos)\/([^/]+)/i.exec(clean);
-  if (repoMatch?.[1]) return repoMatch[1];
-  if (/\/imported history(?:\/|$)/i.test(clean)) return null;
+  if (repoMatch?.[1] && !isJunkProjectToken(repoMatch[1])) return repoMatch[1];
+  if (/\/imported[- ]history(?:\/|$)/i.test(clean)) return null;
   const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
-  if (!base || base === "Workspace" || base === "workspace" || OPAQUE_SESSION_ID_RE.test(base) || /^\d{3,6}$/.test(base)) {
+  if (!base || isJunkProjectToken(base)) {
     return null;
   }
   return base;
 }
 
 export function deriveCardProject(card = null, thread = null, orgOverride = null) {
+  const aliases = orgOverride?.projectAliases ?? null;
   const overrideProj = typeof orgOverride?.project === "string" ? orgOverride.project.trim().replace(/^#/, "") : "";
-  if (overrideProj && overrideProj.toLowerCase() !== "general") return overrideProj;
+  if (overrideProj && overrideProj.toLowerCase() !== "general") return applyProjectAlias(overrideProj, aliases);
   const explicit = typeof card?.project === "string" ? card.project.trim().replace(/^#/, "") : "";
-  if (explicit && explicit.toLowerCase() !== "general") return explicit;
-  const repo = String(card?.repo ?? thread?.repo ?? "").trim();
-  if (repo) {
-    const seg = repo.split("/").filter(Boolean).at(-1);
-    if (seg) return seg;
-  }
-  const paseoProjectName = String(thread?.meta?.paseoProjectName ?? "").trim();
-  if (paseoProjectName && !/imported history/i.test(paseoProjectName) && !/^\d{3,6}$/.test(paseoProjectName) && !OPAQUE_SESSION_ID_RE.test(paseoProjectName)) {
-    return paseoProjectName;
-  }
-  for (const candidate of [thread?.cwd, thread?.meta?.paseoProjectRoot, thread?.meta?.paseoCwd, card?.cwd, card?.workspace, thread?.workspace]) {
-    const extracted = extractProjectFromPath(candidate);
-    if (extracted) return extracted;
-  }
+  if (explicit && !isJunkProjectToken(explicit)) return applyProjectAlias(explicit, aliases);
   const rawLabels = Array.isArray(thread?.meta?.paseoLabels) ? thread.meta.paseoLabels : [];
   for (const label of rawLabels) {
     const slash = String(label ?? "").indexOf("/");
     if (slash > 0) {
       const prefix = String(label).slice(0, slash).trim();
-      if (prefix && prefix.toLowerCase() !== "general" && prefix.toLowerCase() !== "history") return prefix;
+      if (prefix && !isJunkProjectToken(prefix) && prefix.toLowerCase() !== "infrastructure") {
+        return applyProjectAlias(prefix, aliases);
+      }
     }
+  }
+  const repo = String(card?.repo ?? thread?.repo ?? "").trim();
+  if (repo) {
+    const seg = repo.split("/").filter(Boolean).at(-1);
+    if (seg && !isJunkProjectToken(seg)) return applyProjectAlias(seg, aliases);
+  }
+  const paseoProjectName = String(thread?.meta?.paseoProjectName ?? "").trim();
+  if (paseoProjectName && !isJunkProjectToken(paseoProjectName)) {
+    return applyProjectAlias(paseoProjectName, aliases);
+  }
+  const origCwd = thread?.meta?.agentLabels?.["migration.originalCwd"] ?? null;
+  for (const candidate of [thread?.cwd, thread?.meta?.paseoProjectRoot, thread?.meta?.paseoCwd, origCwd, card?.cwd, card?.workspace, thread?.workspace]) {
+    const extracted = extractProjectFromPath(candidate);
+    if (extracted) return applyProjectAlias(extracted, aliases);
+  }
+  const agentTheme = String(thread?.meta?.agentLabels?.theme ?? thread?.meta?.theme ?? "").trim();
+  if (agentTheme && !isJunkProjectToken(agentTheme) && agentTheme.toLowerCase() !== "misc") {
+    return applyProjectAlias(agentTheme, aliases);
   }
   return "general";
 }
@@ -1149,7 +1200,7 @@ export function computeBlockingImpact({
 
 export function buildSupervisorDeck(
   state,
-  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null } = {}
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null } = {}
 ) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
@@ -1158,6 +1209,7 @@ export function buildSupervisorDeck(
   for (const r of snapshot?.threads ?? []) if (r?.key) rowsByKey.set(r.key, r);
   const actions = Array.isArray(state?.actions) ? state.actions : [];
   const questions = Array.isArray(state?.questions) ? state.questions : [];
+  const aliasOverride = projectAliases ? { projectAliases } : null;
 
   const questionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
@@ -1167,7 +1219,7 @@ export function buildSupervisorDeck(
   const prefCards = buildProgressivePreferenceCards(prefs, { now });
   const cards = [...questionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
     ...card,
-    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null)
+    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null, aliasOverride)
   }));
 
   const activeSummary = buildActiveSummary(snapshot, cards);

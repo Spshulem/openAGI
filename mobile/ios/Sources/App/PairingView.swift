@@ -85,10 +85,20 @@ struct PairingView: View {
                             Text("Your saved server is \(savedServer.absoluteString). Reconnect with the saved pairing; you don't need a new code after a disconnection.")
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
-                        Button("Use a local or hosted model", systemImage: "iphone") { showingFallback = true }
+                        Button("Use a local or hosted model", systemImage: "apple.intelligence") { showingFallback = true }
                             .buttonStyle(.bordered)
-                        Text("Apple Intelligence chat works without a server on supported iPhones with Apple Intelligence enabled.")
+                        Text("Apple Intelligence chat works right on this iPhone without a server or API key.")
                             .font(.footnote).foregroundStyle(.secondary)
+                        ShareLink(
+                            item: URL(string: "https://github.com/Spshulem/openAGI/releases/latest")!,
+                            subject: Text("Download OpenAGI for Mac"),
+                            message: Text("Install OpenAGI on your Mac, then open Menu → Connect a phone:")
+                        ) {
+                            Label("Send Mac app download link to yourself", systemImage: "paperplane")
+                                .font(.footnote.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("pairing-share-mac-link")
                         VStack(alignment: .leading, spacing: 8) {
                             Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / Tailscale address", systemImage: "network") {
                                 discovery.start(addresses: [savedServer, TailscaleServerAddress.parse(serverText)].compactMap { $0 })

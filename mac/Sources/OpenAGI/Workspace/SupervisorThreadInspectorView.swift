@@ -492,73 +492,119 @@ struct SupervisorThreadInspectorView: View {
     }
   }
 
-  private var transcriptBody: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
-        if let q = resolvedQuestion, !q.body.isEmpty {
-          WorkspaceMarkdownContent(
-            blocks: WorkspaceMarkdownParser.parse(q.body),
-            bodyFont: WorkspaceTheme.Typography.secondary,
-            textColor: WorkspaceTheme.ink
-          )
-          .padding(WorkspaceTheme.Spacing.x3)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .workspaceCardSurface(cornerRadius: 12)
-        } else if let ev = resolvedActivity, let detail = ev.detail, !detail.isEmpty {
-          WorkspaceMarkdownContent(
-            blocks: WorkspaceMarkdownParser.parse(detail),
-            bodyFont: WorkspaceTheme.Typography.secondary,
-            textColor: WorkspaceTheme.ink
-          )
-          .padding(WorkspaceTheme.Spacing.x3)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .workspaceCardSurface(cornerRadius: 12)
-        } else if let task = resolvedTask, let desc = task.description ?? task.notes, !desc.isEmpty {
-          WorkspaceMarkdownContent(
-            blocks: WorkspaceMarkdownParser.parse(desc),
-            bodyFont: WorkspaceTheme.Typography.secondary,
-            textColor: WorkspaceTheme.ink
-          )
-          .padding(WorkspaceTheme.Spacing.x3)
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .workspaceCardSurface(cornerRadius: 12)
-        }
+  private static func sanitizeTranscriptText(_ raw: String) -> String {
+    raw
+      .replacingOccurrences(
+        of: #"<oai-mem-citation\b[\s\S]*?(?:</oai-mem-citation>|$)"#,
+        with: "",
+        options: [.regularExpression, .caseInsensitive]
+      )
+      .replacingOccurrences(
+        of: #"<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b[\s\S]*?(?:</(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)"#,
+        with: "",
+        options: [.regularExpression, .caseInsensitive]
+      )
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
 
-        if let key = directThreadKey {
-          if fleet.detailLoading.contains(key) && resolvedDetail?.conversation == nil {
-            HStack(spacing: 8) {
-              ProgressView().controlSize(.small)
-              Text("Loading live thread…")
+  private static func dedupedMessages(_ list: [FleetConversationMessage]) -> [FleetConversationMessage] {
+    var out: [FleetConversationMessage] = []
+    var prevNorm: String? = nil
+    var prevOwner: Bool? = nil
+    for msg in list {
+      let cleaned = sanitizeTranscriptText(msg.text)
+      guard !cleaned.isEmpty else { continue }
+      let norm = cleaned.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+      if prevOwner == msg.isOwner, prevNorm == norm {
+        continue
+      }
+      prevOwner = msg.isOwner
+      prevNorm = norm
+      out.append(msg)
+    }
+    return Array(out.suffix(40))
+  }
+
+  private var transcriptBody: some View {
+    ScrollViewReader { proxy in
+      ScrollView {
+        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+          if let q = resolvedQuestion, !q.body.isEmpty {
+            WorkspaceMarkdownContent(
+              blocks: WorkspaceMarkdownParser.parse(Self.sanitizeTranscriptText(q.body)),
+              bodyFont: WorkspaceTheme.Typography.secondary,
+              textColor: WorkspaceTheme.ink
+            )
+            .padding(WorkspaceTheme.Spacing.x3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .workspaceCardSurface(cornerRadius: 12)
+          } else if let ev = resolvedActivity, let detail = ev.detail, !detail.isEmpty {
+            WorkspaceMarkdownContent(
+              blocks: WorkspaceMarkdownParser.parse(Self.sanitizeTranscriptText(detail)),
+              bodyFont: WorkspaceTheme.Typography.secondary,
+              textColor: WorkspaceTheme.ink
+            )
+            .padding(WorkspaceTheme.Spacing.x3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .workspaceCardSurface(cornerRadius: 12)
+          } else if let task = resolvedTask, let desc = task.description ?? task.notes, !desc.isEmpty {
+            WorkspaceMarkdownContent(
+              blocks: WorkspaceMarkdownParser.parse(desc),
+              bodyFont: WorkspaceTheme.Typography.secondary,
+              textColor: WorkspaceTheme.ink
+            )
+            .padding(WorkspaceTheme.Spacing.x3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .workspaceCardSurface(cornerRadius: 12)
+          }
+
+          if let key = directThreadKey {
+            if fleet.detailLoading.contains(key) && resolvedDetail?.conversation == nil {
+              HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading live thread…")
+                  .font(.caption)
+                  .foregroundStyle(WorkspaceTheme.muted)
+              }
+            }
+            if let rawMessages = resolvedDetail?.conversation?.messages, !rawMessages.isEmpty {
+              let messages = Self.dedupedMessages(rawMessages)
+              ForEach(messages) { msg in
+                messageCard(
+                  speaker: msg.displaySpeaker,
+                  isOwner: msg.isOwner,
+                  atISO: msg.at,
+                  text: Self.sanitizeTranscriptText(msg.text)
+                )
+              }
+            } else if let excerpt = resolvedDetail?.lastAgentText ?? resolvedThread?.lastAgentText ?? resolvedQuestion?.displayAskContext,
+                      !excerpt.isEmpty {
+              messageCard(
+                speaker: actorText ?? "Agent",
+                isOwner: false,
+                atISO: resolvedThread?.lastAgentAt,
+                text: Self.sanitizeTranscriptText(excerpt)
+              )
+            } else if !fleet.detailLoading.contains(key) {
+              Text("No transcript turns loaded yet.")
                 .font(.caption)
                 .foregroundStyle(WorkspaceTheme.muted)
             }
           }
-          if let messages = resolvedDetail?.conversation?.messages, !messages.isEmpty {
-            ForEach(Array(messages.suffix(40))) { msg in
-              messageCard(
-                speaker: msg.displaySpeaker,
-                isOwner: msg.isOwner,
-                atISO: msg.at,
-                text: msg.text
-              )
-            }
-          } else if let excerpt = resolvedDetail?.lastAgentText ?? resolvedThread?.lastAgentText ?? resolvedQuestion?.displayAskContext,
-                    !excerpt.isEmpty {
-            messageCard(
-              speaker: actorText ?? "Agent",
-              isOwner: false,
-              atISO: resolvedThread?.lastAgentAt,
-              text: excerpt
-            )
-          } else if !fleet.detailLoading.contains(key) {
-            Text("No transcript turns loaded yet.")
-              .font(.caption)
-              .foregroundStyle(WorkspaceTheme.muted)
-          }
+          Color.clear.frame(height: 1).id("inspector-transcript-bottom")
         }
+        .padding(WorkspaceTheme.Spacing.x4)
+        .frame(maxWidth: .infinity, alignment: .leading)
       }
-      .padding(WorkspaceTheme.Spacing.x4)
-      .frame(maxWidth: .infinity, alignment: .leading)
+      .onAppear {
+        proxy.scrollTo("inspector-transcript-bottom", anchor: .bottom)
+      }
+      .onChange(of: directThreadKey) { _, _ in
+        proxy.scrollTo("inspector-transcript-bottom", anchor: .bottom)
+      }
+      .onChange(of: resolvedDetail?.conversation?.messages.last?.id) { _, _ in
+        proxy.scrollTo("inspector-transcript-bottom", anchor: .bottom)
+      }
     }
   }
 
