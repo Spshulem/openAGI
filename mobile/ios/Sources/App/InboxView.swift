@@ -31,15 +31,25 @@ struct InboxView: View {
                         ForEach(fleetCards) { card in
                             Button {
                                 model.requestedFocusCardID = card.id
+                                model.requestedOpenContextCardID = card.id
+                                model.requestedOpenThreadKey = card.threadKey ?? card.threadKeys.first
                                 model.requestedChatThread = .supervisor
                                 model.selectedTab = .chat
                             } label: {
                                 inboxRow(
                                     title: card.headline,
-                                    secondary: [card.project, card.kindLabel, card.prRef].compactMap { $0 }.joined(separator: " · ")
+                                    secondary: [card.project, card.kindLabel, card.prRef].compactMap { $0 }.joined(separator: " · "),
+                                    busy: busyActionIDs.contains(card.id)
                                 )
                             }
                             .accessibilityIdentifier("inbox-fleet-\(card.id)")
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button("Dismiss", systemImage: "xmark.circle") {
+                                    Task { await dismissFleetCard(card) }
+                                }
+                                .tint(.secondary)
+                                .disabled(busyActionIDs.contains(card.id))
+                            }
                         }
                     }
                 }
@@ -142,6 +152,23 @@ struct InboxView: View {
             await load(force: true)
         } catch {
             actionBanner = "Couldn't reach OpenAGI to update that approval."
+        }
+    }
+
+    private func dismissFleetCard(_ card: SupervisorCard) async {
+        guard !busyActionIDs.contains(card.id) else { return }
+        busyActionIDs.insert(card.id)
+        defer { busyActionIDs.remove(card.id) }
+        fleetCards.removeAll { $0.id == card.id }
+        do {
+            _ = try await model.client.fleetActCard(id: card.id, op: "dismiss", value: "dismiss")
+            actionBanner = "Dismissed notification: \(card.headline)"
+            await load(force: true)
+        } catch {
+            if let qid = card.questionId {
+                _ = try? await model.client.fleetDismiss(questionID: qid)
+            }
+            await load(force: true)
         }
     }
 

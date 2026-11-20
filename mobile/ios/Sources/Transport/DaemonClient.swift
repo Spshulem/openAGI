@@ -558,12 +558,14 @@ public actor DaemonClient {
     }
 
     public func fleetActCard(id: String, op: String, value: String? = nil,
+                             confirmed: Bool = false,
                              clarification: String? = nil, instructions: String? = nil,
                              images: [ChatAttachment] = []) async throws -> FleetCardActResult {
         guard !id.isEmpty, !id.contains("/") else { throw DaemonError.malformedResponse }
         var request = try authorizedRequest(path: "/fleet/api/cards/\(id)/act", method: "POST")
         var body: [String: Any] = ["op": op]
         if let value { body["value"] = value }
+        if confirmed { body["confirmed"] = true }
         if let clarification { body["clarification"] = clarification }
         if let instructions { body["instructions"] = instructions }
         let encodedImages = Self.encodedFleetImages(images)
@@ -573,6 +575,24 @@ public actor DaemonClient {
         request.timeoutInterval = 200
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(FleetCardActResult.self, from: data)
+    }
+
+    public func fleetUnarchiveThread(key: String) async throws -> FleetCardActResult {
+        guard key.range(of: #"^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
+            throw DaemonError.malformedResponse
+        }
+        var request = try authorizedRequest(path: "/fleet/api/threads/\(key)/unarchive", method: "POST")
+        request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        struct Response: Decodable {
+            let result: FleetCardActResult?
+            let state: FleetState?
+        }
+        let decoded = try Self.decodeJSON(Response.self, from: data)
+        var res = decoded.result ?? FleetCardActResult(ok: true, status: "unarchived_session", message: "Restored coding chat in Paseo.")
+        if res.state == nil { res.state = decoded.state }
+        return res
     }
 
     private static func encodedFleetImages(_ images: [ChatAttachment]) -> [[String: Any]] {

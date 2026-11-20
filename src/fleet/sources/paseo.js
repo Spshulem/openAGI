@@ -562,3 +562,19 @@ export async function archivePaseoAgent(config, serverId, agentId, factory) {
     return { ok: true, detail: "Archived in Paseo." };
   }, factory);
 }
+
+export async function unarchivePaseoAgent(config, serverId, agentId, factory) {
+  if (!config?.paseo?.enabled || !serverId || !agentId) return { ok: false, detail: "Paseo not configured." };
+  return withPaseo(config, async (client) => {
+    const api = await hostApi(client, serverId);
+    const ref = api.agents.ref(agentId);
+    if (typeof ref?.reload !== "function") {
+      return { ok: false, detail: "Paseo host does not support restoring archived chats." };
+    }
+    const res = await ref.reload();
+    if (res?.agent?.archivedAt) {
+      return { ok: false, detail: "Paseo kept the coding chat archived." };
+    }
+    return { ok: true, detail: "Restored coding chat in Paseo." };
+  }, factory);
+}

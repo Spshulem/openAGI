@@ -173,6 +173,15 @@ final class SupervisorPushContentTests: XCTestCase {
                        .open)
     }
 
+    @MainActor
+    func testPushRouterPreservesQuestionAndThreadDeepLink() {
+        let router = PushRouter()
+        router.openSupervisor(questionID: " fq-demo-1 ", threadKey: " paseo:srv.demo-agent-1 ")
+        XCTAssertTrue(router.wantsSupervisor)
+        XCTAssertEqual(router.pendingQuestionID, "fq-demo-1")
+        XCTAssertEqual(router.pendingThreadKey, "paseo:srv.demo-agent-1")
+    }
+
     func testUnknownOrIncompleteActionsDoNothing() {
         let userInfo: [AnyHashable: Any] = ["questionId": "fq123", "options": ["Approve"]]
         for id in ["answer.1", "answer.-1", "answer.x", "answer.", "something", UNNotificationDismissActionIdentifier] {

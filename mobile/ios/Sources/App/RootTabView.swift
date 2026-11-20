@@ -107,6 +107,16 @@ struct RootTabView: View {
         .task { if runsBackgroundServices { await PushRegistrar.shared.start() } }
         .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in
             guard wants else { return }
+            if let qid = PushRouter.shared.pendingQuestionID {
+                model.requestedFocusCardID = qid
+                model.requestedOpenContextCardID = qid
+                PushRouter.shared.pendingQuestionID = nil
+            }
+            if let tk = PushRouter.shared.pendingThreadKey {
+                model.requestedOpenThreadKey = tk
+                PushRouter.shared.pendingThreadKey = nil
+            }
+            model.bumpFleetGeneration()
             model.requestedChatThread = .supervisor
             model.selectedTab = .chat
             PushRouter.shared.wantsSupervisor = false

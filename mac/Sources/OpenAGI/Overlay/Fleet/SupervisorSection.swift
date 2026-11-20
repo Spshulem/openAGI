@@ -273,11 +273,20 @@ struct SupervisorSection: View {
       .help("Open context and reply")
 
       if !question.body.isEmpty {
-        Text(question.body)
-          .font(.system(size: 11))
-          .foregroundStyle(WorkspaceTheme.muted)
-          .lineLimit(question.risky ? 6 : 3)
-          .fixedSize(horizontal: false, vertical: true)
+        Button {
+          fleet.openQuestion(question)
+        } label: {
+          Text(question.body)
+            .font(.system(size: 11))
+            .foregroundStyle(WorkspaceTheme.muted)
+            .lineLimit(question.risky ? 6 : 3)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open context and reply")
       }
 
       if let note = fleet.notes[question.id] {

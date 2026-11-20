@@ -31,7 +31,7 @@ import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISION
 import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } from "./themes.js";
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
-import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, withPaseo } from "./sources/paseo.js";
+import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -1923,7 +1923,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async answerQuestion(id, answer, { deadlineAt = null, clarification = null } = {}) {
+  async answerQuestion(id, answer, { deadlineAt = null, clarification = null, confirmed = false } = {}) {
     const startedAt = Date.now();
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
@@ -1949,8 +1949,9 @@ export class FleetSupervisor {
     try {
       let delivery = null;
       const settling = [];
-      // Completed / session-error review cards: "Mark done" marks the turn
-      // reviewed in OpenAGI; "Archive" also archives the Paseo session.
+      // Completed / session-error review cards: "Got it" / "Mark done" / unconfirmed
+      // notification taps ONLY clear the notification in OpenAGI. Archiving the
+      // underlying Paseo session requires explicit confirmation (`confirmed: true`).
       if (["completed", "session-error"].includes(question.kind)) {
         if (question.threadKey) {
           this.store.markCompletionReviewed(
@@ -1958,7 +1959,7 @@ export class FleetSupervisor {
             question.contextSnapshot?.lastAgentAt ?? question.lastAskedAt ?? question.createdAt ?? this.now()
           );
         }
-        if (String(answer).toLowerCase() === "archive" && String(question.threadKey ?? "").startsWith("paseo:")) {
+        if (confirmed === true && String(answer).toLowerCase() === "archive" && String(question.threadKey ?? "").startsWith("paseo:")) {
           const parsed = parsePaseoThreadKey(question.threadKey);
           if (parsed) {
             try {
@@ -1966,12 +1967,14 @@ export class FleetSupervisor {
               delivery = {
                 status: "sent",
                 route: "paseo-archive",
-                detail: archRes?.ok ? "Archived in OpenAGI and Paseo." : `Marked done in OpenAGI (${archRes?.detail || "Paseo archive unavailable"}).`
+                detail: archRes?.ok ? "Archived in OpenAGI and Paseo." : `Cleared notification in OpenAGI (${archRes?.detail || "Paseo archive unavailable"}).`
               };
             } catch {
-              delivery = { status: "sent", route: "paseo-archive", detail: "Marked done in OpenAGI." };
+              delivery = { status: "sent", route: "paseo-archive", detail: "Cleared notification in OpenAGI." };
             }
           }
+        } else {
+          delivery = { status: "sent", route: "openagi-review", detail: "Notification dismissed." };
         }
       }
       // A tap on one of a permission card's buttons clicks that button in
@@ -2436,6 +2439,56 @@ export class FleetSupervisor {
     return { assignment, organization: this.store.organization() };
   }
 
+  async archiveThread(threadKey, { confirmed = false } = {}) {
+    if (confirmed !== true) {
+      return { ok: false, status: "confirmation_required", detail: "Confirm archiving this coding chat first." };
+    }
+    const parsed = parsePaseoThreadKey(threadKey);
+    if (!parsed) {
+      return { ok: false, status: "blocked", detail: "Only Paseo coding chats support direct session archiving." };
+    }
+    this.store.markCompletionReviewed(threadKey, this.now());
+    let archRes;
+    try {
+      archRes = await archivePaseoAgent(this.config, parsed.serverId, parsed.agentId, this.deps.paseoFactory);
+    } catch {
+      return { ok: false, status: "blocked", detail: "Could not reach Paseo host to archive coding chat." };
+    }
+    if (!archRes?.ok) {
+      return { ok: false, status: "blocked", detail: archRes?.detail || "Could not archive coding chat in Paseo." };
+    }
+    const prev = this.knownThreads.get(threadKey) ?? this.lastThreads.get(threadKey) ?? null;
+    if (prev) this.recordDiscoveredThread({ ...prev, archived: true });
+    for (const q of this.store.openQuestions()) {
+      if (q.threadKey === threadKey) {
+        this.store.resolveQuestion(q.id, "session archived by owner");
+        this.resolveOutreach(q, "archived", "acted");
+      }
+    }
+    this.emitFleet("thread-archived");
+    return { ok: true, status: "archived_session", threadKey, detail: "Archived coding chat in Paseo." };
+  }
+
+  async unarchiveThread(threadKey) {
+    const parsed = parsePaseoThreadKey(threadKey);
+    if (!parsed) {
+      return { ok: false, status: "blocked", detail: "Only Paseo coding chats support restoring archived sessions." };
+    }
+    let restoreRes;
+    try {
+      restoreRes = await unarchivePaseoAgent(this.config, parsed.serverId, parsed.agentId, this.deps.paseoFactory);
+    } catch {
+      return { ok: false, status: "blocked", detail: "Could not reach Paseo host to restore coding chat." };
+    }
+    if (!restoreRes?.ok) {
+      return { ok: false, status: "blocked", detail: restoreRes?.detail || "Could not restore coding chat in Paseo." };
+    }
+    const prev = this.knownThreads.get(threadKey) ?? this.lastThreads.get(threadKey) ?? null;
+    if (prev) this.recordDiscoveredThread({ ...prev, archived: false });
+    this.emitFleet("thread-unarchived");
+    return { ok: true, status: "unarchived_session", threadKey, detail: restoreRes.detail || "Restored coding chat in Paseo." };
+  }
+
   async syncThemes(options = {}) {
     return syncThemesToPaseoLabels(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
   }
@@ -2677,7 +2730,7 @@ export class FleetSupervisor {
     return { ...routed, dispatched: false, delivery: null };
   }
 
-  async actCard(cardId, { op = "primary", value = null, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
+  async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
 
@@ -2722,7 +2775,50 @@ export class FleetSupervisor {
 
     if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {
       const dismissed = this.dismissQuestion(question.id);
-      return { ok: Boolean(dismissed), kind: "defer", status: "dismissed", question: dismissed, delivery: null };
+      return { ok: Boolean(dismissed), kind: "defer", status: "dismissed", message: "Dismissed notification.", question: dismissed, delivery: null };
+    }
+
+    if (effectiveOp === "open_chat") {
+      return {
+        ok: true,
+        kind: "open_chat",
+        status: "open_chat",
+        threadKey: card?.threadKey ?? question.threadKey ?? null,
+        message: "Open conversation context."
+      };
+    }
+
+    if (effectiveOp === "archive_session" || (effectiveOp === "answer" && String(effectiveValue ?? "").toLowerCase() === "archive")) {
+      if (confirmed !== true) {
+        return {
+          ok: false,
+          kind: "archive_session",
+          status: "confirmation_required",
+          message: "Confirm archiving this coding chat first. Tap Dismiss if you only want to clear the notification."
+        };
+      }
+      const targetKey = card?.threadKey ?? question.threadKey ?? null;
+      const archOutcome = await this.archiveThread(targetKey, { confirmed: true });
+      if (!archOutcome.ok) {
+        return {
+          ok: false,
+          kind: "archive_session",
+          status: archOutcome.status ?? "blocked",
+          message: archOutcome.detail ?? "Could not archive coding chat."
+        };
+      }
+      if (this.store.question(question.id)?.status === "open") {
+        this.store.resolveQuestion(question.id, "session archived by owner");
+        this.resolveOutreach(question, "archived", "acted");
+      }
+      return {
+        ok: true,
+        kind: "archive_session",
+        status: "archived_session",
+        threadKey: targetKey,
+        message: "Archived coding chat in Paseo.",
+        delivery: { status: "sent", route: "paseo-archive", detail: "Archived coding chat in Paseo." }
+      };
     }
 
     if (effectiveOp === "fix_ci") {
@@ -3995,7 +4091,6 @@ export class FleetSupervisor {
       const isErr = attnReason === "error" || Boolean(thread.error);
       const qKind = isErr ? "session-error" : "completed";
       const label = clampText(redactSecrets(thread.title || thread.workspace || thread.key), 72);
-      const isPaseo = String(thread.key).startsWith("paseo:");
       asks.push({
         threadKey: thread.key,
         action: "ask-user",
@@ -4005,9 +4100,9 @@ export class FleetSupervisor {
           dedupeKey: `${qKind}:${thread.key}:${stampIso || "latest"}`,
           threadKey: thread.key,
           prRef: thread.prRefs?.[0] ?? null,
-          title: isErr ? `${label}: session hit an error` : `${label}: finished — review & archive?`,
+          title: isErr ? `${label}: session hit an error` : `${label}: finished`,
           body: clampTailLines(redactSecrets(bodySource), 900),
-          options: isPaseo ? ["Mark done", "Archive", "later"] : ["Mark done", "later"],
+          options: ["Got it"],
           ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
         }
       });

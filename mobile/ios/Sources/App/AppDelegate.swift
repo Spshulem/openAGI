@@ -35,11 +35,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
+        let userInfo = response.notification.request.content.userInfo
         let action = SupervisorAnswerAction.from(actionIdentifier: response.actionIdentifier,
                                                  defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
-                                                 userInfo: response.notification.request.content.userInfo)
+                                                 userInfo: userInfo)
+        let questionID = (userInfo[SupervisorPushContent.questionIdKey] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let threadKey = (userInfo[SupervisorPushContent.threadKeyKey] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let notificationID = response.notification.request.identifier
-        let digestTab = DailyDigestNotifier.tab(for: response.notification.request.content.userInfo)
+        let digestTab = DailyDigestNotifier.tab(for: userInfo)
         let done = UncheckedSendableBox(value: completionHandler)
         Task { @MainActor in
             // Phone-only mode's morning plan and evening recap.
@@ -50,7 +55,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             }
             switch action {
             case .open?:
-                PushRouter.shared.openSupervisor()
+                PushRouter.shared.openSupervisor(questionID: questionID, threadKey: threadKey)
             case let action?:
                 await SupervisorAnswerSender.send(action, notificationID: notificationID)
             case nil:
@@ -61,15 +66,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     }
 }
 
-// A notification tap asks for the Supervisor tab. RootTabView watches this,
-// including on a cold launch where the tap arrives before it exists.
+// A notification tap asks for the Supervisor tab and, when present, deep-links
+// straight into the exact question/thread context sheet. RootTabView watches
+// this, including on a cold launch where the tap arrives before it exists.
 @Observable
 @MainActor
 final class PushRouter {
     static let shared = PushRouter()
     var wantsSupervisor = false
+    var pendingQuestionID: String?
+    var pendingThreadKey: String?
     // Any other tab a notification tap asks for.
     var wantsTab: AppTab?
 
-    func openSupervisor() { wantsSupervisor = true }
+    func openSupervisor(questionID: String? = nil, threadKey: String? = nil) {
+        if let q = questionID?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
+            pendingQuestionID = q
+        }
+        if let t = threadKey?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            pendingThreadKey = t
+        }
+        wantsSupervisor = true
+    }
 }
