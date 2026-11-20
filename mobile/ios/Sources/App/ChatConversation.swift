@@ -69,6 +69,11 @@ final class ChatConversation {
     private var activeRefreshes = 0
     private var didLoadOlder = false
     private var forgotten = false
+    // Finds replies whose stream was lost (see ChatTurnRecovery) while the
+    // app is active. Polls history; never holds a stream in the background.
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryToken = UUID()
+    private var lastPage: ConversationPage?
 
     init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String,
          conversationID: String = "main", isReadOnly: Bool = false) {
@@ -140,23 +145,31 @@ final class ChatConversation {
               attachments.allSatisfy({ $0.data != nil }) else { return nil }
         let text = trimmed.isEmpty ? "Please describe the attached images." : trimmed
         isSending = true
-        messages.append(ChatMessage(role: .user, text: text, attachments: attachments))
-        let reply = ChatMessage(role: .assistant, text: "", isStreaming: true)
+        appendTurn(text: text, attachments: attachments)
+        return (text, messages[messages.count - 1].id)
+    }
+
+    // The user line and its reply placeholder, both named with a new turn id.
+    private func appendTurn(text: String, attachments: [ChatAttachment]) {
+        let requestID = Self.newRequestID()
+        var user = ChatMessage(role: .user, text: text, attachments: attachments)
+        user.requestID = requestID
+        var reply = ChatMessage(role: .assistant, text: "", isStreaming: true)
+        reply.requestID = requestID
+        messages.append(user)
         messages.append(reply)
         persist()
-        return (text, reply.id)
     }
+
+    static func newRequestID() -> String { "ios-" + UUID().uuidString.lowercased() }
 
     private func finishSend(text: String, attachments: [ChatAttachment], replyID: UUID, focusedCardID: String?) async {
         defer { isSending = false }
         await streamReply(text: text, attachments: attachments, replyID: replyID, focusedCardID: focusedCardID)
         while !forgotten, !queuedSubmissions.isEmpty {
             let next = queuedSubmissions.removeFirst()
-            messages.append(ChatMessage(role: .user, text: next.text, attachments: next.attachments))
-            let nextReply = ChatMessage(role: .assistant, text: "", isStreaming: true)
-            messages.append(nextReply)
-            persist()
-            await streamReply(text: next.text, attachments: next.attachments, replyID: nextReply.id, focusedCardID: next.focusedCardID)
+            appendTurn(text: next.text, attachments: next.attachments)
+            await streamReply(text: next.text, attachments: next.attachments, replyID: messages[messages.count - 1].id, focusedCardID: next.focusedCardID)
         }
     }
 
@@ -168,7 +181,15 @@ final class ChatConversation {
         guard let target = ChatRetry.target(failedID: failedMessage.id, in: messages, isSending: isSending) else { return }
         isSending = true
         defer { isSending = false }
-        let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
+        // The same id: if main did get the first try, it replays or follows
+        // that turn instead of running it again. A turn main lost is new.
+        let failed = messages[target.index]
+        var fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
+        fresh.requestID = failed.newRequestOnRetry || failed.requestID == nil ? Self.newRequestID() : failed.requestID
+        if fresh.requestID != failed.requestID,
+           let userIndex = messages[..<target.index].lastIndex(where: { $0.role == .user }) {
+            messages[userIndex].requestID = fresh.requestID
+        }
         messages[target.index] = fresh
         persist()
         await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id, focusedCardID: focusedCardID)
@@ -181,10 +202,18 @@ final class ChatConversation {
     private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID, focusedCardID: String? = nil) async {
         var sawTerminalFrame = false
         var openedStream = false
+        let requestID = messages.first(where: { $0.id == replyID })?.requestID
+        // Room to finish handing the turn to main if the app is backgrounded
+        // right after Send. Ends at main's acknowledgement: the reply itself
+        // never depends on staying awake.
+        let grace = BackgroundTaskGuard(name: "chat-send")
+        grace.begin(onExpire: {})
+        defer { grace.end() }
         do {
             let stream = try await client.sendMessageStreaming(
                 text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey,
-                attachments: attachments, conversationId: conversationID, focusedCardId: focusedCardID
+                attachments: attachments, conversationId: conversationID, focusedCardId: focusedCardID,
+                requestId: requestID
             )
             openedStream = true
             for try await event in stream {
@@ -215,30 +244,92 @@ final class ChatConversation {
                         messages[index].activity = label
                     }
                 case .session:
-                    break
+                    // Main has the turn: from here on it is never lost.
+                    messages[index].accepted = true
+                    grace.end()
+                    persist()
                 }
             }
             // The daemon closes the stream only after `final` or `failure`;
-            // anything else is a dropped connection mid-reply. The daemon may
-            // still finish and store the reply -- the refresh below brings it
-            // in and clears this failure if so.
-            if !sawTerminalFrame {
-                fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
-            }
+            // anything else is a dropped connection mid-reply.
+            if !sawTerminalFrame { await connectionLost(replyID) }
         } catch let error as DaemonError {
             if !sawTerminalFrame {
-                fail(replyID, text: !openedStream
-                     ? ChatErrorCopy.message(for: error)
-                     : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.",
-                     retrySafe: error == .agentHostDisabled || error == .imagesUnsupported)
+                if !openedStream, error.isRejection {
+                    fail(replyID, text: ChatErrorCopy.message(for: error),
+                         retrySafe: error == .agentHostDisabled || error == .imagesUnsupported)
+                } else {
+                    await connectionLost(replyID)
+                }
             }
         } catch {
-            if !sawTerminalFrame {
-                fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
-            }
+            if !sawTerminalFrame { await connectionLost(replyID) }
         }
         persist()
         await refresh()
+        startRecoveryIfNeeded()
+    }
+
+    // The stream went before `final`/`failure`. With turn ids main can say
+    // what happened, so never ask the person to guess:
+    // - accepted: main keeps working; find the reply in history.
+    // - not confirmed: resending the same id is safe; do it once, offer Retry.
+    // A main without turn ids keeps the old "check before resending".
+    private func connectionLost(_ replyID: UUID) async {
+        guard let before = messages.firstIndex(where: { $0.id == replyID }) else { return }
+        let hasTurnID = messages[before].requestID != nil
+        let mainSupportsTurnIDs = !(await client.turnIdsUnsupported)
+        // Re-read: the list can change while this awaited.
+        guard let index = messages.firstIndex(where: { $0.id == replyID }) else { return }
+        if hasTurnID && mainSupportsTurnIDs {
+            if messages[index].accepted {
+                messages[index].isDetached = true
+                messages[index].activity = ChatHistoryCodec.stillWorking
+            } else {
+                let images = messages[..<index].last(where: { $0.role == .user })?.attachments ?? []
+                fail(replyID, text: ChatHistoryCodec.unconfirmedText, retrySafe: images.allSatisfy { $0.data != nil })
+                messages[index].autoRetry = true
+            }
+        } else {
+            fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
+        }
+    }
+
+    // Opening the chat, or the app becoming active: catch up with main,
+    // keep finding replies whose stream was lost, and resend (once, same id)
+    // a send main never confirmed.
+    func resume() async {
+        await refresh()
+        startRecoveryIfNeeded()
+        if historyStatus == .synced, !isSending,
+           let pending = messages.first(where: { $0.isFailed && $0.autoRetry && $0.retrySafe }) {
+            if let index = messages.firstIndex(where: { $0.id == pending.id }) {
+                messages[index].autoRetry = false
+            }
+            await retry(pending)
+        }
+    }
+
+    // Stops polling when the app leaves the foreground; `resume` restarts it.
+    func pauseRecovery() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+    }
+
+    private func startRecoveryIfNeeded() {
+        guard recoveryTask == nil, !forgotten, messages.contains(where: \.isDetached) else { return }
+        let token = UUID()
+        recoveryToken = token
+        recoveryTask = Task { [weak self] in
+            var delay: UInt64 = 2
+            while let self, !Task.isCancelled, !self.forgotten, self.messages.contains(where: \.isDetached) {
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                if Task.isCancelled { break }
+                await self.refresh()
+                delay = min(delay * 2, 15)
+            }
+            if self?.recoveryToken == token { self?.recoveryTask = nil }
+        }
     }
 
     private func fail(_ replyID: UUID, text: String, retrySafe: Bool = false) {
@@ -271,7 +362,8 @@ final class ChatConversation {
             let overlaps = messages.contains { message in
                 message.serverID.map(pageIDs.contains) ?? false
             }
-            let merged = ChatHistoryMerge.merge(local: messages, server: page.messages)
+            lastPage = page
+            let merged = ChatTurnRecovery.resolve(ChatHistoryMerge.merge(local: messages, server: page.messages), page: page)
             if merged != messages {
                 messages = merged
                 persist()
@@ -328,6 +420,7 @@ final class ChatConversation {
     // keeping the last saved conversation available if setup is cancelled.
     func suspend() {
         persist()
+        pauseRecovery()
         forgotten = true
     }
 
@@ -339,6 +432,7 @@ final class ChatConversation {
         queuedSubmissions = []
         focusedCardID = nil
         composerRevision += 1
+        pauseRecovery()
         forgotten = true
         messages = []
         nextBefore = nil

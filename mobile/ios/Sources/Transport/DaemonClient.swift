@@ -35,6 +35,18 @@ public enum DaemonError: Error {
     case mainConnection(MainConnectionIssue)
 }
 
+extension DaemonError {
+    // Main (or the worker in front of it) answered and refused the request
+    // before running anything. Otherwise the connection itself failed, and
+    // whether main got the message is unknown.
+    public var isRejection: Bool {
+        switch self {
+        case .transport, .unreachableHost: false
+        default: true
+        }
+    }
+}
+
 // `Error` doesn't conform to `Equatable`, so adding `.transport(Error)` above
 // breaks synthesized conformance. Written by hand: every case compares by its
 // own stable payload, and `.transport` compares only by case — two transport
@@ -94,6 +106,10 @@ public actor DaemonClient {
     // an updated main is picked up.
     private var sharedThreadsUnsupported = false
     private var focusedCardUnsupported = false
+    // A main older than turn recovery rejects `requestId` (400, before the
+    // turn runs). Remembered until relaunch; such a main cannot replay or
+    // attach to a turn, so the chat falls back to "check before resending".
+    public private(set) var turnIdsUnsupported = false
 
     public init(server: URL, nodeID: String, token: String, session: URLSession = .shared) {
         self.server = server
@@ -273,7 +289,8 @@ public actor DaemonClient {
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
                                      from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [],
-                                     conversationId: String = "main", focusedCardId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     conversationId: String = "main", focusedCardId: String? = nil,
+                                     requestId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
         // Check before uploading pixels. Older mains can reject a large body
         // before returning a useful error; that is not a dropped agent turn.
         if !attachments.isEmpty { try await requireImageSupport() }
@@ -283,6 +300,7 @@ public actor DaemonClient {
         }
         if let from { body["from"] = from }
         if let sessionId { body["sessionId"] = sessionId }
+        if let requestId, !turnIdsUnsupported { body["requestId"] = requestId }
         if conversationId != "main" { body["conversationId"] = conversationId }
         if conversationId != "main" && sharedThreadsUnsupported { throw DaemonError.notFound }
         let bytes: URLSession.AsyncBytes
@@ -339,6 +357,7 @@ public actor DaemonClient {
     }
 
     private struct SharedThreadsRejected: Error {}
+    private struct TurnIdRejected: Error {}
     private struct FocusedCardRejected: Error {}
 
     private struct MessageCapabilities: Decodable { let imageAttachments: Bool }
@@ -374,6 +393,19 @@ public actor DaemonClient {
     }
 
     private func openMessageStream(body: [String: Any]) async throws -> URLSession.AsyncBytes {
+        do {
+            return try await openMessageStreamOnce(body: body)
+        } catch is TurnIdRejected {
+            // Rejected during validation, before anything ran: resending
+            // without the id cannot double-send.
+            turnIdsUnsupported = true
+            var without = body
+            without.removeValue(forKey: "requestId")
+            return try await openMessageStreamOnce(body: without)
+        }
+    }
+
+    private func openMessageStreamOnce(body: [String: Any]) async throws -> URLSession.AsyncBytes {
         var request = try authorizedRequest(path: "/message", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -406,6 +438,9 @@ public actor DaemonClient {
             if http.statusCode == 400 {
                 let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
                 if text.contains("unsupported fields") {
+                    // Newest field first: blaming the attachments here would
+                    // tell an image-capable main that it cannot take images.
+                    if body["requestId"] != nil { throw TurnIdRejected() }
                     if body["attachments"] != nil { throw DaemonError.imagesUnsupported }
                     if body["focusedCardId"] != nil { throw FocusedCardRejected() }
                     if body["thread"] != nil { throw SharedThreadsRejected() }

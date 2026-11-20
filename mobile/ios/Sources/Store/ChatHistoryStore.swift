@@ -16,9 +16,17 @@ public struct SavedChatEntry: Codable, Sendable, Equatable {
     public var sourceNodeId: String?
     public var sourceName: String?
     public var attachments: [ChatAttachment]?
+    // Turn recovery (all optional: older caches decode unchanged). The
+    // client's id for the turn; a reply main accepted whose stream was lost
+    // (still being recovered); and a send never confirmed, to retry once.
+    public var requestID: String?
+    public var detached: Bool?
+    public var autoRetry: Bool?
+    public var newRequestOnRetry: Bool?
 
     public init(id: UUID, serverID: String? = nil, role: String, at: Date, text: String, failed: Bool = false, retrySafe: Bool? = nil,
-                sourceNodeId: String? = nil, sourceName: String? = nil, attachments: [ChatAttachment]? = nil) {
+                sourceNodeId: String? = nil, sourceName: String? = nil, attachments: [ChatAttachment]? = nil,
+                requestID: String? = nil, detached: Bool? = nil, autoRetry: Bool? = nil, newRequestOnRetry: Bool? = nil) {
         self.id = id
         self.serverID = serverID
         self.role = role
@@ -29,6 +37,10 @@ public struct SavedChatEntry: Codable, Sendable, Equatable {
         self.sourceNodeId = sourceNodeId
         self.sourceName = sourceName
         self.attachments = attachments
+        self.requestID = requestID
+        self.detached = detached
+        self.autoRetry = autoRetry
+        self.newRequestOnRetry = newRequestOnRetry
     }
 }
 
