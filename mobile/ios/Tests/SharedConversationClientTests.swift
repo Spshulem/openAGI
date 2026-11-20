@@ -358,6 +358,9 @@ final class SharedConversationClientTests: XCTestCase {
         XCTAssertEqual(conversation.messages.map(\.text), ["plan my day", "Planned."])
         XCTAssertFalse(conversation.messages.contains(where: \.isDetached))
         XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1, "never resent")
+        // The background poll found nothing left to recover and stops; none
+        // of its requests may outlive this test's stub.
+        conversation.pauseRecovery()
     }
 
     // Main never confirmed the send (the connection went first): offer it
@@ -390,6 +393,7 @@ final class SharedConversationClientTests: XCTestCase {
         XCTAssertEqual(conversation.messages.last?.text, "Done.")
         await conversation.resume()
         XCTAssertEqual(state.turns.count, 2, "resent once, not on every return")
+        conversation.pauseRecovery()
     }
 
     @MainActor

@@ -327,9 +327,12 @@ final class ChatConversation {
         recoveryToken = token
         recoveryTask = Task { [weak self] in
             var delay: UInt64 = 2
-            while let self, !Task.isCancelled, !self.forgotten, self.messages.contains(where: \.isDetached) {
+            while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
-                if Task.isCancelled { break }
+                // Re-check after waking: the reply may have arrived meanwhile
+                // (another refresh, an /events update), or the chat was closed.
+                guard let self, !Task.isCancelled, !self.forgotten,
+                      self.messages.contains(where: \.isDetached) else { break }
                 await self.refresh()
                 delay = min(delay * 2, 15)
             }
