@@ -89,6 +89,7 @@ final class SupervisorBoardTests: XCTestCase {
               {
                 "key": "codex:board-1",
                 "title": "Board Inspector PR",
+                "project": "openAGI",
                 "workspace": "openAGI",
                 "state": "waiting",
                 "health": "needs_human",
@@ -143,6 +144,7 @@ final class SupervisorBoardTests: XCTestCase {
 
         let thread = try XCTUnwrap(state.snapshot?.threads.first)
         XCTAssertNotNil(thread.nextCheckAt)
+        XCTAssertEqual(thread.project, "openAGI")
         XCTAssertEqual(thread.actorLabel, "codex · gpt-5.4 via Paseo")
         XCTAssertEqual(thread.subchannel, "ios")
         XCTAssertEqual(thread.labels, ["kind=feature", "pr=#410"])
@@ -226,6 +228,33 @@ final class SupervisorBoardTests: XCTestCase {
         let req = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(req.httpMethod, "POST")
         XCTAssertEqual(req.url?.path, "/fleet/api/tasks/claim")
+    }
+
+    func testFleetProjectOrganizationEndpointsPostExpectedPaths() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubProtocol.self]
+        let client = DaemonClient(
+            server: URL(string: "http://mac.tail1234.ts.net:43210")!,
+            nodeID: "mobile:abc",
+            token: String(repeating: "b", count: 43),
+            session: URLSession(configuration: config)
+        )
+        StubProtocol.handler = { request in
+            (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data(#"{"ok":true}"#.utf8)
+            )
+        }
+
+        try await client.fleetUpsertProject(name: "Marketing", theme: "Launch")
+        let upsertReq = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(upsertReq.httpMethod, "POST")
+        XCTAssertEqual(upsertReq.url?.path, "/fleet/api/projects")
+
+        try await client.fleetOrganizeThread(key: "codex:thread-1", project: "Marketing", theme: "Launch")
+        let orgReq = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(orgReq.httpMethod, "POST")
+        XCTAssertEqual(orgReq.url?.path, "/fleet/api/threads/codex:thread-1/organize")
     }
 
     func testPendingActionDisplayTitleAndSubtitleHumanizeComputerUseAndTools() throws {

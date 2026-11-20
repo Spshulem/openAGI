@@ -230,6 +230,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     public var key: String
     public var kind: String?
     public var title: String?
+    public var project: String?
     public var workspace: String?
     public var repo: String?
     public var branch: String?
@@ -253,7 +254,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
 
     public var id: String { key }
 
-    public init(key: String, kind: String? = nil, title: String? = nil, workspace: String? = nil, repo: String? = nil,
+    public init(key: String, kind: String? = nil, title: String? = nil, project: String? = nil, workspace: String? = nil, repo: String? = nil,
                 branch: String? = nil, agentStatus: String? = nil, state: String? = nil, health: String? = nil,
                 reason: String? = nil, blockers: [String] = [], pr: FleetPR? = nil, lastActivityAt: Date? = nil,
                 lastAgentText: String? = nil, error: FleetThreadError? = nil, live: Bool = false,
@@ -262,6 +263,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         self.key = key
         self.kind = kind
         self.title = title
+        self.project = project
         self.workspace = workspace
         self.repo = repo
         self.branch = branch
@@ -283,7 +285,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case key, kind, title, workspace, repo, branch, agentStatus, state, health, reason, blockers, pr
+        case key, kind, title, project, workspace, repo, branch, agentStatus, state, health, reason, blockers, pr
         case lastActivityAt, lastAgentText, error, live, decision
         case nextCheckAt, actorLabel, subchannel, labels
     }
@@ -293,6 +295,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         key = c.lenient(String.self, .key) ?? ""
         kind = c.lenient(String.self, .kind)
         title = c.lenient(String.self, .title)
+        project = c.lenient(String.self, .project)
         workspace = c.lenient(String.self, .workspace)
         repo = c.lenient(String.self, .repo)
         branch = c.lenient(String.self, .branch)

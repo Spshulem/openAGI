@@ -82,6 +82,8 @@ const EXACT = new Set([
   "GET /fleet/api/search",
   "GET /fleet/api/workspaces",
   "GET /fleet/api/hierarchy",
+  "GET /fleet/api/projects",
+  "POST /fleet/api/projects",
   "GET /fleet/api/repo-status",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
@@ -144,9 +146,10 @@ const PATTERNS = [
   { method: "POST", re: /^\/fleet\/api\/cards\/[A-Za-z0-9:%_-]{1,160}\/act$/ },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
-  // One fleet thread's detail/transcript, and the owner's Push now, Mute and Unmute.
+  // One fleet thread's detail/transcript, and the owner's Push now, Mute, Unmute, and OpenAGI Project/Theme organization.
+  { method: "DELETE", re: /^\/fleet\/api\/projects\/[A-Za-z0-9_-]{1,80}$/ },
   { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}(?:/transcript)?$`) },
-  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }
+  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute|organize)$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {

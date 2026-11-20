@@ -58,6 +58,7 @@ final class FleetConsumer: ObservableObject {
   /// Each thread's last Push now, Mute or Unmute result, in its row.
   @Published private(set) var threadNotes: [String: FleetNote] = [:]
   @Published private(set) var workspaces: [FleetWorkspaceEntry] = []
+  @Published private(set) var hierarchyProjects: [FleetHierarchyProject] = []
   /// Active index in the compact overlay single-card deck.
   @Published var currentQuestionIndex: Int = 0
   /// Whether the collapsible session list in the overlay is expanded.
@@ -330,6 +331,69 @@ final class FleetConsumer: ObservableObject {
       }
     } catch {
       // Non-fatal: manual workspace or auto-resolve still works.
+    }
+  }
+
+  func loadHierarchy(limit: Int = 60) async {
+    let clamped = max(1, min(60, limit))
+    let req = request(path: "/fleet/api/hierarchy?limit=\(clamped)", method: "GET", timeout: 20)
+    do {
+      let (data, response) = try await fetchDetail(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return }
+      if let decoded = try? JSONDecoder().decode(FleetHierarchyResponse.self, from: data) {
+        hierarchyProjects = decoded.projects
+      }
+    } catch {
+      // Non-fatal: sidebar degrades cleanly to live watched threads.
+    }
+  }
+
+  @discardableResult
+  func upsertProject(name: String, theme: String? = nil) async -> Bool {
+    let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanName.isEmpty else { return false }
+    var payload: [String: Any] = ["name": cleanName]
+    if let cleanTheme = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanTheme.isEmpty {
+      payload["theme"] = cleanTheme
+    }
+    var req = request(path: "/fleet/api/projects", method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (_, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return false }
+      await loadHierarchy()
+      await refresh()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  @discardableResult
+  func organizeThread(key: String, project: String?, theme: String? = nil) async -> Bool {
+    guard let encoded = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return false }
+    var payload: [String: Any] = [:]
+    if let p = project?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+      payload["project"] = p
+    }
+    if let t = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+      payload["theme"] = t
+    }
+    var req = request(path: "/fleet/api/threads/\(encoded)/organize", method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (_, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return false }
+      await loadHierarchy()
+      await refresh()
+      return true
+    } catch {
+      return false
     }
   }
 

@@ -7,6 +7,10 @@ struct ConversationBrowser: View {
     var onSelect: (UUID?) -> Void
     @State private var search = ""
     @State private var showLegacyAgentChats = false
+    @State private var showMoreProjects = false
+    @State private var showingNewProjectAlert = false
+    @State private var newProjectName = ""
+    @State private var newProjectTheme = ""
 
     private var isUITesting: Bool {
         ProcessInfo.processInfo.arguments.contains("--ui-testing")
@@ -25,6 +29,10 @@ struct ConversationBrowser: View {
         model.latestFleetState?.snapshot?.threads ?? []
     }
 
+    private var hierarchyProjects: [FleetProjectGroup] {
+        model.latestFleetHierarchy?.projects ?? []
+    }
+
     private var decisionItems: [SupervisorDecisionItem] {
         fleetCards.map { card in
             SupervisorDecisionItem(
@@ -39,19 +47,107 @@ struct ConversationBrowser: View {
     }
 
     private var sessionBriefs: [SupervisorSessionBrief] {
-        fleetThreads.map { t in
-            SupervisorSessionBrief(
+        var hierarchyMetaByKey: [String: (project: String, theme: String?)] = [:]
+        for proj in hierarchyProjects {
+            for th in proj.themes {
+                let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+                for s in th.sessions where !s.key.isEmpty {
+                    hierarchyMetaByKey[s.key] = (proj.name, cleanTheme)
+                }
+            }
+        }
+
+        var seen = Set<String>()
+        var out: [SupervisorSessionBrief] = fleetThreads.map { t in
+            seen.insert(t.key)
+            let hMeta = hierarchyMetaByKey[t.key]
+            let proj = SupervisorChannelGrouping.normalizeProject(
+                explicit: t.project ?? hMeta?.project,
+                repo: t.repo,
+                workspace: t.workspace
+            )
+            let sub = t.subchannel ?? hMeta?.theme.map { "\(proj)/\($0)" }
+            return SupervisorSessionBrief(
                 id: t.key,
-                project: SupervisorChannelGrouping.normalizeProject(repo: t.repo, workspace: t.workspace),
-                subchannel: t.subchannel,
+                project: proj,
+                subchannel: sub,
+                theme: hMeta?.theme ?? "General",
                 title: SupervisorFormat.name(t),
                 state: t.state ?? "idle"
             )
         }
+
+        for proj in hierarchyProjects {
+            let normProj = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+            for th in proj.themes {
+                let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+                let sub = cleanTheme.map { "\(normProj)/\($0)" }
+                for s in th.sessions where !s.key.isEmpty && seen.insert(s.key).inserted {
+                    out.append(SupervisorSessionBrief(
+                        id: s.key,
+                        project: normProj,
+                        subchannel: sub,
+                        theme: cleanTheme ?? "General",
+                        title: s.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? s.title! : s.key,
+                        host: s.host,
+                        state: s.state ?? "idle"
+                    ))
+                }
+            }
+        }
+        return out
     }
 
     private var projectChannels: [SupervisorChannelSummary] {
-        SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+        var base = SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+        var seen = Set(base.map { ch -> String in
+            if case let .project(name) = ch.kind { return name.lowercased() }
+            return ch.displayName.lowercased()
+        })
+        for proj in hierarchyProjects {
+            let norm = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+            let key = norm.lowercased()
+            guard key != "general", seen.insert(key).inserted else { continue }
+            base.append(SupervisorChannelSummary(
+                id: "project:\(key)",
+                kind: .project(norm),
+                displayName: "# \(norm)",
+                waitingCount: proj.needsYouCount,
+                runningCount: proj.counts.running,
+                totalCount: proj.counts.total
+            ))
+        }
+        return base
+    }
+
+    private func mergedSubchannels(forProject projName: String) -> [SupervisorSubchannelSummary] {
+        var base = SupervisorChannelGrouping.subchannels(
+            forProject: projName,
+            from: decisionItems,
+            sessions: sessionBriefs
+        )
+        var seen = Set(base.map { $0.displayName.lowercased() })
+        if let hProj = hierarchyProjects.first(where: {
+            $0.name.caseInsensitiveCompare(projName) == .orderedSame
+                || SupervisorChannelGrouping.normalizeProject(explicit: $0.name, repo: $0.repo).caseInsensitiveCompare(projName) == .orderedSame
+        }) {
+            for th in hProj.themes {
+                guard th.name.caseInsensitiveCompare("General & Standalone") != .orderedSame,
+                      th.name.caseInsensitiveCompare(projName) != .orderedSame else { continue }
+                let display = "/\(th.name)"
+                guard seen.insert(display.lowercased()).inserted else { continue }
+                base.append(SupervisorSubchannelSummary(
+                    id: "subchannel:\(projName.lowercased())/\(th.id.lowercased())",
+                    project: projName,
+                    subchannel: "\(projName)/\(th.name)",
+                    displayName: display,
+                    waitingCount: th.needsYouCount,
+                    runningCount: th.counts.running,
+                    totalCount: th.counts.total
+                ))
+            }
+        }
+        return base
     }
 
     var body: some View {
@@ -67,9 +163,7 @@ struct ConversationBrowser: View {
 
             if showsWorkspaceChannels && search.isEmpty {
                 workspaceChannelsSection
-                if !projectChannels.isEmpty {
-                    projectsSection
-                }
+                projectsSection
             }
 
             if isUITesting || model.isOnPhone {
@@ -108,14 +202,50 @@ struct ConversationBrowser: View {
         .listStyle(.sidebar)
         .navigationTitle(showsWorkspaceChannels ? "Workspace" : "Conversations")
         .searchable(text: $search, prompt: showsWorkspaceChannels ? "Search channels & threads" : "Search conversations")
-        .refreshable { await model.conversations.refresh() }
-        .task {
+        .refreshable {
             await model.conversations.refresh()
-            if showsWorkspaceChannels && model.latestFleetState == nil {
+            if showsWorkspaceChannels {
                 if let fresh = try? await model.client.fleetState() {
                     model.latestFleetState = fresh
                 }
+                if let hierarchy = try? await model.client.fleetHierarchy(limit: 60) {
+                    model.latestFleetHierarchy = hierarchy
+                }
             }
+        }
+        .task {
+            await model.conversations.refresh()
+            if showsWorkspaceChannels {
+                if model.latestFleetState == nil, let fresh = try? await model.client.fleetState() {
+                    model.latestFleetState = fresh
+                }
+                if let hierarchy = try? await model.client.fleetHierarchy(limit: 60) {
+                    model.latestFleetHierarchy = hierarchy
+                }
+            }
+        }
+        .alert("New OpenAGI Project", isPresented: $showingNewProjectAlert) {
+            TextField("Project name (e.g. openAGI, Marketing)", text: $newProjectName)
+            TextField("Optional theme (e.g. iOS, CI)", text: $newProjectTheme)
+            Button("Create") {
+                let name = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let theme = newProjectTheme.trimmingCharacters(in: .whitespacesAndNewlines)
+                newProjectName = ""
+                newProjectTheme = ""
+                guard !name.isEmpty else { return }
+                Task {
+                    try? await model.client.fleetUpsertProject(name: name, theme: theme.isEmpty ? nil : theme)
+                    if let hierarchy = try? await model.client.fleetHierarchy(limit: 60) {
+                        model.latestFleetHierarchy = hierarchy
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                newProjectName = ""
+                newProjectTheme = ""
+            }
+        } message: {
+            Text("Organize sessions and tasks into projects and themes directly inside OpenAGI.")
         }
         .accessibilityIdentifier("conversation-browser")
     }
@@ -147,35 +277,65 @@ struct ConversationBrowser: View {
     }
 
     private var projectsSection: some View {
-        Section("Projects") {
-            ForEach(projectChannels) { ch in
-                let projName: String = {
-                    if case let .project(name) = ch.kind { return name }
-                    return ch.displayName
-                }()
-                channelButton(
-                    .project(projName),
-                    title: "#\(projName)",
-                    systemImage: "folder",
-                    badge: ch.waitingCount > 0 ? "\(ch.waitingCount)" : nil,
-                    badgeTint: Theme.caution
-                )
-                let subs = SupervisorChannelGrouping.subchannels(
-                    forProject: projName,
-                    from: decisionItems,
-                    sessions: sessionBriefs
-                )
-                ForEach(subs) { sub in
-                    channelButton(
-                        .subchannel(project: projName, subchannel: sub.displayName),
-                        title: sub.displayName,
-                        systemImage: "arrow.turn.down.right",
-                        badge: sub.waitingCount > 0 ? "\(sub.waitingCount)" : nil,
-                        badgeTint: Theme.caution,
-                        indented: true
-                    )
+        let primaryLimit = 8
+        let primaryProjects = Array(projectChannels.prefix(primaryLimit))
+        let overflowProjects = projectChannels.count > primaryLimit
+            ? Array(projectChannels.dropFirst(primaryLimit))
+            : []
+        return Section {
+            if projectChannels.isEmpty {
+                Text("No projects yet — tap + to create one.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(primaryProjects) { ch in
+                    projectChannelRows(ch)
+                }
+                if !overflowProjects.isEmpty {
+                    DisclosureGroup("More projects (\(overflowProjects.count))", isExpanded: $showMoreProjects) {
+                        ForEach(overflowProjects) { ch in
+                            projectChannelRows(ch)
+                        }
+                    }
+                    .font(.subheadline)
                 }
             }
+        } header: {
+            HStack {
+                Text("Projects")
+                Spacer()
+                Button("New project", systemImage: "plus") {
+                    showingNewProjectAlert = true
+                }
+                .labelStyle(.iconOnly)
+                .accessibilityIdentifier("new-openagi-project")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func projectChannelRows(_ ch: SupervisorChannelSummary) -> some View {
+        let projName: String = {
+            if case let .project(name) = ch.kind { return name }
+            return ch.displayName
+        }()
+        channelButton(
+            .project(projName),
+            title: "#\(projName)",
+            systemImage: "folder",
+            badge: ch.waitingCount > 0 ? "\(ch.waitingCount)" : nil,
+            badgeTint: Theme.caution
+        )
+        let subs = mergedSubchannels(forProject: projName)
+        ForEach(subs) { sub in
+            channelButton(
+                .subchannel(project: projName, subchannel: sub.displayName),
+                title: sub.displayName,
+                systemImage: "arrow.turn.down.right",
+                badge: sub.waitingCount > 0 ? "\(sub.waitingCount)" : nil,
+                badgeTint: Theme.caution,
+                indented: true
+            )
         }
     }
 

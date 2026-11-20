@@ -715,7 +715,7 @@ export function buildSupervisorCard(
   } : null;
 
   const project = deriveCardProject(
-    { repo: row?.repo ?? thread?.repo ?? snap?.repo ?? parsedPr?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? snap?.workspace ?? null, project: question?.project ?? null },
+    { repo: row?.repo ?? thread?.repo ?? snap?.repo ?? parsedPr?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? snap?.workspace ?? null, project: question?.project ?? row?.project ?? null, cwd: row?.cwd ?? null },
     thread ?? row
   );
   const actorLabel = deriveActorLabel(row, thread);
@@ -923,19 +923,50 @@ export function buildCatchUpSummary(cards = [], activeSummary = null) {
   return "All clear—no coding sessions need you right now.";
 }
 
-export function deriveCardProject(card = null, thread = null) {
-  const explicit = typeof card?.project === "string" ? card.project.trim() : "";
-  if (explicit && explicit !== "General") return explicit;
+function extractProjectFromPath(rawPath) {
+  const clean = String(rawPath ?? "").trim().replace(/\/+$/, "");
+  if (!clean) return null;
+  const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/.exec(clean)
+    ?? /\/conductor\/workspaces\/([^/]+)\/([^/]+)/.exec(clean)
+    ?? /\/([^/]+)\/\.conductor\/([^/]+)/.exec(clean);
+  if (wtMatch?.[1]) return wtMatch[1];
+  const repoMatch = /\/conductor\/repos\/([^/]+)/.exec(clean)
+    ?? /\/codex-worktrees\/[0-9a-f]+\/([^/]+)/i.exec(clean)
+    ?? /(?:\/Users\/[^/]+|\/home\/[^/]+)\/(?:Dev|Developer|Code|Projects|Repos)\/([^/]+)/i.exec(clean);
+  if (repoMatch?.[1]) return repoMatch[1];
+  if (/\/imported history(?:\/|$)/i.test(clean)) return null;
+  const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
+  if (!base || base === "Workspace" || base === "workspace" || OPAQUE_SESSION_ID_RE.test(base) || /^\d{3,6}$/.test(base)) {
+    return null;
+  }
+  return base;
+}
+
+export function deriveCardProject(card = null, thread = null, orgOverride = null) {
+  const overrideProj = typeof orgOverride?.project === "string" ? orgOverride.project.trim().replace(/^#/, "") : "";
+  if (overrideProj && overrideProj.toLowerCase() !== "general") return overrideProj;
+  const explicit = typeof card?.project === "string" ? card.project.trim().replace(/^#/, "") : "";
+  if (explicit && explicit.toLowerCase() !== "general") return explicit;
   const repo = String(card?.repo ?? thread?.repo ?? "").trim();
   if (repo) {
     const seg = repo.split("/").filter(Boolean).at(-1);
     if (seg) return seg;
   }
-  const dir = String(thread?.cwd ?? card?.workspace ?? thread?.workspace ?? "").trim();
-  if (dir) {
-    const clean = dir.replace(/\/+$/, "");
-    const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
-    if (base && base !== "Workspace" && base !== "workspace") return base;
+  const paseoProjectName = String(thread?.meta?.paseoProjectName ?? "").trim();
+  if (paseoProjectName && !/imported history/i.test(paseoProjectName) && !/^\d{3,6}$/.test(paseoProjectName) && !OPAQUE_SESSION_ID_RE.test(paseoProjectName)) {
+    return paseoProjectName;
+  }
+  for (const candidate of [thread?.cwd, thread?.meta?.paseoProjectRoot, thread?.meta?.paseoCwd, card?.cwd, card?.workspace, thread?.workspace]) {
+    const extracted = extractProjectFromPath(candidate);
+    if (extracted) return extracted;
+  }
+  const rawLabels = Array.isArray(thread?.meta?.paseoLabels) ? thread.meta.paseoLabels : [];
+  for (const label of rawLabels) {
+    const slash = String(label ?? "").indexOf("/");
+    if (slash > 0) {
+      const prefix = String(label).slice(0, slash).trim();
+      if (prefix && prefix.toLowerCase() !== "general" && prefix.toLowerCase() !== "history") return prefix;
+    }
   }
   return "general";
 }
@@ -978,8 +1009,14 @@ export function deriveActorLabel(row = null, thread = null) {
   return head;
 }
 
-export function deriveSubchannel(row = null, thread = null, explicitProject = null) {
-  const proj = cleanSubAreaSlug(explicitProject || deriveCardProject(row, thread)) || "general";
+export function deriveSubchannel(row = null, thread = null, explicitProject = null, orgOverride = null) {
+  const proj = cleanSubAreaSlug(explicitProject || deriveCardProject(row, thread, orgOverride)) || "general";
+  if (typeof orgOverride?.theme === "string" && orgOverride.theme.trim()) {
+    const cleaned = cleanSubAreaSlug(orgOverride.theme);
+    if (cleaned && cleaned !== proj) {
+      return cleaned.includes("/") ? cleaned : `${proj}/${cleaned}`;
+    }
+  }
   const explicitSub = typeof (row?.subchannel ?? thread?.meta?.subchannel) === "string"
     ? row?.subchannel ?? thread?.meta?.subchannel
     : null;
@@ -992,6 +1029,15 @@ export function deriveSubchannel(row = null, thread = null, explicitProject = nu
   const theme = cleanSubAreaSlug(row?.theme ?? thread?.theme ?? thread?.meta?.theme);
   if (theme && theme !== proj) {
     return theme.includes("/") ? theme : `${proj}/${theme}`;
+  }
+  const rawLabels = Array.isArray(thread?.meta?.paseoLabels) ? thread.meta.paseoLabels : [];
+  for (const label of rawLabels) {
+    const trimmed = String(label ?? "").trim();
+    const slash = trimmed.indexOf("/");
+    if (slash > 0) {
+      const leaf = cleanSubAreaSlug(trimmed.slice(slash + 1));
+      if (leaf && leaf !== proj) return `${proj}/${leaf}`;
+    }
   }
   const rawCwd = String(thread?.cwd ?? thread?.meta?.paseoCwd ?? row?.cwd ?? "").trim().replace(/\/+$/, "");
   if (rawCwd) {

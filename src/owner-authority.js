@@ -96,6 +96,13 @@ export const INTENT_FAMILIES = Object.freeze({
     pattern: String.raw`(?:sync|apply|assign|update)\b[^.!?\n]{0,60}?\b(?:paseo\s+(?:workspace\s+|theme\s+)?labels?|workspace\s+(?:theme\s+)?labels?|theme\s+labels?)\b`,
     tools: ["fleet_sync_themes"]
   },
+  organize: {
+    pattern: [
+      String.raw`(?:create|add|delete|remove)\s+(?:(?:a|an|the|new)\s+)?(?:openagi\s+)?(?:project|subchannel)\b`,
+      String.raw`(?:move|assign|put)\s+${NAMED_RECIPIENT}\s+(?:to|into|under)\s+(?:(?:the|a)\s+)?(?:project|theme|subchannel|#)\b`
+    ].join("|"),
+    tools: ["fleet_organize_project"]
+  },
   // Messaging needs a recipient, so "write a summary of these results", "tell
   // if this site is legit" or "write a twitter thread" never lets read text
   // message a coding agent: "tell amman to continue", "ask amman to", "reply

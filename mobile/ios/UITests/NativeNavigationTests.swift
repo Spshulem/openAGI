@@ -320,6 +320,21 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
     }
 
+    func testSupervisorBoardSheetIsReachableFromToolbar() {
+        let app = launch()
+        tab(app, "Chat")
+        tap(app, "chat-conversations")
+        tap(app, "conversation-supervisor")
+        XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 10))
+
+        tap(app, "supervisor-board-button")
+        XCTAssertTrue(app.navigationBars["Supervisor Board"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["Done"].waitForExistence(timeout: 5))
+
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 5))
+    }
+
     func testChatRedesignEmptyStateRepliesWorkingLineAndApprovalCard() {
         let app = launch(["--ui-chat-redesign", "--ui-dark"])
         tab(app, "Chat")

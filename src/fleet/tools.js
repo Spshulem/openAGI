@@ -17,7 +17,7 @@ const TOOL_NAMES = [
   "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app",
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
-  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes"
+  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project"
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
 const LABEL_MAX = 80;
@@ -571,6 +571,50 @@ export function registerFleetTools(registry, supervisor) {
         pinnedAssignments: args.pinnedAssignments
       });
     } });
+  if (typeof supervisor.upsertProject === "function" && typeof supervisor.organizeThread === "function") registry.register({
+    name: "fleet_organize_project",
+    source: SOURCE,
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    description: "Create or update an OpenAGI-side Project and/or Theme, or assign any coding session (Codex, Claude Code, Conductor, Antigravity, or Paseo) to an OpenAGI Project & Theme—works even without Paseo workspace labels.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["upsert_project", "assign_thread", "delete_project"], description: "Whether to create/update a project/theme, assign a thread to a project/theme, or delete a custom project" },
+        project: { type: "string", maxLength: 80, description: "Project name (e.g. 'openAGI', 'Marketing', 'bb-recorder')" },
+        theme: { type: "string", maxLength: 80, description: "Optional theme/subchannel inside the project (e.g. 'Mobile', 'SEO', 'CI')" },
+        threadKey: { type: "string", maxLength: KEY_MAX, description: "Required for action='assign_thread': the session key to organize" }
+      },
+      required: ["action"],
+      additionalProperties: false
+    },
+    prepareApprovalArgs: (args) => {
+      const action = String(args?.action ?? "").trim();
+      const project = typeof args?.project === "string" ? args.project.trim().slice(0, 80) : null;
+      const theme = typeof args?.theme === "string" ? args.theme.trim().slice(0, 80) : null;
+      const threadKey = typeof args?.threadKey === "string" ? args.threadKey.trim().slice(0, KEY_MAX) : null;
+      if (action === "upsert_project" && !project) throw new Error("Pass a project name.");
+      if (action === "delete_project" && !project) throw new Error("Pass a project name or id to delete.");
+      if (action === "assign_thread" && !threadKey) throw new Error("Pass threadKey to organize.");
+      return { action, ...(project ? { project } : {}), ...(theme ? { theme } : {}), ...(threadKey ? { threadKey } : {}) };
+    },
+    approvalTtlMs: 10 * 60_000,
+    approvalDedupeKey: (args, context) => `fleet-org:${digest([context?.sessionId ?? null, args.action, args.project ?? null, args.theme ?? null, args.threadKey ?? null])}`,
+    summarize: (args) => {
+      if (args.action === "delete_project") return `Delete OpenAGI project "${args.project}"`;
+      if (args.action === "assign_thread") {
+        const dest = [args.project, args.theme].filter(Boolean).join(" / ") || "auto";
+        return `Assign session ${args.threadKey} to ${dest}`;
+      }
+      return `Create OpenAGI project "${args.project}"${args.theme ? ` / ${args.theme}` : ""}`;
+    },
+    handler: async (args, context) => {
+      if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+      if (args.action === "delete_project") return supervisor.deleteProject(args.project);
+      if (args.action === "assign_thread") return supervisor.organizeThread(args.threadKey, { project: args.project ?? null, theme: args.theme ?? null });
+      return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null });
+    }
+  });
 }
 
 async function fleetDispatchGoalTarget(supervisor, args = {}) {

@@ -40,6 +40,107 @@ struct FleetWorkspaceEntry: Decodable, Equatable, Identifiable {
   let defaultTarget: Target?
 }
 
+struct FleetHierarchySession: Decodable, Equatable, Identifiable {
+  let key: String
+  let title: String?
+  let host: String?
+  let cwd: String?
+  let state: String?
+  let lastActivityAt: String?
+  let theme: String?
+  let themeId: String?
+  var id: String { key }
+}
+
+struct FleetHierarchyTheme: Decodable, Equatable, Identifiable {
+  struct Counts: Decodable, Equatable {
+    let running: Int?
+    let idle: Int?
+    let sleeping: Int?
+    let total: Int?
+  }
+
+  let id: String
+  let name: String
+  let source: String?
+  let counts: Counts?
+  let needsYouCount: Int?
+  let sessions: [FleetHierarchySession]
+
+  enum CodingKeys: String, CodingKey { case id, name, source, counts, needsYouCount, sessions }
+
+  init(id: String, name: String, source: String? = nil, counts: Counts? = nil, needsYouCount: Int? = nil, sessions: [FleetHierarchySession] = []) {
+    self.id = id
+    self.name = name
+    self.source = source
+    self.counts = counts
+    self.needsYouCount = needsYouCount
+    self.sessions = sessions
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+    name = (try? c.decode(String.self, forKey: .name)) ?? id
+    source = try? c.decodeIfPresent(String.self, forKey: .source)
+    counts = try? c.decodeIfPresent(Counts.self, forKey: .counts)
+    needsYouCount = try? c.decodeIfPresent(Int.self, forKey: .needsYouCount)
+    sessions = ((try? c.decodeIfPresent([Lossy<FleetHierarchySession>].self, forKey: .sessions)) ?? []).compactMap(\.value)
+  }
+}
+
+struct FleetHierarchyProject: Decodable, Equatable, Identifiable {
+  struct Counts: Decodable, Equatable {
+    let running: Int?
+    let idle: Int?
+    let sleeping: Int?
+    let total: Int?
+  }
+
+  let id: String
+  let name: String
+  let repo: String?
+  let counts: Counts?
+  let needsYouCount: Int?
+  let themes: [FleetHierarchyTheme]
+
+  enum CodingKeys: String, CodingKey { case id, name, repo, counts, needsYouCount, themes }
+
+  init(id: String, name: String, repo: String? = nil, counts: Counts? = nil, needsYouCount: Int? = nil, themes: [FleetHierarchyTheme] = []) {
+    self.id = id
+    self.name = name
+    self.repo = repo
+    self.counts = counts
+    self.needsYouCount = needsYouCount
+    self.themes = themes
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+    name = (try? c.decode(String.self, forKey: .name)) ?? id
+    repo = try? c.decodeIfPresent(String.self, forKey: .repo)
+    counts = try? c.decodeIfPresent(Counts.self, forKey: .counts)
+    needsYouCount = try? c.decodeIfPresent(Int.self, forKey: .needsYouCount)
+    themes = ((try? c.decodeIfPresent([Lossy<FleetHierarchyTheme>].self, forKey: .themes)) ?? []).compactMap(\.value)
+  }
+}
+
+struct FleetHierarchyResponse: Decodable, Equatable {
+  let projects: [FleetHierarchyProject]
+
+  enum CodingKeys: String, CodingKey { case projects }
+
+  init(projects: [FleetHierarchyProject] = []) {
+    self.projects = projects
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    projects = ((try? c.decodeIfPresent([Lossy<FleetHierarchyProject>].self, forKey: .projects)) ?? []).compactMap(\.value)
+  }
+}
+
 struct FleetQuestion: Decodable, Equatable, Identifiable {
   let id: String
   let kind: String?
