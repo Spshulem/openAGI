@@ -246,8 +246,8 @@ class DaemonClient(
     // closes the stream. `Accept: text/event-stream` is what selects this
     // richer streaming reply over the plain single-JSON-object response the
     // same route gives a caller that doesn't ask for it.
-    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null, thread: String? = null): Flow<SseFrame> {
-        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId, thread))
+    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null, thread: String? = null, requestId: String? = null): Flow<SseFrame> {
+        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId, thread, requestId))
         val request = authorized("/message")
             .header("Accept", "text/event-stream")
             .post(body.toRequestBody(JSON))
