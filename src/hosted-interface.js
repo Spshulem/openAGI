@@ -71,6 +71,7 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
+import { LiveTurns, storedTurn, replayedResult, replayedFailure } from "./message-turns.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -307,6 +308,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.setMaxListeners(50);
 
   const sseClients = new Set();
+  // Turns a paired phone named with its own request id, while they run: a
+  // repeat of the id attaches here instead of running the turn again.
+  const liveTurns = new LiveTurns();
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -2012,7 +2016,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
-          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main" }));
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main", liveTurns }));
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2224,6 +2228,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
+        let clientTurnId = null;
         try {
           if (body && typeof body === "object" && !Array.isArray(body)) {
             const images = normalizeMessageImages(body.attachments);
@@ -2234,7 +2239,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId", "requestId"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
@@ -2242,6 +2247,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (body.focusedCardId !== undefined && (typeof body.focusedCardId !== "string" || !/^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId))) {
             return sendJson(res, 400, { error: "focusedCardId must be a valid card id" });
           }
+          // The client's own name for this turn: sending it again (after a
+          // dropped stream) attaches to or replays the turn, never reruns it.
+          if (body.requestId !== undefined && (typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.requestId))) {
+            return sendJson(res, 400, { error: "requestId must be 8-128 letters, digits, _ or -" });
+          }
+          clientTurnId = typeof body.requestId === "string" ? body.requestId : null;
           if (typeof body.text !== "string" || !body.text.trim()
               || body.text.includes("\0") || Buffer.byteLength(body.text, "utf8") > 64 * 1024) {
             return sendJson(res, 400, { error: "node message text must be non-empty and at most 64 KiB" });
@@ -2324,17 +2335,45 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // same auth and Origin gates above protect both forms; this is a direct
         // response stream, not a broadcast that another signed-in client can
         // accidentally observe.
+        // A turn the client named: run it once. A repeat of the id while it
+        // runs follows that run (progress and its final reply); a repeat
+        // after it ended replays how it ended. Neither reaches the model.
+        let runTurn = (hooks) => channels.handleLocalMessage(body, { ...hooks, principal });
+        if (clientTurnId && typeof body.sessionId === "string") {
+          const sessionId = body.sessionId;
+          const live = liveTurns.get(sessionId, clientTurnId);
+          const stored = live ? null : storedTurn(runtime.agentHost?.store ?? channels?.agentHost?.store, sessionId, clientTurnId);
+          if (live) {
+            runTurn = (hooks) => {
+              const off = liveTurns.subscribe(live, (kind, data) => { if (kind === "progress") hooks.onProgress?.(data); });
+              hooks.onProgress?.({ stage: live.stage, session: { id: sessionId } });
+              return live.promise.finally(off);
+            };
+          } else if (stored) {
+            runTurn = async (hooks) => {
+              hooks.onProgress?.({ stage: "replayed", session: { id: sessionId, messageCount: stored.messageCount } });
+              if (stored.status === "complete") return replayedResult(stored);
+              throw replayedFailure(stored, clientTurnId);
+            };
+          } else {
+            const fresh = runTurn;
+            runTurn = (hooks) => liveTurns.run(sessionId, clientTurnId, fresh, (kind, data) => {
+              if (kind === "progress") hooks.onProgress?.(data);
+              else hooks.onTextDelta?.(data);
+            }).promise;
+          }
+        }
         if (acceptsEventStream(req)) {
-          return streamLocalMessage(res, channels, body, principal);
+          return streamLocalMessage(res, channels, body, principal, runTurn);
         }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
         try {
-          const result = await channels.handleLocalMessage(body, { principal });
+          const result = await runTurn({});
           return sendJson(res, 200, result);
         } catch (error) {
-          logAgentFailure(error, { sessionId: error?.openagiSessionId, requestId: req.openagiRequestId });
+          if (!error?.openagiReplayed) logAgentFailure(error, { sessionId: error?.openagiSessionId, requestId: req.openagiRequestId });
           return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null, req.openagiRequestId));
         }
       }
@@ -4299,7 +4338,11 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
     sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
-    metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread, ...(focusedCardId ? { focusedCardId } : {}) }
+    metadata: {
+      sourceNodeId: requestNodeId, sourceName, thread: body.thread,
+      ...(focusedCardId ? { focusedCardId } : {}),
+      ...(typeof body.requestId === "string" ? { requestId: body.requestId } : {})
+    }
   };
 }
 
@@ -4314,7 +4357,7 @@ function bindScopedNodeMessage(body, requestNodeId) {
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
     sessionId: `node:${nodeNamespace}:${conversationNamespace}:main`,
-    metadata: { sourceNodeId: requestNodeId }
+    metadata: { sourceNodeId: requestNodeId, ...(typeof body.requestId === "string" ? { requestId: body.requestId } : {}) }
   };
 }
 
@@ -4339,7 +4382,8 @@ export function relayedSender(from) {
   return typeof from === "string" && /^[a-z][a-z0-9_-]*:/i.test(from.trim());
 }
 
-async function streamLocalMessage(res, channels, body, principal = null) {
+async function streamLocalMessage(res, channels, body, principal = null,
+  runTurn = (hooks) => channels.handleLocalMessage(body, { ...hooks, principal })) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -4403,11 +4447,11 @@ async function streamLocalMessage(res, channels, body, principal = null) {
   };
 
   try {
-    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta, principal });
+    const result = await runTurn({ onProgress, onTextDelta });
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
-    logAgentFailure(error, { sessionId: error?.openagiSessionId ?? sessionId, requestId });
+    if (!error?.openagiReplayed) logAgentFailure(error, { sessionId: error?.openagiSessionId ?? sessionId, requestId });
     write("failure", { ...messageFailure(error, error?.openagiSessionId ?? sessionId), ...(requestId ? { requestId } : {}) });
   } finally {
     clearInterval(heartbeat);
@@ -4472,6 +4516,10 @@ function boundedProgressText(value, max) {
 }
 
 function messageFailure(error, sessionId = null, requestId = null) {
+  // A replayed failure already carries its public code and text.
+  if (error?.openagiReplayed) {
+    return { code: error.code, error: error.message, sessionId: sessionId || null, ...(requestId ? { requestId } : {}), replayed: true };
+  }
   return publicAgentFailure(error, sessionId, requestId);
 }
 

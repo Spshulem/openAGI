@@ -237,7 +237,7 @@ struct ChatConversationView: View {
             }
             onComposerFocusChanged(focused)
         }
-        .task(id: conversation.identity) { await conversation.refresh() }
+        .task(id: conversation.identity) { await conversation.resume() }
         .onDisappear { dictation.stop() }
         .onChange(of: conversation.identity) { _, _ in dictation.stop() }
         .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
@@ -249,8 +249,13 @@ struct ChatConversationView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await conversation.refresh() } }
-            else { dictation.stop() }
+            // Coming back finds replies whose stream iOS cut while away and
+            // resends a send main never confirmed. Away, nothing polls.
+            if phase == .active { Task { await conversation.resume() } }
+            else {
+                conversation.pauseRecovery()
+                dictation.stop()
+            }
         }
     }
 
@@ -497,8 +502,9 @@ struct ChatConversationView: View {
             if isLatestReply, !conversation.isReadOnly, let code = ApprovalCodePrompt.extractCode(from: item.message.text) {
                 ChatConfirmationCodeBar(code: code, conversation: conversation)
             }
-            // Offer a resend only when the daemon rejected the turn before
-            // it ran. A lost stream can hide a completed action.
+            // Offer a resend only when it cannot run a turn twice: main
+            // rejected it before it ran, or main never confirmed it and the
+            // resend carries the same turn id (main replays or follows it).
             if item.message.isFailed && item.message.retrySafe {
                 Button("Try again") {
                     Task { await conversation.retry(item.message) }

@@ -371,6 +371,34 @@ reply or its failure record), `/events` sends `conversation.updated` with
 `{"thread": "agent", "messageId": "msg_…"}` (§7). Reload the thread's newest
 page on it. The phone's local chat history is an offline cache only.
 
+#### Recovering a turn after the stream drops
+
+iOS suspends an app's sockets when it is backgrounded or locked, and networks
+drop. The turn itself does not depend on the stream: once main has the
+message it runs to the end and stores the reply (or a failure record) with no
+client attached. To find it again, and to send safely after a drop, a phone
+names each turn:
+
+- `"requestId"` on `POST /message`: 8-128 characters of `A-Z a-z 0-9 _ -`,
+  new for each turn (a UUID). Main stores it on the user message and on the
+  reply or failure record. Any other value is `400`. Mains older than this
+  field reject it as an unsupported field (`400`) before running anything,
+  so a client may resend without it.
+- The stream's `session` frame (it carries the same `requestId`) means main
+  has accepted the turn. Before it, nothing is known to have arrived; after
+  it, never treat the turn as lost.
+- Sending the same `requestId` again never runs the turn twice. While it is
+  running, the new request follows it: `session`, progress, then its `final`
+  (or `failure`); text deltas already sent are not repeated. After it ended,
+  the request replays the stored reply (`"replayed": true`) or failure. A turn
+  whose user message was stored but which never finished (main restarted)
+  fails with code `interrupted` rather than running again.
+- History messages carry `requestId` (when the turn had one) and a stored
+  failure record carries `"status": "failed"`. The newest page (no `before`)
+  also lists the thread's turns still running:
+  `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
+  A turn in `inFlight`, or whose reply is not there yet, is still working.
+
 A G2 joins the same threads through `POST /nodes/g2/experience`: op
 `submit` accepts `"thread"` (beside or inside `question`; no
 `conversationId` needed) and op `history` accepts `thread`, `before` and
