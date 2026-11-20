@@ -50,7 +50,8 @@ final class ChatTurnRecoveryTests: XCTestCase {
 
     func testAnOlderMainThatCannotListRunningTurnsIsWaitedOnUntilStale() {
         let server = page([line("m1", .user, "plan my day", turn: nil)], inFlight: nil)
-        XCTAssertEqual(ChatTurnRecovery.resolve(detached("ios-1"), page: server, now: now), detached("ios-1"))
+        let waiting = detached("ios-1")
+        XCTAssertEqual(ChatTurnRecovery.resolve(waiting, page: server, now: now), waiting)
         let stale = ChatTurnRecovery.resolve(detached("ios-1", at: -(ChatTurnRecovery.staleAfter + 1)), page: server, now: now)
         XCTAssertTrue(try XCTUnwrap(stale.last).isFailed)
         XCTAssertFalse(try XCTUnwrap(stale.last).newRequestOnRetry, "a stale turn may still be running: retry follows it")

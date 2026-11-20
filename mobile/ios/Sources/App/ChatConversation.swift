@@ -220,6 +220,9 @@ final class ChatConversation {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
                 case .delta(let frame):
+                    // Text means main is running the turn, whatever frames
+                    // came before it.
+                    messages[index].accepted = true
                     // The working line stays under the text received so far
                     // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
@@ -291,9 +294,11 @@ final class ChatConversation {
                 messages[index].autoRetry = true
             }
         } else {
-            fail(replyID, text: "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.")
+            fail(replyID, text: Self.connectionLostText)
         }
     }
+
+    static let connectionLostText = "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again."
 
     // Opening the chat, or the app becoming active: catch up with main,
     // keep finding replies whose stream was lost, and resend (once, same id)
@@ -378,6 +383,13 @@ final class ChatConversation {
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .needsUpdate
+            // No shared history on this main, so a lost reply can't be found
+            // again: say so plainly, and don't offer a blind resend.
+            for index in messages.indices where messages[index].isDetached {
+                fail(messages[index].id, text: Self.connectionLostText)
+                messages[index].isDetached = false
+            }
+            persist()
         } catch DaemonError.unauthorized {
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
