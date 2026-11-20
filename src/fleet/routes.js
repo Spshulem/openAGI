@@ -209,10 +209,12 @@ export function createFleetRoute({ supervisor } = {}) {
           const body = await readObject(readBody);
           const name = typeof body?.name === "string" ? body.name.trim() : "";
           const theme = typeof body?.theme === "string" ? body.theme.trim() : null;
+          const alias = typeof body?.alias === "string" ? body.alias.trim() : null;
           if (!name || name.length > 80) return fail(400, "Project name must be 1-80 characters.");
           if (theme && theme.length > 80) return fail(400, "Theme name must be up to 80 characters.");
+          if (alias && alias.length > 80) return fail(400, "Alias must be up to 80 characters.");
           try {
-            const res = await supervisor.upsertProject({ name, theme: theme || null });
+            const res = await supervisor.upsertProject({ name, theme: theme || null, alias: alias || null });
             return ok({ ...res, state: state() });
           } catch (err) {
             return fail(400, String(err?.message ?? "Could not save project.").slice(0, 200));

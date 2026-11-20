@@ -151,6 +151,7 @@ struct SupervisorWorkspaceView: View {
   @State private var showNewProjectPopover: Bool = false
   @State private var newProjectName: String = ""
   @State private var newProjectTheme: String = ""
+  @State private var newProjectAlias: String = ""
   @State private var organizingSessionKey: String? = nil
   @State private var organizeProjectDraft: String = ""
   @State private var organizeThemeDraft: String = ""
@@ -490,18 +491,26 @@ struct SupervisorWorkspaceView: View {
                 .textFieldStyle(.roundedBorder)
               TextField("Optional theme (e.g. SEO, Mobile)", text: $newProjectTheme)
                 .textFieldStyle(.roundedBorder)
+              TextField("Merge folder alias (optional, e.g. web-client)", text: $newProjectAlias)
+                .textFieldStyle(.roundedBorder)
               HStack {
                 Spacer()
                 Button("Cancel") { showNewProjectPopover = false }
                 Button("Save") {
                   let name = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
                   let theme = newProjectTheme.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let alias = newProjectAlias.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !name.isEmpty else { return }
                   Task {
-                    let ok = await fleet.upsertProject(name: name, theme: theme.isEmpty ? nil : theme)
+                    let ok = await fleet.upsertProject(
+                      name: name,
+                      theme: theme.isEmpty ? nil : theme,
+                      alias: alias.isEmpty ? nil : alias
+                    )
                     if ok {
                       newProjectName = ""
                       newProjectTheme = ""
+                      newProjectAlias = ""
                       showNewProjectPopover = false
                       nav.selectedChannel = .project(name)
                     }
@@ -2451,10 +2460,35 @@ struct SupervisorWorkspaceView: View {
     .frame(maxWidth: .infinity, alignment: .trailing)
   }
 
+  private static func extractApprovalCode(from text: String) -> String? {
+    let pattern = #"(?i)\bsay\s+['"\u2018\u2019\u201C\u201D`]*yes\s+(\d{2,3})['"\u2018\u2019\u201C\u201D`]*"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: range),
+          match.numberOfRanges > 1,
+          let codeRange = Range(match.range(at: 1), in: text) else { return nil }
+    return String(text[codeRange])
+  }
+
   private func assistantDocumentRow(_ msg: SyncedSupervisorMessage, showsActions: Bool) -> some View {
     VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
       WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(msg.text))
       if showsActions {
+        if let code = Self.extractApprovalCode(from: msg.text) {
+          HStack(spacing: 8) {
+            WorkspaceActionButton(prominent: true, small: true) {
+              Task { _ = await supervisor.sendMessage("yes \(code)") }
+            } label: {
+              Label("Approve", systemImage: "checkmark.circle.fill")
+            }
+            WorkspaceActionButton(small: true) {
+              Task { _ = await supervisor.sendMessage("no \(code)") }
+            } label: {
+              Text("Cancel")
+            }
+          }
+          .padding(.top, 2)
+        }
         HStack(spacing: 8) {
           Button {
             copyText(msg.text)

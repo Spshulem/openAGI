@@ -1075,7 +1075,7 @@ struct SupervisorView: View {
     }
 
     private func autonomyBanner(line: String, autonomy: SupervisorAutonomy?) -> some View {
-        let latestUnvetoed = autonomy?.recentActions.first(where: { !$0.vetoed })
+        let latestVetoable = autonomy?.recentActions.first(where: { $0.canVeto && !$0.vetoed })
         return HStack(spacing: 8) {
             Image(systemName: "bolt.fill")
                 .font(.caption2)
@@ -1085,8 +1085,9 @@ struct SupervisorView: View {
                 .foregroundStyle(Theme.ink)
                 .lineLimit(1)
             Spacer(minLength: 4)
-            if let latest = latestUnvetoed {
-                Button("Don't do that") {
+            if let latest = latestVetoable {
+                let sliceTitle = latest.sliceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+                Button(sliceTitle?.isEmpty == false ? "Undo \(sliceTitle!)" : "Undo auto") {
                     Task {
                         await updatePreferences(cadence: nil, mergePolicy: nil,
                                                 vetoSlice: latest.slice, vetoActionID: latest.id)
@@ -1520,6 +1521,15 @@ struct SupervisorView: View {
         }
         if lowerOp == "approve" || lowerLabel.contains("approve") {
             return "Approved"
+        }
+        if lowerLabel == "proceed" || action.value?.lowercased() == "proceed" {
+            return "Sent Proceed"
+        }
+        if lowerLabel == "archive" || action.value?.lowercased() == "archive" {
+            return "Archived session"
+        }
+        if lowerLabel == "mark done" || action.value?.lowercased() == "mark done" {
+            return "Marked done"
         }
         if lowerOp == "reply" || lowerOp == "answer" {
             return "Sent reply"
@@ -3901,6 +3911,48 @@ private struct ThreadDetailSheet: View {
                     .accessibilityIdentifier("supervisor-read-conversation")
                 }
 
+                if card == nil && !thread.key.hasPrefix("fleet:") {
+                    Section("Message coding session") {
+                        TextField("Send message or attach images…", text: $replyText, axis: .vertical)
+                            .lineLimit(2...5)
+                        replyAttachmentSection(disabled: directSendBusy || preparingReplyImages)
+                        let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let canDirectSend = !directSendBusy && !preparingReplyImages && (!trimmed.isEmpty || !replyAttachments.isEmpty)
+                        Button {
+                            let effectiveText = trimmed.isEmpty ? "Please inspect the attached image(s)." : trimmed
+                            let sentImages = replyAttachments
+                            Task {
+                                directSendBusy = true
+                                directSendNote = nil
+                                defer { directSendBusy = false }
+                                do {
+                                    let res = try await model.client.fleetSendMessage(
+                                        threadKey: thread.key,
+                                        message: effectiveText,
+                                        images: sentImages
+                                    )
+                                    let note = SupervisorFormat.deliveryNote(res.delivery, fallback: "Sent to coding session.")
+                                    directSendNote = note
+                                    if !note.isAlert {
+                                        replyText = ""
+                                        replyAttachments = []
+                                    }
+                                } catch let err as DaemonError {
+                                    directSendNote = SupervisorFormat.failureNote(err)
+                                } catch {
+                                    directSendNote = .init(text: "Couldn't reach OpenAGI.", isAlert: true)
+                                }
+                            }
+                        } label: {
+                            Label(directSendBusy ? "Sending…" : "Send to session", systemImage: "paperplane.fill")
+                        }
+                        .disabled(!canDirectSend)
+                        if let directSendNote {
+                            NoteLine(note: directSendNote)
+                        }
+                    }
+                }
+
                 if !details.isEmpty {
                     Section("Thread status") {
                         ForEach(details) { detail in detailRow(detail) }
@@ -3954,47 +4006,6 @@ private struct ThreadDetailSheet: View {
                 }
                 if let actionNote, !proposed.contains(where: { $0.id == actionNote.id }) {
                     NoteLine(note: actionNote.note)
-                }
-                if card == nil && thread.key.hasPrefix("paseo:") {
-                    Section("Message coding session") {
-                        TextField("Send message or attach images…", text: $replyText, axis: .vertical)
-                            .lineLimit(2...5)
-                        replyAttachmentSection(disabled: directSendBusy || preparingReplyImages)
-                        let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let canDirectSend = !directSendBusy && !preparingReplyImages && (!trimmed.isEmpty || !replyAttachments.isEmpty)
-                        Button {
-                            let effectiveText = trimmed.isEmpty ? "Please inspect the attached image(s)." : trimmed
-                            let sentImages = replyAttachments
-                            Task {
-                                directSendBusy = true
-                                directSendNote = nil
-                                defer { directSendBusy = false }
-                                do {
-                                    let res = try await model.client.fleetSendMessage(
-                                        threadKey: thread.key,
-                                        message: effectiveText,
-                                        images: sentImages
-                                    )
-                                    let note = SupervisorFormat.deliveryNote(res.delivery, fallback: "Sent to coding session.")
-                                    directSendNote = note
-                                    if !note.isAlert {
-                                        replyText = ""
-                                        replyAttachments = []
-                                    }
-                                } catch let err as DaemonError {
-                                    directSendNote = SupervisorFormat.failureNote(err)
-                                } catch {
-                                    directSendNote = .init(text: "Couldn't reach OpenAGI.", isAlert: true)
-                                }
-                            }
-                        } label: {
-                            Label(directSendBusy ? "Sending…" : "Send to session", systemImage: "paperplane.fill")
-                        }
-                        .disabled(!canDirectSend)
-                        if let directSendNote {
-                            NoteLine(note: directSendNote)
-                        }
-                    }
                 }
             }
             .accessibilityIdentifier("supervisor-thread-details")
@@ -4168,14 +4179,22 @@ private struct ThreadDetailSheet: View {
         .padding(.top, 4)
     }
 
+    private static func stripInternalMarkup(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: #"(?is)<oai-mem-citation\b.*?(?:</oai-mem-citation>|$)"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?is)<(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)\b.*?(?:</(?:system_instruction|system-reminder|EXTREMELY_IMPORTANT|TASK_INSTRUCTION)>|$)"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func activityMessage(_ speaker: String, text: String, at: Date?) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let cleaned = Self.stripInternalMarkup(text)
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(speaker).font(.subheadline.weight(.semibold))
                 if let at { Text(SupervisorFormat.clockTime(at)).font(.caption).foregroundStyle(.secondary) }
             }
-            MarkdownContent(blocks: MarkdownParser.parse(text)).textSelection(.enabled)
-            let milestones = SupervisorMilestoneParser.parse(from: text)
+            MarkdownContent(blocks: MarkdownParser.parse(cleaned.isEmpty ? text : cleaned)).textSelection(.enabled)
+            let milestones = SupervisorMilestoneParser.parse(from: cleaned.isEmpty ? text : cleaned)
             if !milestones.isEmpty {
                 BoardMilestoneStrip(milestones: milestones)
             }

@@ -492,8 +492,11 @@ struct ChatConversationView: View {
                 }
                 .frame(width: min(width * 0.78, 320))
             }
-            MessageBubbleRow(message: item.message, maxContainerWidth: width,
-                             showsActions: item.message.id == latestFinishedReplyID)
+            let isLatestReply = item.message.id == latestFinishedReplyID
+            MessageBubbleRow(message: item.message, maxContainerWidth: width, showsActions: isLatestReply)
+            if isLatestReply, !conversation.isReadOnly, let code = ApprovalCodePrompt.extractCode(from: item.message.text) {
+                ChatConfirmationCodeBar(code: code, conversation: conversation)
+            }
             // Offer a resend only when the daemon rejected the turn before
             // it ran. A lost stream can hide a completed action.
             if item.message.isFailed && item.message.retrySafe {
@@ -945,6 +948,56 @@ enum ChatErrorCopy {
 // is plain text on the page, full width, like a document. While a reply
 // streams, a working line says what the agent is doing. A failed reply is
 // plain `alert` text (the app's own copy, never run through Markdown).
+enum ApprovalCodePrompt {
+    static func extractCode(from text: String) -> String? {
+        let pattern = #"(?i)\bsay\s+['"\u2018\u2019\u201C\u201D`]*yes\s+(\d{2,3})['"\u2018\u2019\u201C\u201D`]*"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              match.numberOfRanges > 1,
+              let codeRange = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[codeRange])
+    }
+}
+
+private struct ChatConfirmationCodeBar: View {
+    let code: String
+    let conversation: ChatConversation
+
+    var body: some View {
+        if !conversation.isSending {
+            HStack(spacing: Theme.Spacing.x2) {
+                Button {
+                    Task { await conversation.send("yes \(code)") }
+                } label: {
+                    Label("Approve", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(Color(uiColor: .systemBackground))
+                        .background(Theme.ink, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat-confirm-yes-\(code)")
+
+                Button {
+                    Task { await conversation.send("no \(code)") }
+                } label: {
+                    Text("Cancel")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(Theme.ink)
+                        .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat-confirm-no-\(code)")
+            }
+            .padding(.top, 2)
+        }
+    }
+}
+
 private struct MessageBubbleRow: View {
     @Environment(\.chatFont) private var chatFont
     let message: ChatMessage

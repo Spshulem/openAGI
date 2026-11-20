@@ -1050,31 +1050,41 @@ public struct SupervisorPreferences: Decodable, Sendable, Equatable {
 public struct SupervisorAutonomousAction: Decodable, Sendable, Equatable, Identifiable {
     public var id: String
     public var slice: String?
+    public var sliceLabel: String?
     public var summary: String?
     public var threadKey: String?
     public var at: Date?
     public var vetoed: Bool
+    public var canVeto: Bool
 
-    public init(id: String, slice: String? = nil, summary: String? = nil, threadKey: String? = nil,
-                at: Date? = nil, vetoed: Bool = false) {
+    public init(id: String, slice: String? = nil, sliceLabel: String? = nil, summary: String? = nil,
+                threadKey: String? = nil, at: Date? = nil, vetoed: Bool = false, canVeto: Bool? = nil) {
         self.id = id
         self.slice = slice
+        self.sliceLabel = sliceLabel
         self.summary = summary
         self.threadKey = threadKey
         self.at = at
         self.vetoed = vetoed
+        self.canVeto = canVeto ?? (slice != nil && !vetoed)
     }
 
-    private enum CodingKeys: String, CodingKey { case id, slice, summary, threadKey, at, vetoed, reverted }
+    private enum CodingKeys: String, CodingKey {
+        case id, slice, sliceLabel, summary, threadKey, at, vetoed, reverted, canVeto
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = c.lenient(String.self, .id) ?? ""
-        slice = c.lenient(String.self, .slice)
+        let decodedSlice = c.lenient(String.self, .slice)
+        slice = decodedSlice
+        sliceLabel = c.lenient(String.self, .sliceLabel)
         summary = c.lenient(String.self, .summary)
         threadKey = c.lenient(String.self, .threadKey)
         at = c.lenient(Date.self, .at)
-        vetoed = c.lenient(Bool.self, .vetoed) ?? c.lenient(Bool.self, .reverted) ?? false
+        let isVetoed = c.lenient(Bool.self, .vetoed) ?? c.lenient(Bool.self, .reverted) ?? false
+        vetoed = isVetoed
+        canVeto = c.lenient(Bool.self, .canVeto) ?? (decodedSlice != nil && !isVetoed)
     }
 }
 

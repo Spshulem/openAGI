@@ -300,6 +300,50 @@ final class SupervisorBoardTests: XCTestCase {
         XCTAssertEqual(supervisorAction.displaySubtitle, "Coding Supervisor")
     }
 
+    func testAutonomyRecentActionsRespectCanVetoFlag() throws {
+        let json = #"""
+        {
+          "handledCount": 18,
+          "totalDecisions": 20,
+          "autonomousPercent": 90,
+          "recentActions": [
+            {
+              "id": "act_review_1",
+              "slice": null,
+              "summary": "reviewed 1: 0 closed, 1 kept",
+              "canVeto": false,
+              "vetoed": false
+            },
+            {
+              "id": "auto_slice_1",
+              "slice": "ci_rerun",
+              "sliceLabel": "CI reruns",
+              "summary": "Re-ran flaky CI check",
+              "canVeto": true,
+              "vetoed": false
+            }
+          ]
+        }
+        """#
+        let decoded = try ProtocolDecoder.json.decode(SupervisorAutonomy.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.recentActions.count, 2)
+        XCTAssertFalse(decoded.recentActions[0].canVeto)
+        XCTAssertTrue(decoded.recentActions[1].canVeto)
+        XCTAssertEqual(decoded.recentActions[1].sliceLabel, "CI reruns")
+    }
+
+    func testApprovalCodePromptExtractsTwoOrThreeDigitCode() {
+        XCTAssertEqual(
+            ApprovalCodePrompt.extractCode(from: "Say 'yes 49' to apply it (within 10 minutes), or 'no 49' to cancel."),
+            "49"
+        )
+        XCTAssertEqual(
+            ApprovalCodePrompt.extractCode(from: "Say “yes 55” to run that action, or “no 55” to cancel."),
+            "55"
+        )
+        XCTAssertNil(ApprovalCodePrompt.extractCode(from: "All 3,509 tests passed with zero errors."))
+    }
+
     func testRequestPairingPromptPostsDeviceName() async throws {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubProtocol.self]
