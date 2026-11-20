@@ -79,8 +79,72 @@ function emptyState() {
     fixLocks: {},
     fixCommands: {},
     selfSessions: [],
-    preferences: defaultPreferences()
+    preferences: defaultPreferences(),
+    organization: { projects: [], threadAssignments: {} }
   };
+}
+
+const ORG_PROJECTS_MAX = 60;
+const ORG_THEMES_MAX = 24;
+const ORG_ASSIGNMENTS_MAX = 400;
+
+function slugifyOrgName(raw) {
+  return String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^#/, "")
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function normalizeOrganization(raw) {
+  const out = { projects: [], threadAssignments: {} };
+  if (!isObject(raw)) return out;
+  const seenProjects = new Set();
+  if (Array.isArray(raw.projects)) {
+    for (const item of raw.projects) {
+      if (!isObject(item)) continue;
+      const name = clampText(String(item.name ?? "").trim(), 80);
+      const id = slugifyOrgName(item.id || name);
+      if (!name || !id || id === "general" || seenProjects.has(id)) continue;
+      seenProjects.add(id);
+      const themes = [];
+      const seenThemes = new Set();
+      if (Array.isArray(item.themes)) {
+        for (const t of item.themes) {
+          const tName = clampText(String(isObject(t) ? t.name : t ?? "").trim(), 80);
+          const tId = slugifyOrgName(isObject(t) ? (t.id || tName) : tName);
+          if (!tName || !tId || tId === "general" || seenThemes.has(tId)) continue;
+          seenThemes.add(tId);
+          themes.push({ id: tId, name: tName });
+          if (themes.length >= ORG_THEMES_MAX) break;
+        }
+      }
+      out.projects.push({
+        id,
+        name,
+        themes,
+        createdAt: typeof item.createdAt === "string" ? item.createdAt : null,
+        updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : null
+      });
+      if (out.projects.length >= ORG_PROJECTS_MAX) break;
+    }
+  }
+  if (isObject(raw.threadAssignments)) {
+    for (const [key, entry] of Object.entries(raw.threadAssignments).slice(0, ORG_ASSIGNMENTS_MAX)) {
+      if (!key || !isObject(entry)) continue;
+      const project = clampText(String(entry.project ?? "").trim(), 80) || null;
+      const theme = clampText(String(entry.theme ?? "").trim(), 80) || null;
+      if (!project && !theme) continue;
+      out.threadAssignments[key] = {
+        project,
+        theme,
+        updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : null
+      };
+    }
+  }
+  return out;
 }
 
 function isObject(value) {
@@ -1256,8 +1320,101 @@ export class FleetStore {
       suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
       selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
-      preferences: normalizePreferences(raw.preferences)
+      preferences: normalizePreferences(raw.preferences),
+      organization: normalizeOrganization(raw.organization)
     };
+  }
+
+  organization() {
+    const org = normalizeOrganization(this.state.organization);
+    return {
+      projects: org.projects.map((p) => ({ ...p, themes: p.themes.map((t) => ({ ...t })) })),
+      threadAssignments: Object.fromEntries(
+        Object.entries(org.threadAssignments).map(([k, v]) => [k, { ...v }])
+      )
+    };
+  }
+
+  threadAssignment(threadKey) {
+    if (!threadKey) return null;
+    const entry = this.state.organization?.threadAssignments?.[threadKey];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  upsertProject({ name, theme = null } = {}) {
+    const cleanName = clampText(String(name ?? "").trim().replace(/^#/, ""), 80);
+    const id = slugifyOrgName(cleanName);
+    if (!cleanName || !id || id === "general") {
+      throw new Error("Project name must be 1-80 characters and cannot be 'general'.");
+    }
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const nowIso = iso(this.now());
+    let project = this.state.organization.projects.find((p) => p.id === id);
+    if (!project) {
+      if (this.state.organization.projects.length >= ORG_PROJECTS_MAX) {
+        throw new Error(`Maximum of ${ORG_PROJECTS_MAX} custom projects reached.`);
+      }
+      project = { id, name: cleanName, themes: [], createdAt: nowIso, updatedAt: nowIso };
+      this.state.organization.projects.push(project);
+    } else {
+      project.name = cleanName;
+      project.updatedAt = nowIso;
+    }
+    const cleanTheme = clampText(String(theme ?? "").trim().replace(/^[/#]+/, ""), 80);
+    if (cleanTheme) {
+      const themeId = slugifyOrgName(cleanTheme);
+      if (themeId && themeId !== "general" && themeId !== id) {
+        const existingTheme = project.themes.find((t) => t.id === themeId);
+        if (existingTheme) {
+          existingTheme.name = cleanTheme;
+        } else if (project.themes.length < ORG_THEMES_MAX) {
+          project.themes.push({ id: themeId, name: cleanTheme });
+        }
+      }
+    }
+    this._save();
+    return { ...project, themes: project.themes.map((t) => ({ ...t })) };
+  }
+
+  deleteProject(projectIdOrName) {
+    const id = slugifyOrgName(projectIdOrName);
+    if (!id) return false;
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const before = this.state.organization.projects.length;
+    this.state.organization.projects = this.state.organization.projects.filter((p) => p.id !== id);
+    if (this.state.organization.projects.length === before) return false;
+    this._save();
+    return true;
+  }
+
+  assignThread(threadKey, { project = null, theme = null } = {}) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) throw new Error("Pass a valid thread key.");
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const cleanProject = clampText(String(project ?? "").trim().replace(/^#/, ""), 80) || null;
+    const cleanTheme = clampText(String(theme ?? "").trim().replace(/^[/#]+/, ""), 80) || null;
+    if (!cleanProject && !cleanTheme) {
+      delete this.state.organization.threadAssignments[key];
+      this._save();
+      return null;
+    }
+    const nowIso = iso(this.now());
+    const assignment = { project: cleanProject, theme: cleanTheme, updatedAt: nowIso };
+    this.state.organization.threadAssignments[key] = assignment;
+    const keys = Object.keys(this.state.organization.threadAssignments);
+    if (keys.length > ORG_ASSIGNMENTS_MAX) {
+      delete this.state.organization.threadAssignments[keys[0]];
+    }
+    if (cleanProject && slugifyOrgName(cleanProject) !== "general") {
+      try {
+        this.upsertProject({ name: cleanProject, theme: cleanTheme });
+      } catch {
+        this._save();
+      }
+    } else {
+      this._save();
+    }
+    return { ...assignment };
   }
 
   _save() {

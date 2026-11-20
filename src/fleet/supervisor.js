@@ -1235,15 +1235,20 @@ export class FleetSupervisor {
       const canPush = preview?.action === "nudge" && preview.message && !muted && !pending
         && !this.ownerAnswerThreads(Infinity).has(row.key) && !repeatsLastSend(thread, this.store.ledgerFor(row.key), preview.messageHash);
       const actorLabel = row.actorLabel ?? deriveActorLabel(row, thread);
-      const project = deriveCardProject({ repo: row.repo ?? thread?.repo ?? null, workspace: row.workspace ?? thread?.workspace ?? null }, thread ?? row);
-      const subchannel = row.subchannel ?? deriveSubchannel(row, thread, project);
+      const orgOverride = this.store?.threadAssignment?.(row.key) ?? null;
+      const project = deriveCardProject(
+        { repo: row.repo ?? thread?.repo ?? null, workspace: row.workspace ?? thread?.workspace ?? null, project: row.project ?? null, cwd: row.cwd ?? null },
+        thread ?? row,
+        orgOverride
+      );
+      const subchannel = (orgOverride?.theme ? null : row.subchannel) ?? deriveSubchannel(row, thread, project, orgOverride);
       const labels = Array.isArray(row.labels) && row.labels.length > 0
         ? row.labels
         : deriveBoardLabels({ row: { ...row, watch }, thread, prRef: row.pr?.ref ?? null, ciState: row.pr?.ci?.state ?? null, subchannel });
       const activeQuietWatch = !muted && (row.live || row.agentStatus === "running" || ["working", "waiting", "push", "you"].includes(watch?.group) || row.pr?.state === "OPEN");
       const nextCheckAt = activeQuietWatch ? fallbackNextTick : null;
       return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
-        actorLabel, subchannel, labels, nextCheckAt,
+        project, actorLabel, subchannel, labels, nextCheckAt,
         pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
     });
     return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.length } };
@@ -2354,6 +2359,28 @@ export class FleetSupervisor {
 
   async getHierarchy(options = {}) {
     return buildFleetHierarchy(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  getOrganization() {
+    return this.store.organization();
+  }
+
+  upsertProject({ name, theme = null } = {}) {
+    const project = this.store.upsertProject({ name, theme });
+    this.emitFleet("organization-updated");
+    return { project, organization: this.store.organization() };
+  }
+
+  deleteProject(projectIdOrName) {
+    const deleted = this.store.deleteProject(projectIdOrName);
+    if (deleted) this.emitFleet("organization-updated");
+    return { deleted, organization: this.store.organization() };
+  }
+
+  organizeThread(threadKey, { project = null, theme = null } = {}) {
+    const assignment = this.store.assignThread(threadKey, { project, theme });
+    this.emitFleet("organization-updated");
+    return { assignment, organization: this.store.organization() };
   }
 
   async syncThemes(options = {}) {

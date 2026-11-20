@@ -80,7 +80,7 @@ struct SupervisorView: View {
     }
 
     private enum SupervisorSheet: String, Identifiable {
-        case sessions, preferences, conversations
+        case board, sessions, preferences, conversations
         var id: String { rawValue }
     }
 
@@ -115,32 +115,113 @@ struct SupervisorView: View {
         }
     }
 
+    private var hierarchyProjects: [FleetProjectGroup] {
+        model.latestFleetHierarchy?.projects ?? []
+    }
+
     private var sessionBriefs: [SupervisorSessionBrief] {
-        (state?.snapshot?.threads ?? []).map { t in
-            SupervisorSessionBrief(
+        var hierarchyMetaByKey: [String: (project: String, theme: String?)] = [:]
+        for proj in hierarchyProjects {
+            for th in proj.themes {
+                let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+                for s in th.sessions where !s.key.isEmpty {
+                    hierarchyMetaByKey[s.key] = (proj.name, cleanTheme)
+                }
+            }
+        }
+
+        var seen = Set<String>()
+        var out: [SupervisorSessionBrief] = (state?.snapshot?.threads ?? []).map { t in
+            seen.insert(t.key)
+            let hMeta = hierarchyMetaByKey[t.key]
+            let proj = SupervisorChannelGrouping.normalizeProject(
+                explicit: t.project ?? hMeta?.project,
+                repo: t.repo,
+                workspace: t.workspace
+            )
+            let sub = t.subchannel ?? hMeta?.theme.map { "\(proj)/\($0)" }
+            return SupervisorSessionBrief(
                 id: t.key,
-                project: SupervisorChannelGrouping.normalizeProject(
-                    repo: t.repo,
-                    workspace: t.workspace
-                ),
-                subchannel: t.subchannel,
+                project: proj,
+                subchannel: sub,
+                theme: hMeta?.theme ?? "General",
                 title: SupervisorFormat.name(t),
                 state: t.state ?? "idle"
             )
         }
+
+        for proj in hierarchyProjects {
+            let normProj = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+            for th in proj.themes {
+                let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+                let sub = cleanTheme.map { "\(normProj)/\($0)" }
+                for s in th.sessions where !s.key.isEmpty && seen.insert(s.key).inserted {
+                    out.append(SupervisorSessionBrief(
+                        id: s.key,
+                        project: normProj,
+                        subchannel: sub,
+                        theme: cleanTheme ?? "General",
+                        title: s.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? s.title! : s.key,
+                        host: s.host,
+                        state: s.state ?? "idle"
+                    ))
+                }
+            }
+        }
+        return out
     }
 
     private var channelSummaries: [SupervisorChannelSummary] {
-        SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+        var base = SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+        var seen = Set(base.map { ch -> String in
+            if case let .project(name) = ch.kind { return name.lowercased() }
+            return ch.displayName.lowercased()
+        })
+        for proj in hierarchyProjects {
+            let norm = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+            let key = norm.lowercased()
+            guard key != "general", seen.insert(key).inserted else { continue }
+            base.append(SupervisorChannelSummary(
+                id: "project:\(key)",
+                kind: .project(norm),
+                displayName: "# \(norm)",
+                waitingCount: proj.needsYouCount,
+                runningCount: proj.counts.running,
+                totalCount: proj.counts.total
+            ))
+        }
+        return base
     }
 
     private var subchannelSummaries: [SupervisorSubchannelSummary] {
         guard let selectedProjectChannel else { return [] }
-        return SupervisorChannelGrouping.subchannels(
+        var base = SupervisorChannelGrouping.subchannels(
             forProject: selectedProjectChannel,
             from: decisionItems,
             sessions: sessionBriefs
         )
+        var seen = Set(base.map { $0.displayName.lowercased() })
+        if let hProj = hierarchyProjects.first(where: {
+            $0.name.caseInsensitiveCompare(selectedProjectChannel) == .orderedSame
+                || SupervisorChannelGrouping.normalizeProject(explicit: $0.name, repo: $0.repo).caseInsensitiveCompare(selectedProjectChannel) == .orderedSame
+        }) {
+            for th in hProj.themes {
+                guard th.name.caseInsensitiveCompare("General & Standalone") != .orderedSame,
+                      th.name.caseInsensitiveCompare(selectedProjectChannel) != .orderedSame else { continue }
+                let display = "/\(th.name)"
+                guard seen.insert(display.lowercased()).inserted else { continue }
+                base.append(SupervisorSubchannelSummary(
+                    id: "subchannel:\(selectedProjectChannel.lowercased())/\(th.id.lowercased())",
+                    project: selectedProjectChannel,
+                    subchannel: "\(selectedProjectChannel)/\(th.name)",
+                    displayName: display,
+                    waitingCount: th.needsYouCount,
+                    runningCount: th.counts.running,
+                    totalCount: th.counts.total
+                ))
+            }
+        }
+        return base
     }
 
     private var availableLabels: [SupervisorBoardLabel] {
@@ -244,6 +325,11 @@ struct SupervisorView: View {
             .animation(.spring(duration: 0.25), value: toastBanner?.id)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button("Board", systemImage: "square.grid.2x2") {
+                        initialBrowseMode = .themes
+                        activeSheet = .board
+                    }
+                    .accessibilityIdentifier("supervisor-board-button")
                     activeSessionsPill
                     Button("Conversations", systemImage: "text.bubble") {
                         if let onOpenConversations {
@@ -340,7 +426,7 @@ struct SupervisorView: View {
         }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
-            case .sessions:
+            case .board, .sessions:
                 ActiveSessionsSheet(
                     state: state,
                     initialMode: initialBrowseMode,
@@ -611,9 +697,9 @@ struct SupervisorView: View {
                 .disabled(batchBusy || busyCardID != nil)
             }
 
-            Button("Active sessions & search", systemImage: "magnifyingglass") {
+            Button("Board", systemImage: "square.grid.2x2") {
                 initialBrowseMode = .themes
-                activeSheet = .sessions
+                activeSheet = .board
             }
 
             Button("Preferences", systemImage: "slider.horizontal.3") {
@@ -1300,6 +1386,7 @@ struct SupervisorView: View {
     private func refresh() async {
         let sequence = nextSequence()
         async let freshModelSettings = try? model.client.modelSettings()
+        async let freshHierarchy = try? model.client.fleetHierarchy(limit: 60)
         do {
             let fresh = try await model.client.fleetState()
             accept(sequence, fresh)
@@ -1310,6 +1397,9 @@ struct SupervisorView: View {
         }
         if let updatedModels = await freshModelSettings {
             modelSettings = updatedModels
+        }
+        if let updatedHierarchy = await freshHierarchy {
+            model.latestFleetHierarchy = updatedHierarchy
         }
     }
 

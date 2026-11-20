@@ -147,6 +147,13 @@ struct SupervisorWorkspaceView: View {
   @State private var composerMode: WorkspaceComposerMode = .chat
   @State private var composerClaimInPaseo: Bool = true
   @State private var claimingTaskIDs: Set<String> = []
+  @State private var showMoreProjects: Bool = false
+  @State private var showNewProjectPopover: Bool = false
+  @State private var newProjectName: String = ""
+  @State private var newProjectTheme: String = ""
+  @State private var organizingSessionKey: String? = nil
+  @State private var organizeProjectDraft: String = ""
+  @State private var organizeThemeDraft: String = ""
 
   private var activeChannel: WorkspaceChannel {
     nav.selectedChannel ?? .general
@@ -183,18 +190,32 @@ struct SupervisorWorkspaceView: View {
   }
 
   private var sessionBriefs: [SupervisorSessionBrief] {
-    fleet.threads.map { t in
+    var hierarchyMetaByKey: [String: (project: String, theme: String?)] = [:]
+    for proj in fleet.hierarchyProjects {
+      for th in proj.themes {
+        let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+        for s in th.sessions {
+          hierarchyMetaByKey[s.key] = (proj.name, cleanTheme)
+        }
+      }
+    }
+
+    var seen = Set<String>()
+    var out: [SupervisorSessionBrief] = fleet.threads.map { t in
+      seen.insert(t.key)
+      let hMeta = hierarchyMetaByKey[t.key]
       let proj = SupervisorChannelGrouping.normalizeProject(
-        explicit: nil,
+        explicit: t.project ?? hMeta?.project,
         repo: t.repo,
         workspace: t.workspace,
         cwd: t.cwd
       )
+      let sub = t.subchannel ?? hMeta?.theme.map { "\(proj)/\($0)" }
       return SupervisorSessionBrief(
         id: t.key,
         project: proj,
-        subchannel: t.subchannel,
-        theme: "General",
+        subchannel: sub,
+        theme: hMeta?.theme ?? "General",
         title: t.name,
         host: t.host,
         cwd: t.cwd,
@@ -202,10 +223,73 @@ struct SupervisorWorkspaceView: View {
         lastActivityISO: t.lastActivityAt
       )
     }
+
+    for proj in fleet.hierarchyProjects {
+      let normProj = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+      for th in proj.themes {
+        let cleanTheme = th.name.caseInsensitiveCompare("General & Standalone") == .orderedSame ? nil : th.name
+        let sub = cleanTheme.map { "\(normProj)/\($0)" }
+        for s in th.sessions where seen.insert(s.key).inserted {
+          out.append(SupervisorSessionBrief(
+            id: s.key,
+            project: normProj,
+            subchannel: sub,
+            theme: cleanTheme ?? "General",
+            title: s.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? s.title! : s.key,
+            host: s.host,
+            cwd: s.cwd,
+            state: s.state ?? "idle",
+            lastActivityISO: s.lastActivityAt
+          ))
+        }
+      }
+    }
+    return out
   }
 
   private var projectChannels: [SupervisorChannelSummary] {
-    SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+    var base = SupervisorChannelGrouping.projectChannels(from: decisionItems, sessions: sessionBriefs)
+    var seen = Set(base.map { projectName(for: $0).lowercased() })
+    for proj in fleet.hierarchyProjects {
+      let norm = SupervisorChannelGrouping.normalizeProject(explicit: proj.name, repo: proj.repo)
+      let key = norm.lowercased()
+      guard key != "general", seen.insert(key).inserted else { continue }
+      base.append(SupervisorChannelSummary(
+        id: "project:\(key)",
+        kind: .project(norm),
+        displayName: "# \(norm)",
+        waitingCount: proj.needsYouCount ?? 0,
+        runningCount: proj.counts?.running ?? 0,
+        totalCount: proj.counts?.total ?? 0
+      ))
+    }
+    return base
+  }
+
+  private func mergedSubchannels(forProject projName: String) -> [SupervisorSubchannelSummary] {
+    var base = SupervisorChannelGrouping.subchannels(forProject: projName, from: decisionItems, sessions: sessionBriefs)
+    var seen = Set(base.map { $0.displayName.lowercased() })
+    if let hProj = fleet.hierarchyProjects.first(where: {
+      $0.name.caseInsensitiveCompare(projName) == .orderedSame
+        || SupervisorChannelGrouping.normalizeProject(explicit: $0.name, repo: $0.repo).caseInsensitiveCompare(projName) == .orderedSame
+    }) {
+      for th in hProj.themes {
+        guard th.name.caseInsensitiveCompare("General & Standalone") != .orderedSame,
+              th.name.caseInsensitiveCompare(projName) != .orderedSame else { continue }
+        let display = "/\(th.name)"
+        guard seen.insert(display.lowercased()).inserted else { continue }
+        base.append(SupervisorSubchannelSummary(
+          id: "subchannel:\(projName.lowercased())/\(th.id.lowercased())",
+          project: projName,
+          subchannel: "\(projName)/\(th.name)",
+          displayName: display,
+          waitingCount: th.needsYouCount ?? 0,
+          runningCount: th.counts?.running ?? 0,
+          totalCount: th.counts?.total ?? 0
+        ))
+      }
+    }
+    return base
   }
 
   private var navigationTitleText: String {
@@ -327,6 +411,7 @@ struct SupervisorWorkspaceView: View {
     .task {
       await supervisor.refreshAll()
       await fleet.refresh()
+      await fleet.loadHierarchy()
       await approvals.refresh()
       AppDelegate.updateDockBadge(count: waitingTotal)
     }
@@ -363,37 +448,142 @@ struct SupervisorWorkspaceView: View {
           .tag(WorkspaceChannel.activity)
       }
 
-      if !projectChannels.isEmpty {
-        Section("Projects") {
-          ForEach(projectChannels) { summary in
-            let projName = projectName(for: summary)
-            let count = summary.waitingCount > 0 ? summary.waitingCount : summary.totalCount
-            sidebarBadgeRow(
-              title: "# \(projName)",
-              systemImage: summary.waitingCount > 0 ? "exclamationmark.circle.fill" : "folder",
-              count: count,
-              highlight: summary.waitingCount > 0
-            )
-            .tag(WorkspaceChannel.project(projName))
-
-            let subs = SupervisorChannelGrouping.subchannels(forProject: projName, from: decisionItems, sessions: sessionBriefs)
-            ForEach(subs) { sub in
-              let subCount = sub.waitingCount > 0 ? sub.waitingCount : sub.totalCount
-              sidebarBadgeRow(
-                title: "  \(sub.displayName)",
-                systemImage: "arrow.turn.down.right",
-                count: subCount,
-                highlight: sub.waitingCount > 0
-              )
-              .font(.caption)
-              .tag(WorkspaceChannel.subchannel(project: projName, subchannel: sub.subchannel))
+      Section {
+        let primaryProjects = Array(projectChannels.prefix(8))
+        let overflowProjects = Array(projectChannels.dropFirst(8))
+        ForEach(primaryProjects) { summary in
+          projectSidebarRows(summary)
+        }
+        if !overflowProjects.isEmpty {
+          DisclosureGroup(isExpanded: $showMoreProjects) {
+            ForEach(overflowProjects) { summary in
+              projectSidebarRows(summary)
             }
+          } label: {
+            Label("More projects (\(overflowProjects.count))", systemImage: "ellipsis.circle")
+              .font(.caption.weight(.medium))
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+        if projectChannels.isEmpty {
+          Text("No projects yet — click + to organize.")
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
+      } header: {
+        HStack {
+          Text("Projects")
+          Spacer()
+          Button {
+            showNewProjectPopover.toggle()
+          } label: {
+            Image(systemName: "plus")
+              .font(.caption.weight(.semibold))
+          }
+          .buttonStyle(.plain)
+          .help("Create OpenAGI Project & Theme")
+          .popover(isPresented: $showNewProjectPopover) {
+            VStack(alignment: .leading, spacing: 10) {
+              Text("New Project / Theme")
+                .font(.headline)
+              TextField("Project name (e.g. Marketing, openAGI)", text: $newProjectName)
+                .textFieldStyle(.roundedBorder)
+              TextField("Optional theme (e.g. SEO, Mobile)", text: $newProjectTheme)
+                .textFieldStyle(.roundedBorder)
+              HStack {
+                Spacer()
+                Button("Cancel") { showNewProjectPopover = false }
+                Button("Save") {
+                  let name = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let theme = newProjectTheme.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !name.isEmpty else { return }
+                  Task {
+                    let ok = await fleet.upsertProject(name: name, theme: theme.isEmpty ? nil : theme)
+                    if ok {
+                      newProjectName = ""
+                      newProjectTheme = ""
+                      showNewProjectPopover = false
+                      nav.selectedChannel = .project(name)
+                    }
+                  }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(newProjectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+              }
+            }
+            .padding(14)
+            .frame(width: 280)
           }
         }
       }
     }
     .listStyle(.sidebar)
     .navigationSplitViewColumnWidth(min: 205, ideal: 232, max: 275)
+    .sheet(isPresented: Binding(
+      get: { organizingSessionKey != nil },
+      set: { if !$0 { organizingSessionKey = nil } }
+    )) {
+      VStack(alignment: .leading, spacing: 12) {
+        Text("Organize Session in OpenAGI")
+          .font(.headline)
+        Text("Assign this coding session to an OpenAGI project & theme (works across Paseo, Codex, Claude Code, Conductor, and Antigravity).")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        TextField("Project (e.g. openAGI, Marketing)", text: $organizeProjectDraft)
+          .textFieldStyle(.roundedBorder)
+        TextField("Theme / Subchannel (e.g. Mobile, SEO)", text: $organizeThemeDraft)
+          .textFieldStyle(.roundedBorder)
+        HStack {
+          Button("Reset to Auto") {
+            guard let key = organizingSessionKey else { return }
+            Task {
+              _ = await fleet.organizeThread(key: key, project: nil, theme: nil)
+              organizingSessionKey = nil
+            }
+          }
+          Spacer()
+          Button("Cancel") { organizingSessionKey = nil }
+          Button("Move") {
+            guard let key = organizingSessionKey else { return }
+            let proj = organizeProjectDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let theme = organizeThemeDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            Task {
+              _ = await fleet.organizeThread(key: key, project: proj.isEmpty ? nil : proj, theme: theme.isEmpty ? nil : theme)
+              organizingSessionKey = nil
+            }
+          }
+          .buttonStyle(.borderedProminent)
+        }
+      }
+      .padding(18)
+      .frame(width: 340)
+    }
+  }
+
+  @ViewBuilder
+  private func projectSidebarRows(_ summary: SupervisorChannelSummary) -> some View {
+    let projName = projectName(for: summary)
+    let count = summary.waitingCount > 0 ? summary.waitingCount : summary.totalCount
+    sidebarBadgeRow(
+      title: "# \(projName)",
+      systemImage: summary.waitingCount > 0 ? "exclamationmark.circle.fill" : "folder",
+      count: count,
+      highlight: summary.waitingCount > 0
+    )
+    .tag(WorkspaceChannel.project(projName))
+
+    let subs = mergedSubchannels(forProject: projName)
+    ForEach(subs) { sub in
+      let subCount = sub.waitingCount > 0 ? sub.waitingCount : sub.totalCount
+      sidebarBadgeRow(
+        title: "  \(sub.displayName)",
+        systemImage: "arrow.turn.down.right",
+        count: subCount,
+        highlight: sub.waitingCount > 0
+      )
+      .font(.caption)
+      .tag(WorkspaceChannel.subchannel(project: projName, subchannel: sub.subchannel))
+    }
   }
 
   private func projectName(for summary: SupervisorChannelSummary) -> String {
@@ -1892,6 +2082,23 @@ struct SupervisorWorkspaceView: View {
     }
     .padding(WorkspaceTheme.Spacing.x4)
     .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
+    .contextMenu {
+      Button("Move to Project / Theme…", systemImage: "folder.badge.gearshape") {
+        organizeProjectDraft = session.project == "general" ? "" : session.project
+        organizeThemeDraft = session.theme == "General" ? "" : session.theme
+        organizingSessionKey = session.id
+      }
+      if !projectChannels.isEmpty {
+        Menu("Quick Move to Project") {
+          ForEach(projectChannels.prefix(12)) { ch in
+            let targetProj = projectName(for: ch)
+            Button("# \(targetProj)") {
+              Task { _ = await fleet.organizeThread(key: session.id, project: targetProj, theme: nil) }
+            }
+          }
+        }
+      }
+    }
   }
 
   @ViewBuilder

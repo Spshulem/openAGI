@@ -639,6 +639,32 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetHierarchyResponse.self, from: data)
     }
 
+    public func fleetUpsertProject(name: String, theme: String? = nil) async throws {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { throw DaemonError.malformedResponse }
+        var request = try authorizedRequest(path: "/fleet/api/projects", method: "POST")
+        var body: [String: Any] = ["name": cleanName]
+        if let cleanTheme = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanTheme.isEmpty {
+            body["theme"] = cleanTheme
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
+    public func fleetOrganizeThread(key: String, project: String?, theme: String?) async throws {
+        guard key.range(of: #"^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
+            throw DaemonError.malformedResponse
+        }
+        var request = try authorizedRequest(path: "/fleet/api/threads/\(key)/organize", method: "POST")
+        var body: [String: Any] = [:]
+        if let project { body["project"] = project }
+        if let theme { body["theme"] = theme }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
     public func fleetDispatchGoal(project: String, goal: String, mode: String = "auto", targetKey: String? = nil) async throws -> FleetDispatchGoalResponse {
         var request = try authorizedRequest(path: "/fleet/api/dispatch", method: "POST")
         var body: [String: Any] = [

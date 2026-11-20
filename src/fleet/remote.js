@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -360,6 +360,10 @@ export class RemoteFleetSupervisor {
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async getOrganization() { return (await this.request('GET', '/fleet/api/projects')).organization; }
+  async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
+  async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
+  async organizeThread(threadKey, input = {}) { return this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/organize`, input); }
   async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
   async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }

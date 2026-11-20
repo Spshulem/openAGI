@@ -193,6 +193,8 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
   });
 
   const state = supervisor?.getState?.() ?? {};
+  const org = supervisor?.store?.organization?.() ?? { projects: [], threadAssignments: {} };
+  const threadAssignments = org.threadAssignments ?? {};
   const openCards = Array.isArray(state.cards) ? state.cards : [];
   const cardsByThread = new Map();
   const cardsByPr = new Map();
@@ -209,20 +211,134 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
     }
   }
 
+  // Merge auto-discovered workspaces with OpenAGI-native thread overrides,
+  // OpenAGI custom projects/themes, and OpenAGI task project metadata so users
+  // without Paseo (or without Paseo workspace labels) get full Project/Theme
+  // organization natively on the OpenAGI side.
+  const workspacesById = new Map();
+  const ensureWorkspaceBucket = (rawName, base = {}) => {
+    const cleanName = String(rawName ?? "").trim().replace(/^#/, "");
+    const id = slugify(cleanName || base.id || "general");
+    let ws = workspacesById.get(id);
+    if (!ws) {
+      ws = {
+        id,
+        name: cleanName || base.name || id,
+        repo: base.repo ?? null,
+        counts: { running: 0, idle: 0, sleeping: 0, archived: 0, total: 0 },
+        defaultTarget: base.defaultTarget ?? null,
+        hosts: Array.isArray(base.hosts) ? [...base.hosts] : [],
+        overlaps: Array.isArray(base.overlaps) ? [...base.overlaps] : [],
+        referencedPrs: Array.isArray(base.referencedPrs) ? [...base.referencedPrs] : [],
+        latestActivityAt: base.latestActivityAt ?? null,
+        recentChats: [],
+        customThemes: [],
+        source: base.source ?? "auto"
+      };
+      workspacesById.set(id, ws);
+    } else {
+      if (!ws.repo && base.repo) ws.repo = base.repo;
+      if (!ws.defaultTarget && base.defaultTarget) ws.defaultTarget = base.defaultTarget;
+      if (base.source === "openagi") ws.source = "openagi";
+    }
+    return ws;
+  };
+
+  for (const ws of wsResult.workspaces ?? []) {
+    const bucket = ensureWorkspaceBucket(ws.name, ws);
+    for (const session of ws.recentChats ?? []) {
+      const override = threadAssignments[session.key] ?? null;
+      const targetWs = override?.project && slugify(override.project) !== bucket.id
+        ? ensureWorkspaceBucket(override.project, { source: "openagi" })
+        : bucket;
+      targetWs.recentChats.push(
+        override ? { ...session, __openagiTheme: override.theme ?? null, __openagiProject: override.project ?? null } : session
+      );
+      targetWs.counts.total += 1;
+      if (session.state === "running" || session.state === "waiting") targetWs.counts.running += 1;
+      else if (session.state === "sleeping") targetWs.counts.sleeping += 1;
+      else if (session.state === "archived") targetWs.counts.archived += 1;
+      else targetWs.counts.idle += 1;
+      if (!targetWs.latestActivityAt || String(session.lastActivityAt ?? "") > targetWs.latestActivityAt) {
+        targetWs.latestActivityAt = session.lastActivityAt ?? targetWs.latestActivityAt;
+      }
+    }
+  }
+
+  for (const custom of org.projects ?? []) {
+    if (!custom?.name) continue;
+    if (project && slugify(project) !== slugify(custom.name) && !custom.name.toLowerCase().includes(String(project).trim().toLowerCase())) {
+      continue;
+    }
+    const bucket = ensureWorkspaceBucket(custom.name, { id: custom.id, source: "openagi" });
+    for (const t of custom.themes ?? []) {
+      if (t?.name && !bucket.customThemes.some((x) => slugify(x.name) === slugify(t.name))) {
+        bucket.customThemes.push({ id: t.id || slugify(t.name), name: t.name });
+      }
+    }
+  }
+
+  const taskStore = supervisor?.runtime?.tasks ?? supervisor?.deps?.taskStore ?? supervisor?.taskStore ?? null;
+  if (taskStore) {
+    try {
+      const openTasks = typeof taskStore.list === "function"
+        ? (taskStore.list({ includeCompleted: false }) ?? [])
+        : [...(taskStore.tasks?.values?.() ?? [])].filter((tk) => !["completed", "cancelled"].includes(String(tk?.status ?? "").toLowerCase()));
+      for (const tk of openTasks) {
+        const taskProj = String(tk?.sourceMeta?.project ?? "").trim().replace(/^#/, "");
+        if (!taskProj || taskProj.toLowerCase() === "general") continue;
+        if (project && slugify(project) !== slugify(taskProj) && !taskProj.toLowerCase().includes(String(project).trim().toLowerCase())) {
+          continue;
+        }
+        const bucket = ensureWorkspaceBucket(taskProj, { source: "openagi" });
+        const rawSub = String(tk?.sourceMeta?.subchannel ?? "").trim().replace(/^#/, "");
+        const subLeaf = rawSub.includes("/") ? rawSub.split("/").slice(1).join("/") : rawSub;
+        if (subLeaf && subLeaf.toLowerCase() !== "general" && !bucket.customThemes.some((x) => slugify(x.name) === slugify(subLeaf))) {
+          bucket.customThemes.push({ id: slugify(subLeaf), name: subLeaf });
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
   let totalThemes = 0;
   let totalRunning = 0;
   let totalOverlaps = 0;
   const projects = [];
 
-  for (const ws of wsResult.workspaces ?? []) {
+  for (const ws of workspacesById.values()) {
     totalRunning += ws.counts?.running ?? 0;
     totalOverlaps += (ws.overlaps ?? []).length;
 
     const themeBuckets = new Map();
     const projectCardMap = new Map();
 
+    for (const customTheme of ws.customThemes ?? []) {
+      const themeId = slugify(customTheme.name);
+      if (!themeBuckets.has(themeId)) {
+        themeBuckets.set(themeId, {
+          id: themeId,
+          name: customTheme.name,
+          color: deterministicColor(customTheme.name),
+          labelPath: `${displayProjectLabel(ws.name)}/${customTheme.name}`,
+          source: "openagi",
+          counts: { running: 0, idle: 0, sleeping: 0, archived: 0, total: 0 },
+          needsYouCount: 0,
+          prRefsSet: new Set(),
+          latestActivityAt: null,
+          sessions: []
+        });
+      }
+    }
+
     for (const session of ws.recentChats ?? []) {
-      const inferred = inferSessionTheme(session, ws.name);
+      const inferred = session.__openagiTheme
+        ? {
+            name: session.__openagiTheme,
+            color: deterministicColor(session.__openagiTheme),
+            source: "openagi",
+            rawLabel: `${displayProjectLabel(ws.name)}/${session.__openagiTheme}`
+          }
+        : inferSessionTheme(session, ws.name);
       const themeId = slugify(inferred.name);
       let bucket = themeBuckets.get(themeId);
       if (!bucket) {
@@ -239,7 +355,9 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
           sessions: []
         };
         themeBuckets.set(themeId, bucket);
-      } else if (inferred.source === "paseo-label") {
+      } else if (inferred.source === "openagi") {
+        bucket.source = "openagi";
+      } else if (inferred.source === "paseo-label" && bucket.source !== "openagi") {
         bucket.source = "paseo-label";
       }
 

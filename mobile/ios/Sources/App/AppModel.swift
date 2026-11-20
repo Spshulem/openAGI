@@ -73,6 +73,7 @@ final class AppModel {
     var requestedFocusCardID: String? = nil
     var workspaceChannel: iOSWorkspaceChannel = .general
     var latestFleetState: FleetState? = nil
+    var latestFleetHierarchy: FleetHierarchyResponse? = nil
 
     private(set) var pendingActionsCount = 0
     private(set) var clarificationsCount = 0

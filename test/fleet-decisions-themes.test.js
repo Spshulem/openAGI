@@ -1222,3 +1222,108 @@ test("fleet image endpoints accept >32KB image payloads and paired Mac proxy rec
   const hist = sharedThreadHistory(store, "supervisor");
   assert.equal(hist.messages.at(-1).sourceName, "Mac");
 });
+
+test("OpenAGI-native project/theme organization works without Paseo, preserves paseoCwd project names, and exposes routes", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-native-org-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const config = resolveFleetConfig({}, { dataDir: dir, paseo: { enabled: false } });
+  const fakeTaskStore = {
+    list: () => [{
+      id: "task-mkt-1",
+      title: "Draft launch post",
+      status: "pending",
+      sourceMeta: { project: "Marketing", subchannel: "Marketing/Launch" }
+    }]
+  };
+  const sup = new FleetSupervisor({ config, dataDir: dir, runtime: { tasks: fakeTaskStore } });
+
+  // Seed a Paseo thread (whose cwd is null and real path is in meta.paseoCwd)
+  // plus a standalone Codex thread with no Paseo setup at all.
+  const bilbaoThread = {
+    key: "paseo:srv_1.ag_bilbao",
+    kind: "paseo",
+    title: "Audio capture refactor",
+    cwd: null,
+    workspace: "bilbao",
+    repo: null,
+    agentStatus: "running",
+    meta: { paseoCwd: "/home/dev/paseo/worktrees/bb-recorder/bilbao", provider: "codex" }
+  };
+  const codexThread = {
+    key: "codex:local-1",
+    kind: "codex",
+    title: "Improve homepage SEO citations",
+    cwd: "/Users/me/Dev/website-app",
+    workspace: "website-app",
+    repo: null,
+    agentStatus: "idle",
+    meta: { provider: "codex" }
+  };
+  sup.lastThreads.set(bilbaoThread.key, bilbaoThread);
+  sup.lastThreads.set(codexThread.key, codexThread);
+  sup.store.recordSnapshot({
+    at: "2026-11-20T01:00:00Z",
+    threads: [
+      { key: bilbaoThread.key, title: bilbaoThread.title, workspace: "bilbao", state: "running" },
+      { key: codexThread.key, title: codexThread.title, workspace: "website-app", cwd: codexThread.cwd, state: "idle" }
+    ]
+  });
+
+  // 1. liveSnapshot must include derived `project` on every thread row AND map
+  //    worktree `bilbao` under `bb-recorder` (with subchannel `bb-recorder/bilbao`)!
+  const snapState = sup.getState();
+  const bilbaoRow = snapState.snapshot.threads.find((r) => r.key === bilbaoThread.key);
+  assert.equal(bilbaoRow.project, "bb-recorder");
+  assert.equal(bilbaoRow.subchannel, "bb-recorder/bilbao");
+
+  // 2. Routes + mobile allowlist for OpenAGI-side project/theme management
+  const route = createFleetRoute({ supervisor: sup });
+  assert.equal(isMobileRouteAllowed("GET", "/fleet/api/projects"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/projects"), true);
+  assert.equal(isMobileRouteAllowed("DELETE", "/fleet/api/projects/marketing"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/threads/codex:local-1/organize"), true);
+
+  const createRes = await route("POST", "/fleet/api/projects", new URL("http://localhost/fleet/api/projects"), async () => ({
+    name: "Growth",
+    theme: "SEO"
+  }));
+  assert.equal(createRes.status, 200);
+  assert.equal(createRes.body.project.id, "growth");
+  assert.equal(createRes.body.project.themes[0].name, "SEO");
+
+  // 3. Reassign a standalone Codex thread into OpenAGI Project/Theme ("Growth" / "SEO")
+  const assignRes = await route(
+    "POST",
+    "/fleet/api/threads/codex:local-1/organize",
+    new URL("http://localhost/fleet/api/threads/codex:local-1/organize"),
+    async () => ({ project: "Growth", theme: "SEO" })
+  );
+  assert.equal(assignRes.status, 200);
+
+  // liveSnapshot now reflects the OpenAGI-side override!
+  const updatedState = sup.getState();
+  const updatedCodex = updatedState.snapshot.threads.find((r) => r.key === codexThread.key);
+  assert.equal(updatedCodex.project, "Growth");
+  assert.equal(updatedCodex.subchannel, "growth/seo");
+
+  // 4. buildFleetHierarchy works cleanly with paseo.enabled=false and includes:
+  //    - bb-recorder (from paseoCwd)
+  //    - Growth / SEO (OpenAGI custom project + reassigned Codex thread)
+  //    - Marketing / Launch (from OpenAGI task metadata)
+  const hierarchy = await sup.getHierarchy({ limit: 40 });
+  const names = hierarchy.projects.map((p) => p.name);
+  assert.ok(names.includes("bb-recorder"), `expected bb-recorder in ${names}`);
+  assert.ok(names.includes("Growth"), `expected Growth in ${names}`);
+  assert.ok(names.includes("Marketing"), `expected Marketing in ${names}`);
+  const growthProj = hierarchy.projects.find((p) => p.name === "Growth");
+  const seoTheme = growthProj.themes.find((th) => th.name === "SEO");
+  assert.ok(seoTheme, "Growth project should include OpenAGI SEO theme");
+  assert.equal(seoTheme.source, "openagi");
+  assert.ok(seoTheme.sessions.some((s) => s.key === codexThread.key));
+
+  // Delete custom project works cleanly
+  const delRes = await route("DELETE", "/fleet/api/projects/growth", new URL("http://localhost/fleet/api/projects/growth"), async () => ({}));
+  assert.equal(delRes.status, 200);
+  assert.equal(delRes.body.deleted, true);
+});

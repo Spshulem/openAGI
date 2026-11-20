@@ -195,6 +195,40 @@ export function createFleetRoute({ supervisor } = {}) {
         }
         return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
       }
+      if (parts[0] === "projects" && (parts.length === 1 || parts.length === 2)) {
+        if (parts.length === 1 && method === "GET") {
+          if (typeof supervisor.getOrganization !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          return ok({ organization: await supervisor.getOrganization() });
+        }
+        if (parts.length === 1 && method === "POST") {
+          if (typeof supervisor.upsertProject !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          const body = await readObject(readBody);
+          const name = typeof body?.name === "string" ? body.name.trim() : "";
+          const theme = typeof body?.theme === "string" ? body.theme.trim() : null;
+          if (!name || name.length > 80) return fail(400, "Project name must be 1-80 characters.");
+          if (theme && theme.length > 80) return fail(400, "Theme name must be up to 80 characters.");
+          try {
+            const res = await supervisor.upsertProject({ name, theme: theme || null });
+            return ok({ ...res, state: state() });
+          } catch (err) {
+            return fail(400, String(err?.message ?? "Could not save project.").slice(0, 200));
+          }
+        }
+        if (parts.length === 2 && method === "DELETE") {
+          if (typeof supervisor.deleteProject !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          const projId = decodeURIComponent(parts[1]).trim();
+          if (!projId || projId.length > 80) return fail(400, "Bad project id.");
+          const res = await supervisor.deleteProject(projId);
+          return ok({ ...res, state: state() });
+        }
+        return fail(405, "Use GET, POST, or DELETE.");
+      }
       if (parts.length === 2 && parts[0] === "themes" && parts[1] === "sync") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (typeof supervisor.syncThemes !== "function") {
@@ -605,6 +639,23 @@ export function createFleetRoute({ supervisor } = {}) {
               return fail(404, msg.slice(0, 200));
             }
             return fail(400, msg.slice(0, 200));
+          }
+        }
+        if (parts[2] === "organize") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (typeof supervisor.organizeThread !== "function") {
+            return fail(503, "Thread organization is not available.");
+          }
+          const body = (await readObject(readBody)) ?? {};
+          const project = typeof body.project === "string" ? body.project.trim() : null;
+          const theme = typeof body.theme === "string" ? body.theme.trim() : null;
+          if (project && project.length > 80) return fail(400, "project must be up to 80 characters.");
+          if (theme && theme.length > 80) return fail(400, "theme must be up to 80 characters.");
+          try {
+            const res = await supervisor.organizeThread(threadKey, { project: project || null, theme: theme || null });
+            return ok({ ...res, state: state() });
+          } catch (err) {
+            return fail(400, String(err?.message ?? "Could not organize thread.").slice(0, 200));
           }
         }
         if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");

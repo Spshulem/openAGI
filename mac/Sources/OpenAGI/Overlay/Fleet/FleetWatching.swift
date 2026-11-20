@@ -70,6 +70,7 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let title: String?
   let workspace: String?
   let repo: String?
+  let project: String?
   let host: String?
   let cwd: String?
   let state: String?
@@ -100,13 +101,13 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   var id: String { key }
 
   enum CodingKeys: String, CodingKey {
-    case key, title, workspace, repo, host, cwd, state, pr, lastActivityAt, lastAgentAt, watch
+    case key, title, workspace, repo, project, host, cwd, state, pr, lastActivityAt, lastAgentAt, watch
     case lastAgentText, lastOwnerAt, muted, openChat, decision, pushPreview, pushing
     case nextCheckAt, actorLabel, subchannel, labels
   }
   private enum PRKeys: String, CodingKey { case ref, url }
 
-  init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, host: String? = nil, cwd: String? = nil, state: String? = nil,
+  init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, project: String? = nil, host: String? = nil, cwd: String? = nil, state: String? = nil,
        prRef: String? = nil, prURL: String? = nil, lastActivityAt: String? = nil, lastAgentAt: String? = nil,
        watch: FleetWatch?, pr: FleetPR? = nil, lastAgentText: String? = nil, lastOwnerAt: String? = nil,
        muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil, pushPreview: FleetDecision? = nil, pushing: Bool = false,
@@ -115,6 +116,7 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     self.title = title
     self.workspace = workspace
     self.repo = repo
+    self.project = project
     self.host = host
     self.cwd = cwd
     self.state = state
@@ -146,6 +148,7 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     title = try? c.decodeIfPresent(String.self, forKey: .title)
     workspace = try? c.decodeIfPresent(String.self, forKey: .workspace)
     repo = try? c.decodeIfPresent(String.self, forKey: .repo)
+    project = try? c.decodeIfPresent(String.self, forKey: .project)
     host = try? c.decodeIfPresent(String.self, forKey: .host)
     cwd = try? c.decodeIfPresent(String.self, forKey: .cwd)
     state = try? c.decodeIfPresent(String.self, forKey: .state)
