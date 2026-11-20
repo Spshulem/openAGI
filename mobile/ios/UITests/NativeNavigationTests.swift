@@ -12,7 +12,10 @@ final class NativeNavigationTests: XCTestCase {
     }
 
     private func element(_ app: XCUIApplication, _ id: String) -> XCUIElement {
-        app.descendants(matching: .any).matching(identifier: id).firstMatch
+        if id == "chat-composer" {
+            return app.textFields[id].firstMatch
+        }
+        return app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
 
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
