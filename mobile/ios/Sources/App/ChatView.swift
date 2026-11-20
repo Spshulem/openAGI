@@ -492,14 +492,11 @@ struct ChatConversationView: View {
                 }
                 .frame(width: min(width * 0.78, 320))
             }
-            MessageBubbleRow(
-                message: item.message,
-                maxContainerWidth: width,
-                showsActions: item.message.id == latestFinishedReplyID,
-                onConfirmCode: (item.message.id == latestFinishedReplyID && !conversation.isSending && !conversation.isReadOnly)
-                    ? { replyCode in Task { await conversation.send(replyCode) } }
-                    : nil
-            )
+            let isLatestReply = item.message.id == latestFinishedReplyID
+            MessageBubbleRow(message: item.message, maxContainerWidth: width, showsActions: isLatestReply)
+            if isLatestReply, !conversation.isReadOnly, let code = ApprovalCodePrompt.extractCode(from: item.message.text) {
+                ChatConfirmationCodeBar(code: code, conversation: conversation)
+            }
             // Offer a resend only when the daemon rejected the turn before
             // it ran. A lost stream can hide a completed action.
             if item.message.isFailed && item.message.retrySafe {
@@ -963,12 +960,49 @@ enum ApprovalCodePrompt {
     }
 }
 
+private struct ChatConfirmationCodeBar: View {
+    let code: String
+    let conversation: ChatConversation
+
+    var body: some View {
+        if !conversation.isSending {
+            HStack(spacing: Theme.Spacing.x2) {
+                Button {
+                    Task { await conversation.send("yes \(code)") }
+                } label: {
+                    Label("Approve", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(Color(uiColor: .systemBackground))
+                        .background(Theme.ink, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat-confirm-yes-\(code)")
+
+                Button {
+                    Task { await conversation.send("no \(code)") }
+                } label: {
+                    Text("Cancel")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(Theme.ink)
+                        .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat-confirm-no-\(code)")
+            }
+            .padding(.top, 2)
+        }
+    }
+}
+
 private struct MessageBubbleRow: View {
     @Environment(\.chatFont) private var chatFont
     let message: ChatMessage
     let maxContainerWidth: CGFloat
     var showsActions = false
-    var onConfirmCode: ((String) -> Void)? = nil
 
     var body: some View {
         if message.role == .user {
@@ -1009,36 +1043,6 @@ private struct MessageBubbleRow: View {
             }
             if message.isStreaming {
                 ChatWorkingLine(text: message.activity ?? "Thinking")
-            }
-            if showsActions, let onConfirmCode, let code = ApprovalCodePrompt.extractCode(from: message.text) {
-                HStack(spacing: Theme.Spacing.x2) {
-                    Button {
-                        onConfirmCode("yes \(code)")
-                    } label: {
-                        Label("Approve", systemImage: "checkmark.circle.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .foregroundStyle(Color(uiColor: .systemBackground))
-                            .background(Theme.ink, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("chat-confirm-yes-\(code)")
-
-                    Button {
-                        onConfirmCode("no \(code)")
-                    } label: {
-                        Text("Cancel")
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .foregroundStyle(Theme.ink)
-                            .overlay(Capsule().strokeBorder(Theme.edge, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("chat-confirm-no-\(code)")
-                }
-                .padding(.top, 2)
             }
             if showsActions { actions }
         }

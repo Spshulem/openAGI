@@ -5,7 +5,6 @@ struct TodayView: View {
     @Environment(\.appCanvas) private var canvas
     var onRevoked: () -> Void = {}
     @State private var settingsShown = false
-    @State private var showOlderOverdue = false
 
     private var isUITesting: Bool {
         ProcessInfo.processInfo.arguments.contains("--ui-testing")
