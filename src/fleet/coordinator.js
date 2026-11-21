@@ -1034,7 +1034,13 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
   const trackedRefs = new Map();
   const addTrackedRef = (ref) => {
     const parsed = parsePrRef(ref);
-    if (parsed?.repo?.toLowerCase() === resolvedRepo.toLowerCase()) trackedRefs.set(`${resolvedRepo}#${parsed.number}`, parsed.number);
+    if (parsed?.repo?.toLowerCase() === resolvedRepo.toLowerCase()) {
+      const canonicalRef = `${resolvedRepo}#${parsed.number}`;
+      trackedRefs.set(canonicalRef, {
+        number: parsed.number,
+        reconciledAt: supervisor?.lastPrs?.get?.(canonicalRef)?.reconciledAt ?? null
+      });
+    }
   };
   for (const ref of supervisor?.lastPrs?.keys?.() ?? []) addTrackedRef(ref);
   for (const thread of [...(supervisor?.knownThreads ?? []), ...(supervisor?.lastThreads ?? [])].map(([, value]) => value)) {
@@ -1046,20 +1052,24 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
     ...(Array.isArray(rawMerged) ? rawMerged : []).map((pr) => `${resolvedRepo}#${pr.number}`)
   ]);
   const trackedPrs = [];
-  const trackedCandidates = [...trackedRefs.entries()].filter(([ref]) => !represented.has(ref)).slice(0, 8);
+  const trackedCandidates = [...trackedRefs.entries()]
+    .filter(([ref]) => !represented.has(ref))
+    .sort(([, a], [, b]) => (Date.parse(a.reconciledAt ?? "") || 0) - (Date.parse(b.reconciledAt ?? "") || 0))
+    .slice(0, 8);
   await Promise.all(trackedCandidates.map(async ([ref, number]) => {
     try {
       const viewed = await runImpl(
         ghBin,
-        ["pr", "view", String(number), "--repo", resolvedRepo,
+        ["pr", "view", String(number.number), "--repo", resolvedRepo,
           "--json", "number,title,state,headRefName,baseRefName,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,updatedAt,closedAt,mergedAt,url,headRefOid"],
         { timeoutMs: 12_000 }
       );
       if (viewed.code !== 0) return;
       const pr = JSON.parse(viewed.stdout || "{}");
       const rollup = summarizeStatusRollup(pr.statusCheckRollup);
+      const reconciledAt = new Date().toISOString();
       trackedPrs.push({
-        number,
+        number: number.number,
         ref,
         title: clampText(redactSecrets(String(pr.title ?? "")), 160),
         url: pr.url ?? null,
@@ -1075,8 +1085,11 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
         pendingChecks: rollup.pendingChecks,
         updatedAt: pr.updatedAt ?? null,
         closedAt: pr.closedAt ?? null,
-        mergedAt: pr.mergedAt ?? null
+        mergedAt: pr.mergedAt ?? null,
+        reconciledAt
       });
+      const cached = supervisor?.lastPrs?.get?.(ref);
+      if (cached) supervisor.lastPrs.set(ref, { ...cached, reconciledAt });
     } catch { /* a stale/missing ref is left unchanged */ }
   }));
 

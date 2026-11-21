@@ -1753,6 +1753,7 @@ export class ActiveWorkManager {
               updatedAt: trackedPr.updatedAt ?? prevPr?.updatedAt ?? null,
               mergedAt: trackedPr.mergedAt ?? prevPr?.mergedAt ?? null,
               closedAt: trackedPr.closedAt ?? prevPr?.closedAt ?? null,
+              reconciledAt: trackedPr.reconciledAt ?? prevPr?.reconciledAt ?? null,
               orphaned: false
             });
           }
@@ -2484,7 +2485,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         };
       },
       approvalTtlMs: 15 * 60_000,
-      approvalDedupeKey: (args, context) => `fleet-act-aw:${shortHash(JSON.stringify([context?.sessionId ?? null, args.op, args.id ?? null, args.targetKey ?? null, args.hours ?? null, args.message ?? null]))}`,
+      approvalDedupeKey: (args, context) => `fleet-act-aw:${shortHash(JSON.stringify([context?.sessionId ?? null, args]))}`,
       summarize: (args) => args.op === "scan_inventory"
         ? `Run bounded Active Work inventory pass (pageSize=${args.pageSize ?? 12})`
         : `Active Work ${args.op} on ${args.id}`,
