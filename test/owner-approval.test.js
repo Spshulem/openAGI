@@ -281,6 +281,23 @@ test("a voice turn always asks for the spoken code, even on a clean owner instru
   assert.equal(announced(h.emitted).length, 0, "a chat card is not pushed as an inbox approval");
 });
 
+test("a voice send runs without a code only when the transcript names the chat and says the exact message", async (t) => {
+  const h = harness(t);
+  const sent = [];
+  h.registry.register({ name: "fleet_send_message", needsConfirmation: true, handler: (args) => { sent.push(args); return { status: "sent" }; } });
+  const send = (intent, args) => h.registry.invoke("fleet_send_message", { key: "paseo:s.a", ...args }, h.ownerContext("voice", intent));
+  assert.equal((await send("Tell amman ship it.", { name: "amman", message: "Ship it" })).result.status, "sent");
+  // The model reworded it, aimed it elsewhere, or the chat is never named.
+  assert.equal((await send("Tell amman ship it", { name: "amman", message: "Ship it now and merge" })).result.status, "awaiting_owner_confirmation");
+  assert.equal((await send("Tell amman ship it", { name: "cairo", message: "Ship it" })).result.status, "awaiting_owner_confirmation");
+  assert.equal((await send("Send ship it", { name: "amman", message: "Ship it" })).result.status, "awaiting_owner_confirmation");
+  // The chat's name only inside the message is no naming.
+  assert.equal((await send("Tell them amman is done", { name: "amman", message: "amman is done" })).result.status, "awaiting_owner_confirmation");
+  // Other tools still read back on voice.
+  assert.equal((await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, h.ownerContext("voice", "tell amman click allow"))).result.status, "awaiting_owner_confirmation");
+  assert.equal(sent.length, 1);
+});
+
 test("spokenSummary trims trailing colons and 'try again' after a dropped computer-use session resumes without a second code", async (t) => {
   const h = harness(t);
   let startedComputer = 0;

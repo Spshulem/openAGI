@@ -388,6 +388,21 @@ export class PendingActionStore {
     appendJsonLine(this._journalPath(), event);
   }
 
+  // Retires one pending card whose context no longer holds, with the reason.
+  expire(id, reason) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "pending") return null;
+    const decidedAt = new Date(this.now()).toISOString();
+    action.status = "expired";
+    this.ownerIntents.delete(action.id);
+    action.decidedAt = decidedAt;
+    action.decidedBy = "system";
+    action.error = String(reason ?? "Approval expired before it was used.").slice(0, 300);
+    this._appendJournal({ op: "decide", id: action.id, status: action.status, decidedAt, decidedBy: action.decidedBy, error: action.error });
+    this._emitResolution(action);
+    return action;
+  }
+
   _expirePending() {
     const atMs = this.now();
     const decidedAt = new Date(atMs).toISOString();

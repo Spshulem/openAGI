@@ -210,6 +210,21 @@ export function assistantProposedActionOrQuestion(previousAssistantText) {
 // (e.g. "Continue, inspect the thread further, or skip?"), short owner replies
 // like "yes", "continue", "skip", or "option 1" count as clear authorization
 // without requiring a confirmation code.
+// A spoken request that names both the chat and the exact message: "tell
+// amman ship it" said to send "ship it" to amman. Then the transcript is the
+// approval and no code is read back. Anything the model added, reworded or
+// aimed at another chat still asks. names: the target's labels (workspace,
+// title, project).
+const spokenWords = (value) => String(value ?? "").toLowerCase().normalize("NFKD")
+  .replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+
+export function spokenRequestNamesTarget(intent, { names = [], message = "" } = {}) {
+  const said = ` ${spokenWords(intent)} `;
+  const text = spokenWords(message);
+  if (!text || !said.includes(` ${text} `)) return false;
+  return names.map(spokenWords).some((name) => name.length >= 3 && said.replace(` ${text} `, " ").includes(` ${name} `));
+}
+
 export function isConversationalAssentOrChoice(intent, previousAssistantText) {
   const value = String(intent ?? "").trim();
   if (!value || value.length > 120) return false;
