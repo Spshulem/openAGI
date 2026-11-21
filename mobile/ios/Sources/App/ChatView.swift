@@ -185,6 +185,11 @@ struct ChatConversationView: View {
     // Cards put away in this chat. The approval stays in the Inbox.
     @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
+    // Voice Mode in the Supervisor chat: one continuous spoken conversation
+    // through the hub. Both sides land in this same thread, so typing after
+    // it continues the same history.
+    @State private var voice: VoiceSession?
+    @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -238,8 +243,8 @@ struct ChatConversationView: View {
             onComposerFocusChanged(focused)
         }
         .task(id: conversation.identity) { await conversation.resume() }
-        .onDisappear { dictation.stop() }
-        .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onDisappear { dictation.stop(); voice?.stop() }
+        .onChange(of: conversation.identity) { _, _ in dictation.stop(); voice?.stop() }
         .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
             if !sending {
@@ -251,7 +256,8 @@ struct ChatConversationView: View {
         .onChange(of: scenePhase) { _, phase in
             // Catching up on return (and pausing while away) is app-wide, for
             // every open chat: see ConversationLibrary.resumeOpenChats.
-            if phase != .active { dictation.stop() }
+            // Voice never listens in the background.
+            if phase != .active { dictation.stop(); voice?.stop() }
         }
     }
 
@@ -596,6 +602,10 @@ struct ChatConversationView: View {
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let composerAccessory { composerAccessory(composerFocused) }
+            if supportsVoice {
+                SupervisorVoiceBar(status: voice?.status ?? VoiceStatus(), note: voiceNote,
+                                   start: startVoice, stop: { voice?.stop() })
+            }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -650,11 +660,34 @@ struct ChatConversationView: View {
                        rightToLeft: layoutDirection == .rightToLeft)
     }
 
+    // The hub runs voice; a phone-only agent and read-only web chats have none.
+    private var supportsVoice: Bool {
+        conversation.thread == .supervisor && !conversation.isReadOnly && !model.isOnPhone
+    }
+
+    private func startVoice() {
+        voiceNote = nil
+        dictation.stop()
+        composerFocused = false
+        Task {
+            guard await VoiceAudio.requestPermission() else {
+                voiceNote = "Voice needs the microphone. Allow it in Settings › OpenAGI."
+                return
+            }
+            let session = voice ?? VoiceSession(server: model.credentials.server, token: model.credentials.token, audio: VoiceAudio())
+            session.onTurnSaved = { [conversation] in Task { await conversation.refresh() } }
+            session.setFocus(VoiceFocus(questionId: conversation.focusedCardID))
+            voice = session
+            session.handsFree(true)
+        }
+    }
+
     private var dictationButton: some View {
         Button {
             if dictation.isListening || dictation.isStarting { dictation.stop() }
             else {
                 composerFocused = false
+                voice?.stop()
                 Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
             }
         } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
