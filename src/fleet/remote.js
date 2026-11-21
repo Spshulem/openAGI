@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/act|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -47,6 +47,13 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/hierarchy') {
         if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (typeof payload.body?.theme === 'string') url.searchParams.set('theme', payload.body.theme);
+        if (payload.body?.includeSnoozed !== undefined) url.searchParams.set('includeSnoozed', String(Boolean(payload.body.includeSnoozed)));
+        if (payload.body?.includeDone !== undefined) url.searchParams.set('includeDone', String(Boolean(payload.body.includeDone)));
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
       if (payload.path === '/fleet/api/repo-status') {
@@ -162,7 +169,8 @@ export class RemoteFleetSupervisor {
     let reached = false;
     let status = null;
     try {
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
+      const isDelivering = method === 'POST' && (DELIVERING.test(path) || /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path));
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: isDelivering ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       if (sequence >= this.appliedSequence) {
@@ -182,7 +190,8 @@ export class RemoteFleetSupervisor {
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
       const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
-      const nonOutageError = missingThread || closedCard || unsupportedRoute;
+      const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
+      const nonOutageError = missingThread || closedCard || missingActiveWork || unsupportedRoute;
       if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
       throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
@@ -369,6 +378,20 @@ export class RemoteFleetSupervisor {
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
   async claimTask(input = {}) { return await this.request('POST', '/fleet/api/tasks/claim', input); }
+  async getActiveWork(input = {}) { return this.request('GET', '/fleet/api/active-work', input); }
+  async trackWork(input = {}) {
+    const { state: _state, activeWork: _aw, ...rest } = await this.request('POST', '/fleet/api/active-work', input);
+    return rest;
+  }
+  async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async actActiveWork(id, input = {}) {
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      throw error;
+    }
+  }
   async batchActCards(input = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new Error('Pass a JSON object body.');

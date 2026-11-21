@@ -39,6 +39,7 @@ import * as codex from "./sources/codex.js";
 import * as conductor from "./sources/conductor.js";
 import * as github from "./sources/github.js";
 import * as processes from "./sources/processes.js";
+import { ActiveWorkManager } from "./active-work.js";
 
 const MIN = 60_000;
 const SOURCE_TIMEOUT_MS = 90_000;
@@ -2499,6 +2500,41 @@ export class FleetSupervisor {
       factory: options.factory ?? this.deps.paseoFactory,
       decisionsFetch: options.decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl
     });
+  }
+
+  get activeWork() {
+    this._activeWork ??= new ActiveWorkManager({
+      dir: this.store.dir,
+      store: this.store,
+      runtime: this.runtime,
+      supervisor: this,
+      config: this.config,
+      deps: this.deps,
+      now: () => this.now()
+    });
+    return this._activeWork;
+  }
+
+  getActiveWork(options = {}) {
+    return this.activeWork.getActiveWork(options);
+  }
+
+  trackWork(input = {}) {
+    const result = this.activeWork.trackWork(input);
+    this.emitFleet("active-work-updated");
+    return result;
+  }
+
+  async scanActiveWork(options = {}) {
+    const pass = await this.activeWork.scanInventory(options);
+    this.emitFleet("active-work-scanned");
+    return pass;
+  }
+
+  async actActiveWork(id, input = {}, sendOptions = {}) {
+    const result = await this.activeWork.actOnWork(id, input, sendOptions);
+    if (result?.ok) this.emitFleet("active-work-acted");
+    return result;
   }
 
   // Lightweight, event-driven reconciliation of ONLY open questions' watched
