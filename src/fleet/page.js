@@ -90,6 +90,10 @@ a.btn.primary{color:var(--ink)}
 .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .item .acts .btn{margin:0;width:auto;flex:1 1 auto}
 .ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
+.settings{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--raise)}
+.settings h4{margin:0 0 8px;font-size:15px}.settings label{display:block;margin-top:9px;font-size:13px;color:var(--muted)}
+.settings select{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+.settings .note{margin:8px 0 0}.settings .acts{margin-top:10px}
 .ask .t{display:block}
 .chat{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .chat .log{max-height:420px;overflow:auto}
@@ -635,6 +639,63 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     return asks.filter(function (q) { return q.kind === 'agent-card' || q.kind === 'prompt'; })[0] || null;
   }
 
+  var settingsLoading = new Set();
+
+  function renderPaseoSettings(parent, t) {
+    var box = el('div', 'settings', null, parent);
+    el('h4', null, 'Paseo session settings', box);
+    var status = el('p', 'note', 'Loading authoritative settings…', box);
+    if (settingsLoading.has(t.key)) return box;
+    settingsLoading.add(t.key);
+    api(threadPath(t.key) + '/settings').then(function (result) {
+      settingsLoading.delete(t.key);
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      var settings = result && result.settings ? result.settings : null;
+      if (!settings) { el('p', 'note', 'Settings are unavailable until this Paseo host can be read safely.', box); return; }
+      var stateText = settings.status === 'pending'
+        ? 'A pending permission card is open. Answer that card; settings cannot approve or clear it.'
+        : settings.status === 'busy'
+          ? 'This session has an active turn. Settings take effect after it finishes; no restart is performed.'
+          : 'Changes are sent to this exact session and confirmed by a fresh readback.';
+      el('p', 'note', stateText, box);
+      var names = [['model', 'Model'], ['reasoningEffort', 'Reasoning effort'], ['permissions', 'Permissions']];
+      var changed = false;
+      names.forEach(function (pair) {
+        var name = pair[0], label = pair[1];
+        var options = Array.isArray(settings.supported && settings.supported[name]) ? settings.supported[name] : [];
+        var select = document.createElement('select');
+        var lab = el('label', null, label, box); lab.append(select);
+        var unavailable = settings.unavailable && settings.unavailable[name];
+        if (unavailable) { select.disabled = true; el('p', 'note', unavailable, box); return; }
+        if (!options.length) { select.disabled = true; el('p', 'note', 'Unavailable on this host/provider.', box); return; }
+        options.forEach(function (item) {
+          var option = document.createElement('option'); option.value = item.id; option.textContent = item.label;
+          option.disabled = item.selectable === false; option.selected = settings.current && settings.current[name] === item.id; select.append(option);
+        });
+        select.disabled = settings.status !== 'ready';
+        select.addEventListener('change', function () {
+          if (changed || select.disabled) return;
+          changed = true; select.disabled = true;
+          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function (saved) {
+            box.replaceChildren();
+            renderPaseoSettings(parent, t);
+            say('Paseo ' + label.toLowerCase() + ' change confirmed by readback.');
+          }).catch(function (error) {
+            changed = false; select.disabled = settings.status !== 'ready';
+            say(error.message || 'The setting was not changed.', true);
+          });
+        });
+      });
+    }).catch(function (error) {
+      settingsLoading.delete(t.key);
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      el('p', 'note', error.message || 'Settings could not be read; nothing was changed.', box);
+    });
+    return box;
+  }
+
   // Where the reply box sends: the question's own reply when it takes one,
   // else a message to the thread. null: only the agent's app answers it.
   function replyTarget(q, key) {
@@ -1032,6 +1093,12 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       var un = button('Unmute', 'btn', acts, function () { return mute(t, false, un); });
     } else {
       var mu = button('Mute ' + MUTE_HOURS + 'h', 'btn', acts, function () { return mute(t, true, mu); });
+    }
+    if (t.kind === 'paseo') {
+      var settings = button('Session settings', 'btn', acts, function () {
+        settings.disabled = true;
+        renderPaseoSettings(parent, t);
+      });
     }
   }
 
