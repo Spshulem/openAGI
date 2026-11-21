@@ -170,7 +170,7 @@ struct SupervisorWorkspaceView: View {
 
   private var decisionItems: [SupervisorDecisionItem] {
     let byKey = Dictionary(fleet.threads.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-    return fleet.questions.map { q in
+    return fleet.questions.filter(\.needsYou).map { q in
       let linked = q.threadKey.flatMap { byKey[$0] }
       let proj = SupervisorChannelGrouping.normalizeProject(
         explicit: q.project,
@@ -182,7 +182,8 @@ struct SupervisorWorkspaceView: View {
         id: q.id,
         project: proj,
         subchannel: q.subchannel ?? linked?.subchannel,
-        headline: q.title,
+        headline: q.decisionHeadline ?? q.title,
+        fact: q.decisionFact,
         kindLabel: q.kind ?? "Needs you",
         risky: q.risky,
         noticedAtISO: q.askedTime
@@ -1752,12 +1753,26 @@ struct SupervisorWorkspaceView: View {
           Button {
             openInspector(.question(q.id))
           } label: {
-            Text(q.title)
+            Text(q.decisionHeadline ?? q.title)
               .font(WorkspaceTheme.Typography.body.weight(.semibold))
               .foregroundStyle(WorkspaceTheme.ink)
               .multilineTextAlignment(.leading)
           }
           .buttonStyle(.plain)
+
+          if let fact = q.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+            Text(fact)
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+              .lineLimit(2)
+              .multilineTextAlignment(.leading)
+          }
+          if !q.remainingItemIds.isEmpty {
+            Text("More owner questions remain; answer this one before the next is presented.")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.live)
+              .lineLimit(2)
+          }
 
           HStack(spacing: 6) {
             if let actor = q.actorLabel, !actor.isEmpty {
@@ -1810,7 +1825,8 @@ struct SupervisorWorkspaceView: View {
         }
       }
 
-      if !q.body.isEmpty {
+      if isExpanded {
+        if !q.body.isEmpty {
         Button {
           if let tk = q.threadKey, !tk.isEmpty {
             openInspector(.session(tk))
@@ -1831,7 +1847,7 @@ struct SupervisorWorkspaceView: View {
         .help("Click to inspect full thread context and conversation")
       }
 
-      if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
+        if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
         VStack(alignment: .leading, spacing: 4) {
           Text(q.isClarificationQuestion ? "Question to unblock" : "Next step")
             .font(WorkspaceTheme.Typography.caption.weight(.semibold))
@@ -1850,6 +1866,7 @@ struct SupervisorWorkspaceView: View {
         .padding(WorkspaceTheme.Spacing.x3)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(WorkspaceTheme.live.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
       }
 
       if revealedPlanQuestionIDs.contains(q.id), let plan = q.plan {
@@ -2410,10 +2427,11 @@ struct SupervisorWorkspaceView: View {
       }
 
       if supervisor.isSending {
-        let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The transcript may already hold this reply (a sync mid-stream):
+        // then only the progress line shows, never a second copy.
         VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
-          if !liveText.isEmpty {
-            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(supervisor.streamingReplyText ?? liveText))
+          if let liveText = supervisor.liveReplyText {
+            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(liveText))
           }
           HStack(spacing: 8) {
             ProgressView()

@@ -66,12 +66,12 @@ class SupervisorAlertServiceTest {
     }
 
     @Test
-    fun reactsToTheFramesThatCanChangeOpenQuestions() {
-        listOf("hello", "fleet", "outreach", "outreach-resolved").forEach {
+    fun reactsToTheFramesThatCanChangeOpenQuestionsOrApprovals() {
+        listOf("hello", "fleet", "outreach", "outreach-resolved", "pending-action", "pending-action-resolved").forEach {
             assertTrue(it, it in ALERT_TRIGGERING_EVENTS)
         }
-        // Chat traffic and task churn never move the supervisor's questions.
-        listOf("message", "conversation.updated", "task-updated", "pending-action").forEach {
+        // Chat traffic and task churn never move questions or approvals.
+        listOf("message", "conversation.updated", "task-updated").forEach {
             assertTrue(it, it !in ALERT_TRIGGERING_EVENTS)
         }
     }

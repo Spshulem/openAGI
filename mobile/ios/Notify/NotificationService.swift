@@ -7,6 +7,7 @@ import UserNotifications
 // answer buttons and the exact option strings onto the notification. Any
 // failure (no key yet, a key from another pairing, a tampered payload) leaves
 // the generic text: the alert still arrives and a tap still opens Supervisor.
+// An approval envelope gets its summary and the Approve/Deny category instead.
 //
 // The mapping itself is SupervisorPushContent.alert, pinned by the app's
 // tests; this file only applies it.
@@ -23,7 +24,13 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
             self.contentHandler = contentHandler
             self.bestAttempt = request.content
         }
-        guard let alert = SupervisorPushContent.alert(userInfo: request.content.userInfo, key: PushKeyStore.load()),
+        let key = PushKeyStore.load()
+        if let approval = ApprovalPushContent.approval(userInfo: request.content.userInfo, key: key),
+           let content = request.content.mutableCopy() as? UNMutableNotificationContent {
+            deliver(approval: approval, content: content)
+            return
+        }
+        guard let alert = SupervisorPushContent.alert(userInfo: request.content.userInfo, key: key),
               let content = request.content.mutableCopy() as? UNMutableNotificationContent
         else {
             finish(with: request.content)
@@ -42,6 +49,25 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
         // the one completion below.
         let delivered = UncheckedSendableBox(value: rewritten)
         SupervisorCategories.register(SupervisorCategories.category(for: alert)) { [self] in
+            finish(with: delivered.value)
+        }
+    }
+
+    // An approval (envelope kind `approval`, ApprovalPushContent.approval):
+    // its summary, and the fixed Approve/Deny category. Registered again here
+    // in case the app has not run since an update added it.
+    private func deliver(approval: ApprovalPushContent.Approval, content: UNMutableNotificationContent) {
+        content.title = approval.title
+        content.body = approval.body
+        content.categoryIdentifier = ApprovalPushContent.category
+        content.threadIdentifier = "approvals"
+        var userInfo = content.userInfo
+        for (key, value) in approval.userInfo { userInfo[key] = value }
+        content.userInfo = userInfo
+        let rewritten = content.copy() as? UNNotificationContent ?? content
+        lock.withLock { bestAttempt = rewritten }
+        let delivered = UncheckedSendableBox(value: rewritten)
+        SupervisorCategories.register(SupervisorCategories.approval()) { [self] in
             finish(with: delivered.value)
         }
     }

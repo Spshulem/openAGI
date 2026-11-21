@@ -75,6 +75,10 @@
             android:exported="false" />
 
         <receiver
+            android:name=".sync.ApprovalActionReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".sync.BootReceiver"
             android:exported="true">
             <intent-filter>

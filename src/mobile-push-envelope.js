@@ -7,11 +7,13 @@ import crypto from "node:crypto";
 //
 // Wire string: v1.<base64url(nonce)>.<base64url(ciphertext || tag)>, AES-256-GCM,
 // 12-byte nonce, 16-byte tag, AAD "openagi-push:v1:<kind>". The AAD binds the
-// kind, so an alert's ciphertext can never be replayed as activity content.
+// kind, so an alert's ciphertext can never be replayed as activity content,
+// nor a question alert as an approval (kind "approval", sent to the relay as
+// an "alert" too).
 // The Swift side (PushEnvelope) must stay byte-for-byte compatible; the
 // shared fixture mobile/fixtures/push-envelope.json pins both.
 export const PUSH_ENVELOPE_VERSION = "v1";
-export const PUSH_KINDS = Object.freeze(["activity", "alert"]);
+export const PUSH_KINDS = Object.freeze(["activity", "alert", "approval"]);
 
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;

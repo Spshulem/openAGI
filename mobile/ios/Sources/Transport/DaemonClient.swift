@@ -560,6 +560,19 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetMutationResult.self, from: data)
     }
 
+    // Free text to a question that takes it (its alert's canReply): the
+    // daemon types it into the question's own thread, or sends it as the
+    // clarification of a suggestion's "Answer question". The same long wait
+    // as an answer. Android's fleetReply posts the same body.
+    public func fleetReply(questionID: String, reply: String) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["reply": reply])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
     public func fleetDismiss(questionID: String) async throws -> FleetMutationResult {
         var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
         request.httpBody = Data(#"{"dismiss":true}"#.utf8)
@@ -774,11 +787,14 @@ public actor DaemonClient {
     // phone has no push-to-start token; `alerts: false` that notifications
     // are not allowed. `renew` in the answer means the relay refused this
     // pass (expired, revoked, unknown) and the phone should mint a new one.
+    // `approvals: true` says this build shows Approve/Deny approval alerts;
+    // an older daemon ignores it.
     // Keys sorted so a test can assert the body byte for byte.
     public func registerPush(pass: String, key: String, env: String, activities: Bool,
                              alerts: Bool) async throws -> PushRegistrationResult {
         var request = try authorizedRequest(path: "/mobile/push", method: "POST")
-        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities, "alerts": alerts]
+        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities, "alerts": alerts,
+                                   "approvals": true]
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let (data, _) = try await perform(request)

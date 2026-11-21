@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
 import { fleetScan, fleetStatus, fleetThread, registerFleetTools } from "../src/fleet/tools.js";
 import { resolvePaseoAgentConfig, startPaseoSession } from "../src/fleet/coordinator.js";
-import { buildSupervisorCard } from "../src/fleet/cards.js";
+import { buildSupervisorCard, buildSupervisorDeck } from "../src/fleet/cards.js";
 import { createDefaultRuntime } from "../src/index.js";
 
 function row(overrides = {}) {
@@ -46,6 +46,44 @@ test("fleet_status never reports a mode the fleet computer has not confirmed as 
   assert.equal(last.modeUnconfirmed, true);
   const live = fleetStatus({ getState: () => ({ ...base, mode: "auto", modeConfirmed: true }) });
   assert.equal(live.modeUnconfirmed, undefined);
+});
+
+test("Needs You hides no-action completions but keeps a verified owner blocker", () => {
+  const finished = {
+    id: "q_finished", status: "open", kind: "completed", title: "Publisher setup finished",
+    body: "Everything completed successfully; no action is needed.", options: ["Got it"], threadKey: "paseo:srv.done"
+  };
+  const blocked = {
+    id: "q_blocked", status: "open", kind: "completed", title: "Publisher setup finished",
+    body: "The agent drafted the listings, but needs your explicit release authorization before it can enter them.",
+    options: ["Got it"], threadKey: "paseo:srv.blocked"
+  };
+  const deck = buildSupervisorDeck({ questions: [finished, blocked], actions: [], snapshot: { threads: [] } });
+  assert.equal(deck.cards.find((card) => card.id === "q_finished").needsYou, false);
+  const visible = deck.cards.filter((card) => card.needsYou !== false);
+  assert.deepEqual(visible.map((card) => card.id), ["q_blocked"]);
+  assert.equal(visible[0].kind, "blocker");
+  assert.equal(visible[0].decisionHeadline, "Authorize the production release");
+  assert.match(visible[0].decisionFact, /drafted the listings/);
+});
+
+test("permission cards expose one active ask and preserve exact source/action mapping for the rest", () => {
+  const card = buildSupervisorCard({
+    id: "q_permission", status: "open", kind: "agent-card", title: "Please complete the browser sign-ins (2 open)",
+    body: "Sign in to the publisher listings in Cursor. 1. Allow. Also open: Sign in to Salesforce.",
+    options: ["Allow", "open thread"], threadKey: "paseo:srv.agent", meta: {
+      app: "paseo", cardId: "permission-1", itemId: "cursor", itemIds: ["cursor", "salesforce"],
+      items: [
+        { itemId: "cursor", source: { app: "paseo", cardId: "permission-1", itemId: "cursor", threadKey: "paseo:srv.agent" }, question: "Sign in to the publisher listings in Cursor", options: ["Allow"] },
+        { itemId: "salesforce", source: { app: "paseo", cardId: "permission-1", itemId: "salesforce", threadKey: "paseo:srv.agent" }, question: "Sign in to Salesforce", options: ["Allow"] }
+      ]
+    }
+  });
+  assert.equal(card.decisionHeadline, "Sign in to the publisher portals");
+  assert.equal(card.decisionItems.length, 2);
+  assert.equal(card.decisionItems.find((item) => item.active).itemId, "cursor");
+  assert.deepEqual(card.remainingItemIds, ["salesforce"]);
+  assert.equal(card.primaryAction.op, "open_chat");
 });
 
 test("past handoffs use target-specific journal evidence, including uncertain deliveries", () => {
