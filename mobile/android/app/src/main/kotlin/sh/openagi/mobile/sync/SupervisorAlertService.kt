@@ -31,8 +31,10 @@ import sh.openagi.mobile.transport.EventStream
 // changed. `fleet` is every supervisor tick; `outreach`/`outreach-resolved` is
 // how a question asked or closed on the Mac reaches a Distiller main that
 // mirrors it (src/fleet/remote.js); `hello` opens every (re)connect, so
-// anything asked while the stream was down is caught up on straight away.
-internal val ALERT_TRIGGERING_EVENTS = setOf("hello", "fleet", "outreach", "outreach-resolved")
+// anything asked while the stream was down is caught up on straight away;
+// `pending-action`/`pending-action-resolved` is a queued approval raised or
+// decided (a chat card is not announced, so the next tick or refresh finds it).
+internal val ALERT_TRIGGERING_EVENTS = setOf("hello", "fleet", "outreach", "outreach-resolved", "pending-action", "pending-action-resolved")
 
 // Turns a burst of "check now" requests into one check. The first request
 // opens a window; everything else that arrives inside it is folded into the

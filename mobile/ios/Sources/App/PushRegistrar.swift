@@ -94,6 +94,7 @@ final class PushRegistrar {
         // Phone-only mode has no push service: nothing leaves the phone.
         guard let credentials = Credentials.load(), !credentials.isEmbedded else { return }
         SupervisorCategories.register(SupervisorCategories.base())
+        SupervisorCategories.register(SupervisorCategories.approval())
         // Not awaited: whatever the answer, the device token is asked for. A
         // Live Activity started by push needs no notification permission.
         // The answer changes `alerts`, so it is reported once given; the sync

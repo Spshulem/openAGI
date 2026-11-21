@@ -38,18 +38,24 @@ private val DELIVERED = setOf("sent", "dry-run", "done")
 // open when its delivery to the agent was blocked or failed (routes.js returns
 // {question, delivery}). That is Undelivered, never Done, or the ping would
 // clear and then come straight back as a new one.
-fun answerOutcome(error: Throwable?, attempt: Int, deliveryStatus: String? = null): AnswerOutcome = when (error) {
+//
+// A typed reply is the exception for 409: the route also answers 409 when
+// the question is still open but takes no typed text, so the owner's words
+// are reported Failed rather than dropped as "already closed".
+fun answerOutcome(error: Throwable?, attempt: Int, deliveryStatus: String? = null, reply: Boolean = false): AnswerOutcome = when (error) {
     null -> if (deliveryStatus == null || deliveryStatus in DELIVERED) AnswerOutcome.Done else AnswerOutcome.Undelivered
-    is DaemonException.NotFound, is DaemonException.Conflict -> AnswerOutcome.Done
+    is DaemonException.Conflict -> if (reply) AnswerOutcome.Failed else AnswerOutcome.Done
+    is DaemonException.NotFound -> AnswerOutcome.Done
     is DaemonException.Unauthorized -> AnswerOutcome.Failed
     else -> if (attempt + 1 < MAX_ANSWER_ATTEMPTS) AnswerOutcome.Retry else AnswerOutcome.Failed
 }
 
-// Sends one answer (or dismissal) tapped on a supervisor notification.
+// Sends one answer, typed reply or dismissal from a supervisor notification.
 class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val questionId = inputData.getString(KEY_QUESTION_ID)?.takeIf { it.isNotBlank() } ?: return Result.success()
         val answer = inputData.getString(KEY_ANSWER)?.takeIf { it.isNotBlank() } ?: return Result.success()
+        val reply = inputData.getBoolean(KEY_REPLY, false)
         val store = NotifiedQuestionsStore(applicationContext.filesDir)
         // Unpaired since the tap: there is no daemon to send to, and the
         // "sending" notice would otherwise spin forever.
@@ -62,7 +68,11 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
         var deliveryStatus: String? = null
         var deliveryDetail: String? = null
         val error = try {
-            val result = if (answer == DISMISS) client.fleetDismiss(questionId) else client.fleetAnswer(questionId, answer)
+            val result = when {
+                reply -> client.fleetReply(questionId, answer)
+                answer == DISMISS -> client.fleetDismiss(questionId)
+                else -> client.fleetAnswer(questionId, answer)
+            }
             deliveryStatus = result.delivery?.status
             deliveryDetail = result.delivery?.detail
             null
@@ -73,7 +83,7 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
         } catch (failure: Exception) {
             failure
         }
-        return when (answerOutcome(error, runAttemptCount, deliveryStatus)) {
+        return when (answerOutcome(error, runAttemptCount, deliveryStatus, reply)) {
             AnswerOutcome.Done -> {
                 // Under the alert lock, so a check already holding an older
                 // "still open" answer cannot post this question again.
@@ -117,6 +127,8 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
         private const val TAG = "supervisor-answer"
         private const val KEY_QUESTION_ID = "questionId"
         private const val KEY_ANSWER = "answer"
+        // The answer is typed text for POST { reply }, not an option.
+        private const val KEY_REPLY = "reply"
         private const val DISMISS = "dismiss"
 
         // Below SupervisorAlerts.FIRST_QUESTION_ID, clear of the live-alerts
@@ -128,9 +140,9 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
         // KEEP: a second tap on the same question while one send is pending
         // is the same intent, not a second answer. A finished (failed) send
         // does not block a fresh one.
-        fun enqueue(context: Context, questionId: String, answer: String) {
+        fun enqueue(context: Context, questionId: String, answer: String, reply: Boolean = false) {
             val request = OneTimeWorkRequestBuilder<SupervisorAnswerWorker>()
-                .setInputData(workDataOf(KEY_QUESTION_ID to questionId, KEY_ANSWER to answer))
+                .setInputData(workDataOf(KEY_QUESTION_ID to questionId, KEY_ANSWER to answer, KEY_REPLY to reply))
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)

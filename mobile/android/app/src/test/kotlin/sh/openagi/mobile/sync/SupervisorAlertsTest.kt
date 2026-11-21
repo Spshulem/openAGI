@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -146,5 +147,23 @@ class SupervisorAlertsTest {
     fun openThreadIsNeverAnAnswerButton() {
         val q = FleetQuestion(id = "q1", options = listOf("yes", "open thread", "Dismiss"))
         assertEquals(listOf("yes"), SupervisorAlerts.actionOptions(q))
+    }
+
+    // "Answer question" needs typed text: as a button it would be refused,
+    // so the Reply field carries it instead.
+    @Test
+    fun answerQuestionIsTheReplyFieldNeverAButton() {
+        val q = FleetQuestion(id = "q1", kind = "suggestion", options = listOf("Approve", "Answer question", "Skip"))
+        assertEquals(listOf("Approve", "Skip"), SupervisorAlerts.actionOptions(q))
+        assertTrue(SupervisorAlerts.acceptsReply(q))
+    }
+
+    // Same rule as the daemon's push alerts: the agent's own ask (canReply),
+    // or a suggestion with "Answer question". Nothing else takes typed text.
+    @Test
+    fun onlyQuestionsTheRouteTakesTypedTextForGetAReplyField() {
+        assertTrue(SupervisorAlerts.acceptsReply(FleetQuestion(id = "q1", kind = "agent-ask", canReply = true)))
+        assertFalse(SupervisorAlerts.acceptsReply(FleetQuestion(id = "q2", kind = "agent-ask", options = listOf("yes"))))
+        assertFalse(SupervisorAlerts.acceptsReply(FleetQuestion(id = "q3", kind = "agent-ask", options = listOf("Answer question"))))
     }
 }
