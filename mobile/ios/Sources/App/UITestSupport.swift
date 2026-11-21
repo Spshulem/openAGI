@@ -31,8 +31,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         ProcessInfo.processInfo.arguments.contains("--ui-testing") || StoreScreenshotProtocol.isEnabled
     }
     private static let decidedActions = OSAllocatedUnfairLock(initialState: Set<String>())
+    private struct BudgetFixtureState: Sendable {
+        var dailyLimit: Double = 10.0
+        var bonusToday: Double = 0.0
+        var spent: Double = 2.5
+    }
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
-    private static let budgetState = OSAllocatedUnfairLock(initialState: (dailyLimit: 10.0, bonusToday: 0.0, spent: 2.5))
+    private static let budgetState = OSAllocatedUnfairLock(initialState: BudgetFixtureState())
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private struct ChatLine: Sendable {
         let id: String
@@ -190,10 +195,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         case "/budget":
             if request.httpMethod == "POST", let body = Self.body(request),
                let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                let limit = (payload["dailyUsdLimit"] as? NSNumber)?.doubleValue
+                let resetBonus = payload["resetTodayBonus"] as? Bool == true
+                let addBonus = (payload["addUsdToday"] as? NSNumber)?.doubleValue
                 Self.budgetState.withLock { state in
-                    if let limit = payload["dailyUsdLimit"] as? Double { state.dailyLimit = limit }
-                    if payload["resetTodayBonus"] as? Bool == true { state.bonusToday = 0 }
-                    if let add = payload["addUsdToday"] as? Double { state.bonusToday += add }
+                    if let limit { state.dailyLimit = limit }
+                    if resetBonus { state.bonusToday = 0 }
+                    if let addBonus { state.bonusToday += addBonus }
                 }
             }
             let current = Self.budgetState.withLock { $0 }
