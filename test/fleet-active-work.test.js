@@ -46,7 +46,13 @@ function createOutreachRecorder() {
     },
     update(id, patch) {
       const hit = items.find((it) => it.id === id);
-      if (hit) Object.assign(hit, patch);
+      if (hit) {
+        for (const key of ["title", "summary", "actions", "sourceRef"]) {
+          if (key in patch) hit[key] = key === "sourceRef" && patch[key] && typeof patch[key] === "object"
+            ? structuredClone(patch[key])
+            : patch[key];
+        }
+      }
       return hit ?? null;
     },
     resolve(id, decision, { status = "acted" } = {}) {
@@ -707,6 +713,30 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(changedWhileSnoozed.item.outcomeVerified, false);
     assert.equal(changedWhileSnoozed.item.verifiedAt, null);
 
+    // Changing only notification permission must also invalidate the mark so
+    // a newly allowed prompt is delivered without unrelated evidence changes.
+    const permissionItem = ctx.supervisor.trackWork({
+      project: "PermissionChange",
+      theme: "Follow-through",
+      goal: "Finish the permission-change check",
+      doneCriteria: "Check is complete",
+      permittedNudges: "none",
+      state: "blocked"
+    });
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    const permissionUpdate = ctx.supervisor.trackWork({
+      project: "PermissionChange",
+      theme: "Follow-through",
+      goal: "Finish the permission-change check",
+      doneCriteria: "Check is complete",
+      permittedNudges: "propose_only",
+      state: "blocked"
+    });
+    assert.equal(permissionUpdate.item.id, permissionItem.item.id);
+    const permissionPass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    assert.ok(permissionPass.evaluatedCount >= 1);
+    assert.ok(ctx.outreach.items.some((entry) => entry.sourceRef?.id === permissionItem.item.id));
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });
@@ -724,6 +754,11 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(confirmed.item.followThroughState, "archive_candidate");
     assert.equal(archiveCalls.length, 0, "confirm_done must never auto-archive");
 
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    const verifiedAppfolio = ctx.supervisor.activeWork.state.items.find((item) => item.id === appfolio.id);
+    const archiveOutreachId = verifiedAppfolio.outreachId;
+    assert.ok(archiveOutreachId, "Archive candidates keep a resolvable outreach record");
+
     // Proposing archive without confirmed: true returns proposal only
     const proposedArch = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive" });
     assert.equal(proposedArch.ok, true);
@@ -736,6 +771,7 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(executedArch.ok, true);
     assert.equal(executedArch.status, "archived_session");
     assert.equal(archiveCalls.length, 1);
+    assert.equal(ctx.outreach.items.find((entry) => entry.id === archiveOutreachId)?.status, "acted");
     assert.equal(archiveCalls[0].agentId, "cust_appfolio");
     assert.equal(executedArch.item.followThroughState, "done");
 
@@ -1002,10 +1038,13 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
     remote.mirrorActiveWork({ prompts: [mirroredPrompt] });
     const mirrored = remoteOutreach.items.find((item) => item.sourceRef?.id === mirroredPrompt.id);
     assert.ok(mirrored);
-    remoteOutreach.resolve(mirrored.id, "dismissed", { status: "dismissed" });
-    remote.mirrorActiveWork({ prompts: [mirroredPrompt] });
-    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 1);
     remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-b" }] });
+    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 1);
+    assert.equal(mirrored.sourceRef.mark, "mark-b", "open hub records persist the new evidence mark");
+    remoteOutreach.resolve(mirrored.id, "dismissed", { status: "dismissed" });
+    remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-b" }] });
+    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 1);
+    remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-c" }] });
     assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 2);
 
     const remoteView = await remote.getActiveWork({ project: "Growth" });

@@ -1774,6 +1774,7 @@ export class ActiveWorkManager {
       const deltaMark = shortHash(JSON.stringify([
         item.goalUpdatedAt ?? "",
         item.state,
+        item.permittedNudges ?? null,
         item.outcomeVerified,
         item.remainingCount ?? null,
         ownerKey ?? "",
@@ -2246,6 +2247,7 @@ export class ActiveWorkManager {
       if (archRes?.ok) {
         item.archivedAt = nowIso;
         item.updatedAt = nowIso;
+        this._resolveItemOutreach(item, "archived_session", "acted");
         this._recordAudit({ op: "propose_archive", itemId: item.id, targetKey, executed: true });
         this._save();
       }
