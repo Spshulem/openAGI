@@ -594,6 +594,30 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     const afterCount = ctx.supervisor.getActiveWork({ includeDone: true, includeSnoozed: true }).counts.totalTracked;
     assert.equal(afterCount, beforeCount);
 
+    // An update that omits doneCriteria preserves the explicit completion
+    // contract already recorded for the commitment.
+    const beforeCriteria = ctx.supervisor.getActiveWork({ includeDone: true, includeSnoozed: true }).items
+      .find((item) => item.customer === "AppFolio").doneCriteria;
+    ctx.supervisor.trackWork({
+      project: "BuildBetter",
+      theme: "Customer Follow-up",
+      customer: "AppFolio",
+      goal: "Deliver AppFolio rubric/export fix and confirm in customer workspace",
+      nextAction: "Recheck the customer workspace"
+    });
+    const afterCriteria = ctx.supervisor.getActiveWork({ includeDone: true, includeSnoozed: true }).items
+      .find((item) => item.customer === "AppFolio").doneCriteria;
+    assert.equal(afterCriteria, beforeCriteria);
+
+    // Distinct long goals with the same readable prefix remain separate
+    // commitments when no customer or PR key is available.
+    const longPrefix = "Verify the production rollout and complete all post-deployment checks for ";
+    const longA = ctx.supervisor.trackWork({ project: "Platform", theme: "Release", goal: `${longPrefix}${"A".repeat(120)}` });
+    const longB = ctx.supervisor.trackWork({ project: "Platform", theme: "Release", goal: `${longPrefix}${"B".repeat(120)}` });
+    assert.equal(longA.created, true);
+    assert.equal(longB.created, true);
+    assert.notEqual(longA.item.id, longB.item.id);
+
     // 2. Evidence freshness: because AppFolio's doneCriteria was just updated at BASE_NOW,
     // its earlier PR merge evidence (4h ago) is flagged `fresh: false` (`predates_current_goal`)!
     const appfolio = ctx.supervisor.getActiveWork().digest.find((it) => it.customer === "AppFolio");
@@ -621,10 +645,11 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(pass3.page.nextOffset, 0);
     assert.ok(pass3.page.cycleCount >= 1);
 
-    // Subsequent pass with zero changes skips unchanged items deterministically
+    // Items whose evidence is unchanged but whose prompt was deferred by the
+    // previous pass's cap are revisited so their notification is not lost.
     const pass4 = await ctx.supervisor.scanActiveWork({ pageSize: 15, maxRepoChecks: 0 });
-    assert.equal(pass4.evaluatedCount, 0);
-    assert.ok(pass4.skippedUnchanged >= 10);
+    assert.ok(pass4.evaluatedCount >= 1, "deferred prompts remain eligible on a later pass");
+    assert.ok(pass4.skippedUnchanged >= 8);
 
     // 4. Snooze: snoozed item leaves digest until snoozedUntil expires, then resurfaces
     const sales = ctx.supervisor.getActiveWork().digest.find((it) => it.project === "Sales");
@@ -865,6 +890,7 @@ test("treats transcripts as untrusted, blocks disallowed nudge permissions, and 
 test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor relay, and conversational tools", async () => {
   const ctx = seedRepresentativeFixtures();
   const remoteDir = makeTempDir("openagi-aw-remote-");
+  const remoteOutreach = createOutreachRecorder();
   try {
     // 1. Mobile route allowlist checks
     assert.equal(isMobileRouteAllowed("GET", "/fleet/api/active-work"), true);
@@ -889,6 +915,7 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
       dataDir: remoteDir,
       nodeId: "mac-node-1",
       runtime: {
+        outreach: remoteOutreach,
         events: { emit() {} },
         nodeCapabilities: {
           dispatch: async (_nodeId, _cap, op, payload) => capability.invoke(op, payload)
@@ -908,6 +935,7 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
 
     const remotePass = await remote.scanActiveWork({ pageSize: 8, maxRepoChecks: 2 });
     assert.equal(remotePass.page.scannedSessions, 8);
+    assert.ok(remoteOutreach.items.some((item) => item.type === "fleet-active-work"), "Active Work prompts reach the hosted hub");
 
     const remoteView = await remote.getActiveWork({ project: "Growth" });
     assert.equal(remoteView.items.length, 1);
@@ -949,6 +977,13 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
 
     // Conversational propose_archive strictly proposes (`archive_proposed`), never auto-archives!
     const actTool = tools.get("fleet_act_active_work");
+    const approvalA = actTool.prepareApprovalArgs({ op: "resume_owner", id: "tw_message", message: "Run the checks" });
+    const approvalB = actTool.prepareApprovalArgs({ op: "resume_owner", id: "tw_message", message: "Do not run the checks" });
+    assert.notEqual(
+      actTool.approvalDedupeKey(approvalA, { sessionId: "owner" }),
+      actTool.approvalDedupeKey(approvalB, { sessionId: "owner" }),
+      "changed resume instructions require a fresh approval"
+    );
     await actTool.handler(
       actTool.prepareApprovalArgs({ op: "confirm_done", id: enrolled.item.id, note: "Audit signed off" }),
       { __confirmed: true }

@@ -437,7 +437,10 @@ export function buildWorkDedupeKey({ project, theme = null, customer = null, goa
   if (customer && String(customer).trim()) {
     return `work:${projSlug}:${themeSlug}:customer:${slugKey(customer)}`;
   }
-  return `work:${projSlug}:${themeSlug}:goal:${slugKey(goal).slice(0, 64)}`;
+  // Keep a readable prefix for diagnostics, but include a digest of the full
+  // goal so two commitments that share their first 64 characters never
+  // silently overwrite one another.
+  return `work:${projSlug}:${themeSlug}:goal:${slugKey(goal).slice(0, 64)}:${shortHash(goal)}`;
 }
 
 export class ActiveWorkManager {
@@ -585,12 +588,12 @@ export class ActiveWorkManager {
       ? cleanText(input.customer, 80)
       : null;
 
-    const doneCriteria = cleanText(
-      input.doneCriteria ?? (customer
-        ? `Outcome verified and ${customer} follow-up confirmed by owner`
-        : "Outcome verified by owner"),
-      500
-    );
+    const requestedDoneCriteria = input.doneCriteria !== undefined
+      ? cleanText(input.doneCriteria, 500)
+      : null;
+    const defaultDoneCriteria = customer
+      ? `Outcome verified and ${customer} follow-up confirmed by owner`
+      : "Outcome verified by owner";
     const nextAction = input.nextAction !== undefined && input.nextAction !== null && String(input.nextAction).trim()
       ? cleanText(input.nextAction, 300)
       : null;
@@ -672,6 +675,9 @@ export class ActiveWorkManager {
     const existing = (input.id ? this.state.items.find((it) => it.id === input.id) : null)
       ?? this.state.items.find((it) => it.dedupeKey === dedupeKey)
       ?? null;
+    // An omitted doneCriteria is an update to the existing commitment, not a
+    // request to replace its explicit completion contract with the default.
+    const doneCriteria = requestedDoneCriteria ?? existing?.doneCriteria ?? defaultDoneCriteria;
 
     let item;
     let created = false;
@@ -733,6 +739,13 @@ export class ActiveWorkManager {
           snoozedUntil: new Date(parseIsoMs(input.snoozedUntil)).toISOString()
         } : {}),
         ...(input.confirmDone === true ? { verifiedAt: nowIso, verifiedBy: "owner" } : {}),
+        ...(goalChanged ? {
+          decisionsVerdict: null,
+          lastEvaluatedMark: null,
+          lastPromptedMark: null,
+          lastEvaluatedActionable: null,
+          promptDeferred: false
+        } : {}),
         ...(remainingCount !== null ? { remainingCount, remainingCountSource: "explicit" } : {}),
         ...(input.awaitingFollowup !== undefined ? { awaitingFollowup: Boolean(input.awaitingFollowup) } : {}),
         updatedAt: nowIso
@@ -784,6 +797,8 @@ export class ActiveWorkManager {
         decisionsVerdict: null,
         lastEvaluatedMark: null,
         lastEvaluatedAt: null,
+        lastEvaluatedActionable: null,
+        promptDeferred: false,
         lastPromptedMark: null,
         outreachId: null,
         archivedAt: null,
@@ -1136,6 +1151,28 @@ export class ActiveWorkManager {
       .sort(sortRanked)
       .slice(0, maxItems);
 
+    // Only mirror prompts that were actually emitted on this computer. This
+    // preserves the per-pass prompt cap when a hosted hub renders the same
+    // Active Work digest, and gives the hub a stable mark for updates.
+    const prompts = scoped
+      .filter((it) => {
+        const raw = this.state.items.find((candidate) => candidate.id === it.id);
+        return Boolean(raw?.outreachId && it.actionable && raw.lastPromptedMark);
+      })
+      .map((it) => {
+        const raw = this.state.items.find((candidate) => candidate.id === it.id);
+        const title = clampText(
+          `Follow-through · ${it.project}${it.theme ? ` / ${it.theme}` : ""}`,
+          110
+        );
+        const choiceLabels = (it.choices ?? []).map((choice) => choice.label).slice(0, 4).join(", ");
+        const summary = clampText(
+          `${it.whySurfaced}${it.verificationQuestion ? ` ${it.verificationQuestion}` : ""}${choiceLabels ? ` (Choices: ${choiceLabels})` : ""}`,
+          260
+        );
+        return { id: it.id, mark: raw.lastPromptedMark, title, summary, actions: ["dismiss"] };
+      });
+
     const openProposals = this.state.proposedProjects
       .filter((p) => p.status === "proposed" && (!filterProjectSlug || slugKey(p.project) === filterProjectSlug))
       .slice(0, 30);
@@ -1165,6 +1202,7 @@ export class ActiveWorkManager {
       counts,
       digest,
       items: visibleItems,
+      prompts,
       proposedProjects: openProposals,
       inventory: structuredClone(this.state.inventoryCursor),
       spend: structuredClone(this.state.spend),
@@ -1454,11 +1492,23 @@ export class ActiveWorkManager {
     }
   }
 
+  _persistRepoProbeSnapshot(prsByRef) {
+    const target = this.supervisor?.lastPrs;
+    if (!(target instanceof Map) || !(prsByRef instanceof Map)) return;
+    // Repo probes are fresher than the supervisor tick that seeded the scan.
+    // Keep the PR-ref entries so the next read-only digest sees the same
+    // evidence immediately, while preserving thread-key and unrelated rows.
+    for (const [ref, pr] of prsByRef) {
+      if (parsePrRef(ref) || String(ref).includes("#")) target.set(ref, pr);
+    }
+  }
+
   _resolveItemOutreach(item, decision = "resolved", status = "acted") {
     if (!item?.outreachId) return;
     try {
       this.runtime?.outreach?.resolve?.(item.outreachId, decision, { status });
     } catch { /* best-effort */ }
+    item.outreachId = null;
   }
 
   // Bounded, resumable inventory pass across hosts. Never pings or starts agents.
@@ -1676,6 +1726,8 @@ export class ActiveWorkManager {
       }
     }
 
+    this._persistRepoProbeSnapshot(prsByRef);
+
     // 3. Cheap deterministic delta/age filter across tracked items + shortlist ambiguous cases.
     let evaluatedCount = 0;
     let skippedUnchanged = 0;
@@ -1713,11 +1765,6 @@ export class ActiveWorkManager {
       const staleAfterMs = (item.cadence?.staleAfterHours ?? 24) * HOUR_MS;
       const crossedStaleBoundary = (nowMs - progressMs) >= staleAfterMs && !item.wasStaleAtLastEval;
 
-      if (!inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null) {
-        skippedUnchanged += 1;
-        continue;
-      }
-
       const prRef = item.prRef ?? (item.evidenceLinks ?? []).find((l) => l.kind === "pr")?.ref ?? session?.prRefs?.find((r) => parsePrRef(r)) ?? null;
       const livePr = prRef ? (prsByRef.get(prRef.toLowerCase()) ?? null) : null;
       const completionReviewedAt = readCompletionReviewedIso(this.store, ownerKey);
@@ -1741,7 +1788,21 @@ export class ActiveWorkManager {
         completionReviewedAt ?? ""
       ]));
 
-      if (deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke) {
+      // Verdicts are only valid for the evidence mark they evaluated. Clear a
+      // stale one even when this item is outside the current inventory page;
+      // otherwise an old blocked verdict can survive a resumed session.
+      if (item.decisionsVerdict && item.decisionsVerdict.evidenceMark !== deltaMark) {
+        item.decisionsVerdict = null;
+      }
+
+      const pendingPrompt = item.promptDeferred === true;
+      if (!inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt) {
+        skippedUnchanged += 1;
+        continue;
+      }
+
+      const pendingPromptForDelta = item.promptDeferred === true;
+      if (deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta) {
         skippedUnchanged += 1;
         continue;
       }
@@ -1840,7 +1901,13 @@ export class ActiveWorkManager {
         // Replace (never sum!) observed remaining count only if not explicitly pinned.
         // If an untrusted message claims "0 remaining" while outcomeVerified is false,
         // flag awaitingFollowup so it surfaces for owner verification rather than dropping to healthy active.
-        if (item.remainingCountSource !== "explicit" && untrusted.observedRemainingCount !== null) {
+        if (item.remainingCountSource === "untrusted_transcript" && untrusted.observedRemainingCount === null) {
+          // Replace, rather than retain, transcript-derived counts. A newer
+          // completion message without a number must not leave an obsolete
+          // blocker count attached to the work item.
+          item.remainingCount = null;
+          item.remainingCountSource = null;
+        } else if (item.remainingCountSource !== "explicit" && untrusted.observedRemainingCount !== null) {
           const prevRemaining = item.remainingCount;
           item.remainingCount = untrusted.observedRemainingCount;
           item.remainingCountSource = "untrusted_transcript";
@@ -1851,7 +1918,14 @@ export class ActiveWorkManager {
       }
 
       if (decisionsOutcome.verdicts.has(item.id)) {
-        item.decisionsVerdict = decisionsOutcome.verdicts.get(item.id);
+        item.decisionsVerdict = {
+          ...decisionsOutcome.verdicts.get(item.id),
+          evidenceMark: deltaMark
+        };
+      } else if (item.decisionsVerdict && item.decisionsVerdict.evidenceMark !== deltaMark) {
+        // A model verdict is tied to the evidence it read. Never carry a
+        // stale blocked/follow-up classification onto changed evidence.
+        item.decisionsVerdict = null;
       }
 
       const currentProgressMs = parseIsoMs(item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? item.createdAt) ?? nowMs;
@@ -1860,6 +1934,13 @@ export class ActiveWorkManager {
       item.lastEvaluatedAt = nowIso;
 
       const projected = this._projectItem(item, { nowMs, sessionsByKey, prsByRef });
+      item.lastEvaluatedActionable = projected.actionable;
+      if (!projected.actionable && item.outreachId) {
+        this._resolveItemOutreach(item, "resolved", "no-longer-actionable");
+      }
+      if (!projected.actionable || item.permittedNudges === "none" || item.lastPromptedMark === deltaMark) {
+        item.promptDeferred = false;
+      }
       if (
         projected.actionable
         && item.permittedNudges !== "none"
@@ -1870,9 +1951,15 @@ export class ActiveWorkManager {
         if (outreachId) {
           item.outreachId = outreachId;
           item.lastPromptedMark = deltaMark;
+          item.promptDeferred = false;
           promptsEmittedThisPass += 1;
           this.state.spend.promptsEmitted += 1;
         }
+      } else if (projected.actionable && item.permittedNudges !== "none" && item.lastPromptedMark !== deltaMark) {
+        // The evidence was evaluated, but this pass's prompt budget was full
+        // (or the outreach store was unavailable). Revisit delivery next pass
+        // even if the underlying evidence is unchanged.
+        item.promptDeferred = true;
       }
     }
 
@@ -2093,7 +2180,13 @@ export class ActiveWorkManager {
       if (typeof this.supervisor?.sendOwnerMessage !== "function") {
         return { ok: false, op, status: "send_unavailable", detail: "Session messaging is not available." };
       }
-      const sent = await this.supervisor.sendOwnerMessage(targetKey, defaultMessage, sendOptions);
+      // Active Work is explicitly an existing-session follow-up. A
+      // disconnected Paseo runtime must remain blocked rather than silently
+      // creating a replacement session that this item does not track.
+      const sent = await this.supervisor.sendOwnerMessage(targetKey, defaultMessage, {
+        ...sendOptions,
+        recoverDisconnected: false
+      });
       const delivery = sent?.delivery ?? { status: "blocked", detail: "Delivery unavailable" };
       if (delivery.status === "sent") {
         if (item.state === "paused") item.state = "active";
@@ -2301,7 +2394,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         };
       },
       approvalTtlMs: 15 * 60_000,
-      approvalDedupeKey: (args, context) => `fleet-act-aw:${shortHash(JSON.stringify([context?.sessionId ?? null, args.op, args.id ?? null, args.targetKey ?? null, args.hours ?? null]))}`,
+      approvalDedupeKey: (args, context) => `fleet-act-aw:${shortHash(JSON.stringify([context?.sessionId ?? null, args.op, args.id ?? null, args.targetKey ?? null, args.hours ?? null, args.message ?? null]))}`,
       summarize: (args) => args.op === "scan_inventory"
         ? `Run bounded Active Work inventory pass (pageSize=${args.pageSize ?? 12})`
         : `Active Work ${args.op} on ${args.id}`,

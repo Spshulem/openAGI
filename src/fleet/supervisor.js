@@ -2188,7 +2188,7 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -2215,7 +2215,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     if (delivery.status === "sent") {

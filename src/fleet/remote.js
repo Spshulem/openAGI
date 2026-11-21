@@ -66,7 +66,11 @@ export function createFleetCapability(supervisor) {
       }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
-      return { response, state: supervisor.getState() };
+      return {
+        response,
+        state: supervisor.getState(),
+        activeWork: typeof supervisor.getActiveWork === 'function' ? supervisor.getActiveWork() : null
+      };
     }
   };
 }
@@ -102,6 +106,7 @@ export class RemoteFleetSupervisor {
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
     this.lastEmitted = null;
+    this.activeWorkSignature = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
   }
@@ -179,6 +184,7 @@ export class RemoteFleetSupervisor {
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
         this.mirrorQuestions();
+        this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();
       }
       status = result.response?.status ?? null;
@@ -217,6 +223,7 @@ export class RemoteFleetSupervisor {
         state.snapshot?.at ?? null,
         state.questions.map(q => q.id).sort(),
         (state.cards ?? []).map(c => c.id).sort(),
+        this.activeWorkSignature,
         state.preferences?.mergePolicy ?? null,
         state.preferences?.cadence ?? null,
         state.preferences?.autoSlices ?? null
@@ -737,6 +744,39 @@ export class RemoteFleetSupervisor {
           ...shown, needsDecision: true, dedupeOpen: true });
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
+    }
+  }
+
+  mirrorActiveWork(activeWork) {
+    const outreach = this.runtime?.outreach;
+    if (!activeWork || !Array.isArray(activeWork.prompts)) return;
+    const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
+    this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
+    if (!outreach) return;
+    const openIds = new Set(prompts.map((prompt) => String(prompt.id)));
+    for (const item of outreach.list()) {
+      if (item.sourceRef?.kind === 'active-work'
+          && item.sourceRef.nodeId === this.nodeId
+          && ['unseen', 'seen'].includes(item.status)
+          && !openIds.has(String(item.sourceRef.id))) {
+        outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
+      }
+    }
+    const existing = outreach.list();
+    for (const prompt of prompts) {
+      const sourceRef = { kind: 'active-work', id: prompt.id, nodeId: this.nodeId, mark: prompt.mark };
+      const shown = {
+        title: prompt.title,
+        summary: prompt.summary,
+        actions: Array.isArray(prompt.actions) && prompt.actions.length ? prompt.actions : ['dismiss']
+      };
+      const current = existing.find((item) => item.sourceRef?.kind === 'active-work'
+        && item.sourceRef.nodeId === this.nodeId
+        && String(item.sourceRef.id) === String(prompt.id));
+      const item = (current && current.sourceRef?.mark !== prompt.mark && outreach.reopen?.(current.id))
+        || current
+        || outreach.append({ type: 'fleet-active-work', sourceRef, ...shown, needsDecision: false, dedupeOpen: true });
+      if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
     }
   }
 }
