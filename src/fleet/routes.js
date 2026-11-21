@@ -588,7 +588,8 @@ export function createFleetRoute({ supervisor } = {}) {
       // The owner's feedback (voice or typed): GET lists it, POST records one.
       if (parts.length === 1 && parts[0] === "feedback") {
         if (typeof supervisor.recordFeedback !== "function") return fail(503, "Feedback is not available.");
-        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 100 }) });
+        // Everything the store keeps: a status filter must see old open items.
+        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 500 }) });
         if (method !== "POST") return fail(405, "Use GET or POST.");
         const body = await readObject(readBody);
         if (!body) return fail(400, "Send a JSON object: { utterance, intent, target?, source? }.");
