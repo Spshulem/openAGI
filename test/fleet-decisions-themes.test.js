@@ -784,6 +784,22 @@ test("deliverPaseo recovers disconnected ACP sessions in-place, unblocks stale n
   assert.equal(imageFollowUps.length, 1);
   assert.equal(imageFollowUps[0].options.images.length, 1);
 
+  // Active Work resumes are existing-session-only: a disconnected runtime
+  // must be reported as blocked instead of creating a replacement session.
+  const noRecovery = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: paseoThread(initialBroken, "srv_mac"),
+    text: "[OpenAGI supervisor] Follow up in the existing session.",
+    store: { dir },
+    actionId: "act-no-recovery",
+    base: { messageHash: "owner-no-recovery", playbook: "owner-message" },
+    factory: factoryA,
+    recoverDisconnected: false
+  });
+  assert.equal(noRecovery.status, "blocked");
+  assert.match(noRecovery.detail, /existing session only/);
+  assert.equal(createdSessions.length, 1);
+
   // Case B: Turnless ACP/Claude provider confirms owner message + clears stale unconfirmed background receipt!
   const turnlessAgent = {
     id: "claude-turnless",

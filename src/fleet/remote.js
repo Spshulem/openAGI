@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/act|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +49,13 @@ export function createFleetCapability(supervisor) {
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
+      if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (typeof payload.body?.theme === 'string') url.searchParams.set('theme', payload.body.theme);
+        if (payload.body?.includeSnoozed !== undefined) url.searchParams.set('includeSnoozed', String(Boolean(payload.body.includeSnoozed)));
+        if (payload.body?.includeDone !== undefined) url.searchParams.set('includeDone', String(Boolean(payload.body.includeDone)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
       if (payload.path === '/fleet/api/repo-status') {
         if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
         if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
@@ -59,7 +66,11 @@ export function createFleetCapability(supervisor) {
       }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
-      return { response, state: supervisor.getState() };
+      return {
+        response,
+        state: supervisor.getState(),
+        activeWork: typeof supervisor.getActiveWork === 'function' ? supervisor.getActiveWork() : null
+      };
     }
   };
 }
@@ -95,6 +106,7 @@ export class RemoteFleetSupervisor {
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
     this.lastEmitted = null;
+    this.activeWorkSignature = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
   }
@@ -162,7 +174,8 @@ export class RemoteFleetSupervisor {
     let reached = false;
     let status = null;
     try {
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
+      const isDelivering = method === 'POST' && (DELIVERING.test(path) || /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path));
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: isDelivering ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       if (sequence >= this.appliedSequence) {
@@ -171,6 +184,7 @@ export class RemoteFleetSupervisor {
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
         this.mirrorQuestions();
+        this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();
       }
       status = result.response?.status ?? null;
@@ -182,7 +196,8 @@ export class RemoteFleetSupervisor {
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
       const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
-      const nonOutageError = missingThread || closedCard || unsupportedRoute;
+      const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
+      const nonOutageError = missingThread || closedCard || missingActiveWork || unsupportedRoute;
       if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
       throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
@@ -208,6 +223,7 @@ export class RemoteFleetSupervisor {
         state.snapshot?.at ?? null,
         state.questions.map(q => q.id).sort(),
         (state.cards ?? []).map(c => c.id).sort(),
+        this.activeWorkSignature,
         state.preferences?.mergePolicy ?? null,
         state.preferences?.cadence ?? null,
         state.preferences?.autoSlices ?? null
@@ -369,6 +385,20 @@ export class RemoteFleetSupervisor {
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
   async claimTask(input = {}) { return await this.request('POST', '/fleet/api/tasks/claim', input); }
+  async getActiveWork(input = {}) { return this.request('GET', '/fleet/api/active-work', input); }
+  async trackWork(input = {}) {
+    const { state: _state, activeWork: _aw, ...rest } = await this.request('POST', '/fleet/api/active-work', input);
+    return rest;
+  }
+  async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async actActiveWork(id, input = {}) {
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      throw error;
+    }
+  }
   async batchActCards(input = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new Error('Pass a JSON object body.');
@@ -714,6 +744,53 @@ export class RemoteFleetSupervisor {
           ...shown, needsDecision: true, dedupeOpen: true });
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
+    }
+  }
+
+  mirrorActiveWork(activeWork) {
+    const outreach = this.runtime?.outreach;
+    if (!activeWork || !Array.isArray(activeWork.prompts)) return;
+    const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
+    this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
+    if (!outreach) return;
+    const openIds = new Set(prompts.map((prompt) => String(prompt.id)));
+    for (const item of outreach.list()) {
+      if (item.sourceRef?.kind === 'active-work'
+          && item.sourceRef.nodeId === this.nodeId
+          && ['unseen', 'seen'].includes(item.status)
+          && !openIds.has(String(item.sourceRef.id))) {
+        outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
+      }
+    }
+    const existing = outreach.list();
+    for (const prompt of prompts) {
+      const sourceRef = { kind: 'active-work', id: prompt.id, nodeId: this.nodeId, mark: prompt.mark };
+      const shown = {
+        title: prompt.title,
+        summary: prompt.summary,
+        actions: Array.isArray(prompt.actions) && prompt.actions.length ? prompt.actions : ['dismiss']
+      };
+      const current = existing.find((item) => item.sourceRef?.kind === 'active-work'
+        && item.sourceRef.nodeId === this.nodeId
+        && String(item.sourceRef.id) === String(prompt.id));
+      const markChanged = Boolean(current && current.sourceRef?.mark !== prompt.mark);
+      const sourceReopened = Boolean(current
+        && current.status === 'dismissed'
+        && current.decision === 'resolved');
+      let item = (markChanged || sourceReopened) ? (outreach.reopen?.(current.id) ?? null) : current;
+      if (!item && current && ['unseen', 'seen'].includes(current.status)) item = current;
+      if (!item) {
+        item = outreach.append({
+          type: 'fleet-active-work',
+          sourceRef,
+          ...shown,
+          needsDecision: false,
+          // A dismissed record cannot be reopened for a changed mark. Do not
+          // let an open-record dedupe rule suppress the replacement notice.
+          dedupeOpen: !markChanged
+        });
+      }
+      if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
     }
   }
 }

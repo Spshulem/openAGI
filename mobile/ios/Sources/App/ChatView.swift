@@ -355,11 +355,12 @@ struct ChatConversationView: View {
                                    offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
             } action: { previous, geometry in
                 hasContentBelow = !geometry.isAtBottom
-                // Keyboard dismissal and fold changes resize the viewport
-                // after Send has already moved to the reply. Resolve the
-                // message again at that size, rather than retaining a lazy
-                // stack's estimated bottom offset.
-                if previous.viewportHeight != geometry.viewportHeight && isPinnedToBottom && !userIsScrolling {
+                // Keyboard dismissal, fold changes and lazy multi-line row
+                // measurement resize the scroll geometry after an initial or
+                // post-send scroll. Settle again while pinned to the bottom.
+                if (previous.viewportHeight != geometry.viewportHeight
+                    || (previous.contentHeight != geometry.contentHeight && !geometry.isAtBottom))
+                    && isPinnedToBottom && !userIsScrolling {
                     scrollToLatest()
                 }
                 // Loading history, streaming and keyboard resizing must
@@ -383,8 +384,26 @@ struct ChatConversationView: View {
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
                     // Keep the message the reader was looking at in place
                     // when an earlier page is inserted above it.
+                    isPinnedToBottom = false
                     scrollPosition.scrollTo(id: first, anchor: .top)
-                } else if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+                } else if !new.isEmpty && (isPinnedToBottom || isBottomVisible) {
+                    isPinnedToBottom = true
+                    scrollToLatest()
+                    // Lazy message rows resolve their wrapped height after
+                    // materializing; settle onto the true end once laid out.
+                    Task { @MainActor in
+                        await Task.yield()
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling {
+                            scrollToLatest()
+                        }
+                        try? await Task.sleep(for: .milliseconds(120))
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling && !isBottomVisible {
+                            withAnimation(nil) {
+                                scrollPosition.scrollTo(id: Self.endOfConversation, anchor: .bottom)
+                            }
+                        }
+                    }
+                }
             }
             .onAppear {
                 if let id = scrollToMessageID {
