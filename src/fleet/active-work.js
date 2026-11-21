@@ -751,11 +751,13 @@ export class ActiveWorkManager {
         ...(goalChanged || ownerChanged ? { archivedAt: null } : {}),
         ...(nextState === "snoozed" && !existing.snoozedUntil && !parseIsoMs(input.snoozedUntil) ? {
           snoozedAt: nowIso,
-          snoozedUntil: new Date(nowMs + 24 * HOUR_MS).toISOString()
+          snoozedUntil: new Date(nowMs + 24 * HOUR_MS).toISOString(),
+          snoozedFromState: existing.state === "snoozed" ? (existing.snoozedFromState ?? "active") : existing.state
         } : {}),
         ...(parseIsoMs(input.snoozedUntil) ? {
           snoozedAt: nowIso,
-          snoozedUntil: new Date(parseIsoMs(input.snoozedUntil)).toISOString()
+          snoozedUntil: new Date(parseIsoMs(input.snoozedUntil)).toISOString(),
+          snoozedFromState: existing.state === "snoozed" ? (existing.snoozedFromState ?? "active") : existing.state
         } : {}),
         ...(input.confirmDone === true ? { verifiedAt: nowIso, verifiedBy: "owner" } : {}),
         ...(goalChanged && input.confirmDone !== true ? { verifiedAt: null, verifiedBy: null } : {}),
@@ -810,6 +812,7 @@ export class ActiveWorkManager {
               ? new Date(parseIsoMs(input.snoozedUntil)).toISOString()
               : new Date(nowMs + 24 * HOUR_MS).toISOString())
           : null,
+        snoozedFromState: null,
         remainingCount,
         remainingCountSource: remainingCount !== null ? "explicit" : null,
         awaitingFollowup: Boolean(input.awaitingFollowup),
@@ -1793,7 +1796,10 @@ export class ActiveWorkManager {
       if (item.state === "snoozed") {
         const untilMs = parseIsoMs(item.snoozedUntil);
         if (untilMs === null || nowMs >= untilMs) {
-          item.state = "active";
+          item.state = item.snoozedFromState && item.snoozedFromState !== "snoozed"
+            ? item.snoozedFromState
+            : "active";
+          item.snoozedFromState = null;
           item.snoozedUntil = null;
           item.lastEvaluatedMark = null;
           item.lastPromptedMark = null;
@@ -1807,6 +1813,7 @@ export class ActiveWorkManager {
 
       const ownerKey = item.owner?.threadKey ?? null;
       const session = ownerKey ? (sessionsByKey.get(ownerKey) ?? null) : null;
+      const ownerMissing = Boolean(ownerKey && !session);
       const inCurrentPage = !ownerKey || sessions.length === 0 || pageSessionKeys.has(ownerKey) || (session ? pageSessionKeys.has(session.key) : false);
 
       const progressMs = parseIsoMs(item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? item.createdAt) ?? nowMs;
@@ -1852,14 +1859,14 @@ export class ActiveWorkManager {
 
       const pendingPrompt = item.promptDeferred === true;
       const pendingDecision = item.decisionDeferred === true;
-      if (!inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt && !pendingDecision) {
+      if (!ownerMissing && !inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt && !pendingDecision) {
         skippedUnchanged += 1;
         continue;
       }
 
       const pendingPromptForDelta = item.promptDeferred === true;
       const pendingDecisionForDelta = item.decisionDeferred === true;
-      if (deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta && !pendingDecisionForDelta) {
+      if (!ownerMissing && deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta && !pendingDecisionForDelta) {
         skippedUnchanged += 1;
         continue;
       }
@@ -2152,10 +2159,16 @@ export class ActiveWorkManager {
         throw new Error("Snooze hours must be between 0 and 336.");
       }
       if (rawHours === 0) {
-        item.state = "active";
+        item.state = item.snoozedFromState && item.snoozedFromState !== "snoozed"
+          ? item.snoozedFromState
+          : "active";
+        item.snoozedFromState = null;
         item.snoozedAt = null;
         item.snoozedUntil = null;
       } else {
+        item.snoozedFromState = item.state === "snoozed"
+          ? (item.snoozedFromState ?? "active")
+          : item.state;
         item.state = "snoozed";
         item.snoozedAt = nowIso;
         item.snoozedUntil = new Date(nowMs + Math.round(rawHours * HOUR_MS)).toISOString();

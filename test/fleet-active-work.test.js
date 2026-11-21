@@ -873,6 +873,36 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(assignResult.ok, true);
     assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === reassigned.item.id).archivedAt, null);
 
+    const snoozedBlocked = ctx.supervisor.trackWork({
+      project: "SnoozedBlocked",
+      goal: "Keep the unresolved blocked state",
+      doneCriteria: "Dependency resolved",
+      state: "blocked"
+    });
+    await ctx.supervisor.actActiveWork(snoozedBlocked.item.id, { op: "snooze", hours: 1 });
+    ctx.advanceHours(2);
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
+    assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === snoozedBlocked.item.id).state, "blocked");
+    assert.equal(ctx.supervisor.getActiveWork({ project: "SnoozedBlocked" }).items[0].followThroughState, "blocked");
+
+    const absentOwnerRef = "acme/absent-owner#77";
+    ctx.supervisor.lastPrs.set(absentOwnerRef, {
+      ref: absentOwnerRef, state: "OPEN", isDraft: false, mergeState: "CLEAN", ciState: "SUCCESS", ci: { state: "SUCCESS", failing: [] }
+    });
+    const absentOwner = ctx.supervisor.trackWork({
+      project: "AbsentOwner",
+      goal: "Refresh evidence without an owner session",
+      threadKey: "paseo:srv_missing.archived",
+      prRef: absentOwnerRef
+    });
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
+    ctx.supervisor.lastPrs.set(absentOwnerRef, {
+      ref: absentOwnerRef, state: "MERGED", mergedAt: new Date(ctx.supervisor.now()).toISOString(), updatedAt: new Date(ctx.supervisor.now()).toISOString()
+    });
+    const absentOwnerPass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
+    assert.ok(absentOwnerPass.evaluatedCount >= 1, "items whose owner is absent remain eligible for evidence refresh");
+    assert.equal(ctx.supervisor.getActiveWork({ project: "AbsentOwner" }).items.find((item) => item.id === absentOwner.item.id).followThroughState, "owner_followup");
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });
