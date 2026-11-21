@@ -2410,10 +2410,11 @@ struct SupervisorWorkspaceView: View {
       }
 
       if supervisor.isSending {
-        let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The transcript may already hold this reply (a sync mid-stream):
+        // then only the progress line shows, never a second copy.
         VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
-          if !liveText.isEmpty {
-            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(supervisor.streamingReplyText ?? liveText))
+          if let liveText = supervisor.liveReplyText {
+            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(liveText))
           }
           HStack(spacing: 8) {
             ProgressView()
