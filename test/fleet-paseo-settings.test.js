@@ -2,10 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { applyPaseoSessionSettings, readPaseoSessionSettings, summarizePaseoSettings } from "../src/fleet/paseo-settings.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
+import { RemoteFleetSupervisor } from "../src/fleet/remote.js";
 
 const CONFIG = { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } };
 
-function makeFactory({ status = "idle", pendingPermissions = [], mutate = true, wrongId = false, mutationApi = true } = {}) {
+function makeFactory({ status = "idle", pendingPermissions = [], mutate = true, wrongId = false, mutationApi = true, currentThinkingOptions = [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }], targetThinkingOptions = [{ id: "low", label: "Low" }] } = {}) {
   const state = {
     id: "agent-1",
     provider: "codex",
@@ -32,10 +33,8 @@ function makeFactory({ status = "idle", pendingPermissions = [], mutate = true, 
     hosts: { list: async () => ({ self: { serverId: "host-1" }, hosts: [] }) },
     providers: {
       snapshot: async () => ({ entries: [{ provider: "codex", status: "ready", models: [{
-        id: "gpt-6-sol", label: "GPT-6 Sol", thinkingOptions: [
-          { id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }
-        ]
-      }, { id: "gpt-6-luna", label: "GPT-6 Luna", thinkingOptions: [{ id: "low", label: "Low" }] }] }] })
+        id: "gpt-6-sol", label: "GPT-6 Sol", thinkingOptions: currentThinkingOptions
+      }, { id: "gpt-6-luna", label: "GPT-6 Luna", thinkingOptions: targetThinkingOptions }] }] })
     },
     agents: {
       ref: () => ref,
@@ -142,6 +141,21 @@ test("a supported owner change is read back on the exact session", async () => {
   assert.equal(fake.calls.length, 1);
 });
 
+test("combined model and reasoning changes validate effort against the requested model", async () => {
+  const fake = makeFactory({
+    currentThinkingOptions: [{ id: "high", label: "High" }],
+    targetThinkingOptions: [{ id: "low", label: "Low" }]
+  });
+  const read = await readSettings(fake);
+  const result = await applyPaseoSessionSettings(CONFIG, {
+    serverId: "host-1", agentId: "agent-1",
+    body: { confirmed: true, targetFingerprint: read.settings.targetFingerprint, model: "gpt-6-luna", reasoningEffort: "low" }, factory: fake.factory
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.settings.current.model, "gpt-6-luna");
+  assert.equal(result.settings.current.reasoningEffort, "low");
+});
+
 test("readback mismatch never reports optimistic success", async () => {
   const fake = makeFactory({ mutate: false });
   const read = await readSettings(fake);
@@ -214,6 +228,28 @@ test("fleet route exposes GET and owner-confirmed POST settings without approval
   const applied = await route("POST", "/fleet/api/threads/paseo%3Ahost-1.agent-1/settings", new URL("http://localhost"), async () => ({ confirmed: true, model: "x" }));
   assert.equal(applied.status, 200);
   assert.equal(calls.length, 1);
+});
+
+test("remote settings adapter preserves the local ok/settings contract", async () => {
+  const runtime = {
+    nodeCapabilities: {
+      dispatch: async (_nodeId, _capability, _operation, request) => ({
+        state: { questions: [], actions: [], snapshot: null },
+        response: { status: 200, body: request.method === "GET"
+          ? { settings: { current: { model: "gpt-6-sol" } } }
+          : { settings: { current: { model: "gpt-6-luna" } }, detail: "next turn" } }
+      })
+    },
+    events: { emit: () => {} }
+  };
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: "fleet-1" });
+  const read = await remote.paseoSessionSettings("paseo:host-1.agent-1");
+  assert.equal(read.ok, true);
+  assert.equal(read.settings.current.model, "gpt-6-sol");
+  const saved = await remote.updatePaseoSessionSettings("paseo:host-1.agent-1", { confirmed: true, model: "gpt-6-luna" });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.settings.current.model, "gpt-6-luna");
+  assert.equal(saved.detail, "next turn");
 });
 
 test("summarizePaseoSettings marks provider controls unavailable instead of inventing choices", () => {

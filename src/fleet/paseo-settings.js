@@ -168,7 +168,7 @@ async function readWithApi(api, serverId, agentId) {
     reasoningEffort: atomic || typeof ref?.setThinkingOption === "function" || typeof api?.agents?.setThinkingOption === "function" || typeof api?.setAgentThinkingOption === "function",
     permissions: atomic || typeof ref?.setFeature === "function" || typeof api?.agents?.setFeature === "function" || typeof api?.setAgentFeature === "function" || typeof ref?.setOptions === "function"
   };
-  return { ok: true, ref, agent, settings: summarizePaseoSettings(agent, { serverId, providerSnapshot, mutation }) };
+  return { ok: true, ref, agent, providerSnapshot, settings: summarizePaseoSettings(agent, { serverId, providerSnapshot, mutation }) };
 }
 
 export async function readPaseoSessionSettings(config, { serverId, agentId, factory } = {}) {
@@ -235,7 +235,19 @@ export async function applyPaseoSessionSettings(config, { serverId, agentId, bod
     if (body.targetFingerprint && body.targetFingerprint !== before.settings.targetFingerprint) return { ok: false, status: "stale-target", detail: "The session changed since it was read. Refresh before changing settings." };
     if (before.settings.status === "pending") return { ok: false, status: "pending", settings: before.settings, detail: "A pending permission request must be answered in its card; settings cannot clear or approve it." };
     if (before.settings.status === "busy") return { ok: false, status: "busy", settings: before.settings, detail: "The session has an active turn. Settings take effect after it finishes; no restart was performed." };
-    const errors = validatePatch(patch, before.settings);
+    let validationSettings = before.settings;
+    if (patch.model !== undefined && patch.reasoningEffort !== undefined) {
+      const requestedModel = providerModelCatalog(before.providerSnapshot, before.agent.provider)
+        .find((item) => String(item?.id) === patch.model);
+      const requestedEffortOptions = Array.isArray(requestedModel?.thinkingOptions)
+        ? requestedModel.thinkingOptions.map((item) => choice(item?.id, item?.label, item?.description ? { description: clean(item.description, 240) } : {})).filter(Boolean)
+        : [];
+      validationSettings = {
+        ...before.settings,
+        supported: { ...before.settings.supported, reasoningEffort: requestedEffortOptions }
+      };
+    }
+    const errors = validatePatch(patch, validationSettings);
     if (errors.length) return { ok: false, status: "unsupported", settings: before.settings, detail: errors.join(" ") };
     const permission = findPermissionFeature(before.agent);
     try {

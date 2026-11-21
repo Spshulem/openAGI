@@ -640,6 +640,18 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   }
 
   var settingsLoading = new Set();
+  var settingsOpen = new Set();
+
+  function currentSettingsOption(select, settings, name) {
+    var current = settings && settings.current ? settings.current[name] : null;
+    if (!current) return;
+    var option = document.createElement('option');
+    option.value = current;
+    option.textContent = current;
+    option.selected = true;
+    option.disabled = true;
+    select.append(option);
+  }
 
   function renderPaseoSettings(parent, t) {
     var box = el('div', 'settings', null, parent);
@@ -649,6 +661,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     settingsLoading.add(t.key);
     api(threadPath(t.key) + '/settings').then(function (result) {
       settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
       box.replaceChildren();
       el('h4', null, 'Paseo session settings', box);
       var settings = result && result.settings ? result.settings : null;
@@ -667,7 +680,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
         var select = document.createElement('select');
         var lab = el('label', null, label, box); lab.append(select);
         var unavailable = settings.unavailable && settings.unavailable[name];
-        if (unavailable) { select.disabled = true; el('p', 'note', unavailable, box); return; }
+        if (unavailable) { currentSettingsOption(select, settings, name); select.disabled = true; el('p', 'note', unavailable, box); return; }
         if (!options.length) { select.disabled = true; el('p', 'note', 'Unavailable on this host/provider.', box); return; }
         options.forEach(function (item) {
           var option = document.createElement('option'); option.value = item.id; option.textContent = item.label;
@@ -689,6 +702,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       });
     }).catch(function (error) {
       settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
       box.replaceChildren();
       el('h4', null, 'Paseo session settings', box);
       el('p', 'note', error.message || 'Settings could not be read; nothing was changed.', box);
@@ -1096,9 +1110,12 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     }
     if (t.kind === 'paseo') {
       var settings = button('Session settings', 'btn', acts, function () {
+        settingsOpen.add(t.key);
         settings.disabled = true;
         renderPaseoSettings(parent, t);
       });
+      settings.disabled = settingsOpen.has(t.key);
+      if (settingsOpen.has(t.key)) renderPaseoSettings(parent, t);
     }
   }
 
@@ -1135,7 +1152,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     // A row the owner just opened wants fresh detail; one a re-render keeps
     // open (its toggle fires too) refetches only once the detail is stale.
     d.addEventListener('toggle', function () {
-      if (!d.open) { openThreads.delete(t.key); return; }
+      if (!d.open) { openThreads.delete(t.key); settingsOpen.delete(t.key); return; }
       var fresh = !openThreads.has(t.key);
       openThreads.add(t.key);
       wantDetail(t.key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);

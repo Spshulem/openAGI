@@ -364,8 +364,14 @@ export class RemoteFleetSupervisor {
   async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
   async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
   async organizeThread(threadKey, input = {}) { return this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/organize`, input); }
-  async paseoSessionSettings(threadKey) { return this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`); }
-  async updatePaseoSessionSettings(threadKey, input = {}) { return this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`, input); }
+  async paseoSessionSettings(threadKey) {
+    const body = await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
+  async updatePaseoSessionSettings(threadKey, input = {}) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`, input);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
   async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
   async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
