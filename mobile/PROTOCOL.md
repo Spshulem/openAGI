@@ -245,6 +245,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| GET | `/conversations/agent/turns` | where each named agent turn stands, §3.1 |
+| GET | `/conversations/supervisor/turns` | where each named supervisor turn stands, §3.1 |
 | GET | `/lifelog/moments` | read-only G2 lifelog moments, §3.2 |
 
 `:id` above means a task/action id as minted by `createId()`:
@@ -398,6 +400,26 @@ names each turn:
   also lists the thread's turns still running:
   `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
   A turn in `inFlight`, or whose reply is not there yet, is still working.
+- The same `requestId` with different text is refused with `409`
+  `{"error": "request_id_conflict"}`. Main keeps one id to one message; it
+  never matches sends by their text, so two sends with the same words and
+  different ids are two turns.
+- Main keeps a durable receipt for each named turn, so a repeat is recognised
+  across a main restart and after the turn's records have rotated out of the
+  session (`already_handled`, never rerun).
+- `GET /conversations/:thread/turns?ids=a,b` (1-50 ids, optional
+  `conversationId`) says how each named turn stands, for a client
+  reconnecting with sends it never heard back about:
+  `{"thread", "conversationId", "active": [<inFlight entries>], "turns":
+  [{"requestId", "state", "code"?}]}`. `state` is `queued` (accepted, waiting
+  behind another turn), `running`, `done` (its reply is in history),
+  `failed`, `interrupted` (main stopped while it ran: a retry is a new turn
+  with a new id), or `unknown` (main never took it, or stopped before it
+  started: safe to send again with the same id). Mains older than this route
+  answer `404`; then never resend a send that may have arrived.
+- A client with an outbox sends one turn at a time, and the next only after
+  main finished the one before. After a drop it checks unconfirmed sends here
+  before sending anything else, so reconnecting never releases a burst.
 
 A G2 joins the same threads through `POST /nodes/g2/experience`: op
 `submit` accepts `"thread"` (beside or inside `question`; no

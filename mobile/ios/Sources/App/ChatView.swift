@@ -695,45 +695,65 @@ struct ChatConversationView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.muted)
             ForEach(conversation.queuedSubmissions) { item in
+                let state = conversation.displayState(of: item)
                 HStack(spacing: 8) {
-                    Image(systemName: "clock")
+                    Image(systemName: QueuedTrayCopy.icon(state))
                         .font(.caption2)
-                        .foregroundStyle(Theme.live)
-                    Text(item.text)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.ink)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(QueuedTrayCopy.isProblem(state) ? Theme.alert : Theme.live)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.text)
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.ink)
+                            .lineLimit(1)
+                        Text(QueuedTrayCopy.label(state))
+                            .font(.caption2)
+                            .foregroundStyle(QueuedTrayCopy.isProblem(state) ? Theme.alert : Theme.muted)
+                            .lineLimit(3)
+                            .accessibilityIdentifier("chat-queued-state")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     if !item.attachments.isEmpty {
                         Text("\(item.attachments.count) img")
                             .font(.caption2)
                             .foregroundStyle(Theme.muted)
                     }
-                    Button("Edit") {
-                        guard let popped = conversation.popQueuedSubmissionForEdit(id: item.id) else { return }
-                        if conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            conversation.draft = popped.text
-                        } else {
-                            conversation.draft += "\n" + popped.text
-                        }
-                        if !popped.attachments.isEmpty {
-                            let available = max(0, ChatAttachment.maximumCount - conversation.draftAttachments.count)
-                            conversation.draftAttachments.append(contentsOf: popped.attachments.prefix(available))
-                        }
-                        composerFocused = true
+                    if item.canRetry {
+                        Button("Retry") { conversation.retryQueuedSubmission(id: item.id) }
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.live)
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("chat-queued-retry")
                     }
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Theme.live)
-                    .buttonStyle(.plain)
-                    Button {
-                        conversation.removeQueuedSubmission(id: item.id)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(Theme.muted)
+                    // Only a message main can never have seen may change.
+                    if item.isEditable {
+                        Button("Edit") {
+                            guard let popped = conversation.popQueuedSubmissionForEdit(id: item.id) else { return }
+                            if conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                conversation.draft = popped.text
+                            } else {
+                                conversation.draft += "\n" + popped.text
+                            }
+                            if !popped.attachments.isEmpty {
+                                let available = max(0, ChatAttachment.maximumCount - conversation.draftAttachments.count)
+                                conversation.draftAttachments.append(contentsOf: popped.attachments.prefix(available))
+                            }
+                            composerFocused = true
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Theme.live)
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Remove queued message")
+                    if item.state != .sending {
+                        Button {
+                            conversation.removeQueuedSubmission(id: item.id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(Theme.muted)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove queued message")
+                    }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
@@ -925,6 +945,33 @@ enum ChatRetry {
 // provider configured yet. `.agentHostDisabled` gets its own legible line
 // instead of falling into the generic "can't reach" copy that used to be
 // indistinguishable from an actually-down daemon.
+// What each Queued tray row says about where its message is.
+enum QueuedTrayCopy {
+    static func label(_ state: QueuedChatDisplayState) -> String {
+        switch state {
+        case .queued: return "Queued"
+        case .sending: return "Sending"
+        case .waiting: return "Waiting for previous reply"
+        case .notSent: return "Not sent · will retry when connected"
+        case .failed(let reason): return "Failed · \(reason)"
+        }
+    }
+
+    static func icon(_ state: QueuedChatDisplayState) -> String {
+        switch state {
+        case .queued, .waiting: return "clock"
+        case .sending: return "arrow.up.circle"
+        case .notSent: return "wifi.slash"
+        case .failed: return "exclamationmark.circle"
+        }
+    }
+
+    static func isProblem(_ state: QueuedChatDisplayState) -> Bool {
+        if case .failed = state { return true }
+        return false
+    }
+}
+
 enum ChatErrorCopy {
     static func message(for error: DaemonError) -> String {
         switch error {

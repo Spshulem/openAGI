@@ -71,7 +71,7 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
-import { LiveTurns, storedTurn, replayedResult, replayedFailure } from "./message-turns.js";
+import { CLIENT_TURN_ID, LiveTurns, TurnReceipts, alreadyHandledFailure, storedTurn, replayedResult, replayedFailure, turnFingerprint, turnStates } from "./message-turns.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -108,6 +108,7 @@ import {
   parseLifelogMomentsQuery,
   sharedHistoryThread,
   sharedSessionId,
+  sharedTurnsThread,
   sharedThreadForSession,
   sharedThreadHistory,
   appendSharedThreadMessages,
@@ -311,6 +312,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // Turns a paired phone named with its own request id, while they run: a
   // repeat of the id attaches here instead of running the turn again.
   const liveTurns = new LiveTurns();
+  // And main's durable receipt for each of them, so neither a restart nor a
+  // client replaying its outbox can run one twice.
+  const turnReceipts = new TurnReceipts(path.join(dataDir, "message-turns.json"));
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -989,7 +993,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
         "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
-      const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
+      const sharedHistoryRoute = method === "GET" && (sharedHistoryThread(pathname) !== null || sharedTurnsThread(pathname) !== null);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message") || sharedHistoryRoute;
       const headerNodeId = typeof req.headers["x-openagi-node-id"] === "string"
@@ -2015,6 +2019,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const turnsThread = sharedTurnsThread(pathname);
+        if (turnsThread) {
+          // How each turn a client named stands, so a client reconnecting
+          // with sends it never heard back about resumes only the ones main
+          // never took, one at a time, instead of sending them all again.
+          const ids = [...new Set(String(url.searchParams.get("ids") ?? "").split(",").filter(Boolean))];
+          if (ids.length < 1 || ids.length > 50 || ids.some((id) => !CLIENT_TURN_ID.test(id))) {
+            return sendJson(res, 400, { error: "invalid_ids", message: "ids must list 1 to 50 turn ids." });
+          }
+          const conversationId = url.searchParams.get("conversationId") ?? "main";
+          try {
+            const sessionId = sharedSessionId(turnsThread, conversationId);
+            return sendJson(res, 200, {
+              thread: turnsThread, conversationId,
+              active: liveTurns.list(sessionId),
+              turns: turnStates({ store, liveTurns, receipts: turnReceipts, sessionId, requestIds: ids })
+            });
+          } catch (error) {
+            if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+            throw error;
+          }
+        }
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
@@ -2298,6 +2324,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // An owner UI such as Paseo joins the same named shared thread as
         // paired devices. Resolve its identity here, never in the client.
         if (!requestNodeId && body?.thread !== undefined) {
+          // The Mac names its turns the same way a phone does.
+          if (body.requestId !== undefined && (typeof body.requestId !== "string" || !CLIENT_TURN_ID.test(body.requestId))) {
+            return sendJson(res, 400, { error: "requestId must be 8-128 letters, digits, _ or -" });
+          }
+          if (typeof body.requestId === "string") {
+            clientTurnId = body.requestId;
+            body = { ...body, metadata: { ...body.metadata, requestId: clientTurnId } };
+          }
+          delete body.requestId;
           try {
             const safeFocusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
               ? body.focusedCardId
@@ -2345,6 +2380,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const sessionId = body.sessionId;
           const live = liveTurns.get(sessionId, clientTurnId);
           const stored = live ? null : storedTurn(runtime.agentHost?.store ?? channels?.agentHost?.store, sessionId, clientTurnId);
+          const receipt = turnReceipts.get(sessionId, clientTurnId);
+          // One id is one message. The same id with other words is a client
+          // bug, never a second send: refuse it rather than replay or run it.
+          const fingerprint = turnFingerprint(body.text);
+          if (receipt?.fingerprint && receipt.fingerprint !== fingerprint) {
+            return sendJson(res, 409, { error: "request_id_conflict", message: "That requestId was already used for a different message." });
+          }
           if (live) {
             runTurn = (hooks) => {
               const off = liveTurns.subscribe(live, (kind, data) => { if (kind === "progress") hooks.onProgress?.(data); });
@@ -2357,8 +2399,37 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               if (stored.status === "complete") return replayedResult(stored);
               throw replayedFailure(stored, clientTurnId);
             };
+          } else if (receipt && receipt.state !== "queued") {
+            // Main took this id before and its records have rotated out, or
+            // it was running when main stopped: it never runs again.
+            runTurn = async (hooks) => {
+              hooks.onProgress?.({ stage: "replayed", session: { id: sessionId } });
+              throw receipt.state === "interrupted"
+                ? replayedFailure({ status: "interrupted", sessionId }, clientTurnId)
+                : alreadyHandledFailure(sessionId, clientTurnId);
+            };
           } else {
-            const fresh = runTurn;
+            // Accepted: the receipt is on disk before the turn can start, and
+            // follows it to running and to how it ended.
+            turnReceipts.accept(sessionId, clientTurnId, fingerprint);
+            const untracked = runTurn;
+            const fresh = async (hooks) => {
+              let started = false;
+              try {
+                const result = await untracked({
+                  ...hooks,
+                  onProgress: (raw) => {
+                    if (!started) { started = true; turnReceipts.mark(sessionId, clientTurnId, "running"); }
+                    hooks.onProgress?.(raw);
+                  }
+                });
+                turnReceipts.mark(sessionId, clientTurnId, "done");
+                return result;
+              } catch (error) {
+                turnReceipts.mark(sessionId, clientTurnId, "failed", { code: typeof error?.code === "string" ? error.code : "agent_failed" });
+                throw error;
+              }
+            };
             runTurn = (hooks) => liveTurns.run(sessionId, clientTurnId, fresh, (kind, data) => {
               if (kind === "progress") hooks.onProgress?.(data);
               else hooks.onTextDelta?.(data);

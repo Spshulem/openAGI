@@ -51,6 +51,23 @@ data class ConversationPage(
     val inFlight: List<InFlightTurn>? = null,
 )
 
+// GET /conversations/:thread/turns?ids=… (PROTOCOL.md §3.1): what main
+// knows about each named turn. state is queued or running (still on main),
+// done (its reply is in history), failed (a failure record), interrupted
+// (main restarted mid-turn: a retry is a new turn), or unknown (never
+// accepted: safe to send again with the same id). `active` is every turn
+// main is running in the thread. A main older than this route answers 404.
+@Serializable
+data class TurnState(val requestId: String, val state: String, val code: String? = null)
+
+@Serializable
+data class TurnStates(
+    val thread: String? = null,
+    val conversationId: String? = null,
+    val active: List<InFlightTurn> = emptyList(),
+    val turns: List<TurnState> = emptyList(),
+)
+
 // The /events frame that says a shared thread has a new stored message.
 @Serializable
 data class ConversationUpdated(val thread: String, val messageId: String? = null)

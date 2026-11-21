@@ -105,6 +105,60 @@ public struct ConversationPage: Decodable, Sendable, Equatable {
     }
 }
 
+// `GET /conversations/:thread/turns?ids=…` -- what main knows about turns
+// this phone named. A state this build does not know decodes as nil (the
+// entry is dropped): the phone then waits rather than resending.
+public struct ConversationTurnStatus: Decodable, Sendable, Equatable {
+    public enum State: String, Decodable, Sendable {
+        // Accepted, waiting behind another turn in this conversation.
+        case queued
+        case running
+        // Finished; the reply (or failure record) is in history.
+        case done
+        case failed
+        // Main restarted while it ran: a retry is a new turn with a new id.
+        case interrupted
+        // Main never accepted it (or restarted first): resend, same id.
+        case unknown
+    }
+
+    public let requestId: String
+    public let state: State
+    public let code: String?
+
+    public init(requestId: String, state: State, code: String? = nil) {
+        self.requestId = requestId
+        self.state = state
+        self.code = code
+    }
+}
+
+public struct ConversationTurns: Decodable, Sendable, Equatable {
+    public let thread: String?
+    public let conversationId: String?
+    public let active: [InFlightTurn]
+    public let turns: [ConversationTurnStatus]
+
+    public init(thread: String? = nil, conversationId: String? = nil, active: [InFlightTurn] = [], turns: [ConversationTurnStatus]) {
+        self.thread = thread
+        self.conversationId = conversationId
+        self.active = active
+        self.turns = turns
+    }
+
+    private enum CodingKeys: String, CodingKey { case thread, conversationId, active, turns }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try? container.decodeIfPresent(String.self, forKey: .thread)
+        conversationId = try? container.decodeIfPresent(String.self, forKey: .conversationId)
+        let rawActive = (try? container.decodeIfPresent([Lenient<InFlightTurn>].self, forKey: .active)) ?? []
+        active = rawActive.compactMap(\.value)
+        // Required: a body without `turns` is not this route's answer.
+        turns = try container.decode([Lenient<ConversationTurnStatus>].self, forKey: .turns).compactMap(\.value)
+    }
+}
+
 // Decodes one array element, or nil when that element is malformed, so a
 // list can drop a bad entry instead of throwing for the whole payload.
 public struct Lenient<T: Decodable & Sendable>: Decodable, Sendable {

@@ -2368,6 +2368,80 @@ struct SupervisorWorkspaceView: View {
     }
   }
 
+  /// The Supervisor outbox: sends saved on this Mac that main hasn't finished.
+  /// Each row says whether it is still queued here, accepted by main and
+  /// waiting for its reply, or failed and waiting for the owner.
+  @ViewBuilder
+  private func supervisorOutboxTray(
+    items: [SupervisorOutboxItem],
+    holdReason: String?,
+    onRetry: @escaping (String) -> Void,
+    onEdit: @escaping (String) -> Void,
+    onRemove: @escaping (String) -> Void
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 6) {
+        Text("Queued (\(items.count))")
+          .font(.caption2.weight(.semibold))
+          .foregroundStyle(WorkspaceTheme.muted)
+        if let holdReason {
+          Text(holdReason)
+            .font(.caption2)
+            .foregroundStyle(WorkspaceTheme.muted)
+            .lineLimit(1)
+        }
+      }
+      ForEach(items) { item in
+        let status = SupervisorOutboxRowStatus(item.state)
+        HStack(spacing: 8) {
+          Image(systemName: status.symbol)
+            .font(.caption2)
+            .foregroundStyle(item.state == .failed ? WorkspaceTheme.caution : WorkspaceTheme.live)
+          VStack(alignment: .leading, spacing: 1) {
+            Text(item.text)
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.ink)
+              .lineLimit(1)
+            Text(item.state == .failed ? (item.failure ?? status.label) : status.label)
+              .font(.caption2)
+              .foregroundStyle(item.state == .failed ? WorkspaceTheme.caution : WorkspaceTheme.muted)
+              .lineLimit(2)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          if !item.attachments.isEmpty {
+            Text("\(item.attachments.count) img")
+              .font(.caption2)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+          if item.state == .failed {
+            Button("Retry") { onRetry(item.id) }
+              .buttonStyle(.borderless)
+              .font(.caption2.weight(.medium))
+              .foregroundStyle(WorkspaceTheme.live)
+          }
+          if item.state == .queued {
+            Button("Edit") { onEdit(item.id) }
+              .buttonStyle(.borderless)
+              .font(.caption2.weight(.medium))
+              .foregroundStyle(WorkspaceTheme.live)
+          }
+          if item.state == .queued || item.state == .failed {
+            Button { onRemove(item.id) } label: {
+              Image(systemName: "xmark")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(WorkspaceTheme.muted)
+            }
+            .buttonStyle(.plain)
+            .help("Remove from queue")
+          }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+      }
+    }
+  }
+
   @ViewBuilder
   private func queuedMessagesTray(
     items: [QueuedSupervisorMessage],
@@ -2600,9 +2674,14 @@ struct SupervisorWorkspaceView: View {
         .padding(.horizontal, 10)
       }
 
-      if !supervisor.queuedMessages.isEmpty {
-        queuedMessagesTray(
-          items: supervisor.queuedMessages,
+      // The send whose reply is streaming shows in the transcript; the rest
+      // of the outbox shows here with where each one stands.
+      let outboxShown = supervisor.outboxItems.filter { $0.id != supervisor.outboxActiveId }
+      if !outboxShown.isEmpty {
+        supervisorOutboxTray(
+          items: outboxShown,
+          holdReason: supervisor.outboxHoldReason,
+          onRetry: { id in supervisor.retryQueued(id: id) },
           onEdit: { id in
             guard let popped = supervisor.popQueuedForEdit(id: id) else { return }
             if composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

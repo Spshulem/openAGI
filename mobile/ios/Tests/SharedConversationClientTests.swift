@@ -363,9 +363,10 @@ final class SharedConversationClientTests: XCTestCase {
         conversation.pauseRecovery()
     }
 
-    // Main never confirmed the send (the connection went first): offer it
-    // again, and resend once when the app is next active, with the same
-    // turn id so main replays or follows it rather than running it twice.
+    // Main never confirmed the send (the connection went first): it waits
+    // in the outbox as "Not sent", and goes again when the app is next
+    // active only after the turns route says main never got it -- with the
+    // same turn id, so main replays or follows it rather than running it twice.
     @MainActor
     func testASendMainNeverConfirmedIsResentOnceWithTheSameTurnId() async throws {
         final class State: @unchecked Sendable { var turns: [String] = [] }
@@ -378,14 +379,20 @@ final class SharedConversationClientTests: XCTestCase {
                 if state.turns.count == 1 { return (ok, Data()) }
                 return (ok, Data("event: session\ndata: {\"id\":\"devices:agent:main\",\"messageCount\":1}\n\nevent: final\ndata: {\"reply\":\"Done.\"}\n\n".utf8))
             }
+            if request.url?.path == "/conversations/agent/turns" {
+                let id = state.turns.first ?? ""
+                return (ok, Data(#"{"thread":"agent","conversationId":"main","active":[],"turns":[{"requestId":"\#(id)","state":"unknown"}]}"#.utf8))
+            }
             return (ok, Data(#"{"thread":"agent","messages":[],"nextBefore":null,"inFlight":[]}"#.utf8))
         }
         let conversation = ChatConversation(thread: .agent, client: makeClient(),
                                             store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
         await conversation.send("hello")
-        let unconfirmed = try XCTUnwrap(conversation.messages.last)
-        XCTAssertTrue(unconfirmed.isFailed && unconfirmed.retrySafe && unconfirmed.autoRetry)
-        XCTAssertEqual(unconfirmed.text, ChatHistoryCodec.unconfirmedText)
+        XCTAssertTrue(conversation.messages.isEmpty, "back in the outbox, not a failed line")
+        let unconfirmed = try XCTUnwrap(conversation.queuedSubmissions.first)
+        XCTAssertEqual(unconfirmed.state, .notSent)
+        XCTAssertEqual(conversation.displayState(of: unconfirmed), .notSent)
+        XCTAssertFalse(unconfirmed.isEditable, "main may have it: never edited")
 
         await conversation.resume()
         XCTAssertEqual(state.turns.count, 2)
