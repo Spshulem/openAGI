@@ -1759,6 +1759,26 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.at(-1).queue, false);
 });
 
+test("a watch-only chat is scanned and reviewed like any other, but the supervisor never messages it", async (t) => {
+  // Its PR is red: a normal chat would get a nudge.
+  const thread = makeThread({ key: "codex:watched", id: "watched" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], env: { OPENAGI_FLEET_SELF_SESSION_IDS: "watched" } });
+  const snapshot = await supervisor.tick();
+  const row = snapshot.threads.find((r) => r.key === "codex:watched");
+  assert.ok(row, "it is in the scan, not excluded as self");
+  assert.notEqual(row.state, "excluded");
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /watch-only chat: the supervisor never messages it/);
+  assert.equal(delivered.length, 0);
+  // The owner's own message still goes through.
+  assert.equal((await supervisor.sendOwnerMessage("codex:watched", "Take the review comments next.")).delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  // The same chat, not listed, is nudged.
+  const { supervisor: plain, delivered: nudged } = fixture(t, { mode: "auto", threads: [makeThread({ key: "codex:watched", id: "watched" })] });
+  await plain.tick();
+  assert.equal(nudged.length, 1);
+});
+
 test("an owner send that is refused always leaves a receipt saying why", async (t) => {
   const { supervisor } = fixture(t, { threads: [makeThread()] });
   await supervisor.tick();
