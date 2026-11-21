@@ -796,6 +796,30 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     });
     assert.equal(ctx.supervisor.lastThreads.get(refreshedThreadKey).agentStatus, "running");
 
+    const persistedPrRef = "acme/persisted-pr#901";
+    ctx.supervisor.lastPrs.set(persistedPrRef, {
+      ref: persistedPrRef,
+      state: "OPEN",
+      isDraft: false,
+      mergeState: "DIRTY",
+      ciState: "SUCCESS",
+      ci: { state: "SUCCESS", failing: [] },
+      updatedAt: isoAgo(1)
+    });
+    ctx.supervisor.trackWork({
+      project: "PersistedPR",
+      repo: "acme/persisted-pr",
+      prRef: persistedPrRef,
+      goal: "Keep the conflict follow-through visible",
+      doneCriteria: "Conflict resolved and outcome verified"
+    });
+    const restarted = new FleetSupervisor({
+      dataDir: ctx.dataDir,
+      config: { enabled: false, paseo: { enabled: false } },
+      runtime: { outreach: ctx.outreach, events: { emit() {} } }
+    });
+    assert.equal(restarted.getActiveWork({ project: "PersistedPR" }).items[0].followThroughState, "blocked_pr");
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });

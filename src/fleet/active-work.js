@@ -338,6 +338,8 @@ function normalizeEvidenceLink(raw, nowIso) {
     label: cleanText(raw.label ?? "", 140) || null,
     state: cleanText(raw.state ?? "", 40) || null,
     ciState: cleanText(raw.ciState ?? "", 40) || null,
+    isDraft: typeof raw.isDraft === "boolean" ? raw.isDraft : null,
+    mergeState: cleanText(raw.mergeState ?? "", 40) || null,
     headSha: typeof raw.headSha === "string" && raw.headSha.trim() ? raw.headSha.trim().slice(0, 40) : null,
     observedAt: parseIsoMs(raw.observedAt) ? new Date(parseIsoMs(raw.observedAt)).toISOString() : nowIso,
     updatedAt: parseIsoMs(raw.updatedAt) ? new Date(parseIsoMs(raw.updatedAt)).toISOString() : null,
@@ -362,6 +364,8 @@ function mergeEvidenceLinks(existing = [], incoming = [], nowIso) {
     } else {
       const materialChange = norm.state !== prev.state
         || norm.ciState !== prev.ciState
+        || norm.isDraft !== prev.isDraft
+        || norm.mergeState !== prev.mergeState
         || norm.headSha !== prev.headSha
         || (norm.updatedAt && norm.updatedAt !== prev.updatedAt);
       byKey.set(key, {
@@ -371,6 +375,8 @@ function mergeEvidenceLinks(existing = [], incoming = [], nowIso) {
         label: norm.label ?? prev.label,
         state: norm.state ?? prev.state,
         ciState: norm.ciState ?? prev.ciState,
+        isDraft: norm.isDraft ?? prev.isDraft,
+        mergeState: norm.mergeState ?? prev.mergeState,
         headSha: norm.headSha ?? prev.headSha,
         observedAt: materialChange ? norm.observedAt : prev.observedAt,
         updatedAt: norm.updatedAt ?? prev.updatedAt,
@@ -648,6 +654,8 @@ export class ActiveWorkManager {
         state: livePr?.state ?? null,
         ciState: livePr?.ci?.state ?? livePr?.ciState ?? null,
         headSha: livePr?.headOid ?? livePr?.headSha ?? null,
+        isDraft: livePr?.isDraft ?? null,
+        mergeState: livePr?.mergeState ?? null,
         observedAt: nowIso,
         updatedAt: livePr?.mergedAt ?? livePr?.updatedAt ?? null,
         trusted: Boolean(livePr)
@@ -908,8 +916,8 @@ export class ActiveWorkManager {
 
     const prState = livePrFromSupervisor?.state ?? prLink?.state ?? null;
     const prCiState = livePrFromSupervisor?.ci?.state ?? livePrFromSupervisor?.ciState ?? prLink?.ciState ?? null;
-    const prIsDraft = Boolean(livePrFromSupervisor?.isDraft);
-    const prMergeState = livePrFromSupervisor?.mergeState ?? null;
+    const prIsDraft = livePrFromSupervisor?.isDraft ?? prLink?.isDraft ?? false;
+    const prMergeState = livePrFromSupervisor?.mergeState ?? prLink?.mergeState ?? null;
 
     const { links: evaluatedLinks, summary: evidenceFreshness } = this._evaluateEvidenceFreshness(item, {
       nowMs,
@@ -1678,6 +1686,8 @@ export class ActiveWorkManager {
                     label: openPr.title ?? null,
                     state: "OPEN",
                     ciState: openPr.ciState ?? null,
+                    isDraft: Boolean(openPr.isDraft),
+                    mergeState: openPr.mergeState ?? null,
                     observedAt: nowIso,
                     updatedAt: parsedUpdatedMs ? progressIso : null,
                     trusted: true
@@ -1906,6 +1916,8 @@ export class ActiveWorkManager {
           state: livePr.state ?? null,
           ciState: livePr.ci?.state ?? livePr.ciState ?? null,
           headSha: livePr.headOid ?? livePr.headSha ?? null,
+          isDraft: livePr.isDraft ?? null,
+          mergeState: livePr.mergeState ?? null,
           observedAt: nowIso,
           updatedAt: livePr.mergedAt ?? livePr.updatedAt ?? null,
           trusted: true
