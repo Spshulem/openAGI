@@ -694,8 +694,8 @@ export class ActiveWorkManager {
 
       let nextState = requestedState ?? existing.state ?? "active";
       let outcomeVerified = Boolean(existing.outcomeVerified);
-      if (goalChanged && existing.state === "done" && input.confirmDone !== true) {
-        nextState = "active";
+      if (goalChanged && input.confirmDone !== true) {
+        if (existing.state === "done") nextState = "active";
         outcomeVerified = false;
       }
       if (input.confirmDone === true) {
@@ -739,6 +739,7 @@ export class ActiveWorkManager {
           snoozedUntil: new Date(parseIsoMs(input.snoozedUntil)).toISOString()
         } : {}),
         ...(input.confirmDone === true ? { verifiedAt: nowIso, verifiedBy: "owner" } : {}),
+        ...(goalChanged && input.confirmDone !== true ? { verifiedAt: null, verifiedBy: null } : {}),
         ...(goalChanged ? {
           decisionsVerdict: null,
           lastEvaluatedMark: null,
@@ -1784,6 +1785,8 @@ export class ActiveWorkManager {
         prRef ?? "",
         livePr?.state ?? null,
         livePr?.ci?.state ?? livePr?.ciState ?? null,
+        livePr?.mergeState ?? null,
+        livePr?.isDraft ?? null,
         livePr?.headOid ?? livePr?.headSha ?? null,
         completionReviewedAt ?? ""
       ]));
@@ -1954,6 +1957,10 @@ export class ActiveWorkManager {
           item.promptDeferred = false;
           promptsEmittedThisPass += 1;
           this.state.spend.promptsEmitted += 1;
+        } else {
+          // The evidence was evaluated, but outreach could not persist the
+          // notification. Revisit delivery after the store recovers.
+          item.promptDeferred = true;
         }
       } else if (projected.actionable && item.permittedNudges !== "none" && item.lastPromptedMark !== deltaMark) {
         // The evidence was evaluated, but this pass's prompt budget was full
@@ -2341,7 +2348,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         };
       },
       approvalTtlMs: 15 * 60_000,
-      approvalDedupeKey: (args, context) => `fleet-track-work:${shortHash(JSON.stringify([context?.sessionId ?? null, args.project, args.theme ?? null, args.customer ?? null, args.goal]))}`,
+      approvalDedupeKey: (args, context) => `fleet-track-work:${shortHash(JSON.stringify([context?.sessionId ?? null, args]))}`,
       summarize: (args) => `Track Active Work in ${args.project}${args.theme ? ` / ${args.theme}` : ""}${args.customer ? ` (${args.customer})` : ""}: ${cleanText(args.goal, 140)}`,
       handler: async (args, context) => {
         if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");

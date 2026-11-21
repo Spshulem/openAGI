@@ -773,9 +773,20 @@ export class RemoteFleetSupervisor {
       const current = existing.find((item) => item.sourceRef?.kind === 'active-work'
         && item.sourceRef.nodeId === this.nodeId
         && String(item.sourceRef.id) === String(prompt.id));
-      const item = (current && current.sourceRef?.mark !== prompt.mark && outreach.reopen?.(current.id))
-        || current
-        || outreach.append({ type: 'fleet-active-work', sourceRef, ...shown, needsDecision: false, dedupeOpen: true });
+      const markChanged = Boolean(current && current.sourceRef?.mark !== prompt.mark);
+      let item = markChanged ? (outreach.reopen?.(current.id) ?? null) : current;
+      if (!item && current && ['unseen', 'seen'].includes(current.status)) item = current;
+      if (!item) {
+        item = outreach.append({
+          type: 'fleet-active-work',
+          sourceRef,
+          ...shown,
+          needsDecision: false,
+          // A dismissed record cannot be reopened for a changed mark. Do not
+          // let an open-record dedupe rule suppress the replacement notice.
+          dedupeOpen: !markChanged
+        });
+      }
       if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
     }
   }

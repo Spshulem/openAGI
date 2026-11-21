@@ -56,6 +56,13 @@ function createOutreachRecorder() {
         hit.decision = decision;
       }
       return hit ?? null;
+    },
+    reopen(id) {
+      const hit = items.find((it) => it.id === id);
+      if (!hit || hit.status !== "dismissed" || hit.decision !== "resolved") return null;
+      hit.status = "unseen";
+      hit.decision = null;
+      return hit;
     }
   };
 }
@@ -651,6 +658,15 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.ok(pass4.evaluatedCount >= 1, "deferred prompts remain eligible on a later pass");
     assert.ok(pass4.skippedUnchanged >= 8);
 
+    // Draft and mergeability are classification inputs, so changing either
+    // one forces a fresh evidence evaluation even when head and CI are stable.
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
+    const appfolioRef = "acme/bbapp#701";
+    const appfolioPr = ctx.supervisor.lastPrs.get(appfolioRef);
+    ctx.supervisor.lastPrs.set(appfolioRef, { ...appfolioPr, isDraft: true, mergeState: "DIRTY" });
+    const prStatePass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
+    assert.ok(prStatePass.evaluatedCount >= 1, "PR draft/merge-state changes must invalidate the evidence mark");
+
     // 4. Snooze: snoozed item leaves digest until snoozedUntil expires, then resurfaces
     const sales = ctx.supervisor.getActiveWork().digest.find((it) => it.project === "Sales");
     const snoozed = await ctx.supervisor.actActiveWork(sales.id, { op: "snooze", hours: 12 });
@@ -669,6 +685,27 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.ok(salesOutreach, "Woken snoozed item re-emits bounded outreach notification");
     assert.deepEqual(salesOutreach.actions, ["dismiss"]);
     assert.equal(salesOutreach.needsDecision, false);
+
+    // Changing the completion contract while a verified item is snoozed must
+    // invalidate verification without waking it automatically.
+    const snoozedVerified = ctx.supervisor.trackWork({
+      project: "Verification",
+      theme: "Release",
+      goal: "Confirm the release smoke test",
+      doneCriteria: "Smoke test is green"
+    });
+    const verified = await ctx.supervisor.actActiveWork(snoozedVerified.item.id, { op: "confirm_done" });
+    assert.equal(verified.item.outcomeVerified, true);
+    await ctx.supervisor.actActiveWork(snoozedVerified.item.id, { op: "snooze", hours: 12 });
+    const changedWhileSnoozed = ctx.supervisor.trackWork({
+      project: "Verification",
+      theme: "Release",
+      goal: "Confirm the release smoke test",
+      doneCriteria: "Smoke test and rollback check are green"
+    });
+    assert.equal(changedWhileSnoozed.item.state, "snoozed");
+    assert.equal(changedWhileSnoozed.item.outcomeVerified, false);
+    assert.equal(changedWhileSnoozed.item.verifiedAt, null);
 
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
@@ -736,6 +773,28 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(sentResume.status, "resumed_owner");
     assert.equal(ctx.sentMessages.length, 1);
     assert.equal(ctx.sentMessages[0].key, "paseo:srv_mac.seo_ads");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("failed outreach append defers delivery until the store recovers", async () => {
+  const ctx = seedRepresentativeFixtures();
+  const append = ctx.outreach.append;
+  try {
+    ctx.outreach.append = () => { throw new Error("outreach unavailable"); };
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    const sales = ctx.supervisor.activeWork.state.items.find((item) => item.project === "Sales");
+    assert.ok(sales);
+    assert.equal(sales.lastPromptedMark, null);
+    assert.equal(sales.promptDeferred, true);
+
+    ctx.outreach.append = append;
+    const retry = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    assert.ok(retry.evaluatedCount >= 1);
+    const retriedSales = ctx.supervisor.activeWork.state.items.find((item) => item.id === sales.id);
+    assert.equal(retriedSales.promptDeferred, false);
+    assert.ok(ctx.outreach.items.some((item) => item.sourceRef?.id === sales.id));
   } finally {
     ctx.cleanup();
   }
@@ -937,6 +996,18 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
     assert.equal(remotePass.page.scannedSessions, 8);
     assert.ok(remoteOutreach.items.some((item) => item.type === "fleet-active-work"), "Active Work prompts reach the hosted hub");
 
+    // A user dismissal must survive an unchanged mark, but a later mark must
+    // create a fresh hub notification when the dismissed record cannot reopen.
+    const mirroredPrompt = { id: "tw_remote_mark", mark: "mark-a", title: "Follow-through", summary: "First", actions: ["dismiss"] };
+    remote.mirrorActiveWork({ prompts: [mirroredPrompt] });
+    const mirrored = remoteOutreach.items.find((item) => item.sourceRef?.id === mirroredPrompt.id);
+    assert.ok(mirrored);
+    remoteOutreach.resolve(mirrored.id, "dismissed", { status: "dismissed" });
+    remote.mirrorActiveWork({ prompts: [mirroredPrompt] });
+    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 1);
+    remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-b" }] });
+    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 2);
+
     const remoteView = await remote.getActiveWork({ project: "Growth" });
     assert.equal(remoteView.items.length, 1);
 
@@ -974,6 +1045,30 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
     const trackedViaTool = await trackTool.handler(preparedTrack, { __confirmed: true });
     assert.equal(trackedViaTool.created, true);
     assert.equal(trackedViaTool.item.customer, "AcmeCorp");
+
+    const trackingA = trackTool.prepareApprovalArgs({
+      project: "Partnerships",
+      customer: "AcmeCorp",
+      goal: "Ship co-marketing integration guide",
+      doneCriteria: "Guide live",
+      cadence: "daily",
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.partner",
+      prRef: "acme/openagi#99"
+    });
+    const trackingB = trackTool.prepareApprovalArgs({
+      ...trackingA,
+      doneCriteria: "Guide live and partner sign-off confirmed",
+      cadence: "weekly",
+      permittedNudges: "none",
+      threadKey: "paseo:srv_mac.partner-v2",
+      prRef: "acme/openagi#100"
+    });
+    assert.notEqual(
+      trackTool.approvalDedupeKey(trackingA, { sessionId: "owner" }),
+      trackTool.approvalDedupeKey(trackingB, { sessionId: "owner" }),
+      "changed tracking settings require a fresh approval"
+    );
 
     // Conversational propose_archive strictly proposes (`archive_proposed`), never auto-archives!
     const actTool = tools.get("fleet_act_active_work");
