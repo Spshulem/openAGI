@@ -123,7 +123,7 @@ test("alert plaintext: the Android option filter, caps, and a fallback title", (
   assert.deepEqual(alertOptions(["Approve", "dismiss", "Open Thread", " DISMISS ", "Skip", "Later", "More"]), ["Approve", "Skip", "Later"]);
   assert.deepEqual(alertOptions(null), []);
   const alert = buildAlert({ id: "fq1", title: "  ", body: "B".repeat(300), options: ["Approve"], threadKey: "codex:abc" });
-  assert.deepEqual(Object.keys(alert), ["questionId", "title", "body", "options", "threadKey"]);
+  assert.deepEqual(Object.keys(alert), ["questionId", "title", "body", "options", "threadKey", "canReply"]);
   assert.equal(alert.title, "Needs you");
   assert.equal(alert.body.length, 220);
   assert.equal(buildAlert({ id: "fq2", title: "T".repeat(150) }).title.length, 100);
@@ -246,7 +246,7 @@ test("each open question alerts once, collapse id = question id, at most 5 per p
   await h.push.flush();
   const alerts = h.sent.filter((s) => s.type === "alert");
   assert.deepEqual(alerts.map((a) => a.collapseId), ["fq0", "fq1", "fq2", "fq3", "fq4"]);
-  assert.deepEqual(h.open(alerts[0]), { questionId: "fq0", title: "Q fq0", body: "", options: ["yes", "no"], threadKey: "codex:a" });
+  assert.deepEqual(h.open(alerts[0]), { questionId: "fq0", title: "Q fq0", body: "", options: ["yes", "no"], threadKey: "codex:a", canReply: false });
   await h.push.flush();
   assert.deepEqual(h.sent.filter((s) => s.type === "alert").map((a) => a.collapseId).slice(5), ["fq5", "fq6"]);
   await h.push.flush();

@@ -21,6 +21,15 @@ class SupervisorAnswerOutcomeTest {
         assertEquals(AnswerOutcome.Done, answerOutcome(DaemonException.Conflict(), attempt = 0))
     }
 
+    // For typed text, 409 can also mean "still open, takes no typed reply":
+    // the owner's words are reported, never dropped as already closed.
+    @Test
+    fun aRefusedReplyFailsInsteadOfVanishing() {
+        assertEquals(AnswerOutcome.Failed, answerOutcome(DaemonException.Conflict(), attempt = 0, reply = true))
+        assertEquals(AnswerOutcome.Done, answerOutcome(DaemonException.NotFound(), attempt = 0, reply = true))
+        assertEquals(AnswerOutcome.Done, answerOutcome(null, attempt = 0, deliveryStatus = "sent", reply = true))
+    }
+
     // A refused credential will not start working on a retry.
     @Test
     fun aRefusedCredentialFailsAtOnce() {

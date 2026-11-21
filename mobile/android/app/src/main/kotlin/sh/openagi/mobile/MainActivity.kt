@@ -385,9 +385,13 @@ class MainActivity : ComponentActivity() {
             intent.hasExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
         ) {
             pendingTabState.value = AppTab.SUPERVISOR
+        } else if (intent.getStringExtra(SupervisorNotifier.EXTRA_TAB) == SupervisorNotifier.TAB_INBOX) {
+            // An approval notification, or the result that replaced one.
+            pendingTabState.value = AppTab.INBOX
         }
         intent.removeExtra(SupervisorNotifier.EXTRA_TAB)
         intent.removeExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+        intent.removeExtra(SupervisorNotifier.EXTRA_ACTION_ID)
     }
 
     // Asks for the notification permission once, ever: someone who said no is

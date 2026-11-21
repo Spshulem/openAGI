@@ -759,6 +759,19 @@ X-OpenAGI-Node-ID: <nodeId>
   permission. `false` means no alerts are sent and no question is marked
   alerted, so turning it back on (re-POST, same pass is fine) alerts the
   questions still open.
+- `approvals` (optional boolean, default `false`): the app can show and act
+  on an approval alert. With it, every pending action that waits on the
+  owner (a queued approval or a chat card's code; never an owner-mode
+  record) is alerted once per card id: relay type `alert`, collapse id the
+  action id, envelope kind `approval` with plaintext
+  `{"actionId", "summary", "code"}`. A card the agent raises again with the
+  same arguments is the same card and is not alerted again. The phone's
+  Approve and Deny call `POST /pending-actions/<id>/approve` / `deny` with
+  its own credential, after checking the card is still pending.
+
+Question alerts (kind `alert`) also carry `canReply`: `true` when
+`POST /fleet/api/questions/<id>` takes `{"reply": "<text>"}` for that
+question, which is what the notification's Reply field sends.
 
 Response `{"ok": true, "renew": false}`; a bad body is `400 {"error": "..."}`.
 `renew: true` means the relay refused this same pass (`bad_pass`,
@@ -775,7 +788,8 @@ than starting a second one.
 `DELETE /mobile/push` (no body) removes it, and so does revoking the phone
 (§9). Envelope format, plaintexts and relay API:
 `docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`. The daemon
-sends only when it runs the fleet supervisor and `OPENAGI_PUSH` is not `0`;
+sends only when it runs the fleet supervisor or the approval queue and
+`OPENAGI_PUSH` is not `0`;
 `OPENAGI_PUSH_RELAY` overrides the relay URL (default
 `https://push.openagi.sh`).
 

@@ -36,9 +36,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
+        let approval = ApprovalAction.from(actionIdentifier: response.actionIdentifier,
+                                           defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
+                                           userInfo: userInfo)
         let action = SupervisorAnswerAction.from(actionIdentifier: response.actionIdentifier,
                                                  defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
-                                                 userInfo: userInfo)
+                                                 userInfo: userInfo,
+                                                 userText: (response as? UNTextInputNotificationResponse)?.userText)
         let questionID = (userInfo[SupervisorPushContent.questionIdKey] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let threadKey = (userInfo[SupervisorPushContent.threadKeyKey] as? String)?
@@ -52,6 +56,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                 PushRouter.shared.wantsTab = digestTab
                 done.value()
                 return
+            }
+            // An approval alert, or the result that replaced one.
+            switch approval {
+            case .open?:
+                PushRouter.shared.wantsTab = .inbox
+                done.value()
+                return
+            case let decision?:
+                await ApprovalActionSender.send(decision, notificationID: notificationID)
+                done.value()
+                return
+            case nil:
+                break
             }
             switch action {
             case .open?:

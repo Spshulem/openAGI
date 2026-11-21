@@ -5,12 +5,13 @@ import kotlinx.serialization.builtins.serializer
 import sh.openagi.mobile.protocol.ProtocolJson
 import java.io.File
 
-// The supervisor question ids this phone has already posted a notification
+// The supervisor question ids (or, under APPROVALS_FILE_NAME, the pending
+// action ids) this phone has already posted a notification
 // for. It is what makes a ping happen once per question rather than once per
 // check, and what says which notifications to take down when a question
 // closes. Oldest first, so the cap below drops the stalest ids.
-class NotifiedQuestionsStore(directory: File) {
-    private val file = File(directory, FILE_NAME)
+class NotifiedQuestionsStore(directory: File, fileName: String = FILE_NAME) {
+    private val file = File(directory, fileName)
 
     // Keyed by path, not per instance — see SnapshotStore.lockFor. The live
     // alerts service, RefreshWorker and an answer worker each build their own
@@ -64,13 +65,15 @@ class NotifiedQuestionsStore(directory: File) {
         val capped = ids.filter { it.isNotBlank() }.distinct().takeLast(MAX_IDS)
         val encoded = ProtocolJson.json.encodeToString(ListSerializer(String.serializer()), capped)
         // Atomic: a reader in another worker must never see half a file.
-        val temp = File(file.parentFile, "$FILE_NAME.tmp")
+        val temp = File(file.parentFile, "${file.name}.tmp")
         temp.writeText(encoded)
         temp.renameTo(file)
     }
 
     companion object {
         const val FILE_NAME = "supervisor-notified.json"
+        // The same memory for approval notifications (ApprovalAlerts).
+        const val APPROVALS_FILE_NAME = "approvals-notified.json"
         const val MAX_IDS = 200
     }
 }
