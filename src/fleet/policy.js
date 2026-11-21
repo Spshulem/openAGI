@@ -178,7 +178,20 @@ export function decideThread(classified, thread, options = {}) {
   // A Codex card beside the thread's own decision (a resume, a nudge, a
   // question): its question is asked too.
   const card = classified.card ? cardIntent(ctx, classified.card.card) : null;
-  return card?.question ? { ...decision, cardQuestion: card.question } : decision;
+  const decided = card?.question ? { ...decision, cardQuestion: card.question } : decision;
+  return thread?.watchOnly ? watchOnly(decided) : decided;
+}
+
+// A watch-only chat (OPENAGI_FLEET_SELF_SESSION_IDS) is never messaged by
+// the supervisor: a planned nudge waits and says so, so the review card,
+// diagnostics and the owner still see what it would have sent. Questions to
+// the owner and owner replies go on as for any chat.
+export const WATCH_ONLY_REASON = "watch-only chat: the supervisor never messages it; reply to it yourself";
+
+function watchOnly(decision) {
+  if (decision?.action !== "nudge") return decision;
+  return { ...decision, action: "wait", route: null, withheld: { playbook: decision.playbook ?? null, message: decision.message ?? null },
+    reason: `${WATCH_ONLY_REASON}; would have: ${decision.reason ?? decision.playbook ?? "nudged"}` };
 }
 
 function makeContext(classified, thread, options) {
