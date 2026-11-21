@@ -43,7 +43,7 @@ test("an approval whose chat is gone or that the owner moved past is retired, no
   now.value += 5 * 60_000;
   const moved = await executeApprovedAction(h.runtime, first.result.actionId);
   assert.equal(moved.status, 410);
-  assert.match(moved.body.error, /You wrote to amman since this was asked/);
+  assert.match(moved.body.error, /amman has new messages since this was asked/);
   assert.equal(h.pendingActions.get(first.result.actionId).status, "expired");
 
   const second = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Merge it" }, { sessionId: "s1" });

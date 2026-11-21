@@ -210,19 +210,25 @@ export function assistantProposedActionOrQuestion(previousAssistantText) {
 // (e.g. "Continue, inspect the thread further, or skip?"), short owner replies
 // like "yes", "continue", "skip", or "option 1" count as clear authorization
 // without requiring a confirmation code.
-// A spoken request that names both the chat and the exact message: "tell
-// amman ship it" said to send "ship it" to amman. Then the transcript is the
-// approval and no code is read back. Anything the model added, reworded or
-// aimed at another chat still asks. names: the target's labels (workspace,
-// title, project).
-const spokenWords = (value) => String(value ?? "").toLowerCase().normalize("NFKD")
-  .replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+// A spoken request that is nothing but "tell <chat> <message>": "tell amman
+// ship it" sends "ship it" to amman with no code read back. The whole
+// sentence must be that shape, so "don't", "should I", a second chat or a
+// trailing condition all still ask, and the message may hold only plain
+// words and punctuation: anything comparison would drop (another script,
+// symbols, emoji) could ride along unheard. names: the target's labels.
+const spokenWords = (value) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const PLAIN_MESSAGE = /^[A-Za-z0-9\s.,!?'’";:()-]+$/;
+const SPOKEN_LEAD = "(?:(?:hey|ok|okay|so|please) )*";
+const SPOKEN_VERB = "(?:tell|ask|message|ping|nudge|text|send|reply to|write to)";
+const SPOKEN_TAIL = "(?: please| thanks| thank you)?";
 
 export function spokenRequestNamesTarget(intent, { names = [], message = "" } = {}) {
-  const said = ` ${spokenWords(intent)} `;
+  if (!PLAIN_MESSAGE.test(String(message ?? ""))) return false;
+  const said = spokenWords(intent);
   const text = spokenWords(message);
-  if (!text || !said.includes(` ${text} `)) return false;
-  return names.map(spokenWords).some((name) => name.length >= 3 && said.replace(` ${text} `, " ").includes(` ${name} `));
+  if (!said || !text) return false;
+  return names.map(spokenWords).some((name) => name.length >= 3
+    && new RegExp(`^${SPOKEN_LEAD}${SPOKEN_VERB} ${name} (?:to |that )?(?:please )?${text}${SPOKEN_TAIL}$`).test(said));
 }
 
 export function isConversationalAssentOrChoice(intent, previousAssistantText) {

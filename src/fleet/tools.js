@@ -826,11 +826,15 @@ function fleetTarget(supervisor, args = {}) {
 
 async function fleetSendStillValid(supervisor, args, action) {
   await fleetTarget(supervisor, args);
+  // Anything written to the chat since the card was (last) raised: the
+  // owner's own words, or a supervisor message. Either can change what a
+  // waiting "yes" or "go ahead" would answer.
+  const thread = supervisor.lastThreads?.get?.(args?.key) ?? null;
   const row = (readState(supervisor).snapshot?.threads ?? []).find((item) => item?.key === args?.key);
-  const ownerAt = Date.parse(row?.lastOwnerAt ?? "");
-  const askedAt = Date.parse(action?.createdAt ?? "");
-  if (Number.isFinite(ownerAt) && Number.isFinite(askedAt) && ownerAt > askedAt) {
-    return `You wrote to ${clip(args?.name || args?.key, 80)} since this was asked, so it was not sent. Ask again if you still want it.`;
+  const wroteAt = Math.max(Date.parse(thread?.lastUserAt ?? "") || 0, Date.parse(row?.lastOwnerAt ?? "") || 0);
+  const askedAt = Date.parse(action?.raisedAt ?? action?.createdAt ?? "");
+  if (wroteAt && Number.isFinite(askedAt) && wroteAt > askedAt) {
+    return `${clip(args?.name || args?.key, 80)} has new messages since this was asked, so it was not sent. Ask again if you still want it.`;
   }
   return null;
 }

@@ -314,8 +314,9 @@ export class RemoteFleetSupervisor {
       try {
         await this.request('POST', '/fleet/api/feedback', entry.input);
       } catch (error) {
-        if (!error.reached) break;
-        // Refused: retrying would be refused again.
+        // Kept for later unless the computer refused it as invalid (4xx):
+        // out of reach, or a 5xx, may work next time.
+        if (!error.reached || !(error.status >= 400 && error.status < 500)) break;
       }
       this.feedbackOutbox = this.feedbackOutbox.filter(e => e.localId !== entry.localId);
       this.saveFeedbackOutbox();
