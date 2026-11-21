@@ -3,6 +3,7 @@
 // is copied into anything another agent will read.
 
 import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampTailLines, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
+import { diagnoseAgentBlocker } from "./watchdog.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -382,6 +383,10 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
   // stopped whatever its PR says. Its last words are mid-work, not a wait
   // or an ask, and a merged or missing PR does not mean the work is done.
   if (thread.agentStatus === "stalled" || (thread.agentStatus === "aborted" && !deliberateStop(thread))) {
+    const silentDiag = thread.meta?.silentStuck ? diagnoseAgentBlocker(thread, { pr, now, limits }) : null;
+    if (silentDiag) {
+      return result("stopped", `stuck: ${silentDiag.snagLabel}`, { snag: silentDiag });
+    }
     return result("stopped", thread.agentStatus === "aborted" ? "turn interrupted mid-work" : "turn stopped mid-work, no end written");
   }
 
@@ -447,6 +452,17 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
   // nothing.
   const prKnown = pr ? pr.state === "MERGED" : !thread.prRefs?.length && (!thread.branch || thread.prLookedUp === true);
   const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
+  if (!idle?.promised && !settled) {
+    const wall = diagnoseAgentBlocker(thread, { pr, now, limits });
+    if (wall?.kind === "owner-wall") {
+      return result("needs-human", `agent blocked: ${wall.snagLabel}`, {
+        ask: { topic: wall.topic ?? "credentials", options: wall.options ?? ["retry", "later"], text: wall.summary, wall: true }
+      });
+    }
+    if (wall?.kind === "agent-snag") {
+      return result("stopped", `stopped on ${wall.snagLabel}`, { snag: wall });
+    }
+  }
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
 }

@@ -23,8 +23,11 @@ const DEFAULT_PRICES = {
   // published, so it is not modelled here (the per-call input cap in the
   // providers keeps chat turns far below it).
   "gpt-6-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
-  // gpt-6.1-sol (the owner's ceiling): past 272K input tokens the whole
+  // gpt-6.1-sol / gpt-6.2-sol (the owner's ceiling): past 272K input tokens the whole
   // request bills at 2x input/cache and 1.5x output; the cap keeps calls under.
+  "gpt-6.2-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "gpt-6.2-sol": { in: 2, out: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+  "gpt-6.2-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-6.1-sol": { in: 2, out: 10, cacheRead: 0.1, cacheWrite: 2.5 },
   "gpt-6-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-5.6-terra": { in: 2, out: 12, cacheRead: 0.2, cacheWrite: 0 },
@@ -59,14 +62,72 @@ export class BudgetGuard {
     return new Date().toISOString().slice(0, 10);
   }
 
+  bonusTodayUsd() {
+    const raw = Number(this.state.bonusByDay?.[this.todayKey()] ?? 0);
+    return Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(4)) : 0;
+  }
+
+  effectiveDailyLimitUsd() {
+    return Number((this.dailyUsdLimit + this.bonusTodayUsd()).toFixed(4));
+  }
+
+  setDailyLimit(limitUsd) {
+    const parsed = Number(limitUsd);
+    if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+      const err = new Error("Daily budget limit must be between $0.50 and $10,000.");
+      err.code = "INVALID_BUDGET";
+      throw err;
+    }
+    this.dailyUsdLimit = Number(parsed.toFixed(2));
+    return this.status();
+  }
+
+  addBonusToday(addUsd) {
+    const parsed = Number(addUsd);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 10000) {
+      const err = new Error("Added budget must be between $0.01 and $10,000.");
+      err.code = "INVALID_BUDGET";
+      throw err;
+    }
+    const today = this.todayKey();
+    this.state.bonusByDay ??= {};
+    this.state.bonusByDay[today] = Number((this.bonusTodayUsd() + parsed).toFixed(2));
+    const keepKeys = new Set(
+      Object.keys(this.state.bonusByDay)
+        .sort((a, b) => b.localeCompare(a))
+        .slice(0, 14)
+    );
+    keepKeys.add(today);
+    for (const key of Object.keys(this.state.bonusByDay)) {
+      if (!keepKeys.has(key)) delete this.state.bonusByDay[key];
+    }
+    this.persist();
+    return this.status();
+  }
+
+  clearBonusToday() {
+    const today = this.todayKey();
+    if (this.state.bonusByDay && today in this.state.bonusByDay) {
+      delete this.state.bonusByDay[today];
+      this.persist();
+    }
+    return this.status();
+  }
+
   status() {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
+    const bonusUsdToday = this.bonusTodayUsd();
+    const effectiveLimitUsd = this.effectiveDailyLimitUsd();
+    const reservedUsd = Object.values(this.voiceReservationsToday()).reduce((sum, usd) => sum + usd, 0);
     return {
       today,
       dailyUsdLimit: this.dailyUsdLimit,
+      bonusUsdToday,
+      effectiveLimitUsd,
       spentUsd: Number(day.usd.toFixed(4)),
-      remainingUsd: Number((this.dailyUsdLimit - day.usd).toFixed(4)),
+      remainingUsd: Number((effectiveLimitUsd - day.usd).toFixed(4)),
+      exceeded: day.usd + reservedUsd >= effectiveLimitUsd,
       calls: day.calls,
       tokens: { input: day.input, output: day.output, cacheRead: day.cacheRead, cacheWrite: day.cacheWrite },
       history: Object.entries(this.state.days)
@@ -80,10 +141,11 @@ export class BudgetGuard {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { usd: 0 };
     const reservedUsd = Object.values(this.voiceReservationsToday()).reduce((sum, usd) => sum + usd, 0);
-    if (day.usd + reservedUsd + additionalUsd >= this.dailyUsdLimit) {
+    const effectiveLimit = this.effectiveDailyLimitUsd();
+    if (day.usd + reservedUsd + additionalUsd >= effectiveLimit) {
       const error = new Error(
-        `Daily budget reached: $${day.usd.toFixed(4)} of $${this.dailyUsdLimit.toFixed(2)}. ` +
-        `Raise OPENAGI_DAILY_USD_LIMIT or wait until tomorrow.`
+        `Daily budget reached: $${day.usd.toFixed(4)} of $${effectiveLimit.toFixed(2)}. ` +
+        `Add budget or raise your daily limit in Settings.`
       );
       error.code = "BUDGET_EXCEEDED";
       throw error;

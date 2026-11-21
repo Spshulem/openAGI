@@ -433,6 +433,115 @@ function safeApprovalDedupeKey(fn, args, context) {
 
 export function registerCoreTools(registry, runtime) {
   registry.register({
+    name: "get_budget",
+    sideEffects: false,
+    trustedOutput: true,
+    description: "Inspect the current OpenAGI daily model spend budget, today's spend, remaining allowance, and any extra budget added for today.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    handler: async () => {
+      if (!runtime?.budget?.status) return { configured: false, error: "Budget guard is not configured on this runtime." };
+      return { configured: true, ...runtime.budget.status() };
+    }
+  });
+
+  registry.register({
+    name: "update_budget",
+    needsConfirmation: true,
+    trustedOutput: true,
+    description: "Add extra spend headroom for today (addUsdToday), change the recurring daily USD budget limit (dailyUsdLimit), or reset today's extra top-up. Direct owner budget commands execute immediately; background or untrusted requests raise an inline budget approval card.",
+    parameters: {
+      type: "object",
+      properties: {
+        addUsdToday: {
+          type: "number",
+          minimum: 0.01,
+          maximum: 10000,
+          description: "Extra USD to add to today's budget only (e.g. 10 or 25) without changing future days' cap."
+        },
+        dailyUsdLimit: {
+          type: "number",
+          minimum: 0.5,
+          maximum: 10000,
+          description: "New recurring daily USD spend cap (persists OPENAGI_DAILY_USD_LIMIT)."
+        },
+        resetTodayBonus: {
+          type: "boolean",
+          description: "When true, clears any extra one-day top-up added earlier today."
+        },
+        reason: {
+          type: "string",
+          description: "Short note explaining why the budget change is requested."
+        }
+      },
+      additionalProperties: false
+    },
+    summarize: (args = {}) => {
+      const parts = [];
+      if (Number.isFinite(Number(args.addUsdToday)) && Number(args.addUsdToday) > 0) {
+        parts.push(`Add +$${Number(args.addUsdToday).toFixed(2)} to today's budget`);
+      }
+      if (Number.isFinite(Number(args.dailyUsdLimit)) && Number(args.dailyUsdLimit) >= 0.5) {
+        parts.push(`Set daily budget limit to $${Number(args.dailyUsdLimit).toFixed(2)}/day`);
+      }
+      if (args.resetTodayBonus === true) {
+        parts.push("Reset today's extra budget");
+      }
+      return parts.join(" and ") || "Update OpenAGI daily budget";
+    },
+    approvalDedupeKey: (args = {}, context = {}) => {
+      const add = Number.isFinite(Number(args.addUsdToday)) ? Number(args.addUsdToday).toFixed(2) : "0";
+      const lim = Number.isFinite(Number(args.dailyUsdLimit)) ? Number(args.dailyUsdLimit).toFixed(2) : "keep";
+      const rst = args.resetTodayBonus === true ? "1" : "0";
+      return `budget:${context?.sessionId ?? "global"}:${add}:${lim}:${rst}`;
+    },
+    handler: async (args = {}) => {
+      if (!runtime?.budget) throw new Error("Budget guard is not configured on this runtime.");
+      const hasLimit = args.dailyUsdLimit !== undefined && args.dailyUsdLimit !== null;
+      const hasBonus = args.addUsdToday !== undefined && args.addUsdToday !== null;
+      const hasReset = args.resetTodayBonus === true;
+      if (!hasLimit && !hasBonus && !hasReset) {
+        throw new Error("Provide addUsdToday, dailyUsdLimit, or resetTodayBonus.");
+      }
+      if (hasLimit) {
+        const parsed = Number(args.dailyUsdLimit);
+        if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+          throw new Error("Daily budget limit must be between $0.50 and $10,000.");
+        }
+      }
+      if (hasBonus) {
+        const parsedBonus = Number(args.addUsdToday);
+        if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+          throw new Error("Added budget for today must be between $0.01 and $10,000.");
+        }
+      }
+      if (hasLimit) {
+        runtime.budget.setDailyLimit(Number(args.dailyUsdLimit));
+        process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({
+            dataDir: runtime.dataDir ?? resolveDataDir(),
+            values: { OPENAGI_DAILY_USD_LIMIT: String(runtime.budget.dailyUsdLimit) }
+          });
+        } catch { /* in-memory budget limit already updated */ }
+      }
+      if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+        runtime.budget.clearBonusToday();
+      }
+      if (hasBonus) {
+        runtime.budget.addBonusToday(Number(args.addUsdToday));
+      }
+      const updated = runtime.budget.status();
+      runtime.events?.emit?.("budget-updated", updated);
+      return updated;
+    }
+  });
+
+  registry.register({
     name: "remember",
     description: "Save a piece of information to long-lived memory so it can be recalled in future turns. Use when the user says 'remember', 'save', or shares a durable fact.",
     parameters: {

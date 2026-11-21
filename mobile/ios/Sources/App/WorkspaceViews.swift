@@ -6,12 +6,13 @@ import SwiftUI
 // 2026-10-16-openagi-phone-workspace-design.md.
 
 enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
-    case model, instructions, integrations, skills, scheduled
+    case model, budget, instructions, integrations, skills, scheduled
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .model: "Model"
+        case .budget: "Budget"
         case .instructions: "Instructions"
         case .integrations: "Integrations"
         case .skills: "Skills"
@@ -21,6 +22,7 @@ enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
     var symbol: String {
         switch self {
         case .model: "brain"
+        case .budget: "dollarsign.circle"
         case .instructions: "text.page"
         case .integrations: "link"
         case .skills: "wrench.and.screwdriver"
@@ -30,15 +32,36 @@ enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
 }
 
 struct WorkspaceSection: View {
+    @Environment(AppModel.self) private var model
+    @State private var budgetSummary: BudgetStatus?
+
     var body: some View {
         Section("Agent") {
             ForEach(WorkspaceDestination.allCases) { destination in
                 NavigationLink(value: destination) {
-                    Label(destination.title, systemImage: destination.symbol)
+                    if destination == .budget, let budgetSummary {
+                        HStack {
+                            Label(destination.title, systemImage: destination.symbol)
+                            Spacer(minLength: 8)
+                            Text(budgetBadgeText(budgetSummary))
+                                .font(Theme.Typography.caption.weight(budgetSummary.isExceeded ? .semibold : .regular))
+                                .foregroundStyle(budgetSummary.isExceeded ? Theme.alert : Theme.muted)
+                        }
+                    } else {
+                        Label(destination.title, systemImage: destination.symbol)
+                    }
                 }
                 .accessibilityIdentifier("settings-\(destination.rawValue)")
             }
         }
+        .task {
+            budgetSummary = try? await model.client.budget()
+        }
+    }
+
+    private func budgetBadgeText(_ b: BudgetStatus) -> String {
+        let prefix = b.isExceeded ? "Limit hit · " : ""
+        return String(format: "%@$%.2f / $%.0f", prefix, b.spentUsd, b.effectiveLimit)
     }
 }
 
@@ -84,6 +107,12 @@ struct ModelSettingsView: View {
                     .accessibilityIdentifier("model-provider")
                     LabeledContent("Now answering", value: activeLabel(settings))
                         .accessibilityIdentifier("model-active")
+                    NavigationLink {
+                        BudgetSettingsView()
+                    } label: {
+                        Label("Daily budget", systemImage: "dollarsign.circle")
+                    }
+                    .accessibilityIdentifier("model-open-budget")
                 } footer: {
                     Text(model.isOnPhone
                          ? "Apple Intelligence keeps model requests on this iPhone. Automatic can use saved cloud keys or ChatGPT sign-in. Cloud models send requests to that provider and can fall back to this iPhone when offline."
@@ -284,6 +313,198 @@ enum ModelSettingsErrorCopy {
         case .malformedResponse:
             return "Your server returned model settings this app couldn't read. Update OpenAGI on the main server, then retry."
         default: return "Couldn't reach your agent. Check its connection, then retry."
+        }
+    }
+}
+
+// MARK: - Budget
+
+struct BudgetSettingsView: View {
+    @Environment(AppModel.self) private var model
+    @State private var budget: BudgetStatus?
+    @State private var customLimit = ""
+    @State private var customTopUp = ""
+    @State private var isLoading = false
+    @State private var isSaving = false
+    @State private var status: (text: String, isError: Bool)?
+
+    private let presets: [Double] = [10, 25, 50, 100]
+
+    var body: some View {
+        Form {
+            if let budget {
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(String(format: "$%.2f spent today", budget.spentUsd))
+                                .font(Theme.Typography.body.weight(.semibold))
+                                .foregroundStyle(budget.isExceeded ? Theme.alert : Theme.ink)
+                            Spacer()
+                            Text(String(format: "of $%.2f", budget.effectiveLimit))
+                                .font(Theme.Typography.secondary)
+                                .foregroundStyle(Theme.muted)
+                        }
+                        ProgressView(value: min(max(budget.spentUsd, 0), max(budget.effectiveLimit, 0.01)),
+                                     total: max(budget.effectiveLimit, 0.01))
+                            .tint(budget.isExceeded ? Theme.alert : .accentColor)
+                        HStack {
+                            Text(budget.remainingUsd >= 0
+                                 ? String(format: "$%.2f remaining", budget.remainingUsd)
+                                 : String(format: "$%.2f over limit", abs(budget.remainingUsd)))
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(budget.isExceeded ? Theme.alert : Theme.muted)
+                            Spacer()
+                            Text("\(budget.calls) call\(budget.calls == 1 ? "" : "s")")
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(Theme.muted)
+                        }
+                        if let bonus = budget.bonusUsdToday, bonus > 0 {
+                            Text(String(format: "Includes +$%.2f added for today (base limit $%.2f/day).", bonus, budget.dailyUsdLimit))
+                                .font(Theme.Typography.caption)
+                                .foregroundStyle(Theme.live)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    .accessibilityIdentifier("budget-summary")
+                } header: {
+                    Text("Today (\(budget.today))")
+                }
+
+                Section {
+                    HStack(spacing: 8) {
+                        ForEach([10, 25, 50], id: \.self) { amount in
+                            Button("+\(amount == 10 ? "$10" : amount == 25 ? "$25" : "$50")") {
+                                Task { await apply(BudgetUpdate(addUsdToday: Double(amount)), success: "Added +$\(amount) for today.") }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("budget-add-\(amount)")
+                        }
+                    }
+                    HStack {
+                        Text("+$").foregroundStyle(Theme.muted)
+                        TextField("Custom extra for today", text: $customTopUp)
+                            .keyboardType(.decimalPad)
+                            .font(Theme.Typography.dataMono)
+                            .accessibilityIdentifier("budget-custom-topup-input")
+                        Button("Add today") {
+                            let cleaned = customTopUp.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard let parsed = Double(cleaned), parsed >= 0.5, parsed <= 10000 else {
+                                status = ("Enter a top-up amount between $0.50 and $10,000.", true)
+                                return
+                            }
+                            Task {
+                                await apply(BudgetUpdate(addUsdToday: parsed), success: String(format: "Added +$%.2f for today.", parsed))
+                                customTopUp = ""
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(customTopUp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("budget-save-topup")
+                    }
+                    if let bonus = budget.bonusUsdToday, bonus > 0 {
+                        Button("Reset today's extra", role: .destructive) {
+                            Task { await apply(BudgetUpdate(resetTodayBonus: true), success: "Reset today's extra budget.") }
+                        }
+                        .accessibilityIdentifier("budget-reset-bonus")
+                    }
+                } header: {
+                    Text("Quick top-up (+$$$ today)")
+                } footer: {
+                    Text("Adds immediate headroom so you can finish today's work without permanently raising tomorrow's daily cap.")
+                }
+
+                Section {
+                    HStack(spacing: 8) {
+                        ForEach(presets, id: \.self) { preset in
+                            let selected = abs(budget.dailyUsdLimit - preset) < 0.01
+                            Button(String(format: "$%.0f", preset)) {
+                                customLimit = String(format: "%.0f", preset)
+                                Task { await apply(BudgetUpdate(dailyUsdLimit: preset), success: String(format: "Daily limit set to $%.2f.", preset)) }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(selected ? .accentColor : .secondary)
+                            .accessibilityIdentifier("budget-preset-\(Int(preset))")
+                        }
+                    }
+                    HStack {
+                        Text("$").foregroundStyle(Theme.muted)
+                        TextField("Custom daily limit", text: $customLimit)
+                            .keyboardType(.decimalPad)
+                            .font(Theme.Typography.dataMono)
+                            .accessibilityIdentifier("budget-custom-input")
+                        Button("Save") {
+                            guard let parsed = Double(customLimit.trimmingCharacters(in: .whitespacesAndNewlines)),
+                                  parsed >= 0.5, parsed <= 10000 else {
+                                status = ("Enter a daily limit between $0.50 and $10,000.", true)
+                                return
+                            }
+                            Task { await apply(BudgetUpdate(dailyUsdLimit: parsed), success: String(format: "Daily limit set to $%.2f.", parsed)) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(customLimit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("budget-save-limit")
+                    }
+                    if let status {
+                        Text(status.text)
+                            .font(Theme.Typography.secondary)
+                            .foregroundStyle(status.isError ? Theme.alert : Theme.live)
+                    }
+                } header: {
+                    Text("Daily limit")
+                } footer: {
+                    Text("Applies immediately on your agent server and saves OPENAGI_DAILY_USD_LIMIT for future days.")
+                }
+            } else if let status, !isLoading {
+                ContentUnavailableView {
+                    Label("Budget unavailable", systemImage: "dollarsign.circle")
+                } description: {
+                    Text(status.text)
+                } actions: {
+                    Button("Retry") { Task { await reload() } }
+                        .accessibilityIdentifier("budget-retry")
+                }
+            } else {
+                ProgressView("Loading budget…")
+            }
+        }
+        .accessibilityIdentifier("budget-form")
+        .navigationTitle("Budget")
+        .navigationBarTitleDisplayMode(.inline)
+        .disabled(isSaving)
+        .task { await reload() }
+        .refreshable { await reload() }
+    }
+
+    private func reload() async {
+        guard !isLoading else { return }
+        isLoading = true
+        status = nil
+        defer { isLoading = false }
+        do {
+            let loaded = try await model.client.budget()
+            budget = loaded
+            customLimit = String(format: "%.2f", loaded.dailyUsdLimit)
+        } catch is CancellationError {
+            return
+        } catch let error as DaemonError where error == .notFound {
+            status = ("Update OpenAGI on your main server to view and edit the daily budget from here.", true)
+        } catch {
+            status = ("Couldn't load the budget. Check your connection and retry.", true)
+        }
+    }
+
+    private func apply(_ update: BudgetUpdate, success: String) async {
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            let updated = try await model.client.updateBudget(update)
+            budget = updated
+            customLimit = String(format: "%.2f", updated.dailyUsdLimit)
+            status = (success, false)
+        } catch let error as DaemonError where error == .notFound {
+            status = ("Update OpenAGI on your main server to change the budget from here.", true)
+        } catch {
+            status = ("Couldn't save the budget change. Try again.", true)
         }
     }
 }

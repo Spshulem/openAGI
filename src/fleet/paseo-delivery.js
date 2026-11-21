@@ -318,10 +318,11 @@ async function respondPaseoPermission(api, ref, agentId, requestId, response) {
   throw new Error("Paseo client does not support respondToPermission");
 }
 
-function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
+function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false } = {}) {
   if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
-  if (!ownerInitiated && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (!ownerInitiated && !silentStuckRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
   if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) return "Paseo chat changed; scan again before sending";
@@ -336,6 +337,9 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
 export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
+  const silentStuckRecovery = !ownerInitiated
+    && Boolean(thread?.meta?.silentStuck)
+    && ["status-check", "resume", "unblock-snag"].includes(base?.playbook);
   const normalizedImages = normalizePaseoImages(images);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
@@ -434,14 +438,14 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
         }
       }
-      const preflight = ineligibleAgent(agent, thread, { ownerInitiated });
+      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery });
       if (preflight) return blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: ownerInitiated ? 8 : 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
       // refetch updates the SDK handle; check both snapshots so a newer event
       // or an unavailable baseline cannot be hidden by the other snapshot.
-      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated }) || ineligibleAgent(ref.current(), thread, { ownerInitiated });
+      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery });
       if (changed) return blocked(changed);
       const messageId = randomUUID();
       const cursor = timelineCursor(baseline);
@@ -508,7 +512,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       };
       writeJsonAtomic(file, correlated);
       const turnOutcome = await waitForPaseoTurn(ref, correlated, signal, save, {
-        ownerInitiated,
+        ownerInitiated: ownerInitiated || silentStuckRecovery,
         onSawOwn: () => { sawOwnBeforeAbort = true; }
       });
       if (turnOutcome.systemError) {

@@ -13,6 +13,7 @@ import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
 import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
+import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
@@ -1045,17 +1046,46 @@ export class FleetSupervisor {
       }
     };
     const projectAliases = store.projectAliases?.() ?? null;
-    const deck = buildSupervisorDeck(baseState, {
-      preferences: store.preferences(),
-      now: this.now(),
-      threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
-      prsByKey: this.lastPrs,
-      knownRows: this.knownRows,
-      blockingResolver,
-      projectAliases
-    });
-    return { ...baseState, ...deck };
-  }
+      const deck = buildSupervisorDeck(baseState, {
+        preferences: store.preferences(),
+        now: this.now(),
+        threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
+        prsByKey: this.lastPrs,
+        knownRows: this.knownRows,
+        blockingResolver,
+        projectAliases
+      });
+      const watchdog = this.buildWatchdogSummary(snapshot);
+      return { ...baseState, ...deck, watchdog };
+    }
+
+    buildWatchdogSummary(snapshot) {
+      const rows = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+      const tracked = rows.filter((r) => r?.watchdog);
+      const overdueItems = tracked
+        .filter((r) => r.watchdog.overdue)
+        .sort((a, b) => (b.watchdog.silentMinutes ?? 0) - (a.watchdog.silentMinutes ?? 0))
+        .slice(0, 25)
+        .map((r) => ({
+          threadKey: r.key,
+          title: r.title ?? r.key,
+          project: r.project ?? null,
+          status: r.watchdog.status,
+          phase: r.watchdog.phase,
+          expectedMinutes: r.watchdog.expectedMinutes,
+          silentMinutes: r.watchdog.silentMinutes,
+          overdueMinutes: r.watchdog.overdueMinutes,
+          checkInDueAt: r.watchdog.checkInDueAt,
+          diagnosis: r.watchdog.diagnosis ?? null
+        }));
+      return {
+        checkedAt: snapshot?.at ?? new Date(this.now()).toISOString(),
+        trackedCount: tracked.length,
+        overdueCount: tracked.filter((r) => r.watchdog.overdue).length,
+        stuckCount: tracked.filter((r) => r.watchdog.severelyStuck).length,
+        items: overdueItems
+      };
+    }
 
   enrichQuestionView(questionView, rows, blockingResolver) {
     const key = questionView?.threadKey ?? null;
@@ -1256,9 +1286,27 @@ export class FleetSupervisor {
         ? row.labels
         : deriveBoardLabels({ row: { ...row, watch }, thread, prRef: row.pr?.ref ?? null, ciState: row.pr?.ci?.state ?? null, subchannel });
       const activeQuietWatch = !muted && (row.live || row.agentStatus === "running" || ["working", "waiting", "push", "you"].includes(watch?.group) || row.pr?.state === "OPEN");
-      const nextCheckAt = activeQuietWatch ? fallbackNextTick : null;
+      const linkedTask = this.linkedTaskForThread(row.key);
+      const freshWatchdog = thread
+        ? estimateExpectedCheckIn(thread, {
+            classified: this.lastItems.get(row.key)?.classified ?? { state: row.state },
+            pr: this.lastItems.get(row.key)?.pr ?? row.pr ?? null,
+            task: linkedTask,
+            now: this.now(),
+            limits: this.config.limits
+          })
+        : (row.watchdog ?? null);
+      const diagnosis = row.watchdog?.diagnosis ?? (thread ? diagnoseAgentBlocker(thread, { pr: row.pr ?? null, now: this.now(), limits: this.config.limits }) : null);
+      const watchdog = freshWatchdog
+        ? { ...freshWatchdog, ...(diagnosis ? { diagnosis: { kind: diagnosis.kind, label: diagnosis.snagLabel, resolution: diagnosis.resolution } } : {}) }
+        : null;
+      const nextCheckAt = activeQuietWatch
+        ? (watchdog?.checkInDueAt && Date.parse(watchdog.checkInDueAt) < Date.parse(fallbackNextTick ?? "")
+            ? watchdog.checkInDueAt
+            : fallbackNextTick)
+        : null;
       return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
-        project, actorLabel, subchannel, labels, nextCheckAt,
+        project, actorLabel, subchannel, labels, nextCheckAt, ...(watchdog ? { watchdog } : {}),
         pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
     });
     return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.filter((question) => needsOwnerDecision(question)).length } };
@@ -2011,8 +2059,8 @@ export class FleetSupervisor {
         delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [], startedAt, deadlineAt });
       }
       // An owner answer to the agent's own question, or "retry" after the owner
-      // fixed a login/disk blocker, is an explicit instruction: every mode.
-      const retry = question.kind === "infra" && answer === "retry";
+      // fixed a login/disk/access blocker, is an explicit instruction: every mode.
+      const retry = (question.kind === "infra" || question.meta?.wall === "true") && answer === "retry";
       if ((question.kind === "agent-ask" || paseoCardAnswer || retry) && question.threadKey && answer !== "open thread") {
         let deliveredChoice = answer;
         if (paseoCardAnswer && Array.isArray(question.meta?.labels) && question.meta.labels.length > 0) {
@@ -2325,6 +2373,7 @@ export class FleetSupervisor {
     labels = null,
     dependsOn = null,
     priority = 70,
+    checkInMinutes = null,
     images = null
   } = {}) {
     const taskStore = this.runtime?.tasks;
@@ -2368,6 +2417,9 @@ export class FleetSupervisor {
 
     const nowMs = this.now();
     const leaseMs = Number(taskStore.leaseMs) > 0 ? Number(taskStore.leaseMs) : 30 * MIN;
+    const expectedCheckInMin = Number.isFinite(Number(checkInMinutes)) && Number(checkInMinutes) > 0
+      ? Math.min(720, Math.max(5, Math.round(Number(checkInMinutes))))
+      : 25;
     const prevAttempts = Number(task.sourceMeta?.agentLease?.attempts ?? 0);
     const attempts = Number.isFinite(prevAttempts) ? prevAttempts + 1 : 1;
     const actor = [session.provider || provider, session.model || model]
@@ -2385,6 +2437,12 @@ export class FleetSupervisor {
         project: resolvedProject || null,
         subchannel: subchannel || task.sourceMeta?.subchannel || null,
         actor,
+        checkInMinutes: expectedCheckInMin,
+        watchdog: {
+          expectedMinutes: expectedCheckInMin,
+          checkInDueAt: new Date(nowMs + expectedCheckInMin * MIN).toISOString(),
+          status: "on_track"
+        },
         agentLease: {
           claimedAt: new Date(nowMs).toISOString(),
           expiresAt: new Date(nowMs + leaseMs).toISOString(),
@@ -4046,8 +4104,9 @@ export class FleetSupervisor {
     // A thread whose git read or PR fetch failed this tick is unknown too: its
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
-    // A thread a capped scan deferred was not reassessed either.
-    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || deferred.has(key));
+    const historyUnknown = new Set([...byKey.values()].filter((thread) => thread?.excluded === "history-unavailable").map((thread) => thread.key));
+    // A thread a capped scan deferred or whose history read is still pending was not reassessed either.
+    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || historyUnknown.has(key) || deferred.has(key));
     // With no settled read remembered (a fresh start), an unread PR cannot
     // tell a merge that settled an ask from a live one: an ask the
     // supervisor already closed waits for GitHub instead of coming back.
@@ -4354,6 +4413,10 @@ export class FleetSupervisor {
       // An owner answer that started after the judge read (during the
       // review, the notifications, the kept answers, an earlier send or the
       // PR read just above) goes first: checked again right before each send.
+      if (decision.action === "nudge" && target?.meta?.paseoClosed) {
+        decision.reason = `${decision.reason}; held: Paseo session sleeping`;
+        continue;
+      }
       if (decision.action === "nudge" && (this.pushing.has(decision.threadKey) || this.ownerAnswerThreads(started).has(decision.threadKey))) {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
@@ -4566,7 +4629,51 @@ export class FleetSupervisor {
     return { ...watch, since: new Date(since).toISOString() };
   }
 
+  linkedTaskForThread(threadKey) {
+    if (!threadKey || !this.runtime?.tasks?.tasks) return null;
+    for (const task of this.runtime.tasks.tasks.values()) {
+      if (task?.sourceMeta?.threadKey === threadKey && task.status !== "completed" && task.status !== "cancelled") {
+        return task;
+      }
+    }
+    return null;
+  }
+
+  syncTaskWatchdogs(items, now) {
+    const taskStore = this.runtime?.tasks;
+    if (!taskStore?.tasks || typeof taskStore.update !== "function") return;
+    for (const { thread, classified, pr } of items) {
+      const task = this.linkedTaskForThread(thread.key);
+      if (!task) continue;
+      const checkIn = estimateExpectedCheckIn(thread, { classified, pr, task, now, limits: this.config.limits });
+      if (!checkIn) continue;
+      const diag = classified.snag ?? diagnoseAgentBlocker(thread, { pr, now, limits: this.config.limits });
+      const prevWatchdog = task.sourceMeta?.watchdog ?? null;
+      const nextStatus = checkIn.status;
+      const diagKind = diag?.kind ?? null;
+      if (prevWatchdog?.status === nextStatus && prevWatchdog?.diagnosisKind === diagKind && prevWatchdog?.checkInDueAt === checkIn.checkInDueAt) {
+        continue;
+      }
+      const nextMeta = {
+        ...(task.sourceMeta ?? {}),
+        ...(diag ? { blockedReason: `${diag.snagLabel}: ${diag.summary}`.slice(0, 240) } : {}),
+        ...(checkIn.severelyStuck && !task.sourceMeta?.stalledSince ? { stalledSince: checkIn.anchorAt } : {}),
+        watchdog: {
+          expectedMinutes: checkIn.expectedMinutes,
+          silentMinutes: checkIn.silentMinutes,
+          checkInDueAt: checkIn.checkInDueAt,
+          overdue: checkIn.overdue,
+          overdueMinutes: checkIn.overdueMinutes,
+          status: nextStatus,
+          ...(diagKind ? { diagnosisKind: diagKind, diagnosisLabel: diag.snagLabel } : {})
+        }
+      };
+      try { taskStore.update(task.id, { sourceMeta: nextMeta }); } catch { /* best-effort task sync */ }
+    }
+  }
+
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes = [], manager, delivery = null, storage = null, previous = null }) {
+    this.syncTaskWatchdogs(items, finished);
     const byState = {};
     const byWatch = Object.fromEntries(WATCH_GROUPS.map((group) => [group, 0]));
     const decisionFor = effectiveDecisions(decisions);
@@ -4579,6 +4686,12 @@ export class FleetSupervisor {
       // The wait age was measured when the scan classified, at its start.
       const watch = this.trackWatch(thread.key, watchOf(thread, classified, { now: started, askedAt: askedAt.get(thread.key) ?? null }), finished);
       if (watch) { byWatch[watch.group] = (byWatch[watch.group] ?? 0) + 1; seen.add(thread.key); }
+      const linkedTask = this.linkedTaskForThread(thread.key);
+      const checkIn = estimateExpectedCheckIn(thread, { classified, pr, task: linkedTask, now: finished, limits: this.config.limits });
+      const diag = classified.snag ?? diagnoseAgentBlocker(thread, { pr, now: finished, limits: this.config.limits });
+      const watchdog = checkIn
+        ? { ...checkIn, ...(diag ? { diagnosis: { kind: diag.kind, label: diag.snagLabel, resolution: diag.resolution } } : {}) }
+        : null;
       return {
         key: thread.key,
         kind: thread.kind,
@@ -4629,6 +4742,7 @@ export class FleetSupervisor {
         attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).
         openChat: openChatFor(thread),
+        ...(watchdog ? { watchdog } : {}),
         watch
       };
     });

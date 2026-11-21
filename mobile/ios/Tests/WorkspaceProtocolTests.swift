@@ -92,4 +92,60 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertEqual(card.plan?.nextAction, "Should automated retries cap backoff at 60s?")
         XCTAssertEqual(card.plan?.acceptance, "Cap retry delay at 60s.")
     }
+
+    func testBudgetProtocolAndExceededDetection() throws {
+        let json = """
+        {"today":"2026-11-21","dailyUsdLimit":10,"bonusUsdToday":10,"effectiveLimitUsd":20,
+         "spentUsd":10.42,"remainingUsd":9.58,"exceeded":false,"calls":38}
+        """
+        let status = try ProtocolDecoder.json.decode(BudgetStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.effectiveLimit, 20)
+        XCTAssertFalse(status.isExceeded)
+
+        let encoded = try ProtocolDecoder.jsonEncoder.encode(BudgetUpdate(addUsdToday: 10))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(body.keys), ["addUsdToday"])
+        XCTAssertEqual(body["addUsdToday"] as? Double, 10)
+
+        let hit = ChatMessage(role: .assistant, text: "I couldn't complete that request: Daily budget exceeded")
+        let normal = ChatMessage(role: .assistant, text: "All tests passed.")
+        let userLine = ChatMessage(role: .user, text: "Daily budget exceeded?")
+        XCTAssertTrue(BudgetLimitPrompt.isBudgetExceeded(hit))
+        XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(normal))
+        XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(userLine))
+    }
+
+    func testFleetWatchdogDecodingAndBadges() throws {
+        let json = """
+        {
+          "key": "paseo:srv_1.504212e5",
+          "title": "Staging QA Report Analysis",
+          "agentStatus": "stalled",
+          "state": "stopped",
+          "watchdog": {
+            "phase": "stalled",
+            "expectedMinutes": 15,
+            "silentMinutes": 930,
+            "checkInDueAt": "2026-11-20T17:15:00.000Z",
+            "overdue": true,
+            "overdueMinutes": 915,
+            "severelyStuck": true,
+            "status": "stuck",
+            "diagnosis": {
+              "kind": "silent-turn",
+              "label": "silent 15h with no progress",
+              "resolution": "auto-nudge"
+            }
+          }
+        }
+        """
+        let thread = try ProtocolDecoder.json.decode(FleetThread.self, from: Data(json.utf8))
+        XCTAssertEqual(thread.watchdog?.severelyStuck, true)
+        XCTAssertEqual(thread.watchdog?.isAlert, true)
+        XCTAssertEqual(thread.watchdog?.badgeText, "Stuck 15h · silent 15h with no progress")
+
+        let overdue = FleetWatchdog(expectedMinutes: 25, silentMinutes: 35, overdue: true, overdueMinutes: 10, severelyStuck: false, status: "overdue")
+        XCTAssertEqual(overdue.badgeText, "Check-in overdue +10m")
+        XCTAssertTrue(overdue.isAlert)
+    }
 }

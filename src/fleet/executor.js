@@ -266,6 +266,7 @@ export function backgroundRouteFor(thread, config) {
 }
 
 function antigravityBusy(thread) {
+  if (thread.meta?.silentStuck === true && runStatusOf(thread.meta?.runStatus) === "IDLE") return false;
   return thread.agentStatus === "running" || ["RUNNING", "BUSY", "CANCELING"].includes(runStatusOf(thread.meta?.runStatus)) || thread.meta?.notFullyIdle === true;
 }
 

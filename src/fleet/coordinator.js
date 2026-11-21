@@ -26,7 +26,7 @@ import { normalizePaseoImages } from "./paseo-delivery.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
 
-const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
 
 function cleanName(value) {
@@ -41,7 +41,7 @@ export function deriveProjectInfo({ cwd = null, workspace = null, projectName = 
     ?? null;
   const rawCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   const ws = cleanName(workspace);
-  const explicitProj = projectName && !/imported history/i.test(String(projectName))
+  const explicitProj = projectName && !/imported[-_ ]history/i.test(String(projectName))
     ? cleanName(projectName)
     : null;
 
@@ -71,7 +71,7 @@ export function deriveProjectInfo({ cwd = null, workspace = null, projectName = 
       project = codexWtMatch[1];
     } else if (devMatch) {
       project = devMatch[1];
-    } else if (!/\/imported history(?:\/|$)/i.test(rawCwd)) {
+    } else if (!/\/imported[-_ ]history(?:\/|$)/i.test(rawCwd) && !/\/codex-worktrees\/[0-9a-f]+$/i.test(rawCwd)) {
       const base = path.basename(rawCwd);
       if (base && base !== "." && base !== "/" && !OPAQUE_ID_RE.test(base) && !/^\d{3,6}$/.test(base)) {
         project = base;

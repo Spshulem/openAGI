@@ -244,7 +244,7 @@ function isQuestionLiveForDeck(question, row, prefs) {
   return true;
 }
 
-const OPAQUE_SESSION_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const OPAQUE_SESSION_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const LEADING_OPAQUE_PREFIX_RE = /^(?:wks_[0-9a-f]+|Paseo chat|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}):/i;
 
 function cleanWorkspaceName(workspace) {
