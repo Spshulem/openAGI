@@ -224,6 +224,7 @@ final class VoiceSessionTests: XCTestCase {
         socket.onData?(Data([0, 1]))
         XCTAssertEqual(audio.played.count, 1, "audio from the interrupted reply is dropped")
         socket.receive(["type": "barged"])
+        XCTAssertEqual(audio.barges, 2, "the hub's barged also clears local playback, as on Android")
 
         socket.receive(["type": "reply.delta", "text": "Two things "])
         socket.receive(["type": "reply.delta", "text": "need you."])
@@ -239,7 +240,7 @@ final class VoiceSessionTests: XCTestCase {
         XCTAssertFalse(voice.status.speaking)
         // A fully heard reply is not cut short by the next speech.
         socket.receive(["type": "speech_started"])
-        XCTAssertEqual(audio.barges, 1)
+        XCTAssertEqual(audio.barges, 2)
     }
 
     func testStopEndsEverythingAndReloadsTheChat() throws {
