@@ -40,7 +40,7 @@ enum SupervisorAnswerOutcome: Equatable {
     }
 }
 
-// Sends an answer or dismissal tapped on a supervisor alert, straight to the
+// Sends an answer, typed reply or dismissal from a supervisor alert, to the
 // paired daemon (POST /fleet/api/questions/:id). The alert goes away when the
 // question is done; otherwise it is replaced in place by a "Not sent" notice
 // whose tap opens Supervisor, like Android's.
@@ -58,7 +58,7 @@ enum SupervisorAnswerSender {
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         let questionID: String
         switch action {
-        case let .answer(id, _), let .dismiss(id): questionID = id
+        case let .answer(id, _), let .reply(id, _), let .dismiss(id): questionID = id
         case .open: return
         }
 
@@ -71,6 +71,16 @@ enum SupervisorAnswerSender {
                 case let .answer(id, answer):
                     let result = try await client.fleetAnswer(questionID: id, answer: answer)
                     return .of(error: nil, delivery: result.delivery)
+                case let .reply(id, text):
+                    // A 409 here can also mean the question is still open but
+                    // takes no typed text, so the owner's words are not
+                    // quietly dropped as "already closed".
+                    do {
+                        let result = try await client.fleetReply(questionID: id, reply: text)
+                        return .of(error: nil, delivery: result.delivery)
+                    } catch DaemonError.conflict {
+                        return .failed
+                    }
                 case let .dismiss(id):
                     _ = try await client.fleetDismiss(questionID: id)
                     return .done

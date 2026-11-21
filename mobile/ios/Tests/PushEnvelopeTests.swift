@@ -145,6 +145,9 @@ final class PushEnvelopeTests: XCTestCase {
         let minimal = try JSONDecoder().decode(SupervisorAlertPlaintext.self, from: Data(#"{"questionId":"q","threadKey":null}"#.utf8))
         XCTAssertEqual(minimal.options, [])
         XCTAssertNil(minimal.threadKey)
+        XCTAssertFalse(minimal.canReply, "an older daemon sends no canReply")
+        let replyable = try JSONDecoder().decode(SupervisorAlertPlaintext.self, from: Data(#"{"questionId":"q","canReply":true}"#.utf8))
+        XCTAssertTrue(replyable.canReply)
         XCTAssertThrowsError(try JSONDecoder().decode(SupervisorAlertPlaintext.self, from: Data(#"{"title":"x"}"#.utf8)))
     }
 
