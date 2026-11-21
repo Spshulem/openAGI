@@ -820,6 +820,59 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     });
     assert.equal(restarted.getActiveWork({ project: "PersistedPR" }).items[0].followThroughState, "blocked_pr");
 
+    const movedPrKey = "moved-pr-commitment";
+    ctx.supervisor.lastPrs.set("acme/moved-pr#1", {
+      ref: "acme/moved-pr#1", state: "MERGED", mergedAt: isoAgo(2), updatedAt: isoAgo(2)
+    });
+    ctx.supervisor.lastPrs.set("acme/moved-pr#2", {
+      ref: "acme/moved-pr#2", state: "OPEN", isDraft: true, mergeState: "CLEAN", ciState: "SUCCESS", ci: { state: "SUCCESS", failing: [] }
+    });
+    ctx.supervisor.trackWork({
+      dedupeKey: movedPrKey,
+      project: "MovedPR",
+      repo: "acme/moved-pr",
+      prRef: "acme/moved-pr#1",
+      goal: "Move the commitment to the current PR",
+      doneCriteria: "Current PR outcome verified"
+    });
+    ctx.supervisor.trackWork({
+      dedupeKey: movedPrKey,
+      project: "MovedPR",
+      repo: "acme/moved-pr",
+      prRef: "acme/moved-pr#2",
+      goal: "Move the commitment to the current PR",
+      doneCriteria: "Current PR outcome verified"
+    });
+    const movedRestart = new FleetSupervisor({
+      dataDir: ctx.dataDir,
+      config: { enabled: false, paseo: { enabled: false } },
+      runtime: { outreach: ctx.outreach, events: { emit() {} } }
+    });
+    assert.equal(movedRestart.getActiveWork({ project: "MovedPR" }).items[0].followThroughState, "active");
+
+    const reassigned = ctx.supervisor.trackWork({
+      dedupeKey: "reassign-archive-marker",
+      project: "ReassignArchive",
+      goal: "Old archived commitment",
+      threadKey: "paseo:srv_mac.openagi_helper"
+    });
+    const reassignedState = ctx.supervisor.activeWork.state.items.find((item) => item.id === reassigned.item.id);
+    reassignedState.archivedAt = new Date(ctx.supervisor.now()).toISOString();
+    ctx.supervisor.trackWork({
+      dedupeKey: "reassign-archive-marker",
+      project: "ReassignArchive",
+      goal: "New owner commitment",
+      threadKey: "paseo:srv_mac.openagi_helper"
+    });
+    assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === reassigned.item.id).archivedAt, null);
+    reassignedState.archivedAt = new Date(ctx.supervisor.now()).toISOString();
+    const assignResult = await ctx.supervisor.actActiveWork(reassigned.item.id, {
+      op: "assign_orphan",
+      targetKey: "paseo:srv_mac.openagi_helper"
+    });
+    assert.equal(assignResult.ok, true);
+    assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === reassigned.item.id).archivedAt, null);
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });

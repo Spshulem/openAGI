@@ -695,6 +695,12 @@ export class ActiveWorkManager {
     let created = false;
     if (existing) {
       const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria;
+      const ownerUpdated = input.owner !== undefined || input.threadKey !== undefined;
+      const ownerChanged = ownerUpdated && (
+        existing.owner?.threadKey !== owner.threadKey
+        || existing.owner?.kind !== owner.kind
+        || existing.owner?.label !== owner.label
+      );
       const mergedLinks = mergeEvidenceLinks(existing.evidenceLinks, incomingEvidence, nowIso);
       const nextProgressAt = explicitProgressMs
         ? new Date(explicitProgressMs).toISOString()
@@ -742,6 +748,7 @@ export class ActiveWorkManager {
         },
         state: nextState,
         outcomeVerified,
+        ...(goalChanged || ownerChanged ? { archivedAt: null } : {}),
         ...(nextState === "snoozed" && !existing.snoozedUntil && !parseIsoMs(input.snoozedUntil) ? {
           snoozedAt: nowIso,
           snoozedUntil: new Date(nowMs + 24 * HOUR_MS).toISOString()
@@ -910,8 +917,12 @@ export class ActiveWorkManager {
       ? "archived"
       : (isSessionLiveRunning(session) ? "running" : (session?.agentStatus ?? (ownerKey ? "idle" : null)));
 
-    const prLink = (item.evidenceLinks ?? []).find((l) => l.kind === "pr") ?? null;
-    const prRef = item.prRef ?? prLink?.ref ?? session?.prRefs?.find((r) => parsePrRef(r)) ?? null;
+    const evidencePrLinks = (item.evidenceLinks ?? []).filter((l) => l.kind === "pr");
+    const requestedPrRef = item.prRef ?? session?.prRefs?.find((r) => parsePrRef(r)) ?? null;
+    const prRef = requestedPrRef ?? evidencePrLinks[0]?.ref ?? null;
+    const prLink = requestedPrRef
+      ? (evidencePrLinks.find((link) => String(link.ref).toLowerCase() === String(requestedPrRef).toLowerCase()) ?? null)
+      : (evidencePrLinks[0] ?? null);
     const livePrFromSupervisor = prRef ? (prsByRef.get(prRef.toLowerCase()) ?? null) : null;
 
     const prState = livePrFromSupervisor?.state ?? prLink?.state ?? null;
@@ -2195,6 +2206,7 @@ export class ActiveWorkManager {
       } else {
         item.owner = { kind: "human", threadKey: null, label: ownerLabel, host: null };
       }
+      item.archivedAt = null;
       item.updatedAt = nowIso;
       this._recordAudit({ op: "assign_orphan", itemId: item.id, owner: item.owner });
       this._save();
