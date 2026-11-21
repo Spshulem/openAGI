@@ -316,10 +316,10 @@ enum SupervisorFormat {
     // synthesizes equivalent cards from `questions` + `snapshot.threads` when
     // connected to an older daemon or UI test fixture.
     static func resolvedCards(_ state: FleetState) -> [SupervisorCard] {
-        let cards = state.cards.filter { !$0.id.isEmpty }
+        let cards = state.cards.filter { !$0.id.isEmpty && $0.needsYou }
         if !cards.isEmpty { return cards }
         let threads = state.snapshot?.threads ?? []
-        return state.questions.filter { !$0.id.isEmpty }.map { question in
+        return state.questions.filter { !$0.id.isEmpty && $0.needsYou }.map { question in
             let keys = threadKeys(question)
             let primaryKey = question.threadKey ?? keys.first
             let thread = primaryKey.flatMap { key in threads.first(where: { $0.key == key }) }
@@ -337,7 +337,14 @@ enum SupervisorFormat {
                 questionId: question.id,
                 kind: isReady ? "merge_ready" : "agent_decision",
                 kindLabel: isReady ? "PR ready" : "Needs your decision",
-                headline: nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
+                needsYou: question.needsYou,
+                decisionHeadline: question.decisionHeadline,
+                decisionFact: question.decisionFact,
+                decisionSource: question.decisionSource,
+                decisionAction: question.decisionAction,
+                remainingItemIds: question.remainingItemIds,
+                decisionItems: question.decisionItems,
+                headline: nonBlank(question.decisionHeadline) ?? nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
                 sessionTitle: nonBlank(thread?.title),
                 summary: nonBlank(question.body),
                 agentSummary: nonBlank(thread?.lastAgentText),

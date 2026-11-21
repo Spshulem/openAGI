@@ -10,6 +10,116 @@ import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizeP
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+const OWNER_BLOCKER_RE = /\b(?:you|your|owner)\b[^.?!\n]{0,80}\b(?:decision|call|approv\w*|authori[sz]\w*|sign[ -]?off|credentials?|sign[ -]?in|log[ -]?in|choice|pick|go[ -]?ahead)\b|\b(?:explicit|owner|your)\s+(?:release\s+)?(?:authorization|approval|sign[ -]?off)\b/i;
+const NO_ACTION_COMPLETION_RE = /\b(?:nothing|no action|all done|completed successfully|finished successfully|done)\b[^.?!\n]{0,80}\b(?:needed|required|left|else|more)\b/i;
+
+function cleanOwnerCopy(value, max = 220) {
+  return clampText(redactSecrets(cleanBriefProse(String(value ?? ""))), max) || null;
+}
+
+function firstUsefulSentence(value) {
+  const text = cleanOwnerCopy(value, 360);
+  if (!text) return null;
+  return (text.split(/(?<=[.!?])\s+/).find((part) => part.trim()) ?? text).trim();
+}
+
+function ownerActionHeadline(question, { kind = null } = {}) {
+  const title = cleanOwnerCopy(question?.title, 160);
+  const body = cleanOwnerCopy(question?.body, 360);
+  const activeItem = Array.isArray(question?.meta?.items) && question?.meta?.itemId != null
+    ? question.meta.items.find((item) => String(item?.itemId ?? "") === String(question.meta.itemId))
+    : null;
+  const source = cleanOwnerCopy(activeItem?.question, 360) || `${title ?? ""} ${body ?? ""}`.trim();
+  if (!source) return "Review this decision";
+  const signIn = /\b(?:browser\s+)?sign[ -]?ins?\b|\blog(?:ged)?[ -]?in\b|\bportals?\b/i.test(source);
+  if (signIn) return /\b(?:publisher|listing|submission)s?\b/i.test(source)
+    ? "Sign in to the publisher portals"
+    : "Sign in to the requested portals";
+  const release = /\b(?:release|deploy|cut)\b/i.test(source) && /\b(?:authori[sz]\w*|approv\w*|sign[ -]?off|owner)\b/i.test(source);
+  if (release) return "Authorize the production release";
+  const stripped = (title || firstUsefulSentence(body) || "Review this decision")
+    .replace(/^(?:please|can you|could you|would you)\s+/i, "")
+    .replace(/\s*\(\d+\s+open\)\s*$/i, "")
+    .replace(/^(?:question\s+\d+|needs? your (?:call|decision))[: -]*/i, "")
+    .trim();
+  return clampText(stripped || "Review this decision", 120);
+}
+
+function ownerDecisionFact(question, { kind = null, hasVerifiedOwnerBlocker = false } = {}) {
+  const body = cleanOwnerCopy(question?.body, 500);
+  const context = cleanOwnerCopy(question?.askContext, 500);
+  const source = body || context;
+  if (source) {
+    const sentences = source.split(/(?<=[.!?])\s+/).map((part) => part.trim()).filter(Boolean);
+    const consequence = sentences.find((part) => /\b(?:can't|cannot|won't|stops?|blocked|paused|waiting|until|requires?|needs?)\b/i.test(part));
+    if (consequence) return clampText(consequence, 220);
+    if (hasVerifiedOwnerBlocker) return "The session is waiting for your authorization before it can continue.";
+  }
+  if (kind === "prompt" || kind === "agent-card") return "The agent is paused on this permission card; your choice controls the next action.";
+  if (kind === "merge_ready") return "This decision changes the repository; the current checks and head are shown in Context.";
+  if (kind === "ci_failed") return "The pull request cannot move forward until the failing checks or rebase are resolved.";
+  if (kind === "session-error") return "The session reported an error and needs your direction before work can resume.";
+  if (kind === "completed") return "The session finished without a verified owner blocker.";
+  return "The agent is waiting for your answer before it can continue.";
+}
+
+function questionHasVerifiedOwnerBlocker(question, { kind = null } = {}) {
+  if (question?.meta?.ownerBlocker === true || question?.ownerBlocker === true) return true;
+  if (kind !== "completed") return false;
+  const source = [question?.title, question?.body, question?.askContext, question?.card].filter(Boolean).join(" ");
+  return OWNER_BLOCKER_RE.test(source) && !NO_ACTION_COMPLETION_RE.test(source);
+}
+
+export function needsOwnerDecision(question, { kind = question?.kind ?? null } = {}) {
+  if (!question || question.status && question.status !== "open") return false;
+  const verifiedBlocker = questionHasVerifiedOwnerBlocker(question, { kind });
+  if (kind === "completed" && !verifiedBlocker) return false;
+  if (kind === "suggestion" && question.meta?.plan?.nextAction == null) return false;
+  return true;
+}
+
+export function buildOwnerDecision(question, { kind = question?.kind ?? null, primaryAction = null } = {}) {
+  const verifiedBlocker = questionHasVerifiedOwnerBlocker(question, { kind: question?.kind ?? kind });
+  const needsYou = needsOwnerDecision(question, { kind });
+  const itemIds = Array.isArray(question?.meta?.itemIds) ? question.meta.itemIds.map(String) : [];
+  const activeItemId = question?.meta?.itemId ? String(question.meta.itemId) : null;
+  const source = {
+    questionId: question?.id ?? null,
+    threadKey: question?.threadKey ?? null,
+    threadKeys: Array.isArray(question?.threadKeys) ? question.threadKeys : [],
+    ...(question?.meta?.app ? { app: String(question.meta.app) } : {}),
+    ...(question?.meta?.cardId ? { cardId: String(question.meta.cardId) } : {}),
+    ...(activeItemId ? { itemId: activeItemId } : {})
+  };
+  const action = primaryAction ? {
+    op: primaryAction.op ?? null,
+    ...(primaryAction.value != null ? { value: primaryAction.value } : {}),
+    ...(primaryAction.label ? { label: primaryAction.label } : {})
+  } : null;
+  const remaining = itemIds.filter((id) => id !== activeItemId);
+  const decisionItems = Array.isArray(question?.meta?.items)
+    ? question.meta.items.map((item) => ({
+        itemId: item?.itemId ? String(item.itemId) : null,
+        source: item?.source && typeof item.source === "object" ? item.source : source,
+        headline: cleanOwnerCopy(item?.question, 180) || ownerActionHeadline(question, { kind }),
+        options: Array.isArray(item?.options) ? item.options.map((option) => String(option)).filter(Boolean) : [],
+        multiSelect: item?.multiSelect === true,
+        freeText: item?.freeText === true,
+        active: item?.itemId != null && String(item.itemId) === activeItemId
+      }))
+    : [];
+  return {
+    needsYou,
+    ownerBlocker: verifiedBlocker,
+    decisionHeadline: ownerActionHeadline(question, { kind }),
+    decisionFact: ownerDecisionFact(question, { kind, hasVerifiedOwnerBlocker: verifiedBlocker }),
+    decisionSource: source,
+    decisionAction: action,
+    ...(decisionItems.length ? { decisionItems } : {}),
+    ...(remaining.length ? { remainingItemIds: remaining } : {})
+  };
+}
+
 const OPTION_LABELS = Object.freeze({
   yes: "Approve",
   no: "Decline",
@@ -91,10 +201,13 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
     return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
   }
   if (question.kind === "completed") {
+    if (questionHasVerifiedOwnerBlocker(question, { kind: "completed" })) {
+      return { kind: "blocker", kindLabel: "Owner blocker", rank: 0 };
+    }
     return { kind: "completed", kindLabel: "Finished", rank: 2 };
   }
   if (question.kind === "session-error") {
-    return { kind: "blocker", kindLabel: "Session Error", rank: 1 };
+    return { kind: "blocker", kindLabel: "Session Error", rank: 0 };
   }
   if (question.meta?.hasPlanArtifact || (Array.isArray(question.options) && question.options.some((o) => /^proceed$/i.test(String(o))))) {
     return { kind: "approval", kindLabel: "Plan Ready", rank: 0 };
@@ -654,6 +767,7 @@ export function buildSupervisorCard(
 
   const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef, prMeta);
+  const ownerDecision = buildOwnerDecision(question, { kind, primaryAction });
   const distinctTitle = cleanSessionTitle(row?.title)
     || cleanSessionTitle(thread?.title)
     || cleanSessionTitle(snap?.threadTitle);
@@ -774,6 +888,7 @@ export function buildSupervisorCard(
     kindLabel,
     rank,
     headline,
+    ...ownerDecision,
     sessionTitle,
     summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
     recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
@@ -1229,13 +1344,18 @@ export function buildSupervisorDeck(
   const questions = Array.isArray(state?.questions) ? state.questions : [];
   const aliasOverride = projectAliases ? { projectAliases } : null;
 
-  const questionCards = questions
+  const allQuestionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
     .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
+  const questionCards = allQuestionCards.filter((card) => card.needsYou !== false);
 
   const prefCards = buildProgressivePreferenceCards(prefs, { now });
   const cards = [...questionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
+    ...card,
+    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null, aliasOverride)
+  }));
+  const allCards = [...allQuestionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
     ...card,
     project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null, aliasOverride)
   }));
@@ -1245,7 +1365,9 @@ export function buildSupervisorDeck(
   const catchUpSummary = buildCatchUpSummary(cards, activeSummary);
 
   return {
-    cards,
+    // Keep non-actionable completion cards addressable for Context/Inspect and
+    // the explicit archive flow; clients filter them from Needs You by needsYou.
+    cards: allCards,
     preferences: {
       mergePolicy: prefs.mergePolicy,
       cadence: prefs.cadence,
