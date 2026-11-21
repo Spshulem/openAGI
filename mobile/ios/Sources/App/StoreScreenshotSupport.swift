@@ -61,6 +61,15 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
         case "/workspace/skills": object = ["skills": []]
         case "/workspace/jobs": object = ["jobs": []]
         case "/workspace/integrations": object = ["integrations": []]
+        // The iPad layout shows the conversation list beside the chat; without
+        // this it read "Conversation list unavailable" in the store image.
+        case "/conversations":
+            object = ["conversations": [
+                ["id": "main", "thread": "agent", "title": "Plan my morning",
+                 "preview": "Let's keep it simple", "updatedAt": Self.date, "messageCount": 2, "readOnly": false],
+                ["id": "main", "thread": "supervisor", "title": "Supervisor",
+                 "preview": "Start a conversation", "updatedAt": Self.date, "messageCount": 0, "readOnly": false]
+            ]]
         case let path where path.hasPrefix("/conversations/"):
             object = ["thread": "agent", "messages": [
                 ["id": "morning-question", "role": "user", "at": Self.date,
