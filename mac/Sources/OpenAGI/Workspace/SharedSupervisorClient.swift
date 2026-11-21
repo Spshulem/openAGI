@@ -494,10 +494,12 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var isSending = false
   @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
   @Published private(set) var streamingReplyText: String? = nil
-  /// The assistant messages already shown when the current reply started.
-  /// One outside it is this reply, saved by the server and pulled in by a
+  /// The assistant messages already shown when the current reply started,
+  /// and the question it answers. A new assistant message right after that
+  /// question is this reply, saved by the server and pulled in by a
   /// transcript sync before the stream ended.
   @Published private(set) var replyBaselineIds: Set<String> = []
+  @Published private(set) var replyPromptText: String? = nil
   @Published private(set) var progressStage: String? = nil
   @Published private(set) var activeModelId: String? = nil
   @Published private(set) var activeProvider: String? = nil
@@ -657,17 +659,28 @@ final class SharedSupervisorClient: ObservableObject {
   /// The reply's newest streamed text to draw, or nil once the transcript
   /// already holds this reply (one bubble, never two).
   var liveReplyText: String? {
-    Self.liveReplyText(streaming: streamingReplyText, messages: messages, baseline: replyBaselineIds)
+    Self.liveReplyText(streaming: streamingReplyText, messages: messages, baseline: replyBaselineIds, prompt: replyPromptText)
   }
 
-  nonisolated static func liveReplyText(streaming: String?, messages: [SyncedSupervisorMessage], baseline: Set<String>) -> String? {
+  nonisolated static func liveReplyText(streaming: String?, messages: [SyncedSupervisorMessage], baseline: Set<String>, prompt: String?) -> String? {
     guard let text = streaming, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-    if replyAlreadyShown(messages: messages, baseline: baseline) { return nil }
+    if replyAlreadyShown(messages: messages, baseline: baseline, prompt: prompt) { return nil }
     return text
   }
 
-  nonisolated static func replyAlreadyShown(messages: [SyncedSupervisorMessage], baseline: Set<String>) -> Bool {
-    messages.contains { $0.role == "assistant" && !baseline.contains($0.id) }
+  /// True only for a new assistant message that directly follows this turn's
+  /// own question. A Quick Ask mirrored in meanwhile, or older history a
+  /// sync brings back, answers something else and leaves the stream showing.
+  nonisolated static func replyAlreadyShown(messages: [SyncedSupervisorMessage], baseline: Set<String>, prompt: String?) -> Bool {
+    let asked = prompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !asked.isEmpty,
+          let question = messages.lastIndex(where: { $0.role == "user" && $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == asked })
+    else { return false }
+    for message in messages[(question + 1)...] {
+      if message.role == "user" { return false }
+      if message.role == "assistant" && !baseline.contains(message.id) { return true }
+    }
+    return false
   }
 
   func refreshMessages() async {
@@ -753,6 +766,7 @@ final class SharedSupervisorClient: ObservableObject {
     progressStage = "queued"
 
     let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+    replyPromptText = displayText
     let localId = "local_\(UUID().uuidString)"
     let optimistic = SyncedSupervisorMessage(
       id: localId,
@@ -800,7 +814,7 @@ final class SharedSupervisorClient: ObservableObject {
       }
       // A sync during the stream may already have brought the saved reply.
       if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty,
-         !Self.replyAlreadyShown(messages: messages, baseline: previousAssistantIds) {
+         !Self.replyAlreadyShown(messages: messages, baseline: previousAssistantIds, prompt: displayText) {
         messages.append(SyncedSupervisorMessage(
           id: "local_reply_\(UUID().uuidString)",
           role: "assistant",
