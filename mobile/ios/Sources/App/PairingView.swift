@@ -37,6 +37,14 @@ struct PairingView: View {
         self.onPaired = onPaired
     }
 
+    private func scrollToCode(_ scroll: ScrollViewProxy) {
+        Task { @MainActor in
+            // After the keyboard's own animation (about 0.3 s).
+            try? await Task.sleep(for: .milliseconds(350))
+            withAnimation { scroll.scrollTo("pairing-code", anchor: .center) }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ScrollViewReader { scroll in
@@ -109,6 +117,9 @@ struct PairingView: View {
                                 Button {
                                     serverText = server.address.absoluteString
                                     discovery.stop()
+                                    // Scrolled again once the list collapses and the
+                                    // keyboard is up (onChange below): this frame's
+                                    // layout is about to change under it.
                                     scroll.scrollTo("pairing-code", anchor: .center)
                                     codeFocused = true
                                     Task { await triggerMacPairingPopup(for: server.address) }
@@ -234,6 +245,16 @@ struct PairingView: View {
                     }
                 }
                 .onDisappear { discovery.stop() }
+                // Selecting a server removes the result rows, raises the
+                // number pad and may add a notice above the code, all after
+                // the first scroll. Bring the code into view again once each
+                // settles, so it never ends up under the keyboard.
+                .onChange(of: codeFocused) { _, focused in
+                    if focused { scrollToCode(scroll) }
+                }
+                .onChange(of: promptNotice) { _, _ in
+                    if codeFocused { scrollToCode(scroll) }
+                }
                 .toolbar {
                     if let onCancel {
                         ToolbarItem(placement: .cancellationAction) {
