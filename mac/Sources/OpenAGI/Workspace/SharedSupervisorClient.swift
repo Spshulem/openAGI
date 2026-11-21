@@ -494,6 +494,10 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var isSending = false
   @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
   @Published private(set) var streamingReplyText: String? = nil
+  /// The assistant messages already shown when the current reply started.
+  /// One outside it is this reply, saved by the server and pulled in by a
+  /// transcript sync before the stream ended.
+  @Published private(set) var replyBaselineIds: Set<String> = []
   @Published private(set) var progressStage: String? = nil
   @Published private(set) var activeModelId: String? = nil
   @Published private(set) var activeProvider: String? = nil
@@ -650,6 +654,22 @@ final class SharedSupervisorClient: ObservableObject {
     }
   }
 
+  /// The reply's newest streamed text to draw, or nil once the transcript
+  /// already holds this reply (one bubble, never two).
+  var liveReplyText: String? {
+    Self.liveReplyText(streaming: streamingReplyText, messages: messages, baseline: replyBaselineIds)
+  }
+
+  nonisolated static func liveReplyText(streaming: String?, messages: [SyncedSupervisorMessage], baseline: Set<String>) -> String? {
+    guard let text = streaming, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    if replyAlreadyShown(messages: messages, baseline: baseline) { return nil }
+    return text
+  }
+
+  nonisolated static func replyAlreadyShown(messages: [SyncedSupervisorMessage], baseline: Set<String>) -> Bool {
+    messages.contains { $0.role == "assistant" && !baseline.contains($0.id) }
+  }
+
   func refreshMessages() async {
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
@@ -727,6 +747,7 @@ final class SharedSupervisorClient: ObservableObject {
   private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
+    replyBaselineIds = previousAssistantIds
     lastError = nil
     streamingReplyText = nil
     progressStage = "queued"
@@ -777,7 +798,9 @@ final class SharedSupervisorClient: ObservableObject {
           continue
         }
       }
-      if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty {
+      // A sync during the stream may already have brought the saved reply.
+      if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty,
+         !Self.replyAlreadyShown(messages: messages, baseline: previousAssistantIds) {
         messages.append(SyncedSupervisorMessage(
           id: "local_reply_\(UUID().uuidString)",
           role: "assistant",
