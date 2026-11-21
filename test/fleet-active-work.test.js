@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
+import { parseUntrustedTranscriptSignals } from "../src/fleet/active-work.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
@@ -778,6 +779,23 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === progressItem.item.id).lastMeaningfulProgressAt, freshProgress);
     assert.equal(ctx.outreach.items.some((entry) => entry.sourceRef?.id === progressItem.item.id && ["unseen", "seen"].includes(entry.status)), false);
 
+    const refreshedThreadKey = "paseo:srv_mac.refreshed-session";
+    ctx.supervisor.lastThreads.set(refreshedThreadKey, {
+      key: refreshedThreadKey,
+      kind: "paseo",
+      agentStatus: "idle",
+      workspace: "RefreshState",
+      meta: { serverId: "srv_mac" }
+    });
+    ctx.supervisor.recordDiscoveredThread({
+      key: refreshedThreadKey,
+      kind: "paseo",
+      agentStatus: "running",
+      workspace: "RefreshState",
+      meta: { serverId: "srv_mac" }
+    });
+    assert.equal(ctx.supervisor.lastThreads.get(refreshedThreadKey).agentStatus, "running");
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });
@@ -903,6 +921,10 @@ test("treats transcripts as untrusted, blocks disallowed nudge permissions, and 
   const archiveCalls = [];
   const ctx = seedRepresentativeFixtures({ decisionsFetch, paseoArchiveCalls: archiveCalls });
   try {
+    const zeroFailures = parseUntrustedTranscriptSignals("All done. 0 failing checks.");
+    assert.equal(zeroFailures.claimsBlocked, false);
+    assert.equal(zeroFailures.claimsCompletion, true);
+
     // 1. Disallowed permissions (customer_outreach, auto_merge, auto_archive, spawn_agent) are stripped
     const tracked = ctx.supervisor.trackWork({
       project: "SecurityCheck",

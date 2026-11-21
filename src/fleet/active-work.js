@@ -301,9 +301,13 @@ export function parseUntrustedTranscriptSignals(rawText) {
     }
   }
 
+  // A completion report often says "0 failing checks". Remove an explicit
+  // zero/no-failure phrase before matching blocker language so it cannot
+  // override the numeric zero and suppress owner verification.
+  const blockerText = sanitized.replace(/\b(?:0|zero|no)\s+(?:failing|failed|failure|failures)(?:\s+checks?)?\b/gi, "");
   const claimsBlocked = Boolean(
     (observedRemainingCount !== null && observedRemainingCount > 0)
-    || /\b(blocked\s+on|still\s+blocked|cannot\s+proceed|failing\s+checks?|missing\s+credentials?|staging\s+blocked)\b/i.test(sanitized)
+    || /\b(blocked\s+on|still\s+blocked|cannot\s+proceed|failing\s+checks?|missing\s+credentials?|staging\s+blocked)\b/i.test(blockerText)
   );
 
   const claimsCompletion = !claimsBlocked && (
@@ -1706,6 +1710,27 @@ export class ActiveWorkManager {
                 }]);
               }
             }
+          }
+          for (const trackedPr of status?.trackedPrs ?? []) {
+            if (!trackedPr?.ref) continue;
+            const prevPr = prsByRef.get(trackedPr.ref.toLowerCase()) ?? null;
+            prsByRef.set(trackedPr.ref.toLowerCase(), {
+              ...prevPr,
+              ref: trackedPr.ref,
+              url: trackedPr.url ?? prevPr?.url ?? null,
+              title: trackedPr.title ?? prevPr?.title ?? null,
+              state: trackedPr.state ?? prevPr?.state ?? null,
+              isDraft: Boolean(trackedPr.isDraft),
+              mergeState: trackedPr.mergeState ?? prevPr?.mergeState ?? null,
+              ci: { state: trackedPr.ciState ?? "NONE", failing: trackedPr.failingChecks ?? [] },
+              ciState: trackedPr.ciState ?? "NONE",
+              headOid: trackedPr.headOid ?? prevPr?.headOid ?? null,
+              headSha: trackedPr.headSha ?? prevPr?.headSha ?? null,
+              updatedAt: trackedPr.updatedAt ?? prevPr?.updatedAt ?? null,
+              mergedAt: trackedPr.mergedAt ?? prevPr?.mergedAt ?? null,
+              closedAt: trackedPr.closedAt ?? prevPr?.closedAt ?? null,
+              orphaned: false
+            });
           }
           for (const mergedPr of status?.recentlyMerged ?? []) {
             if (!mergedPr?.ref) continue;

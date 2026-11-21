@@ -2272,6 +2272,11 @@ export class FleetSupervisor {
       }
     };
     setBounded(this.knownThreads, thread.key, merged);
+    // Live inventory refreshes can arrive through listWorkspaces while the
+    // previous tick's snapshot is still in lastThreads. Keep both caches in
+    // sync so the next digest does not let the stale tick overwrite fresh
+    // running/idle state.
+    if (this.lastThreads.has(thread.key)) setBounded(this.lastThreads, thread.key, merged);
     return merged;
   }
 

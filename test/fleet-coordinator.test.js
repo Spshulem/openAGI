@@ -230,6 +230,28 @@ test("listWorkspaces, readChatTranscript, inspectRepoStatus, startPaseoSession, 
         stderr: ""
       };
     }
+    if (joined.includes("pr view") && joined.includes("425")) {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          number: 425,
+          title: "closed without merge",
+          state: "CLOSED",
+          headRefName: "spencer/closed-orphan",
+          baseRefName: "main",
+          isDraft: false,
+          headRefOid: "closed425",
+          mergeStateStatus: "UNKNOWN",
+          reviewDecision: null,
+          statusCheckRollup: [],
+          updatedAt: "2026-11-16T15:00:00Z",
+          closedAt: "2026-11-16T15:00:00Z",
+          mergedAt: null,
+          url: "https://github.com/acme/recorder-app/pull/425"
+        }),
+        stderr: ""
+      };
+    }
     if (joined.includes("pr merge")) {
       mergedPrs.push(joined);
       return { code: 0, stdout: "Merged", stderr: "" };
@@ -288,6 +310,16 @@ test("listWorkspaces, readChatTranscript, inspectRepoStatus, startPaseoSession, 
   assert.equal(pr426.orphaned, true, "#426 has no loaded active session");
   assert.equal(repoStatus.recentlyMerged[0].number, 279);
   assert.equal(repoStatus.releases[0].tag, "v1.8.2");
+
+  sup.trackWork({
+    project: "recorder-app",
+    repo: "acme/recorder-app",
+    prRef: "acme/recorder-app#425",
+    goal: "Follow through on closed orphan PR",
+    doneCriteria: "Closed PR outcome recorded"
+  });
+  const closedStatus = await sup.inspectRepoStatus({ repo: "acme/recorder-app" });
+  assert.equal(closedStatus.trackedPrs.find((p) => p.number === 425).state, "CLOSED");
 
   // 4. startPaseoSession automatically targets srv_mac:/Users/dev/Dev/recorder-app with ready codex/gpt-5.4
   const started = await sup.startPaseoSession({
