@@ -552,7 +552,10 @@ final class NativeNavigationTests: XCTestCase {
             result.tap()
             let title = kind == "agent" ? "Chat" : "Supervisor chat"
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
-            XCTAssertTrue(app.staticTexts["Earlier synthetic question"].isHittable)
+            let question = app.staticTexts["Earlier synthetic question"]
+            let questionHittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: question)
+            XCTAssertEqual(XCTWaiter.wait(for: [questionHittable], timeout: 5), .completed)
+            XCTAssertTrue(question.isHittable)
             XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].isHittable)
             XCTAssertFalse(app.buttons["chat-jump-latest"].exists,
                            "Selecting an already-visible result must not create a redundant jump button")
