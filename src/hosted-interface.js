@@ -4944,8 +4944,11 @@ export function withLiveApprovalStatus(session, store) {
           ...message.metadata,
           pendingApprovals: cards.map((card) => {
             const action = typeof card?.id === "string" ? store?.get?.(card.id) ?? null : null;
+            // A card the owner's later instruction ran is closed as denied
+            // "superseded": it did run, so it must not read "Nothing was run."
             const status = !action ? "unknown"
               : action.status === "approved" && action.error != null ? "failed"
+              : action.status === "denied" && /^superseded\b/.test(String(action.error ?? "")) ? "superseded"
               : action.status;
             return { ...card, status, ...(action?.expiresAt ? { expiresAt: action.expiresAt } : {}) };
           })
@@ -6899,6 +6902,7 @@ function chatApprovalStateLabel(status) {
     approved: "Approved.",
     failed: "Approved, but it failed.",
     denied: "Denied. Nothing was run.",
+    superseded: "Already run from your later message.",
     expired: "Expired. Ask again to retry.",
     interrupted: "Interrupted. Ask again to retry."
   })[status] ?? "No longer available.";
