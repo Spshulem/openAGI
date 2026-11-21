@@ -432,6 +432,56 @@ public struct FleetDecision: Decodable, Sendable, Equatable {
     }
 }
 
+public struct SupervisorDecisionSource: Decodable, Sendable, Equatable {
+    public var questionId: String?
+    public var threadKey: String?
+    public var threadKeys: [String]
+    public var app: String?
+    public var cardId: String?
+    public var itemId: String?
+
+    private enum CodingKeys: String, CodingKey { case questionId, threadKey, threadKeys, app, cardId, itemId }
+
+    public init(questionId: String? = nil, threadKey: String? = nil, threadKeys: [String] = [], app: String? = nil, cardId: String? = nil, itemId: String? = nil) {
+        self.questionId = questionId; self.threadKey = threadKey; self.threadKeys = threadKeys
+        self.app = app; self.cardId = cardId; self.itemId = itemId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        questionId = c.lenient(String.self, .questionId)
+        threadKey = c.lenient(String.self, .threadKey)
+        threadKeys = c.lenientList(String.self, .threadKeys)
+        app = c.lenient(String.self, .app)
+        cardId = c.lenient(String.self, .cardId)
+        itemId = c.lenient(String.self, .itemId)
+    }
+}
+
+public struct FleetDecisionItem: Decodable, Sendable, Equatable, Identifiable {
+    public var itemId: String?
+    public var source: SupervisorDecisionSource?
+    public var headline: String
+    public var options: [String]
+    public var multiSelect: Bool
+    public var freeText: Bool
+    public var active: Bool
+    public var id: String { itemId ?? headline }
+
+    private enum CodingKeys: String, CodingKey { case itemId, source, headline, options, multiSelect, freeText, active }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        itemId = c.lenient(String.self, .itemId)
+        source = c.lenient(SupervisorDecisionSource.self, .source)
+        headline = c.lenient(String.self, .headline) ?? "Owner decision"
+        options = c.lenientList(String.self, .options)
+        multiSelect = c.lenient(Bool.self, .multiSelect) ?? false
+        freeText = c.lenient(Bool.self, .freeText) ?? false
+        active = c.lenient(Bool.self, .active) ?? false
+    }
+}
+
 public struct FleetQuestion: Decodable, Sendable, Equatable, Identifiable {
     public var id: String
     public var title: String?
@@ -442,9 +492,19 @@ public struct FleetQuestion: Decodable, Sendable, Equatable, Identifiable {
     public var threadKeys: [String]?
     public var prRef: String?
     public var createdAt: Date?
+    public var needsYou: Bool
+    public var decisionHeadline: String?
+    public var decisionFact: String?
+    public var decisionSource: SupervisorDecisionSource?
+    public var decisionAction: SupervisorCardAction?
+    public var remainingItemIds: [String]
+    public var decisionItems: [FleetDecisionItem]
 
     public init(id: String, title: String? = nil, body: String? = nil, options: [String] = [], kind: String? = nil,
-                threadKey: String? = nil, threadKeys: [String]? = nil, prRef: String? = nil, createdAt: Date? = nil) {
+                threadKey: String? = nil, threadKeys: [String]? = nil, prRef: String? = nil, createdAt: Date? = nil,
+                needsYou: Bool = true, decisionHeadline: String? = nil, decisionFact: String? = nil,
+                decisionSource: SupervisorDecisionSource? = nil, decisionAction: SupervisorCardAction? = nil,
+                remainingItemIds: [String] = [], decisionItems: [FleetDecisionItem] = []) {
         self.id = id
         self.title = title
         self.body = body
@@ -454,10 +514,12 @@ public struct FleetQuestion: Decodable, Sendable, Equatable, Identifiable {
         self.threadKeys = threadKeys
         self.prRef = prRef
         self.createdAt = createdAt
+        self.needsYou = needsYou; self.decisionHeadline = decisionHeadline; self.decisionFact = decisionFact
+        self.decisionSource = decisionSource; self.decisionAction = decisionAction; self.remainingItemIds = remainingItemIds; self.decisionItems = decisionItems
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, body, options, kind, threadKey, threadKeys, prRef, createdAt
+        case id, title, body, options, kind, threadKey, threadKeys, prRef, createdAt, needsYou, decisionHeadline, decisionFact, decisionSource, decisionAction, remainingItemIds, decisionItems
     }
 
     public init(from decoder: Decoder) throws {
@@ -471,6 +533,13 @@ public struct FleetQuestion: Decodable, Sendable, Equatable, Identifiable {
         threadKeys = c.lenient([String].self, .threadKeys)
         prRef = c.lenient(String.self, .prRef)
         createdAt = c.lenient(Date.self, .createdAt)
+        needsYou = c.lenient(Bool.self, .needsYou) ?? true
+        decisionHeadline = c.lenient(String.self, .decisionHeadline)
+        decisionFact = c.lenient(String.self, .decisionFact)
+        decisionSource = c.lenient(SupervisorDecisionSource.self, .decisionSource)
+        decisionAction = c.lenient(SupervisorCardAction.self, .decisionAction)
+        remainingItemIds = c.lenientList(String.self, .remainingItemIds)
+        decisionItems = c.lenientList(FleetDecisionItem.self, .decisionItems)
     }
 }
 
@@ -872,6 +941,13 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var kindLabel: String?
     public var slice: String?
     public var headline: String
+    public var needsYou: Bool
+    public var decisionHeadline: String?
+    public var decisionFact: String?
+    public var decisionSource: SupervisorDecisionSource?
+    public var decisionAction: SupervisorCardAction?
+    public var remainingItemIds: [String]
+    public var decisionItems: [FleetDecisionItem]
     public var sessionTitle: String?
     public var summary: String?
     public var brief: SupervisorCardBrief?
@@ -910,7 +986,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var labels: [String]
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
-                slice: String? = nil, headline: String, sessionTitle: String? = nil,
+                slice: String? = nil, headline: String, needsYou: Bool = true, decisionHeadline: String? = nil,
+                decisionFact: String? = nil, decisionSource: SupervisorDecisionSource? = nil,
+                decisionAction: SupervisorCardAction? = nil, remainingItemIds: [String] = [], decisionItems: [FleetDecisionItem] = [], sessionTitle: String? = nil,
                 summary: String? = nil, brief: SupervisorCardBrief? = nil, suggestedReplies: [String] = [],
                 canReply: Bool? = nil, agentSummary: String? = nil, recommendation: String? = nil,
                 threadKey: String? = nil, threadKeys: [String] = [], repo: String? = nil, branch: String? = nil,
@@ -929,6 +1007,13 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.kindLabel = kindLabel
         self.slice = slice
         self.headline = headline
+        self.needsYou = needsYou
+        self.decisionHeadline = decisionHeadline
+        self.decisionFact = decisionFact
+        self.decisionSource = decisionSource
+        self.decisionAction = decisionAction
+        self.remainingItemIds = remainingItemIds
+        self.decisionItems = decisionItems
         self.sessionTitle = sessionTitle
         self.summary = summary
         self.brief = brief
@@ -968,7 +1053,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, questionId, kind, kindLabel, slice, headline, sessionTitle, summary, brief, suggestedReplies, canReply, agentSummary, recommendation
+        case id, questionId, kind, kindLabel, slice, headline, needsYou, decisionHeadline, decisionFact, decisionSource, decisionAction, remainingItemIds, decisionItems, sessionTitle, summary, brief, suggestedReplies, canReply, agentSummary, recommendation
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
         case prContext, recentMessages, timeline, resources, openChat, project, plan
@@ -983,6 +1068,13 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         kindLabel = c.lenient(String.self, .kindLabel)
         slice = c.lenient(String.self, .slice)
         headline = c.lenient(String.self, .headline) ?? "Needs review"
+        needsYou = c.lenient(Bool.self, .needsYou) ?? true
+        decisionHeadline = c.lenient(String.self, .decisionHeadline)
+        decisionFact = c.lenient(String.self, .decisionFact)
+        decisionSource = c.lenient(SupervisorDecisionSource.self, .decisionSource)
+        decisionAction = c.lenient(SupervisorCardAction.self, .decisionAction)
+        remainingItemIds = c.lenientList(String.self, .remainingItemIds)
+        decisionItems = c.lenientList(FleetDecisionItem.self, .decisionItems)
         sessionTitle = c.lenient(String.self, .sessionTitle)
         summary = c.lenient(String.self, .summary)
         brief = c.lenient(SupervisorCardBrief.self, .brief)

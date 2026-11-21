@@ -260,6 +260,34 @@ data class FleetDecision(
 )
 
 @Serializable
+data class FleetDecisionSource(
+    val questionId: String? = null,
+    val threadKey: String? = null,
+    val threadKeys: List<String> = emptyList(),
+    val app: String? = null,
+    val cardId: String? = null,
+    val itemId: String? = null,
+)
+
+@Serializable
+data class FleetDecisionItem(
+    val itemId: String? = null,
+    val source: FleetDecisionSource? = null,
+    val headline: String = "Owner decision",
+    val options: List<String> = emptyList(),
+    val multiSelect: Boolean = false,
+    val freeText: Boolean = false,
+    val active: Boolean = false,
+)
+
+@Serializable
+data class FleetCardAction(
+    val op: String? = null,
+    val label: String? = null,
+    val value: String? = null,
+)
+
+@Serializable
 data class FleetQuestion(
     val id: String = "",
     val title: String? = null,
@@ -288,6 +316,13 @@ data class FleetQuestion(
     // Absent (false) on a hub from before replies.
     val canReply: Boolean = false,
     val project: String? = null,
+    val needsYou: Boolean = true,
+    val decisionHeadline: String? = null,
+    val decisionFact: String? = null,
+    val decisionSource: FleetDecisionSource? = null,
+    val decisionAction: FleetCardAction? = null,
+    val remainingItemIds: List<String> = emptyList(),
+    val decisionItems: List<FleetDecisionItem> = emptyList(),
 ) {
     val answeredInAgentApp: Boolean get() = answerIn == "agent app" || (answerIn == null && "open thread" in options)
 }

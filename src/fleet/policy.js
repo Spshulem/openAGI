@@ -539,6 +539,14 @@ function cardIntent(ctx, card) {
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
+      items: items.map((open) => ({
+        itemId: String(open.itemId),
+        source: { app: card.app, cardId: String(card.cardId), itemId: String(open.itemId), threadKey: thread.key },
+        question: clampText(stripTags(open.question || open.header || "Owner decision"), 180),
+        options: open.options.map((option) => clampText(option, 80)),
+        multiSelect: open.multiSelect === true,
+        freeText: open.freeText === true
+      })),
       count: String(items.length), freeText: item.freeText ? "1" : "0", multiSelect: item.multiSelect ? "1" : "0", labels: [...item.options],
       ...(card.requestId ? { paseoPermissionId: String(card.requestId) } : {})
     },

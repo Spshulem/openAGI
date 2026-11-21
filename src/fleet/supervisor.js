@@ -23,7 +23,7 @@ import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
-import { buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel } from "./cards.js";
+import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
@@ -1262,7 +1262,7 @@ export class FleetSupervisor {
         project, actorLabel, subchannel, labels, nextCheckAt,
         pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
     });
-    return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.length } };
+    return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.filter((question) => needsOwnerDecision(question)).length } };
   }
 
   // One open question as the cards show it: when the agent asked (else when
@@ -1305,6 +1305,7 @@ export class FleetSupervisor {
       openChat,
       ...(chats.length ? { chats } : {}),
       risky: riskyQuestion(question),
+      ...buildOwnerDecision(question, { kind: question.kind }),
       // Takes the owner's own words (POST questions/:id { reply }).
       canReply: canReplyTo(question) || (isPaseoThread && ["agent-card", "prompt"].includes(question.kind))
     };
