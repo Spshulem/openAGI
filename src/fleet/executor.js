@@ -219,6 +219,18 @@ function isSelf(thread, config) {
   return isSelfThread(thread, config);
 }
 
+// Self sessions are never nudged by the supervisor itself (no self-loops).
+// The owner may still write to one, except the session hosting this process.
+const OWNER_DIRECTED = new Set(["owner-message", "owner-answer"]);
+export const SELF_HOST_BLOCK = "the session running this supervisor: a message would loop back into the turn that sent it";
+export const SELF_SESSION_BLOCK = "the supervisor's own session: it is not nudged automatically; only your own message is sent there";
+
+function selfBlock(thread, config, playbook) {
+  if (!isSelf(thread, config)) return null;
+  if (isSelfThread(thread, { selfSessionIds: config?.hostSessionIds ?? [] })) return SELF_HOST_BLOCK;
+  return OWNER_DIRECTED.has(playbook) ? null : SELF_SESSION_BLOCK;
+}
+
 // An app send blocked only because the owner is at the Mac. A send that left
 // our text in the composer ("...; our text is left as a draft") is not one:
 // a second route would duplicate it.
@@ -269,13 +281,14 @@ function antigravityBusy(thread) {
   return thread.agentStatus === "running" || ["RUNNING", "BUSY", "CANCELING"].includes(runStatusOf(thread.meta?.runStatus)) || thread.meta?.notFullyIdle === true;
 }
 
-function checkPreconditions(thread, route, message, config, fallback = false) {
+function checkPreconditions(thread, route, message, config, fallback = false, playbook = null) {
   if (!thread?.key) return "no thread";
   if (["paseo-migrated", "paseo-discovery-unavailable"].includes(thread.excluded) || (config?.paseo?.enabled && config.paseo.only && thread.kind !== "paseo")) return "chat is supervised through Paseo only";
   if (thread.kind === "paseo" && route !== "paseo-send") return "Paseo chats must use their native host and agent";
   if (!ROUTES.includes(route)) return "no delivery route";
   if (!String(message ?? "").trim()) return "empty message";
-  if (isSelf(thread, config)) return "the supervisor's own session";
+  const self = selfBlock(thread, config, playbook);
+  if (self) return self;
   if (thread.archived) return "archived";
   // On a computer-use-only Mac no send ever runs a CLI, whatever an older
   // proposal or caller asked for.
@@ -726,7 +739,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
     };
-    const reason = checkPreconditions(thread, route, message, config, Boolean(fallbackFrom));
+    const reason = checkPreconditions(thread, route, message, config, Boolean(fallbackFrom), playbook);
     // Only the app can queue a message behind a Conductor chat's background
     // tasks: a relay or resume would deliver it now.
     if (!reason && queue && route !== "computer-use" && (thread.kind === "conductor" || thread.meta?.conductorHost)) return blocked("queue needs the Conductor app: not sent another way");

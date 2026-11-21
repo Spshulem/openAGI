@@ -155,6 +155,26 @@ test("the supervisor never delivers to its own session", async (t) => {
   assert.equal(calls.length, 0);
 });
 
+test("the owner may write to a self-listed session; the supervisor never nudges it, and nobody loops into the hosting session", async (t) => {
+  const { cwd, calls, config, store } = setup(t);
+  const executor = createExecutor({ config: { ...config, selfSessionIds: ["s1", "host-1"], hostSessionIds: ["host-1"] }, run: async () => { calls.push(1); return { code: 0, stdout: "ok" }; }, store });
+  const live = { live: { peerName: "me", pid: 1, status: "idle" } };
+  // An autonomous nudge is refused with why.
+  const nudge = await executor.deliver({ thread: claudeThread(cwd, live), message: "continue", route: "peer-relay", playbook: "resume", dryRun: true });
+  assert.equal(nudge.status, "blocked");
+  assert.match(nudge.detail, /not nudged automatically/);
+  // The owner's own message goes through.
+  for (const playbook of ["owner-message", "owner-answer"]) {
+    const owner = await executor.deliver({ thread: claudeThread(cwd, live), message: "Pick up Active Work", route: "peer-relay", playbook, dryRun: true });
+    assert.equal(owner.status, "dry-run", playbook);
+  }
+  // The session this process runs inside: refused whoever asks.
+  const host = await executor.deliver({ thread: claudeThread(cwd, { ...live, id: "host-1", claudeSessionId: "host-1", key: "claude:host-1" }), message: "hi", route: "peer-relay", playbook: "owner-message", dryRun: true });
+  assert.equal(host.status, "blocked");
+  assert.match(host.detail, /loop back/);
+  assert.equal(calls.length, 0);
+});
+
 test("dry-run checks preconditions but never calls run", async (t) => {
   const { cwd, calls, store, executor } = setup(t);
   const ok = await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec", dryRun: true });
