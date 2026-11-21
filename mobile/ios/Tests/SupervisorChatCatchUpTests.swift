@@ -211,7 +211,11 @@ final class CatchUpDaemon: URLProtocol {
                 state.requestID = id
                 return state.stream
             }
-            client?.urlProtocol(self, didReceive: ok, cacheStoragePolicy: .notAllowed)
+            // The content type matters: without it URLSession holds the
+            // first bytes back to sniff one, and a hung stream shows nothing.
+            let sse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                      headerFields: ["Content-Type": "text/event-stream"])!
+            client?.urlProtocol(self, didReceive: sse, cacheStoragePolicy: .notAllowed)
             let frames = """
             event: status\ndata: {"stage":"queued"}\n\n\
             event: session\ndata: {"id":"devices:supervisor:main","messageCount":1}\n\n\
@@ -219,7 +223,12 @@ final class CatchUpDaemon: URLProtocol {
             """
             client?.urlProtocol(self, didLoad: Data(frames.utf8))
             if mode == .drops {
-                client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                // Later, as a real drop is: an error at once can overtake
+                // bytes the client has not read yet.
+                let client = self.client
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [self] in
+                    client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                }
             }
             return // `.hangs`: never finishes, never fails.
         }
