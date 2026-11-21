@@ -1157,6 +1157,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
         try {
+          if (body.OPENAGI_DAILY_USD_LIMIT !== undefined && runtime.budget?.setDailyLimit) {
+            const parsedLimit = Number.parseFloat(String(body.OPENAGI_DAILY_USD_LIMIT));
+            if (Number.isFinite(parsedLimit) && parsedLimit >= 0.5 && parsedLimit <= 10000) {
+              runtime.budget.setDailyLimit(parsedLimit);
+            }
+          }
           const { createModelProvider } = await import("./model-provider.js");
           if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|CLAUDE_CLI_|CODEX_CLI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
@@ -2426,6 +2432,56 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "POST" && pathname === "/budget") {
+        if (!runtime.budget) return sendJson(res, 503, { error: "no-budget" });
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_body", message: "Expected a JSON budget update." });
+        }
+        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus"]);
+        if (Object.keys(body).some((k) => !allowedKeys.has(k))) {
+          return sendJson(res, 400, { error: "unsupported_fields", message: "Unsupported budget fields." });
+        }
+        const hasLimit = body.dailyUsdLimit !== undefined && body.dailyUsdLimit !== null;
+        const hasBonus = body.addUsdToday !== undefined && body.addUsdToday !== null;
+        const hasReset = body.resetTodayBonus === true;
+        if (!hasLimit && !hasBonus && !hasReset) {
+          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit or addUsdToday." });
+        }
+        try {
+          if (hasLimit) {
+            const parsed = Number(body.dailyUsdLimit);
+            if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Daily budget limit must be between $0.50 and $10,000." });
+            }
+          }
+          if (hasBonus) {
+            const parsedBonus = Number(body.addUsdToday);
+            if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
+            }
+          }
+          if (hasLimit) {
+            runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));
+            process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { OPENAGI_DAILY_USD_LIMIT: String(runtime.budget.dailyUsdLimit) } });
+            } catch { /* runtime limit already updated */ }
+          }
+          if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+            runtime.budget.clearBonusToday();
+          }
+          if (hasBonus) {
+            runtime.budget.addBonusToday(Number(body.addUsdToday));
+          }
+          const updated = runtime.budget.status();
+          runtime.events?.emit?.("budget-updated", updated);
+          return sendJson(res, 200, updated);
+        } catch (error) {
+          return sendJson(res, 400, { error: "invalid_budget", message: String(error?.message ?? "Invalid budget update.") });
+        }
+      }
       if (method === "GET" && pathname === "/budget/ledger") {
         const ledger = runtime.budget?.ledger;
         if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
@@ -8075,11 +8131,13 @@ async function renderChannels() {
 
 async function renderBudget() {
   const b = await fetchJson("/budget");
-  const pct = Math.min(100, (b.spentUsd / Math.max(b.dailyUsdLimit, 0.0001)) * 100);
+  const effectiveLimit = Number(b.effectiveLimitUsd ?? b.dailyUsdLimit ?? 10);
+  const bonusUsdToday = Number(b.bonusUsdToday ?? 0);
+  const pct = Math.min(100, (b.spentUsd / Math.max(effectiveLimit, 0.0001)) * 100);
   const stateClass = pct > 90 ? "err" : pct > 70 ? "warn" : "ok";
   main.innerHTML = \`
     <div class="pane">
-      <h2>Credits</h2>
+      <h2>Credits &amp; Daily Budget</h2>
       <div class="card">
         <div class="row between" style="align-items:center;">
           <span class="name">Today · \${escapeHtml(b.today)}</span>
@@ -8090,11 +8148,34 @@ async function renderBudget() {
         </div>
       </div>
 
+      <div class="card" style="margin-top:12px;">
+        <div class="row between" style="align-items:center;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div class="name">Adjust budget</div>
+            <div class="desc">Add extra room just for today or change your daily limit immediately.</div>
+          </div>
+          <div class="row" style="gap:8px;flex-wrap:wrap;">
+            <button class="btn" id="budgetAdd10Btn" type="button">+$10 today</button>
+            <button class="btn" id="budgetAdd25Btn" type="button">+$25 today</button>
+            \${bonusUsdToday > 0 ? '<button class="btn ghost" id="budgetResetBonusBtn" type="button">Reset today extra</button>' : ""}
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label class="desc" for="budgetDailyInput">Daily limit ($/day)</label>
+          <input id="budgetDailyInput" type="number" min="0.5" max="10000" step="0.5" value="\${Number(b.dailyUsdLimit ?? 10).toFixed(2)}" style="width:120px;" />
+          <button class="btn primary" id="budgetSaveLimitBtn" type="button">Save daily limit</button>
+          <button class="btn ghost" data-budget-preset="25" type="button">$25/day</button>
+          <button class="btn ghost" data-budget-preset="50" type="button">$50/day</button>
+          <button class="btn ghost" data-budget-preset="100" type="button">$100/day</button>
+          <span id="budgetSaveMsg" class="desc"></span>
+        </div>
+      </div>
+
       <h3>Today</h3>
       <div class="grid stats">
         <div class="card"><span class="desc">Spent</span><div class="stat-value">$\${b.spentUsd.toFixed(4)}</div></div>
         <div class="card"><span class="desc">Remaining</span><div class="stat-value">$\${b.remainingUsd.toFixed(4)}</div></div>
-        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}</div></div>
+        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}\${bonusUsdToday > 0 ? \` (+\$\${bonusUsdToday.toFixed(2)} today)\` : ""}</div></div>
         <div class="card"><span class="desc">Calls</span><div class="stat-value">\${b.calls}</div></div>
         <div class="card"><span class="desc">Input tokens</span><div class="stat-value">\${b.tokens.input.toLocaleString()}</div></div>
         <div class="card"><span class="desc">Output tokens</span><div class="stat-value">\${b.tokens.output.toLocaleString()}</div></div>
@@ -8104,7 +8185,7 @@ async function renderBudget() {
 
       <h3>Last 14 days</h3>
       <div id="budgetHistory" class="grid"></div>
-      <p class="desc" style="margin-top:12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+      <p class="desc" style="margin-top:12px;">Saved daily limits persist to <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code> and take effect immediately.</p>
       <h3>Spend over time (30 days)</h3>
       <div id="creditChart" class="card"></div>
       <h3>By activity (30 days)</h3>
@@ -8116,6 +8197,26 @@ async function renderBudget() {
     </div>
   \`;
   const hist = $("budgetHistory");
+  const applyBudgetPatch = async (patch) => {
+    const msg = $("budgetSaveMsg");
+    if (msg) msg.textContent = "Saving…";
+    try {
+      await postJson("/budget", patch);
+      await renderBudget();
+    } catch (err) {
+      if (msg) msg.textContent = err?.message || "Failed to update budget.";
+    }
+  };
+  $("budgetAdd10Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 10 }));
+  $("budgetAdd25Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 25 }));
+  $("budgetResetBonusBtn")?.addEventListener("click", () => applyBudgetPatch({ resetTodayBonus: true }));
+  $("budgetSaveLimitBtn")?.addEventListener("click", () => {
+    const val = Number.parseFloat($("budgetDailyInput")?.value ?? "");
+    applyBudgetPatch({ dailyUsdLimit: val });
+  });
+  for (const btn of main.querySelectorAll("[data-budget-preset]")) {
+    btn.addEventListener("click", () => applyBudgetPatch({ dailyUsdLimit: Number(btn.getAttribute("data-budget-preset")) }));
+  }
   for (const d of (b.history ?? [])) {
     const c = document.createElement("div");
     c.className = "card";

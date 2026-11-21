@@ -4046,8 +4046,9 @@ export class FleetSupervisor {
     // A thread whose git read or PR fetch failed this tick is unknown too: its
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
-    // A thread a capped scan deferred was not reassessed either.
-    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || deferred.has(key));
+    const historyUnknown = new Set([...byKey.values()].filter((thread) => thread?.excluded === "history-unavailable").map((thread) => thread.key));
+    // A thread a capped scan deferred or whose history read is still pending was not reassessed either.
+    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key) || historyUnknown.has(key) || deferred.has(key));
     // With no settled read remembered (a fresh start), an unread PR cannot
     // tell a merge that settled an ask from a live one: an ask the
     // supervisor already closed waits for GitHub instead of coming back.
@@ -4354,6 +4355,10 @@ export class FleetSupervisor {
       // An owner answer that started after the judge read (during the
       // review, the notifications, the kept answers, an earlier send or the
       // PR read just above) goes first: checked again right before each send.
+      if (decision.action === "nudge" && target?.meta?.paseoClosed) {
+        decision.reason = `${decision.reason}; held: Paseo session sleeping`;
+        continue;
+      }
       if (decision.action === "nudge" && (this.pushing.has(decision.threadKey) || this.ownerAnswerThreads(started).has(decision.threadKey))) {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;

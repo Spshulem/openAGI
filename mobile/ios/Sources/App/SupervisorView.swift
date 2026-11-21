@@ -89,7 +89,7 @@ struct SupervisorView: View {
     }
 
     private enum SupervisorSheet: String, Identifiable {
-        case board, sessions, preferences, conversations
+        case board, sessions, preferences, budget, conversations
         var id: String { rawValue }
     }
 
@@ -471,6 +471,11 @@ struct SupervisorView: View {
                                                 vetoSlice: vetoSlice, vetoActionID: vetoActionID)
                     }
                 )
+            case .budget:
+                NavigationStack {
+                    BudgetSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { activeSheet = nil } } }
+                }
             case .conversations:
                 NavigationStack {
                     ConversationBrowser(thread: $browserThread) { message in
@@ -800,6 +805,11 @@ struct SupervisorView: View {
                 activeSheet = .preferences
             }
             .accessibilityIdentifier("supervisor-preferences-button")
+
+            Button("Budget", systemImage: "dollarsign.circle") {
+                activeSheet = .budget
+            }
+            .accessibilityIdentifier("supervisor-budget-button")
 
             if let state {
                 Menu {

@@ -108,6 +108,8 @@ const EXACT = new Set([
   "POST /conversations",
   "GET /lifelog/moments",
   // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+  "GET /budget",
+  "POST /budget",
   "GET /settings/models",
   "POST /settings/models",
   "POST /settings/models/test",

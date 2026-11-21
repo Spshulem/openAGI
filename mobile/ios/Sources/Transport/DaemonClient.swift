@@ -1071,6 +1071,14 @@ extension DaemonClient {
         try await json(ModelTestResult.self, path: "/settings/models/test", method: "POST", body: Data("{}".utf8), timeout: 45)
     }
 
+    public func budget() async throws -> BudgetStatus {
+        try await json(BudgetStatus.self, path: "/budget", method: "GET")
+    }
+
+    public func updateBudget(_ update: BudgetUpdate) async throws -> BudgetStatus {
+        try await json(BudgetStatus.self, path: "/budget", method: "POST", body: try ProtocolDecoder.jsonEncoder.encode(update), timeout: 20)
+    }
+
     public func persona() async throws -> PersonaDocument {
         try await json(PersonaDocument.self, path: "/workspace/persona", method: "GET")
     }

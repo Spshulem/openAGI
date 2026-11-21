@@ -92,4 +92,26 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertEqual(card.plan?.nextAction, "Should automated retries cap backoff at 60s?")
         XCTAssertEqual(card.plan?.acceptance, "Cap retry delay at 60s.")
     }
+
+    func testBudgetProtocolAndExceededDetection() throws {
+        let json = """
+        {"today":"2026-11-21","dailyUsdLimit":10,"bonusUsdToday":10,"effectiveLimitUsd":20,
+         "spentUsd":10.42,"remainingUsd":9.58,"exceeded":false,"calls":38}
+        """
+        let status = try ProtocolDecoder.json.decode(BudgetStatus.self, from: Data(json.utf8))
+        XCTAssertEqual(status.effectiveLimit, 20)
+        XCTAssertFalse(status.isExceeded)
+
+        let encoded = try ProtocolDecoder.jsonEncoder.encode(BudgetUpdate(addUsdToday: 10))
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(Set(body.keys), ["addUsdToday"])
+        XCTAssertEqual(body["addUsdToday"] as? Double, 10)
+
+        let hit = ChatMessage(role: .assistant, text: "I couldn't complete that request: Daily budget exceeded")
+        let normal = ChatMessage(role: .assistant, text: "All tests passed.")
+        let userLine = ChatMessage(role: .user, text: "Daily budget exceeded?")
+        XCTAssertTrue(BudgetLimitPrompt.isBudgetExceeded(hit))
+        XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(normal))
+        XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(userLine))
+    }
 }

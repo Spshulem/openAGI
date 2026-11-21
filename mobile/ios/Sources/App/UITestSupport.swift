@@ -32,6 +32,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     }
     private static let decidedActions = OSAllocatedUnfairLock(initialState: Set<String>())
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
+    private static let budgetState = OSAllocatedUnfairLock(initialState: (dailyLimit: 10.0, bonusToday: 0.0, spent: 2.5))
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private struct ChatLine: Sendable {
         let id: String
@@ -186,6 +187,27 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                           "chatgpt": ["signedIn": false]]])
         case "/settings/models/test":
             finish(object: ["ok": true, "model": "demo-model"])
+        case "/budget":
+            if request.httpMethod == "POST", let body = Self.body(request),
+               let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                Self.budgetState.withLock { state in
+                    if let limit = payload["dailyUsdLimit"] as? Double { state.dailyLimit = limit }
+                    if payload["resetTodayBonus"] as? Bool == true { state.bonusToday = 0 }
+                    if let add = payload["addUsdToday"] as? Double { state.bonusToday += add }
+                }
+            }
+            let current = Self.budgetState.withLock { $0 }
+            let effective = current.dailyLimit + current.bonusToday
+            finish(object: [
+                "today": "2026-10-18",
+                "dailyUsdLimit": current.dailyLimit,
+                "bonusUsdToday": current.bonusToday,
+                "effectiveLimitUsd": effective,
+                "spentUsd": current.spent,
+                "remainingUsd": effective - current.spent,
+                "exceeded": current.spent >= effective,
+                "calls": 14
+            ])
         case "/workspace/persona":
             finish(object: ["markdown": "Synthetic instructions for the UI test."])
         case "/workspace/skills": finish(object: ["skills": []])
