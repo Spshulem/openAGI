@@ -1157,5 +1157,6 @@ final class SharedSupervisorClient: ObservableObject {
     if let token = AppState.shared.authToken(), !token.isEmpty {
       req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
+    req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
   }
 }

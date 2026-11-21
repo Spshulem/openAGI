@@ -100,6 +100,7 @@ public struct ModelTestResult: Decodable, Sendable, Equatable {
 
 public struct BudgetStatus: Decodable, Sendable, Equatable {
     public let today: String
+    public let timeZone: String?
     public let dailyUsdLimit: Double
     public let bonusUsdToday: Double?
     public let effectiveLimitUsd: Double?
@@ -121,11 +122,13 @@ public struct BudgetUpdate: Encodable, Sendable, Equatable {
     public var dailyUsdLimit: Double?
     public var addUsdToday: Double?
     public var resetTodayBonus: Bool?
+    public var timeZone: String?
 
-    public init(dailyUsdLimit: Double? = nil, addUsdToday: Double? = nil, resetTodayBonus: Bool? = nil) {
+    public init(dailyUsdLimit: Double? = nil, addUsdToday: Double? = nil, resetTodayBonus: Bool? = nil, timeZone: String? = nil) {
         self.dailyUsdLimit = dailyUsdLimit
         self.addUsdToday = addUsdToday
         self.resetTodayBonus = resetTodayBonus
+        self.timeZone = timeZone
     }
 }
 

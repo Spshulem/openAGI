@@ -2235,6 +2235,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
         let clientTurnId = null;
         try {
@@ -2431,22 +2434,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 202, { accepted: true });
       }
 
-      if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget") {
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      }
       if (method === "POST" && pathname === "/budget") {
         if (!runtime.budget) return sendJson(res, 503, { error: "no-budget" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
         const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
         if (!body || typeof body !== "object" || Array.isArray(body)) {
           return sendJson(res, 400, { error: "invalid_body", message: "Expected a JSON budget update." });
         }
-        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus"]);
+        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus", "timeZone"]);
         if (Object.keys(body).some((k) => !allowedKeys.has(k))) {
           return sendJson(res, 400, { error: "unsupported_fields", message: "Unsupported budget fields." });
         }
         const hasLimit = body.dailyUsdLimit !== undefined && body.dailyUsdLimit !== null;
         const hasBonus = body.addUsdToday !== undefined && body.addUsdToday !== null;
         const hasReset = body.resetTodayBonus === true;
-        if (!hasLimit && !hasBonus && !hasReset) {
-          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit or addUsdToday." });
+        const hasTimeZone = typeof body.timeZone === "string" && body.timeZone.trim().length > 0;
+        if (!hasLimit && !hasBonus && !hasReset && !hasTimeZone) {
+          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit, addUsdToday, or timeZone." });
         }
         try {
           if (hasLimit) {
@@ -2460,6 +2472,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
               return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
             }
+          }
+          if (hasTimeZone && typeof runtime.budget.setTimeZone === "function") {
+            runtime.budget.setTimeZone(body.timeZone.trim());
+            process.env.OPENAGI_TIMEZONE = runtime.budget.timeZone;
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { OPENAGI_TIMEZONE: runtime.budget.timeZone } });
+            } catch { /* runtime timezone already updated */ }
           }
           if (hasLimit) {
             runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));

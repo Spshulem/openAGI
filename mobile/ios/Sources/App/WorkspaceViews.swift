@@ -319,6 +319,50 @@ enum ModelSettingsErrorCopy {
 
 // MARK: - Budget
 
+enum BudgetSettingsErrorCopy {
+    static func title(for error: Error?) -> String {
+        guard let daemonError = error as? DaemonError else { return "Budget unavailable" }
+        if daemonError == .notFound {
+            return "Server update needed"
+        }
+        return "Budget unavailable"
+    }
+
+    static func loadMessage(for error: Error) -> String {
+        guard let daemonError = error as? DaemonError else {
+            return "Couldn't reach your agent. Check its connection, then retry."
+        }
+        switch daemonError {
+        case .notFound:
+            return "Your main OpenAGI server is on an older version that predates live budget controls. Update OpenAGI on your main server, then tap Retry."
+        case .mainConnection(let issue):
+            return issue.message
+        case .unauthorized:
+            return "Your server didn't authorize budget settings. Check its version and this phone's access in Connection Settings, then retry."
+        case .malformedResponse:
+            return "Your server returned budget data this app couldn't read. Update OpenAGI on the main server, then retry."
+        default:
+            return "Couldn't load the budget. Check your connection and retry."
+        }
+    }
+
+    static func saveMessage(for error: Error) -> String {
+        guard let daemonError = error as? DaemonError else {
+            return "Couldn't save the budget change. Check your connection and retry."
+        }
+        switch daemonError {
+        case .notFound:
+            return "Update OpenAGI on your main server first to change the budget from your phone."
+        case .mainConnection(let issue):
+            return issue.message
+        case .unauthorized:
+            return "Your server didn't authorize changing the budget. Check its version and Connection Settings."
+        default:
+            return "Couldn't save the budget change. Try again."
+        }
+    }
+}
+
 struct BudgetSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var budget: BudgetStatus?
@@ -326,7 +370,7 @@ struct BudgetSettingsView: View {
     @State private var customTopUp = ""
     @State private var isLoading = false
     @State private var isSaving = false
-    @State private var status: (text: String, isError: Bool)?
+    @State private var status: (title: String, text: String, isError: Bool)?
 
     private let presets: [Double] = [10, 25, 50, 100]
 
@@ -367,7 +411,11 @@ struct BudgetSettingsView: View {
                     .padding(.vertical, 4)
                     .accessibilityIdentifier("budget-summary")
                 } header: {
-                    Text("Today (\(budget.today))")
+                    if let tz = budget.timeZone, !tz.isEmpty {
+                        Text("Today (\(budget.today) · \(tz))")
+                    } else {
+                        Text("Today (\(budget.today))")
+                    }
                 }
 
                 Section {
@@ -389,7 +437,7 @@ struct BudgetSettingsView: View {
                         Button("Add today") {
                             let cleaned = customTopUp.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
                             guard let parsed = Double(cleaned), parsed >= 0.5, parsed <= 10000 else {
-                                status = ("Enter a top-up amount between $0.50 and $10,000.", true)
+                                status = ("Invalid amount", "Enter a top-up amount between $0.50 and $10,000.", true)
                                 return
                             }
                             Task {
@@ -435,7 +483,7 @@ struct BudgetSettingsView: View {
                         Button("Save") {
                             guard let parsed = Double(customLimit.trimmingCharacters(in: .whitespacesAndNewlines)),
                                   parsed >= 0.5, parsed <= 10000 else {
-                                status = ("Enter a daily limit between $0.50 and $10,000.", true)
+                                status = ("Invalid limit", "Enter a daily limit between $0.50 and $10,000.", true)
                                 return
                             }
                             Task { await apply(BudgetUpdate(dailyUsdLimit: parsed), success: String(format: "Daily limit set to $%.2f.", parsed)) }
@@ -456,7 +504,7 @@ struct BudgetSettingsView: View {
                 }
             } else if let status, !isLoading {
                 ContentUnavailableView {
-                    Label("Budget unavailable", systemImage: "dollarsign.circle")
+                    Label(status.title, systemImage: status.title == "Server update needed" ? "arrow.triangle.2.circlepath.circle" : "dollarsign.circle")
                 } description: {
                     Text(status.text)
                 } actions: {
@@ -486,10 +534,8 @@ struct BudgetSettingsView: View {
             customLimit = String(format: "%.2f", loaded.dailyUsdLimit)
         } catch is CancellationError {
             return
-        } catch let error as DaemonError where error == .notFound {
-            status = ("Update OpenAGI on your main server to view and edit the daily budget from here.", true)
         } catch {
-            status = ("Couldn't load the budget. Check your connection and retry.", true)
+            status = (BudgetSettingsErrorCopy.title(for: error), BudgetSettingsErrorCopy.loadMessage(for: error), true)
         }
     }
 
@@ -500,11 +546,9 @@ struct BudgetSettingsView: View {
             let updated = try await model.client.updateBudget(update)
             budget = updated
             customLimit = String(format: "%.2f", updated.dailyUsdLimit)
-            status = (success, false)
-        } catch let error as DaemonError where error == .notFound {
-            status = ("Update OpenAGI on your main server to change the budget from here.", true)
+            status = ("Updated", success, false)
         } catch {
-            status = ("Couldn't save the budget change. Try again.", true)
+            status = (BudgetSettingsErrorCopy.title(for: error), BudgetSettingsErrorCopy.saveMessage(for: error), true)
         }
     }
 }

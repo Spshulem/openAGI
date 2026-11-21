@@ -60,8 +60,10 @@ test("GET /budget and POST /budget are mobile-scoped, main-routed, update live r
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "budget-http-"));
   const prevDataDir = process.env.OPENAGI_DATA_DIR;
   const prevLimit = process.env.OPENAGI_DAILY_USD_LIMIT;
+  const prevTz = process.env.OPENAGI_TIMEZONE;
   process.env.OPENAGI_DATA_DIR = dataDir;
   process.env.OPENAGI_DAILY_USD_LIMIT = "10";
+  delete process.env.OPENAGI_TIMEZONE;
 
   let app;
   let runtime;
@@ -72,6 +74,8 @@ test("GET /budget and POST /budget are mobile-scoped, main-routed, update live r
     else process.env.OPENAGI_DATA_DIR = prevDataDir;
     if (prevLimit === undefined) delete process.env.OPENAGI_DAILY_USD_LIMIT;
     else process.env.OPENAGI_DAILY_USD_LIMIT = prevLimit;
+    if (prevTz === undefined) delete process.env.OPENAGI_TIMEZONE;
+    else process.env.OPENAGI_TIMEZONE = prevTz;
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
@@ -137,6 +141,24 @@ test("GET /budget and POST /budget are mobile-scoped, main-routed, update live r
   assert.equal(saved.bonusUsdToday, 0);
   const envRaw = fs.readFileSync(path.join(dataDir, ".env"), "utf8");
   assert.match(envRaw, /OPENAGI_DAILY_USD_LIMIT=50/);
+
+  // Client X-OpenAGI-Timezone header syncs BudgetGuard timezone on GET /budget
+  runtime.budget._explicitTimeZone = null;
+  runtime.budget.timeZone = "UTC";
+  const tzSyncRes = await fetch(`${baseUrl}/budget`, {
+    headers: { ...headers, "x-openagi-timezone": "America/Los_Angeles" }
+  }).then((r) => r.json());
+  assert.equal(tzSyncRes.timeZone, "America/Los_Angeles");
+  assert.equal(runtime.budget.timeZone, "America/Los_Angeles");
+
+  // Explicit timeZone in POST /budget persists OPENAGI_TIMEZONE
+  const explicitTzRes = await fetch(`${baseUrl}/budget`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ timeZone: "America/New_York" })
+  }).then((r) => r.json());
+  assert.equal(explicitTzRes.timeZone, "America/New_York");
+  assert.match(fs.readFileSync(path.join(dataDir, ".env"), "utf8"), /OPENAGI_TIMEZONE=America\/New_York/);
 });
 
 test("Recent unarchived sleeping Paseo chats (status=closed) stay visible, retain open questions, and skip auto-nudges", async (t) => {

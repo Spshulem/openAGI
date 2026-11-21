@@ -1386,10 +1386,8 @@ private struct ChatBudgetExceededBar: View {
                       }) {
                 await conversation.send(priorUser.text)
             }
-        } catch let error as DaemonError where error == .notFound {
-            note = ("Update OpenAGI on your main server to raise the budget from here.", true)
         } catch {
-            note = ("Couldn't update the budget. Try Settings.", true)
+            note = (BudgetSettingsErrorCopy.saveMessage(for: error), true)
         }
     }
 }

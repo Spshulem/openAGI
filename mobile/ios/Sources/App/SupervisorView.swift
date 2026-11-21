@@ -1652,7 +1652,7 @@ struct SupervisorView: View {
             budgetStatus = updated
             showToast(String(format: "Added +$%.2f today ($%.2f remaining) ✓", amount, max(0, updated.remainingUsd)))
         } catch {
-            showToast("Couldn't update budget. Open Budget settings to retry.", isError: true)
+            showToast(BudgetSettingsErrorCopy.saveMessage(for: error), isError: true)
         }
     }
 

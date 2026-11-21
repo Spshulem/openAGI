@@ -95,11 +95,12 @@ final class WorkspaceProtocolTests: XCTestCase {
 
     func testBudgetProtocolAndExceededDetection() throws {
         let json = """
-        {"today":"2026-11-21","dailyUsdLimit":10,"bonusUsdToday":10,"effectiveLimitUsd":20,
+        {"today":"2026-11-21","timeZone":"America/Los_Angeles","dailyUsdLimit":10,"bonusUsdToday":10,"effectiveLimitUsd":20,
          "spentUsd":10.42,"remainingUsd":9.58,"exceeded":false,"calls":38}
         """
         let status = try ProtocolDecoder.json.decode(BudgetStatus.self, from: Data(json.utf8))
         XCTAssertEqual(status.effectiveLimit, 20)
+        XCTAssertEqual(status.timeZone, "America/Los_Angeles")
         XCTAssertFalse(status.isExceeded)
 
         let encoded = try ProtocolDecoder.jsonEncoder.encode(BudgetUpdate(addUsdToday: 10))
@@ -113,6 +114,46 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertTrue(BudgetLimitPrompt.isBudgetExceeded(hit))
         XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(normal))
         XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(userLine))
+    }
+
+    func testBudgetClientSendsTimeZoneAndDetectsOlderMainViaHeartbeat() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubProtocol.self]
+        let client = DaemonClient(
+            server: URL(string: "http://mac.tail1234.ts.net:43210")!,
+            nodeID: "mobile:peri",
+            token: String(repeating: "m", count: 43),
+            session: URLSession(configuration: config)
+        )
+
+        var seenTimeZoneHeader: String?
+        StubProtocol.handler = { request in
+            if request.url?.path == "/budget" {
+                seenTimeZoneHeader = request.value(forHTTPHeaderField: "X-OpenAGI-Timezone")
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 502, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"error":"main-pairing-required","message":"Older main rejected route."}"#.utf8)
+                )
+            }
+            if request.url?.path == "/nodes/heartbeat" {
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"ok":true}"#.utf8)
+                )
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        do {
+            _ = try await client.budget()
+            XCTFail("Expected .notFound when older main rejects /budget while heartbeat is healthy")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .notFound)
+            XCTAssertEqual(BudgetSettingsErrorCopy.title(for: error), "Server update needed")
+            XCTAssertTrue(BudgetSettingsErrorCopy.loadMessage(for: error).contains("Update OpenAGI"))
+            XCTAssertTrue(BudgetSettingsErrorCopy.saveMessage(for: error).contains("Update OpenAGI"))
+        }
+        XCTAssertEqual(seenTimeZoneHeader, TimeZone.current.identifier)
     }
 
     func testFleetWatchdogDecodingAndBadges() throws {

@@ -176,3 +176,102 @@ test("applyUpdate: already up to date is a clean no-op", async () => {
   assert.equal(r.updated, false);
   assert.match(r.reason, /up to date/i);
 });
+
+test("portable Linux release-archive self-update verifies SHA-256 and updates runtime while preserving .openagi", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createHash } = await import("node:crypto");
+
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-portable-"));
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+
+  fs.mkdirSync(path.join(rootDir, "src"), { recursive: true });
+  fs.mkdirSync(path.join(rootDir, ".openagi"), { recursive: true });
+  fs.writeFileSync(path.join(rootDir, "package.json"), JSON.stringify({ name: "openagi", version: "0.0.83" }));
+  fs.writeFileSync(path.join(rootDir, "src", "index.js"), "export const v = '0.0.83';\n");
+  fs.writeFileSync(path.join(rootDir, ".openagi", "secret.txt"), "keep-me-intact");
+
+  const fakeArchiveBytes = Buffer.from("fake-tarball-payload-0.0.84");
+  const goodSha = createHash("sha256").update(fakeArchiveBytes).digest("hex");
+  const notGitRun = async () => { throw new Error("fatal: not a git repository"); };
+
+  const makeReleaseFetch = (shaText) => async (url) => {
+    if (String(url).endsWith("/releases/latest")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tag_name: "v0.0.84",
+          assets: [
+            { name: "OpenAGI-Linux-arm64.tar.gz", browser_download_url: "https://example.test/OpenAGI-Linux-arm64.tar.gz" },
+            { name: "OpenAGI-Linux-arm64.tar.gz.sha256", browser_download_url: "https://example.test/OpenAGI-Linux-arm64.tar.gz.sha256" }
+          ]
+        })
+      };
+    }
+    if (String(url).endsWith(".tar.gz")) {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => fakeArchiveBytes.buffer.slice(fakeArchiveBytes.byteOffset, fakeArchiveBytes.byteOffset + fakeArchiveBytes.byteLength)
+      };
+    }
+    if (String(url).endsWith(".sha256")) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => `${shaText}  OpenAGI-Linux-arm64.tar.gz\n`
+      };
+    }
+    throw new Error(`unexpected url: ${url}`);
+  };
+
+  const check = await checkForUpdate({
+    run: notGitRun,
+    release: { rootDir, platform: "linux", arch: "arm64", fetchImpl: makeReleaseFetch(goodSha) }
+  });
+  assert.equal(check.ok, true);
+  assert.equal(check.mode, "release-archive");
+  assert.equal(check.current, "v0.0.83");
+  assert.equal(check.latest, "v0.0.84");
+  assert.equal(check.updateAvailable, true);
+
+  // Mismatched checksum fails closed before extracting
+  const badRes = await applyUpdate({
+    run: notGitRun,
+    release: {
+      rootDir,
+      platform: "linux",
+      arch: "arm64",
+      fetchImpl: makeReleaseFetch("0".repeat(64)),
+      extractArchive: async () => { throw new Error("must not extract when sha mismatches"); }
+    }
+  });
+  assert.equal(badRes.updated, false);
+  assert.match(badRes.reason, /SHA-256 mismatch/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")).version, "0.0.83");
+
+  // Valid checksum extracts and swaps runtime entries while preserving `.openagi`
+  const goodRes = await applyUpdate({
+    run: notGitRun,
+    release: {
+      rootDir,
+      platform: "linux",
+      arch: "arm64",
+      fetchImpl: makeReleaseFetch(goodSha),
+      extractArchive: async (_archivePath, extractDir) => {
+        const bundle = path.join(extractDir, "OpenAGI");
+        fs.mkdirSync(path.join(bundle, "src"), { recursive: true });
+        fs.writeFileSync(path.join(bundle, "package.json"), JSON.stringify({ name: "openagi", version: "0.0.84" }));
+        fs.writeFileSync(path.join(bundle, "src", "index.js"), "export const v = '0.0.84';\n");
+      }
+    }
+  });
+  assert.equal(goodRes.updated, true);
+  assert.equal(goodRes.from, "v0.0.83");
+  assert.equal(goodRes.to, "v0.0.84");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")).version, "0.0.84");
+  assert.match(fs.readFileSync(path.join(rootDir, "src", "index.js"), "utf8"), /0\.0\.84/);
+  assert.equal(fs.readFileSync(path.join(rootDir, ".openagi", "secret.txt"), "utf8"), "keep-me-intact");
+});
