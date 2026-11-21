@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f5ef">
+  <meta name="description" content="OpenAGI is a self-hosted personal runtime and evidence-backed supervisor for the coding agents you already use.">
+  <title>OpenAGI — your work, in view</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="wordmark" href="#top" aria-label="OpenAGI home">openagi<span aria-hidden="true">.</span></a>
+    <nav aria-label="Primary navigation">
+      <a href="#supervisor">Supervisor</a>
+      <a href="#principles">How it works</a>
+      <a href="#install">Install</a>
+      <a href="#compare">Compare</a>
+      <a class="nav-source" href="https://github.com/Spshulem/openAGI">GitHub ↗</a>
+    </nav>
+    <button class="menu-button" type="button" aria-expanded="false" aria-controls="mobile-nav">Menu</button>
+    <div class="mobile-nav" id="mobile-nav" hidden>
+      <a href="#supervisor">Supervisor</a><a href="#principles">How it works</a><a href="#install">Install</a><a href="#compare">Compare</a><a href="https://github.com/Spshulem/openAGI">GitHub ↗</a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow">Self-hosted · source available · built for humans in the loop</p>
+        <h1>Your work,<br><em>in view.</em></h1>
+        <p class="hero-lede">OpenAGI is a proactive personal runtime that remembers what matters and supervises the coding agents already working for you.</p>
+        <div class="hero-actions">
+          <a class="button button-dark" href="#install">Choose an install path <span aria-hidden="true">↓</span></a>
+          <a class="text-link" href="https://github.com/Spshulem/openAGI">Browse the source ↗</a>
+        </div>
+        <p class="hero-note">Fresh install? Start with the release. Already running it? <a href="http://127.0.0.1:43210/">Open your local dashboard ↗</a>.</p>
+      </div>
+      <div class="hero-card" aria-label="Supervisor summary">
+        <div class="card-top"><span class="status-dot"></span><span>SUPERVISOR · OBSERVE</span><span class="card-date">TODAY</span></div>
+        <p class="card-kicker">One place to come back to</p>
+        <h2>Three projects.<br><strong>One decision.</strong></h2>
+        <div class="signal-row"><span class="signal-mark signal-amber">?</span><div><b>Checkout</b><small>needs a decision · PR evidence attached</small></div><span class="signal-label">NEEDS YOU</span></div>
+        <div class="signal-row"><span class="signal-mark signal-green">↗</span><div><b>OpenAGI</b><small>checks passed · ready for review</small></div><span class="signal-label">READY</span></div>
+        <div class="signal-row"><span class="signal-mark signal-gray">◷</span><div><b>Mobile</b><small>agent is working · no action yet</small></div><span class="signal-label">WATCH</span></div>
+        <div class="card-bottom"><span>Human control stays on.</span><span>OpenAGI runtime</span></div>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="OpenAGI properties">
+      <span>Runs on your computer</span><span>Bring your own model</span><span>Local-first by default</span><span>You choose permissions</span>
+    </section>
+
+    <section class="section intro" id="supervisor">
+      <div class="section-heading">
+        <p class="eyebrow">Supervisor · from your Mac or phone</p>
+        <h2>Stop checking tabs.<br><em>Start deciding.</em></h2>
+      </div>
+      <div class="section-body">
+        <p>Supervisor groups supported Codex, Claude Code, Conductor, and other coding conversations by project. It shows what is working, what is blocked, what is waiting on checks, and the questions that need you.</p>
+        <p>Read the question with the thread, pull request, and verification evidence beside it. Observe first. Propose a reply when you choose. Auto is an explicit, bounded setting — discovery never sends a message or runs an action.</p>
+        <a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md">Read the Supervisor setup ↗</a>
+      </div>
+    </section>
+
+    <section class="evidence-section" aria-labelledby="evidence-title">
+      <div class="section evidence-head">
+        <div><p class="eyebrow">A real workflow, captured</p><h2 id="evidence-title">See the thread.<br><em>Keep the choice.</em></h2></div>
+        <p>These captures are from the OpenAGI onboarding verification run on 11 Nov 2026. Test project names and IDs are fixtures; no credentials are shown. They document shipped controls, not a fabricated product mock.</p>
+      </div>
+      <div class="evidence-grid">
+        <figure class="evidence-card evidence-large"><img src="assets/evidence/supervisor-discovered-session.png" alt="OpenAGI Coding setup showing a discovered Codex session with Inspect and Watch controls"><figcaption><b>01 · Discover, read-only</b><span>Supervisor finds a supported local conversation. Inspect and Watch are separate choices.</span></figcaption></figure>
+        <figure class="evidence-card"><img src="assets/evidence/supervisor-session-evidence.png" alt="OpenAGI showing the recent conversation from a discovered coding session"><figcaption><b>02 · See the evidence</b><span>The recent conversation is labeled reference-only; it is not permission to act.</span></figcaption></figure>
+        <figure class="evidence-card"><img src="assets/evidence/supervisor-watch-mode.png" alt="OpenAGI Coding setup showing a watched session and Stop watching control"><figcaption><b>03 · Watch, don’t guess</b><span>Watch mode records a short output preview. It does not send automatic nudges or poll a paid model.</span></figcaption></figure>
+        <figure class="evidence-card"><img src="assets/evidence/supervisor-approval.png" alt="OpenAGI approval queue showing an action waiting for the human to approve or deny"><figcaption><b>04 · Decide explicitly</b><span>Actions wait in the durable approval queue. The human approves or denies each one.</span></figcaption></figure>
+      </div>
+      <p class="evidence-footnote">Evidence boundary: these are historical verification captures, not a claim that a new install has discovered a project. A fresh setup starts empty until you opt in and select a project.</p>
+    </section>
+
+    <section class="section principles" id="principles">
+      <div class="section-heading"><p class="eyebrow">The project thesis</p><h2>Three ideas that make<br><em>a runtime useful.</em></h2><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/WHITEPAPER.md">Read the full whitepaper ↗</a></div>
+      <div class="principle-list">
+        <article><span class="principle-number">01</span><div><h3>Directional Adaptive Scrutiny</h3><p>Before an event becomes an action, the runtime can decide whether to act, ask, watch, ignore, or bring in a specialist. Permissions and evidence shape that decision.</p><p class="example"><b>Example</b> A failed check becomes a question with its PR and log, not an unexplained automated change.</p></div></article>
+        <article><span class="principle-number">02</span><div><h3>Tiered Memory</h3><p>Short-term context, recurring patterns, and durable knowledge have different lifetimes. A correction can become a reviewed preference instead of disappearing at the end of a chat.</p><p class="example"><b>Example</b> “Keep release notes brief” can be saved, recalled, and corrected from Memory.</p></div></article>
+        <article><span class="principle-number">03</span><div><h3>Propagation</h3><p>Useful context can move between the runtime, skills, devices, and specialists with an inspectable record. You choose which tools and nodes receive it.</p><p class="example"><b>Example</b> A watched project update can reach a paired phone without giving the phone blanket access to the Mac.</p></div></article>
+      </div>
+    </section>
+
+    <section class="install-section" id="install">
+      <div class="section install-inner">
+        <div class="section-heading"><p class="eyebrow">Start on the host you control</p><h2>Install the runtime.<br><em>Get one result.</em></h2><p>OpenAGI keeps conversations, memory, tasks, and configuration on the host you choose. Pair a phone or another node later.</p></div>
+        <div class="install-grid">
+          <a class="install-card featured" href="https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-0.0.83.dmg"><span class="install-icon">⌘</span><span class="install-label">macOS · v0.0.83</span><h3>Download the Mac app</h3><p>DMG → Applications → launch. Native menu bar app, bundled runtime, updates, and optional screen/computer access.</p><b>Download OpenAGI-0.0.83.dmg ↗</b></a>
+          <a class="install-card" href="https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-Windows-x64.zip"><span class="install-icon">⊞</span><span class="install-label">Windows x64 · v0.0.83</span><h3>Download the portable ZIP</h3><p>Extract the whole archive and run Start-OpenAGI.cmd. No Node or Git needed for the published bundle.</p><b>Download Windows x64 ↗</b></a>
+          <a class="install-card" href="https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-Linux-x64.tar.gz"><span class="install-icon">⌁</span><span class="install-label">Linux x64 / arm64 · v0.0.83</span><h3>Download or use Docker</h3><p>Use the portable tarball, the inspected installer, or Docker. Raspberry Pi needs a compatible 64-bit arm64 OS.</p><code class="install-command">docker run ghcr.io/spshulem/openagi:&lt;version&gt;</code><b>Download Linux x64 ↗</b></a>
+          <a class="install-card" href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md"><span class="install-icon">$</span><span class="install-label">Source · Docker · all paths</span><h3>Follow the install guide</h3><p>Source installs use Node.js 22+. The guide covers Docker, model setup, updates, state, Windows PowerShell, and recovery.</p><b>Read docs/INSTALL.md ↗</b></a>
+        </div>
+        <div class="first-result"><div><p class="eyebrow">First useful task · two minutes</p><h3>Give it one thing to take off your plate.</h3></div><ol><li><b>Connect &amp; verify</b><span>Choose a cloud provider, local OpenAI-compatible server, or native Apple model on supported Mac/iPhone builds.</span></li><li><b>Ask for a real result</b><span>Draft a three-item brief, save a non-sensitive preference, or show one project status.</span></li><li><b>Choose what comes next</b><span>Keep it local, add a skill, pair a phone, or connect an integration later in Settings.</span></li></ol></div>
+        <p class="install-note"><strong>Current release checked 21 Nov 2026:</strong> v0.0.83 publishes the Mac DMG, Windows x64 ZIP, Linux x64 tarball, Linux arm64 tarball, and SHA-256 files on GitHub. The all-platform release page is the download index.</p>
+      </div>
+    </section>
+
+    <section class="section customize" id="customize">
+      <div class="section-heading"><p class="eyebrow">Make it yours</p><h2>Open where it matters.<br><em>Bounded where it counts.</em></h2><p>Configure the parts that shape behavior instead of accepting a black box.</p></div>
+      <div class="customize-grid">
+        <article><span>Skills</span><h3>Turn a routine into a reviewed capability.</h3><p>Skills are inspectable Markdown with explicit tools and optional replay. Accept suggestions; they do not silently become actions.</p><a href="https://github.com/Spshulem/openAGI#skills">Skills in the README ↗</a></article>
+        <article><span>MCP</span><h3>Connect tools one at a time.</h3><p>MCP servers become first-class tools after you configure and authorize them. Keep account keys in Settings.</p><a href="https://github.com/Spshulem/openAGI#mcps-servers">MCP documentation ↗</a></article>
+        <article><span>Models</span><h3>Use cloud or local inference.</h3><p>Anthropic, OpenAI, ChatGPT plan, Ollama, LM Studio, and the native Apple path are separate choices. Verify a real response first.</p><a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md#connect-a-model">Model setup ↗</a></article>
+        <article><span>Permissions</span><h3>Observe, propose, or allow a bounded action.</h3><p>Screen access, computer use, account connections, and Supervisor sends are opt-in. Approvals remain durable and reviewable.</p><a href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md#safety-limits">Control boundaries ↗</a></article>
+        <article><span>Source</span><h3>Read and change the runtime.</h3><p>The repository, whitepaper, architecture notes, and release history are public. This project is source-available under PolyForm Noncommercial 1.0.0.</p><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">Read the license ↗</a></article>
+      </div>
+    </section>
+
+    <section class="devices-section" id="devices">
+      <div class="section devices-inner"><div class="section-heading"><p class="eyebrow">Devices · status matters</p><h2>Solo first.<br><em>Pair when useful.</em></h2><p>Keep a Mac, Linux box, Docker host, or phone useful on its own. Pair only when the next task needs another node.</p></div><div class="device-status"><div class="device-row"><b>Mac</b><span>Native app + browser runtime</span><em class="available">Available</em></div><div class="device-row"><b>Linux / Docker</b><span>Persistent runtime; optional system service</span><em class="available">Available</em></div><div class="device-row"><b>iPhone / Android</b><span>Tasks, chat, approvals, Supervisor; source / QA builds</span><em class="planned">No public store link</em></div><div class="device-row"><b>Pairing</b><span>QR/deep link or manual address + code; reachable host required</span><em class="planned">Verify on device</em></div><a class="button button-light" href="https://github.com/Spshulem/openAGI/tree/main/mobile">Read mobile setup ↗</a></div></div>
+    </section>
+
+    <section class="section compare" id="compare">
+      <div class="section-heading"><p class="eyebrow">A task-based comparison</p><h2>Different tools.<br><em>Different jobs.</em></h2><p>Descriptions below follow each project's official site or repository, checked 21 Nov 2026. They are complements, not exclusivity claims.</p></div>
+      <div class="compare-table" role="table" aria-label="Task-based comparison of OpenAGI and other agents"><div class="compare-row compare-header" role="row"><span>When you need to…</span><span>T3 Code</span><span>OpenClaw</span><span>Hermes Agent</span><span>OpenAGI</span></div><div class="compare-row" role="row"><span>Coordinate coding agents</span><span>Primary coding workspace / control plane</span><span>Personal agent across channels</span><span>Agent with skills and memory</span><span><b>Supervisor organizes existing coding sessions, blockers, decisions, and evidence</b></span></div><div class="compare-row" role="row"><span>Carry context forward</span><span>Workspace context</span><span>Cross-channel assistant context</span><span>Persistent learning and skills</span><span><b>Tiered memory plus reviewed skills on your host</b></span></div><div class="compare-row" role="row"><span>Control actions</span><span>Workspace controls</span><span>Configured channel and tool access</span><span>Configured tools and skills</span><span><b>Observe → Propose → bounded Auto; approvals stay explicit</b></span></div><div class="compare-links"><a href="https://t3.codes/">T3 Code ↗</a><a href="https://openclaw.ai/">OpenClaw ↗</a><a href="https://hermes-agent.nousresearch.com/">Hermes Agent ↗</a><a href="https://github.com/Spshulem/openAGI">OpenAGI source ↗</a></div></div>
+    </section>
+
+    <section class="section license-callout"><div><p class="eyebrow">Read the terms</p><h2>Source-available<br><em>means source-available.</em></h2></div><div><p>OpenAGI is licensed under <strong>PolyForm Noncommercial 1.0.0</strong>. It is not presented as OSI-approved open source. Read the actual license before distributing or building a commercial product.</p><a class="button button-dark" href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">Read LICENSE ↗</a></div></section>
+  </main>
+
+  <footer class="site-footer"><div class="footer-brand"><a class="wordmark" href="#top">openagi<span aria-hidden="true">.</span></a><p>A self-hosted personal runtime and evidence-backed Supervisor for the agents you already use.</p></div><div class="footer-links"><a href="https://github.com/Spshulem/openAGI">GitHub</a><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases</a><a href="https://github.com/Spshulem/openAGI/blob/main/README.md">README</a><a href="https://github.com/Spshulem/openAGI/blob/main/WHITEPAPER.md">Whitepaper</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/abi-architecture.md">Architecture</a><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">License</a></div><div class="footer-bottom"><span>Host your own runtime. Choose your model. Keep the final say.</span><span>Preview only · no production deployment</span></div></footer>
+</body>
+</html>
