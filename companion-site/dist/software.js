@@ -39,8 +39,8 @@
       note: 'For macOS, Debian-family Linux, or a host with Docker. The installer guides you to setup.'
     },
     docker: {
-      command: 'docker run -d --name openagi -p 127.0.0.1:43210:43210 -v openagi-data:/data ghcr.io/spshulem/openagi:latest',
-      note: 'Requires Docker. Then open http://127.0.0.1:43210/setup on this computer.'
+      command: 'OPENAGI_AUTH_TOKEN="$(openssl rand -hex 32)"\ndocker run -d --name openagi --restart unless-stopped -p 127.0.0.1:43210:43210 -v openagi-data:/data -e OPENAGI_AUTH_TOKEN="$OPENAGI_AUTH_TOKEN" ghcr.io/spshulem/openagi:v0.0.83',
+      note: 'Requires Docker and OpenSSL. Save the generated token; enter it at http://127.0.0.1:43210/ when the dashboard asks.'
     },
     source: {
       command: 'git clone https://github.com/Spshulem/openAGI\ncd openAGI\nnpm ci --ignore-scripts\nnpm run serve',

@@ -1,0 +1,30 @@
+{
+  "base": "http://127.0.0.1:8789/setup.html",
+  "capturedAt": "2026-11-21T18:23:17.432Z",
+  "rows": [
+    {
+      "name": "docker-preview",
+      "width": 1440,
+      "status": 200,
+      "command": "OPENAGI_AUTH_TOKEN=\"$(openssl rand -hex 32)\"\ndocker run -d --name openagi --restart unless-stopped -p 127.0.0.1:43210:43210 -v openagi-data:/data -e OPENAGI_AUTH_TOKEN=\"$OPENAGI_AUTH_TOKEN\" ghcr.io/spshulem/openagi:v0.0.83",
+      "context": "Requires Docker and OpenSSL. Save the generated token; enter it at http://127.0.0.1:43210/ when the dashboard asks.",
+      "overflow": {
+        "scrollWidth": 1440,
+        "clientWidth": 1440
+      },
+      "errors": []
+    },
+    {
+      "name": "docker-preview-mobile",
+      "width": 390,
+      "status": 200,
+      "command": "OPENAGI_AUTH_TOKEN=\"$(openssl rand -hex 32)\"\ndocker run -d --name openagi --restart unless-stopped -p 127.0.0.1:43210:43210 -v openagi-data:/data -e OPENAGI_AUTH_TOKEN=\"$OPENAGI_AUTH_TOKEN\" ghcr.io/spshulem/openagi:v0.0.83",
+      "context": "Requires Docker and OpenSSL. Save the generated token; enter it at http://127.0.0.1:43210/ when the dashboard asks.",
+      "overflow": {
+        "scrollWidth": 390,
+        "clientWidth": 390
+      },
+      "errors": []
+    }
+  ]
+}

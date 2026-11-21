@@ -47,6 +47,23 @@ reply, local-model inference, physical Apple Intelligence availability,
 installed-app prescan, pairing, notifications, or Computer Use. Those checks
 remain in the tracked plan rather than being implied by the screenshots.
 
+## PR follow-up: Docker install command
+
+The review found that the website's Docker tab omitted the required dashboard
+token. The command now generates a token, passes it into the container, pins the
+public v0.0.83 image, and tells the user where to enter it. Local preview QA
+after the fix returned HTTP 200 with no browser errors and no horizontal
+overflow at 1440px and 390px:
+
+- [Docker desktop preview](2026-11-21-site-onboarding/docker-preview.png)
+- [Docker mobile preview](2026-11-21-site-onboarding/docker-preview-mobile.png)
+- [Machine results](2026-11-21-site-onboarding/docker-preview-results.json)
+
+BuildBot3 preview QA is still blocked in this environment: the required
+`bb3-doctor` executable is unavailable and `ssh buildbot3` rejects the available
+key (`Permission denied (publickey)`). The local preview is evidence of the
+static fix only; it is not a BuildBot3 pass.
+
 ## Public download evidence
 
 `gh release view v0.0.83` on 2026-11-21 returned public assets for the Mac DMG,

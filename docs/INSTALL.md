@@ -132,8 +132,9 @@ integration and channel settings remain under **Advanced settings**.
 
 ## Docker
 
-Use the version tag you selected from GitHub Releases. Replace `<version>`
-below, for example with `v0.0.58`. The volume keeps state across replacements.
+Use the version tag you selected from GitHub Releases. The current public
+release is `v0.0.83`; replace the tag below when you intentionally choose a
+different release. The volume keeps state across replacements.
 Binding the published port to loopback keeps setup on this computer.
 
 ```sh
