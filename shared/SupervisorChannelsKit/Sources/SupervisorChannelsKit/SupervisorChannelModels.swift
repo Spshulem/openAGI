@@ -40,6 +40,7 @@ public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
     public let project: String
     public let subchannel: String?
     public let headline: String
+    public let fact: String?
     public let kindLabel: String
     public let risky: Bool
     public let noticedAtISO: String?
@@ -49,6 +50,7 @@ public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
         project: String,
         subchannel: String? = nil,
         headline: String,
+        fact: String? = nil,
         kindLabel: String = "Needs you",
         risky: Bool = false,
         noticedAtISO: String? = nil
@@ -57,6 +59,7 @@ public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
         self.project = project
         self.subchannel = subchannel
         self.headline = headline
+        self.fact = fact
         self.kindLabel = kindLabel
         self.risky = risky
         self.noticedAtISO = noticedAtISO

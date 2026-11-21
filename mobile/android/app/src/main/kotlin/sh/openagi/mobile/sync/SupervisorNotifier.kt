@@ -11,15 +11,18 @@ import android.os.Build
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.RemoteInput
 import androidx.core.content.ContextCompat
 import sh.openagi.mobile.MainActivity
 import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetState
+import sh.openagi.mobile.protocol.PendingAction
 import sh.openagi.mobile.store.NotifiedQuestionsStore
 
 // The Android half of supervisor alerts: channels, the "needs you"
-// notification with one button per answer, and the sending/failed notices
-// an answer tap turns it into. What to post and when is SupervisorAlerts'
+// notification with one button per answer (and a Reply field when the
+// question takes typed text), the approval notification with Approve and
+// Deny, and the sending/failed/result notices a tap turns them into. What to post and when is SupervisorAlerts'
 // call; this only draws it. No push service is involved — the phone learns
 // about questions from its own paired daemon (SupervisorAlertCheck).
 object SupervisorNotifier {
@@ -28,12 +31,17 @@ object SupervisorNotifier {
     const val EXTRA_TAB = "sh.openagi.mobile.extra.TAB"
     const val TAB_SUPERVISOR = "supervisor"
     const val EXTRA_QUESTION_ID = "sh.openagi.mobile.extra.QUESTION_ID"
+    const val EXTRA_ACTION_ID = "sh.openagi.mobile.extra.ACTION_ID"
+    const val TAB_INBOX = "inbox"
+    // The RemoteInput result key of a question's Reply field.
+    const val KEY_REPLY_TEXT = "sh.openagi.mobile.extra.REPLY_TEXT"
 
     // The app ships no drawables of its own yet; a system one keeps the
     // status bar icon a clean monochrome silhouette as Android requires.
     private val SMALL_ICON = android.R.drawable.ic_dialog_info
     private const val ACTION_LABEL_MAX = 40
     private const val SENDING_ANSWER_MAX = 80
+    private const val RESULT_TEXT_MAX = 160
 
     // Idempotent: creating an existing channel only updates its name and
     // description, never the importance the owner may have changed since.
@@ -73,6 +81,56 @@ object SupervisorNotifier {
                 store.add(question.id)
             }
         }
+    }
+
+    // The same reconciling for approvals: a card decided anywhere (the Mac,
+    // the Inbox, a spoken "yes NN") comes down, a new one posts once.
+    fun syncApprovals(context: Context, pending: List<PendingAction>, store: NotifiedQuestionsStore) {
+        val manager = NotificationManagerCompat.from(context)
+        val plan = ApprovalAlerts.plan(pending, store.load())
+        plan.cancel.forEach { id ->
+            manager.cancel(ApprovalAlerts.notificationId(id))
+            store.remove(id)
+        }
+        if (plan.post.isEmpty()) return
+        ensureChannels(context)
+        if (!canPostQuestions(context)) return
+        plan.post.forEach { action ->
+            if (post(context, ApprovalAlerts.notificationId(action.id), approvalNotification(context, action))) {
+                store.add(action.id)
+            }
+        }
+    }
+
+    // Approve or Deny was tapped: the buttons go away before a second tap.
+    fun showApprovalSending(context: Context, actionId: String, approve: Boolean) {
+        ensureChannels(context)
+        val notification = NotificationCompat.Builder(context, CHANNEL_QUESTIONS)
+            .setSmallIcon(SMALL_ICON)
+            .setContentTitle(if (approve) "Approving…" else "Denying…")
+            .setProgress(0, 0, true)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setSilent(true)
+            .setContentIntent(openInboxIntent(context, actionId))
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .build()
+        post(context, ApprovalAlerts.notificationId(actionId), notification)
+    }
+
+    // What the tap came to, in place of the approval. Silent when it did
+    // what was asked; otherwise it is news. A tap opens the Inbox.
+    fun showApprovalResult(context: Context, actionId: String, title: String, text: String?, silent: Boolean) {
+        ensureChannels(context)
+        val builder = NotificationCompat.Builder(context, CHANNEL_QUESTIONS)
+            .setSmallIcon(SMALL_ICON)
+            .setContentTitle(title)
+            .setCategory(if (silent) NotificationCompat.CATEGORY_STATUS else NotificationCompat.CATEGORY_ERROR)
+            .setSilent(silent)
+            .setAutoCancel(true)
+            .setContentIntent(openInboxIntent(context, actionId))
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+        text?.trim()?.takeIf { it.isNotEmpty() }?.let { builder.setContentText(SupervisorAlerts.cap(it, RESULT_TEXT_MAX)) }
+        post(context, ApprovalAlerts.notificationId(actionId), builder.build())
     }
 
     // Replaces the question's notification in place (same id) the moment a
@@ -115,6 +173,10 @@ object SupervisorNotifier {
         NotificationManagerCompat.from(context).cancel(SupervisorAlerts.notificationId(questionId))
     }
 
+    fun cancelApproval(context: Context, actionId: String) {
+        NotificationManagerCompat.from(context).cancel(ApprovalAlerts.notificationId(actionId))
+    }
+
     // Everything this pairing ever posted, and every answer still queued for
     // it: a queued answer left behind would be sent to whichever daemon the
     // phone pairs with next. The channel sweep catches notices the store no
@@ -123,8 +185,12 @@ object SupervisorNotifier {
     // the service's to remove.
     fun cancelAll(context: Context, store: NotifiedQuestionsStore) {
         SupervisorAnswerWorker.cancelAll(context)
+        ApprovalActionWorker.cancelAll(context)
         val manager = NotificationManagerCompat.from(context)
         store.load().forEach { manager.cancel(SupervisorAlerts.notificationId(it)) }
+        val approvals = NotifiedQuestionsStore(context.filesDir, NotifiedQuestionsStore.APPROVALS_FILE_NAME)
+        approvals.load().forEach { manager.cancel(ApprovalAlerts.notificationId(it)) }
+        approvals.clear()
         runCatching {
             manager.activeNotifications
                 .filter { it.notification.channelId == CHANNEL_QUESTIONS }
@@ -147,6 +213,21 @@ object SupervisorNotifier {
         }
         val requestCode = questionId?.let { SupervisorAlerts.notificationId(it) } ?: 0
         return PendingIntent.getActivity(context, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    // Opens the app on the Inbox, where the approval is shown in full.
+    fun openInboxIntent(context: Context, actionId: String): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java)
+            .putExtra(EXTRA_TAB, TAB_INBOX)
+            .putExtra(EXTRA_ACTION_ID, actionId)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        intent.identifier = "inbox/$actionId"
+        return PendingIntent.getActivity(
+            context,
+            ApprovalAlerts.notificationId(actionId),
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
     }
 
     // For the answer worker's getForegroundInfo, which WorkManager only calls
@@ -196,7 +277,80 @@ object SupervisorNotifier {
                     .build(),
             )
         }
+        // Typed text goes through the same answer route as the buttons, to
+        // this question's own thread. The same unlock rule.
+        if (SupervisorAlerts.acceptsReply(question)) {
+            val input = RemoteInput.Builder(KEY_REPLY_TEXT).setLabel("Reply to the agent").build()
+            builder.addAction(
+                NotificationCompat.Action.Builder(0, "Reply", replyIntent(context, question.id))
+                    .addRemoteInput(input)
+                    .setAllowGeneratedReplies(false)
+                    .setAuthenticationRequired(true)
+                    .build(),
+            )
+        }
         return builder.build()
+    }
+
+    private fun approvalNotification(context: Context, action: PendingAction): Notification {
+        val title = ApprovalAlerts.title(action)
+        val text = ApprovalAlerts.text(action)
+        val builder = NotificationCompat.Builder(context, CHANNEL_QUESTIONS)
+            .setSmallIcon(SMALL_ICON)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text).setBigContentTitle(title))
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setAutoCancel(true)
+            .setContentIntent(openInboxIntent(context, action.id))
+            // The summary can name people and content; hidden on a lock
+            // screen set to hide sensitive notifications.
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                NotificationCompat.Builder(context, CHANNEL_QUESTIONS)
+                    .setSmallIcon(SMALL_ICON)
+                    .setContentTitle("An action needs your approval")
+                    .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                    .build(),
+            )
+        (action.raisedAt ?: action.createdAt)?.let { builder.setWhen(it.toEpochMilli()).setShowWhen(true) }
+        // Approve runs the tool, so neither button works from a locked phone:
+        // the system asks for the unlock first.
+        builder.addAction(
+            NotificationCompat.Action.Builder(0, "Approve", approvalIntent(context, action.id, approve = true))
+                .setAuthenticationRequired(true)
+                .build(),
+        )
+        builder.addAction(
+            NotificationCompat.Action.Builder(0, "Deny", approvalIntent(context, action.id, approve = false))
+                .setAuthenticationRequired(true)
+                .build(),
+        )
+        return builder.build()
+    }
+
+    private fun approvalIntent(context: Context, actionId: String, approve: Boolean): PendingIntent {
+        val verb = if (approve) ApprovalActionReceiver.ACTION_APPROVE else ApprovalActionReceiver.ACTION_DENY
+        val intent = Intent(context, ApprovalActionReceiver::class.java)
+            .setAction(verb)
+            .putExtra(EXTRA_ACTION_ID, actionId)
+        // See answerIntent: the identifier keeps each card+verb its own
+        // PendingIntent.
+        intent.identifier = "approval/$actionId/${if (approve) "approve" else "deny"}"
+        val requestCode = "$actionId\u0000$approve".hashCode()
+        return PendingIntent.getBroadcast(context, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    // Mutable, unlike every other PendingIntent here: the system writes the
+    // typed text into it. The explicit component means nothing else can
+    // receive it, and the receiver is not exported.
+    private fun replyIntent(context: Context, questionId: String): PendingIntent {
+        val intent = Intent(context, SupervisorAnswerReceiver::class.java)
+            .setAction(SupervisorAnswerReceiver.ACTION_REPLY)
+            .putExtra(EXTRA_QUESTION_ID, questionId)
+        intent.identifier = "reply/$questionId"
+        val requestCode = "$questionId\u0000reply".hashCode()
+        return PendingIntent.getBroadcast(context, requestCode, intent, PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
     private fun answerIntent(context: Context, questionId: String, answer: String, index: Int): PendingIntent {
