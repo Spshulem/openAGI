@@ -91,6 +91,26 @@ final class SupervisorChatCatchUpTests: XCTestCase {
     }
 
     @MainActor
+    func testAReplyMainAcceptsAfterTheLockStillLetsGoOfItsStream() async throws {
+        // Send, then lock at once: main confirms the turn only after the app
+        // went away. The stream must still be let go, not suspended open.
+        CatchUpDaemon.state.withLock { $0.stream = .acceptsLate }
+        let app = model()
+        let chat = app.supervisorChat
+        Task { await chat.send("How is the fleet?") }
+        try await until("the question is posted") { CatchUpDaemon.posts() == 1 }
+        XCTAssertFalse(try XCTUnwrap(chat.messages.last).accepted, "not confirmed yet")
+        app.conversations.enterBackground()
+        try await until("accepted while away, the stream is let go") { !chat.isSending }
+        XCTAssertTrue(try XCTUnwrap(chat.messages.last).isDetached)
+
+        CatchUpDaemon.state.withLock { $0.history = .finished }
+        app.conversations.resumeOpenChats()
+        try await until("the stored reply replaces the working line") { chat.messages.last?.text == "Fleet is green." }
+        assertSettled(chat, reply: "Fleet is green.")
+    }
+
+    @MainActor
     func testReturningAfterTheReplyFinishedShowsItOnce() async throws {
         CatchUpDaemon.state.withLock { $0.stream = .hangs }
         let app = model()
@@ -177,7 +197,8 @@ final class SupervisorChatCatchUpTests: XCTestCase {
 // A synthetic daemon: `/message` streams a reply that then hangs (a socket
 // iOS cut while locked) or drops; the supervisor history says what main has.
 final class CatchUpDaemon: URLProtocol {
-    enum Stream: Sendable { case hangs, drops }
+    // acceptsLate: main confirms the turn only after a delay, then hangs.
+    enum Stream: Sendable { case hangs, drops, acceptsLate }
     enum History: Sendable { case empty, running, finished, failed }
     struct State: Sendable {
         var stream: Stream = .hangs
@@ -216,6 +237,18 @@ final class CatchUpDaemon: URLProtocol {
             let sse = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
                                       headerFields: ["Content-Type": "text/event-stream"])!
             client?.urlProtocol(self, didReceive: sse, cacheStoragePolicy: .notAllowed)
+            if mode == .acceptsLate {
+                client?.urlProtocol(self, didLoad: Data("event: status\ndata: {\"stage\":\"queued\"}\n\n".utf8))
+                let client = self.client
+                let later = """
+                event: session\ndata: {"id":"devices:supervisor:main","messageCount":1}\n\n\
+                event: delta\ndata: {"text":"Checking the fleet","reset":false}\n\n
+                """
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [self] in
+                    client?.urlProtocol(self, didLoad: Data(later.utf8))
+                }
+                return
+            }
             let frames = """
             event: status\ndata: {"stage":"queued"}\n\n\
             event: session\ndata: {"id":"devices:supervisor:main","messageCount":1}\n\n\

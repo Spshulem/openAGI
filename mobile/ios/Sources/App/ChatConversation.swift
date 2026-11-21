@@ -241,6 +241,9 @@ final class ChatConversation {
                     // Text means main is running the turn, whatever frames
                     // came before it.
                     messages[index].accepted = true
+                    // Accepted after the app left: let go now, as
+                    // enterBackground does, rather than suspend on it.
+                    if isAway { relay.finish() }
                     // The working line stays under the text received so far
                     // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
@@ -269,6 +272,7 @@ final class ChatConversation {
                     messages[index].accepted = true
                     grace.end()
                     persist()
+                    if isAway { relay.finish() }
                 }
             }
             // The daemon closes the stream only after `final` or `failure`;
