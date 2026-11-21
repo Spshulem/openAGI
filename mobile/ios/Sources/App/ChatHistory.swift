@@ -255,6 +255,10 @@ enum ChatHistoryMerge {
                 local[index].serverID.flatMap { serverIndexForID[$0] } ?? matchedServerIndex[local[index].id]
             }
             if message.isStreaming {
+                // Main already stored this turn's reply (or its failure):
+                // that copy is on the page, so the placeholder would repeat it.
+                if message.role == .assistant, let id = message.requestID,
+                   server.contains(where: { $0.role == .assistant && $0.requestId == id }) { continue }
                 result.append((message, .distantFuture))
             } else if message.isFailed {
                 if message.role == .assistant, let asked = askedAt, hasReply(after: asked, in: server) { continue }
