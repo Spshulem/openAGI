@@ -432,6 +432,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   // ─── needs you ───────────────────────────────────────────────────────────
 
   function renderNeeds(questions, byKey) {
+    questions = (questions || []).filter(function (q) { return q && q.needsYou !== false; });
     var box = $('needsList');
     box.replaceChildren();
     cards.clear();
@@ -441,7 +442,8 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       var card = el('article', 'card', null, box);
       card.dataset.id = q.id;
       cards.set(q.id, card);
-      el('h3', null, q.title || 'Question', card);
+      el('h3', null, q.decisionHeadline || q.title || 'Question', card);
+      if (q.decisionFact) el('p', 'note', q.decisionFact, card);
       var ctx = el('div', 'ctx', null, card);
       var t = q.threadKey ? byKey.get(q.threadKey) : null;
       // In which chat (workspace and app), else the thread's workspace.
