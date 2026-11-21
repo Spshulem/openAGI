@@ -17,6 +17,10 @@ import { decodePushKey } from "./mobile-push-envelope.js";
 // `alerts: false` that its notification permission is off. `renew: true`
 // means the relay refused the pass itself, so nothing is sent with it until
 // the phone posts a new one (POST /mobile/push answers it renew: true).
+// `approvals: true` means the phone's app can show and act on an approval
+// alert (an older build would only show the relay's generic text), and
+// `approvalsNotified` is the pending-action ids already alerted to it, kept
+// here for the same reason as `notified`.
 export const PUSH_PASS_MAX = 2000;
 export const PUSH_ENVS = Object.freeze(["sandbox", "production"]);
 
@@ -26,7 +30,7 @@ const FILE_VERSION = 1;
 /// { ok: false, error }, never throws.
 export function validatePushRegistration(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "body must be an object" };
-  const { pass, key, env, activities, alerts } = body;
+  const { pass, key, env, activities, alerts, approvals } = body;
   if (typeof pass !== "string" || !pass.startsWith("p1.") || pass.length > PUSH_PASS_MAX) {
     return { ok: false, error: `pass must start with "p1." and be at most ${PUSH_PASS_MAX} chars` };
   }
@@ -34,10 +38,16 @@ export function validatePushRegistration(body) {
   if (!PUSH_ENVS.includes(env)) return { ok: false, error: `env must be one of ${PUSH_ENVS.join(", ")}` };
   if (activities !== undefined && typeof activities !== "boolean") return { ok: false, error: "activities must be a boolean" };
   if (alerts !== undefined && typeof alerts !== "boolean") return { ok: false, error: "alerts must be a boolean" };
-  return { ok: true, value: { pass, key, env, activities: activities !== false, alerts: alerts !== false } };
+  if (approvals !== undefined && typeof approvals !== "boolean") return { ok: false, error: "approvals must be a boolean" };
+  return { ok: true, value: { pass, key, env, activities: activities !== false, alerts: alerts !== false, approvals: approvals === true } };
 }
 
-const copy = (record) => ({ ...record, notified: [...record.notified], activity: record.activity ? { ...record.activity } : null });
+const copy = (record) => ({
+  ...record,
+  notified: [...record.notified],
+  approvalsNotified: [...record.approvalsNotified],
+  activity: record.activity ? { ...record.activity } : null
+});
 
 export class MobilePushStore {
   constructor({ dir, now = () => new Date() } = {}) {
@@ -57,6 +67,8 @@ export class MobilePushStore {
         notified: Array.isArray(record.notified) ? record.notified.filter((id) => typeof id === "string") : [],
         activities: record.activities !== false,
         alerts: record.alerts !== false,
+        approvals: record.approvals === true,
+        approvalsNotified: Array.isArray(record.approvalsNotified) ? record.approvalsNotified.filter((id) => typeof id === "string") : [],
         renew: record.renew === true,
         noLiveActivity: record.noLiveActivity === true,
         activity: Number.isFinite(Date.parse(record.activity?.startedAt ?? "")) ? { startedAt: record.activity.startedAt } : null
@@ -77,15 +89,17 @@ export class MobilePushStore {
   /// the same pass keeps its activity state, a new pass is a new push-to-start
   /// token whose activity is not ours to update. The notified ids carry over
   /// either way: it is the same phone, which already saw those alerts.
-  put(nodeId, { pass, key, env, activities = true, alerts = true }) {
+  put(nodeId, { pass, key, env, activities = true, alerts = true, approvals = false }) {
     const prior = this.records.get(nodeId);
     const samePass = prior?.pass === pass;
     const record = {
       nodeId, pass, key, env,
       updatedAt: this.now().toISOString(),
       notified: prior?.notified ?? [],
+      approvalsNotified: prior?.approvalsNotified ?? [],
       activities: activities !== false,
       alerts: alerts !== false,
+      approvals: approvals === true,
       // The relay's verdicts belong to the pass, not the request.
       renew: samePass ? prior.renew === true : false,
       noLiveActivity: samePass ? prior.noLiveActivity === true : false,
@@ -144,6 +158,16 @@ export class MobilePushStore {
     const next = [...new Set(ids)];
     if (next.length === record.notified.length && next.every((id, i) => id === record.notified[i])) return;
     record.notified = next;
+    this.save();
+  }
+
+  /// The same rule for pending-action ids: the caller prunes decided ones.
+  setApprovalsNotified(nodeId, ids) {
+    const record = this.records.get(nodeId);
+    if (!record) return;
+    const next = [...new Set(ids)];
+    if (next.length === record.approvalsNotified.length && next.every((id, i) => id === record.approvalsNotified[i])) return;
+    record.approvalsNotified = next;
     this.save();
   }
 

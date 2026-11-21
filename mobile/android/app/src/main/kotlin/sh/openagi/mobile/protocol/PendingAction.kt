@@ -27,6 +27,11 @@ data class PendingAction(
     val decidedBy: String? = null,
     val result: JsonElement? = null,
     val error: String? = null,
+    // "queue", "chat" (waits on the owner's spoken code) or "owner" (already
+    // ran on the owner's word). Absent on older mains: a queued card.
+    val mode: String? = null,
+    // The spoken "yes NN" code, when the card has one.
+    val confirmCode: String? = null,
 )
 
 @Serializable

@@ -395,14 +395,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   if (runtime.bindOutreachEvents) runtime.bindOutreachEvents(runtime.events);
 
   // Paired iPhones' push registrations (POST /mobile/push), and the sender
-  // that turns fleet changes into sealed Live Activity updates and alerts.
+  // that turns fleet changes into sealed Live Activity updates and alerts,
+  // and pending approvals into Approve/Deny alerts.
   // Registrations are stored even with sending off, so turning it on later
   // needs no re-pairing.
   const mobilePushStore = new MobilePushStore({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
-  const mobilePush = runtime.fleetSupervisor && process.env.OPENAGI_PUSH !== "0"
+  const mobilePush = (runtime.fleetSupervisor || runtime.pendingActions) && process.env.OPENAGI_PUSH !== "0"
     ? new MobilePush({
         store: mobilePushStore,
-        supervisor: runtime.fleetSupervisor,
+        supervisor: runtime.fleetSupervisor ?? null,
+        pendingActions: runtime.pendingActions ?? null,
         events: runtime.events,
         relayUrl: process.env.OPENAGI_PUSH_RELAY || undefined,
         ...(options.pushFetch ? { fetch: options.pushFetch } : {})

@@ -25,16 +25,36 @@ enum SupervisorCategories {
         UNNotificationCategory(identifier: SupervisorPushContent.baseCategory, actions: [], intentIdentifiers: [])
     }
 
-    // One button per option, then Dismiss. Both need an unlocked phone: a tap
-    // relays text to a live coding agent (Android does the same).
+    // One button per option, a Reply field when the question takes typed
+    // text, then Dismiss. All need an unlocked phone: a tap relays text to a
+    // live coding agent (Android does the same).
     static func category(for alert: SupervisorPushContent.Alert) -> UNNotificationCategory {
         var actions = alert.actionTitles.enumerated().map { index, title in
             UNNotificationAction(identifier: SupervisorPushContent.answerActionPrefix + String(index),
                                  title: title, options: [.authenticationRequired])
         }
+        if alert.canReply {
+            actions.append(UNTextInputNotificationAction(identifier: SupervisorPushContent.replyAction,
+                                                         title: SupervisorPushContent.replyTitle,
+                                                         options: [.authenticationRequired],
+                                                         textInputButtonTitle: SupervisorPushContent.replyButtonTitle,
+                                                         textInputPlaceholder: SupervisorPushContent.replyPlaceholder))
+        }
         actions.append(UNNotificationAction(identifier: SupervisorPushContent.dismissAction,
                                             title: SupervisorPushContent.dismissTitle, options: [.authenticationRequired]))
         return UNNotificationCategory(identifier: alert.categoryIdentifier, actions: actions, intentIdentifiers: [])
+    }
+
+    // Approve and Deny on a pending action. Fixed titles, so one category
+    // serves every approval. Neither works from a locked phone: Approve runs
+    // the tool, and the system asks for Face ID / the passcode first.
+    static func approval() -> UNNotificationCategory {
+        UNNotificationCategory(identifier: ApprovalPushContent.category, actions: [
+            UNNotificationAction(identifier: ApprovalPushContent.approveAction,
+                                 title: ApprovalPushContent.approveTitle, options: [.authenticationRequired]),
+            UNNotificationAction(identifier: ApprovalPushContent.denyAction,
+                                 title: ApprovalPushContent.denyTitle, options: [.authenticationRequired, .destructive])
+        ], intentIdentifiers: [])
     }
 
     // Everything that is not a per-question `sq.*` category is kept as is.

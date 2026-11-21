@@ -10,9 +10,10 @@ import Foundation
 //
 // Wire: `v1.<base64url(nonce)>.<base64url(ciphertext || tag)>`, AES-256-GCM,
 // 12-byte nonce, 16-byte tag, AAD `openagi-push:v1:<kind>`. The AAD binds the
-// kind, so an activity payload can never be replayed as an alert.
+// kind, so an activity payload can never be replayed as an alert, nor a
+// question alert as an approval.
 public enum PushKind: String, Sendable {
-    case activity, alert
+    case activity, alert, approval
 }
 
 public enum PushEnvelopeError: Error, Equatable {
@@ -166,16 +167,21 @@ public struct SupervisorAlertPlaintext: Codable, Sendable, Equatable {
     public var body: String?
     public var options: [String]
     public var threadKey: String?
+    // The answer route takes typed text for this question (a Reply field).
+    // Absent from older daemons: no field.
+    public var canReply: Bool
 
-    public init(questionId: String, title: String? = nil, body: String? = nil, options: [String] = [], threadKey: String? = nil) {
+    public init(questionId: String, title: String? = nil, body: String? = nil, options: [String] = [], threadKey: String? = nil,
+                canReply: Bool = false) {
         self.questionId = questionId
         self.title = title
         self.body = body
         self.options = options
         self.threadKey = threadKey
+        self.canReply = canReply
     }
 
-    private enum CodingKeys: String, CodingKey { case questionId, title, body, options, threadKey }
+    private enum CodingKeys: String, CodingKey { case questionId, title, body, options, threadKey, canReply }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -184,6 +190,31 @@ public struct SupervisorAlertPlaintext: Codable, Sendable, Equatable {
         body = try? c.decodeIfPresent(String.self, forKey: .body)
         options = (try? c.decodeIfPresent([String].self, forKey: .options)) ?? []
         threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+        canReply = (try? c.decodeIfPresent(Bool.self, forKey: .canReply)) ?? false
+    }
+}
+
+// Kind `approval`: a pending action waiting on the owner. Display text only;
+// Approve and Deny go through the authenticated approve/deny routes.
+public struct ApprovalAlertPlaintext: Codable, Sendable, Equatable {
+    public var actionId: String
+    public var summary: String?
+    // The spoken "yes NN" code, when the card has one.
+    public var code: String?
+
+    public init(actionId: String, summary: String? = nil, code: String? = nil) {
+        self.actionId = actionId
+        self.summary = summary
+        self.code = code
+    }
+
+    private enum CodingKeys: String, CodingKey { case actionId, summary, code }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        actionId = try c.decode(String.self, forKey: .actionId)
+        summary = try? c.decodeIfPresent(String.self, forKey: .summary)
+        code = try? c.decodeIfPresent(String.self, forKey: .code)
     }
 }
 

@@ -117,7 +117,7 @@ struct SupervisorView: View {
                     workspace: card.workspace
                 ),
                 subchannel: card.subchannel,
-                headline: card.headline,
+                headline: card.decisionHeadline ?? card.headline,
                 kindLabel: card.kindLabel ?? "Needs you",
                 risky: card.risky
             )
@@ -1289,10 +1289,25 @@ struct SupervisorView: View {
                 .font(Theme.Typography.caption.weight(.bold))
                 .foregroundStyle(Theme.ink)
                 .fixedSize()
-            Text(card.headline)
-                .font(Theme.Typography.caption)
-                .foregroundStyle(Theme.muted)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(card.decisionHeadline ?? card.headline)
+                    .font(Theme.Typography.caption.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                if let fact = card.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+                    Text(fact)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
+                }
+                if !card.remainingItemIds.isEmpty {
+                    Text("More owner questions remain")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.live)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 4)
             Button {
                 withAnimation(.spring(duration: 0.22)) {
@@ -2087,17 +2102,26 @@ private struct SupervisorCardDeckView: View {
     }
 
     private func headlineRow(showsChevron: Bool) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(card.headline)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.ink)
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-            Spacer(minLength: 4)
-            if showsChevron {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(card.decisionHeadline ?? card.headline)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 4)
+                if showsChevron {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+            if let fact = card.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+                Text(fact)
+                    .font(.caption)
                     .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
