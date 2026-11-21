@@ -9,6 +9,7 @@ import {
   redactSecrets, shortHash, uiTargetFor
 } from "./contracts.js";
 import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
+import { providerAuthDetail } from "./errors.js";
 import { renderTemplate } from "./playbooks.js";
 import { requiredChecksFor } from "./sources/github.js";
 
@@ -25,7 +26,7 @@ const LB_WATCH_FRESH_MS = 45 * MIN;
 
 const LIMIT_KINDS = new Set(["session-limit", "usage-limit"]);
 const BACKOFF_KINDS = new Set(["overloaded", "network"]);
-const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit", "logged-out", "disk-full"]);
+const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit", "logged-out", "provider-auth", "disk-full"]);
 const RESUME_STATUSES = new Set(["aborted", "stalled", "error"]);
 const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
@@ -298,6 +299,7 @@ function infraIntent(ctx) {
         ["retry", "later"], `logged-out:${thread.key}`, "infra")
     };
   }
+  if (kind === "provider-auth") return providerAuthIntent(ctx);
   if (kind === "disk-full") {
     return {
       type: "ask", reason: "disk full",
@@ -306,6 +308,31 @@ function infraIntent(ctx) {
     };
   }
   return { type: "none", reason: classified.reason };
+}
+
+// The model proxy has no signed-in account for the provider
+// (auth_not_found). Unlike an overload, a resend fails the same way until
+// someone fixes the proxy, so nothing is sent automatically: the owner is
+// asked once per distinct failure, and "retry" resends. While the error
+// stays on the thread every scan reaches this same ask (deduplicated);
+// once a turn clears it, the thread is classified normally again and the
+// question resolves as no longer asked. Only the provider and model names
+// are shown, never the raw error text.
+function providerAuthIntent(ctx) {
+  const { thread } = ctx;
+  const detail = providerAuthDetail(thread.error?.text) ?? { providers: [], model: null };
+  const providers = detail.providers.map((name) => fact(name, 24)).filter(Boolean);
+  const model = detail.model ? fact(detail.model, 40) : "";
+  const who = providers.length ? providers.join("/") : "provider";
+  const scope = [providers.length ? `providers=${providers.join(",")}` : "", model ? `model=${model}` : ""].filter(Boolean).join(", ");
+  const fingerprint = shortHash(`${providers.join(",")}|${model}`).slice(0, 8);
+  return {
+    type: "ask", reason: `provider auth missing${scope ? ` (${scope})` : ""}; auto-resume held until it is fixed`,
+    question: question(ctx, `${ctx.facts.label}: no ${who} auth on the proxy. Fix and retry?`,
+      `${ctx.facts.label} stopped: the model proxy has no signed-in ${who} account${model ? ` for ${model}` : ""} (auth_not_found). `
+        + "Resending continue fails the same way, so the supervisor will not resume it. Sign the account in on the proxy, then answer retry.",
+      ["retry", "later"], `provider-auth:${thread.key}:${fingerprint}`, "infra")
+  };
 }
 
 function backoffIntent(ctx, errorAt, kind) {

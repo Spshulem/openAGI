@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyCodexErrorCode, classifyErrorText, parseResetAt } from "../src/fleet/errors.js";
+import { classifyCodexErrorCode, classifyErrorText, parseResetAt, providerAuthDetail } from "../src/fleet/errors.js";
 
 const now = new Date(2026, 8, 26, 1, 0, 0); // Sep 26 2026 01:00 local
 
@@ -72,4 +72,33 @@ test("Antigravity quota errors are a usage limit with the exact reset", () => {
   // A plain 429 is still overloaded, and Claude's reset wording still parses.
   assert.equal(classifyErrorText("HTTP 429 Too Many Requests", at).kind, "overloaded");
   assert.ok(classifyErrorText("You've hit your session limit · resets 2:50am (America/Los_Angeles)", at).resetAt);
+});
+
+// Live Paseo chat, 2026-11-21: the model proxy had no Codex account, and the
+// generic 503 rule read it as overloaded, so the supervisor kept resuming it.
+const AUTH_NOT_FOUND = "[System Error] unexpected status 503 Service Unavailable: auth_not_found: no auth available (providers=codex, model=gpt-6.2-sol)";
+
+test("explicit auth_not_found is provider-auth, never a generic 503 overload", () => {
+  assert.deepEqual(classifyErrorText(AUTH_NOT_FOUND, now), { kind: "provider-auth", resetAt: null });
+  assert.equal(classifyErrorText("auth_not_found", now).kind, "provider-auth");
+  assert.equal(classifyErrorText("502 Bad Gateway: no auth available for provider", now).kind, "provider-auth");
+  // Codex reports the proxy's 503 as server_overloaded; the message's code wins.
+  for (const code of ["server_overloaded", "other", null]) assert.equal(classifyCodexErrorCode(code, AUTH_NOT_FOUND, now).kind, "provider-auth", String(code));
+  // A real overload or LB outage keeps its own kind.
+  assert.equal(classifyErrorText("unexpected status 503 Service Unavailable", now).kind, "overloaded");
+  assert.equal(classifyErrorText("unexpected status 503 Service Unavailable: server is overloaded", now).kind, "overloaded");
+  assert.equal(classifyErrorText("unexpected status 503 Service Unavailable: No available accounts", now).kind, "lb");
+  assert.equal(classifyCodexErrorCode("server_overloaded", "Selected model is at capacity", now).kind, "model-limit");
+  // Prose that merely talks about auth is not the structured code.
+  assert.equal(classifyErrorText("Fixed the auth not found page in the login flow.", now), null);
+});
+
+test("providerAuthDetail keeps only the provider and model names", () => {
+  assert.deepEqual(providerAuthDetail(AUTH_NOT_FOUND), { providers: ["codex"], model: "gpt-6.2-sol" });
+  assert.deepEqual(providerAuthDetail("auth_not_found: no auth available (providers=codex,claude, model=x-1)"), { providers: ["codex", "claude"], model: "x-1" });
+  assert.deepEqual(providerAuthDetail("auth_not_found"), { providers: [], model: null });
+  assert.equal(providerAuthDetail("unexpected status 503 Service Unavailable"), null);
+  const noisy = providerAuthDetail("auth_not_found: no auth available (providers=codex, model=gpt-6.2-sol) Authorization: Bearer sk-live-abcdef0123456789 account=owner@example.com");
+  assert.deepEqual(noisy, { providers: ["codex"], model: "gpt-6.2-sol" });
+  assert.doesNotMatch(JSON.stringify(noisy), /sk-live|Bearer|example\.com/);
 });
