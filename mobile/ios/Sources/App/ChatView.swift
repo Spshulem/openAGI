@@ -249,13 +249,9 @@ struct ChatConversationView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            // Coming back finds replies whose stream iOS cut while away and
-            // resends a send main never confirmed. Away, nothing polls.
-            if phase == .active { Task { await conversation.resume() } }
-            else {
-                conversation.pauseRecovery()
-                dictation.stop()
-            }
+            // Catching up on return (and pausing while away) is app-wide, for
+            // every open chat: see ConversationLibrary.resumeOpenChats.
+            if phase != .active { dictation.stop() }
         }
     }
 
