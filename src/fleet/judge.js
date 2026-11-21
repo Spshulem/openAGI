@@ -20,7 +20,7 @@ export const JUDGE_ACTIONS = Object.freeze(["send", "wait", "ask-owner"]);
 // verify locally" went out to an agent that had said nothing ran there).
 // Owner answers, owner messages, manager escalations and questions never
 // come here.
-export const JUDGED_PLAYBOOKS = new Set(["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume", "no-local-verify", "infra-recovered", "in-scope-yes"]);
+export const JUDGED_PLAYBOOKS = new Set(["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume", "no-local-verify", "infra-recovered", "in-scope-yes", "unblock-snag"]);
 export const DEFAULT_JUDGE_TIMEOUT_MS = 40_000;
 const MESSAGE_MAX = 600;
 const REASON_MAX = 200;

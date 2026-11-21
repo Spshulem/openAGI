@@ -95,6 +95,10 @@ struct SupervisorView: View {
 
     @State private var openThread: ThreadPresentation?
     @State private var activeSheet: SupervisorSheet?
+    @State private var budgetStatus: BudgetStatus?
+    @State private var budgetBusy = false
+    @State private var showingCustomBudgetPrompt = false
+    @State private var customBudgetAmountText = "50"
     @State private var issued = 0
     @State private var applied = 0
 
@@ -495,6 +499,24 @@ struct SupervisorView: View {
         } message: {
             Text("In Auto the supervisor sends preset nudges to your agents by itself, a few per scan, without asking first. Observe and Propose never send on their own.")
         }
+        .alert("Add extra budget for today", isPresented: $showingCustomBudgetPrompt) {
+            TextField("Amount in USD (e.g. 50)", text: $customBudgetAmountText)
+                .keyboardType(.decimalPad)
+            Button("Add today") {
+                let cleaned = customBudgetAmountText
+                    .replacingOccurrences(of: "$", with: "")
+                    .replacingOccurrences(of: "+", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let amount = Double(cleaned), amount >= 0.5, amount <= 10000 {
+                    Task { await quickTopUpBudget(amount: amount) }
+                } else {
+                    showToast("Enter an amount between $0.50 and $10,000.", isError: true)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Adds immediate headroom for today without permanently changing tomorrow's daily cap.")
+        }
         .confirmationDialog(
             "Archive coding chat in Paseo?",
             isPresented: Binding(
@@ -858,6 +880,50 @@ struct SupervisorView: View {
     @ViewBuilder
     private var topBannerStack: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let budget = budgetStatus, budget.isExceeded {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "dollarsign.circle.fill")
+                            .foregroundStyle(Theme.alert)
+                            .font(.footnote.weight(.semibold))
+                        Text(String(format: "Daily budget reached ($%.2f / $%.2f)", budget.spentUsd, budget.effectiveLimit))
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Theme.ink)
+                        Spacer(minLength: 4)
+                    }
+                    HStack(spacing: 8) {
+                        Button("+$10") { Task { await quickTopUpBudget(amount: 10) } }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-10")
+                        Button("+$25") { Task { await quickTopUpBudget(amount: 25) } }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-25")
+                        Button("+$$$…") { showingCustomBudgetPrompt = true }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-custom")
+                        Button("Settings") { activeSheet = .budget }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-open")
+                    }
+                }
+                .padding(.horizontal, Theme.gutter)
+                .padding(.vertical, 8)
+                .background(Theme.alert.opacity(0.08))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("supervisor-budget-exceeded-banner")
+            }
             if let loadError, state == nil || SupervisorFormat.isUnavailable(loadError) {
                 let copy = SupervisorFormat.errorCopy(loadError)
                 HStack(alignment: .top, spacing: 10) {
@@ -1557,6 +1623,7 @@ struct SupervisorView: View {
         let sequence = nextSequence()
         async let freshModelSettings = try? model.client.modelSettings()
         async let freshHierarchy = try? model.client.fleetHierarchy(limit: 60)
+        async let freshBudget = try? model.client.budget()
         do {
             let fresh = try await model.client.fleetState()
             accept(sequence, fresh)
@@ -1570,6 +1637,22 @@ struct SupervisorView: View {
         }
         if let updatedHierarchy = await freshHierarchy {
             model.latestFleetHierarchy = updatedHierarchy
+        }
+        if let updatedBudget = await freshBudget {
+            budgetStatus = updatedBudget
+        }
+    }
+
+    private func quickTopUpBudget(amount: Double) async {
+        guard !budgetBusy else { return }
+        budgetBusy = true
+        defer { budgetBusy = false }
+        do {
+            let updated = try await model.client.updateBudget(BudgetUpdate(addUsdToday: amount))
+            budgetStatus = updated
+            showToast(String(format: "Added +$%.2f today ($%.2f remaining) ✓", amount, max(0, updated.remainingUsd)))
+        } catch {
+            showToast("Couldn't update budget. Open Budget settings to retry.", isError: true)
         }
     }
 
@@ -3482,7 +3565,9 @@ private struct BoardThreadInspectorPane: View {
                             if let actor = thread.actorLabel, !actor.isEmpty {
                                 BoardActorPill(actor: actor)
                             }
-                            if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
+                            if let wd = thread.watchdog, let wdText = wd.badgeText {
+                                Chip(text: wdText, color: wd.isAlert ? Theme.alert : Theme.muted)
+                            } else if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
                                 BoardQuietCheckPill(label: check)
                             }
                             if let prChip = SupervisorFormat.prChip(thread.pr) {
@@ -3744,7 +3829,8 @@ private struct ThreadRow: View {
                         .lineLimit(1)
                 }
                 let chip = SupervisorFormat.prChip(thread.pr)
-                let checkBadge = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt)
+                let watchdogChip = thread.watchdog?.badgeText
+                let checkBadge = watchdogChip == nil ? SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) : nil
                 let threadLabels = Array(SupervisorBoardLabel.extract(from: thread.labels).prefix(3))
                 let subSlug = thread.subchannel.flatMap { raw -> String? in
                     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3752,7 +3838,7 @@ private struct ThreadRow: View {
                     let clean = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
                     return clean.split(separator: "/").last.map(String.init) ?? clean
                 }
-                if chip != nil || hasProposal || thread.actorLabel != nil || checkBadge != nil || subSlug != nil {
+                if chip != nil || hasProposal || thread.actorLabel != nil || watchdogChip != nil || checkBadge != nil || subSlug != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Theme.Spacing.x2) {
                             if let actor = thread.actorLabel, !actor.isEmpty {
@@ -3764,7 +3850,9 @@ private struct ThreadRow: View {
                             if let chip {
                                 Chip(text: chip, color: SupervisorFormat.ciFailing(thread.pr?.ci) ? Theme.alert : Theme.ink)
                             }
-                            if let checkBadge {
+                            if let watchdogChip {
+                                Chip(text: watchdogChip, color: thread.watchdog?.isAlert == true ? Theme.alert : Theme.muted)
+                            } else if let checkBadge {
                                 BoardQuietCheckPill(label: checkBadge)
                             }
                             if hasProposal { Chip(text: "Nudge ready to send", color: Theme.live) }

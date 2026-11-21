@@ -114,4 +114,38 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(normal))
         XCTAssertFalse(BudgetLimitPrompt.isBudgetExceeded(userLine))
     }
+
+    func testFleetWatchdogDecodingAndBadges() throws {
+        let json = """
+        {
+          "key": "paseo:srv_1.504212e5",
+          "title": "Staging QA Report Analysis",
+          "agentStatus": "stalled",
+          "state": "stopped",
+          "watchdog": {
+            "phase": "stalled",
+            "expectedMinutes": 15,
+            "silentMinutes": 930,
+            "checkInDueAt": "2026-11-20T17:15:00.000Z",
+            "overdue": true,
+            "overdueMinutes": 915,
+            "severelyStuck": true,
+            "status": "stuck",
+            "diagnosis": {
+              "kind": "silent-turn",
+              "label": "silent 15h with no progress",
+              "resolution": "auto-nudge"
+            }
+          }
+        }
+        """
+        let thread = try ProtocolDecoder.json.decode(FleetThread.self, from: Data(json.utf8))
+        XCTAssertEqual(thread.watchdog?.severelyStuck, true)
+        XCTAssertEqual(thread.watchdog?.isAlert, true)
+        XCTAssertEqual(thread.watchdog?.badgeText, "Stuck 15h · silent 15h with no progress")
+
+        let overdue = FleetWatchdog(expectedMinutes: 25, silentMinutes: 35, overdue: true, overdueMinutes: 10, severelyStuck: false, status: "overdue")
+        XCTAssertEqual(overdue.badgeText, "Check-in overdue +10m")
+        XCTAssertTrue(overdue.isAlert)
+    }
 }

@@ -331,7 +331,7 @@ function currentError(agent, entries) {
   return { ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }), text: clampText(message, 1000) };
 }
 
-export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null, sleepingActive = false } = {}) {
+export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null, sleepingActive = false, silentStuck = false } = {}) {
   const messages = entries.filter(e => ["user_message", "assistant_message"].includes(e.item?.type));
   const users = messages.filter(e => e.item.type === "user_message");
   const owner = users.findLast(e => !e.item.text?.startsWith(SUPERVISOR_PREFIX));
@@ -377,7 +377,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
     cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? workspaceMeta?.repo ?? null, branch: workspaceMeta?.branch ?? null,
-    agentStatus: hasBlockingPermission ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
+    agentStatus: hasBlockingPermission ? "waiting" : silentStuck ? "stalled" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status
       : (sleepingActive && !agent.archivedAt && agent.status === "closed") ? "idle" : "unknown",
     archived: Boolean(agent.archivedAt),
@@ -392,6 +392,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
       ...(!agent.archivedAt && agent.status === "closed" ? { paseoClosed: true } : {}),
+      ...(silentStuck ? { silentStuck: true } : {}),
       requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
       ...(Object.keys(agentLabels).length ? { agentLabels } : {}),
       ...(agentLabels.theme ? { theme: agentLabels.theme } : {}),
@@ -466,11 +467,19 @@ export function createPaseoSource({ factory } = {}) {
       }
       const scanStartedAt = meta.startedAt ?? Date.now();
       const lookbackMs = Math.max(1, Number(config.lookbackHours ?? 48)) * 3600_000;
+      const liveStallMs = config.limits?.liveServerStallMs ?? 2 * 3600_000;
       const isRecentSleeping = (a) => Boolean(
         !a.archivedAt && a.status === "closed" && (Date.parse(a.updatedAt ?? "") || 0) >= scanStartedAt - lookbackMs
       );
+      const isSilentRunning = (a) => Boolean(
+        !a.archivedAt
+        && !a.pendingPermissions?.length
+        && (a.activeTurn || ["running", "initializing"].includes(a.status))
+        && (Date.parse(a.updatedAt ?? "") || 0) > 0
+        && scanStartedAt - (Date.parse(a.updatedAt ?? "") || 0) >= liveStallMs
+      );
       const candidates = inventory.filter(({ agent: a, key }) => !a.archivedAt
-        && (["idle", "error"].includes(a.status) || isRecentSleeping(a))
+        && (["idle", "error"].includes(a.status) || isRecentSleeping(a) || isSilentRunning(a))
         && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) =>
           (Number(a.agent.status === "closed") - Number(b.agent.status === "closed"))
           || ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
@@ -529,6 +538,12 @@ export function createPaseoSource({ factory } = {}) {
       const out = inventory.map(({ agent: a, id, key }) => {
         const history = cache.get(key);
         const sleepingActive = isRecentSleeping(a);
+        const histEntries = history?.stamp === a.updatedAt ? (history?.entries ?? []) : [];
+        const latestTimelineMs = Math.max(
+          Date.parse(a.updatedAt ?? "") || 0,
+          ...histEntries.map((e) => Date.parse(e?.timestamp ?? "") || 0)
+        );
+        const silentStuck = isSilentRunning(a) && scanStartedAt - latestTimelineMs >= liveStallMs;
         const known = ["running", "initializing"].includes(a.status)
           || (a.status === "closed" && !sleepingActive)
           || (history?.stamp === a.updatedAt);
@@ -548,7 +563,8 @@ export function createPaseoSource({ factory } = {}) {
         const row = paseoThread(a, id, known ? history?.entries ?? [] : [], known, {
           planArtifactPath: known ? history?.planArtifactPath ?? null : null,
           workspaceMeta,
-          sleepingActive
+          sleepingActive,
+          silentStuck
         });
         row.meta.isLocalHost = Boolean(selfIsLocal && id === directory.self?.serverId);
         return row;

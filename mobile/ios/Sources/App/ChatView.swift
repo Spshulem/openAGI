@@ -1285,36 +1285,50 @@ private struct ChatBudgetExceededBar: View {
     let conversation: ChatConversation
     let onOpenBudgetSettings: () -> Void
     @State private var isWorking = false
+    @State private var showingCustomPrompt = false
+    @State private var customAmountText = "50"
     @State private var note: (text: String, isError: Bool)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Button {
-                    Task { await addAndRetry(amount: 10, retryTurn: true) }
-                } label: {
-                    Label("+$10 & retry", systemImage: "plus.circle.fill")
-                        .font(.footnote.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isWorking || conversation.isSending)
-                .accessibilityIdentifier("chat-budget-add-10")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await addAndRetry(amount: 10, retryTurn: true) }
+                    } label: {
+                        Label("+$10 & retry", systemImage: "plus.circle.fill")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-10")
 
-                Button {
-                    Task { await addAndRetry(amount: 25, retryTurn: false) }
-                } label: {
-                    Text("+$25 today")
-                        .font(.footnote.weight(.medium))
-                }
-                .buttonStyle(.bordered)
-                .disabled(isWorking || conversation.isSending)
-                .accessibilityIdentifier("chat-budget-add-25")
-
-                Button("Change budget…", action: onOpenBudgetSettings)
-                    .font(.footnote.weight(.medium))
+                    Button {
+                        Task { await addAndRetry(amount: 25, retryTurn: true) }
+                    } label: {
+                        Text("+$25 & retry")
+                            .font(.footnote.weight(.medium))
+                    }
                     .buttonStyle(.bordered)
-                    .disabled(isWorking)
-                    .accessibilityIdentifier("chat-budget-open")
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-25")
+
+                    Button {
+                        showingCustomPrompt = true
+                    } label: {
+                        Text("+$$$…")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-custom")
+
+                    Button("Settings", action: onOpenBudgetSettings)
+                        .font(.footnote.weight(.medium))
+                        .buttonStyle(.bordered)
+                        .disabled(isWorking)
+                        .accessibilityIdentifier("chat-budget-open")
+                }
             }
             if let note {
                 Text(note.text)
@@ -1325,6 +1339,35 @@ private struct ChatBudgetExceededBar: View {
         .padding(.top, 4)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("chat-budget-exceeded-bar")
+        .alert("Add extra budget for today", isPresented: $showingCustomPrompt) {
+            TextField("Amount in USD (e.g. 50)", text: $customAmountText)
+                .keyboardType(.decimalPad)
+            Button("Add & retry") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: true) }
+                }
+            }
+            Button("Add only") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: false) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Adds immediate headroom for today without permanently changing tomorrow's daily cap.")
+        }
+    }
+
+    private func parsedCustomAmount() -> Double? {
+        let cleaned = customAmountText
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: "+", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let amount = Double(cleaned), amount >= 0.5, amount <= 10000 else {
+            note = ("Enter an amount between $0.50 and $10,000.", true)
+            return nil
+        }
+        return amount
     }
 
     private func addAndRetry(amount: Double, retryTurn: Bool) async {
@@ -1333,7 +1376,7 @@ private struct ChatBudgetExceededBar: View {
         defer { isWorking = false }
         do {
             let updated = try await model.client.updateBudget(BudgetUpdate(addUsdToday: amount))
-            note = (String(format: "Added +$%.0f today ($%.2f remaining).", amount, max(0, updated.remainingUsd)), false)
+            note = (String(format: "Added +$%.2f today ($%.2f remaining).", amount, max(0, updated.remainingUsd)), false)
             guard retryTurn else { return }
             if message.isFailed && message.retrySafe {
                 await conversation.retry(message)
@@ -1346,7 +1389,7 @@ private struct ChatBudgetExceededBar: View {
         } catch let error as DaemonError where error == .notFound {
             note = ("Update OpenAGI on your main server to raise the budget from here.", true)
         } catch {
-            note = ("Couldn't update the budget. Try Change budget…", true)
+            note = ("Couldn't update the budget. Try Settings.", true)
         }
     }
 }

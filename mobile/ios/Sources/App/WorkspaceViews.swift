@@ -32,15 +32,36 @@ enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
 }
 
 struct WorkspaceSection: View {
+    @Environment(AppModel.self) private var model
+    @State private var budgetSummary: BudgetStatus?
+
     var body: some View {
         Section("Agent") {
             ForEach(WorkspaceDestination.allCases) { destination in
                 NavigationLink(value: destination) {
-                    Label(destination.title, systemImage: destination.symbol)
+                    if destination == .budget, let budgetSummary {
+                        HStack {
+                            Label(destination.title, systemImage: destination.symbol)
+                            Spacer(minLength: 8)
+                            Text(budgetBadgeText(budgetSummary))
+                                .font(Theme.Typography.caption.weight(budgetSummary.isExceeded ? .semibold : .regular))
+                                .foregroundStyle(budgetSummary.isExceeded ? Theme.alert : Theme.muted)
+                        }
+                    } else {
+                        Label(destination.title, systemImage: destination.symbol)
+                    }
                 }
                 .accessibilityIdentifier("settings-\(destination.rawValue)")
             }
         }
+        .task {
+            budgetSummary = try? await model.client.budget()
+        }
+    }
+
+    private func budgetBadgeText(_ b: BudgetStatus) -> String {
+        let prefix = b.isExceeded ? "Limit hit · " : ""
+        return String(format: "%@$%.2f / $%.0f", prefix, b.spentUsd, b.effectiveLimit)
     }
 }
 
@@ -302,6 +323,7 @@ struct BudgetSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var budget: BudgetStatus?
     @State private var customLimit = ""
+    @State private var customTopUp = ""
     @State private var isLoading = false
     @State private var isSaving = false
     @State private var status: (text: String, isError: Bool)?
@@ -349,14 +371,36 @@ struct BudgetSettingsView: View {
                 }
 
                 Section {
-                    Button("Add $10 for today", systemImage: "plus.circle.fill") {
-                        Task { await apply(BudgetUpdate(addUsdToday: 10), success: "Added $10 for today.") }
+                    HStack(spacing: 8) {
+                        ForEach([10, 25, 50], id: \.self) { amount in
+                            Button("+\(amount == 10 ? "$10" : amount == 25 ? "$25" : "$50")") {
+                                Task { await apply(BudgetUpdate(addUsdToday: Double(amount)), success: "Added +$\(amount) for today.") }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .accessibilityIdentifier("budget-add-\(amount)")
+                        }
                     }
-                    .accessibilityIdentifier("budget-add-10")
-                    Button("Add $25 for today", systemImage: "plus.circle.fill") {
-                        Task { await apply(BudgetUpdate(addUsdToday: 25), success: "Added $25 for today.") }
+                    HStack {
+                        Text("+$").foregroundStyle(Theme.muted)
+                        TextField("Custom extra for today", text: $customTopUp)
+                            .keyboardType(.decimalPad)
+                            .font(Theme.Typography.dataMono)
+                            .accessibilityIdentifier("budget-custom-topup-input")
+                        Button("Add today") {
+                            let cleaned = customTopUp.replacingOccurrences(of: "$", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard let parsed = Double(cleaned), parsed >= 0.5, parsed <= 10000 else {
+                                status = ("Enter a top-up amount between $0.50 and $10,000.", true)
+                                return
+                            }
+                            Task {
+                                await apply(BudgetUpdate(addUsdToday: parsed), success: String(format: "Added +$%.2f for today.", parsed))
+                                customTopUp = ""
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(customTopUp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("budget-save-topup")
                     }
-                    .accessibilityIdentifier("budget-add-25")
                     if let bonus = budget.bonusUsdToday, bonus > 0 {
                         Button("Reset today's extra", role: .destructive) {
                             Task { await apply(BudgetUpdate(resetTodayBonus: true), success: "Reset today's extra budget.") }
@@ -364,7 +408,7 @@ struct BudgetSettingsView: View {
                         .accessibilityIdentifier("budget-reset-bonus")
                     }
                 } header: {
-                    Text("Quick top-up")
+                    Text("Quick top-up (+$$$ today)")
                 } footer: {
                     Text("Adds immediate headroom so you can finish today's work without permanently raising tomorrow's daily cap.")
                 }

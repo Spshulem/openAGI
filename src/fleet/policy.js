@@ -212,7 +212,19 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
-    case "stopped": return nudge("resume", classified.reason);
+    case "stopped": {
+      if (classified.snag?.playbook === "status-check") {
+        return nudge("status-check", classified.reason, {
+          vars: { what: "a long-running turn", quiet: String(classified.snag.silentMinutes ?? 120) }
+        });
+      }
+      if (classified.snag?.playbook === "unblock-snag") {
+        return nudge("unblock-snag", classified.reason, {
+          vars: { snag: classified.snag.snagLabel ?? "a blocker" }
+        });
+      }
+      return nudge("resume", classified.reason);
+    }
     // It said it would keep going ("Next: ...", "merging once they pass"),
     // then its turn ended: nothing wakes it but a nudge. A finished report
     // is left alone.
@@ -608,12 +620,16 @@ function agentAskIntent(ctx) {
         ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["opened", "later"], `prompt:${thread.key}`, "prompt")
     };
   }
-  const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
+  const topicTitle = ask.wall ? "hit an access or login wall. Unblock?" : (TOPIC_TITLES[ask.topic] ?? "asks you. Answer?");
   // A "Blocked on:" ask brings its own answers ("open thread" at least).
-  const options = ask.structured || ask.blocked ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
+  const options = ask.structured || ask.blocked || ask.wall ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   // A "Blocked on:" item that points at a list ("the two P1s above") shows it.
   const excerpt = ownerExcerpt(ask.context ? `${ask.text}: ${ask.context}` : ask.text || thread.lastAgentText, ctx.limits.bodyMax);
   // A sealed Codex ask brings its own key: its shown text is a stand-in.
+  const askMeta = {
+    ...(thread.meta?.hasPlanArtifact ? { hasPlanArtifact: "true" } : {}),
+    ...(ask.wall ? { wall: "true" } : {})
+  };
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
     question: {
@@ -623,7 +639,7 @@ function agentAskIntent(ctx) {
       // The body is only the ask sentence; the review needs what it is about.
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
       agentAskedAt: thread.lastAgentAt ?? null,
-      ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
+      ...(Object.keys(askMeta).length ? { meta: askMeta } : {})
     }
   };
 }
