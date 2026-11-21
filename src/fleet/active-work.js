@@ -1780,6 +1780,7 @@ export class ActiveWorkManager {
         item.outcomeVerified,
         item.remainingCount ?? null,
         ownerKey ?? "",
+        item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? null,
         session?.agentStatus ?? null,
         session?.archived ?? false,
         session?.lastActivityAt ?? null,
@@ -2360,8 +2361,8 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
           goal,
           ...(args.doneCriteria ? { doneCriteria: cleanText(args.doneCriteria, 500) } : {}),
           ...(args.nextAction ? { nextAction: cleanText(args.nextAction, 300) } : {}),
-          cadence: args.cadence ?? "daily",
-          permittedNudges: args.permittedNudges ?? "propose_only",
+          ...(args.cadence !== undefined ? { cadence: args.cadence } : {}),
+          ...(args.permittedNudges !== undefined ? { permittedNudges: args.permittedNudges } : {}),
           ...(args.threadKey ? { threadKey: String(args.threadKey).trim().slice(0, 200) } : {}),
           ...(args.prRef ? { prRef: String(args.prRef).trim().slice(0, 160) } : {}),
           ...(args.state ? { state: args.state } : {})

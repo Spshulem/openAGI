@@ -757,6 +757,27 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     assert.ok(cadencePass.evaluatedCount >= 1);
     assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === cadenceItem.item.id).cadence.mode, "weekly");
 
+    const progressItem = ctx.supervisor.trackWork({
+      project: "ProgressChange",
+      theme: "Follow-through",
+      goal: "Refresh stale progress",
+      cadence: "daily",
+      lastMeaningfulProgressAt: isoAgo(30)
+    });
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    assert.ok(ctx.outreach.items.some((entry) => entry.sourceRef?.id === progressItem.item.id && ["unseen", "seen"].includes(entry.status)));
+    const freshProgress = new Date(ctx.supervisor.now()).toISOString();
+    ctx.supervisor.trackWork({
+      project: "ProgressChange",
+      theme: "Follow-through",
+      goal: "Refresh stale progress",
+      lastMeaningfulProgressAt: freshProgress
+    });
+    const progressPass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    assert.ok(progressPass.evaluatedCount >= 1, "explicit progress changes invalidate the prior evaluation");
+    assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === progressItem.item.id).lastMeaningfulProgressAt, freshProgress);
+    assert.equal(ctx.outreach.items.some((entry) => entry.sourceRef?.id === progressItem.item.id && ["unseen", "seen"].includes(entry.status)), false);
+
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
     const preArchiveAttempt = await ctx.supervisor.actActiveWork(appfolio.id, { op: "propose_archive", confirmed: true });
@@ -1127,6 +1148,24 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
     const trackedViaTool = await trackTool.handler(preparedTrack, { __confirmed: true });
     assert.equal(trackedViaTool.created, true);
     assert.equal(trackedViaTool.item.customer, "AcmeCorp");
+
+    const preservedSettings = await trackTool.handler(trackTool.prepareApprovalArgs({
+      project: "PreserveSettings",
+      goal: "Keep the existing tracking settings",
+      cadence: "weekly",
+      permittedNudges: "none"
+    }), { __confirmed: true });
+    const omittedSettings = trackTool.prepareApprovalArgs({
+      project: "PreserveSettings",
+      goal: "Keep the existing tracking settings",
+      nextAction: "Record the latest check"
+    });
+    assert.equal("cadence" in omittedSettings, false, "omitted cadence stays omitted through approval");
+    assert.equal("permittedNudges" in omittedSettings, false, "omitted permissions stay omitted through approval");
+    const preservedUpdate = await trackTool.handler(omittedSettings, { __confirmed: true });
+    assert.equal(preservedUpdate.item.id, preservedSettings.item.id);
+    assert.equal(preservedUpdate.item.cadence.mode, "weekly");
+    assert.equal(preservedUpdate.item.permittedNudges, "none");
 
     const trackingA = trackTool.prepareApprovalArgs({
       project: "Partnerships",
