@@ -326,7 +326,7 @@ final class AppModel {
     // MARK: - Live events
 
     func startEventStream() {
-        guard eventStream == nil else { return }
+        guard isActive, eventStream == nil else { return }
         let controller = EventStreamController(client: client)
         eventStream = controller
         Task { [weak self] in

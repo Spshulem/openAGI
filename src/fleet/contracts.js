@@ -417,6 +417,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    // The session this process runs inside, if any: a message to it would
+    // loop back into the turn that sent it, whoever asked.
+    hostSessionIds: [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, env.PASEO_AGENT_ID, ...(overrides.hostSessionIds ?? [])].filter(Boolean),
     selfFix: {
       ...DEFAULTS.selfFix,
       runtimeImprovements: envFlag(env.OPENAGI_RUNTIME_IMPROVEMENTS),

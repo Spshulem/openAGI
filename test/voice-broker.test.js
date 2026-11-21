@@ -238,11 +238,25 @@ test("the tool-hop limit requests one final spoken answer with tools disabled", 
   assert.equal(h.upstream.last("response.create").response, undefined, "tools return on the next owner turn");
 });
 
+test("a send whose transcript names the chat and says the exact message goes without a code", async (t) => {
+  const h = harness(t);
+  h.ready();
+  h.upstream.event({ type: "input_audio_buffer.committed", item_id: "in_1" });
+  h.upstream.event({ type: "conversation.item.input_audio_transcription.completed", item_id: "in_1", transcript: "Tell amman rebase and push." });
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase and push." }));
+  await flush();
+  assert.equal(h.events.some((event) => event.type === "tool" && event.status === "awaiting_confirmation"), false);
+  assert.equal(h.sent.length, 1);
+});
+
+// The model's own wording ("Rebase and push" for "get its branch current")
+// always reads a code back.
 test("a gated action runs only on the owner's transcript, never on model text or tool text", async (t) => {
   const h = harness(t);
   h.ready();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "in_1" });
-  h.upstream.event({ type: "conversation.item.input_audio_transcription.completed", item_id: "in_1", transcript: "Tell amman to rebase and push." });
+  h.upstream.event({ type: "conversation.item.input_audio_transcription.completed", item_id: "in_1", transcript: "Tell amman to get its branch current." });
   h.upstream.event({ type: "response.created" });
   h.upstream.event(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase and push." }));
   await flush();
@@ -446,7 +460,7 @@ test("voice approvals require a code that existed before the committed owner tur
   const h = harness(t);
   h.ready();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
-  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onTranscript("request", "Tell amman to get its branch current.");
   await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
   const card = h.events.find((event) => event.status === "awaiting_confirmation");
   h.heard(h.events.find((event) => event.type === "confirmation.readback").text);
@@ -467,11 +481,11 @@ test("an old transcript cannot approve a card raised after its commit", async (t
   h.ready();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "old" });
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "new" });
-  await h.session.onTranscript("new", "Tell amman to rebase.");
+  await h.session.onTranscript("new", "Tell amman to get its branch current.");
   const outcome = await h.session.runTool({ name: "fleet_send_message", arguments: JSON.stringify({ key: "codex:t1", message: "Rebase." }) }, "new");
   await h.session.onTranscript("old", `yes ${outcome.result.code}`);
   assert.equal(h.sent.length, 0);
-  assert.equal(h.session.ownerText, "Tell amman to rebase.");
+  assert.equal(h.session.ownerText, "Tell amman to get its branch current.");
 });
 
 test("tool outputs finish before the next response and retain their own input transcript", async (t) => {
@@ -750,7 +764,7 @@ for (const crossChat of [false, true]) test(`slow approved actions speak their r
   h.ready();
   h.session.transcriptWaitMs = 10;
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
-  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onTranscript("request", "Tell amman to get its branch current.");
   await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
   const readback = h.events.find((event) => event.type === "confirmation.readback");
   h.heard(readback.text);
@@ -802,7 +816,7 @@ for (const interrupted of [false, true]) test(`audio readbacks require full devi
   const h = harness(t);
   h.ready();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
-  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onTranscript("request", "Tell amman to get its branch current.");
   await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
   const readback = h.events.find((event) => event.type === "confirmation.readback");
   h.upstream.event({ type: "response.created" });
@@ -941,7 +955,7 @@ for (const status of ["approved", "denied", "expired"]) test(`readbacks resolved
   const h = harness(t);
   h.ready();
   h.upstream.event({ type: "input_audio_buffer.committed", item_id: "request" });
-  await h.session.onTranscript("request", "Tell amman to rebase.");
+  await h.session.onTranscript("request", "Tell amman to get its branch current.");
   await h.session.onResponseDone(callDone("fleet_send_message", { key: "codex:t1", message: "Rebase." }).response);
   const readback = h.events.find((event) => event.type === "confirmation.readback");
   h.pendingActions.get(readback.actionId).status = status;

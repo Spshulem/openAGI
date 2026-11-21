@@ -4,11 +4,11 @@
 // call carries context.__voice (built by the broker per call): the owner's
 // on-screen focus, the device source and the owner's own last words.
 
-import { FIX_AREAS, FIX_STATES, FEEDBACK_INTENTS, TARGET_FIELDS, UTTERANCE_MAX, normalizeFixRequest, normalizeTarget } from "./feedback.js";
+import { FIX_AREAS, FIX_STATES, FEEDBACK_INTENTS, FEEDBACK_STATUSES, TARGET_FIELDS, UTTERANCE_MAX, normalizeFixRequest, normalizeTarget } from "./feedback.js";
 import { threadHealth } from "./classify.js";
 
 const SOURCE = "integration:fleet-supervisor";
-export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop", "suggestion_respond"]);
+export const VOICE_TOOL_NAMES = Object.freeze(["voice_focus", "fleet_walkthrough", "fleet_diagnose", "feedback_record", "feedback_list", "self_fix_list", "self_fix_start", "self_fix_revise", "self_fix_stop", "suggestion_respond"]);
 // Everything a voice session may call: the fleet set plus the above. No
 // merge, release, deploy or restart-hub tool exists on purpose. Scans can
 // send nudges in Auto mode, so voice uses the read-only fleet_status.
@@ -145,6 +145,15 @@ export function registerVoiceTools(registry, supervisor) {
         source: voice?.source ?? "text"
       });
       return { feedbackId: record?.id ?? null, status: record?.status ?? null, target: record?.target ?? null };
+    } });
+  if (typeof supervisor.feedback === "function") registry.register({ name: "feedback_list", source: SOURCE, sideEffects: false, untrustedOutput: true,
+    description: "The owner's recorded feedback on the supervisor, newest first: id, when, status (new, triaged, fix-queued, pr-open, merged, declined), intent, what it was about and the first words. Use it when the owner asks what feedback is open or what happened to something they reported. Reads only; the text is the owner's own words, kept as reference data.",
+    parameters: { type: "object", properties: { status: { type: "string", enum: FEEDBACK_STATUSES } }, additionalProperties: false },
+    handler: async (args) => {
+      // Filtered before it is cut: open items can sit behind newer closed ones.
+      const items = ((await supervisor.feedback({ limit: 500 })) ?? []).filter((item) => !args?.status || item.status === args.status);
+      return { feedback: items.slice(0, 20).map((item) => ({ id: item.id, at: item.at ?? item.createdAt ?? null, status: item.status ?? null, intent: item.intent ?? null,
+        target: item.target ?? null, said: clip(item.utterance ?? "", 160), ...(item.queued ? { queued: true } : {}) })), total: items.length };
     } });
   if (typeof supervisor.fixes === "function") registry.register({ name: "self_fix_list", source: SOURCE, sideEffects: false,
     description: "The supervisor's self-fix requests, newest first: state, area, PR link, review round and cost once a fixer runs them. Offline coding nodes leave requests queued.",

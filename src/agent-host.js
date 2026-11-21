@@ -582,6 +582,7 @@ export class AgentHost {
             // An owner turn that read nothing untrusted: the next owner turn
             // may count this reply as clean history.
             ...(turnState ? { ownerTurn: { untrusted: turnState.untrusted === true } } : {}),
+            ...pendingApprovalsMetadata(modelResult.toolCalls, this.runtime.pendingActions, sessionId),
             toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
               name: call.name,
               arguments: durableToolArguments(toolRegistry, call),
@@ -1355,6 +1356,33 @@ function toolCallWasAttempted(call) {
   if (["awaiting_confirmation", "awaiting_owner_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
   if (result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true) return false;
   return true;
+}
+
+// The code cards this turn raised for the owner, kept on the reply so the
+// chat can offer Approve / Deny under it after a reload. A record only: the
+// live status is read from the pending-action store when the session is
+// served, and approving still goes through the owner-only approve route.
+// Only a card the store raised for this very call in this session counts,
+// and its words come from the store: a tool result (an MCP server's, say)
+// that echoes another card's id cannot dress it up as something else.
+function pendingApprovalsMetadata(toolCalls, store, sessionId) {
+  const seen = new Map();
+  for (const call of toolCalls ?? []) {
+    const held = call?.result?.ok === true ? call.result.result : null;
+    if (held?.status !== "awaiting_owner_confirmation" || typeof held.actionId !== "string" || !held.actionId) continue;
+    if (seen.has(held.actionId)) continue;
+    const action = store?.get?.(held.actionId) ?? null;
+    if (!action || action.mode !== "chat" || action.toolName !== call.name || action.context?.sessionId !== sessionId) continue;
+    seen.set(held.actionId, {
+      id: held.actionId,
+      code: action.confirmCode ?? null,
+      summary: boundedText(action.summary ?? "", 300),
+      toolName: action.toolName,
+      expiresAt: action.expiresAt ?? null
+    });
+    if (seen.size >= 10) break;
+  }
+  return seen.size ? { pendingApprovals: [...seen.values()] } : {};
 }
 
 function durableToolArguments(registry, call) {

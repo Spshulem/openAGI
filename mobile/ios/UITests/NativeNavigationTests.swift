@@ -727,7 +727,11 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "pairing-discovered-server-https://daemon.example.com")
         let code = element(app, "pairing-code")
         XCTAssertTrue(code.waitForExistence(timeout: 5))
-        XCTAssertTrue(code.isHittable)
+        // The form scrolls to the code and raises the keyboard; both animate.
+        // Wait for the field to settle hittable instead of reading it once
+        // mid-animation (CI failed here on unrelated PRs while it moved).
+        let hittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: code)
+        XCTAssertEqual(XCTWaiter().wait(for: [hittable], timeout: 5), .completed, "Selecting a server must bring the code into view")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
         code.typeText("123456")
         XCTAssertEqual(code.value as? String, "123456")

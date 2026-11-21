@@ -1341,7 +1341,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/sessions") return sendJson(res, 200, runtime.agentHost?.store.listSessions() ?? []);
       if (method === "GET" && pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(pathname.slice("/sessions/".length));
-        return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
+        const session = runtime.agentHost?.store.getSession(id);
+        return sendJson(res, 200, session ? withLiveApprovalStatus(session, runtime.pendingActions) : { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
       if (method === "POST" && /^\/nodes\/[^/]+\/revoke$/.test(pathname)) {
@@ -5003,6 +5004,38 @@ function readForm(req) {
   });
 }
 
+// A reply's metadata.pendingApprovals is the record of the code cards that
+// turn raised. Stamp each with the card's current state on the way out (a
+// copy; the stored session is untouched) so the chat shows Approve / Deny
+// only while the card can still be decided. A card the store no longer has
+// reads "unknown" and gets no buttons.
+export function withLiveApprovalStatus(session, store) {
+  if (!Array.isArray(session?.messages) || !session.messages.some((m) => Array.isArray(m?.metadata?.pendingApprovals))) return session;
+  return {
+    ...session,
+    messages: session.messages.map((message) => {
+      const cards = message?.metadata?.pendingApprovals;
+      if (!Array.isArray(cards)) return message;
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          pendingApprovals: cards.map((card) => {
+            const action = typeof card?.id === "string" ? store?.get?.(card.id) ?? null : null;
+            // A card the owner's later instruction ran is closed as denied
+            // "superseded": it did run, so it must not read "Nothing was run."
+            const status = !action ? "unknown"
+              : action.status === "approved" && action.error != null ? "failed"
+              : action.status === "denied" && /^superseded\b/.test(String(action.error ?? "")) ? "superseded"
+              : action.status;
+            return { ...card, status, ...(action?.expiresAt ? { expiresAt: action.expiresAt } : {}) };
+          })
+        }
+      };
+    })
+  };
+}
+
 function renderApp() {
   return `<!doctype html>
 <html lang="en">
@@ -6930,9 +6963,76 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const pendingNote = pending
     ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
     : "";
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${pendingNote}\`;
+  const approvals = renderChatApprovals(msg);
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${approvals}\${pendingNote}\`;
+  if (approvals) wireChatApprovals(div);
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+// Code cards the reply raised (metadata.pendingApprovals, stamped with live
+// status by GET /sessions/:id). Buttons only while a card is pending; after
+// that the card shows its state. Typing "yes NN" keeps working alongside.
+function chatApprovalStateLabel(status) {
+  return ({
+    pending: "Waiting for your answer.",
+    executing: "Running…",
+    approved: "Approved.",
+    failed: "Approved, but it failed.",
+    denied: "Denied. Nothing was run.",
+    superseded: "Already run from your later message.",
+    expired: "Expired. Ask again to retry.",
+    interrupted: "Interrupted. Ask again to retry."
+  })[status] ?? "No longer available.";
+}
+
+function renderChatApprovals(msg) {
+  const cards = msg?.role === "assistant" && Array.isArray(msg.metadata?.pendingApprovals) ? msg.metadata.pendingApprovals : [];
+  return cards.filter((card) => card && typeof card.id === "string").map((card) => {
+    const live = card.status === "pending";
+    const hint = live && card.code ? " · or reply yes " + card.code : "";
+    return '<div class="card chat-approval" data-approval-id="' + escapeHtml(card.id) + '" data-approval-status="' + escapeHtml(card.status ?? "unknown") + '" style="padding:10px 12px; margin-top:8px;">'
+      + '<div style="font-weight:600;">' + escapeHtml(card.summary || card.toolName || "Agent action") + '</div>'
+      + '<div class="muted" style="font-size:12px;">' + escapeHtml((card.toolName ?? "") + hint) + '</div>'
+      + (live
+        ? '<div class="row" style="gap:8px; margin-top:8px;"><button type="button" data-approval-decision="approve">Approve</button><button type="button" class="secondary" data-approval-decision="deny">Deny</button></div>'
+        : "")
+      + '<div class="muted chat-approval-outcome" style="font-size:12px; margin-top:6px;"' + (live ? " hidden" : "") + '>' + escapeHtml(chatApprovalStateLabel(card.status)) + '</div>'
+      + '</div>';
+  }).join("");
+}
+
+// The same owner-authenticated routes the Approvals tab uses. A refusal
+// (already decided, expired, the tool failed) is final; only a transport
+// failure leaves the buttons usable for another try.
+async function decideChatApproval(id, decision) {
+  try {
+    const res = await postJson("/pending-actions/" + encodeURIComponent(id) + "/" + decision, {});
+    if (decision === "deny") return { ok: true, final: true, text: "Denied. Nothing was run." };
+    return { ok: true, final: true, text: res?.continuation?.status === "queued" ? "Approved. The agent is continuing in this chat." : "Approved." };
+  } catch (err) {
+    return { ok: false, final: err.status != null, text: (decision === "approve" ? "Approve" : "Deny") + " failed: " + err.message };
+  }
+}
+
+function wireChatApprovals(root) {
+  root.querySelectorAll(".chat-approval").forEach((card) => {
+    const buttons = Array.from(card.querySelectorAll("[data-approval-decision]"));
+    const outcome = card.querySelector(".chat-approval-outcome");
+    for (const button of buttons) {
+      button.addEventListener("click", async () => {
+        buttons.forEach((b) => { b.disabled = true; });
+        const result = await decideChatApproval(card.dataset.approvalId, button.dataset.approvalDecision);
+        if (outcome) {
+          outcome.textContent = result.text;
+          outcome.hidden = false;
+          outcome.className = "chat-approval-outcome " + (result.ok ? "muted" : "err");
+        }
+        if (!result.final) buttons.forEach((b) => { b.disabled = false; });
+        refreshApprovalBadge().catch(() => {});
+      });
+    }
+  });
 }
 
 // Keep transient model text outside state.messages: only the exact provider
