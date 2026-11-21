@@ -32,6 +32,7 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
+import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -2303,6 +2304,25 @@ export class FleetSupervisor {
 
   async inspectRepoStatus(options = {}) {
     return inspectRepoStatus(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async paseoSessionSettings(threadKey, options = {}) {
+    const target = parsePaseoSettingsTarget(threadKey);
+    if (!target) return { ok: false, status: "wrong-target", detail: "Choose one exact Paseo session." };
+    return readPaseoSessionSettings(this.config, {
+      ...target,
+      factory: options.factory ?? this.deps.paseoFactory
+    });
+  }
+
+  async updatePaseoSessionSettings(threadKey, body = {}, options = {}) {
+    const target = parsePaseoSettingsTarget(threadKey);
+    if (!target) return { ok: false, status: "wrong-target", detail: "Choose one exact Paseo session." };
+    return applyPaseoSessionSettings(this.config, {
+      ...target,
+      body,
+      factory: options.factory ?? this.deps.paseoFactory
+    });
   }
 
   async startPaseoSession(options = {}) {
