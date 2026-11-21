@@ -27,7 +27,10 @@ import { transcriptionPrompt, voiceInstructions } from "./instructions.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-realtime-2.1";
 export const TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
-export const DEFAULT_VOICE_DAILY_USD = 5;
+// Voice has no cap of its own by default: it reserves and records against the
+// shared OpenAGI daily budget (BudgetGuard), like every other model call.
+// OPENAGI_VOICE_DAILY_USD opts into an additional, lower voice-only cap.
+export const DEFAULT_VOICE_DAILY_USD = Infinity;
 export const VOICE_RATE = 24000;
 const BYTES_PER_MS = VOICE_RATE * 2 / 1000;
 // The API rejects a commit under 100 ms of audio.
@@ -60,6 +63,14 @@ export function voiceDailyCapUsd(env = process.env) {
   const value = Number.parseFloat(env.OPENAGI_VOICE_DAILY_USD ?? "");
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_VOICE_DAILY_USD;
 }
+
+// Why voice cannot spend more today, in the owner's words.
+export function voiceCapMessage(spend) {
+  const cap = spend?.capUsd;
+  if (Number.isFinite(cap) && spend.today() >= cap) return `Voice hit today's $${cap} voice cap (OPENAGI_VOICE_DAILY_USD).`;
+  return "Today's OpenAGI budget is used up, and voice counts against it. Try again tomorrow or raise OPENAGI_DAILY_USD_LIMIT.";
+}
+const capForFrame = (cap) => (Number.isFinite(cap) ? cap : null);
 
 // Today's voice spend, shared by every session on the hub. Seeded from the
 // ledger once a day, then kept in memory as sessions add to it.
@@ -265,7 +276,7 @@ export class VoiceSession {
 
   start() {
     if (this.spend.capped()) {
-      this.end(`Voice hit today's $${this.spend.capUsd} cap (OPENAGI_VOICE_DAILY_USD).`, "voice_cap");
+      this.end(voiceCapMessage(this.spend), "voice_cap");
       return this;
     }
     try {
@@ -512,7 +523,7 @@ export class VoiceSession {
     for (const event of this.queued) this.sendUp(event);
     this.queued = [];
     this.queuedBytes = 0;
-    this.io.send({ type: "ready", model: this.model, mode: this.handsFree ? "handsfree" : "ptt", output: this.output, capUsd: this.spend.capUsd, todayUsd: round(this.spend.today()) });
+    this.io.send({ type: "ready", model: this.model, mode: this.handsFree ? "handsfree" : "ptt", output: this.output, capUsd: capForFrame(this.spend.capUsd), todayUsd: round(this.spend.today()) });
   }
 
   onAudio(itemId, delta, responseId = null) {
@@ -767,7 +778,7 @@ export class VoiceSession {
 
   reserve(id, usd) {
     if (this.spend.reserve(id, usd)) return true;
-    this.end("Voice has no unreserved room in the voice or global daily budget.", "voice_cap");
+    this.end(Number.isFinite(this.spend.capUsd) ? "Voice has no unreserved room in the voice or shared daily budget." : "Voice has no unreserved room in today's shared OpenAGI budget.", "voice_cap");
     return false;
   }
 
@@ -776,8 +787,8 @@ export class VoiceSession {
     this.sessionUsd += usd;
     const today = this.spend.add(usd, model, { tokens: usageTokens(usage), sessionId: this.sessionId, from: this.from, tools: [...new Set(this.toolsCalled)].slice(0, 20) }, reservationId);
     this.toolsCalled = [];
-    this.io.send({ type: "spend", usd: round(this.sessionUsd), todayUsd: round(today), capUsd: this.spend.capUsd });
-    if (this.spend.capped()) this.end(`Voice hit today's $${this.spend.capUsd} cap (OPENAGI_VOICE_DAILY_USD).`, "voice_cap");
+    this.io.send({ type: "spend", usd: round(this.sessionUsd), todayUsd: round(today), capUsd: capForFrame(this.spend.capUsd) });
+    if (this.spend.capped()) this.end(voiceCapMessage(this.spend), "voice_cap");
   }
 
   // A system note in the model's conversation (focus, confirm receipts).
@@ -843,7 +854,7 @@ export function createVoiceSessionFactory({ runtime, env = process.env, upstream
       try { runtime?.budget?.check?.(); } catch {
         throw Object.assign(new Error("Voice reached the hub's daily budget (OPENAGI_DAILY_USD_LIMIT)."), { code: "budget" });
       }
-      if (meter.capped()) throw Object.assign(new Error(`Voice hit today's $${meter.capUsd} cap (OPENAGI_VOICE_DAILY_USD).`), { code: "voice_cap" });
+      if (meter.capped()) throw Object.assign(new Error(voiceCapMessage(meter)), { code: "voice_cap" });
       const agentHost = runtime?.agentHost ?? null;
       const session = new VoiceSession({
         apiKey,
