@@ -666,8 +666,9 @@ export class VoiceSession {
     }
     this.responseReadbacks = [];
     if (said) {
-      this.io.send({ type: "reply.done", text: clip(said, 4000), itemId: this.responseAudioItem?.id ?? null, audioMs: (this.responseAudioItem?.bytes ?? 0) / BYTES_PER_MS });
+      // Save before telling the phone, so the chat reload it does on reply.done finds the reply.
       this.appendThread({ role: "assistant", content: clip(said, 4000), metadata: { provider: "openai-realtime", model: this.model, voice: true, ownerTurn: { untrusted: this.turnState.untrusted === true } } });
+      this.io.send({ type: "reply.done", text: clip(said, 4000), itemId: this.responseAudioItem?.id ?? null, audioMs: (this.responseAudioItem?.bytes ?? 0) / BYTES_PER_MS });
     }
     const calls = response.status === "cancelled" ? [] : (response.output ?? []).filter((item) => item?.type === "function_call");
     if (calls.length) {

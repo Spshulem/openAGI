@@ -388,6 +388,19 @@ test("spend goes to the ledger as channel voice, and the daily cap ends the sess
   assert.equal(capped.ends[0].code, "voice_cap");
 });
 
+test("a reply is in the shared thread before the phone hears reply.done", async (t) => {
+  const h = harness(t);
+  h.ready();
+  let threadLengthAtDone = null;
+  const send = h.session.io.send;
+  h.session.io.send = (event) => { if (event.type === "reply.done") threadLengthAtDone = h.thread.length; send(event); };
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event(sayDone("Here's the first item."));
+  await flush();
+  assert.equal(threadLengthAtDone, 1, "the phone reloads the chat on reply.done; the reply must already be saved");
+  assert.equal(h.thread.at(-1).content, "Here's the first item.");
+});
+
 test("transcripts go to the shared supervisor thread; feedback keeps the owner's words and focus", async (t) => {
   const h = harness(t, { focus: { view: "supervisor", questionId: "fq_1" } });
   h.ready();
