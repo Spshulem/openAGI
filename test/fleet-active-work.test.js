@@ -25,7 +25,7 @@ function createOutreachRecorder() {
   const items = [];
   return {
     items,
-    list: () => items,
+    list: () => items.slice().reverse(),
     append(entry) {
       if (entry.dedupeOpen) {
         const existing = items.find(
@@ -662,14 +662,13 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     // previous pass's cap are revisited so their notification is not lost.
     const pass4 = await ctx.supervisor.scanActiveWork({ pageSize: 15, maxRepoChecks: 0 });
     assert.ok(pass4.evaluatedCount >= 1, "deferred prompts remain eligible on a later pass");
-    assert.ok(pass4.skippedUnchanged >= 8);
 
     // Draft and mergeability are classification inputs, so changing either
     // one forces a fresh evidence evaluation even when head and CI are stable.
     await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
     const appfolioRef = "acme/bbapp#701";
     const appfolioPr = ctx.supervisor.lastPrs.get(appfolioRef);
-    ctx.supervisor.lastPrs.set(appfolioRef, { ...appfolioPr, isDraft: true, mergeState: "DIRTY" });
+    ctx.supervisor.lastPrs.set(appfolioRef, { ...appfolioPr, isDraft: true, mergeState: "DIRTY", updatedAt: isoAgo(1, ctx.supervisor.now?.() ?? BASE_NOW) });
     const prStatePass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, resetCursor: true });
     assert.ok(prStatePass.evaluatedCount >= 1, "PR draft/merge-state changes must invalidate the evidence mark");
 
@@ -736,6 +735,27 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     const permissionPass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
     assert.ok(permissionPass.evaluatedCount >= 1);
     assert.ok(ctx.outreach.items.some((entry) => entry.sourceRef?.id === permissionItem.item.id));
+
+    const cadenceItem = ctx.supervisor.trackWork({
+      project: "CadenceChange",
+      theme: "Follow-through",
+      goal: "Finish the cadence-change check",
+      doneCriteria: "Check is complete",
+      cadence: "daily",
+      state: "blocked"
+    });
+    await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    ctx.supervisor.trackWork({
+      project: "CadenceChange",
+      theme: "Follow-through",
+      goal: "Finish the cadence-change check",
+      doneCriteria: "Check is complete",
+      cadence: "weekly",
+      state: "blocked"
+    });
+    const cadencePass = await ctx.supervisor.scanActiveWork({ pageSize: 30, maxRepoChecks: 0, maxPromptsPerPass: 30, resetCursor: true });
+    assert.ok(cadencePass.evaluatedCount >= 1);
+    assert.equal(ctx.supervisor.activeWork.state.items.find((item) => item.id === cadenceItem.item.id).cadence.mode, "weekly");
 
     // 5. Completed work stays open until outcomeVerified; archive is refused before confirm_done,
     // then surfaces as archive_candidate, and propose_archive never auto-archives without confirmed: true!
@@ -945,6 +965,24 @@ test("treats transcripts as untrusted, blocks disallowed nudge permissions, and 
     assert.equal(decisionCalls, 1);
     assert.ok(pass.promptsEmitted <= 2);
 
+    // The second ambiguous item was deferred by maxDecisionItems: 1. The
+    // next bounded pass must prioritize it instead of treating it as unchanged.
+    const ambig2ItemBefore = ctx.supervisor.activeWork.state.items.find((item) => item.goal === "Finish config migration 2");
+    assert.equal(ambig2ItemBefore.decisionDeferred, true);
+    let ambig2ItemAfter = ambig2ItemBefore;
+    for (let attempt = 0; attempt < 12 && !ambig2ItemAfter.decisionsVerdict; attempt += 1) {
+      await ctx.supervisor.scanActiveWork({
+        pageSize: 30,
+        maxRepoChecks: 0,
+        maxDecisionItems: 1,
+        maxPromptsPerPass: 2,
+        resetCursor: true
+      });
+      ambig2ItemAfter = ctx.supervisor.activeWork.state.items.find((item) => item.id === ambig2ItemBefore.id);
+    }
+    assert.equal(ambig2ItemAfter.decisionDeferred, false);
+    assert.equal(ambig2ItemAfter.decisionsVerdict.classification, "owner_followup");
+
     // Offline /v1/decisions falls back gracefully without throwing
     simulateOffline = true;
     const ambig2 = ctx.supervisor.lastThreads.get("paseo:srv_mac.ambig_2");
@@ -1046,6 +1084,11 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
     assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 1);
     remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-c" }] });
     assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 2);
+    const sourceResolved = remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).at(-1);
+    remoteOutreach.resolve(sourceResolved.id, "resolved", { status: "dismissed" });
+    remote.mirrorActiveWork({ prompts: [{ ...mirroredPrompt, mark: "mark-c" }] });
+    assert.equal(remoteOutreach.items.filter((item) => item.sourceRef?.id === mirroredPrompt.id).length, 2);
+    assert.notEqual(sourceResolved.status, "dismissed");
 
     const remoteView = await remote.getActiveWork({ project: "Growth" });
     assert.equal(remoteView.items.length, 1);

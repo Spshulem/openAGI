@@ -774,7 +774,10 @@ export class RemoteFleetSupervisor {
         && item.sourceRef.nodeId === this.nodeId
         && String(item.sourceRef.id) === String(prompt.id));
       const markChanged = Boolean(current && current.sourceRef?.mark !== prompt.mark);
-      let item = markChanged ? (outreach.reopen?.(current.id) ?? null) : current;
+      const sourceReopened = Boolean(current
+        && current.status === 'dismissed'
+        && current.decision === 'resolved');
+      let item = (markChanged || sourceReopened) ? (outreach.reopen?.(current.id) ?? null) : current;
       if (!item && current && ['unseen', 'seen'].includes(current.status)) item = current;
       if (!item) {
         item = outreach.append({

@@ -1733,6 +1733,7 @@ export class ActiveWorkManager {
     let evaluatedCount = 0;
     let skippedUnchanged = 0;
     const ambiguousShortlist = [];
+    const deferredAmbiguous = [];
     const candidateItemsToUpdate = [];
 
     for (const item of this.state.items) {
@@ -1774,6 +1775,7 @@ export class ActiveWorkManager {
       const deltaMark = shortHash(JSON.stringify([
         item.goalUpdatedAt ?? "",
         item.state,
+        item.cadence ?? null,
         item.permittedNudges ?? null,
         item.outcomeVerified,
         item.remainingCount ?? null,
@@ -1789,6 +1791,8 @@ export class ActiveWorkManager {
         livePr?.mergeState ?? null,
         livePr?.isDraft ?? null,
         livePr?.headOid ?? livePr?.headSha ?? null,
+        livePr?.updatedAt ?? null,
+        livePr?.mergedAt ?? null,
         completionReviewedAt ?? ""
       ]));
 
@@ -1800,13 +1804,15 @@ export class ActiveWorkManager {
       }
 
       const pendingPrompt = item.promptDeferred === true;
-      if (!inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt) {
+      const pendingDecision = item.decisionDeferred === true;
+      if (!inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt && !pendingDecision) {
         skippedUnchanged += 1;
         continue;
       }
 
       const pendingPromptForDelta = item.promptDeferred === true;
-      if (deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta) {
+      const pendingDecisionForDelta = item.decisionDeferred === true;
+      if (deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta && !pendingDecisionForDelta) {
         skippedUnchanged += 1;
         continue;
       }
@@ -1829,18 +1835,25 @@ export class ActiveWorkManager {
         || prCi === "FAILURE"
         || !ownerKey
       );
-      if (
+      const ambiguous = (
         !clearlyDeterministic
         && session
         && session.agentStatus === "idle"
         && untrusted?.excerpt
-        && ambiguousShortlist.length < boundedDecisions
-      ) {
-        ambiguousShortlist.push({ item, session, untrusted });
+      );
+      if (ambiguous) {
+        const entry = { item, session, untrusted };
+        if (item.decisionDeferred === true) deferredAmbiguous.push(entry);
+        else if (ambiguousShortlist.length < boundedDecisions) ambiguousShortlist.push(entry);
+        else item.decisionDeferred = true;
+      } else {
+        item.decisionDeferred = false;
       }
     }
 
-    const decisionsOutcome = await this._evaluateAmbiguousShortlist(ambiguousShortlist, {
+    const decisionShortlist = [...deferredAmbiguous, ...ambiguousShortlist].slice(0, boundedDecisions);
+    const decisionCandidateIds = new Set(decisionShortlist.map(({ item }) => item.id));
+    const decisionsOutcome = await this._evaluateAmbiguousShortlist(decisionShortlist, {
       nowMs,
       maxDailyDecisionTokens: boundedDailyTokens
     });
@@ -1922,10 +1935,15 @@ export class ActiveWorkManager {
       }
 
       if (decisionsOutcome.verdicts.has(item.id)) {
+        item.decisionDeferred = false;
         item.decisionsVerdict = {
           ...decisionsOutcome.verdicts.get(item.id),
           evidenceMark: deltaMark
         };
+      } else if (decisionCandidateIds.has(item.id)) {
+        // The bounded decision pass attempted this ambiguous item but did not
+        // produce a verdict. Keep it eligible for a later pass.
+        item.decisionDeferred = true;
       } else if (item.decisionsVerdict && item.decisionsVerdict.evidenceMark !== deltaMark) {
         // A model verdict is tied to the evidence it read. Never carry a
         // stale blocked/follow-up classification onto changed evidence.
