@@ -5,7 +5,8 @@ import {
   intentCovers,
   isConversationalAssentOrChoice,
   isOwnerPrincipal,
-  isSupervisorActionableDirective
+  isSupervisorActionableDirective,
+  spokenRequestNamesTarget
 } from "./owner-authority.js";
 import { evaluateOwnerIntentClarityWithDecisions } from "./fleet/decisions-gate.js";
 import { argsDigest } from "./pending-actions.js";
@@ -58,6 +59,10 @@ export class ToolRegistry {
       approvalTtlMs: Number.isFinite(Number(tool.approvalTtlMs)) && Number(tool.approvalTtlMs) > 0
         ? Math.trunc(Number(tool.approvalTtlMs))
         : null,
+      // Checked again when an approval is used: null while the context it was
+      // asked in still holds, or why it no longer does. A tool with one keeps
+      // its card for as long as that context lasts, not a short fixed time.
+      approvalStillValid: typeof tool.approvalStillValid === "function" ? tool.approvalStillValid : null,
       // Short human-readable summary used in the approval UI when the args
       // alone don't describe the action well. Optional fn(args) -> string.
       summarize: typeof tool.summarize === "function" ? tool.summarize : null,
@@ -100,6 +105,19 @@ export class ToolRegistry {
 
   get(name) {
     return this.tools.get(name);
+  }
+
+  // Why a pending approval may no longer run (its chat is gone, the owner
+  // moved on), or null. An unreadable check counts as no longer valid.
+  async approvalStillValid(action) {
+    const check = this.tools.get(action?.toolName)?.approvalStillValid;
+    if (!check) return null;
+    try {
+      const reason = await check(action.args, action);
+      return typeof reason === "string" && reason ? reason : null;
+    } catch (error) {
+      return error?.message || "The approval's target changed; ask again.";
+    }
   }
 
   list({ readOnly = false } = {}) {
@@ -294,8 +312,10 @@ export class ToolRegistry {
   // the spoken code instead only when the turn read untrusted text and the
   // owner's own words do not name this kind of action (an injected "click
   // Approve" must not ride on "what's the latest?"), or the tool insists.
-  // A voice turn always asks: the model heard the words, so it reads the
-  // action back and only the owner's own transcript ("yes 42") runs it.
+  // A voice turn asks too: the model heard the words, so it reads the action
+  // back and only the owner's own transcript ("yes 42") runs it. Except a
+  // message to a coding chat whose transcript names that chat and says the
+  // exact message: the words already are the approval.
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
@@ -316,7 +336,11 @@ export class ToolRegistry {
       && isSupervisorActionableDirective(turn.intent ?? "", { previousAssistantText: prevAssistant })
     ) || conversationalCover;
     let tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
-    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
+    const spokenExactly = owner.via === "voice"
+      && ["fleet_send_message", "reply_to_coding_agent"].includes(tool.name)
+      && intentCovers(turn.intent ?? "", tool.name)
+      && spokenRequestNamesTarget(turn.intent ?? "", { names: [args?.name, args?.project], message: args?.message });
+    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || (owner.via === "voice" && !spokenExactly);
     let approvedBy = `owner:${owner.via}`;
     if (
       tainted

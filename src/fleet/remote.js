@@ -77,6 +77,15 @@ const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
 const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive))$/;
 
+const FEEDBACK_OUTBOX_MAX = 200;
+
+function queuedFeedback(entry) {
+  const input = entry.input ?? {};
+  return { id: entry.localId, status: 'queued', queued: true, createdAt: entry.at,
+    utterance: typeof input.utterance === 'string' ? input.utterance : null, intent: input.intent ?? null, target: input.target ?? null,
+    detail: 'Saved on this server; it goes to the fleet computer once that is reachable.' };
+}
+
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
     this.runtime = runtime;
@@ -94,6 +103,10 @@ export class RemoteFleetSupervisor {
     this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
+    // Feedback said while the computer was out of reach, kept here and sent
+    // on the next refresh that reaches it.
+    this.feedbackOutboxFile = dataDir ? path.join(dataDir, "fleet-feedback-outbox.json") : null;
+    this.feedbackOutbox = this.loadFeedbackOutbox();
     this.lastEmitted = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
@@ -193,6 +206,7 @@ export class RemoteFleetSupervisor {
       this.refreshing = this.request('GET', '/fleet/api/state')
         .then(async (body) => { await this.selfFixHub?.sync().catch(() => {}); return body; })
         .then(async (body) => { await this.replayDismissals(); return body; })
+        .then(async (body) => { await this.flushFeedback(); return body; })
         .then((body) => { this.emitIfChanged(); return body; })
         .finally(() => { this.refreshing = null; });
     }
@@ -264,8 +278,50 @@ export class RemoteFleetSupervisor {
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
   }
   // Feedback and self-fix requests live with the fleet, on the computer.
-  async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
-  async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async recordFeedback(input) {
+    try {
+      return (await this.request('POST', '/fleet/api/feedback', input)).feedback;
+    } catch (error) {
+      // The computer answered and refused it: that is the answer. Out of
+      // reach: keep it here instead of losing the owner's words.
+      if (error.reached || !this.feedbackOutboxFile) throw error;
+      const entry = { localId: `fb_local_${randomUUID().replace(/-/g, '').slice(0, 16)}`, input, at: new Date().toISOString() };
+      this.feedbackOutbox = [...this.feedbackOutbox, entry].slice(-FEEDBACK_OUTBOX_MAX);
+      this.saveFeedbackOutbox();
+      return queuedFeedback(entry);
+    }
+  }
+  async feedback() {
+    const sent = (await this.request('GET', '/fleet/api/feedback')).feedback ?? [];
+    return [...this.feedbackOutbox.map(queuedFeedback).reverse(), ...sent];
+  }
+  loadFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return [];
+    try {
+      const saved = readJsonFile(this.feedbackOutboxFile, null);
+      return Array.isArray(saved?.entries) ? saved.entries.filter(e => e?.localId && e.input && typeof e.input === 'object') : [];
+    } catch {
+      return [];
+    }
+  }
+  saveFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return;
+    try { writeJsonAtomic(this.feedbackOutboxFile, { entries: this.feedbackOutbox }); } catch { /* kept in memory; the next save writes it */ }
+  }
+  // Oldest first; stops at the first one the computer cannot be reached for.
+  async flushFeedback() {
+    for (const entry of [...this.feedbackOutbox]) {
+      try {
+        await this.request('POST', '/fleet/api/feedback', entry.input);
+      } catch (error) {
+        // Kept for later unless the computer refused it as invalid (4xx):
+        // out of reach, or a 5xx, may work next time.
+        if (!error.reached || !(error.status >= 400 && error.status < 500)) break;
+      }
+      this.feedbackOutbox = this.feedbackOutbox.filter(e => e.localId !== entry.localId);
+      this.saveFeedbackOutbox();
+    }
+  }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
   async searchThreads(options = {}) {
     const limit = Number.isInteger(options?.limit) ? options.limit : 20;
