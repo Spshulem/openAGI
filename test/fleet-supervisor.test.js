@@ -1782,6 +1782,12 @@ test("a long prompt already in the chat as the owner's last message is not sent 
   assert.match(again.delivery.detail, /already in this chat as your message at \d\d:\d\d UTC/);
   assert.ok(again.delivery.actionId);
   assert.equal(delivered.length, 0);
+  // A correction that differs only in case or inner spacing is new.
+  const { supervisor: fixed, delivered: fixedSent } = fixture(t, { threads: [makeThread({ lastUserText: prompt, lastUserAt: ago(5 * MIN) })] });
+  await fixed.tick();
+  assert.equal((await fixed.sendOwnerMessage("codex:t1", prompt.replace("Active Work", "active work"))).delivery.status, "sent");
+  assert.equal((await fixed.sendOwnerMessage("codex:t1", prompt.replace("slice of", "slice  of"))).delivery.status, "sent");
+  assert.equal(fixedSent.length, 2);
   // Short words are meant to repeat, and an old prompt may be sent again.
   const { supervisor: short, delivered: shortSent } = fixture(t, { threads: [makeThread({ lastUserText: "continue", lastUserAt: ago(MIN) })] });
   await short.tick();

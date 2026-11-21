@@ -226,8 +226,9 @@ export const SELF_HOST_BLOCK = "the session running this supervisor: a message w
 export const SELF_SESSION_BLOCK = "the supervisor's own session: it is not nudged automatically; only your own message is sent there";
 
 function selfBlock(thread, config, playbook) {
-  if (!isSelf(thread, config)) return null;
+  // Checked on its own: the host may be known only by PASEO_AGENT_ID.
   if (isSelfThread(thread, { selfSessionIds: config?.hostSessionIds ?? [] })) return SELF_HOST_BLOCK;
+  if (!isSelf(thread, config)) return null;
   return OWNER_DIRECTED.has(playbook) ? null : SELF_SESSION_BLOCK;
 }
 

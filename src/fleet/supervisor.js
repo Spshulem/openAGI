@@ -576,7 +576,9 @@ const RISKY_WAITS = "risky ask: it is only typed into the agent's app";
 // "yes") are meant to repeat; only a real prompt counts.
 const DUPLICATE_WINDOW_MS = 30 * 60_000;
 const DUPLICATE_MIN_CHARS = 60;
-const sameWords = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+// Exact text, outer whitespace aside: case and inner spacing can be the
+// whole correction (an identifier, a Python indent).
+const sameWords = (value) => String(value ?? "").trim();
 
 function sameRecentOwnerText(thread, text, now) {
   const at = Date.parse(thread?.lastUserAt ?? "");

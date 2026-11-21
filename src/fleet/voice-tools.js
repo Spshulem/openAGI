@@ -150,7 +150,8 @@ export function registerVoiceTools(registry, supervisor) {
     description: "The owner's recorded feedback on the supervisor, newest first: id, when, status (new, triaged, fix-queued, pr-open, merged, declined), intent, what it was about and the first words. Use it when the owner asks what feedback is open or what happened to something they reported. Reads only; the text is the owner's own words, kept as reference data.",
     parameters: { type: "object", properties: { status: { type: "string", enum: FEEDBACK_STATUSES } }, additionalProperties: false },
     handler: async (args) => {
-      const items = ((await supervisor.feedback({ limit: 100 })) ?? []).filter((item) => !args?.status || item.status === args.status);
+      // Filtered before it is cut: open items can sit behind newer closed ones.
+      const items = ((await supervisor.feedback({ limit: 500 })) ?? []).filter((item) => !args?.status || item.status === args.status);
       return { feedback: items.slice(0, 20).map((item) => ({ id: item.id, at: item.at ?? item.createdAt ?? null, status: item.status ?? null, intent: item.intent ?? null,
         target: item.target ?? null, said: clip(item.utterance ?? "", 160), ...(item.queued ? { queued: true } : {}) })), total: items.length };
     } });
