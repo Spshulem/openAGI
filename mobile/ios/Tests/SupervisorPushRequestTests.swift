@@ -68,6 +68,8 @@ final class SupervisorPushRequestTests: XCTestCase {
             switch action {
             case let .answer(id, answer):
                 return .of(error: nil, delivery: try await client.fleetAnswer(questionID: id, answer: answer).delivery)
+            case let .reply(id, text):
+                return .of(error: nil, delivery: try await client.fleetReply(questionID: id, reply: text).delivery)
             case let .dismiss(id):
                 _ = try await client.fleetDismiss(questionID: id)
                 return .done
@@ -91,6 +93,20 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertEqual(request.url?.path, "/fleet/api/questions/fq123")
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-OpenAGI-Node-ID"), "mobile:abc")
         XCTAssertEqual(try body(of: request) as? [String: String], ["answer": " Skip "])
+    }
+
+    func testReplyFieldPostsTheTypedTextAsTheQuestionsReply() async throws {
+        respond(200, #"{"delivery":{"status":"sent"}}"#)
+        let action = try XCTUnwrap(SupervisorAnswerAction.from(
+            actionIdentifier: "reply", defaultActionIdentifier: "default",
+            userInfo: ["questionId": "fq123", "options": ["Approve"]], userText: "  use the staging DB  "))
+        XCTAssertEqual(action, .reply(questionId: "fq123", text: "use the staging DB"))
+        let outcome = await send(action)
+        XCTAssertEqual(outcome, .done)
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/fleet/api/questions/fq123")
+        XCTAssertEqual(try body(of: request) as? [String: String], ["reply": "use the staging DB"])
     }
 
     func testDismissButtonPostsDismissTrue() async throws {
@@ -222,6 +238,55 @@ final class SupervisorPushRequestTests: XCTestCase {
         }
     }
 
+    // MARK: - Approval action → requests
+
+    // Routes by path: the pending list first, then the decision.
+    private func respondApprovals(pending: [String], approve: (Int, String) = (200, #"{"ok":true}"#)) {
+        let list = pending.map { #"{"id":"\#($0)","toolName":"send_email","summary":"Email Alex","status":"pending","createdAt":"2026-11-21T12:00:00.625Z"}"# }
+            .joined(separator: ",")
+        StubProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            var reply: (Int, String) = (404, "{}")
+            if path == "/pending-actions" { reply = (200, #"{"actions":[\#(list)]}"#) }
+            if path.hasSuffix("/approve") { reply = approve }
+            if path.hasSuffix("/deny") { reply = (200, #"{"id":"act_1","status":"denied"}"#) }
+            return (HTTPURLResponse(url: request.url!, statusCode: reply.0, httpVersion: nil, headerFields: nil)!, Data(reply.1.utf8))
+        }
+    }
+
+    func testApproveChecksTheActionIsStillPendingThenApproves() async throws {
+        respondApprovals(pending: ["act_1"])
+        let outcome = await ApprovalActionSender.decide(.approve(actionId: "act_1"), client: makeClient())
+        XCTAssertEqual(outcome, .approved)
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/pending-actions/act_1/approve")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-OpenAGI-Node-ID"), "mobile:abc")
+    }
+
+    func testDenyChecksTheActionIsStillPendingThenDenies() async throws {
+        respondApprovals(pending: ["act_1"])
+        let outcome = await ApprovalActionSender.decide(.deny(actionId: "act_1"), client: makeClient())
+        XCTAssertEqual(outcome, .denied)
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.path, "/pending-actions/act_1/deny")
+    }
+
+    func testAnActionNoLongerPendingIsNeverSent() async throws {
+        respondApprovals(pending: ["act_other"])
+        let outcome = await ApprovalActionSender.decide(.approve(actionId: "act_1"), client: makeClient())
+        XCTAssertEqual(outcome, .notPending)
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.path, "/pending-actions", "only the check was made")
+    }
+
+    func testApproveThatRanAndFailedSaysWhy() async throws {
+        respondApprovals(pending: ["act_1"], approve: (400, #"{"ok":false,"error":"SMTP refused"}"#))
+        let outcome = await ApprovalActionSender.decide(.approve(actionId: "act_1"), client: makeClient())
+        XCTAssertEqual(outcome, .failed("SMTP refused"))
+        respondApprovals(pending: ["act_1"], approve: (409, #"{"error":"action already approved"}"#))
+        let raced = await ApprovalActionSender.decide(.approve(actionId: "act_1"), client: makeClient())
+        XCTAssertEqual(raced, .notPending, "decided elsewhere between the check and the tap")
+    }
+
     func testDaemonRegisterAndUnregister() async throws {
         respond(200, #"{"ok":true}"#)
         let client = makeClient()
@@ -238,7 +303,8 @@ final class SupervisorPushRequestTests: XCTestCase {
         XCTAssertEqual(sent["env"] as? String, "production")
         XCTAssertEqual(sent["activities"] as? Bool, false)
         XCTAssertEqual(sent["alerts"] as? Bool, false)
-        XCTAssertEqual(sent.count, 5)
+        XCTAssertEqual(sent["approvals"] as? Bool, true, "this build acts on approval alerts")
+        XCTAssertEqual(sent.count, 6)
 
         respond(200, #"{"ok":true,"renew":true}"#)
         let renew = try await client.registerPush(pass: "p1.x.y", key: "k", env: "sandbox", activities: true, alerts: true)
