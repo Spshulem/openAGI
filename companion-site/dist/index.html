@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f6f6f0">
+  <meta name="description" content="Install a proactive personal agent that remembers your context, makes recurring work repeatable, and supervises your coding agents. Start with the Mac app or one command.">
+  <title>OpenAGI — Your agent. Already on it.</title>
+  <link rel="icon" href="assets/openagi-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="platform.css"><link rel="stylesheet" href="overview.css"><link rel="stylesheet" href="software.css">
+  <script src="platform.js" defer></script><script src="software.js" defer></script>
+</head>
+<body class="home software-home agent-first">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header unified-header">
+  <a class="brand" href="index.html" aria-label="OpenAGI home">openagi<span class="brand-dot" aria-hidden="true"></span></a>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu <span aria-hidden="true">+</span></button>
+  <nav id="site-nav" aria-label="Main navigation">
+    <a href="index.html#personal-agent">Personal agent</a><a href="index.html#supervisor">Supervisor</a><a href="ecosystem.html">Apps &amp; integrations</a><a href="https://github.com/Spshulem/openAGI">GitHub <span aria-hidden="true">↗</span></a><a class="nav-action" href="setup.html">Install OpenAGI <span aria-hidden="true">↗</span></a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="section software-hero">
+    <div class="software-hero-copy">
+      <p class="eyebrow">Your personal, proactive agent</p>
+      <h1>Your agent.<br><span>Already on it.</span></h1>
+      <p class="lede">OpenAGI remembers what matters, turns routines into repeatable work, and keeps your coding agents moving. <strong>Install it on your computer. Put it to work today.</strong></p>
+      <div class="hero-actions"><a class="button dark" href="#install">Install OpenAGI <span aria-hidden="true">↓</span></a><a class="text-link" href="https://github.com/Spshulem/openAGI">View source ↗</a><a class="text-link" href="#supervisor">Meet Supervisor ↗</a></div>
+      <div class="install-line"><code id="quick-install">curl -fsSL https://openagi.sh/install.sh | sh</code><button class="copy-inline" type="button" data-clipboard="quick-install" aria-label="Copy install command" aria-live="polite">Copy</button></div>
+      <p class="platform-note">macOS · Windows · Linux · Docker <span aria-hidden="true"> / </span> <a href="setup.html#downloads">All downloads ↗</a></p>
+    </div>
+    <div class="software-demo">
+      <div class="product-window">
+        <div class="window-bar"><span class="window-brand"><i aria-hidden="true"></i> OpenAGI</span><span class="preview-label">Illustrative preview</span></div>
+        <div class="demo-switch" role="tablist" aria-label="Explore OpenAGI">
+          <button type="button" role="tab" id="product-personal" data-product-tab aria-controls="demo-personal" aria-selected="true">Personal agent</button>
+          <button type="button" role="tab" id="product-supervisor" data-product-tab aria-controls="demo-supervisor" aria-selected="false" tabindex="-1">Supervisor</button>
+        </div>
+        <div class="demo-panel" id="demo-personal" data-product-panel role="tabpanel" aria-labelledby="product-personal" tabindex="0">
+          <p class="demo-greeting">A little ahead of your day.</p><h2>Three things you<br>can stop keeping in your head.</h2>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">↗</span><div><h3>Your 2 pm, prepped.</h3><p>A meeting brief from your calendar and the notes you connected.</p><span class="demo-tag">Ready for review</span></div></article>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">↻</span><div><h3>That Monday routine.</h3><p>“I can prepare this every week. Want to save it as a skill?”</p><span class="demo-tag">Suggested skill · You decide</span></div></article>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">✓</span><div><h3>The decision from last week.</h3><p>“Launch with the small team first. I’ll keep that in mind.”</p></div></article>
+        </div>
+        <div class="demo-panel" id="demo-supervisor" data-product-panel role="tabpanel" aria-labelledby="product-supervisor" tabindex="0" hidden>
+          <p class="demo-greeting">Your coding agents, together.</p><h2>One decision for you.<br>The rest, in view.</h2>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">?</span><div><h3>Codex needs a decision.</h3><p>“The fix is ready. Should this include the migration?”</p><span class="demo-tag attention">Question + PR + verification evidence</span></div></article>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">↻</span><div><h3>Claude Code is working.</h3><p>The test suite is running. Nothing for you to answer yet.</p><span class="demo-tag">Working</span></div></article>
+          <article class="demo-item"><span class="demo-symbol" aria-hidden="true">◷</span><div><h3>Conductor is waiting on checks.</h3><p>See the session, its PR, and the checks it is waiting for.</p></div></article>
+        </div>
+        <div class="window-bottom"><span>Memory · Tools · Scheduled work</span><span>Your agent, on your host</span></div>
+      </div>
+      <p class="demo-caption">Example scenarios with connected tools. You choose the access.</p>
+    </div>
+  </section>
+  <div class="software-proof" aria-label="OpenAGI principles"><span>Runs on your host</span><span>Bring your own model</span><span>Source-available</span><span>You set the permissions</span></div>
+
+  <section class="section" id="personal-agent">
+    <p class="eyebrow">The personal agent</p>
+    <div class="benefit-heading"><h2>Less repeating yourself.<br>More getting things done.</h2><p>Context that carries forward. Useful work that doesn't end with a chat.</p></div>
+    <div class="benefit-grid">
+      <article><span class="benefit-number">01</span><h3>Pick up where<br>you left off.</h3><p>Keep decisions, preferences, and working context across conversations. Saved corrections help guide the next answer.</p><blockquote class="example-quote">“What did we decide about the launch?”</blockquote></article>
+      <article><span class="benefit-number">02</span><h3>Get the repeat work<br>off your plate.</h3><p>Turn a recurring task into a reviewed skill. Connect its tools and schedule it. Optional observation can help spot routines worth automating.</p><blockquote class="example-quote">“Have my morning brief ready at 8.”</blockquote></article>
+      <article><span class="benefit-number">03</span><h3>Stay ahead of<br>the next thing.</h3><p>Use the context you share to prepare meeting briefs, set reminders, and surface follow-ups. Give your agent useful work to come back with.</p><blockquote class="example-quote">“Help me prepare for this afternoon.”</blockquote></article>
+    </div>
+  </section>
+
+  <section class="supervisor-band" id="supervisor">
+    <div class="section supervisor-layout">
+      <div class="supervisor-copy">
+        <p class="eyebrow">Supervisor · For your coding agents</p><h2>Keep the work moving.<br>Skip the tab patrol.</h2>
+        <p>From your Mac or phone, organize coding agents by project and see what is working, blocked, waiting on checks, or waiting for your decision. Get the question, the PR, and the verification evidence in one place, then act only when you choose.</p>
+        <div class="provider-list"><span>Codex</span><span>Claude Code</span><span>Conductor</span><span>Antigravity</span></div>
+        <div class="hero-link-row"><a class="button light" href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md">Set up Supervisor <span aria-hidden="true">↗</span></a><a class="text-link" href="onboarding.html#supervisor-path">See the first success path ↗</a></div>
+        <p class="small-note">Start in Observe. Review proposed nudges, or explicitly enable bounded automatic nudging. You choose how much authority to give it.</p>
+      </div>
+      <div class="supervisor-board">
+        <div class="window-bar"><span class="window-brand">Supervisor</span><span class="preview-label">Illustrative preview</span></div>
+        <div class="board-top"><div><h3>Needs you</h3><p>The decisions worth coming back for.</p></div><span class="mode-label">Observe mode</span></div>
+        <article class="fleet-task"><div class="task-heading"><span class="task-tool">Codex / Checkout fix</span><span class="task-status needs-you">Needs a decision</span></div><h4>Include the data migration in this PR?</h4><p>The agent has a question. The work behind it is attached.</p><details><summary>See example evidence</summary><p>PR #42 · Checkout retry fix<br>Unit tests passed · Migration not verified<br>Decision: include the migration, or keep it in a separate change.<br><br>Example data. Real questions link back to the thread and PR.</p></details></article>
+        <article class="fleet-task"><div class="task-heading"><span class="task-tool">Claude Code / Search</span><span class="task-status">Working</span></div><h4>Running the integration suite.</h4><p>No decision needed. Keep an eye on the result.</p></article>
+        <article class="fleet-task"><div class="task-heading"><span class="task-tool">Conductor / Settings</span><span class="task-status checking">Waiting on checks</span></div><h4>The PR is open. CI is still running.</h4><p>The thread and verification status stay together.</p></article>
+        <div class="board-footer">Observe → Propose → Auto · Authority stays with you</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section system-layout">
+    <div><p class="eyebrow">Why OpenAGI</p><h2>The model is<br>only the start.</h2><p class="lede">The useful part is everything that lets an agent keep working with you: memory, judgment, tools, and follow-through.</p><a class="text-link" href="technology.html">Explore the technical stack ↗</a></div>
+    <div class="system-points">
+      <article><span>01</span><div><h3>Memory that carries forward.</h3><p>Tiered memory keeps working context, recurring patterns, and durable knowledge. Corrections become part of future decisions.</p></div></article>
+      <article><span>02</span><div><h3>A decision before an action.</h3><p>Adaptive Scrutiny weighs the signal: act, ask, watch, ignore, or bring in a specialist. Permissions define what the agent can do.</p></div></article>
+      <article><span>03</span><div><h3>Specialists with a specific job.</h3><p>Delegate bounded work with a defined scope and tools. Keep an activity record you can inspect on your own host.</p></div></article>
+    </div>
+  </section>
+
+  <section class="anywhere-band" id="anywhere"><div class="section">
+    <div class="anywhere-intro"><p class="eyebrow">Take your agent with you</p><h2>One agent.<br>More ways to reach it.</h2><p>Start on your computer. Connect the apps and tools you use. Keep the same agent in reach as your day moves.</p></div>
+    <div class="access-grid">
+      <article class="access-card"><span class="access-symbol" aria-hidden="true">⌘</span><p class="eyebrow">Mac app &amp; browser</p><h3>At your desk.</h3><p>Open your agent from the menu bar or a browser. Chat, review memory, connect tools, and manage recurring work.</p><a class="text-link" href="setup.html">Get OpenAGI ↗</a></article>
+      <article class="access-card"><span class="access-symbol" aria-hidden="true">↗</span><p class="eyebrow">iOS &amp; Android · Source / QA builds</p><h3>Out in the world.</h3><p>Bring tasks, chat, approvals, and Supervisor to a paired phone. Mobile builds need setup and a reachable host.</p><a class="text-link" href="https://github.com/Spshulem/openAGI/tree/main/mobile">Mobile apps &amp; setup ↗</a></article>
+      <article class="access-card"><span class="access-symbol" aria-hidden="true">＋</span><p class="eyebrow">Your connected tools</p><h3>Where your work is.</h3><p>Connect Gmail, Google Calendar, messaging, and MCP tools. Choose the accounts and actions your agent can use.</p><a class="text-link" href="ecosystem.html#connections">Explore integrations ↗</a></article>
+    </div>
+    <p class="hardware-footnote">Want a physical way to reach your agent? <a href="hardware.html">Explore hardware &amp; DIY projects ↗</a></p>
+  </div></section>
+
+  <section class="section installation-section" id="install">
+    <div class="install-heading"><p class="eyebrow">Install it. Make it useful.</p><h2>Your next useful tool<br>is an agent.</h2><p>Start with one job you'd like to stop doing yourself.</p><p class="install-source-links"><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases</a><a href="https://github.com/Spshulem/openAGI">Source</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md">Install docs</a></p></div>
+<div class="install-options">
+  <article class="mac-install">
+    <p class="eyebrow">The Mac app</p><h3>Your agent.<br>In your menu bar.</h3>
+    <p>OpenAGI, with a native home on your Mac. Download the app and follow setup.</p>
+    <a class="button dark" href="https://openagi.sh/download">Download for Mac <span aria-hidden="true">↓</span></a>
+  </article>
+  <div class="terminal-install">
+    <div class="install-tabs" role="tablist" aria-label="Installation method">
+      <button type="button" role="tab" id="install-tab-curl" data-install-tab="curl" aria-controls="install-panel" aria-selected="true">One command</button>
+      <button type="button" role="tab" id="install-tab-docker" data-install-tab="docker" aria-controls="install-panel" aria-selected="false" tabindex="-1">Docker</button>
+      <button type="button" role="tab" id="install-tab-source" data-install-tab="source" aria-controls="install-panel" aria-selected="false" tabindex="-1">Source</button>
+    </div>
+    <div class="terminal-body" id="install-panel" role="tabpanel" aria-labelledby="install-tab-curl" tabindex="0">
+      <pre><code id="install-command">curl -fsSL https://openagi.sh/install.sh | sh</code></pre>
+      <div class="terminal-actions"><button type="button" class="command-copy" data-clipboard="install-command" aria-live="polite">Copy command</button><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md">Installation docs ↗</a></div>
+      <p class="install-context" id="install-context">For macOS, Debian-family Linux, or a host with Docker. The installer guides you to setup.</p>
+    </div>
+  </div>
+</div><ol class="start-steps">
+  <li><span>01</span><h3>Install OpenAGI.</h3><p>Use the Mac app or run the agent on your computer or server.</p></li>
+  <li><span>02</span><h3>Connect a model.</h3><p>Follow the setup wizard. Choose a supported provider or local model.</p></li>
+  <li><span>03</span><h3>Give it a real job.</h3><p>Start a conversation, save a decision, or set up your first recurring task.</p></li>
+</ol>
+    <p class="install-fineprint">Use your own model connection. Provider usage may have its own costs. <a href="setup.html">See the setup guide</a>.</p>
+<div class="software-faq">
+  <details><summary>What do I need to get started?</summary><p>A Mac, a supported Linux computer, or Docker, plus a model connection for AI features. The source install needs Git and Node.js 22 or newer. Keep your host running for scheduled work and remote access. Model providers and connected services may charge for usage.</p></details>
+  <details><summary>Where does my data go?</summary><p>OpenAGI keeps agent state on your host. Your configured cloud model receives selected prompts and tool context, and connected services process the requests you send them. Supported local models can keep inference on your device. Screen observation is optional; external writes and computer actions have their own permissions. <a href="technology.html#control">Read about privacy and control</a>.</p></details>
+  <details><summary>How do I use it on my phone?</summary><p>The iOS and Android apps include tasks, chat, approvals, and Supervisor. They are currently source / QA builds, with no public app-store download advertised. Pair an available build with a reachable host. <a href="https://github.com/Spshulem/openAGI/tree/main/mobile">See mobile availability and setup</a>.</p></details>
+</div>
+  </section>
+</main>
+<footer class="site-footer unified-footer">
+  <div class="footer-top"><a class="brand" href="index.html">openagi<span class="brand-dot" aria-hidden="true"></span></a><div><a href="index.html#supervisor">Supervisor</a><a href="ecosystem.html">Apps &amp; integrations</a><a href="technology.html">Technology</a><a href="hardware.html">Hardware</a><a href="https://github.com/Spshulem/openAGI">Source ↗</a><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases ↗</a><a href="setup.html#downloads">Downloads ↗</a></div></div>
+  <p>A personal, proactive agent. Install it, connect your tools, and put it to work.</p>
+  <div class="footer-bottom"><span>Your host. Your models. Your permissions.</span><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">Source-available · PolyForm Noncommercial</a></div>
+</footer>
+</body>
+</html>

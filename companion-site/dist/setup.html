@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f6f6f0">
+  <meta name="description" content="Download the OpenAGI Mac app or install with one command. Connect a model and start using your personal agent and Supervisor.">
+  <title>Install OpenAGI — Start with one useful job</title>
+  <link rel="icon" href="assets/openagi-mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="platform.css"><link rel="stylesheet" href="overview.css"><link rel="stylesheet" href="software.css">
+  <script src="platform.js" defer></script><script src="software.js" defer></script>
+</head>
+<body class="install-page">
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header unified-header">
+  <a class="brand" href="index.html" aria-label="OpenAGI home">openagi<span class="brand-dot" aria-hidden="true"></span></a>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu <span aria-hidden="true">+</span></button>
+  <nav id="site-nav" aria-label="Main navigation">
+    <a href="index.html#personal-agent">Personal agent</a><a href="index.html#supervisor">Supervisor</a><a href="ecosystem.html">Apps &amp; integrations</a><a href="https://github.com/Spshulem/openAGI">GitHub <span aria-hidden="true">↗</span></a><a class="nav-action" href="setup.html">Install OpenAGI <span aria-hidden="true">↗</span></a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="section install-intro"><p class="eyebrow">Get OpenAGI</p><h1>Install your agent.<br>Give it a job.</h1><p class="lede">Choose the Mac app, a portable desktop bundle, or a terminal install. The setup wizard helps you connect a model and start your first conversation.</p><p class="install-source-links"><a href="https://github.com/Spshulem/openAGI/releases/latest">GitHub releases ↗</a><a href="https://github.com/Spshulem/openAGI">Source ↗</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md">Full install docs ↗</a></p></section>
+  <section class="section installation-section" id="downloads" aria-label="Install and get started">
+<div class="install-options">
+  <article class="mac-install">
+    <p class="eyebrow">The Mac app</p><h3>Your agent.<br>In your menu bar.</h3>
+    <p>OpenAGI, with a native home on your Mac. Download the app and follow setup.</p>
+    <a class="button dark" href="https://openagi.sh/download">Download for Mac <span aria-hidden="true">↓</span></a>
+  </article>
+  <div class="terminal-install">
+    <div class="install-tabs" role="tablist" aria-label="Installation method">
+      <button type="button" role="tab" id="install-tab-curl" data-install-tab="curl" aria-controls="install-panel" aria-selected="true">One command</button>
+      <button type="button" role="tab" id="install-tab-docker" data-install-tab="docker" aria-controls="install-panel" aria-selected="false" tabindex="-1">Docker</button>
+      <button type="button" role="tab" id="install-tab-source" data-install-tab="source" aria-controls="install-panel" aria-selected="false" tabindex="-1">Source</button>
+    </div>
+    <div class="terminal-body" id="install-panel" role="tabpanel" aria-labelledby="install-tab-curl" tabindex="0">
+      <pre><code id="install-command">curl -fsSL https://openagi.sh/install.sh | sh</code></pre>
+      <div class="terminal-actions"><button type="button" class="command-copy" data-clipboard="install-command" aria-live="polite">Copy command</button><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md">Installation docs ↗</a></div>
+      <p class="install-context" id="install-context">For macOS, Debian-family Linux, or a host with Docker. The installer guides you to setup.</p>
+    </div>
+  </div>
+</div><ol class="start-steps">
+  <li><span>01</span><h3>Install OpenAGI.</h3><p>Use the Mac app or run the agent on your computer or server.</p></li>
+  <li><span>02</span><h3>Connect a model.</h3><p>Follow the setup wizard. Choose a supported provider or local model.</p></li>
+  <li><span>03</span><h3>Give it a real job.</h3><p>Start a conversation, save a decision, or set up your first recurring task.</p></li>
+</ol>
+    <p class="install-fineprint">The source install requires Git and Node.js 22+. Use your own model connection; provider usage may have its own costs. Open the local setup wizard at <code>http://127.0.0.1:43210/setup</code>. GitHub is the all-platform download index; <a href="https://openagi.sh/download">openagi.sh/download</a> currently redirects to the Mac DMG.</p>
+    <section class="onboarding-callout" aria-labelledby="onboarding-heading"><div><p class="eyebrow">Choose your path</p><h2 id="onboarding-heading">One real result,<br>then more if you want it.</h2><p>Pick <strong>Personal Assistant</strong>, <strong>Agent Supervisor</strong>, or <strong>Both</strong>. Each path is skippable and resumable; setup does not grant permissions or send anything on your behalf.</p></div><div class="onboarding-path-grid"><a href="onboarding.html#assistant-path"><strong>Personal Assistant</strong><span>Save a useful preference or finish a small task.</span></a><a href="onboarding.html#supervisor-path"><strong>Agent Supervisor</strong><span>See one project status, blocker, or watched update.</span></a><a href="onboarding.html#both-path"><strong>Both</strong><span>Get a real reply, then connect the next surface.</span></a></div></section><div class="first-task"><div><p class="eyebrow">Your first conversation</p><h2>Start with something real.</h2><p>Tell OpenAGI what you're working on, what it should remember, and one thing you'd like help with.</p></div><div><blockquote>“Help me get started with OpenAGI, one question at a time.”</blockquote><p>Or bring your coding agents into view.</p><a href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md">Set up Supervisor ↗</a></div></div>
+    <div class="setup-next"><a href="ecosystem.html#connections">Connect your tools ↗</a><a href="https://github.com/Spshulem/openAGI/tree/main/mobile">Pair a phone ↗</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md">First-use guide ↗</a><a href="onboarding.html">Onboarding paths ↗</a></div>
+<div class="software-faq">
+  <details><summary>What do I need to get started?</summary><p>A Mac, a supported Linux computer, or Docker, plus a model connection for AI features. The source install needs Git and Node.js 22 or newer. Keep your host running for scheduled work and remote access. Model providers and connected services may charge for usage.</p></details>
+  <details><summary>Where does my data go?</summary><p>OpenAGI keeps agent state on your host. Your configured cloud model receives selected prompts and tool context, and connected services process the requests you send them. Supported local models can keep inference on your device. Screen observation is optional; external writes and computer actions have their own permissions. <a href="technology.html#control">Read about privacy and control</a>.</p></details>
+  <details><summary>How do I use it on my phone?</summary><p>The iOS and Android apps include tasks, chat, approvals, and Supervisor. They are currently source / QA builds, with no public app-store download advertised. Pair an available build with a reachable host. <a href="https://github.com/Spshulem/openAGI/tree/main/mobile">See mobile availability and setup</a>.</p></details>
+</div>
+  </section>
+</main>
+<footer class="site-footer unified-footer">
+  <div class="footer-top"><a class="brand" href="index.html">openagi<span class="brand-dot" aria-hidden="true"></span></a><div><a href="index.html#supervisor">Supervisor</a><a href="ecosystem.html">Apps &amp; integrations</a><a href="technology.html">Technology</a><a href="hardware.html">Hardware</a><a href="https://github.com/Spshulem/openAGI">Source ↗</a><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases ↗</a><a href="setup.html#downloads">Downloads ↗</a></div></div>
+  <p>A personal, proactive agent. Install it, connect your tools, and put it to work.</p>
+  <div class="footer-bottom"><span>Your host. Your models. Your permissions.</span><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">Source-available · PolyForm Noncommercial</a></div>
+</footer>
+</body>
+</html>

@@ -8,9 +8,9 @@ Run a personal agent on a computer you control. Chat with it, teach it your
 preferences, monitor coding agents, and connect your tools and devices. Add
 screen observation or approved computer interaction when you need them.
 
-**[Download for macOS](https://github.com/Spshulem/openAGI/releases/latest)** ·
-**[Windows install](docs/INSTALL.md#windows-from-source-powershell)** ·
-**[Linux / Raspberry Pi install](docs/INSTALL.md#linux-and-raspberry-pi)** ·
+**[GitHub source](https://github.com/Spshulem/openAGI)** ·
+**[Latest release and downloads](https://github.com/Spshulem/openAGI/releases/latest)** ·
+**[Install docs](docs/INSTALL.md)** ·
 **[First-use guide](docs/GETTING_STARTED.md)** ·
 **[Website](https://openagi.sh)**
 
@@ -18,16 +18,17 @@ screen observation or approved computer interaction when you need them.
 
 | Platform | Start here | Includes |
 | --- | --- | --- |
-| **macOS** | [Download the latest DMG](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
-| **Windows** | [Download source ZIP](https://github.com/Spshulem/openAGI/archive/refs/heads/main.zip), then [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; Node.js 22+ required for source installs |
-| **Linux / Raspberry Pi** | [Install guide](docs/INSTALL.md#linux-and-raspberry-pi) or [download source archive](https://github.com/Spshulem/openAGI/archive/refs/heads/main.tar.gz) | Browser dashboard, persistent runtime, optional systemd service; Linux x64/arm64 Docker image |
+| **macOS** | [Download the v0.0.83 DMG](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-0.0.83.dmg) or [view releases](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
+| **Windows** | [Download the Windows x64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Windows-x64.zip), extract, run `Start-OpenAGI.cmd` | Browser dashboard and CLI runtime with Node included; native Mac capture/control is not included |
+| **Linux x64** | [Download the Linux x64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Linux-x64.tar.gz) or [use the shell installer](docs/INSTALL.md#linux-and-raspberry-pi) | Browser dashboard and persistent runtime with Node included |
+| **Linux arm64 / Raspberry Pi** | [Download the Linux arm64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Linux-arm64.tar.gz) or [use Docker](docs/INSTALL.md#docker) | Browser dashboard and persistent runtime; use a compatible 64-bit OS |
 | **iPhone / Android** | [Companion app and pairing](mobile/README.md) | Mobile source with tasks, chat, approvals, and supervisor views; no public store download linked |
 
-The latest release currently has a Mac installer. Releases built with the new
-portable-download workflow also attach Windows x64 and Linux x64/arm64 bundles
-with Node included. See [download availability and launch instructions](docs/INSTALL.md#downloads).
-Source ZIP/archive links above track `main`; each GitHub release also offers its
-exact source under **Assets → Source code**.
+The public **v0.0.83** release (published 2026-11-20) has all four desktop
+artifacts above and checksum files for the portable archives. The v0.0.83
+links are pinned evidence; use the release page for a newer version. Verify the
+checksum next to each portable download. Each release also offers its exact
+source under **Assets → Source code**.
 
 ## Your first five minutes
 
@@ -55,6 +56,15 @@ npm run serve
 Windows PowerShell users can use `npm.cmd ci --ignore-scripts` and
 `npm.cmd run serve`. Source/portable users should relaunch after setup asks for
 a restart. See [all install paths, Docker, updates, and troubleshooting](docs/INSTALL.md).
+
+For Debian-family Linux or a compatible Raspberry Pi, inspect and run the
+shell installer:
+
+```sh
+curl -fL https://openagi.sh/install.sh -o install-openagi.sh
+less install-openagi.sh
+sh install-openagi.sh
+```
 
 ## What you can do
 
@@ -97,13 +107,19 @@ using Computer Use and running repairs have their own controls. See the
 [voice setup](docs/setup/fleet-supervisor.md#voice) and
 [self-fix setup](docs/setup/fleet-supervisor.md#self-fix-runner).
 
-## Availability
+## Availability and evidence
 
 This README describes the repository's current capabilities. Check the
 [latest release](https://github.com/Spshulem/openAGI/releases/latest) for the
 installers and portable downloads actually published. The mobile apps are
-source/QA builds; no public store release is linked here. Windows/Linux
-portable downloads appear when the release workflow publishes those assets.
+source/QA builds; no public store release is linked here. A GitHub Actions
+artifact is uploaded evidence, not a public download, and a Store submission
+is not public availability. The website and docs label these states separately.
+
+OpenAGI does not include product telemetry or an account service. Local budget
+and audit views record configured model cost and attribution on the host; they
+do not upload message content. GitHub may show aggregate clone/download counts,
+but those are GitHub's repository analytics rather than OpenAGI user analytics.
 
 ## Why a persistent runtime helps
 

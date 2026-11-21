@@ -1,0 +1,134 @@
+{
+  "base": "https://openagi-hardware.vercel.app",
+  "results": [
+    {
+      "path": "/",
+      "width": 1440,
+      "status": 200,
+      "title": "OpenAGI — Your agent. Already on it.",
+      "heading": "Your agent.\nAlready on it.",
+      "overflow": false
+    },
+    {
+      "path": "/",
+      "width": 390,
+      "status": 200,
+      "title": "OpenAGI — Your agent. Already on it.",
+      "heading": "Your agent.\nAlready on it.",
+      "overflow": false
+    },
+    {
+      "path": "/setup.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Install OpenAGI — Start with one useful job",
+      "heading": "Install your agent.\nGive it a job.",
+      "overflow": false
+    },
+    {
+      "path": "/setup.html",
+      "width": 390,
+      "status": 200,
+      "title": "Install OpenAGI — Start with one useful job",
+      "heading": "Install your agent.\nGive it a job.",
+      "overflow": false
+    },
+    {
+      "path": "/technology.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Technology — OpenAGI",
+      "heading": "Intelligence.\nWith a little\nstructure.",
+      "overflow": false
+    },
+    {
+      "path": "/technology.html",
+      "width": 390,
+      "status": 200,
+      "title": "Technology — OpenAGI",
+      "heading": "Intelligence.\nWith a little\nstructure.",
+      "overflow": false
+    },
+    {
+      "path": "/ecosystem.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Apps & integrations — OpenAGI",
+      "heading": "Your agent.\nWhere you need it.",
+      "overflow": false
+    },
+    {
+      "path": "/ecosystem.html",
+      "width": 390,
+      "status": 200,
+      "title": "Apps & integrations — OpenAGI",
+      "heading": "Your agent.\nWhere you need it.",
+      "overflow": false
+    },
+    {
+      "path": "/hardware.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Hardware — OpenAGI",
+      "heading": "Your agent.\nWithin reach.",
+      "overflow": false
+    },
+    {
+      "path": "/hardware.html",
+      "width": 390,
+      "status": 200,
+      "title": "Hardware — OpenAGI",
+      "heading": "Your agent.\nWithin reach.",
+      "overflow": false
+    },
+    {
+      "path": "/devices.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Find your device — OpenAGI",
+      "heading": "Small hardware.\nBig possibilities.",
+      "overflow": false
+    },
+    {
+      "path": "/devices.html",
+      "width": 390,
+      "status": 200,
+      "title": "Find your device — OpenAGI",
+      "heading": "Small hardware.\nBig possibilities.",
+      "overflow": false
+    },
+    {
+      "path": "/how-it-works.html",
+      "width": 1440,
+      "status": 200,
+      "title": "How hardware connects — OpenAGI",
+      "heading": "A few words.\nA way forward.",
+      "overflow": false
+    },
+    {
+      "path": "/how-it-works.html",
+      "width": 390,
+      "status": 200,
+      "title": "How hardware connects — OpenAGI",
+      "heading": "A few words.\nA way forward.",
+      "overflow": false
+    },
+    {
+      "path": "/device-guide.html?device=vocci",
+      "width": 1440,
+      "status": 200,
+      "title": "Put recorded context to work. — OpenAGI",
+      "heading": "Put recorded context to work.",
+      "overflow": false
+    },
+    {
+      "path": "/device-guide.html?device=vocci",
+      "width": 390,
+      "status": 200,
+      "title": "Put recorded context to work. — OpenAGI",
+      "heading": "Put recorded context to work.",
+      "overflow": false
+    }
+  ],
+  "issues": []
+}

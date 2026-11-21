@@ -1,12 +1,16 @@
 # Website feature refresh
 
-Copy and placement for the public OpenAGI site, audited against main and the
-v0.0.58 release on 2026-10-18. This is an editorial handoff, not a deployed
-website or a release announcement. The canonical site lives in
+Copy and placement for the public OpenAGI site, originally audited against main
+and the v0.0.58 release on 2026-10-18. The historical recommendations remain
+useful context; the current reviewable static software pages and outcome-led
+onboarding are in `companion-site/dist`. This is an editorial handoff, not a
+deployed website or a release announcement. The canonical site lives in
 [`buildbetter-app/bb-website/openagi`](https://github.com/buildbetter-app/bb-website/tree/main/openagi),
 and Vercel's `buildbetter/openagi` project deploys it from `main` to
 `openagi.sh` and `www.openagi.sh`. It is separate from this application repo.
-The separate local `companion-site` is a hardware catalogue.
+The companion-site checkout now contains both the preserved hardware catalogue
+and the software/install pages. Deploy only the intended `dist` contents after
+the website owner reviews the PR.
 
 ## Hero supporting copy
 
@@ -109,9 +113,10 @@ browser/CLI runtime is not a native capture app.
 | iOS push and phone-agent/workspace additions | Merged #208/#209 after v0.0.58; source/QA availability, not a store release |
 | New messaging/Google/Pebble connections | Merged #210 after v0.0.58; owner accounts, configuration and live acceptance required |
 | Provider, cost and approval improvements | Merged #212–#214 after v0.0.58; not evidence that an installed app has updated |
-| Guided onboarding and Windows/Linux portable downloads | #215 is open; publish download claims only when the release assets exist |
+| Guided onboarding and Windows/Linux portable downloads | The deterministic setup/Get started flows are shipped; v0.0.83 publicly has Mac, Windows x64, and Linux x64/arm64 assets. Unified opt-in discovery and the no-key help skill remain planned in [`docs/plans/2026-11-21-onboarding-handoff.md`](plans/2026-11-21-onboarding-handoff.md). |
 
 Before publishing, recheck the latest release assets, use only those download
 links, and verify desktop/mobile layout, navigation and screenshot privacy in
 the actual website project. The README refresh and this copy do not deploy the
-public website.
+public website. See the [fresh preview verification](verification/2026-11-21-site-onboarding.md)
+for current screenshots and evidence boundaries.
