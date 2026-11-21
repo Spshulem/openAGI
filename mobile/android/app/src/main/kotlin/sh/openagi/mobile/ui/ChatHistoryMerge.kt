@@ -36,9 +36,11 @@ internal object ChatHistoryMerge {
             val entry = unsynced[index]
             if (entry is ChatEntry.User) {
                 val reply = unsynced.getOrNull(index + 1) as? ChatEntry.Assistant
-                // The turn's own id when both sides have it; otherwise the text.
+                // The turn's own id when both sides have it; otherwise the text,
+                // but never between two named turns: the same words sent twice
+                // are two turns, and one must not stand in for the other.
                 val match = entry.requestId?.let { id -> unclaimed.firstOrNull { it.requestId == id } }
-                    ?: unclaimed.firstOrNull { it.text == entry.text }
+                    ?: unclaimed.firstOrNull { it.text == entry.text && (entry.requestId == null || it.requestId == null) }
                 if (match != null) unclaimed.remove(match)
                 val replyUnfinished = reply == null || reply.streaming || reply.failed
                 // Unconfirmed and unfinished: the daemon may never have seen it.

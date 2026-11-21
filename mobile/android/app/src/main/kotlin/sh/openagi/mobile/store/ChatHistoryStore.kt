@@ -23,11 +23,13 @@ data class SavedChatEntry(
     val sourceName: String? = null,
     // Turn recovery (all optional: older files decode unchanged). The turn
     // id; a reply main accepted whose stream was lost (still recovering); a
-    // send never confirmed, to resend once; a turn main lost (retry is new).
+    // send never confirmed, to resend once; a turn main lost (retry is new);
+    // already resent once automatically, so never again without the person.
     val requestId: String? = null,
     val detached: Boolean = false,
     val autoRetry: Boolean = false,
     val newRequestOnRetry: Boolean = false,
+    val autoResent: Boolean = false,
 )
 
 @Serializable

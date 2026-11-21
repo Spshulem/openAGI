@@ -464,6 +464,20 @@ public actor DaemonClient {
         return try Self.decodeJSON(ConversationPage.self, from: data)
     }
 
+    // `GET /conversations/:thread/turns?ids=…` -- whether main has each of
+    // these turns (queued, running, done, failed, interrupted or unknown),
+    // so a send whose answer was lost is never resent blindly. 1-50 ids. A
+    // main older than this route answers 404, or 401 for a phone (the route
+    // is not on its allowlist); both are `DaemonError.notFound`.
+    public func conversationTurns(thread: ConversationThread, ids: [String], conversationId: String = "main") async throws -> ConversationTurns {
+        var items = [URLQueryItem(name: "ids", value: ids.prefix(50).joined(separator: ","))]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/turns", method: "GET", queryItems: items)
+        let (data, http) = try await performConversationRequest(request)
+        try Self.requireConversationJSON(data: data, response: http)
+        return try Self.decodeJSON(ConversationTurns.self, from: data)
+    }
+
     public func conversations() async throws -> [ConversationSummary] {
         let request = try authorizedRequest(path: "/conversations", method: "GET")
         let (data, http) = try await performConversationRequest(request)

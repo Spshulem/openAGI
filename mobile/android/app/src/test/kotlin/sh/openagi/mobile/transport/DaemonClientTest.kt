@@ -795,6 +795,50 @@ class DaemonClientTest {
     }
 
     @Test
+    fun conversationTurnsAsksByTurnIdAndDecodes() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"thread":"supervisor","conversationId":"main",
+                  "active":[{"requestId":"android-2","stage":"model","startedAt":"2026-11-20T10:00:00.000Z"}],
+                  "turns":[{"requestId":"android-1","state":"done"},{"requestId":"android-2","state":"running","code":"busy"}],
+                  "future":true}""",
+            ),
+        )
+        val states = client().conversationTurns("supervisor", listOf("android-1", "android-2"))
+        assertEquals("main", states.conversationId)
+        assertEquals(listOf("android-2"), states.active.map { it.requestId })
+        assertEquals(listOf("done", "running"), states.turns.map { it.state })
+        assertEquals("busy", states.turns[1].code)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/conversations/supervisor/turns", request.requestUrl!!.encodedPath)
+        assertEquals("android-1,android-2", request.requestUrl!!.queryParameter("ids"))
+        assertEquals(null, request.requestUrl!!.queryParameter("conversationId"))
+    }
+
+    @Test
+    fun aMainWithoutTheTurnsRouteIsNotFound() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(404))
+        try {
+            client().conversationTurns("agent", listOf("android-1"))
+            fail("expected NotFound")
+        } catch (expected: DaemonException.NotFound) {
+        }
+    }
+
+    @Test
+    fun turnsAreNeverAskedForWithNoIdsOrTooMany() = runBlocking {
+        for (ids in listOf(emptyList(), List(51) { "android-$it" }, listOf("a,b"))) {
+            try {
+                client().conversationTurns("agent", ids)
+                fail("expected a refusal")
+            } catch (expected: IllegalArgumentException) {
+            }
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
     fun anUnknownThreadIsNeverRequested() = runBlocking {
         try {
             client().conversationMessages("../sessions")

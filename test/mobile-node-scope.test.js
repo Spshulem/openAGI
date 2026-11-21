@@ -90,6 +90,8 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/fleet/api/threads/claude:abc/unmute"],
     ["GET", "/conversations/agent/messages"],
     ["GET", "/conversations/supervisor/messages"],
+    ["GET", "/conversations/agent/turns"],
+    ["GET", "/conversations/supervisor/turns"],
     ["GET", "/lifelog/moments"]
   ];
   for (const [method, pathname] of allowed) {

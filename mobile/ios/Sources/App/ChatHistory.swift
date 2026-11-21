@@ -317,8 +317,11 @@ enum ChatTurnRecovery {
     static let interruptedText = "This reply stopped before it finished (OpenAGI restarted)."
     static let staleText = "No reply yet. OpenAGI may still be working on it."
 
-    static func resolve(_ messages: [ChatMessage], page: ConversationPage, now: Date = Date()) -> [ChatMessage] {
-        let running = Set((page.inFlight ?? []).map(\.requestId))
+    // `alsoRunning`: turns the turns route last called queued or running. A
+    // turn waiting behind another one may not be in the page's `inFlight`.
+    static func resolve(_ messages: [ChatMessage], page: ConversationPage, alsoRunning: Set<String> = [],
+                        now: Date = Date()) -> [ChatMessage] {
+        let running = Set((page.inFlight ?? []).map(\.requestId)).union(alsoRunning)
         var result: [ChatMessage] = []
         for var message in messages {
             guard message.isDetached, let id = message.requestID else { result.append(message); continue }

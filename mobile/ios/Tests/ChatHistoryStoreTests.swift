@@ -112,4 +112,50 @@ final class ChatHistoryStoreTests: XCTestCase {
         XCTAssertEqual(ChatRetry.target(failedID: restored.last!.id, in: restored, isSending: false)?.userText, text.text)
     }
 
+    // MARK: - Outbox
+
+    private func outboxItem(_ text: String, image: String? = nil) -> SavedOutboxItem {
+        SavedOutboxItem(id: UUID(), requestID: "ios-\(UUID().uuidString.lowercased())", text: text,
+                        attachments: image.map { [ChatAttachment(name: "Synthetic.jpg", data: $0, thumbnail: "preview")] } ?? [],
+                        focusedCardID: "card-1", createdAt: Date(timeIntervalSince1970: 1_790_000_000),
+                        state: "notSent", maybeDelivered: true, failureText: nil, retryNeedsNewID: nil, shownQueued: true)
+    }
+
+    func testOutboxKeepsFullImageDataBesideTheHistory() {
+        let store = ChatHistoryStore(thread: "supervisor", directory: directory)
+        let items = [outboxItem("First", image: "original-pixels"), outboxItem("Second")]
+        store.save(nodeID: "n", entries: [SavedChatEntry(id: UUID(), role: "user", at: Date(), text: "older line")])
+        store.saveOutbox(nodeID: "n", items: items)
+        XCTAssertEqual(store.loadOutbox(nodeID: "n"), items)
+        XCTAssertEqual(store.loadOutbox(nodeID: "n").first?.attachments.first?.data, "original-pixels")
+        XCTAssertEqual(store.load(nodeID: "n").map(\.text), ["older line"], "the history file is untouched")
+        XCTAssertEqual(ChatHistoryStore(thread: "agent", directory: directory).loadOutbox(nodeID: "n"), [])
+    }
+
+    func testOutboxBelongsToItsPairingAndGoesWithTheHistory() {
+        let store = ChatHistoryStore(thread: "supervisor", directory: directory)
+        store.saveOutbox(nodeID: "mobile:a", items: [outboxItem("secret")])
+        XCTAssertEqual(store.loadOutbox(nodeID: "mobile:b"), [])
+        store.delete()
+        XCTAssertEqual(store.loadOutbox(nodeID: "mobile:a"), [])
+        store.saveOutbox(nodeID: "mobile:a", items: [outboxItem("x")])
+        store.saveOutbox(nodeID: "mobile:a", items: [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "chat-supervisor.outbox.json").path()))
+    }
+
+    func testAHistoryFileFromBeforeTheOutboxStillLoads() throws {
+        let json = #"{"nodeID":"n","entries":[{"id":"6F9619FF-8B86-D011-B42D-00C04FC964FF","role":"user","at":"2026-11-20T10:00:00.000Z","text":"hi","failed":false,"requestID":"ios-1"}]}"#
+        try Data(json.utf8).write(to: directory.appending(path: "chat-supervisor.json"))
+        let store = ChatHistoryStore(thread: "supervisor", directory: directory)
+        XCTAssertEqual(store.load(nodeID: "n").map(\.text), ["hi"])
+        XCTAssertEqual(store.loadOutbox(nodeID: "n"), [])
+    }
+
+    func testAnUnknownOutboxStateNeedsThePerson() {
+        var saved = outboxItem("From a newer build")
+        saved.state = "teleporting"
+        let item = QueuedChatSubmission(saved: saved)
+        XCTAssertEqual(item.state, .failed)
+        XCTAssertEqual(item.saved.requestID, saved.requestID)
+    }
 }

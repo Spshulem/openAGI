@@ -34,6 +34,20 @@ struct WorkspaceImageAttachment: Identifiable, Equatable {
     ]
   }
 
+  /// Back from the outbox file into the composer (Edit on a queued send).
+  static func restoring(_ saved: SupervisorOutboxAttachment) -> WorkspaceImageAttachment? {
+    guard let full = Data(base64Encoded: saved.data), let preview = NSImage(data: full) else { return nil }
+    return WorkspaceImageAttachment(
+      id: saved.id,
+      name: saved.name,
+      mimeType: saved.mimeType,
+      data: saved.data,
+      thumbnail: saved.thumbnail,
+      previewData: saved.thumbnailData ?? full,
+      preview: preview
+    )
+  }
+
   static func encode(_ image: NSImage, name: String) -> WorkspaceImageAttachment? {
     let rawSize = image.size
     guard rawSize.width > 0, rawSize.height > 0 else { return nil }
@@ -412,6 +426,15 @@ private struct SupervisorStreamFailure: Decodable {
   let error: String?
 }
 
+private struct SupervisorTurnsResponse: Decodable {
+  let turns: [SupervisorTurnStatus]
+}
+
+/// Main ran the turn and it failed, or refused the request outright.
+private struct SupervisorTurnFailure: Error {
+  let message: String
+}
+
 struct MacTaskLease: Decodable, Equatable, Sendable {
   let claimedAt: String?
   let expiresAt: String?
@@ -492,7 +515,11 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var tasks: [MacTaskItem] = []
   @Published private(set) var allTasks: [MacTaskItem] = []
   @Published private(set) var isSending = false
-  @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
+  /// Sends saved on disk until main has finished them (see SupervisorOutbox).
+  @Published private(set) var outboxItems: [SupervisorOutboxItem] = []
+  @Published private(set) var outboxActiveId: String? = nil
+  @Published private(set) var outboxHoldReason: String? = nil
+  let outbox: SupervisorOutbox
   @Published private(set) var streamingReplyText: String? = nil
   /// The assistant messages already shown when the current reply started,
   /// and the question it answers. A new assistant message right after that
@@ -532,15 +559,38 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   func removeQueued(id: String) {
-    queuedMessages.removeAll { $0.id == id }
+    outbox.remove(id: id)
   }
 
+  /// Takes a send main has never seen back into the composer.
   func popQueuedForEdit(id: String) -> QueuedSupervisorMessage? {
-    guard let index = queuedMessages.firstIndex(where: { $0.id == id }) else { return nil }
-    return queuedMessages.remove(at: index)
+    guard let item = outbox.items.first(where: { $0.id == id && $0.state == .queued }),
+          outbox.remove(id: id) != nil else { return nil }
+    return QueuedSupervisorMessage(
+      id: item.id,
+      text: item.text,
+      focusedCardId: item.focusedCardId,
+      attachments: item.attachments.compactMap(WorkspaceImageAttachment.restoring)
+    )
   }
 
-  private init() {}
+  /// A failed send again, as a new message.
+  func retryQueued(id: String) {
+    outbox.retry(id: id)
+    Task { await outbox.drain() }
+  }
+
+  private init() {
+    outbox = SupervisorOutbox(store: SupervisorOutboxStore(url: SupervisorOutboxStore.defaultURL))
+    outbox.$items.assign(to: &$outboxItems)
+    outbox.$activeId.assign(to: &$outboxActiveId)
+    outbox.$holdReason.assign(to: &$outboxHoldReason)
+    outbox.transport = self
+    outbox.onSettled = { [weak self] in
+      await self?.refreshMessages()
+      await self?.refreshTasks()
+    }
+  }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
   /// `src/hosted-interface.js` (`requestNodeId` gate). Never include client-only
@@ -550,7 +600,9 @@ final class SharedSupervisorClient: ObservableObject {
     focusedCardId: String? = nil,
     attachments: [WorkspaceImageAttachment] = [],
     includeThread: Bool = true,
-    includeFocusedCard: Bool = true
+    includeFocusedCard: Bool = true,
+    requestId: String? = nil,
+    savedAttachments: [SupervisorOutboxAttachment] = []
   ) -> [String: Any] {
     var payload: [String: Any] = [
       "text": text,
@@ -558,6 +610,11 @@ final class SharedSupervisorClient: ObservableObject {
     ]
     if includeThread {
       payload["thread"] = "supervisor"
+      // The turn's own name: however often this send goes out, main runs it
+      // once. Only the shared thread knows turn ids.
+      if let requestId, requestId.range(of: "^[A-Za-z0-9_-]{8,128}$", options: .regularExpression) != nil {
+        payload["requestId"] = requestId
+      }
     }
     if includeFocusedCard,
        let rawCard = focusedCardId?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -567,6 +624,8 @@ final class SharedSupervisorClient: ObservableObject {
     }
     if !attachments.isEmpty {
       payload["attachments"] = attachments.map(\.agentHostPayload)
+    } else if !savedAttachments.isEmpty {
+      payload["attachments"] = savedAttachments.map(\.agentHostPayload)
     }
     return payload
   }
@@ -576,6 +635,11 @@ final class SharedSupervisorClient: ObservableObject {
       group.addTask { await self.refreshMessages() }
       group.addTask { await self.refreshTasks() }
       group.addTask { await self.refreshModelSettings() }
+    }
+    // Picks up sends saved before a quit or a drop. drain() checks each
+    // unconfirmed one with main first, and sends one at a time.
+    if outbox.pending {
+      Task { await outbox.drain() }
     }
   }
 
@@ -730,35 +794,29 @@ final class SharedSupervisorClient: ObservableObject {
     allTasks = active + done
   }
 
+  /// Saves the send to the outbox before any network I/O, then drains it.
+  /// Sends go one at a time; a send typed while one is running waits its turn
+  /// in the outbox (and survives a quit) instead of in memory.
   @discardableResult
   func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
-    if isSending {
-      queuedMessages.append(QueuedSupervisorMessage(
-        id: "q-\(UUID().uuidString)",
-        text: text,
-        focusedCardId: focusedCardId,
-        attachments: attachments
-      ))
-      return true
-    }
+    outbox.enqueue(text: text, focusedCardId: focusedCardId, attachments: attachments.map(SupervisorOutboxAttachment.init))
+    await outbox.drain()
+    return true
+  }
+
+  /// One outbox send over the streamed `/message`. Throws a
+  /// SupervisorTransportError when the connection fails, so the outbox can
+  /// check with main instead of moving on to the next send.
+  func send(_ item: SupervisorOutboxItem, onAccepted: @escaping @MainActor () -> Void) async throws -> SupervisorSendOutcome {
     isSending = true
     defer {
       isSending = false
       streamingReplyText = nil
       progressStage = nil
     }
-    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments)
-    while !queuedMessages.isEmpty {
-      let next = queuedMessages.removeFirst()
-      _ = await executeSingleMessage(next.text, focusedCardId: next.focusedCardId, attachments: next.attachments)
-    }
-    return ok
-  }
-
-  private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
     replyBaselineIds = previousAssistantIds
     lastError = nil
@@ -767,8 +825,9 @@ final class SharedSupervisorClient: ObservableObject {
 
     let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
     replyPromptText = displayText
-    let localId = "local_\(UUID().uuidString)"
-    let optimistic = SyncedSupervisorMessage(
+    let localId = "local_\(item.id)"
+    messages.removeAll { $0.id == localId }
+    messages.append(SyncedSupervisorMessage(
       id: localId,
       role: "user",
       text: displayText,
@@ -776,11 +835,10 @@ final class SharedSupervisorClient: ObservableObject {
       sourceName: "Mac",
       sourceNodeId: nil,
       attachments: nil,
-      localThumbnailData: attachments.map(\.previewData)
-    )
-    messages.append(optimistic)
+      localThumbnailData: item.attachments.compactMap(\.thumbnailData)
+    ))
 
-    let hasValidCardId = focusedCardId?
+    let hasValidCardId = item.focusedCardId?
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil
 
@@ -796,18 +854,17 @@ final class SharedSupervisorClient: ObservableObject {
         do {
           let payload = Self.buildMessagePayload(
             text: displayText,
-            focusedCardId: focusedCardId,
-            attachments: attachments,
+            focusedCardId: item.focusedCardId,
             includeThread: attempt.includeThread,
-            includeFocusedCard: attempt.includeFocusedCard
+            includeFocusedCard: attempt.includeFocusedCard,
+            requestId: item.id,
+            savedAttachments: item.attachments
           )
-          replyText = try await performStreamedMessage(payload: payload)
+          replyText = try await performStreamedMessage(payload: payload, onAccepted: onAccepted)
           break
         } catch is UnsupportedFieldsError {
           if index == attempts.count - 1 {
-            throw NSError(domain: "OpenAGI", code: 400, userInfo: [
-              NSLocalizedDescriptionKey: "HTTP 400: node message contains unsupported fields"
-            ])
+            throw SupervisorTurnFailure(message: "HTTP 400: node message contains unsupported fields")
           }
           continue
         }
@@ -825,27 +882,45 @@ final class SharedSupervisorClient: ObservableObject {
           attachments: nil
         ))
       }
-      await refreshMessages()
-      await refreshTasks()
-      return true
-    } catch {
-      await refreshMessages()
-      let persistedAssistantReply = messages.contains {
-        $0.role == "assistant" && !previousAssistantIds.contains($0.id)
-      }
-      if persistedAssistantReply {
-        messages.removeAll { $0.id == localId }
-        lastError = nil
-        await refreshTasks()
-        return true
-      }
+      return .replied
+    } catch let failure as SupervisorTurnFailure {
       messages.removeAll { $0.id == localId }
-      lastError = error.localizedDescription
-      return false
+      lastError = failure.message
+      return .failed(failure.message)
+    } catch {
+      // The outbox tray shows this send until main says how it stands.
+      messages.removeAll { $0.id == localId }
+      throw error
     }
   }
 
-  private func performStreamedMessage(payload: [String: Any]) async throws -> String? {
+  /// How main stands on each named turn; nil from an older main without the
+  /// turns route.
+  func turnStates(ids: [String]) async throws -> [String: SupervisorTurnStatus]? {
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/conversations/supervisor/turns?ids=\(ids.joined(separator: ","))"))
+    authed(&req)
+    req.timeoutInterval = 8
+    let (data, response) = try await URLSession.shared.data(for: req)
+    if let http = response as? HTTPURLResponse, [404, 405].contains(http.statusCode) { return nil }
+    try AppState.ensureOK(response, data)
+    let decoded = try JSONDecoder().decode(SupervisorTurnsResponse.self, from: data)
+    return Dictionary(decoded.turns.map { ($0.requestId, $0) }, uniquingKeysWith: { first, _ in first })
+  }
+
+  /// Errors from before a response arrives. Only a request that provably
+  /// never reached main counts as not sent; anything else may have.
+  nonisolated static func transportError(_ error: Error) -> SupervisorTransportError {
+    if let urlError = error as? URLError,
+       [.notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed]
+        .contains(urlError.code) {
+      return .notSent(urlError.localizedDescription)
+    }
+    return .lost(error.localizedDescription)
+  }
+
+  private func performStreamedMessage(payload: [String: Any], onAccepted: @escaping @MainActor () -> Void) async throws -> String? {
     var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/message"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -854,64 +929,94 @@ final class SharedSupervisorClient: ObservableObject {
     req.timeoutInterval = 180
     authed(&req)
 
-    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+    let bytes: URLSession.AsyncBytes
+    let response: URLResponse
+    do {
+      (bytes, response) = try await URLSession.shared.bytes(for: req)
+    } catch {
+      throw Self.transportError(error)
+    }
     guard let http = response as? HTTPURLResponse else {
-      throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
-        NSLocalizedDescriptionKey: "The daemon returned an invalid response."
-      ])
+      throw SupervisorTransportError.lost("The daemon returned an invalid response.")
     }
 
     if !(200..<300).contains(http.statusCode) {
       var errData = Data()
-      for try await byte in bytes {
-        errData.append(byte)
-        if errData.count >= 4096 { break }
+      do {
+        for try await byte in bytes {
+          errData.append(byte)
+          if errData.count >= 4096 { break }
+        }
+      } catch {
+        throw SupervisorTransportError.lost(error.localizedDescription)
       }
       if http.statusCode == 400,
          AppState.extractErrorMessage(errData).localizedCaseInsensitiveContains("unsupported fields") {
         throw UnsupportedFieldsError()
       }
-      try AppState.ensureOK(response, errData)
+      // A relay or main that is restarting never took the request.
+      if [502, 503, 504].contains(http.statusCode) {
+        throw SupervisorTransportError.notSent("OpenAGI is restarting (HTTP \(http.statusCode)).")
+      }
+      do {
+        try AppState.ensureOK(response, errData)
+      } catch {
+        throw SupervisorTurnFailure(message: error.localizedDescription)
+      }
       return nil
     }
 
     let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
     if !contentType.contains("text/event-stream") {
       var data = Data()
-      for try await byte in bytes { data.append(byte) }
-      try AppState.ensureOK(response, data)
-      let decoded = try JSONDecoder().decode(AppState.MessageReply.self, from: data)
-      return decoded.reply
+      do {
+        for try await byte in bytes { data.append(byte) }
+      } catch {
+        throw SupervisorTransportError.lost(error.localizedDescription)
+      }
+      let decoded = try? JSONDecoder().decode(AppState.MessageReply.self, from: data)
+      onAccepted()
+      return decoded?.reply
     }
 
     var parser = ServerSentEventParser()
-    for try await line in ServerSentEventParser.lines(of: bytes) {
-      guard let event = parser.consume(line: line) else { continue }
-      let data = Data(event.data.utf8)
-      switch event.name {
-      case "status", "heartbeat":
-        if let status = try? JSONDecoder().decode(SupervisorStreamStatus.self, from: data),
-           let stage = status.stage, !stage.isEmpty {
-          progressStage = stage
+    do {
+      for try await line in ServerSentEventParser.lines(of: bytes) {
+        guard let event = parser.consume(line: line) else { continue }
+        let data = Data(event.data.utf8)
+        switch event.name {
+        case "session":
+          // Main stored the question: from here only its reply is owed.
+          onAccepted()
+        case "status", "heartbeat":
+          if let status = try? JSONDecoder().decode(SupervisorStreamStatus.self, from: data),
+             let stage = status.stage, !stage.isEmpty {
+            progressStage = stage
+          }
+        case "delta":
+          if let delta = try? JSONDecoder().decode(SupervisorStreamDelta.self, from: data),
+             !delta.text.isEmpty {
+            onAccepted()
+            streamingReplyText = delta.reset == true ? delta.text : (streamingReplyText ?? "") + delta.text
+          }
+        case "final":
+          onAccepted()
+          let decoded = try? JSONDecoder().decode(AppState.MessageReply.self, from: data)
+          if let reply = decoded?.reply, !reply.isEmpty {
+            streamingReplyText = reply
+          }
+          return decoded?.reply ?? streamingReplyText
+        case "failure":
+          let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
+          throw SupervisorTurnFailure(message: failure?.error ?? "Supervisor could not complete that request.")
+        default:
+          continue
         }
-      case "delta":
-        if let delta = try? JSONDecoder().decode(SupervisorStreamDelta.self, from: data),
-           !delta.text.isEmpty {
-          streamingReplyText = delta.reset == true ? delta.text : (streamingReplyText ?? "") + delta.text
-        }
-      case "final":
-        let decoded = try? JSONDecoder().decode(AppState.MessageReply.self, from: data)
-        if let reply = decoded?.reply, !reply.isEmpty {
-          streamingReplyText = reply
-        }
-        return decoded?.reply ?? streamingReplyText
-      case "failure":
-        let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
-        let message = failure?.error ?? "Supervisor could not complete that request."
-        throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-      default:
-        continue
       }
+    } catch let failure as SupervisorTurnFailure {
+      throw failure
+    } catch {
+      throw SupervisorTransportError.lost(error.localizedDescription)
     }
 
     if let trailing = parser.finish(),
@@ -923,12 +1028,9 @@ final class SharedSupervisorClient: ObservableObject {
       return text
     }
 
-    if let partial = streamingReplyText, !partial.isEmpty {
-      return partial
-    }
-    throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
-      NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
-    ])
+    // Ended without its final frame: partial text is not a finished reply.
+    // The outbox asks main how the turn ended.
+    throw SupervisorTransportError.lost("The connection ended before completion was confirmed.")
   }
 
   func appendMirror(userText: String, assistantText: String) async {
@@ -1091,3 +1193,5 @@ final class SharedSupervisorClient: ObservableObject {
     }
   }
 }
+
+extension SharedSupervisorClient: SupervisorTurnTransport {}
