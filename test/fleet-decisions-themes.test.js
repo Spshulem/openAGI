@@ -46,7 +46,10 @@ test("decisions keep-alive gate suppresses completed chats, escalates owner bloc
   const decisionCalls = [];
   const decisionsFetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    decisionCalls.push({ url, body });
+    // The owner-precedent engine consults the same endpoint for owner asks;
+    // this test counts only keep-alive batches (they carry candidates).
+    if (body.input && Array.isArray(JSON.parse(body.input).candidates)) decisionCalls.push({ url, body });
+    else return { ok: true, status: 200, json: async () => ({ model: "gpt-6-luna-2026", answers: body.questions.map((q) => ({ type: "predicate", name: q.name, probability: 0.05 })), usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } }) };
     const answers = body.questions.map((q) => {
       const idxMatch = /^c(\d+)_(keep_alive|needs_owner)$/.exec(q.name);
       const idx = Number(idxMatch[1]);
