@@ -171,7 +171,12 @@ async function checkReleaseArchiveUpdate({
 async function applyReleaseArchiveUpdate(status, {
   rootDir = REPO_ROOT,
   fetchImpl = globalThis.fetch,
-  extractArchive = null
+  extractArchive = null,
+  // systemd sets INVOCATION_ID for every unit it starts (scripts/install-systemd.sh
+  // uses Restart=always). The portable launcher (start-openagi.sh) execs
+  // `openagi serve` with no respawn loop, so exiting there would take the
+  // agent offline for good.
+  supervised = Boolean(process.env.INVOCATION_ID)
 } = {}) {
   if (!status.archiveUrl || !status.checksumUrl) {
     return { updated: false, ...status, ok: false, reason: "missing release download URL" };
@@ -260,7 +265,10 @@ async function applyReleaseArchiveUpdate(status, {
       to: `v${String(bundlePkg.version ?? status.latest).replace(/^v/i, "")}`,
       branch: "release",
       depsChanged: true,
-      depsInstalled: true
+      depsInstalled: true,
+      // Without a supervisor, callers must keep serving (old code) and ask the
+      // owner to restart rather than exit(0) into nothing.
+      restartRequired: !supervised
     };
   } catch (error) {
     return { updated: false, ...status, ok: false, reason: `release update failed: ${error.message}` };

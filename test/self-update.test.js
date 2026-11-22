@@ -275,3 +275,64 @@ test("portable Linux release-archive self-update verifies SHA-256 and updates ru
   assert.match(fs.readFileSync(path.join(rootDir, "src", "index.js"), "utf8"), /0\.0\.84/);
   assert.equal(fs.readFileSync(path.join(rootDir, ".openagi", "secret.txt"), "utf8"), "keep-me-intact");
 });
+
+test("portable release-archive update without a supervisor reports restartRequired instead of relying on a respawn", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createHash } = await import("node:crypto");
+  const archiveBytes = Buffer.from("fake-tarball-payload-0.0.84");
+  const sha = createHash("sha256").update(archiveBytes).digest("hex");
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/releases/latest")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tag_name: "v0.0.84",
+          assets: [
+            { name: "OpenAGI-Linux-x64.tar.gz", browser_download_url: "https://example.test/OpenAGI-Linux-x64.tar.gz" },
+            { name: "OpenAGI-Linux-x64.tar.gz.sha256", browser_download_url: "https://example.test/OpenAGI-Linux-x64.tar.gz.sha256" }
+          ]
+        })
+      };
+    }
+    if (u.endsWith(".tar.gz")) return { ok: true, status: 200, arrayBuffer: async () => archiveBytes };
+    if (u.endsWith(".sha256")) return { ok: true, status: 200, text: async () => `${sha}  OpenAGI-Linux-x64.tar.gz\n` };
+    throw new Error(`unexpected url: ${url}`);
+  };
+  const runUpdate = async (supervised) => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-portable-restart-"));
+    t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(rootDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(rootDir, "package.json"), JSON.stringify({ name: "openagi", version: "0.0.83" }));
+    fs.writeFileSync(path.join(rootDir, "src", "index.js"), "export const v = '0.0.83';\n");
+    return applyUpdate({
+      run: async () => { throw new Error("fatal: not a git repository"); },
+      release: {
+        rootDir,
+        platform: "linux",
+        arch: "x64",
+        fetchImpl,
+        supervised,
+        extractArchive: async (_archivePath, extractDir) => {
+          const bundle = path.join(extractDir, "OpenAGI");
+          fs.mkdirSync(path.join(bundle, "src"), { recursive: true });
+          fs.writeFileSync(path.join(bundle, "package.json"), JSON.stringify({ name: "openagi", version: "0.0.84" }));
+          fs.writeFileSync(path.join(bundle, "src", "index.js"), "export const v = '0.0.84';\n");
+        }
+      }
+    });
+  };
+
+  // start-openagi.sh execs `openagi serve` directly: nothing respawns it.
+  const unmanaged = await runUpdate(false);
+  assert.equal(unmanaged.updated, true);
+  assert.equal(unmanaged.restartRequired, true);
+
+  // Under systemd (Restart=always) the normal exit-and-respawn path applies.
+  const managed = await runUpdate(true);
+  assert.equal(managed.updated, true);
+  assert.equal(managed.restartRequired, false);
+});

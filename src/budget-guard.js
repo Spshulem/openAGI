@@ -97,8 +97,11 @@ export class BudgetGuard {
     ensureDir(path.dirname(this.storePath));
     this.state = readJsonFile(this.storePath, { version: 1, days: {} });
     this.ledger = options.ledger ?? new CreditLedger({ storePath: path.join(path.dirname(this.storePath), "ledger.jsonl") });
+    // An owner's setTimeZone() choice is stored with `timeZoneExplicit` so it
+    // keeps outranking client X-OpenAGI-Timezone adoption across restarts.
     this._explicitTimeZone = resolveBudgetTimeZone(options.timeZone)
       ?? resolveBudgetTimeZone(process.env.OPENAGI_TIMEZONE ?? process.env.OPENAGI_TIME_ZONE)
+      ?? (this.state.timeZoneExplicit === true ? resolveBudgetTimeZone(this.state.timeZone) : null)
       ?? null;
     this.timeZone = this._explicitTimeZone
       ?? resolveBudgetTimeZone(this.state.timeZone)
@@ -182,7 +185,9 @@ export class BudgetGuard {
       throw err;
     }
     this.timeZone = valid;
+    this._explicitTimeZone = valid;
     this.state.timeZone = valid;
+    this.state.timeZoneExplicit = true;
     this._syncTimeZoneBuckets({ persistIfEmpty: true });
     this.persist();
     return this.status();

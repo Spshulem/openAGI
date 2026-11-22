@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { RemoteFleetSupervisor } from "../src/fleet/remote.js";
+import { RemoteFleetSupervisor, createFleetCapability } from "../src/fleet/remote.js";
+import { shortHash } from "../src/fleet/contracts.js";
+import { ActiveWorkManager } from "../src/fleet/active-work.js";
+import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
+import { TaskStore } from "../src/task-store.js";
+import { PendingActionStore } from "../src/pending-actions.js";
 import {
   OwnerPrecedentStore,
   isSafeLocalWorktreeCommitCommand,
@@ -52,6 +57,7 @@ test("RemoteFleetSupervisor preserves online HTTP errors and reconciles delivere
                     playbook: "owner-message",
                     status: "sent",
                     route: "paseo-send",
+                    messageHash: shortHash("[OpenAGI supervisor] Submit BB Recorder 0.4.1 for review"),
                     at: new Date().toISOString(),
                     detail: "Paseo message and turn confirmed"
                   }
@@ -86,6 +92,52 @@ test("RemoteFleetSupervisor preserves online HTTP errors and reconciles delivere
     assert.equal(sendRes.delivery.reconciledReceipt, true);
     assert.equal(sendRes.delivery.actionId, "act_verified_123");
     assert.ok(callNum >= 3);
+  });
+});
+
+test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlier send on the same thread", async () => {
+  // Regression (#332 review [21]): any owner-message action on the thread in
+  // the last 2s was accepted as proof the new, failed message was sent.
+  await withTempDir(async (dir) => {
+    const threadKey = "paseo:srv_mac.375e1a66";
+    let sendError = new Error("Node command timed out after 300s");
+    const earlier = {
+      id: "act_earlier",
+      threadKey,
+      playbook: "owner-message",
+      status: "sent",
+      route: "paseo-send",
+      messageHash: shortHash("[OpenAGI supervisor] First instruction"),
+      at: new Date().toISOString(),
+      detail: "Paseo message and turn confirmed"
+    };
+    const runtime = {
+      events: { emit() {} },
+      nodeCapabilities: {
+        async dispatch(_nodeId, _cap, _op, payload) {
+          if (payload.path === "/fleet/api/send") throw sendError;
+          if (payload.path === "/fleet/api/state") {
+            return { state: { mode: "auto", questions: [], actions: [earlier], settings: {} }, response: { status: 200, body: { ok: true } } };
+          }
+          throw new Error("unexpected");
+        }
+      }
+    };
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir });
+
+    // A different message timing out must not borrow the earlier receipt.
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "Second instruction"), (err) => err.reached === false);
+
+    // A send that failed outright (not a timeout) is never reconciled, even
+    // when an identical message was just delivered.
+    sendError = new Error("Node is offline");
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
+
+    // The same message timing out is reconciled to its own receipt.
+    sendError = new Error("Node command timed out after 300s");
+    const res = await remote.sendOwnerMessage(threadKey, "First instruction");
+    assert.equal(res.reconciledAfterTimeout, true);
+    assert.equal(res.delivery.actionId, "act_earlier");
   });
 });
 
@@ -509,5 +561,260 @@ test("AbiRuntime upgrades legacy persisted agent-pulse cron prompt on boot", asy
     const upgraded = runtime.cron.jobs.get("agent-pulse");
     assert.ok(upgraded);
     assert.match(upgraded.input.prompt, /verify_goal_progress/);
+  });
+});
+
+function goalToolHarness(dir, { pendingActions = null } = {}) {
+  const sup = new FleetSupervisor({
+    dataDir: path.join(dir, "fleet"),
+    config: { enabled: false, mode: "auto", paseo: { enabled: false } },
+    skip: { bb3: true, github: true }
+  });
+  const tasks = new TaskStore({ dataDir: path.join(dir, "tasks") });
+  const runtime = { dataDir: dir, tasks, fleetSupervisor: sup };
+  const registry = new ToolRegistry();
+  if (pendingActions) registry.bindPendingActions(pendingActions);
+  registerCoreTools(registry, runtime);
+  return { sup, tasks, registry };
+}
+
+function openContinuations(tasks, activeWorkId) {
+  return tasks.list({ queue: "agent", status: "active", limit: Infinity })
+    .filter((t) => t.sourceMeta?.activeWorkId === activeWorkId);
+}
+
+test("upsert_goal re-upsert reuses the task goal and open continuation and updates its cursor (#332 review [8])", async () => {
+  await withTempDir(async (dir) => {
+    const { tasks, registry } = goalToolHarness(dir);
+    const upsert = registry.tools.get("upsert_goal");
+    const base = { project: "BuildBetter", goal: "Triage all 30 staging QA issues", doneCriteria: "remaining === 0" };
+    const first = await upsert.handler({ ...base, cursor: { total: 30, processed: 10, remaining: 20 } });
+    const second = await upsert.handler({ ...base, cursor: { total: 30, processed: 20, remaining: 10 } });
+
+    assert.equal(second.activeWorkItem.id, first.activeWorkItem.id);
+    assert.equal(second.taskGoalId, first.taskGoalId);
+    assert.equal(second.continuationTaskId, first.continuationTaskId);
+    const open = openContinuations(tasks, first.activeWorkItem.id);
+    assert.equal(open.length, 1);
+    assert.equal(open[0].sourceMeta.cursor.remaining, 10);
+    assert.match(open[0].description, /"remaining":10/);
+    assert.equal(tasks.listGoals().length, 1);
+  });
+});
+
+test("owner-confirmed goal completion retires the queued continuation (#332 review [18])", async () => {
+  await withTempDir(async (dir) => {
+    const { tasks, registry } = goalToolHarness(dir);
+    const created = await registry.tools.get("upsert_goal").handler({
+      project: "BuildBetter",
+      goal: "Triage all 20 staging QA issues",
+      doneCriteria: "remaining === 0",
+      cursor: { total: 20, processed: 0, remaining: 20 }
+    });
+    assert.ok(created.continuationTaskId);
+    assert.equal(tasks.agentPickNext()?.id, created.continuationTaskId);
+
+    const verdict = await registry.tools.get("verify_goal_progress").handler({
+      id: created.activeWorkItem.id,
+      cursor: { total: 20, processed: 20, remaining: 0 },
+      ownerConfirmedDone: true,
+      evidenceSummary: "Owner confirmed all 20 triaged."
+    }, { __confirmed: true });
+
+    assert.equal(verdict.accomplished, true);
+    assert.equal(verdict.item.state, "done");
+    assert.equal(tasks.agentPickNext(), null);
+    assert.equal(tasks.get(created.continuationTaskId).status, "completed");
+  });
+});
+
+test("verify_goal_progress holds ownerConfirmedDone for owner approval but runs routine cursor updates (#332 review [20])", async () => {
+  await withTempDir(async (dir) => {
+    const pendingActions = new PendingActionStore({ dir: path.join(dir, "pending-actions") });
+    const { sup, registry } = goalToolHarness(dir, { pendingActions });
+    const created = await registry.tools.get("upsert_goal").handler({
+      project: "BuildBetter",
+      goal: "Triage all 20 staging QA issues",
+      doneCriteria: "remaining === 0",
+      cursor: { total: 20, processed: 0, remaining: 20 }
+    });
+    const id = created.activeWorkItem.id;
+
+    // Ordinary agent turn (no owner principal, no approval): queued, not applied.
+    const forged = await registry.invoke("verify_goal_progress", {
+      id, evidenceSummary: "Done.", ownerConfirmedDone: true, cursor: { remaining: 5 }
+    }, {});
+    assert.equal(forged.ok, true);
+    assert.equal(forged.result.status, "awaiting_confirmation");
+    let item = sup.activeWork.state.items.find((it) => it.id === id);
+    assert.notEqual(item.state, "done");
+    assert.notEqual(item.outcomeVerified, true);
+    assert.equal(pendingActions.list({ status: "pending" }).length, 1);
+
+    // Without an approval queue the handler still refuses the owner branch.
+    const bare = goalToolHarness(path.join(dir, "bare"));
+    const bareGoal = await bare.registry.tools.get("upsert_goal").handler({
+      project: "Ops", goal: "Close every stale ticket", doneCriteria: "zero stale tickets", cursor: { remaining: 3 }
+    });
+    const bareRes = await bare.registry.invoke("verify_goal_progress", {
+      id: bareGoal.activeWorkItem.id, evidenceSummary: "Done.", ownerConfirmedDone: true
+    }, {});
+    assert.equal(bareRes.ok, false);
+    assert.match(bareRes.error, /owner's approval/);
+    assert.notEqual(bare.sup.activeWork.state.items[0].state, "done");
+
+    // Routine cursor update stays ungated.
+    const routine = await registry.invoke("verify_goal_progress", {
+      id, evidenceSummary: "Batch 1 done.", cursor: { total: 20, processed: 10, remaining: 10 }
+    }, {});
+    assert.equal(routine.ok, true);
+    assert.equal(routine.result.accomplished, false);
+    item = sup.activeWork.state.items.find((it) => it.id === id);
+    assert.equal(item.cursor.remaining, 10);
+    assert.equal(pendingActions.list({ status: "pending" }).length, 1);
+  });
+});
+
+test("RemoteFleetSupervisor.verifyGoalProgress forwards cursor and ownerConfirmedDone with the local result contract (#332 review [9])", async () => {
+  await withTempDir(async (dir) => {
+    const local = new FleetSupervisor({
+      dataDir: path.join(dir, "mac"),
+      config: { enabled: false, mode: "auto", paseo: { enabled: false } },
+      skip: { bb3: true, github: true }
+    });
+    const tracked = local.activeWork.trackWork({
+      project: "BuildBetter", goal: "Triage all 20 staging QA issues", doneCriteria: "remaining === 0", remainingCount: 20
+    });
+    const capability = createFleetCapability(local);
+    const paths = [];
+    const runtime = {
+      events: { emit() {} },
+      nodeCapabilities: {
+        async dispatch(_nodeId, _cap, op, payload) {
+          paths.push(`${payload.method} ${payload.path}`);
+          return capability.invoke(op, payload);
+        }
+      }
+    };
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: path.join(dir, "main") });
+
+    const mid = await remote.verifyGoalProgress({
+      id: tracked.item.id, evidenceSummary: "Batch 1", cursor: { total: 20, processed: 10, remaining: 10 }
+    });
+    assert.equal(mid.accomplished, false);
+    assert.equal(mid.continueRequired, true);
+    assert.equal(local.activeWork.state.items[0].cursor.remaining, 10);
+
+    const done = await remote.verifyGoalProgress({
+      id: tracked.item.id,
+      evidenceSummary: "All 20 triaged",
+      cursor: { total: 20, processed: 20, remaining: 0 },
+      ownerConfirmedDone: true
+    });
+    assert.equal(done.accomplished, true);
+    assert.equal(done.continueRequired, false);
+    assert.equal("verified" in done, false);
+    const item = local.activeWork.state.items[0];
+    assert.equal(item.state, "done");
+    assert.equal(item.outcomeVerified, true);
+    assert.equal(item.cursor.remaining, 0);
+    assert.ok(paths.every((p) => p === `POST /fleet/api/active-work/${tracked.item.id}/verify`));
+  });
+});
+
+test("goal verification and semantic precedents skip /v1/decisions when Decisions is disabled (#332 review [16])", async () => {
+  await withTempDir(async (dir) => {
+    let fetches = 0;
+    const fetchImpl = async () => {
+      fetches += 1;
+      return { ok: true, status: 200, async json() { return { answers: [{ name: "goal_accomplished", probability: 0.99 }] }; } };
+    };
+    const manager = new ActiveWorkManager({
+      dir,
+      config: { decisions: { enabled: false, apiKey: "sk-test" } },
+      deps: { decisionsFetch: fetchImpl, env: { OPENAI_API_KEY: "sk-test" } }
+    });
+    const tracked = manager.trackWork({ project: "BuildBetter", goal: "Ship the Q4 launch checklist", doneCriteria: "Every launch item verified" });
+    const verdict = await manager.verifyGoalProgress({ id: tracked.item.id, evidenceSummary: "Launch done." });
+    assert.equal(fetches, 0);
+    assert.equal(verdict.accomplished, false);
+    assert.equal(verdict.confidence, 0);
+
+    const store = new OwnerPrecedentStore({ dir: path.join(dir, "precedents") });
+    const hygiene = await store.evaluateCandidate(
+      {
+        question: {
+          id: "fq_off_1",
+          kind: "agent-ask",
+          title: "buildbetter #7644: CI failed on flaky shard. Re-run?",
+          body: "Only e2e-shard (3) timed out on a known transient runner flake; all code checks passed.",
+          options: ["run CI once more", "later"]
+        },
+        thread: { key: "paseo:srv_mac.999", repo: "buildbetter-app/buildbetter" }
+      },
+      { decisionsConfig: { enabled: false }, env: { OPENAI_API_KEY: "sk-test" }, fetchImpl }
+    );
+    assert.equal(fetches, 0);
+    assert.equal(hygiene.matched, false);
+  });
+});
+
+test("auto-binding keeps an explicitly assigned human owner (#332 review [27])", async () => {
+  await withTempDir(async (dir) => {
+    const manager = new ActiveWorkManager({ dir });
+    const tracked = manager.trackWork({
+      project: "bb-recorder",
+      goal: "Ship BB Recorder 0.4.1 App Store submission",
+      doneCriteria: "Waiting for Review",
+      prRef: "buildbetter-app/bb-recorder#442",
+      permittedNudges: "resume_owner"
+    });
+    const assigned = await manager.actOnWork(tracked.item.id, { op: "assign_orphan", ownerLabel: "Alice" });
+    assert.equal(assigned.ok, true);
+
+    const bound = manager.autoBindUnassignedGoals([{
+      key: "paseo:srv_mac.abc123",
+      title: "BB Recorder 0.4.1 App Store submission",
+      repo: "buildbetter-app/bb-recorder",
+      prRefs: ["buildbetter-app/bb-recorder#442"],
+      agentStatus: "idle",
+      lastActivityAt: "2026-11-22T17:00:00Z"
+    }]);
+    assert.deepEqual(bound, []);
+    const item = manager.state.items.find((it) => it.id === tracked.item.id);
+    assert.equal(item.owner.kind, "human");
+    assert.equal(item.owner.label, "Alice");
+    assert.equal(item.owner.threadKey, null);
+  });
+});
+
+test("agent-pulse prompt upgrade keeps the owner's saved cadence, timeout, and next run (#332 review [23])", async () => {
+  await withTempDir(async (dir) => {
+    const storePath = path.join(dir, "cron", "jobs.json");
+    const fourHours = 4 * 60 * 60 * 1000;
+    const nextRunAt = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    const cron1 = new FileBackedCronScheduler({ storePath });
+    cron1.addJob({
+      id: "agent-pulse",
+      name: "Agent autopilot",
+      enabled: true,
+      task: "autopilot",
+      intervalMs: 30 * 60 * 1000,
+      input: { agentId: "main", prompt: "If the queue is empty ({task: null}): reply 'standing by'.", requireQueuedWork: true }
+    });
+    cron1.updateJob("agent-pulse", { intervalMs: fourHours, timeoutMs: 600_000, nextRunAt });
+
+    const cron2 = new FileBackedCronScheduler({ storePath });
+    const runtime = new AbiRuntime({ cron: cron2, dataDir: dir });
+    const upgraded = runtime.cron.jobs.get("agent-pulse");
+    assert.match(upgraded.input.prompt, /verify_goal_progress/);
+    assert.equal(upgraded.intervalMs, fourHours);
+    assert.equal(upgraded.timeoutMs, 600_000);
+    assert.equal(upgraded.nextRunAt, nextRunAt);
+    assert.equal(upgraded.input.requireQueuedWork, true);
+
+    const persisted = new FileBackedCronScheduler({ storePath }).jobs.get("agent-pulse");
+    assert.equal(persisted.intervalMs, fourHours);
+    assert.match(persisted.input.prompt, /verify_goal_progress/);
   });
 });
