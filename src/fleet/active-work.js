@@ -1955,11 +1955,15 @@ export class ActiveWorkManager {
 
     let repoChecksRun = 0;
     if (boundedRepos > 0 && enrolledRepos.length > 0 && this.supervisor) {
+      const dueRepos = new Set(this.state.rechecks
+        .filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs)
+        .map((recheck) => this.state.items.find((item) => item.id === recheck.itemId)?.repo)
+        .filter(Boolean)
+        .map((repo) => String(repo).toLowerCase()));
       const repoStart = (this.state.inventoryCursor.repoOffset ?? 0) % enrolledRepos.length;
-      const reposThisPass = [];
-      for (let i = 0; i < Math.min(boundedRepos, enrolledRepos.length); i += 1) {
-        reposThisPass.push(enrolledRepos[(repoStart + i) % enrolledRepos.length]);
-      }
+      const rotatedRepos = enrolledRepos.map((_, index) => enrolledRepos[(repoStart + index) % enrolledRepos.length]);
+      const orderedRepos = [...rotatedRepos.filter((repo) => dueRepos.has(String(repo).toLowerCase())), ...rotatedRepos.filter((repo) => !dueRepos.has(String(repo).toLowerCase()))];
+      const reposThisPass = orderedRepos.slice(0, Math.min(boundedRepos, enrolledRepos.length));
       this.state.inventoryCursor.repoOffset = (repoStart + reposThisPass.length) % enrolledRepos.length;
 
       for (const repoSlug of reposThisPass) {
@@ -2386,7 +2390,10 @@ export class ActiveWorkManager {
           if (typeof outreach?.append === "function") {
             const title = verified ? `Follow-through verified · ${projected.project}` : `Follow-through blocker · ${projected.project}`;
             const summary = verified ? `Recheck verified: ${projected.doneCriteria}` : `${projected.whySurfaced || "Actionable blocker found"} Choose resume, assign, confirm, or snooze.`;
-            const item = outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
+            const existing = rawRecheckItem?.outreachId ? outreach.get?.(rawRecheckItem.outreachId) : null;
+            const openExisting = existing && ["unseen", "seen"].includes(existing.status) ? existing : null;
+            const item = openExisting ?? outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
+            if (item?.id && typeof outreach.update === "function") outreach.update(item.id, { title, summary, actions: ["dismiss"] });
             recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId };
           }
           recheck.status = "notified"; recheck.result = recheckNotification;

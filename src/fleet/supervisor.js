@@ -2319,9 +2319,16 @@ export class FleetSupervisor {
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
     const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
-    const thread = this.lastThreads.get(threadKey)
+    let thread = this.lastThreads.get(threadKey)
       ?? this.knownThreads.get(threadKey)
       ?? this.syntheticPaseoThread(threadKey, matchingOpen);
+    let refreshedPermissionState = false;
+    if (thread?.meta?.blockedOnOwner === true && ["codex", "conductor"].includes(thread.kind) && typeof this.refreshThread === "function") {
+      try {
+        const fresh = await this.refreshThread(thread);
+        if (fresh) { thread = { ...thread, ...fresh, meta: { ...(thread.meta ?? {}), ...(fresh.meta ?? {}) } }; refreshedPermissionState = true; }
+      } catch { /* retain the cached permission state and fail closed */ }
+    }
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     // A thread with an open risky ask hears the owner only typed into its
     // app, as an answer to that ask would be.
@@ -2333,8 +2340,7 @@ export class FleetSupervisor {
       thread?.meta?.blockedOnOwner === true
       || thread?.meta?.pendingPermission
       || thread?.meta?.pendingCard?.requestId
-      || matchingOpen?.meta?.paseoPermissionId
-      || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")
+      || (!refreshedPermissionState && (matchingOpen?.meta?.paseoPermissionId || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")))
     );
     // A free-form handoff is not a permission answer. If a permission prompt
     // is pending, refuse with a durable action receipt so prose cannot be
