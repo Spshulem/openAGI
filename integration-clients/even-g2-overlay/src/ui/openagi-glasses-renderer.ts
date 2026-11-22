@@ -65,6 +65,9 @@ export class OpenAGIGlassesRenderer {
     }
     this.show(`Supervisor\n\nTap: talk, tap again to send\nHold: talk, let go to send\nSwipe up: questions (${questions})\nSwipe down: thread status\nDouble-tap: exit`, true)
   }
+  supervisorWalkthrough(title: string, summary: string, item: number, total: number, paused: boolean): void {
+    this.show(`Needs You ${item}/${total}\n\n${title.slice(0, 100)}\n${summary.slice(0, 170)}\n\n${paused ? 'Paused · tap phone to resume' : 'Swipe up: next · Swipe down: back\nTap: actions · Hold: follow up\nDouble-tap: exit'}`, true)
+  }
   home(device?: string): void { this.show(`Talk${device ? ` · ${device}` : ''}\n\nTap: talk to agent\nTap again: ${this.sendOnStop ? 'send' : 'review'}\n\n${this.inboxLine()}Swipe down: Recent\nDouble-tap: exit`, true) }
   lifelogHome(state: LifelogHomeState, detail = ''): void {
     const title = state === 'consent' ? 'Lifelog · needs consent' : state === 'paused' ? 'Lifelog paused' : state === 'waiting' ? 'Lifelog · waiting' : 'Lifelog · starting'

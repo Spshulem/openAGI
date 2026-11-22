@@ -4,6 +4,7 @@ import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
 import { isSuppressedByQuietCadence } from "./fleet/preferences.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./fleet/walkthrough.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -18,10 +19,11 @@ function reject(message, status = 400) { throw Object.assign(new Error(message),
 // Main-owned, bounded snapshots. No raw audio, model invocation, or execution
 // authority. Only explicit task acceptance crosses into the user task queue.
 export class G2Proactive {
-  constructor({ dir, runtime, now = Date.now } = {}) {
+  constructor({ dir, dataDir, runtime, now = Date.now } = {}) {
     this.file = path.join(dir ?? path.join(resolveDataDir(), "g2-proactive"), "state.json");
     this.runtime = runtime;
     this.now = now;
+    this.walkthrough = new SupervisorWalkthrough({ dataDir: dataDir ?? path.resolve(this.file, "..", ".."), now });
     this.reviewing = false; this.closed = false; this.reviewController = null;
     this.nodes = readJsonFile(this.file, { nodes: {} }).nodes;
     this.prune();
@@ -54,6 +56,14 @@ export class G2Proactive {
     if (!body || typeof body !== "object" || Array.isArray(body)) reject("Expected an object");
     this.prune();
     const n = this.node(nodeId);
+    if (body.op === "walkthrough") {
+      try {
+        return { walkthrough: this.walkthrough.mutate(body.command ?? body.operation ?? "view", body.expectedId, this.runtime?.fleetSupervisor?.getState?.()) };
+      } catch (error) {
+        if (error instanceof WalkthroughError) reject(error.message, error.status);
+        throw error;
+      }
+    }
     if (body.op === "lifelog-task") {
       const s = n.segments.find(s => s.id === body.segmentId);
       if (!s || body.confirm !== true || typeof body.title !== "string" || !body.title.trim() || body.title.length > 180) reject("Confirm a task with current transcript evidence");

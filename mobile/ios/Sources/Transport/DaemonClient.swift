@@ -533,6 +533,27 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetState.self, from: data)
     }
 
+    // The Needs You walkthrough is main-owned and shared with G2. Navigation
+    // changes only the cursor; card/question actions still use their normal
+    // approval-gated routes and must be resolved by identity on the main.
+    public func fleetWalkthrough(operation: String = "view", expectedId: String? = nil) async throws -> SupervisorWalkthrough {
+        let allowed = Set(["view", "start", "next", "back", "skip", "pause", "resume"])
+        guard allowed.contains(operation) else { throw DaemonError.malformedResponse }
+        let request: URLRequest
+        if operation == "view" {
+            request = try authorizedRequest(path: "/fleet/api/walkthrough", method: "GET")
+        } else {
+            var mutable = try authorizedRequest(path: "/fleet/api/walkthrough", method: "POST")
+            var body: [String: Any] = ["operation": operation]
+            if let expectedId, !expectedId.isEmpty { body["expectedId"] = expectedId }
+            mutable.httpBody = try JSONSerialization.data(withJSONObject: body)
+            mutable.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request = mutable
+        }
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(SupervisorWalkthrough.self, from: data)
+    }
+
     // A scan can take up to ~100s. No body: the route reads none.
     public func fleetScan() async throws -> FleetState {
         var request = try authorizedRequest(path: "/fleet/api/scan", method: "POST")

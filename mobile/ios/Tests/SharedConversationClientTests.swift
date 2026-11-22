@@ -139,6 +139,19 @@ final class SharedConversationClientTests: XCTestCase {
         XCTAssertEqual(try request(path: "/fleet/api/actions/a1/send").httpMethod, "POST")
     }
 
+    func testSupervisorWalkthroughUsesTheSharedCursorAndIdentity() async throws {
+        let response = #"{"active":true,"paused":false,"currentId":"card-1","total":2,"items":[{"id":"card-1","kind":"card","title":"Review PR","summary":"CI is green","cardId":"card-1"},{"id":"q-2","kind":"question","title":"Choose a route","summary":"The agent is waiting","questionId":"q-2"}]}"#
+        stub(["/fleet/api/walkthrough": (200, response)])
+        let walkthrough = try await makeClient().fleetWalkthrough(operation: "next", expectedId: "card-1")
+        XCTAssertEqual(walkthrough.currentId, "card-1")
+        let sent = try request(path: "/fleet/api/walkthrough")
+        XCTAssertEqual(sent.httpMethod, "POST")
+        let json = try body(of: sent)
+        XCTAssertEqual(json["operation"] as? String, "next")
+        XCTAssertEqual(json["expectedId"] as? String, "card-1")
+        XCTAssertEqual(walkthrough.items.map(\.id), ["card-1", "q-2"])
+    }
+
     func testFleetOnADaemonWithoutASupervisorMapsToUnavailable() async {
         stub(["/fleet/api/state": (503, #"{"error":"fleet supervisor disabled"}"#)])
         do {

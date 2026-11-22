@@ -11,11 +11,11 @@ import { LiveSpeech, SpeechStreamError, type SpeechModel, type SpeechCallbacks }
 import type { ConversationThread, HomeMode, OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer, LifelogHomeState } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
-import { G2ProactiveClient, type InboxItem, type MainConsent } from '../openagi/proactive'
+import { G2ProactiveClient, type InboxItem, type MainConsent, type SupervisorWalkthrough } from '../openagi/proactive'
 import type { SharedThreadMessage } from '../openagi/experience-client'
 import { G2VoiceSession, supervisorVoiceFocus, type VoiceCallbacks } from '../openagi/voice-session'
 
-type Mode = 'cue' | 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'cue' | 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'walkthrough' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 interface RecentEntry { question: string; reply: string; local?: number }
 
 const CONSENT_NEEDED = 'Lifelog needs your recording consent once. Check the consent box on this page; it stays on until you uncheck it.'
@@ -81,6 +81,7 @@ export class OpenAGIG2App {
   private actionTarget: InboxItem | null = null
   private voiceTarget: InboxItem | null = null
   private lastPingedSupervisor: InboxItem | null = null
+  private supervisorWalkthrough: SupervisorWalkthrough | null = null
   private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null; this.lastPingedSupervisor = null }
   private showNotice(item: InboxItem): void {
     this.clearNotice()
@@ -297,6 +298,39 @@ export class OpenAGIG2App {
     if (supervisorOnly && !this.inboxItems.length) { void this.showFleetStatus(); return }
     if (!this.inboxItems.length) { this.flash('Inbox empty', 'Nothing from your main right now.'); this.phone.set('Inbox empty', 'Enable proactive updates on the phone, then Refresh.'); return }
     this.inboxIndex = Math.max(0, this.inboxItems.findIndex(i => i.id === id)); this.showInboxItem()
+  }
+  private walkthroughIdentity(item: InboxItem): string { return item.cardId ?? item.questionId ?? item.id }
+  private walkthroughInboxItem(id: string | null): InboxItem | null {
+    if (!id) return null
+    return this.proactive.items.find(item => this.walkthroughIdentity(item) === id || item.id === id) ?? null
+  }
+  async startSupervisorWalkthrough(): Promise<void> {
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy) return
+    await this.proactive.refresh()
+    try {
+      this.supervisorWalkthrough = await this.proactive.walkthrough('start')
+      this.showSupervisorWalkthrough()
+    } catch (error) { this.phone.set('Needs You unavailable', safeOpenAGIError(error)); this.flash('Needs You unavailable', safeOpenAGIError(error)) }
+  }
+  async supervisorWalkthroughAction(operation: 'next' | 'back' | 'skip' | 'pause' | 'resume'): Promise<void> {
+    const current = this.supervisorWalkthrough?.currentId ?? undefined
+    try {
+      this.supervisorWalkthrough = await this.proactive.walkthrough(operation, current)
+      this.showSupervisorWalkthrough()
+    } catch (error) { this.phone.set('Needs You changed', `${safeOpenAGIError(error)} Refresh the walkthrough.`) }
+  }
+  private showSupervisorWalkthrough(): void {
+    const walkthrough = this.supervisorWalkthrough
+    const current = walkthrough?.current
+    if (!walkthrough?.active || !current || !walkthrough.total) {
+      this.mode = 'message'; this.renderer.message('Needs You', 'There are no live Supervisor cards waiting for you.'); this.phone.supervisorWalkthrough?.(walkthrough); return
+    }
+    this.mode = 'walkthrough'
+    const item = this.walkthroughInboxItem(current.id)
+    const index = Math.max(0, walkthrough.items.findIndex(candidate => candidate.id === current.id))
+    this.renderer.supervisorWalkthrough(current.title, current.summary, index + 1, walkthrough.total, walkthrough.paused)
+    this.phone.supervisorWalkthrough?.(walkthrough)
+    if (item) this.voiceTarget = { ...item }
   }
   private showInboxItem(): void {
     const item = this.inboxItems[this.inboxIndex]; if (!item) return
@@ -637,6 +671,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') void this.sendDraft()
+    else if (this.mode === 'walkthrough') { const item = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null); if (item) { this.actionTarget = { ...item }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() } }
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
@@ -652,7 +687,7 @@ export class OpenAGIG2App {
   // Supervisor: press and hold to talk to the supervisor, let go to
   // send (no review step). Anywhere else a hold stays a plain tap.
   holdStart(): boolean {
-    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
+    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'walkthrough', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
     if (this.navigationBusy || this.microphoneOpening || this.askStarting || this.requestController) return false
     if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.pushToTalk = true; this.releasePending = false; this.lastTapAt = Date.now(); this.clearNotice()
@@ -688,6 +723,7 @@ export class OpenAGIG2App {
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }
     this.clearNotice()
     if (this.mode === 'cue') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showCuePage() }
+    else if (this.mode === 'walkthrough') void this.supervisorWalkthroughAction(direction < 0 ? 'next' : 'back')
     else if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
     else if (this.mode === 'inbox-detail') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showInboxPage() }
     else if (this.mode === 'inbox-action') { this.actionIndex = Math.max(0, Math.min(this.inboxActions().length - 1, this.actionIndex - direction)); this.showInboxAction() }
@@ -794,7 +830,7 @@ export class OpenAGIG2App {
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); return }
     if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
-    if (this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
+    if (this.mode === 'walkthrough' || this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
     this.navigationBusy = true
     try {
       if (this.mode === 'listening') { this.stopLiveSpeech(); await this.audio.stop(); this.audioBuffer = null }
@@ -984,7 +1020,10 @@ export class OpenAGIG2App {
     if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.clearNotice()
     this.renderer.autoSend?.(true)
-    if (this.mode.startsWith('inbox')) {
+    if (this.mode === 'walkthrough') {
+      const selected = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null)
+      this.voiceTarget = selected?.id ? { ...selected } : null
+    } else if (this.mode.startsWith('inbox')) {
       const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]
       this.voiceTarget = selected?.id ? { ...selected } : null
     } else if (!this.voiceTarget && this.mode === 'home') {

@@ -3,7 +3,7 @@ import type { LiveCue } from '../openagi/live-cues'
 import type { SpeechModel } from '../openagi/live-speech'
 import type { HomeMode } from '../openagi/store'
 import type { LifelogHomeState } from './openagi-glasses-renderer'
-import type { InboxItem, InboxOperation, ProactiveSettings } from '../openagi/proactive'
+import type { InboxItem, InboxOperation, ProactiveSettings, SupervisorWalkthrough } from '../openagi/proactive'
 import { PhoneExperience, experienceStyles } from './phone-experience'
 import { parseConnectionCard } from '../openagi/connection-card'
 import type { G2Capabilities, G2History } from '../openagi/experience-client'
@@ -38,6 +38,8 @@ export interface OpenAGIPhoneActions {
   // A supervisor question answered with one of its fixed choices.
   answerQuestion?(id: string, answer: string): Promise<{ ok: boolean; detail: string }>
   actCard?(id: string, cardOp: 'primary' | 'defer' | 'fix_ci'): Promise<{ ok: boolean; detail: string }>
+  startSupervisorWalkthrough?(): void
+  supervisorWalkthroughAction?(operation: 'next' | 'back' | 'skip' | 'pause' | 'resume'): void
   markMoment?(): void
   configureHomeMode?(mode: HomeMode): void
   recordingConsent?(consent: boolean): void
@@ -118,6 +120,7 @@ export class OpenAGIPhoneCompanion {
             <section id="lifelog-panel" hidden><h2>Saved conversations on main</h2><label>Search this G2’s history<input id="lifelog-query" maxlength="200" type="search"></label><button id="lifelog-search">Search / refresh</button><p id="lifelog-status" role="status"></p><div id="lifelog-moments"></div><button id="lifelog-previous" hidden>Previous conversations</button><button id="lifelog-next" hidden>Older conversations</button><button id="lifelog-close">Close history</button></section>
             <details><summary>Advanced owner controls · main sign-in required</summary><p>This G2 pairing can read its own history here. Owner sign-in is still required for analysis models, speaker edits, screen context and other devices. Your owner token is never put in a link.</p><a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Main owner inbox</a><a id="main-lifelog" target="_blank" rel="noopener noreferrer" hidden>Owner lifelog settings</a></details><div id="proactive-items"></div>
           </section>
+          <section id="supervisor-walkthrough" class="ambient"><h2>Needs You walkthrough</h2><p id="supervisor-walkthrough-status">Start a shared walkthrough of the live Supervisor cards. The current card is identified on main before any action.</p><div class="walkthrough-controls"><button id="start-supervisor-walkthrough">Start / refresh</button><button data-walkthrough="back">Back</button><button data-walkthrough="next">Next</button><button data-walkthrough="skip">Skip</button><button data-walkthrough="pause">Pause</button><button data-walkthrough="resume">Resume</button></div></section>
           <section id="mode-picker" class="ambient"><h2>Glasses mode</h2>
             <div class="mode-options" role="radiogroup" aria-label="Glasses mode">
               <label><input type="radio" name="home-mode" value="talk"> <span><strong>Talk</strong> · tap the glasses to talk to your agent, tap again to send. Microphone off otherwise.</span></label>
@@ -180,6 +183,8 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#live-cues-enabled')?.addEventListener('change', () => actions.configureLiveCues?.(root.querySelector<HTMLInputElement>('#live-cues-enabled')!.checked))
     root.querySelector('#find-server')?.addEventListener('click', () => { void this.findServers(allowedOrigins) })
     root.querySelector('#pause-lifelog')?.addEventListener('click', () => { if (this.currentLifelog === 'listening' || this.currentLifelog === 'starting') actions.pauseLifelog?.(); else actions.resumeLifelog?.() })
+    root.querySelector('#start-supervisor-walkthrough')?.addEventListener('click', () => actions.startSupervisorWalkthrough?.())
+    root.querySelectorAll<HTMLButtonElement>('[data-walkthrough]').forEach(button => button.addEventListener('click', () => actions.supervisorWalkthroughAction?.(button.dataset.walkthrough as 'next' | 'back' | 'skip' | 'pause' | 'resume')))
     root.querySelector('#resume-request')?.addEventListener('click', () => actions.resumeRequest?.())
     root.querySelector('#dismiss-request')?.addEventListener('click', () => { if (window.confirm('Have you checked History? Clearing this local reminder does not cancel main work or undo completed actions.')) actions.dismissRequest?.() })
     root.querySelector('#refresh-history')?.addEventListener('click', () => { this.historyContinuation = undefined; actions.readHistory?.(undefined, 0, root.querySelector<HTMLInputElement>('#history-query')!.value) })
@@ -393,6 +398,16 @@ export class OpenAGIPhoneCompanion {
     this.currentHomeMode = mode
     const root = document.querySelector<HTMLElement>('#app'); if (root) root.dataset.homeMode = mode
     for (const radio of this.actionsSection.querySelectorAll<HTMLInputElement>('input[name="home-mode"]')) radio.checked = radio.value === mode
+  }
+  supervisorWalkthrough(state: SupervisorWalkthrough | null): void {
+    const panel = this.actionsSection.querySelector<HTMLElement>('#supervisor-walkthrough')
+    if (!panel) return
+    const status = panel.querySelector<HTMLElement>('#supervisor-walkthrough-status')
+    if (!state?.active || !state.current) {
+      if (status) status.textContent = 'Start a shared walkthrough of the live Supervisor cards. The current card is identified on main before any action.'
+      return
+    }
+    if (status) status.textContent = `${state.paused ? 'Paused' : 'Live'} · ${state.current.title} · ${state.total ? `${Math.max(1, state.items.findIndex(item => item.id === state.currentId) + 1)}/${state.total}` : '0 items'}\n${state.current.summary}`
   }
   recordingConsent(consent: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#recording-consent'); if (input) input.checked = consent }
   lifelogState(state: LifelogHomeState, detail = ''): void {
