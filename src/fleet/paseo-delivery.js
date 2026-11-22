@@ -275,8 +275,15 @@ function selectPreferredModel(providerEntry, usageCounts = null, preferredModelI
   return selectBestPaseoModel(providerEntry, { usageCounts, preferredModelId });
 }
 
+// A replacement or recovered session keeps the owner's saved permission
+// policy (bypass / auto / ask); it is never escalated past it.
+function normalizePermissionMode(mode) {
+  const value = String(mode ?? "").toLowerCase();
+  return ["bypass", "auto", "ask"].includes(value) ? value : "bypass";
+}
+
 function selectExecutionModeId(providerEntry, sourceAgent = null, permissionMode = "bypass") {
-  return resolveDefaultPaseoModeId(providerEntry, { permissionMode, sourceAgent });
+  return resolveDefaultPaseoModeId(providerEntry, { permissionMode: normalizePermissionMode(permissionMode), sourceAgent });
 }
 
 // Automatically switches a quota-exhausted or auth-blocked Paseo coding session
@@ -288,7 +295,8 @@ export async function failoverPaseoSessionProvider({
   reason = "provider usage limit",
   goalContext = null,
   preferredProviders = ["claude", "antigravity", "codex"],
-  factory
+  factory,
+  permissionMode = "bypass"
 } = {}) {
   if (!config?.paseo?.enabled || thread?.kind !== "paseo") {
     return { ok: false, detail: "Paseo is not enabled for this thread." };
@@ -377,7 +385,7 @@ export async function failoverPaseoSessionProvider({
       "Instructions: First run `git status -sb` and `git log -n 3 --oneline` in this workspace to inspect what already landed or is uncommitted. Continue the unfinished in-scope work seamlessly without redoing completed steps. Respect hard red lines: do not merge PRs, deploy to production, send external customer messages, or spend money without explicit owner confirmation."
     ].filter(Boolean).join("\n\n");
 
-    const executionModeId = selectExecutionModeId(chosen, agent);
+    const executionModeId = selectExecutionModeId(chosen, agent, permissionMode);
     const created = await api.agents.create({
       config: {
         provider: `${chosen.provider}/${chosenModel.id}`,
@@ -405,7 +413,7 @@ export async function failoverPaseoSessionProvider({
   }, factory);
 }
 
-async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEntries, text, images, serverId }) {
+async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEntries, text, images, serverId, permissionMode = "bypass" }) {
   const cwd = String(agent?.cwd ?? thread?.meta?.paseoCwd ?? "").trim();
   if (!cwd || typeof api?.providers?.waitForReady !== "function" || typeof api?.agents?.create !== "function") {
     return null;
@@ -434,7 +442,7 @@ async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEnt
     ? `Continuing from Paseo session "${baseTitle}" (whose previous ${agent?.provider ?? "agent"} runtime disconnected).\n\nRecent context:\n${priorTail}\n\nNew owner request:\n${cleanOriginal || text}`
     : (cleanOriginal || text);
 
-  const executionModeId = selectExecutionModeId(ready, agent);
+  const executionModeId = selectExecutionModeId(ready, agent, permissionMode);
   const created = await api.agents.create({
     config: {
       provider: `${ready.provider}/${model.id}`,
@@ -628,6 +636,10 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
 // Refresh immediately before dispatch; steer is preferable to interrupt if a
 // turn starts concurrently. Paseo may fall back to interruption when steering
 // is unsupported: its public API does not offer an atomic idle-only send.
+function ownerPermissionMode(store) {
+  try { return normalizePermissionMode(store?.preferences?.()?.defaultPermissionMode); } catch { return "bypass"; }
+}
+
 export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
@@ -772,6 +784,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           const errReason = clampText(redactSecrets(String(sendErr?.message ?? "runtime disconnected")), 120);
           if (!recoverDisconnected) return blocked(`Paseo delivery failed: ${errReason}; existing session only`);
           const recovered = await recoverDisconnectedPaseoSession({
+            permissionMode: ownerPermissionMode(store),
             api,
             agent,
             thread,
@@ -818,6 +831,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         writeJsonAtomic(file, { ...correlated, pending: false });
         if (ownerInitiated && recoverDisconnected) {
           const recovered = await recoverDisconnectedPaseoSession({
+            permissionMode: ownerPermissionMode(store),
             api,
             agent,
             thread,

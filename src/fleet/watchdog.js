@@ -73,6 +73,28 @@ function agentSpokeLastForWatchdog(thread) {
 }
 
 /**
+ * Latest real progress on a linked task. Deliberately not `updatedAt`: the
+ * watchdog persists its own bookkeeping through TaskStore.update(), which
+ * bumps updatedAt, so anchoring on it would reset the check-in timer on
+ * every scan and an overdue session could never become stuck.
+ */
+function taskProgressAt(task) {
+  if (!task) return null;
+  const meta = task.sourceMeta ?? {};
+  return [
+    task.createdAt,
+    task.reopenedAt,
+    task.completedAt,
+    Array.isArray(task.statusHistory) ? task.statusHistory.at(-1)?.at : null,
+    meta.agentLease?.claimedAt,
+    meta.awaitingReview?.since
+  ]
+    .filter((iso) => Number.isFinite(Date.parse(iso ?? "")))
+    .sort()
+    .at(-1) ?? null;
+}
+
+/**
  * Estimates how long Supervisor should wait before checking in on an active
  * coding session or linked task, and whether that check-in window has elapsed.
  */
@@ -116,7 +138,7 @@ export function estimateExpectedCheckIn(thread, { classified = null, pr = null, 
 
   if (expectedMinutes === null) return null;
 
-  const anchorIso = [thread.lastActivityAt, thread.lastAgentAt, thread.lastUserAt, task?.updatedAt]
+  const anchorIso = [thread.lastActivityAt, thread.lastAgentAt, thread.lastUserAt, taskProgressAt(task)]
     .filter((iso) => Number.isFinite(Date.parse(iso ?? "")))
     .sort()
     .at(-1) ?? null;

@@ -45,7 +45,7 @@ export const AGENT_STATUS = Object.freeze(["running", "idle", "waiting", "stalle
 
 // Why a turn ended on an infrastructure problem instead of real work.
 export const ERROR_KINDS = Object.freeze([
-  "session-limit", "model-limit", "usage-limit", "overloaded", "network", "lb", "logged-out", "disk-full", "other"
+  "session-limit", "model-limit", "usage-limit", "overloaded", "network", "lb", "logged-out", "provider-auth", "disk-full", "other"
 ]);
 
 // Supervisor-level classification. Order matters: first match wins.

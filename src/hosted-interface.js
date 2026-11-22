@@ -2474,21 +2474,29 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
             }
           }
+          // The live update stands even if `.env` can't be written, but the
+          // caller must learn it will not survive a restart (a lowered cap
+          // would otherwise silently revert to the old, higher one).
+          const notPersisted = [];
+          let persistenceError = null;
+          const persistEnv = async (key, value) => {
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { [key]: value } });
+            } catch (error) {
+              notPersisted.push(key);
+              persistenceError ??= String(error?.message ?? error);
+            }
+          };
           if (hasTimeZone && typeof runtime.budget.setTimeZone === "function") {
             runtime.budget.setTimeZone(body.timeZone.trim());
             process.env.OPENAGI_TIMEZONE = runtime.budget.timeZone;
-            try {
-              const { saveEnv } = await import("./setup-wizard.js");
-              saveEnv({ dataDir, values: { OPENAGI_TIMEZONE: runtime.budget.timeZone } });
-            } catch { /* runtime timezone already updated */ }
+            await persistEnv("OPENAGI_TIMEZONE", runtime.budget.timeZone);
           }
           if (hasLimit) {
             runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));
             process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
-            try {
-              const { saveEnv } = await import("./setup-wizard.js");
-              saveEnv({ dataDir, values: { OPENAGI_DAILY_USD_LIMIT: String(runtime.budget.dailyUsdLimit) } });
-            } catch { /* runtime limit already updated */ }
+            await persistEnv("OPENAGI_DAILY_USD_LIMIT", String(runtime.budget.dailyUsdLimit));
           }
           if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
             runtime.budget.clearBonusToday();
@@ -2498,7 +2506,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           const updated = runtime.budget.status();
           runtime.events?.emit?.("budget-updated", updated);
-          return sendJson(res, 200, updated);
+          if (notPersisted.length > 0) {
+            return sendJson(res, 200, {
+              ...updated,
+              persisted: false,
+              notPersisted,
+              persistenceError,
+              warning: "Applied for now, but not saved: the previous setting returns when OpenAGI restarts."
+            });
+          }
+          return sendJson(res, 200, (hasLimit || hasTimeZone) ? { ...updated, persisted: true } : updated);
         } catch (error) {
           return sendJson(res, 400, { error: "invalid_budget", message: String(error?.message ?? "Invalid budget update.") });
         }
@@ -3384,10 +3401,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // with a reason when already current or not fast-forwardable.
         const { applyUpdate } = await import("./self-update.js");
         const result = await applyUpdate();
-        sendJson(res, result.updated ? 202 : 200, result);
+        const willRestart = result.updated && !result.restartRequired;
+        sendJson(res, willRestart ? 202 : 200, result);
         if (result.updated) {
-          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to });
-          setTimeout(() => process.exit(0), 300); // respawn with new code
+          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to, restartRequired: Boolean(result.restartRequired) });
+          // Unsupervised portable installs have nothing to respawn them: keep
+          // serving and report that a manual restart is required.
+          if (willRestart) setTimeout(() => process.exit(0), 300); // respawn with new code
         }
         return;
       }
@@ -5973,7 +5993,7 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     input.style.height = Math.min(180, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -6034,6 +6054,13 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
       sendBtn.disabled = false;
     }
   });
+}
+
+// Only an unmodified Return submits a chat draft. Shift+Return is left to the
+// textarea so it inserts a newline; composition events must also reach the IME.
+function shouldSubmitComposerKey(e) {
+  return e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+    && !e.isComposing && e.keyCode !== 229;
 }
 
 function showToast(msg, ok = true) {
@@ -6715,7 +6742,7 @@ function renderChat() {
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       $("composer").requestSubmit();
     }

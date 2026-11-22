@@ -944,6 +944,8 @@ export class ActiveWorkManager {
       if (!item || item.state === "done" || item.state === "snoozed" || item.outcomeVerified) continue;
       if (String(item.dedupeKey ?? "").startsWith("pr:")) continue;
       if (item.owner?.threadKey && candidates.has(item.owner.threadKey)) continue;
+      // An explicitly assigned human owner is an owner decision, not a gap.
+      if (item.owner?.kind === "human") continue;
 
       let matchedSession = null;
       const goalPr = item.prRef ? String(item.prRef).toLowerCase() : null;
@@ -1106,7 +1108,7 @@ export class ActiveWorkManager {
     const env = this.deps?.env ?? process.env ?? {};
     const apiKey = String(settings.apiKey ?? env.OPENAI_API_KEY ?? "").trim();
     const fetchImpl = this.deps?.decisionsFetch ?? this.deps?.fetchImpl ?? globalThis.fetch;
-    if (apiKey) {
+    if (settings.enabled !== false && apiKey) {
       const res = await callDecisionsEndpoint({
         input: {
           goal: item.goal,

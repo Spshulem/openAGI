@@ -525,6 +525,32 @@ function formatCount(value) {
   return value === null || value === undefined ? "unknown" : String(value);
 }
 
+// Identifies one failure of a session (its error, not the scan time), so a
+// failover is attempted once per failure.
+function failoverSignature(thread) {
+  return shortHash(JSON.stringify([
+    String(thread?.error?.kind ?? ""),
+    String(thread?.error?.text ?? "").slice(0, 300),
+    // When the error message was posted: a new failure is a new message.
+    String(thread?.error?.at ?? thread?.lastAgentAt ?? "")
+  ]));
+}
+
+// A goal the owner snoozed or paused, or whose last batch is done and waits
+// for the owner's sign-off, is never restarted automatically: the sign-off
+// request is surfaced by Active Work follow-through instead.
+function goalAcceptsAutoContinuation(goal, nowMs = Date.now()) {
+  if (!goal || goal.outcomeVerified || goal.state === "done" || goal.state === "paused") return false;
+  if (goal.state === "snoozed") {
+    const until = Date.parse(goal.snoozedUntil ?? "");
+    if (!Number.isFinite(until) || until > nowMs) return false;
+  }
+  if (goal.awaitingFollowup === true) return false;
+  if (goal.cursor && Number(goal.cursor.remaining) === 0) return false;
+  if (goal.remainingCountSource === "explicit" && goal.remainingCount === 0) return false;
+  return true;
+}
+
 function buildQuestionContextSnapshot(thread, pr) {
   if (!thread && !pr) return null;
   const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
@@ -656,8 +682,9 @@ function ownerReply(text) {
   return `Owner says: ${text}`;
 }
 
-// "retry" on a logged-out / disk-full question means the owner fixed it.
-const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
+// "retry" on a logged-out / provider-auth / disk-full question means the
+// owner fixed it.
+const RETRY_DELIVERY = "Owner fixed the blocker (login, provider auth or disk). Retry: continue where you stopped.";
 // "added" on an account-cap question means new capacity: resume now.
 const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
 const RESTART_REPEAT_MS = 10 * 60_000;
@@ -915,7 +942,9 @@ export class FleetSupervisor {
 
   get notifier() {
     if (this.deps.notifier) return this.deps.notifier;
-    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, contextFor: (question) => this.decisionContextFor(question) });
+    // The notifier shares the supervisor's clock, so quiet hours and push
+    // caps are judged at the same time the scan runs (and are testable).
+    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, now: () => new Date(this.now()), contextFor: (question) => this.decisionContextFor(question) });
     return this._notifier;
   }
 
@@ -2553,8 +2582,11 @@ export class FleetSupervisor {
     for (const watch of watches) {
       const sentMs = Date.parse(watch.sentAt ?? "") || started;
       const elapsedMs = Math.max(0, started - sentMs);
-      const thread = byKey.get(watch.threadKey) ?? this.lastThreads.get(watch.threadKey) ?? null;
+      const thread = byKey.get(watch.threadKey) ?? null;
       if (!thread) {
+        // A row kept from a source that failed this scan is not a current
+        // observation: its pre-send idle state must not settle the watch.
+        if (this.lastThreads.has(watch.threadKey)) continue;
         if (elapsedMs > 6 * 60 * MIN) {
           this.store.resolveFollowThroughWatch(watch.id, { outcome: "expired", detail: "session no longer visible in scan" });
         }
@@ -3119,7 +3151,8 @@ export class FleetSupervisor {
         preferredProviders: Array.isArray(preferredProviders) && preferredProviders.length
           ? preferredProviders
           : ["claude", "antigravity"],
-        factory: this.deps.paseoFactory
+        factory: this.deps.paseoFactory,
+        permissionMode: this.store.preferences()?.defaultPermissionMode ?? "bypass"
       });
     } catch (err) {
       return { ok: false, status: "failed", detail: clampText(err?.message ?? "Provider failover failed.", 220) };
@@ -3144,6 +3177,7 @@ export class FleetSupervisor {
       : 12;
     this.store.markCompletionReviewed(cleanKey, nowMs);
     this.store.mute(cleanKey, nowMs + muteHours * 60 * MIN);
+    this.store.recordProviderFailover(cleanKey, { newKey: switched.newKey, failureSig: failoverSignature(thread) });
 
     for (const q of this.store.openQuestions()) {
       const coversSingle = q.threadKey === cleanKey
@@ -4776,6 +4810,9 @@ export class FleetSupervisor {
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
         const resetAtMs = Date.parse(thread.error?.resetAt ?? "");
         if (Number.isFinite(resetAtMs) && resetAtMs > started && resetAtMs - started <= 20 * MIN) continue;
+        // Already handed off for this same failure: the replacement owns the
+        // work now, even after the old session's mute expires.
+        if (store.providerFailoverFor(thread.key)?.failureSig === failoverSignature(thread)) continue;
         const switched = await this.switchPaseoProvider(thread.key, {
           reason: classified.reason || thread.error?.text || "usage limit reached"
         });
@@ -4856,6 +4893,7 @@ export class FleetSupervisor {
         if (
           this.mode === "auto"
           && activeGoal.permittedNudges === "resume_owner"
+          && goalAcceptsAutoContinuation(activeGoal, started)
           && ["idle-no-pr", "done"].includes(classified.state)
           && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
         ) {

@@ -83,7 +83,8 @@ function emptyState() {
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
     supervisorChatNotices: {},
-    surfacedDecisions: {}
+    surfacedDecisions: {},
+    providerFailovers: {}
   };
 }
 
@@ -1487,7 +1488,8 @@ export class FleetStore {
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
       surfacedDecisions: isObject(raw.surfacedDecisions)
         ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
-        : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now())
+        : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {}
     };
   }
 
@@ -1782,6 +1784,26 @@ export class FleetStore {
     }
     if (committed > 0) this._save();
     return committed;
+  }
+
+  // Which replacement session took over a failed one, for which failure. A
+  // later scan seeing the same failure on the old session must not fail it
+  // over again; a different failure (or a resumed session) may.
+  recordProviderFailover(oldKey, { newKey, failureSig } = {}) {
+    const key = String(oldKey ?? "").trim();
+    if (!key || !newKey) return null;
+    this.state.providerFailovers ??= {};
+    const entry = { newKey: String(newKey), failureSig: String(failureSig ?? ""), at: iso(this.now()) };
+    this.state.providerFailovers[key] = entry;
+    const keys = Object.keys(this.state.providerFailovers);
+    if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
+    this._save();
+    return { ...entry };
+  }
+
+  providerFailoverFor(oldKey) {
+    const entry = this.state.providerFailovers?.[String(oldKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   _save() {

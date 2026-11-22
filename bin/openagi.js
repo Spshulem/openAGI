@@ -494,7 +494,11 @@ async function cmdUpdate(positional, flags) {
   }
   if (r.updated) {
     console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps updated)") : ""));
-    console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    if (r.restartRequired) {
+      console.log(c(YELLOW, `restart required: ${target.remote ? "main" : "the daemon"} is still running the old version; stop and start OpenAGI again to use it.`));
+    } else {
+      console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    }
   } else if (r.ok === false) {
     console.error(c(RED, `✗ ${r.reason ?? "update failed"}`));
     return 1;

@@ -1353,11 +1353,22 @@ export async function resolvePaseoAgentConfig(api, cwd, {
     }
   }
 
+  // Discovery failed: an explicit provider wins, then the family the
+  // requested model names, then the configured default provider, so a
+  // Claude model is never paired with Codex (or an Antigravity default lost).
+  const BUILTIN_DEFAULT_MODELS = { claude: "claude-opus-5-5", codex: "gpt-6.2-sol", antigravity: "gemini-4-carbon-high" };
+  const modelFamily = !modelQuery ? null
+    : /claude|opus|sonnet|haiku/i.test(modelQuery) ? "claude"
+      : /gpt|sol|astra|codex/i.test(modelQuery) ? "codex"
+        : /gemini/i.test(modelQuery) ? (["gemini", "antigravity"].includes(prefDefaultProvider) ? prefDefaultProvider : "antigravity")
+          : null;
   const fallbackFamily = explicitFamily
-    || (modelQuery && /gpt|sol|astra|codex/i.test(modelQuery) ? "codex" : (prefDefaultProvider === "codex" ? "codex" : "claude"));
+    || modelFamily
+    || (KNOWN_PROVIDERS.has(prefDefaultProvider) ? prefDefaultProvider : "claude");
   const defaultFallbackModel = modelQuery
     || prefDefaultModels?.[fallbackFamily]
-    || (fallbackFamily === "claude" ? "claude-opus-5-5" : "gpt-6.2-sol");
+    || BUILTIN_DEFAULT_MODELS[fallbackFamily]
+    || null;
   const fallbackSpec = defaultFallbackModel ? `${fallbackFamily}/${defaultFallbackModel}` : (rawProv || fallbackFamily);
   const thinkingOptionId = normalizeEffortId(effort);
   const resolvedModeId = resolveDefaultPaseoModeId(
