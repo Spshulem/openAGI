@@ -14,7 +14,7 @@ import { resolveDataDir } from "../data-dir.js";
 import { readNodeConfig } from "../cli-client.js";
 import { readOrCreateIdentity } from "../node-registry.js";
 import { appendSharedThreadMessages } from "../shared-conversations.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
@@ -521,6 +521,9 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
   }
 }
 
+const CONTEXT_REQUEST_RETRY_MS = 30 * 60_000;
+const CONTEXT_REQUEST_MAX_ATTEMPTS = 3;
+
 function formatCount(value) {
   return value === null || value === undefined ? "unknown" : String(value);
 }
@@ -551,6 +554,16 @@ function goalAcceptsAutoContinuation(goal, nowMs = Date.now()) {
   return true;
 }
 
+// The agent's latest reply for a question's snapshot: its tail, except that
+// a DECISION CONTEXT block is kept whole from its marker, so a long context
+// reply is not cut before its goal and assignment.
+function snapshotAgentSummary(thread) {
+  const full = redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || "");
+  const marker = full.toUpperCase().lastIndexOf("DECISION CONTEXT");
+  if (marker !== -1) return clampTextLines(full.slice(marker), 6000) || null;
+  return clampTailLines(full, 1600) || null;
+}
+
 function buildQuestionContextSnapshot(thread, pr) {
   if (!thread && !pr) return null;
   const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
@@ -566,7 +579,7 @@ function buildQuestionContextSnapshot(thread, pr) {
     paseoHasWorkspaceId: Boolean(thread?.meta && Object.prototype.hasOwnProperty.call(thread.meta, "workspaceId") && thread.meta.workspaceId !== undefined),
     serverId: thread?.meta?.serverId ?? null,
     aliases: Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases.slice(0, 4) : [],
-    agentSummary: clampTailLines(redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || ""), 1600) || null,
+    agentSummary: snapshotAgentSummary(thread),
     lastUserText: clampTailLines(redactSecrets(thread?.lastUserText || ""), 600) || null,
     lastUserAt: thread?.lastUserAt ?? null,
     lastAgentAt: thread?.lastAgentAt ?? null,
@@ -969,7 +982,13 @@ export class FleetSupervisor {
     const missingKey = ctx.missing.join(",");
     const prior = question.contextRequest ?? null;
     let sent = false;
-    if (!prior || prior.missing?.join(",") !== missingKey) {
+    // A request that never reached the agent (no send budget, agent busy,
+    // delivery failed) is retried after a backoff, a few times at most.
+    const priorMs = Date.parse(prior?.at ?? "");
+    const attempts = Number(prior?.attempts ?? 1);
+    const retryUnsent = Boolean(prior && prior.sent !== true && attempts < CONTEXT_REQUEST_MAX_ATTEMPTS
+      && Number.isFinite(priorMs) && started - priorMs >= CONTEXT_REQUEST_RETRY_MS);
+    if (!prior || prior.missing?.join(",") !== missingKey || retryUnsent) {
       const thread = question.threadKey ? (byKey?.get(question.threadKey) ?? this.knownThreads.get(question.threadKey) ?? null) : null;
       const route = thread ? chooseRoute(thread, "auto", this.lastDelivery) : null;
       const reachable = this.mode === "auto"
@@ -994,7 +1013,8 @@ export class FleetSupervisor {
           reason = clampText(redactSecrets(error?.message ?? "delivery failed"), 120);
         }
       }
-      this.store.markContextRequested(question.id, { at: started, missing: ctx.missing, sent, reason });
+      const sameGaps = prior && prior.missing?.join(",") === missingKey;
+      this.store.markContextRequested(question.id, { at: started, missing: ctx.missing, sent, reason, attempts: sameGaps ? attempts + 1 : 1 });
     }
     const latest = this.store.question(question.id) ?? question;
     const latestCtx = this.decisionContextFor(latest);
@@ -2672,7 +2692,7 @@ export class FleetSupervisor {
   trackedGoalSummary() {
     let items;
     try {
-      items = this.activeWork.getActiveWork({ limit: 200 })?.items;
+      items = this.activeWork.projectAllItems();
     } catch {
       items = null;
     }

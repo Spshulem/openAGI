@@ -804,13 +804,14 @@ export class FleetStore {
 
   // The owning agent was asked to supply the decision context this ask lacks.
   // One request per distinct set of gaps; `sent` says whether it reached the agent.
-  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null } = {}) {
+  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null, attempts = 1 } = {}) {
     const question = this._findQuestion(id);
     if (!question) return null;
     question.contextRequest = {
       at: iso(toMs(at, this.now())),
       missing: Array.isArray(missing) ? missing.slice(0, 8).map(String) : [],
       sent: Boolean(sent),
+      attempts: Math.max(1, Math.min(10, Number(attempts) || 1)),
       ...(reason ? { reason: clampText(String(reason), 120) } : {})
     };
     this._save();

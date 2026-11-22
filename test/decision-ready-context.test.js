@@ -358,6 +358,11 @@ test("an existing open follow-up is reworded with the four-part context without 
   assert.match(copy.summary, /^4\. Decision now: OpenAGI \/ Supervisor has been idle 30h\. Resume owner, snooze, or confirm done\? Options: Assign orphan \(A session is assigned/m);
   assert.match(copy.summary, /Confirm done \(The goal is marked verified complete/);
   assert.doesNotMatch(copy.summary, INTERNAL_ID_RE);
+  // The prompt a hosted hub mirrors carries the same copy, not a one-liner.
+  const exported = sup.activeWork.getActiveWork({}).prompts.find((p) => p.id === item.id);
+  assert.ok(exported, "the follow-up is exported to the hub");
+  assert.equal(exported.title, copy.title);
+  assert.equal(exported.summary, copy.summary);
 });
 
 test("agent-supplied context parses, internal ids strip, and gaps are named rather than invented", () => {
@@ -483,7 +488,62 @@ test("check-in counts: goals come from where they are tracked; unknown is never 
   assert.equal(main.runningSessionCount({ counts: { byState: { running: 0 } } }), 0, "zero running is a real zero");
   assert.equal(main.runningSessionCount(null), null, "no scan is unknown, not zero");
 
+  // Counted over every tracked goal, not a 200-item display page.
+  for (let i = 0; i < 200; i += 1) main.activeWork.trackWork({ project: "OpenAGI", goal: `Bulk goal ${i}`, doneCriteria: "done" });
+  assert.equal(main.trackedGoalSummary().count, 205);
+
   // A failed Active Work read is unknown.
-  main.activeWork.getActiveWork = () => { throw new Error("disk read failed"); };
+  main.activeWork.projectAllItems = () => { throw new Error("disk read failed"); };
   assert.equal(main.trackedGoalSummary().text, "Unverified tracked goals: unknown (Active Work could not be read)");
+});
+
+test("#348 review: a long agent context reply fills the card's brief decision and recommendation", () => {
+  const pad = "Background detail. ".repeat(60);
+  const reply = [
+    "DECISION CONTEXT",
+    `Goal: Spencer wants October's finance export corrected before close. ${pad}`,
+    `Assigned: Fix the refund double-count and prove it on October data. ${pad}`,
+    "Verified: October re-run matches Stripe to the cent.",
+    "Blocked: Re-sending October's CSV to finance needs Spencer's approval.",
+    "Decision: Re-send October to finance, or only fix November onward?",
+    "Options:",
+    "- proceed — October's CSV is regenerated and re-sent",
+    "- hold — only November onward uses the fix",
+    "Recommendation: Hold until finance authorizes reopening October."
+  ].join("\n");
+  assert.ok(reply.length > 1600);
+  const question = { id: "fq_long000001", kind: "agent-ask", threadKey: "paseo:s.long", title: "Billing export: needs your call. Proceed?", body: "Proceed?", options: ["proceed", "hold"], status: "open", createdAt: new Date(NOW).toISOString() };
+  const thread = { key: "paseo:s.long", title: "Billing export cleanup", lastAgentFull: reply, lastAgentText: reply.slice(-700), meta: { conversation: [{ role: "user", text: "Fix the billing export double-count" }, { role: "assistant", text: reply }] } };
+  const card = buildSupervisorCard(question, { threadsByKey: new Map([[thread.key, thread]]), now: NOW });
+  assert.equal(card.decisionContext.agentSupplied, true);
+  assert.match(card.decisionContext.goal, /October's finance export/);
+  assert.match(card.brief.decision, /^Re-send October to finance, or only fix November onward\?/);
+  assert.equal(card.recommendation, "Hold until finance authorizes reopening October.");
+});
+
+test("#348 review: a context request that never reached the agent is retried after a backoff", async (t) => {
+  const dir = tempDir(t);
+  let nowMs = NOW;
+  const attempts = [];
+  let deliver = "blocked";
+  const sup = new FleetSupervisor({
+    dataDir: dir, runtime: { events: { emit() {} } },
+    config: { enabled: true, mode: "auto", paseo: { enabled: true, only: true }, review: { enabled: false } },
+    deps: { now: () => nowMs, executor: { deliver: async (a) => { attempts.push(a.playbook); return { status: deliver, route: a.route, detail: deliver === "sent" ? "ok" : "agent busy" }; }, inFlight: () => [], whenIdle: async () => {} } }
+  });
+  const thread = { key: "paseo:srv.sess_r", kind: "paseo", id: "sess_r", title: "Retry case", agentStatus: "idle", archived: false, meta: { serverId: "srv" } };
+  sup.knownThreads.set(thread.key, thread);
+  const q = sup.store.upsertQuestion({ dedupeKey: "ask:r", kind: "agent-ask", threadKey: thread.key, title: "Go ahead?", options: ["go", "hold"] });
+  const byKey = new Map([[thread.key, thread]]);
+  await sup.gateDecisionContext(sup.store.question(q.id), { byKey, budgetLeft: 5, started: nowMs });
+  assert.equal(sup.store.question(q.id).contextRequest.sent, false);
+  nowMs += 5 * 60_000;
+  await sup.gateDecisionContext(sup.store.question(q.id), { byKey, budgetLeft: 5, started: nowMs });
+  assert.equal(attempts.length, 1, "no retry inside the backoff");
+  deliver = "sent";
+  nowMs += 31 * 60_000;
+  await sup.gateDecisionContext(sup.store.question(q.id), { byKey, budgetLeft: 5, started: nowMs });
+  assert.equal(attempts.length, 2, "retried after the backoff");
+  assert.equal(sup.store.question(q.id).contextRequest.sent, true);
+  assert.equal(sup.store.question(q.id).contextRequest.attempts, 2);
 });

@@ -5,7 +5,7 @@
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { asksToMergePr } from "./policy.js";
-import { buildDecisionContext, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
+import { buildDecisionContext, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
@@ -892,6 +892,12 @@ function enrichBriefWithDecisionContext(brief, ctx) {
   if (whatChanged) extra.push(whatChanged);
   if (ctx.blocked && !whatChanged.includes(ctx.blocked.slice(0, 30))) extra.push(`Why it can't proceed alone: ${ctx.blocked}`);
   if (extra.length) brief.whatChanged = clampTextLines(extra.join("\n\n"), 1200);
+  // The recovered decision replaces a generic one ("Proceed?"): clients and
+  // the Fleet tool read brief.decision, not the context.
+  const briefFirstLine = String(brief.decision ?? "").split(/\n/)[0].trim();
+  if (ctx.decision && (ctx.agentSupplied || !briefFirstLine || isGenericAsk(briefFirstLine))) {
+    brief.decision = ctx.decision;
+  }
   const withConsequence = ctx.options.filter((o) => o.consequence);
   if (withConsequence.length && !/\bOptions:/.test(String(brief.decision ?? ""))) {
     brief.decision = clampTextLines(`${brief.decision ?? ctx.decision ?? ""}\n\nOptions:\n${ctx.options.map((o) => `- ${o.label}${o.consequence ? ` — ${o.consequence}` : ""}`).join("\n")}`.trim(), 1400);
@@ -1058,9 +1064,9 @@ export function buildSupervisorCard(
   const activeGoal = typeof activeGoalResolver === "function"
     ? activeGoalResolver(primaryKey, prRef)
     : null;
-  const recommendation = buildRecommendation(question, row, prRef, prefs, prMeta, thread);
+  let recommendation = buildRecommendation(question, row, prRef, prefs, prMeta, thread);
   const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages, activeGoal, thread });
-  const suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
+  let suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
   const rawPlan = question.meta?.plan && typeof question.meta.plan === "object" ? question.meta.plan : null;
   const plan = rawPlan ? {
     remedy: clampText(redactSecrets(String(rawPlan.remedy ?? "")), 40) || null,
@@ -1103,7 +1109,11 @@ export function buildSupervisorCard(
     sessionTitle,
     prMeta: prMeta ? { ...prMeta, url: prUrl } : null,
     recentMessages,
-    agentSummary,
+    // The full latest reply, not the 700/1600-char excerpts: a long
+    // DECISION CONTEXT block must still be parsed from its marker.
+    agentSummary: thread?.lastAgentFull
+      ? redactSecrets(stripAttachmentMarkdown(thread.lastAgentFull))
+      : (snap?.agentSummary ? redactSecrets(String(snap.agentSummary)) : agentSummary),
     activeGoal,
     openChat,
     currentState: brief.currentState,
@@ -1113,6 +1123,12 @@ export function buildSupervisorCard(
     contextRequest: question.contextRequest ?? null
   });
   enrichBriefWithDecisionContext(brief, decisionContext);
+  // The agent's own recommendation, recovered from its context reply, is the
+  // one clients show (they read card.recommendation, not the context).
+  if (decisionContext.agentSupplied && decisionContext.recommendation) {
+    recommendation = clampText(redactSecrets(decisionContext.recommendation), 240);
+    suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
+  }
   const heldForContext = shouldHoldForContext(question, decisionContext, Number(now) || Date.now());
 
   return {

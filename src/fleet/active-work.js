@@ -1430,6 +1430,15 @@ export class ActiveWorkManager {
     return choices;
   }
 
+  // Every tracked item, projected, with no display limit: for aggregate
+  // counts that must not stop at a page size.
+  projectAllItems() {
+    const nowMs = this.now();
+    const { byKey: sessionsByKey } = this._knownSessionsByKey();
+    const prsByRef = this._livePrMap();
+    return this.state.items.map((item) => this._projectItem(item, { nowMs, sessionsByKey, prsByRef }));
+  }
+
   // Strictly read-only ranked Active Work / Follow-through digest.
   getActiveWork({
     project = null,
@@ -1487,15 +1496,9 @@ export class ActiveWorkManager {
       })
       .map((it) => {
         const raw = this.state.items.find((candidate) => candidate.id === it.id);
-        const title = clampText(
-          `Follow-through · ${it.project}${it.theme ? ` / ${it.theme}` : ""}`,
-          110
-        );
-        const choiceLabels = (it.choices ?? []).map((choice) => choice.label).slice(0, 4).join(", ");
-        const summary = clampText(
-          `${it.whySurfaced}${it.verificationQuestion ? ` ${it.verificationQuestion}` : ""}${choiceLabels ? ` (Choices: ${choiceLabels})` : ""}`,
-          260
-        );
+        // The same four-part copy the local outreach item carries, so a hosted
+        // hub mirrors the full context rather than an older one-line summary.
+        const { title, summary } = this._followUpOutreachCopy(it);
         return { id: it.id, mark: raw.lastPromptedMark, title, summary, actions: ["dismiss"] };
       });
 
