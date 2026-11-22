@@ -41,6 +41,10 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
             "sources": [], "status": "pending", "createdAt": Self.date
         ]
         let object: Any
+        if let fleet = StoreScreenshotFleet.object(for: url.path) {
+            deliver(fleet, url: url)
+            return
+        }
         switch url.path {
         case "/mobile/summary":
             object = ["generatedAt": Self.date,
@@ -68,8 +72,10 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
                 ["id": "main", "thread": "agent", "title": "Plan my morning",
                  "preview": "Let's keep it simple", "updatedAt": Self.date, "messageCount": 2, "readOnly": false],
                 ["id": "main", "thread": "supervisor", "title": "Supervisor",
-                 "preview": "Start a conversation", "updatedAt": Self.date, "messageCount": 0, "readOnly": false]
+                 "preview": "Three decisions need you", "updatedAt": Self.date, "messageCount": 2, "readOnly": false]
             ]]
+        case let path where path.hasPrefix("/conversations/supervisor"):
+            object = ["thread": "supervisor", "messages": StoreScreenshotFleet.supervisorMessages()]
         case let path where path.hasPrefix("/conversations/"):
             object = ["thread": "agent", "messages": [
                 ["id": "morning-question", "role": "user", "at": Self.date,
@@ -79,6 +85,10 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
             ]]
         default: object = [:]
         }
+        deliver(object, url: url)
+    }
+
+    private func deliver(_ object: Any, url: URL) {
         do {
             let data = try JSONSerialization.data(withJSONObject: object)
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
