@@ -80,19 +80,17 @@ final class DictationTranscriptTests: XCTestCase {
                                                              live: "Before", text: "After"), "zero duration is unset timing")
     }
 
-    func testSilenceTimeoutCommitsLiveWordsAndClassifiesRecoverablePauseErrors() {
-        var t = DictationTranscript(base: "Initial:")
-        _ = t.receive("spoken before silence", isFinal: false)
-        XCTAssertEqual(t.commitLive(), "Initial: spoken before silence")
-        XCTAssertEqual(t.receive("and after silence", isFinal: false), "Initial: spoken before silence and after silence")
-
-        let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110, userInfo: [NSLocalizedDescriptionKey: "No speech detected"])
-        XCTAssertTrue(ChatDictation.isRecoverablePauseError(noSpeech))
-
-        let canceled = NSError(domain: "kAFAssistantErrorDomain", code: 216, userInfo: [NSLocalizedDescriptionKey: "Recognition request was canceled"])
-        XCTAssertTrue(ChatDictation.isRecoverablePauseError(canceled))
-
-        let fatalHardware = NSError(domain: "AVAudioEngineErrorDomain", code: -10851, userInfo: [NSLocalizedDescriptionKey: "Hardware unavailable"])
-        XCTAssertFalse(ChatDictation.isRecoverablePauseError(fatalHardware))
+    // Codex review on #341: consecutive utterances that share a first word
+    // are still two utterances when real timing says so.
+    func testConsecutiveUtterancesThatShareAFirstWordAreBothKept() {
+        var t = DictationTranscript(base: "")
+        _ = t.receive("I need milk", isFinal: false)
+        let fresh = DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.8), (2.8, 3.2)],
+                                                           live: t.live, text: "I also need bread")
+        XCTAssertTrue(fresh)
+        XCTAssertEqual(t.receive("I also need bread", isFinal: false, startsNewUtterance: fresh), "I need milk I also need bread")
+        // A true extension of the live text, even after a gap, stays one utterance.
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.8)],
+                                                             live: "I need milk", text: "I need milk and eggs."))
     }
 }

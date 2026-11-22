@@ -194,18 +194,6 @@ async function invokeMutation(api, ref, agentId, patch, permissionFeatureId) {
     else await atomic.call(api?.agents?.applyConfig === atomic ? api.agents : api, agentId, config);
     return;
   }
-  // Paseo 0.16+ exposes provider controls through the handle's options API.
-  // It cannot change the session model or reasoning level, so refuse a mixed
-  // patch instead of partially applying it and claiming success.
-  if (typeof ref?.setOptions === "function") {
-    if (patch.model !== undefined || patch.reasoningEffort !== undefined) {
-      throw new Error("This Paseo client exposes provider controls only; model and reasoning changes are unavailable for this host.");
-    }
-    if (patch.permissions !== undefined && permissionFeatureId) {
-      await ref.setOptions({ [permissionFeatureId]: patch.permissions });
-      return;
-    }
-  }
   const operations = [];
   const add = (refFn, apiFn, rootFn, refArgs, apiArgs, rootArgs) => {
     if (typeof refFn === "function") operations.push([ref, refFn, refArgs]);
@@ -217,7 +205,11 @@ async function invokeMutation(api, ref, agentId, patch, permissionFeatureId) {
     [patch.model], [agentId, patch.model], [agentId, patch.model]);
   if (patch.reasoningEffort !== undefined) add(ref?.setThinkingOption, api?.agents?.setThinkingOption, api?.setAgentThinkingOption,
     [patch.reasoningEffort], [agentId, patch.reasoningEffort], [agentId, patch.reasoningEffort]);
-  if (patch.permissions !== undefined) add(ref?.setFeature, api?.agents?.setFeature, api?.setAgentFeature,
+  // Paseo 0.16+ exposes provider controls through the handle's options API;
+  // it covers permissions only, so model/reasoning still need their own mutators.
+  if (patch.permissions !== undefined && permissionFeatureId && typeof ref?.setOptions === "function") {
+    operations.push([ref, ref.setOptions, [{ [permissionFeatureId]: patch.permissions }]]);
+  } else if (patch.permissions !== undefined) add(ref?.setFeature, api?.agents?.setFeature, api?.setAgentFeature,
     [permissionFeatureId, patch.permissions], [agentId, permissionFeatureId, patch.permissions], [agentId, permissionFeatureId, patch.permissions]);
   if (operations.some(([owner, fn]) => !owner || typeof fn !== "function")) throw new Error("This Paseo host does not expose a safe per-session settings mutation API.");
   for (const [owner, fn, args] of operations) await fn.apply(owner, args);

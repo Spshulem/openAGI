@@ -213,6 +213,39 @@ test("new Paseo provider controls use exact option readback for permissions", as
   assert.equal(result.settings.current.permissions, "full");
 });
 
+test("a host exposing setOptions still dispatches model changes to its dedicated mutator", async () => {
+  const state = {
+    id: "agent-1", provider: "codex", cwd: "/workspace/project", model: "gpt-6-sol",
+    thinkingOptionId: "medium", effectiveThinkingOptionId: "medium", status: "idle",
+    pendingPermissions: [], updatedAt: "2026-11-21T01:00:00Z",
+    options: { approval_mode: "ask" },
+    controls: [{ type: "select", key: "approval_mode", label: "Permission mode", choices: [
+      { value: "ask", label: "Ask before tools" }, { value: "full", label: "Full access" }
+    ] }]
+  };
+  const calls = [];
+  const ref = {
+    current: () => state,
+    refresh: async () => ({ agent: state }),
+    setOptions: async (patch) => { calls.push(["setOptions", patch]); Object.assign(state.options, patch); },
+    setModel: async (model) => { calls.push(["setModel", model]); state.model = model; }
+  };
+  const factory = () => ({
+    hosts: { list: async () => ({ self: { serverId: "host-1" }, hosts: [] }) },
+    providers: { snapshot: async () => ({ entries: [{ provider: "codex", status: "ready", models: [
+      { id: "gpt-6-sol", label: "GPT-6 Sol" }, { id: "gpt-6-luna", label: "GPT-6 Luna" }
+    ] }] }) },
+    agents: { ref: () => ref }, connect: async () => {}, close: async () => {}
+  });
+  const read = await readPaseoSessionSettings(CONFIG, { serverId: "host-1", agentId: "agent-1", factory });
+  const result = await applyPaseoSessionSettings(CONFIG, {
+    serverId: "host-1", agentId: "agent-1",
+    body: { confirmed: true, targetFingerprint: read.settings.targetFingerprint, model: "gpt-6-luna", permissions: "full" }, factory
+  });
+  assert.equal(result.ok, true, result.detail);
+  assert.deepEqual(calls, [["setModel", "gpt-6-luna"], ["setOptions", { approval_mode: "full" }]]);
+});
+
 test("fleet route exposes GET and owner-confirmed POST settings without approval routes", async () => {
   const calls = [];
   const supervisor = {

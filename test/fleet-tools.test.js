@@ -317,7 +317,14 @@ test("the send and answer tools need approval and pin the exact target", async (
   assert.match(send.summarize(later), /queued behind its background tasks/);
   assert.notEqual(send.approvalDedupeKey(later, {}), send.approvalDedupeKey(target, {}));
   await assert.rejects(send.handler(target, {}), /approval/);
-  assert.deepEqual(await send.handler(target, { __confirmed: true }), { status: "sent", route: "computer-use", detail: "typed into Codex" });
+  // A sent message only proves delivery, never that the goal is done.
+  assert.deepEqual(await send.handler(target, { __confirmed: true }), {
+    status: "sent",
+    route: "computer-use",
+    detail: "typed into Codex",
+    outcomeVerified: false,
+    verificationNote: "Message delivery and turn start confirmed; target goal/submission is NOT complete until post-turn outcome is verified."
+  });
   assert.deepEqual(sent, [["codex:t1", "Rebase on main and push."]]);
   assert.throws(() => answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Enterprise" }), /one of: Starter, Business/);
   const pinned = answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Business" });
