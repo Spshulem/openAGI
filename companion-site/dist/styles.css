@@ -2,3 +2,4 @@
 
 .mobile-nav[hidden]{display:none!important}
 .install-command{display:block;margin-top:14px;padding:8px 9px;border-radius:6px;background:#e4ece0;color:#315b44;font:10px ui-monospace,monospace;max-width:100%;overflow:auto;white-space:nowrap}
+.install-doc-link{font-size:12px;font-weight:700;color:var(--green);margin-top:14px}.install-download{font-size:12px;font-weight:700;color:var(--green-dark);margin-top:auto;padding-top:20px}
