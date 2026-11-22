@@ -161,6 +161,87 @@ test("GET /budget and POST /budget are mobile-scoped, main-routed, update live r
   assert.match(fs.readFileSync(path.join(dataDir, ".env"), "utf8"), /OPENAGI_TIMEZONE=America\/New_York/);
 });
 
+test("BudgetGuard: a time zone chosen via setTimeZone() is explicit and survives restart against client header adoption", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "budget-tz-explicit-"));
+  const prevTz = process.env.OPENAGI_TIMEZONE;
+  const prevTz2 = process.env.OPENAGI_TIME_ZONE;
+  delete process.env.OPENAGI_TIMEZONE;
+  delete process.env.OPENAGI_TIME_ZONE;
+  t.after(() => {
+    if (prevTz === undefined) delete process.env.OPENAGI_TIMEZONE; else process.env.OPENAGI_TIMEZONE = prevTz;
+    if (prevTz2 === undefined) delete process.env.OPENAGI_TIME_ZONE; else process.env.OPENAGI_TIME_ZONE = prevTz2;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const make = () => new BudgetGuard({
+    storePath: path.join(dir, "usage.json"),
+    dailyUsdLimit: 10,
+    ledger: new CreditLedger({ storePath: path.join(dir, "ledger.jsonl") })
+  });
+  const guard = make();
+  // Without an owner choice, a client header is still adopted.
+  assert.equal(guard.adoptClientTimeZone("Europe/Berlin"), true);
+  assert.equal(guard.timeZone, "Europe/Berlin");
+
+  guard.setTimeZone("America/New_York");
+  assert.equal(guard.adoptClientTimeZone("America/Los_Angeles"), false);
+  assert.equal(guard.timeZone, "America/New_York");
+
+  // Restart with no OPENAGI_TIMEZONE in the environment (e.g. .env unwritable).
+  const reloaded = make();
+  assert.equal(reloaded.timeZone, "America/New_York");
+  assert.equal(reloaded.adoptClientTimeZone("America/Los_Angeles"), false);
+  assert.equal(reloaded.timeZone, "America/New_York");
+});
+
+test("POST /budget keeps an explicit time zone against X-OpenAGI-Timezone and reports when .env cannot be saved", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "budget-persist-"));
+  const prev = {};
+  for (const key of ["OPENAGI_DATA_DIR", "OPENAGI_DAILY_USD_LIMIT", "OPENAGI_TIMEZONE", "OPENAGI_TIME_ZONE"]) prev[key] = process.env[key];
+  process.env.OPENAGI_DATA_DIR = dataDir;
+  process.env.OPENAGI_DAILY_USD_LIMIT = "10";
+  delete process.env.OPENAGI_TIMEZONE;
+  delete process.env.OPENAGI_TIME_ZONE;
+
+  let app;
+  let runtime;
+  t.after(async () => {
+    if (app?.close) await app.close();
+    for (const store of [runtime?.observations, runtime?.vectorStore, runtime?.sessionIndex]) store?.db?.close();
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  runtime = createDurableRuntime({ dataDir, registerDefaults: false, integrations: false, skills: false, autoConnectMcp: false });
+  const authToken = "test-owner-token-budget-persist-1";
+  app = createHostedInterface(runtime, { dataDir, host: "127.0.0.1", port: 0, tickerMs: 0, authToken, nodeControlEnabled: false });
+  const { url: baseUrl } = await app.listen();
+  const headers = { authorization: `Bearer ${authToken}`, "content-type": "application/json" };
+
+  // Explicit selection, then a client in another zone polls /budget.
+  const tzRes = await fetch(`${baseUrl}/budget`, { method: "POST", headers, body: JSON.stringify({ timeZone: "America/New_York" }) });
+  assert.equal(tzRes.status, 200);
+  assert.equal((await tzRes.json()).persisted, true);
+  const polled = await fetch(`${baseUrl}/budget`, { headers: { ...headers, "x-openagi-timezone": "America/Los_Angeles" } }).then((r) => r.json());
+  assert.equal(polled.timeZone, "America/New_York");
+  assert.equal(runtime.budget.timeZone, "America/New_York");
+
+  // Make .env unwritable (a directory in its place): the lowered cap applies
+  // live, but the response must say it was not saved.
+  fs.rmSync(path.join(dataDir, ".env"), { force: true });
+  fs.mkdirSync(path.join(dataDir, ".env"));
+  const lowerRes = await fetch(`${baseUrl}/budget`, { method: "POST", headers, body: JSON.stringify({ dailyUsdLimit: 2 }) });
+  assert.equal(lowerRes.status, 200);
+  const lowered = await lowerRes.json();
+  assert.equal(lowered.dailyUsdLimit, 2);
+  assert.equal(runtime.budget.dailyUsdLimit, 2);
+  assert.equal(lowered.persisted, false);
+  assert.deepEqual(lowered.notPersisted, ["OPENAGI_DAILY_USD_LIMIT"]);
+  assert.equal(typeof lowered.persistenceError, "string");
+  assert.match(lowered.warning, /not saved/);
+});
+
 test("Recent unarchived sleeping Paseo chats (status=closed) stay visible, retain open questions, and skip auto-nudges", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-sleeping-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
