@@ -10,6 +10,36 @@ enum VoiceAudioError: Error { case unavailable }
 // Engine callbacks run on the audio thread. They are built in nonisolated
 // helpers that capture only Sendable values and hop to the main actor, so
 // Swift's isolation checks never see a main-actor closure off the main thread.
+// Where each spoken reply sits on the player's timeline, so an interruption
+// reports how much of the reply being heard was actually played. reply.done
+// marks a reply's end while its audio may still be playing; the next reply
+// starts a new span rather than reusing the old origin.
+struct ReplySpans: Equatable {
+    private(set) var spans: [(start: Int64, end: Int64?)] = []
+
+    mutating func audioScheduled(at start: Int64) {
+        if spans.last == nil || spans.last?.end != nil { spans.append((start, nil)) }
+    }
+
+    mutating func replyDone(endingAt end: Int64) {
+        guard !spans.isEmpty, spans[spans.count - 1].end == nil else { return }
+        spans[spans.count - 1].end = end
+    }
+
+    // Frames of the reply playing at `now` that were heard; 0 when none is.
+    func heard(at now: Int64) -> Int64 {
+        guard let span = spans.first(where: { $0.end.map { now < $0 } ?? true }), now > span.start else { return 0 }
+        return now - span.start
+    }
+
+    mutating func played(through now: Int64) { spans.removeAll { $0.end.map { $0 <= now } ?? false } }
+    mutating func reset() { spans.removeAll() }
+
+    static func == (a: ReplySpans, b: ReplySpans) -> Bool {
+        a.spans.count == b.spans.count && zip(a.spans, b.spans).allSatisfy { $0.start == $1.start && $0.end == $1.end }
+    }
+}
+
 @MainActor
 final class VoiceAudio: VoiceAudioIO {
     static let rate: Double = 24_000
@@ -27,7 +57,7 @@ final class VoiceAudio: VoiceAudioIO {
     private var onAudio: (@MainActor (Data) -> Void)?
     // Player sample positions, for "how much of this reply was heard".
     private var scheduledEnd: AVAudioFramePosition = 0
-    private var replyStart: AVAudioFramePosition?
+    private var replies = ReplySpans()
     private var completions: [Int: @MainActor () -> Void] = [:]
     private var nextCompletion = 0
 
@@ -62,7 +92,7 @@ final class VoiceAudio: VoiceAudioIO {
         }
         player.play()
         scheduledEnd = 0
-        replyStart = nil
+        replies.reset()
         self.onInterrupted = onInterrupted
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: session, queue: .main,
@@ -104,7 +134,7 @@ final class VoiceAudio: VoiceAudioIO {
         let now = currentSample()
         if Double(scheduledEnd - now) / Self.rate > Self.maxQueuedSeconds { return false }
         let start = max(scheduledEnd, now)
-        if replyStart == nil { replyStart = start }
+        replies.audioScheduled(at: start)
         scheduledEnd = start + AVAudioFramePosition(frames)
         player.scheduleBuffer(buffer, completionHandler: nil)
         if !player.isPlaying { player.play() }
@@ -119,7 +149,8 @@ final class VoiceAudio: VoiceAudioIO {
         let id = nextCompletion
         completions[id] = onPlayed
         scheduledEnd = max(scheduledEnd, currentSample()) + 1
-        replyStart = nil
+        // Keep this reply's origin until it has played or is interrupted.
+        replies.replyDone(endingAt: scheduledEnd)
         player.scheduleBuffer(marker, completionCallbackType: .dataPlayedBack,
                               completionHandler: Self.playedHandler(id: id, owner: self))
         if !player.isPlaying { player.play() }
@@ -127,12 +158,12 @@ final class VoiceAudio: VoiceAudioIO {
 
     func barge() -> Int {
         guard opened else { return 0 }
-        let heard = replyStart.map { max(0, currentSample() - $0) } ?? 0
+        let heard = replies.heard(at: currentSample())
         completions.removeAll()
         player.stop()
         player.play()
         scheduledEnd = 0
-        replyStart = nil
+        replies.reset()
         return Int(Double(heard) / Self.rate * 1_000)
     }
 
@@ -155,7 +186,10 @@ final class VoiceAudio: VoiceAudioIO {
     }
 
     fileprivate func deliver(_ pcm: Data) { onAudio?(pcm) }
-    fileprivate func played(_ id: Int) { completions.removeValue(forKey: id)?() }
+    fileprivate func played(_ id: Int) {
+        replies.played(through: currentSample())
+        completions.removeValue(forKey: id)?()
+    }
     fileprivate func interrupted() {
         let callback = onInterrupted
         close()

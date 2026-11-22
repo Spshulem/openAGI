@@ -189,6 +189,8 @@ struct ChatConversationView: View {
     // through the hub. Both sides land in this same thread, so typing after
     // it continues the same history.
     @State private var voice: VoiceSession?
+    // A voice start waiting on microphone permission; any stop invalidates it.
+    @State private var pendingVoiceStart: UUID?
     @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
@@ -243,8 +245,10 @@ struct ChatConversationView: View {
             onComposerFocusChanged(focused)
         }
         .task(id: conversation.identity) { await conversation.resume() }
-        .onDisappear { dictation.stop(); voice?.stop() }
-        .onChange(of: conversation.identity) { _, _ in dictation.stop(); voice?.stop() }
+        .onDisappear { dictation.stop(); stopVoice() }
+        .onChange(of: conversation.identity) { _, _ in dictation.stop(); stopVoice() }
+        // "This" means the card on screen now, not the one voice started on.
+        .onChange(of: conversation.focusedCardID) { _, id in voice?.setFocus(VoiceFocus(questionId: id)) }
         .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
             if !sending {
@@ -257,7 +261,7 @@ struct ChatConversationView: View {
             // Catching up on return (and pausing while away) is app-wide, for
             // every open chat: see ConversationLibrary.resumeOpenChats.
             // Voice never listens in the background.
-            if phase != .active { dictation.stop(); voice?.stop() }
+            if phase != .active { dictation.stop(); stopVoice() }
         }
     }
 
@@ -604,7 +608,7 @@ struct ChatConversationView: View {
             if let composerAccessory { composerAccessory(composerFocused) }
             if supportsVoice {
                 SupervisorVoiceBar(status: voice?.status ?? VoiceStatus(), note: voiceNote,
-                                   start: startVoice, stop: { voice?.stop() })
+                                   start: startVoice, stop: { stopVoice() })
             }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
@@ -661,16 +665,32 @@ struct ChatConversationView: View {
     }
 
     // The hub runs voice; a phone-only agent and read-only web chats have none.
+    // The hub records voice turns in the main Supervisor conversation only, so
+    // voice is offered only there, where the spoken turns will appear.
     private var supportsVoice: Bool {
-        conversation.thread == .supervisor && !conversation.isReadOnly && !model.isOnPhone
+        conversation.thread == .supervisor && conversation.conversationID == "main"
+            && !conversation.isReadOnly && !model.isOnPhone
+    }
+
+    private func stopVoice() {
+        pendingVoiceStart = nil
+        voice?.stop()
     }
 
     private func startVoice() {
         voiceNote = nil
         dictation.stop()
         composerFocused = false
+        let attempt = UUID()
+        pendingVoiceStart = attempt
+        let identity = conversation.identity
         Task {
-            guard await VoiceAudio.requestPermission() else {
+            let allowed = await VoiceAudio.requestPermission()
+            // Leaving the chat, switching chats, dictating, backgrounding or
+            // Stop while permission was pending must not start recording.
+            guard pendingVoiceStart == attempt, conversation.identity == identity, scenePhase == .active else { return }
+            pendingVoiceStart = nil
+            guard allowed else {
                 voiceNote = "Voice needs the microphone. Allow it in Settings › OpenAGI."
                 return
             }
@@ -687,7 +707,7 @@ struct ChatConversationView: View {
             if dictation.isListening || dictation.isStarting { dictation.stop() }
             else {
                 composerFocused = false
-                voice?.stop()
+                stopVoice()
                 Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
             }
         } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
