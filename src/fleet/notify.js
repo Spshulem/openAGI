@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import { DEFAULTS, clampText, clampTextLines } from "./contracts.js";
 import { isSuppressedByQuietCadence } from "./preferences.js";
-import { classifyAsk, renderDecisionContext, stripInternalIds } from "./decision-context.js";
+import { classifyAsk, isGenericAsk, renderDecisionContext, stripInternalIds } from "./decision-context.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const PUSH_TIMEOUT_MS = 5_000;
@@ -76,9 +76,13 @@ export function createNotifier({
   // so a refresh in place is not a new ping.
   const shown = (question) => {
     const ctx = contextOf(question);
-    const rawTitle = stripInternalIds(question.title) || "Needs your decision";
-    const headline = ctx?.decision ?? rawTitle;
-    const title = clampText(ctx?.itemName && !headline.startsWith(ctx.itemName) ? `${ctx.itemName}: ${headline}` : headline, limits.titleMax);
+    // The stored (often review-polished) title stands; only an empty or
+    // generic one ("needs your call. Answer?") is replaced by the item's name
+    // and the agent's actual question.
+    const rawTitle = stripInternalIds(question.title);
+    const generic = !rawTitle || isGenericAsk(rawTitle);
+    const headline = generic && ctx?.decision ? ctx.decision : (rawTitle || "Needs your decision");
+    const title = clampText(generic && ctx?.itemName && !headline.startsWith(ctx.itemName) ? `${ctx.itemName}: ${headline}` : headline, limits.titleMax);
     return {
       title,
       summary: ctx ? clampTextLines(renderDecisionContext(ctx), CONTEXT_SUMMARY_MAX) : clampText(stripInternalIds(question.body), limits.bodyMax),

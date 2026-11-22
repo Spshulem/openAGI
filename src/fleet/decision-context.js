@@ -171,6 +171,10 @@ const GENERIC_STATE_RE = /^(?:Paused at a decision checkpoint|Blocked at an exte
 // Asks that carry no decision of their own ("needs your call. Answer?").
 const GENERIC_ASK_RE = /^(?:answer\??|proceed\??|continue\??|question \d+.*|.{0,60}needs your (?:call|decision|input)\.?\s*(?:answer\?)?|.{0,40}\bAnswer\?)$/i;
 
+export function isGenericAsk(text) {
+  return GENERIC_ASK_RE.test(String(text ?? "").trim());
+}
+
 function splitSentences(text) {
   return String(text ?? "").replace(/\r/g, "").split(/(?<=[.!?])\s+|\n+/).map((t) => t.trim()).filter(Boolean);
 }

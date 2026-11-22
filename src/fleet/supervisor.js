@@ -942,8 +942,11 @@ export class FleetSupervisor {
       const reachable = this.mode === "auto"
         && thread
         && !thread.watchOnly && !thread.meta?.watchOnly
-        && question.kind !== "prompt"
+        // Only an agent's own ask: Supervisor-raised questions (limits,
+        // capped models, stuck groups) have no agent that knows more.
+        && ["agent-ask", "agent-card"].includes(question.kind)
         && !thread.meta?.pendingPermission
+        && !["running", "error"].includes(String(thread.agentStatus ?? "").toLowerCase())
         && ["paseo-send", "antigravity-send", "peer-relay"].includes(route)
         && budgetLeft > 0
         && !this.store.mutedUntil(thread.key);
