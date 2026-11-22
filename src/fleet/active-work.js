@@ -738,8 +738,24 @@ export class ActiveWorkManager {
     // what was actually delegated.
     const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 4000);
     const acceptanceCriteria = cleanText(input.acceptanceCriteria ?? existing?.acceptanceCriteria ?? existing?.doneCriteria ?? requestedDoneCriteria ?? defaultDoneCriteria, 500);
-    const currentStep = cleanText(input.currentStep ?? existing?.currentStep ?? input.progressSummary ?? "Queued for owner work", 300);
-    const nextMilestone = cleanText(input.nextMilestone ?? existing?.nextMilestone ?? nextAction ?? "Fresh owner evidence", 300);
+    const currentStepExplicit = input.currentStep !== undefined
+      ? Boolean(cleanText(input.currentStep, 300))
+      : Boolean(existing?.currentStepExplicit);
+    const currentStep = cleanText(
+      input.currentStep !== undefined
+        ? input.currentStep
+        : (currentStepExplicit ? existing?.currentStep : input.progressSummary ?? existing?.lastMeaningfulProgress?.summary ?? "Queued for owner work"),
+      300
+    );
+    const nextMilestoneExplicit = input.nextMilestone !== undefined
+      ? Boolean(cleanText(input.nextMilestone, 300))
+      : Boolean(existing?.nextMilestoneExplicit);
+    const nextMilestone = cleanText(
+      input.nextMilestone !== undefined
+        ? input.nextMilestone
+        : (nextMilestoneExplicit ? existing?.nextMilestone : nextAction ?? "Fresh owner evidence"),
+      300
+    );
     const blocker = cleanText(input.blocker ?? existing?.blocker ?? "", 300) || null;
     const nextActionOwnerExplicit = input.nextActionOwner !== undefined
       ? Boolean(cleanText(input.nextActionOwner, 120))
@@ -762,7 +778,9 @@ export class ActiveWorkManager {
     let item;
     let created = false;
     if (existing) {
-      const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria;
+      const acceptanceChanged = input.acceptanceCriteria !== undefined
+        && cleanText(input.acceptanceCriteria, 500) !== (existing.acceptanceCriteria ?? existing.doneCriteria ?? "");
+      const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria || acceptanceChanged;
       const ownerUpdated = input.owner !== undefined || input.threadKey !== undefined;
       const ownerChanged = ownerUpdated && (
         existing.owner?.threadKey !== owner.threadKey
@@ -812,6 +830,8 @@ export class ActiveWorkManager {
         nextAction: nextAction !== null ? nextAction : existing.nextAction,
         currentStep,
         nextMilestone,
+        currentStepExplicit,
+        nextMilestoneExplicit,
         blocker,
         nextActionOwner,
         eta,
@@ -889,6 +909,8 @@ export class ActiveWorkManager {
         nextAction,
         currentStep,
         nextMilestone,
+        currentStepExplicit,
+        nextMilestoneExplicit,
         blocker,
         nextActionOwner,
         eta,
@@ -2828,7 +2850,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
           project: { type: "string", maxLength: 80, description: "Project name (e.g. 'SEO', 'BuildBetter', 'bb-recorder')" },
           theme: { type: "string", maxLength: 80, description: "Optional theme/workstream (e.g. 'Ads', 'Content', 'Videos', 'Launch', 'QA', 'Release')" },
           customer: { type: "string", maxLength: 80, description: "Optional customer name for follow-through (e.g. 'AppFolio', 'Brex', 'Intruder', 'Kudos')" },
-          goal: { type: "string", minLength: 1, maxLength: 600, description: "Outcome or commitment to track" },
+          goal: { type: "string", minLength: 1, maxLength: 4000, description: "Outcome or commitment to track" },
           doneCriteria: { type: "string", maxLength: 500, description: "What 'done' means before this outcome can be marked verified" },
           nextAction: { type: "string", maxLength: 300, description: "Next expected step" },
           cadence: { type: "string", enum: ["hourly", "twice_daily", "daily", "weekly", "quiet"], description: "Follow-through check cadence (default 'daily')" },
@@ -2841,7 +2863,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         additionalProperties: false
       },
       prepareApprovalArgs: (args = {}) => {
-        const goal = cleanText(args.goal ?? "", 600);
+        const goal = cleanText(args.goal ?? "", 4000);
         if (!goal) throw new Error("Provide a goal to track.");
         const project = cleanText(args.project || args.customer || "General", 80);
         const theme = args.theme ? cleanText(args.theme, 80) : null;
