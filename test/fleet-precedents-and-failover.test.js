@@ -229,6 +229,31 @@ test("paseoThread detects [System Error] usage-limit on running sessions and swi
   assert.equal(createdSpec.config.modeId, "bypassPermissions");
   assert.match(createdSpec.prompt, /Ship Bob unified chat experience/);
 
+  // The owner's saved "ask" policy survives failover: no silent escalation
+  // to bypassPermissions for the replacement session.
+  await failoverPaseoSessionProvider({
+    config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+    thread: mapped,
+    reason: mapped.error.text,
+    factory: fakeFactory,
+    permissionMode: "ask"
+  });
+  assert.equal(createdSpec.config.modeId, "default", "ask policy creates the Claude replacement in default (asking) mode");
+  await withTempDir(async (dir) => {
+    const askSup = new FleetSupervisor({
+      dataDir: dir,
+      config: { enabled: false, mode: "auto", paseo: { enabled: true, only: true } },
+      deps: { paseoFactory: fakeFactory },
+      skip: { bb3: true, github: true }
+    });
+    askSup.store.savePreferences({ ...askSup.store.preferences(), defaultPermissionMode: "ask" });
+    askSup.knownThreads.set(mapped.key, mapped);
+    createdSpec = null;
+    const viaSupervisor = await askSup.switchPaseoProvider(mapped.key, { reason: mapped.error.text });
+    assert.equal(viaSupervisor.ok, true);
+    assert.equal(createdSpec.config.modeId, "default", "supervisor failover honors the saved ask policy");
+  });
+
   // Full FleetSupervisor switchPaseoProvider check with ActiveWork ownership transfer.
   await withTempDir(async (dir) => {
     const sup = new FleetSupervisor({
