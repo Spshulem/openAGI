@@ -349,6 +349,8 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
   const pendingCard = extractPaseoPendingCard(agent);
   const pendingPermission = extractPaseoPendingPermission(agent);
   const hasBlockingPermission = Boolean(pendingPermission) || (Boolean(agent.pendingPermissions?.length) && !pendingCard);
+  const permissionFeature = (Array.isArray(agent.features) ? agent.features : [])
+    .find((feature) => feature?.type === "select" && /permission|approval|sandbox|tool.?policy/i.test(`${feature.id} ${feature.label}`));
   const rawWorkspace = String(agent.workspaceId ?? "").trim();
   const conductorWorkspace = String(agent.labels?.["migration.conductorWorkspaceName"] ?? "").trim()
     || (/\/\.conductor\/([^/]+)/.exec(String(agent.cwd ?? ""))?.[1] ?? "");
@@ -387,6 +389,14 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
     error: currentError(agent, entries), openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
+      settings: {
+        model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
+        reasoningEffort: clampText(redactSecrets(agent.effectiveThinkingOptionId ?? agent.thinkingOptionId ?? ""), 80) || null,
+        permissions: permissionFeature?.value ? clampText(redactSecrets(permissionFeature.value), 80) : null,
+        pendingPermissionCount: Array.isArray(agent.pendingPermissions) ? agent.pendingPermissions.length : 0,
+        busy: Boolean(agent.activeTurn) || ["running", "initializing"].includes(agent.status),
+        authoritative: false
+      },
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
       requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
       ...(Object.keys(agentLabels).length ? { agentLabels } : {}),

@@ -59,6 +59,8 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
     answerQuestion: (id, answer) => app.proactive.answer(id, answer),
     actCard: (id, cardOp) => app.proactive.actCard(id, cardOp),
+    startSupervisorWalkthrough: () => { void app.startSupervisorWalkthrough() },
+    supervisorWalkthroughAction: operation => { void app.supervisorWalkthroughAction(operation) },
     markMoment: () => { void app.markMoment() },
     configureHomeMode: mode => { void app.configureHomeMode(mode) },
     previousPage: () => app.scrollUp(),

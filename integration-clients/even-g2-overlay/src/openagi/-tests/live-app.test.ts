@@ -33,7 +33,7 @@ async function fixture(initial: Partial<Omit<OpenAGIState, 'version'>> = {}, res
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), snapshotText: vi.fn(() => ''), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn<OpenAGIApiClient['askText']>(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon', sessionId: 'fixture-session' })), ask: vi.fn(), listen: vi.fn() }
   if (restored?.proactive) Object.assign(api, { proactive: restored.proactive })
-  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), lifelogHome: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn(), supervisorHome: vi.fn(), fleetStatus: vi.fn(), recent: vi.fn(), flash: vi.fn(), speaker: vi.fn() }
+  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), lifelogHome: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn(), supervisorHome: vi.fn(), supervisorWalkthrough: vi.fn(), fleetStatus: vi.fn(), recent: vi.fn(), flash: vi.fn(), speaker: vi.fn() }
   const phone = { draft: vi.fn(), set: vi.fn(), paired: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn(), recordingConsent: vi.fn(), lifelogState: vi.fn(), memoryStatus: vi.fn(), homeMode: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
@@ -590,6 +590,27 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
     await tap()
     expect(answer).toHaveBeenCalledWith('o-fleet', 'merged')
     expect(f.renderer.message).toHaveBeenLastCalledWith('Answered', 'merged. typed into Conductor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('walkthrough fallback keeps card action labels and returns to the card after backing out', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ homeMode: 'supervisor' })
+  try {
+    const state = {
+      active: true, paused: false, currentId: 'q:fq_walk', total: 1,
+      current: { id: 'q:fq_walk', kind: 'card' as const, title: 'PR ready', summary: 'CI is green', cardId: 'q:fq_walk', cardKind: 'merge_ready', prRef: 'acme/api#1', primaryLabel: 'Merge PR', ciState: 'passing', options: [] },
+      items: [{ id: 'q:fq_walk', kind: 'card' as const, title: 'PR ready', summary: 'CI is green', cardId: 'q:fq_walk', cardKind: 'merge_ready', prRef: 'acme/api#1', primaryLabel: 'Merge PR', ciState: 'passing', options: [] }],
+    }
+    const internal = f.app as unknown as { mode: string; supervisorWalkthrough: typeof state }
+    internal.supervisorWalkthrough = state; internal.mode = 'walkthrough'; f.app.proactive.items = []
+    vi.advanceTimersByTime(500); f.app.tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#1)', 'PR ready', false)
+    expect(internal.supervisorWalkthrough.currentId).toBe('q:fq_walk')
+    expect(internal.supervisorWalkthrough.active).toBe(true)
+    expect(internal.supervisorWalkthrough.total).toBe(1)
+    f.app.doubleTap(); await Promise.resolve()
+    expect(internal.mode).toBe('walkthrough')
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 

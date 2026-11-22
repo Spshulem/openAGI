@@ -162,7 +162,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
-  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
+  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor, dataDir });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
     ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM, MOBILE_PLATFORM] });
@@ -261,7 +261,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
-  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;

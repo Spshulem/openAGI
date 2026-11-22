@@ -5,6 +5,7 @@
 import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
 import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./walkthrough.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
@@ -52,7 +53,8 @@ async function readObject(readBody) {
   }
 }
 
-export function createFleetRoute({ supervisor } = {}) {
+export function createFleetRoute({ supervisor, dataDir } = {}) {
+  const walkthrough = supervisor ? new SupervisorWalkthrough({ dataDir: dataDir ?? supervisor.dataDir }) : null;
   const state = () => supervisor.getState();
 
   async function handleQuestion(id, readBody, sendOptions) {
@@ -140,6 +142,19 @@ export function createFleetRoute({ supervisor } = {}) {
         const area = url?.searchParams?.get("area") ?? null;
         if (!["24h", "7d"].includes(window) || (area && !FIX_AREAS.includes(area))) return fail(400, "Bad diagnose window or area.");
         return ok(await supervisor.diagnose({ window, area }));
+      }
+      if (parts.length === 1 && parts[0] === "walkthrough") {
+        if (!walkthrough) return fail(503, "Supervisor walkthrough is not available.");
+        if (method === "GET") return ok(walkthrough.read(state()));
+        if (method !== "POST") return fail(405, "Use GET or POST.");
+        const body = (await readObject(readBody)) ?? {};
+        const operation = typeof body.operation === "string" ? body.operation : body.op;
+        const expectedId = body.expectedId;
+        try { return ok(walkthrough.mutate(operation, expectedId, state())); }
+        catch (error) {
+          if (error instanceof WalkthroughError) return fail(error.status, error.message);
+          throw error;
+        }
       }
       if (parts[0] === "suggestions" && (parts.length === 1 || parts.length === 2)) {
         if (typeof supervisor.suggestions !== "function") return fail(503, "Suggestions are not available.");
@@ -628,6 +643,34 @@ export function createFleetRoute({ supervisor } = {}) {
           if (!thread) return fail(404, "No thread with that key in the last scan.");
           const conversation = await supervisor.threadConversation?.(threadKey);
           return ok({ thread: conversation ? { ...thread, conversation } : thread });
+        }
+        if (parts[2] === "settings") {
+          if (method === "GET") {
+            if (typeof supervisor.paseoSessionSettings !== "function") return fail(503, "Paseo session settings are not available.");
+            const result = await supervisor.paseoSessionSettings(threadKey);
+            if (result?.ok) return ok({ settings: result.settings });
+            const status = result?.status === "wrong-target" ? 409 : result?.status === "unavailable" ? 503 : 400;
+            return fail(status, result?.detail ?? "Paseo session settings could not be read.", { settings: result?.settings ?? null });
+          }
+          if (method !== "POST") return fail(405, "Use GET or POST.");
+          const body = (await readObject(readBody)) ?? {};
+          if (body.confirmed !== true) return fail(403, "An explicit owner confirmation is required.");
+          if (typeof supervisor.updatePaseoSessionSettings !== "function") return fail(503, "Paseo session settings are not available.");
+          const result = await supervisor.updatePaseoSessionSettings(threadKey, body, sendOptions);
+          if (result?.ok) return ok({ settings: result.settings, detail: result.detail });
+          const status = {
+            unauthorized: 403,
+            "wrong-target": 409,
+            "stale-target": 409,
+            pending: 409,
+            busy: 409,
+            unsupported: 422,
+            invalid: 400,
+            unavailable: 503,
+            failed: 502,
+            unconfirmed: 502
+          }[result?.status] ?? 400;
+          return fail(status, result?.detail ?? "Paseo session settings were not applied.", { settings: result?.settings ?? null });
         }
         if (parts[2] === "transcript") {
           if (method !== "GET") return fail(405, "Use GET.");
