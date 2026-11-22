@@ -26,6 +26,24 @@ final class ChatDictation {
         error = nil
         defer { if self.generation == generation { isStarting = false } }
         #if DEBUG
+        // The owner's report: dictate, pause about a second (iOS marks that
+        // segment final), then keep talking. Replayed through the same
+        // result handling the real recognizer uses.
+        if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-pause-fixture") {
+            self.updateDraft = update
+            isListening = true
+            Task {
+                let script: [(String, Bool, Int)] = [
+                    ("Before the pause", false, 200), ("Before the pause.", true, 200),
+                    ("After", false, 1200), ("After the pause it continues.", false, 200)
+                ]
+                for (text, isFinal, delay) in script {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    handle(text: text, isFinal: isFinal, failed: false, draft: draft, generation: generation)
+                }
+            }
+            return
+        }
         if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-fixture") {
             self.updateDraft = update
             isListening = true
@@ -79,12 +97,7 @@ final class ChatDictation {
                 let finished = result?.isFinal == true
                 let failed = failure != nil
                 Task { @MainActor [weak self] in
-                    guard let self, self.generation == generation else { return }
-                    if let text { self.receive(transcript: text, draft: draft, generation: generation) }
-                    if failed || finished {
-                        self.stop()
-                        if failed && text == nil { self.error = "Dictation stopped. Your draft is saved; tap the microphone to try again." }
-                    }
+                    self?.handle(text: text, isFinal: finished, failed: failed, draft: draft, generation: generation)
                 }
             }
             engine.prepare()
@@ -93,6 +106,16 @@ final class ChatDictation {
         } catch {
             stop()
             self.error = "Couldn't start dictation. Check microphone access and try again."
+        }
+    }
+
+    // One recognizer result, real or replayed by a UI test fixture.
+    private func handle(text: String?, isFinal: Bool, failed: Bool, draft: String, generation: UUID) {
+        guard self.generation == generation else { return }
+        if let text { receive(transcript: text, draft: draft, generation: generation) }
+        if failed || isFinal {
+            stop()
+            if failed && text == nil { error = "Dictation stopped. Your draft is saved; tap the microphone to try again." }
         }
     }
 
