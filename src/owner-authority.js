@@ -170,6 +170,22 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`reset\s+(?:today['’]?s\s+)?(?:extra|bonus)\s+budget\b`
     ].join("|"),
     tools: ["update_budget"]
+  },
+  // Editable skills: "create a skill for AI SEO", "update the customer report skill", "save this workflow as a skill".
+  skills: {
+    pattern: [
+      String.raw`(?:create|make|build|write|save|author|update|edit|modify|revise|improve|install)\b[^.!?\n]{0,90}?\bskills?\b`,
+      String.raw`(?:turn|save)\s+(?:this|that|it)\s+into\s+a\s+skill\b`
+    ].join("|"),
+    tools: ["create_skill", "update_skill", "read_skill"]
+  },
+  // Persistent goals & provider failover: "track this goal", "switch that chat to Claude/Antigravity".
+  goals: {
+    pattern: [
+      String.raw`(?:track|set|add|create|update|manage|verify|continue)\b[^.!?\n]{0,90}?\b(?:goals?|outcomes?|active\s+work|definition\s+of\s+done|cadence)\b`,
+      String.raw`(?:switch|move|fail\s*over|rotate|change)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|model)\b`
+    ].join("|"),
+    tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider"]
   }
 });
 

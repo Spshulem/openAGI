@@ -85,11 +85,12 @@ Do not invent work. Be conservative — fewer actions, higher signal.`;
 // Conservative on the empty path so we don't burn LLM cycles inventing
 // work. Users who want a different cadence can edit the cron job in
 // the dashboard; setting it to disabled turns the autopilot off entirely.
-const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue.
+const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue and advance active goals until their Definition of Done is genuinely met.
 
-1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do.
-2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, etc). When the task is done, call \`complete_task\` with the task id. If it's still in progress or needs to be deferred, call \`move_task\` to update its status / bucket / due date.
-   - DRAFT-ONLY tasks (tagged \`plan-action\`, or whose description says "produce a draft only"): prepare the artifact and leave it for the user — write the draft into your reply and/or save it, but do NOT send, publish, or schedule anything externally. Mark \`complete_task\` once the draft is ready for review.
+1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do (and check \`list_goals\` if multi-batch goals are active).
+2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, \`verify_goal_progress\`, etc).
+   - **CRITICAL CONTINUATION RULE (Never Stop After 10 Items):** If the user's goal covers an exhaustive set (e.g. "clean ALL my emails", "go through all 888 issues", "verify all 10 customer questions"), processing one batch of 5-20 items is NOT completion. Update progress via \`verify_goal_progress\` (recording \`cursor.processed\`, \`cursor.remaining\`, and \`cursor.lastCursorToken\`) or \`move_task\` so the next pulse automatically continues the next batch until \`remaining === 0\` and \`doneCriteria\` is verified. Only call \`complete_task\` once the ENTIRE goal is satisfied or blocked on a hard owner red line.
+   - DRAFT-ONLY & HARD RED LINES: Never merge PRs, deploy to production, send external emails/messages to customers, or spend money without explicit owner confirmation. Prepare drafts (\`save_draft\`) for human review when external sends are needed.
 3. If the queue is empty (\`{task: null}\`): you don't need to invent work. Glance at recent sessions only if something obviously needs a follow-up — otherwise reply "standing by" in one sentence and stop.
 
 The user is not in this conversation — the only output that matters is what you DO via tools, not what you say. Take no action if you have no committed work; do not summarize, do not editorialize.`;
@@ -311,12 +312,19 @@ export class AbiRuntime {
       // metered model the interval is the single biggest cost lever. Default
       // 30 min; set OPENAGI_AUTOPILOT_INTERVAL_MIN to slow it (e.g. 120 = 2h).
       const autopilotMin = Number(process.env.OPENAGI_AUTOPILOT_INTERVAL_MIN) || 30;
+      const existingPulse = this.cron.jobs?.get?.("agent-pulse") ?? null;
+      const upgradeLegacyPulse = Boolean(
+        existingPulse && !String(existingPulse.input?.prompt ?? "").includes("verify_goal_progress")
+      );
       this.cron.addJob({
         id: "agent-pulse",
         name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
-        enabled: true,
+        enabled: existingPulse ? existingPulse.enabled !== false : true,
+        replace: upgradeLegacyPulse,
         task: "autopilot",
         intervalMs: autopilotMin * 60 * 1000,
+        ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
+        ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
         input: {
           agentId: "main",
           prompt: AGENT_PULSE_PROMPT,

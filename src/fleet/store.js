@@ -80,7 +80,9 @@ function emptyState() {
     fixCommands: {},
     selfSessions: [],
     preferences: defaultPreferences(),
-    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} }
+    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
+    followThroughWatches: [],
+    supervisorChatNotices: {}
   };
 }
 
@@ -1337,7 +1339,9 @@ export class FleetStore {
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
       selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
       preferences: normalizePreferences(raw.preferences),
-      organization: normalizeOrganization(raw.organization)
+      organization: normalizeOrganization(raw.organization),
+      followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
+      supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {}
     };
   }
 
@@ -1486,6 +1490,73 @@ export class FleetStore {
       this._save();
     }
     return { ...assignment };
+  }
+
+  openFollowThroughWatches() {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    return list.filter((w) => w?.status === "watching").map((w) => ({ ...w }));
+  }
+
+  upsertFollowThroughWatch(input = {}) {
+    const threadKey = String(input.threadKey ?? "").trim();
+    if (!threadKey) return null;
+    const nowIso = iso(this.now());
+    this.state.followThroughWatches = (this.state.followThroughWatches ?? []).map((w) => (
+      w?.threadKey === threadKey && w.status === "watching"
+        ? { ...w, status: "superseded", resolvedAt: nowIso }
+        : w
+    ));
+    const watch = {
+      id: makeId("ftw"),
+      status: "watching",
+      threadKey,
+      title: clampText(redactSecrets(String(input.title ?? threadKey)), 120),
+      goalId: input.goalId ? clampText(String(input.goalId), 80) : null,
+      directiveSummary: clampText(redactSecrets(String(input.directiveSummary ?? "")), 240),
+      source: clampText(String(input.source ?? "owner-message"), 40),
+      sentAt: typeof input.sentAt === "string" && Number.isFinite(Date.parse(input.sentAt)) ? input.sentAt : nowIso,
+      baselineAgentAt: typeof input.baselineAgentAt === "string" ? input.baselineAgentAt : null,
+      baselineActivityAt: typeof input.baselineActivityAt === "string" ? input.baselineActivityAt : null,
+      createdAt: nowIso
+    };
+    this.state.followThroughWatches = [...this.state.followThroughWatches, watch].slice(-60);
+    this._save();
+    return { ...watch };
+  }
+
+  resolveFollowThroughWatch(id, { outcome = "settled", detail = null } = {}) {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    const match = list.find((w) => w?.id === id);
+    if (!match) return null;
+    match.status = "resolved";
+    match.outcome = clampText(String(outcome), 40);
+    match.detail = detail ? clampText(redactSecrets(String(detail)), 300) : null;
+    match.resolvedAt = iso(this.now());
+    this._save();
+    return { ...match };
+  }
+
+  lastSupervisorChatNotice(dedupeKey) {
+    if (!dedupeKey) return null;
+    const entry = this.state.supervisorChatNotices?.[dedupeKey];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  recordSupervisorChatNotice(dedupeKey, summary = "") {
+    const key = String(dedupeKey ?? "").trim().slice(0, 120);
+    if (!key) return null;
+    this.state.supervisorChatNotices ??= {};
+    const entry = {
+      at: iso(this.now()),
+      summary: clampText(redactSecrets(String(summary ?? "")), 220)
+    };
+    this.state.supervisorChatNotices[key] = entry;
+    const keys = Object.keys(this.state.supervisorChatNotices);
+    if (keys.length > 100) {
+      delete this.state.supervisorChatNotices[keys[0]];
+    }
+    this._save();
+    return { ...entry };
   }
 
   _save() {

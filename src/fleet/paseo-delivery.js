@@ -121,6 +121,290 @@ function confirmedOwnerSteeredOrQueuedMessage(history, receipt) {
   return history?.agent?.status === "running";
 }
 
+const hostUsageCache = new WeakMap();
+const HOST_USAGE_TTL_MS = 5 * 60_000;
+
+export function parseModelVersionScore(modelId, provider = "") {
+  const raw = String(modelId ?? "").toLowerCase();
+  const prov = String(provider ?? "").toLowerCase();
+  let major = 0;
+  let minor = 0;
+  const claudeVer = /(?:opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/.exec(raw);
+  const gptVer = /gpt-(\d+)(?:[.-](\d+))?/.exec(raw);
+  const geminiVer = /gemini-(\d+)(?:[.-](\d+))?/.exec(raw);
+  const match = claudeVer || gptVer || geminiVer;
+  if (match) {
+    major = Number(match[1]) || 0;
+    minor = Number(match[2]) || 0;
+  }
+  let tier = 50;
+  if (prov === "claude" || /claude|opus|sonnet|haiku|fable/.test(raw)) {
+    if (raw.includes("opus")) tier = 90;
+    else if (raw.includes("fable")) tier = 80;
+    else if (raw.includes("sonnet")) tier = 65;
+    else if (raw.includes("haiku")) tier = 30;
+  } else if (prov === "codex" || raw.includes("gpt")) {
+    if (raw.includes("sol")) tier = 90;
+    else if (raw.includes("astra")) tier = 85;
+    else if (raw.includes("mini") || raw.includes("nano") || raw.includes("luna")) tier = 25;
+    else tier = 70;
+  } else if (prov === "antigravity" || raw.includes("gemini")) {
+    if (raw.includes("carbon-high") || raw.includes("pro")) tier = 90;
+    else if (raw.includes("argon-high")) tier = 80;
+    else if (raw.includes("medium")) tier = 65;
+  }
+  return major * 1000 + minor * 20 + tier;
+}
+
+export async function readHostModelUsageCounts(api) {
+  if (typeof api?.agents?.list !== "function") return new Map();
+  const cached = hostUsageCache.get(api);
+  if (cached && Date.now() - cached.at < HOST_USAGE_TTL_MS) {
+    return cached.counts;
+  }
+  const counts = new Map();
+  try {
+    const res = await api.agents.list({
+      filter: { includeArchived: false, includeBackground: true },
+      sort: [{ key: "updated_at", direction: "desc" }],
+      page: { limit: 80 }
+    });
+    for (const entry of res?.entries ?? []) {
+      const a = entry?.agent ?? entry;
+      const model = String(a?.model ?? "").trim();
+      const prov = String(a?.provider ?? "").trim().toLowerCase();
+      if (!model) continue;
+      const key = prov ? `${prov}/${model}` : model;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      counts.set(model, (counts.get(model) ?? 0) + 1);
+    }
+    hostUsageCache.set(api, { at: Date.now(), counts });
+  } catch { /* fallback to version & preference ranking */ }
+  return counts;
+}
+
+export function selectBestPaseoModel(providerEntry, { usageCounts = null, preferredModelId = null } = {}) {
+  const rawModels = Array.isArray(providerEntry?.models)
+    ? providerEntry.models.filter((m) => m?.id && m?.isSelectable !== false)
+    : [];
+  if (!rawModels.length) return null;
+  const provider = String(providerEntry?.provider ?? "").toLowerCase();
+
+  // Hard guard: never auto-select deprecated 4.x Claude models (e.g. Opus 4.7)
+  // when 5.x+ models exist in the catalog, even if an older CLI marks 4.7 isDefault.
+  const hasGen5PlusClaude = provider === "claude"
+    && rawModels.some((m) => /(?:opus|sonnet|haiku|fable)-[5-9]\b/.test(String(m.id).toLowerCase()));
+  const candidates = hasGen5PlusClaude
+    ? rawModels.filter((m) => !/(?:opus|sonnet|haiku)-4\b/.test(String(m.id).toLowerCase()))
+    : rawModels;
+
+  const pref = typeof preferredModelId === "string" ? preferredModelId.trim().toLowerCase() : "";
+  if (pref) {
+    const exact = candidates.find(
+      (m) => String(m.id).toLowerCase() === pref || String(m.label ?? "").toLowerCase() === pref
+    );
+    if (exact) return exact;
+  }
+
+  let best = candidates[0];
+  let bestScore = -Infinity;
+  for (let idx = 0; idx < candidates.length; idx += 1) {
+    const m = candidates[idx];
+    const id = String(m.id);
+    const verScore = parseModelVersionScore(id, provider);
+    const uses = usageCounts instanceof Map
+      ? (usageCounts.get(`${provider}/${id}`) ?? usageCounts.get(id) ?? 0)
+      : 0;
+    // Usage frequency boosts models the owner actively uses (e.g. 73 sessions on opus-5-5),
+    // combined with semantic version & tier so newer flagships always beat stale models.
+    const usageBonus = uses > 0 ? Math.round(Math.log2(1 + uses) * 180) : 0;
+    const catalogOrderBonus = Math.max(0, 20 - idx);
+    const total = verScore + usageBonus + catalogOrderBonus;
+    if (total > bestScore) {
+      bestScore = total;
+      best = m;
+    }
+  }
+  return best;
+}
+
+export function resolveDefaultPaseoModeId(
+  providerEntry,
+  { permissionMode = "bypass", explicitModeId = null, sourceAgent = null } = {}
+) {
+  if (typeof explicitModeId === "string" && explicitModeId.trim()) {
+    return explicitModeId.trim();
+  }
+  const provider = String(providerEntry?.provider ?? "").toLowerCase();
+  const modes = Array.isArray(providerEntry?.modes)
+    ? providerEntry.modes.filter((m) => m?.id && m.id !== "plan")
+    : [];
+  const modeIds = new Set(modes.map((m) => String(m.id)));
+
+  // Owner default: bypass permissions unless explicitly requested otherwise.
+  if (permissionMode === "bypass") {
+    if (modeIds.has("bypassPermissions")) return "bypassPermissions";
+    if (modeIds.has("full-access")) return "full-access";
+    if (modeIds.has("full")) return "full";
+    if (provider === "claude") return "bypassPermissions";
+    if (provider === "codex" || provider === "antigravity") return "full-access";
+  }
+
+  if (permissionMode === "ask") {
+    if (modeIds.has("default")) return "default";
+    if (modeIds.has("auto")) return "auto";
+    return provider === "claude" ? "default" : "auto";
+  }
+
+  const sourceMode = String(sourceAgent?.modeId ?? "").trim();
+  if (["full-access", "bypassPermissions"].includes(sourceMode)) {
+    if (modeIds.has("bypassPermissions")) return "bypassPermissions";
+    if (modeIds.has("full-access")) return "full-access";
+  }
+  const def = String(providerEntry?.defaultModeId ?? "").trim();
+  if (def && def !== "plan") return def;
+  for (const candidate of ["bypassPermissions", "full-access", "auto", "auto-review", "acceptEdits", "default"]) {
+    if (modeIds.has(candidate)) return candidate;
+  }
+  if (provider === "claude") return "bypassPermissions";
+  if (provider === "codex" || provider === "antigravity") return "full-access";
+  return modes[0]?.id ?? null;
+}
+
+function selectPreferredModel(providerEntry, usageCounts = null, preferredModelId = null) {
+  return selectBestPaseoModel(providerEntry, { usageCounts, preferredModelId });
+}
+
+function selectExecutionModeId(providerEntry, sourceAgent = null, permissionMode = "bypass") {
+  return resolveDefaultPaseoModeId(providerEntry, { permissionMode, sourceAgent });
+}
+
+// Automatically switches a quota-exhausted or auth-blocked Paseo coding session
+// onto another healthy provider (e.g. Codex -> Claude or Antigravity) in the
+// exact same host & working directory, preserving bounded transcript + goal context.
+export async function failoverPaseoSessionProvider({
+  config,
+  thread,
+  reason = "provider usage limit",
+  goalContext = null,
+  preferredProviders = ["claude", "antigravity", "codex"],
+  factory
+} = {}) {
+  if (!config?.paseo?.enabled || thread?.kind !== "paseo") {
+    return { ok: false, detail: "Paseo is not enabled for this thread." };
+  }
+  const serverId = thread?.meta?.serverId;
+  const agentId = thread?.id;
+  if (!serverId || !agentId) {
+    return { ok: false, detail: "Missing Paseo serverId or agentId." };
+  }
+
+  return withPaseo(config, async (client, signal) => {
+    const api = await hostApi(client, serverId);
+    const ref = api.agents.ref(agentId);
+    await ref.refresh().catch(() => {});
+    signal.throwIfAborted();
+    const agent = ref.current();
+    const cwd = String(agent?.cwd ?? thread?.meta?.paseoCwd ?? "").trim();
+    if (!cwd || typeof api?.providers?.waitForReady !== "function" || typeof api?.agents?.create !== "function") {
+      return { ok: false, detail: "Paseo host does not expose provider catalog or session creation for this workspace." };
+    }
+
+    const currentProviderRaw = String(agent?.provider ?? thread?.meta?.provider ?? "").trim().toLowerCase();
+    const exhaustedProvider = currentProviderRaw.split("/")[0] || "codex";
+
+    let timelineEntries = [];
+    try {
+      const history = await ref.timeline.refetch({ direction: "tail", limit: 30 });
+      timelineEntries = Array.isArray(history?.entries) ? history.entries : [];
+    } catch { /* fallback to cached thread conversation */ }
+    signal.throwIfAborted();
+
+    const snap = await api.providers.waitForReady({ cwd, timeoutMs: 8000 });
+    const entries = Array.isArray(snap?.entries) ? snap.entries : [];
+    const readyAlternates = entries.filter(
+      (e) => e?.status === "ready" && e?.provider && String(e.provider).toLowerCase() !== exhaustedProvider
+    );
+    if (!readyAlternates.length) {
+      return {
+        ok: false,
+        exhaustedProvider,
+        detail: `No healthy alternate Paseo provider is ready on ${serverId} (exhausted: ${exhaustedProvider}).`
+      };
+    }
+
+    let chosen = null;
+    for (const pref of preferredProviders) {
+      const match = readyAlternates.find((e) => String(e.provider).toLowerCase() === String(pref).toLowerCase());
+      if (match) {
+        chosen = match;
+        break;
+      }
+    }
+    chosen ??= readyAlternates[0];
+    const usageCounts = await readHostModelUsageCounts(api);
+    const chosenProviderLower = String(chosen?.provider ?? "").toLowerCase();
+    const defaultPreferredModel = chosenProviderLower === "claude"
+      ? "claude-opus-5-5"
+      : chosenProviderLower === "codex"
+        ? "gpt-6.2-sol"
+        : null;
+    const chosenModel = selectPreferredModel(chosen, usageCounts, defaultPreferredModel);
+    if (!chosen?.provider || !chosenModel?.id) {
+      return { ok: false, exhaustedProvider, detail: `Alternate provider ${chosen?.provider ?? "?"} has no selectable model.` };
+    }
+
+    const priorTail = (timelineEntries.length
+      ? timelineEntries
+          .filter((e) => ["user_message", "assistant_message"].includes(e?.item?.type) && !/^\[System Error\]/i.test(String(e?.item?.text ?? "").trim()))
+          .slice(-6)
+          .map((e) => `${e.item.type === "user_message" ? "Owner" : "Assistant"}: ${clampText(redactSecrets(String(e.item.text ?? "")), 420)}`)
+      : (thread?.meta?.conversation ?? [])
+          .filter((m) => !/^\[System Error\]/i.test(String(m?.text ?? "").trim()))
+          .slice(-6)
+          .map((m) => `${m.role === "user" ? "Owner" : "Assistant"}: ${clampText(redactSecrets(String(m.text ?? "")), 420)}`)
+    ).join("\n");
+
+    const baseTitle = clampText(redactSecrets(String(agent?.title ?? thread?.title ?? path.basename(cwd))), 72) || path.basename(cwd);
+    const prLine = thread?.prRefs?.length ? `Linked PR(s): ${thread.prRefs.slice(0, 3).join(", ")}\n` : "";
+    const goalLine = goalContext?.goal
+      ? `Tracked Goal: ${clampText(redactSecrets(goalContext.goal), 260)}\nDefinition of Done: ${clampText(redactSecrets(goalContext.doneCriteria || "Verify all in-scope work is complete."), 260)}\n`
+      : "";
+    const prompt = [
+      `[OpenAGI supervisor] Automatic provider failover: continuing "${baseTitle}" on ${chosen.provider}/${chosenModel.id} because the previous ${exhaustedProvider} runtime hit ${clampText(redactSecrets(reason), 120)}.`,
+      prLine + goalLine,
+      priorTail ? `Recent conversation before quota block:\n${priorTail}` : "",
+      "Instructions: First run `git status -sb` and `git log -n 3 --oneline` in this workspace to inspect what already landed or is uncommitted. Continue the unfinished in-scope work seamlessly without redoing completed steps. Respect hard red lines: do not merge PRs, deploy to production, send external customer messages, or spend money without explicit owner confirmation."
+    ].filter(Boolean).join("\n\n");
+
+    const executionModeId = selectExecutionModeId(chosen, agent);
+    const created = await api.agents.create({
+      config: {
+        provider: `${chosen.provider}/${chosenModel.id}`,
+        ...(executionModeId ? { modeId: executionModeId } : {})
+      },
+      cwd,
+      title: baseTitle,
+      prompt
+    });
+    if (!created?.id) {
+      return { ok: false, exhaustedProvider, detail: "Paseo host returned no session id when creating failover continuation." };
+    }
+
+    return {
+      ok: true,
+      oldKey: thread.key,
+      newKey: `paseo:${serverId}.${created.id}`,
+      serverId,
+      agentId: created.id,
+      exhaustedProvider,
+      provider: `${chosen.provider}/${chosenModel.id}`,
+      cwd,
+      title: baseTitle
+    };
+  }, factory);
+}
+
 async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEntries, text, images, serverId }) {
   const cwd = String(agent?.cwd ?? thread?.meta?.paseoCwd ?? "").trim();
   if (!cwd || typeof api?.providers?.waitForReady !== "function" || typeof api?.agents?.create !== "function") {
@@ -128,10 +412,15 @@ async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEnt
   }
   const snap = await api.providers.waitForReady({ cwd, timeoutMs: 8000 });
   const entries = Array.isArray(snap?.entries) ? snap.entries : [];
-  const ready = entries.find((e) => e?.status === "ready" && e?.provider === "codex")
-    ?? entries.find((e) => e?.status === "ready" && e?.provider === "claude")
+  const ready = entries.find((e) => e?.status === "ready" && e?.provider === "claude")
+    ?? entries.find((e) => e?.status === "ready" && e?.provider === "codex")
     ?? entries.find((e) => e?.status === "ready");
-  const model = ready?.models?.find((m) => m?.isDefault) ?? ready?.models?.[0] ?? null;
+  const usageCounts = await readHostModelUsageCounts(api);
+  const readyProvLower = String(ready?.provider ?? "").toLowerCase();
+  const model = selectBestPaseoModel(ready, {
+    usageCounts,
+    preferredModelId: readyProvLower === "claude" ? "claude-opus-5-5" : readyProvLower === "codex" ? "gpt-6.2-sol" : null
+  });
   if (!ready?.provider || !model?.id) return null;
 
   const priorTail = (Array.isArray(baselineEntries) ? baselineEntries : [])
@@ -145,8 +434,12 @@ async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEnt
     ? `Continuing from Paseo session "${baseTitle}" (whose previous ${agent?.provider ?? "agent"} runtime disconnected).\n\nRecent context:\n${priorTail}\n\nNew owner request:\n${cleanOriginal || text}`
     : (cleanOriginal || text);
 
+  const executionModeId = selectExecutionModeId(ready, agent);
   const created = await api.agents.create({
-    config: { provider: `${ready.provider}/${model.id}` },
+    config: {
+      provider: `${ready.provider}/${model.id}`,
+      ...(executionModeId ? { modeId: executionModeId } : {})
+    },
     cwd,
     title: baseTitle,
     prompt: recoveryPrompt
@@ -318,10 +611,11 @@ async function respondPaseoPermission(api, ref, agentId, requestId, response) {
   throw new Error("Paseo client does not support respondToPermission");
 }
 
-function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false } = {}) {
+function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false, errorRecovery = false } = {}) {
   if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
-  if (!ownerInitiated && !silentStuckRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (errorRecovery && (!["idle", "error"].includes(agent.status) || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
   if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
@@ -340,6 +634,10 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const silentStuckRecovery = !ownerInitiated
     && Boolean(thread?.meta?.silentStuck)
     && ["status-check", "resume", "unblock-snag"].includes(base?.playbook);
+  const errorRecovery = !ownerInitiated && (
+    base?.playbook === "error-retry"
+    || String(base?.playbook ?? "").startsWith("precedent:")
+  );
   const normalizedImages = normalizePaseoImages(images);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
@@ -438,14 +736,14 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
         }
       }
-      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery });
+      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
       if (preflight) return blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: ownerInitiated ? 8 : 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
       // refetch updates the SDK handle; check both snapshots so a newer event
       // or an unavailable baseline cannot be hidden by the other snapshot.
-      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery });
+      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
       if (changed) return blocked(changed);
       const messageId = randomUUID();
       const cursor = timelineCursor(baseline);
@@ -560,6 +858,10 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         status: "sent",
         route: "paseo-send",
         actionId,
+        messageId: correlated.clientMessageId ?? messageId,
+        ...(correlated.providerMessageId ? { providerMessageId: correlated.providerMessageId } : {}),
+        ...(correlated.turnId ? { turnId: correlated.turnId } : {}),
+        verifiedAt: new Date().toISOString(),
         ...(normalizedImages.length ? { attachedImages: normalizedImages.length } : {}),
         detail: normalizedImages.length ? `Paseo message, ${normalizedImages.length} image(s), and turn confirmed` : "Paseo message and turn confirmed"
       };

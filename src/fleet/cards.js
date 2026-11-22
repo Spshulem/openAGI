@@ -386,70 +386,220 @@ function activeReviewBrief(question) {
     : null;
 }
 
-function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
+const TRIVIAL_CONTINUATION_USER_MSG_RE = /^(?:\[openagi supervisor\]|continue\b|resume(?:\s+working)?\.?$|yes\.?$|no\.?$|ok(?:ay)?\.?$|go ahead\.?$|proceed\.?$|status\??$|what(?:'s| is) the status\??$|done\.?$|got it\.?$|allow\.?$)/i;
+
+function extractSubstantiveGoalMessage(messages = []) {
+  const userMsgs = messages
+    .filter((m) => m && m.role === "user" && typeof m.text === "string" && m.text.trim())
+    .map((m) => cleanBriefProse(m.text))
+    .filter((txt) => txt && !/^The previous turn stopped because of a temporary provider/i.test(txt) && !TRIVIAL_CONTINUATION_USER_MSG_RE.test(txt.trim()));
+  if (!userMsgs.length) return null;
+  // Prefer the earliest substantive goal prompt in the window over short follow-ups.
+  const substantial = userMsgs.find((txt) => txt.length >= 28) ?? userMsgs[0];
+  return substantial || null;
+}
+
+function extractPermissionDetail(question, thread = null) {
+  const perm = thread?.meta?.pendingPermission;
+  const cmd = perm?.input?.command ?? perm?.command ?? question?.meta?.command ?? null;
+  const toolName = perm?.toolName ?? perm?.name ?? null;
+  if (typeof cmd === "string" && cmd.trim()) {
+    return {
+      toolName: toolName ? String(toolName) : "Bash",
+      command: clampText(redactSecrets(cmd.trim().replace(/\s+/g, " ")), 220)
+    };
+  }
+  const rawSource = String(question?.card || question?.body || "");
+  const backtickCmd = /`([^`\n]{4,220})`/.exec(rawSource)?.[1] ?? null;
+  if (backtickCmd) {
+    return {
+      toolName: toolName ? String(toolName) : null,
+      command: clampText(redactSecrets(backtickCmd.trim()), 220)
+    };
+  }
+  return toolName ? { toolName: String(toolName), command: null } : null;
+}
+
+function buildCurrentStateSummary(question, row, { kind, prMeta = null, thread = null } = {}) {
+  const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
+  const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
+  const prLabel = prMeta?.ref ? (prMeta.ref.includes("#") ? `PR #${prMeta.ref.split("#").pop()}` : prMeta.ref) : null;
+  const diffStat = formatDiffSummary(prMeta);
+
+  if (kind === "merge_ready") {
+    if (ci === "PENDING" || ci === "IN_PROGRESS") {
+      return `${prLabel ?? "Pull request"} is open${diffStat ? ` (${diffStat})` : ""} · CI checks still running — waiting before merge.`;
+    }
+    const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
+    return `Code complete · ${prLabel ?? "PR"} open${diffStat ? ` (${diffStat})` : ""} · CI green${threads > 0 ? ` · ${threads} open review thread(s)` : ""} — paused at your merge gate.`;
+  }
+  if (kind === "ci_failed") {
+    if (mergeState === "DIRTY") {
+      return `${prLabel ?? "Pull request"} has merge conflicts against base — blocked until rebased and re-verified.`;
+    }
+    const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
+    return `${prLabel ?? "Pull request"} stopped with failing CI${failing ? ` (${failing})` : ""} — needs fix before merge.`;
+  }
+  if (question.kind === "prompt") {
+    const perm = extractPermissionDetail(question, thread);
+    const toolLabel = perm?.toolName || (/bash/i.test(String(question.title ?? "")) ? "shell command" : "tool");
+    return `Paused mid-task waiting for ${toolLabel} approval${prLabel ? ` (${prLabel})` : ""} — has not executed this step yet.`;
+  }
+  if (question.kind === "session-error") {
+    return `Stopped on a runtime/tool error${prLabel ? ` (${prLabel})` : ""} — waiting on recovery or your direction.`;
+  }
+  if (kind === "blocker" || ["stuck", "limit", "open", "deliver"].includes(String(question.kind ?? ""))) {
+    return `Blocked at an external/environment gate${prLabel ? ` (${prLabel})` : ""} — cannot advance without your unblock.`;
+  }
+  return `Paused at a decision checkpoint${prLabel ? ` (${prLabel})` : ""} — waiting for your call before continuing.`;
+}
+
+function buildRecommendation(question, row, prRef, prefs, prMeta = null, thread = null) {
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   const mergeDirty = prMeta?.mergeState === "DIRTY" || row?.pr?.mergeState === "DIRTY";
   const mergeReadyAsk = isMergeReadyQuestion(question, row, prRef, prMeta);
+  const prShort = prRef && String(prRef).includes("#") ? `PR #${String(prRef).split("#").pop()}` : (prRef || "this PR");
   if (mergeReadyAsk) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
-      return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
+      return `Recommend: Do not merge yet — CI failed${failing ? ` (${failing})` : ""}; send back to the coding session first.`;
     }
     if (mergeDirty) {
-      return "Pull request has merge conflicts with the base branch. Have the coding session rebase before merging.";
+      return `Recommend: Do not merge yet — have the session rebase ${prShort} onto base and re-verify.`;
     }
     if (ci === "PENDING" || ci === "IN_PROGRESS") {
-      return "Checks are still running. Auto-merge is off by default; tap Watch CI to get pinged when green.";
+      return `Recommend: Hold merge while CI finishes — tap Watch CI to get notified once checks turn green.`;
     }
   }
   const rb = activeReviewBrief(question);
   if (rb?.recommendation) {
-    return clampText(redactSecrets(rb.recommendation), 220);
+    const cleanRec = clampText(redactSecrets(rb.recommendation), 220);
+    if (cleanRec && !/^reply right below\b/i.test(cleanRec) && !/^tap view chat\b/i.test(cleanRec)) {
+      return cleanRec;
+    }
   }
   if (mergeReadyAsk) {
     const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
     const gatePass = Array.isArray(prMeta?.gates) && prMeta.gates.length > 0 && prMeta.gates.every((g) => g.state === "SUCCESS")
-      ? ` · ${prMeta.gates.map((g) => g.label).join(", ")} green`
+      ? ` (${prMeta.gates.map((g) => g.label).join(", ")} green)`
       : "";
-    return `CI green${gatePass}${threads === 0 ? " · 0 open threads" : ` · ${threads} review thread(s)`}. Ready for your merge confirmation.`;
+    if (threads > 0) {
+      return `Recommend: Inspect the ${threads} open review thread(s) on ${prShort} before merging; CI is green${gatePass}.`;
+    }
+    return `Recommend: Merge ${prShort} after a quick diff check — CI is green${gatePass} with 0 open review threads.`;
   }
   if (question.kind === "completed") {
-    return "Tap View Chat to inspect the full conversation, reply below to follow up, or Dismiss to clear this notification.";
+    return "Session finished — inspect the result or Dismiss.";
   }
-  if (parsePaseoThreadKey(question.threadKey ?? row?.key)) {
-    return "Reply right below to answer or steer this session directly without opening the chat.";
+  if (question.kind === "prompt") {
+    const perm = extractPermissionDetail(question, thread);
+    const cmd = perm?.command ?? "";
+    if (cmd && /\b(?:merge|push\s+--force|reset\s+--hard|rm\s+-rf|deploy|prod)/i.test(cmd)) {
+      return `Recommend: Inspect carefully before allowing — command touches merge/deploy/destructive state (\`${clampText(cmd, 90)}\`).`;
+    }
+    if (cmd) {
+      return `Recommend: Allow if \`${clampText(cmd, 90)}\` matches this task's scope, or Deny to steer another way.`;
+    }
+    return "Recommend: Allow if this local step matches the workspace goal above, or Deny with instructions.";
+  }
+  const bodyText = String(question?.card || question?.body || "");
+  const explicitRecLine = /(?:^|\n)\s*(?:[-*•]|\d+[.)])?\s*\*{0,2}([^*\n]{3,90}?)\s*\(recommended\)\*{0,2}/i.exec(bodyText)?.[1]?.trim();
+  if (explicitRecLine) {
+    return `Recommend: ${clampText(redactSecrets(explicitRecLine), 180)}.`;
+  }
+  const realOptions = (Array.isArray(question?.options) ? question.options : [])
+    .map((o) => String(o ?? "").trim())
+    .filter((o) => o && !["dismiss", "later", "open thread", "opened", "wait", "skip"].includes(o.toLowerCase()));
+  if (realOptions.length > 0) {
+    return `Recommend: "${humanOptionLabel(realOptions[0])}" if the caveats above look right — otherwise pick another option or reply below.`;
   }
   if (row?.reason && !/^agent asks:/i.test(row.reason)) {
-    return clampText(redactSecrets(row.reason), 200);
+    return `Recommend: Review blocker (${clampText(redactSecrets(row.reason), 140)}) and reply with the unblock step.`;
+  }
+  return "Recommend: Open details or reply below with your call on the blocker above.";
+}
+
+function extractUserStoryFromPrBody(bodySummary) {
+  const raw = String(bodySummary ?? "");
+  if (!raw.trim()) return null;
+  const match = /(?:^|\n)##+\s*(?:User\s+story|Why|Goal|Problem|Context)\s*\n+([\s\S]*?)(?=\n##+\s|\s*$)/i.exec(raw);
+  if (match?.[1]) {
+    const cleaned = cleanBriefProse(match[1]);
+    if (cleaned) return clampText(cleaned, 280);
   }
   return null;
 }
 
-function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [] } = {}) {
+function isProcessOnlyWhatChanged(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return true;
+  if (raw.length > 260) return false;
+  return /\b(?:verification\s+run|certificate\s+passed|open\s+review\s+threads|independent\s+human\s+review|no\s+later\s+merge)\b/i.test(raw)
+    && !/\b(?:adds?|fixes?|updates?|routes?|changes?|replaces?|introduces?|supports?)\b/i.test(raw);
+}
+
+function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [], activeGoal = null, thread = null } = {}) {
   const rb = activeReviewBrief(question);
-  const lastUserMsg = [...recentMessages].reverse().find((m) => m.role === "user" && m.text)?.text ?? null;
-  const fallbackContext = lastUserMsg
-    ? `You asked: "${clampText(cleanBriefProse(lastUserMsg), 170)}"`
-    : (sessionTitle && !String(headline).toLowerCase().includes(sessionTitle.toLowerCase())
-        ? `Session: ${sessionTitle}`
-        : null);
+  const substantiveUserGoal = extractSubstantiveGoalMessage(recentMessages);
+  const prUserStory = extractUserStoryFromPrBody(prMeta?.rawBody ?? prMeta?.bodySummary);
+  const goalStory = activeGoal?.goal
+    ? `${clampText(cleanBriefProse(activeGoal.goal), 200)}${activeGoal.doneCriteria ? ` (Done when: ${clampText(cleanBriefProse(activeGoal.doneCriteria), 140)})` : ""}`
+    : null;
+  const combinedGoalAndStory = [goalStory, prUserStory].filter(Boolean).join(" — ") || null;
+  const cleanRbContext = rb?.context && !TRIVIAL_CONTINUATION_USER_MSG_RE.test(String(rb.context).replace(/^You asked:\s*["']?|["']$/gi, "").trim())
+    ? cleanBriefProse(rb.context)
+    : null;
+  const fallbackContext = combinedGoalAndStory
+    || cleanRbContext
+    || (substantiveUserGoal ? clampText(substantiveUserGoal, 240) : null)
+    || (prMeta?.title ? `${clampText(cleanBriefProse(prMeta.title), 200)}` : null)
+    || (sessionTitle ? `${sessionTitle}` : null);
+
+  const currentState = buildCurrentStateSummary(question, row, { kind, prMeta, thread });
+  const permDetail = question.kind === "prompt" ? extractPermissionDetail(question, thread) : null;
+  const permPrefix = permDetail?.command
+    ? `Requested ${permDetail.toolName || "command"}: \`${permDetail.command}\``
+    : (permDetail?.toolName ? `Requested tool: ${permDetail.toolName}` : null);
 
   let fallbackWhatChanged = null;
   if (prMeta?.bodySummary) {
-    const cleanPr = clampTextLines(cleanBriefProse(prMeta.bodySummary), 420);
-    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 220) : "";
+    const cleanPr = clampTextLines(cleanBriefProse(prMeta.bodySummary), 520);
+    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 260) : "";
     fallbackWhatChanged = cleanAgent && !cleanPr.includes(cleanAgent.slice(0, 32))
-      ? clampTextLines(`${cleanPr}\n\nLatest status: ${cleanAgent}`, 520)
+      ? clampTextLines(`${cleanPr}\n\nLatest progress & caveats: ${cleanAgent}`, 780)
       : cleanPr;
+  } else if (prMeta?.title) {
+    const diffStat = formatDiffSummary(prMeta);
+    const header = [prMeta.title, diffStat].filter(Boolean).join(" · ");
+    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 420) : "";
+    fallbackWhatChanged = [header, cleanAgent].filter(Boolean).join("\n\n");
   } else if (agentSummary) {
-    fallbackWhatChanged = clampTailLines(cleanBriefProse(agentSummary), 440);
+    fallbackWhatChanged = clampTailLines(cleanBriefProse(agentSummary), 520);
+  } else if (question.body && !isMechanicalReadyBody(question.body)) {
+    fallbackWhatChanged = clampTextLines(cleanBriefProse(question.body), 480);
   }
+  if (permPrefix) {
+    fallbackWhatChanged = fallbackWhatChanged && !fallbackWhatChanged.includes(permDetail?.command ?? "___")
+      ? clampTextLines(`${permPrefix}\n\n${fallbackWhatChanged}`, 780)
+      : (fallbackWhatChanged || permPrefix);
+  }
+
+  const activeDecisionItem = Array.isArray(question?.meta?.items) && question.meta.items.length > 0
+    ? (question.meta.items.find((it) => String(it?.itemId ?? "") === String(question?.meta?.itemId ?? "")) ?? question.meta.items[0])
+    : null;
+  const fullChoicesBlock = Array.isArray(activeDecisionItem?.options) && activeDecisionItem.options.length > 0
+    ? [
+        activeDecisionItem.question,
+        ...activeDecisionItem.options.map((opt, idx) => (/^\d+[.)]\s/.test(String(opt)) ? String(opt) : `${idx + 1}. ${opt}`))
+      ].filter(Boolean).join("\n")
+    : null;
 
   let fallbackDecision = null;
   if (kind === "merge_ready") {
+    const reviewNote = prMeta?.mergeState === "BLOCKED" ? " (GitHub notes required reviewer approval)" : "";
     fallbackDecision = (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS")
       ? `Checks are still running on ${prMeta?.ref ?? "this PR"}. Tap Watch CI or wait before merging.`
-      : `Confirm whether to merge ${prMeta?.ref ?? "this PR"} now, merge & deploy, or reply with changes.`;
+      : `Approve & merge ${prMeta?.ref ?? "this PR"}${reviewNote} now, merge & deploy, or reply with changes.`;
   } else if (kind === "ci_failed") {
     fallbackDecision = prMeta?.mergeState === "DIRTY"
       ? `Have the session rebase ${prMeta?.ref ?? "this PR"} onto base and re-verify, or reply with guidance.`
@@ -457,29 +607,56 @@ function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle =
   } else if (kind === "completed") {
     fallbackDecision = "Session finished. Tap View Chat to read the result or reply, or Dismiss to clear this notification.";
   } else if (question.kind === "suggestion" && question.meta?.plan?.nextAction) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.meta.plan.nextAction), 600);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.meta.plan.nextAction), 800);
+  } else if (fullChoicesBlock) {
+    fallbackDecision = clampTextLines(cleanBriefProse(fullChoicesBlock), 1100);
   } else if (question.card) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.card), 260);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.card), 900);
   } else if (question.body && !isMechanicalReadyBody(question.body)) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 480);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 1100);
   } else {
     fallbackDecision = headline;
   }
 
   const liveMergeBlocked = kind === "ci_failed"
     || (kind === "merge_ready" && (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS"));
+  let resolvedWhatChanged = (rb?.whatChanged && !isProcessOnlyWhatChanged(rb.whatChanged))
+    ? (prMeta?.bodySummary && !String(rb.whatChanged).includes(prMeta.title ?? "___")
+        ? clampTextLines(`${cleanBriefProse(prMeta.bodySummary).slice(0, 420)}\n\nVerified status & caveats: ${rb.whatChanged}`, 840)
+        : clampTextLines(rb.whatChanged, 740))
+    : (fallbackWhatChanged
+        ? (rb?.whatChanged ? clampTextLines(`${fallbackWhatChanged}\n\nReview check: ${rb.whatChanged}`, 840) : fallbackWhatChanged)
+        : (rb?.whatChanged ?? null));
+  if (permPrefix && resolvedWhatChanged && !resolvedWhatChanged.includes(permDetail?.command ?? "___")) {
+    resolvedWhatChanged = clampTextLines(`${permPrefix}\n\n${resolvedWhatChanged}`, 860);
+  }
+
+  const resolvedDecision = (!liveMergeBlocked && rb?.decision && !fullChoicesBlock)
+    ? clampTextLines(rb.decision, 900)
+    : (fallbackDecision || "Needs your decision.");
+
+  const finalGoal = combinedGoalAndStory || cleanRbContext || fallbackContext;
   return {
-    context: rb?.context ? clampText(redactSecrets(rb.context), 240) : (fallbackContext ? redactSecrets(fallbackContext) : null),
-    whatChanged: rb?.whatChanged ? clampTextLines(redactSecrets(rb.whatChanged), 520) : (fallbackWhatChanged ? redactSecrets(fallbackWhatChanged) : null),
-    decision: (!liveMergeBlocked && rb?.decision) ? clampText(redactSecrets(rb.decision), 260) : redactSecrets(fallbackDecision || "Needs your decision.")
+    context: finalGoal ? clampText(redactSecrets(finalGoal), 420) : null,
+    currentState: currentState ? clampText(redactSecrets(currentState), 240) : null,
+    whatChanged: resolvedWhatChanged ? redactSecrets(resolvedWhatChanged) : null,
+    decision: redactSecrets(clampTextLines(resolvedDecision, 1100))
   };
 }
 
-function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
+function buildSuggestedReplies(question, { kind, canReply = false, recommendation = null } = {}) {
   if (!canReply || kind === "preference") return [];
+  const hasConcreteRec = Boolean(
+    recommendation
+    && !/^Session finished/i.test(recommendation)
+    && !/^Recommend:\s*Open details/i.test(recommendation)
+  );
   const rb = kind === "ci_failed" ? null : activeReviewBrief(question);
   if (Array.isArray(rb?.suggestedReplies) && rb.suggestedReplies.length > 0) {
-    return rb.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
+    return rb.suggestedReplies
+      .slice(0, 4)
+      .map((s) => clampText(redactSecrets(s), 110))
+      .filter((s) => Boolean(s) && (hasConcreteRec || !/recommendation/i.test(s)));
   }
   if (kind === "merge_ready") {
     return [
@@ -497,13 +674,13 @@ function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
   if (question.kind === "prompt") {
     return [
       "Allow",
-      "Skip that step and take a non-destructive approach"
+      "Skip that command and use a read-only / non-destructive path"
     ];
   }
   return [
-    "Go ahead with your recommendation",
-    "Approved — proceed with all items in scope",
-    "Hold off for now — let's adjust the plan"
+    ...(hasConcreteRec ? ["Proceed with the recommended option above"] : []),
+    "Approved — finish all remaining in-scope items",
+    "Hold off — tell me what's still unverified first"
   ];
 }
 
@@ -701,7 +878,7 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
 
 export function buildSupervisorCard(
   question,
-  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null } = {}
+  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null, activeGoalResolver = null } = {}
 ) {
   const primaryKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
@@ -722,7 +899,9 @@ export function buildSupervisorCard(
   const prTitle = hideSettledPr
     ? null
     : (clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null);
-  const rawPrBody = hideSettledPr ? null : (livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null);
+  const rawPrBody = hideSettledPr
+    ? null
+    : (livePr?.bodySummary ?? livePr?.body ?? rowPr?.bodySummary ?? rowPr?.body ?? snapPr?.bodySummary ?? snapPr?.body ?? null);
   const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(cleanBriefProse(rawPrBody)), 2200) : null;
   const additions = hideSettledPr ? null : pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
   const deletions = hideSettledPr ? null : pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
@@ -750,6 +929,7 @@ export function buildSupervisorCard(
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
+    rawBody: rawPrBody ? redactSecrets(String(rawPrBody)) : null,
     bodySummary: prBodySummary,
     isDraft,
     additions,
@@ -845,8 +1025,12 @@ export function buildSupervisorCard(
     && !["suggestion", "self-fix", "preference"].includes(String(question.kind ?? ""))
     && !((question.threadKeys ?? []).length > 1)
     && answerIn === "here";
-  const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages });
-  const suggestedReplies = buildSuggestedReplies(question, { kind, canReply });
+  const activeGoal = typeof activeGoalResolver === "function"
+    ? activeGoalResolver(primaryKey, prRef)
+    : null;
+  const recommendation = buildRecommendation(question, row, prRef, prefs, prMeta, thread);
+  const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages, activeGoal, thread });
+  const suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
   const rawPlan = question.meta?.plan && typeof question.meta.plan === "object" ? question.meta.plan : null;
   const plan = rawPlan ? {
     remedy: clampText(redactSecrets(String(rawPlan.remedy ?? "")), 40) || null,
@@ -891,7 +1075,7 @@ export function buildSupervisorCard(
     ...ownerDecision,
     sessionTitle,
     summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
-    recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
+    recommendation,
     brief,
     ...(plan ? { plan } : {}),
     suggestedReplies,
@@ -1333,7 +1517,7 @@ export function computeBlockingImpact({
 
 export function buildSupervisorDeck(
   state,
-  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null } = {}
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null, activeGoalResolver = null } = {}
 ) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
@@ -1346,7 +1530,7 @@ export function buildSupervisorDeck(
 
   const allQuestionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver }))
+    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
   const questionCards = allQuestionCards.filter((card) => card.needsYou !== false);
 

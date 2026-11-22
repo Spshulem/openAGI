@@ -696,18 +696,19 @@ const OWNER_BLOCKER = /\b(?:your|you|owner)\b[^.\n]{0,40}\b(?:decision|call|appr
 // Items GitHub or time clears: checks running, a review not in yet.
 const PASSIVE_BLOCKER = /\b(?:running|pending|queued|in progress|not (?:yet )?(?:reviewed|started|finished)|has(?:n't| not) reviewed|waiting (?:on|for))\b|^(?:CI|checks?|tests?|builds?)\W*$/i;
 const NO_BLOCKER = /^(?:nothing|none|n\/a|nope|no(?:thing)? (?:blockers?|else))\b/i;
-const BLOCKED_HEADER = /^[\s>#*_\-•]*blocked on\b[\s*_]*:?[\s*_]*(.*)$/i;
+const OWNER_ACTION_HEADER = /^[\s>#*_\-•]*(?:(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?|action\s+(?:needed|required)\s+from\s+(?:you|the\s+owner|spencer))\b[\s*_]*:?[\s*_]*(.*)$/i;
+const BLOCKED_HEADER = /^[\s>#*_\-•]*(?:blocked\s+on|(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?|action\s+(?:needed|required)\s+from\s+(?:you|the\s+owner|spencer))\b[\s*_]*:?[\s*_]*(.*)$/i;
+const INLINE_OWNER_ACTION_SPLIT = /\s+(?=(?:(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?)\s*:)/gi;
 const BULLET = /^(\s*)(?:[-*•+]|\d+[.)]|[a-c][.)])\s+(.*)$/i;
 
-// The agent's "Blocked on:" section: the header (any markdown) with what
-// follows it on its line, then its bullets up to a blank line or the next
-// header. Each item is tagged owner, passive or other; sub-bullets under an
-// item are its options. "Blocked on: nothing" holds no items. The last
-// header wins: an earlier one is often a quoted, older status.
+// The agent's "Blocked on:" or "Single/Exact owner action:" section: the header
+// (any markdown, even when preceded inline on the same line) with what follows
+// it, then its bullets up to a blank line or the next header.
 export function blockedOnSection(text) {
-  const lines = plainLines(text);
+  const lines = plainLines(text).flatMap((line) => line.split(INLINE_OWNER_ACTION_SPLIT));
   const start = lines.findLastIndex((line) => BLOCKED_HEADER.test(line));
   if (start < 0) return null;
+  const explicitOwnerHeader = OWNER_ACTION_HEADER.test(lines[start]);
   const items = [];
   const inline = BLOCKED_HEADER.exec(lines[start])[1].trim();
   if (inline) items.push({ text: inline, options: [] });
@@ -732,7 +733,12 @@ export function blockedOnSection(text) {
     else items.push({ text: bullet[2].trim(), options: [] });
   }
   const tagged = items.filter((item) => item.text && !NO_BLOCKER.test(item.text))
-    .map((item) => ({ ...item, tag: OWNER_BLOCKER.test(item.text) ? "owner" : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other" }));
+    .map((item) => ({
+      ...item,
+      tag: ((explicitOwnerHeader && !PASSIVE_BLOCKER.test(item.text)) || OWNER_BLOCKER.test(item.text))
+        ? "owner"
+        : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other"
+    }));
   const of = (tag) => tagged.filter((item) => item.tag === tag);
   return {
     items: tagged, owner: of("owner"), passive: of("passive"), other: of("other"), mergeCalls: [], start,
