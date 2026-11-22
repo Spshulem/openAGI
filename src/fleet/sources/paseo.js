@@ -576,7 +576,10 @@ export function createPaseoSource({ factory } = {}) {
               .map(e => ({ timestamp: e.timestamp, item: e.item.type === "error"
                 ? { type: "error", message: redactSecrets(e.item.message ?? "").slice(0, 8000) }
                 : { type: e.item.type, text: redactSecrets(e.item.text ?? "").slice(-8000) } }));
-            cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries, planArtifactPath });
+            // Silence is measured across every fetched event (tool calls
+            // included), not just the bounded message excerpts above.
+            const latestEventMs = Math.max(0, ...history.entries.map(e => Date.parse(e?.timestamp ?? "") || 0));
+            cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries, planArtifactPath, latestEventMs });
           } catch { /* uncertain history stays excluded and is tried later */ }
         }));
       }
@@ -589,7 +592,8 @@ export function createPaseoSource({ factory } = {}) {
         const histEntries = history?.stamp === a.updatedAt ? (history?.entries ?? []) : [];
         const latestTimelineMs = Math.max(
           Date.parse(a.updatedAt ?? "") || 0,
-          ...histEntries.map((e) => Date.parse(e?.timestamp ?? "") || 0)
+          ...histEntries.map((e) => Date.parse(e?.timestamp ?? "") || 0),
+          history?.stamp === a.updatedAt ? (history?.latestEventMs ?? 0) : 0
         );
         const silentStuck = isSilentRunning(a) && scanStartedAt - latestTimelineMs >= liveStallMs;
         const known = ["running", "initializing"].includes(a.status)

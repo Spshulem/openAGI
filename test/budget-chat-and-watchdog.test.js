@@ -426,3 +426,53 @@ test("watchdog bookkeeping writes to a linked task do not reset its check-in tim
   assert.equal(latest.sourceMeta.watchdog.checkInDueAt, writes[0].sourceMeta.watchdog.checkInDueAt);
   assert.equal(sup.getState().watchdog.overdueCount, 1);
 });
+
+test("Paseo running session with recent tool activity is not marked stalled", async (t) => {
+  // Regression (#332 review [4]): the history cache keeps only messages and
+  // errors, so a tool call one minute ago was ignored when measuring silence.
+  const storeDir = makeTempDir(t, "paseo-tool-activity-");
+  const now = Date.now();
+  const threeHoursAgo = new Date(now - 3 * HOUR).toISOString();
+  const oneMinuteAgo = new Date(now - MIN).toISOString();
+  const timelineEntries = [
+    { timestamp: threeHoursAgo, item: { type: "user_message", messageId: "m1", text: "Run the staging QA analysis" } },
+    { timestamp: threeHoursAgo, item: { type: "assistant_message", messageId: "m2", text: "Starting the staging QA analysis now." } },
+    { timestamp: oneMinuteAgo, item: { type: "tool_call", name: "run_command", detail: { input: { command: "npm test" } } } }
+  ];
+  const agent = {
+    id: "tool-active-agent",
+    title: "Staging QA Report Analysis",
+    provider: "antigravity",
+    status: "running",
+    activeTurn: { turnId: "turn-1" },
+    cwd: "/home/dev/openAGI",
+    workspaceId: "openAGI",
+    updatedAt: threeHoursAgo,
+    lastUserMessageAt: threeHoursAgo,
+    pendingPermissions: []
+  };
+  const fakeFactory = () => ({
+    async connect() {},
+    async close() {},
+    hosts: { async list() { return { self: { serverId: "srv_local" }, hosts: [] }; } },
+    agents: {
+      async list() { return { entries: [{ agent }], pageInfo: { hasMore: false } }; },
+      ref() {
+        return {
+          async refresh() {},
+          current() { return agent; },
+          timeline: {
+            async refetch() {
+              return { agent, entries: timelineEntries, epoch: "e1", endCursor: { seq: timelineEntries.length }, hasNewer: false };
+            }
+          }
+        };
+      }
+    }
+  });
+
+  const cfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: storeDir });
+  const [thread] = await createPaseoSource({ factory: fakeFactory })(cfg);
+  assert.notEqual(thread.agentStatus, "stalled");
+  assert.equal(thread.meta.silentStuck, undefined);
+});
