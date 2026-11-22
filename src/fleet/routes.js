@@ -5,6 +5,7 @@
 import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
 import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./walkthrough.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
@@ -52,7 +53,8 @@ async function readObject(readBody) {
   }
 }
 
-export function createFleetRoute({ supervisor } = {}) {
+export function createFleetRoute({ supervisor, dataDir } = {}) {
+  const walkthrough = supervisor ? new SupervisorWalkthrough({ dataDir: dataDir ?? supervisor.dataDir }) : null;
   const state = () => supervisor.getState();
 
   async function handleQuestion(id, readBody, sendOptions) {
@@ -140,6 +142,19 @@ export function createFleetRoute({ supervisor } = {}) {
         const area = url?.searchParams?.get("area") ?? null;
         if (!["24h", "7d"].includes(window) || (area && !FIX_AREAS.includes(area))) return fail(400, "Bad diagnose window or area.");
         return ok(await supervisor.diagnose({ window, area }));
+      }
+      if (parts.length === 1 && parts[0] === "walkthrough") {
+        if (!walkthrough) return fail(503, "Supervisor walkthrough is not available.");
+        if (method === "GET") return ok(walkthrough.read(state()));
+        if (method !== "POST") return fail(405, "Use GET or POST.");
+        const body = (await readObject(readBody)) ?? {};
+        const operation = typeof body.operation === "string" ? body.operation : body.op;
+        const expectedId = body.expectedId;
+        try { return ok(walkthrough.mutate(operation, expectedId, state())); }
+        catch (error) {
+          if (error instanceof WalkthroughError) return fail(error.status, error.message);
+          throw error;
+        }
       }
       if (parts[0] === "suggestions" && (parts.length === 1 || parts.length === 2)) {
         if (typeof supervisor.suggestions !== "function") return fail(503, "Suggestions are not available.");

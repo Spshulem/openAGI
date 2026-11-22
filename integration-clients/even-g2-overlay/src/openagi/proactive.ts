@@ -1,7 +1,9 @@
 import type { OpenAGIApiClient } from './api-client'
 import { OpenAGIApiError } from './config'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[]; questionId?: string; threadKey?: string; cardId?: string; cardKind?: string; pmBrief?: string; primaryLabel?: string; prRef?: string; ciState?: string }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; walkthroughOnly?: boolean; options?: string[]; questionId?: string; threadKey?: string; cardId?: string; cardKind?: string; pmBrief?: string; primaryLabel?: string; prRef?: string; ciState?: string }
+export interface SupervisorWalkthroughItem { id: string; kind: 'card' | 'question'; title: string; summary: string; questionId?: string | null; threadKey?: string | null; cardId?: string | null; cardKind?: string | null; prRef?: string | null; primaryLabel?: string | null; ciState?: string | null; pmBrief?: string | null; options?: string[] }
+export interface SupervisorWalkthrough { active: boolean; paused: boolean; currentId: string | null; total: number; updatedAt?: string | null; current: SupervisorWalkthroughItem | null; items: SupervisorWalkthroughItem[] }
 // The supervisor's glanceable status: counts by colour, red then yellow threads.
 export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; cardsCount?: number; catchUpSummary?: string | null; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
 export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'
@@ -13,6 +15,7 @@ export interface ProactiveView {
   activity?(text: string): void
   saveStatus?(text: string): void
   consentLost?(): void
+  walkthrough?(state: SupervisorWalkthrough): void
 }
 
 export interface MainConsent { id: string; grantedAt?: number | null; until?: number | null }
@@ -103,6 +106,12 @@ export class G2ProactiveClient {
       if (!this.running || signal.aborted || feedGeneration !== this.feedGeneration) return
       this.items = result.items ?? []; this.view.inbox?.(this.items)
       if (result.settings) this.view.proactiveSettings?.(result.settings)
+      // Keep an active G2 walkthrough aligned with the main-owned cursor when
+      // iOS or the main UI advances it. Older mains may not expose this route.
+      try {
+        const walkthrough = await this.walkthrough('view', undefined)
+        if (!signal.aborted && this.running) this.view.walkthrough?.(walkthrough)
+      } catch { /* walkthrough is optional on older mains */ }
       // Do not claim a notification until the app says it can show it safely.
       // Supervisor mode pings for its own questions without the general opt-in.
       const item = this.items.find(i => i.important && !i.seen && !i.notified && (result.settings?.enabled === true || (result.settings?.supervisorOnly === true && i.supervisor === true)))
@@ -146,6 +155,11 @@ export class G2ProactiveClient {
   async fleetStatus(): Promise<FleetStatus | null> {
     try { return await this.api.proactive({ op: 'fleet-status' }, this.controller.signal) as unknown as FleetStatus }
     catch { return null }
+  }
+  async walkthrough(operation: 'view' | 'start' | 'next' | 'back' | 'skip' | 'pause' | 'resume' = 'view', expectedId?: string): Promise<SupervisorWalkthrough> {
+    const result = await this.api.proactive({ op: 'walkthrough', command: operation, ...(expectedId ? { expectedId } : {}) }, this.controller.signal) as { walkthrough?: SupervisorWalkthrough }
+    if (!result.walkthrough) throw new Error('Main did not return the Supervisor walkthrough.')
+    return result.walkthrough
   }
   async configure(settings: Partial<ProactiveSettings>): Promise<void> {
     try { await this.api.proactive({ op: 'configure', settings }, this.controller.signal); await this.refresh() }

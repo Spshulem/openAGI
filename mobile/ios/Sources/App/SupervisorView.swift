@@ -28,6 +28,7 @@ struct SupervisorView: View {
     @Environment(AppModel.self) private var model
 
     @State private var state: FleetState?
+    @State private var walkthrough: SupervisorWalkthrough?
     @State private var modelSettings: ModelSettings?
     @State private var isSwitchingModel = false
     @State private var loadError: DaemonError?
@@ -924,6 +925,30 @@ struct SupervisorView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("supervisor-budget-exceeded-banner")
             }
+            if let walkthrough, walkthrough.active, let current = walkthrough.current {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: walkthrough.paused ? "pause.circle" : "rectangle.stack")
+                        .foregroundStyle(Theme.live)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Needs You · \(max(1, (walkthrough.items.firstIndex(where: { $0.id == current.id }) ?? 0) + 1))/\(max(1, walkthrough.total))")
+                            .font(.footnote.weight(.semibold)).foregroundStyle(Theme.ink)
+                        Text(current.title).font(.caption.weight(.medium)).foregroundStyle(Theme.ink).lineLimit(1)
+                        Text(walkthrough.paused ? "Paused · the same card is ready on G2." : current.summary)
+                            .font(.caption2).foregroundStyle(Theme.muted).lineLimit(2)
+                    }
+                    Spacer(minLength: 4)
+                    HStack(spacing: 8) {
+                        Button("Back") { Task { await moveWalkthrough("back") } }
+                        Button(walkthrough.paused ? "Resume" : "Pause") { Task { await moveWalkthrough(walkthrough.paused ? "resume" : "pause") } }
+                        Button("Next") { Task { await moveWalkthrough("next") } }
+                    }
+                    .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, Theme.gutter)
+                .padding(.vertical, 8)
+                .background(Theme.surface)
+                .accessibilityIdentifier("supervisor-walkthrough-bar")
+            }
             if let loadError, state == nil || SupervisorFormat.isUnavailable(loadError) {
                 let copy = SupervisorFormat.errorCopy(loadError)
                 HStack(alignment: .top, spacing: 10) {
@@ -1624,6 +1649,7 @@ struct SupervisorView: View {
         async let freshModelSettings = try? model.client.modelSettings()
         async let freshHierarchy = try? model.client.fleetHierarchy(limit: 60)
         async let freshBudget = try? model.client.budget()
+        async let freshWalkthrough = try? model.client.fleetWalkthrough()
         do {
             let fresh = try await model.client.fleetState()
             accept(sequence, fresh)
@@ -1641,6 +1667,9 @@ struct SupervisorView: View {
         if let updatedBudget = await freshBudget {
             budgetStatus = updatedBudget
         }
+        if let updatedWalkthrough = await freshWalkthrough {
+            walkthrough = updatedWalkthrough
+        }
     }
 
     private func quickTopUpBudget(amount: Double) async {
@@ -1653,6 +1682,16 @@ struct SupervisorView: View {
             showToast(String(format: "Added +$%.2f today ($%.2f remaining) ✓", amount, max(0, updated.remainingUsd)))
         } catch {
             showToast(BudgetSettingsErrorCopy.saveMessage(for: error), isError: true)
+        }
+    }
+
+    private func moveWalkthrough(_ operation: String) async {
+        guard let current = walkthrough?.currentId else { return }
+        do {
+            walkthrough = try await model.client.fleetWalkthrough(operation: operation, expectedId: current)
+        } catch {
+            statusNote = .init(text: "Needs You changed. Refreshing the shared walkthrough.", isAlert: true)
+            walkthrough = try? await model.client.fleetWalkthrough()
         }
     }
 

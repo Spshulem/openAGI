@@ -159,6 +159,55 @@ public struct FleetState: Decodable, Sendable, Equatable {
     }
 }
 
+// Main-owned Needs You walkthrough state. G2 and iOS use the same cursor and
+// stable card/question identity, so moving through the deck on one device is
+// visible on the other without copying approval authority to the glasses.
+public struct SupervisorWalkthroughItem: Decodable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var kind: String
+    public var title: String
+    public var summary: String
+    public var questionId: String?
+    public var threadKey: String?
+    public var cardId: String?
+
+    private enum CodingKeys: String, CodingKey { case id, kind, title, summary, questionId, threadKey, cardId }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.lenient(String.self, .id) ?? ""
+        kind = c.lenient(String.self, .kind) ?? "question"
+        title = c.lenient(String.self, .title) ?? "Needs your decision"
+        summary = c.lenient(String.self, .summary) ?? ""
+        questionId = c.lenient(String.self, .questionId)
+        threadKey = c.lenient(String.self, .threadKey)
+        cardId = c.lenient(String.self, .cardId)
+    }
+}
+
+public struct SupervisorWalkthrough: Decodable, Sendable, Equatable {
+    public var active: Bool
+    public var paused: Bool
+    public var currentId: String?
+    public var total: Int
+    public var updatedAt: Date?
+    public var current: SupervisorWalkthroughItem?
+    public var items: [SupervisorWalkthroughItem]
+
+    private enum CodingKeys: String, CodingKey { case active, paused, currentId, total, updatedAt, current, items }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        active = c.lenient(Bool.self, .active) ?? false
+        paused = c.lenient(Bool.self, .paused) ?? false
+        currentId = c.lenient(String.self, .currentId)
+        total = c.lenient(Int.self, .total) ?? 0
+        updatedAt = c.lenient(Date.self, .updatedAt)
+        current = c.lenient(SupervisorWalkthroughItem.self, .current)
+        items = c.lenientList(SupervisorWalkthroughItem.self, .items)
+    }
+}
+
 public struct FleetSnapshot: Decodable, Sendable, Equatable {
     public var at: Date?
     public var threads: [FleetThread]
