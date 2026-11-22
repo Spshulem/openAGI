@@ -30,7 +30,9 @@ test("read-only rule refuses mutating options, hidden newline commands, and path
     "git diff --output=patch.txt",
     "git grep -O vim foo",
     "git diff --ext-diff",
-    "find . -fprint0 out"
+    "find . -fprint0 out",
+    "echo \\'; touch /tmp/marker; echo \\'",
+    "cat a\\;touch b"
   ]) {
     assert.equal(isSafeReadOnlyCommand(cmd), false, cmd);
   }
