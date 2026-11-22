@@ -798,7 +798,7 @@ export class ActiveWorkManager {
 
       let nextState = requestedState ?? existing.state ?? "active";
       let outcomeVerified = Boolean(existing.outcomeVerified);
-      if (input.dispatching === true) {
+      if (input.resetVerification === true || input.dispatching === true) {
         // A new execution of an already-verified directive is a fresh open
         // outcome; never let the prior completion hide the rerun.
         nextState = requestedState && requestedState !== "done" ? requestedState : "active";

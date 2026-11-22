@@ -960,7 +960,12 @@ export async function dispatchManagerGoal(
       originalAsk: cleanGoal,
       doneCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
       acceptanceCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
-      owner: threadKey ? { threadKey, label: ownerLabel || threadKey } : { label: ownerLabel || "Assigned owner" },
+      // A label-only pre-start record is intentionally unassigned. If Paseo
+      // returns a session key later, the follow-up update binds that same
+      // durable record to the actual owner; a timeout can still be auto-bound.
+      owner: threadKey
+        ? { threadKey, label: ownerLabel || threadKey }
+        : { kind: "unassigned", label: ownerLabel || "Assigned owner" },
       currentStep: "Dispatch recorded; awaiting owner evidence",
       nextMilestone: nextAction || "Owner evidence received and verified",
       nextAction: nextAction || "Owner evidence received and verified",
@@ -970,6 +975,7 @@ export async function dispatchManagerGoal(
       cadence: "hourly",
       permittedNudges: "none",
       dispatching: true,
+      resetVerification: true,
       dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal)
     });
   };
@@ -1275,7 +1281,8 @@ export async function dispatchManagerGoal(
       nextAction: "Owner evidence received and verified",
       nextActionOwner: created.title || suggestedTitle,
       permittedNudges: "none",
-      dispatching: true
+      dispatching: true,
+      resetVerification: true
     });
   }
 
