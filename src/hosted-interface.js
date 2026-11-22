@@ -5859,7 +5859,7 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     input.style.height = Math.min(180, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -5920,6 +5920,13 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
       sendBtn.disabled = false;
     }
   });
+}
+
+// Only an unmodified Return submits a chat draft. Shift+Return is left to the
+// textarea so it inserts a newline; composition events must also reach the IME.
+function shouldSubmitComposerKey(e) {
+  return e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+    && !e.isComposing && e.keyCode !== 229;
 }
 
 function showToast(msg, ok = true) {
@@ -6601,7 +6608,7 @@ function renderChat() {
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       $("composer").requestSubmit();
     }
