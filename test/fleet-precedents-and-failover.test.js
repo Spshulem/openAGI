@@ -27,7 +27,7 @@ function withTempDir(fn) {
 
 test("isSafeReadOnlyCommand strictly allows read-only inspections and blocks mutations/secrets", () => {
   assert.equal(isSafeReadOnlyCommand("Run `rg -n \"SupervisorView\" mobile/ios && sed -n '1,40p' README.md`"), true);
-  assert.equal(isSafeReadOnlyCommand("git status -sb && git log -n 5 --oneline"), true);
+  assert.equal(isSafeReadOnlyCommand("git status -sb && echo \"---\" && git log -n 5 --oneline"), true);
   assert.equal(isSafeReadOnlyCommand("gh pr view 332 --json state,statusCheckRollup && gh pr checks 332"), true);
 
   // Mutations, redirects, subshells, merges, and sensitive files are rejected.

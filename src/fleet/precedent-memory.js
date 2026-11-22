@@ -59,7 +59,7 @@ export const HARD_RED_LINE_RULES = Object.freeze([
 ]);
 
 const SAFE_READONLY_BINS = new Set([
-  "rg", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "pwd",
+  "rg", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "pwd", "echo", "printf",
   "which", "stat", "file", "jq", "cut", "sort", "uniq", "tr", "basename", "dirname", "realpath"
 ]);
 
