@@ -521,6 +521,10 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
   }
 }
 
+function formatCount(value) {
+  return value === null || value === undefined ? "unknown" : String(value);
+}
+
 function buildQuestionContextSnapshot(thread, pr) {
   if (!thread && !pr) return null;
   const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
@@ -2617,6 +2621,42 @@ export class FleetSupervisor {
     return outcomes;
   }
 
+  // Sessions this machine's own scan saw running; null when it has no scan.
+  runningSessionCount(snapshot) {
+    const raw = snapshot?.counts?.byState?.running ?? snapshot?.counts?.byWatch?.working ?? snapshot?.counts?.running;
+    const value = Number(raw);
+    return raw === undefined || raw === null || !Number.isFinite(value) ? null : value;
+  }
+
+  // Unverified tracked goals, from the store that actually holds them. A node
+  // paired to a main tracks goals on the main: an empty local store there is
+  // "not tracked here", not zero. A read failure is "unknown".
+  trackedGoalSummary() {
+    let items;
+    try {
+      items = this.activeWork.getActiveWork({ limit: 200 })?.items;
+    } catch {
+      items = null;
+    }
+    if (!Array.isArray(items)) return { count: null, source: "unknown", text: "Unverified tracked goals: unknown (Active Work could not be read)" };
+    const unverified = items.filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed");
+    let pairedToMain = false;
+    try { pairedToMain = Boolean(this.dataDir && readNodeConfig(this.dataDir)?.remote); } catch { pairedToMain = false; }
+    if (pairedToMain && items.length === 0) {
+      return { count: null, source: "main", text: "Unverified tracked goals: tracked on the main, not counted on this node" };
+    }
+    const blocked = unverified.filter((it) => ["blocked", "blocked_pr"].includes(it.followThroughState)).length;
+    const awaiting = unverified.filter((it) => ["owner_followup", "ready_pr", "orphan_pr", "stale_pr"].includes(it.followThroughState)).length;
+    const parts = [blocked ? `${blocked} blocked` : null, awaiting ? `${awaiting} awaiting rollout or verification` : null].filter(Boolean);
+    return {
+      count: unverified.length,
+      source: "local",
+      blocked,
+      awaiting,
+      text: `Unverified tracked goals: ${unverified.length}${parts.length ? ` (${parts.join(", ")})` : ""}`
+    };
+  }
+
   async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
@@ -2678,19 +2718,14 @@ export class FleetSupervisor {
       lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
     }
     // Running sessions, tracked goals, and decisions are different things; say
-    // each separately so a count is never mistaken for an ask.
-    let unfinishedGoals = 0;
-    try {
-      unfinishedGoals = (this.activeWork.getActiveWork({ limit: 200 })?.items ?? [])
-        .filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed").length;
-    } catch { unfinishedGoals = 0; }
-    const runningCount = Number(snapshot?.counts?.byState?.running ?? 0);
+    // each separately so a count is never mistaken for an ask. A count this
+    // machine cannot know is said to be unknown, never rendered as zero.
     const errors = nonDecisions.filter((q) => classifyAsk(q) === "session_error").length;
     const fyis = nonDecisions.length - errors;
     lines.push("", [
       `Decisions waiting on you: ${openActionable.length}`,
-      `Sessions running: ${runningCount}`,
-      `Unfinished tracked goals: ${unfinishedGoals}`,
+      `Sessions running here: ${formatCount(this.runningSessionCount(snapshot))}`,
+      this.trackedGoalSummary().text,
       ...(fyis || errors ? [`FYIs / session errors (no decision needed): ${fyis} / ${errors}`] : [])
     ].join(" · "));
 

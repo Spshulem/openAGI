@@ -285,7 +285,7 @@ test("a context-poor new card is held while its owning agent supplies context, t
   assert.match(chat[0], /2\. \*\*You asked the agent to:\*\* Fix the refund double-count/);
   assert.match(chat[0], /3\. \*\*Where it stands:\*\* Verified: Re-ran October/);
   assert.match(chat[0], /4\. \*\*Decision now:\*\* Re-send October's corrected CSV.*Recommendation: proceed/);
-  assert.match(chat[0], /Decisions waiting on you: 1 · Sessions running: 0 · Unfinished tracked goals: 0/);
+  assert.match(chat[0], /Decisions waiting on you: 1 · Sessions running here: 0 · Unverified tracked goals: 0/);
   assert.doesNotMatch(chat[0], INTERNAL_ID_RE, "check-ins use names, not ids");
 
   // Unchanged afterwards: nothing repeats.
@@ -440,4 +440,50 @@ test("the hosted hub mirror honors a context hold and shows the four-part summar
   assert.deepEqual(posted.map((i) => i.sourceRef.id), ["fq_ready00001"], "the held ask is not mirrored yet");
   assert.match(posted[0].summary, /^1\. Goal: Ship the onboarding emails/m);
   assert.match(posted[0].summary, /^4\. Decision now: Send now, or hold\?/m);
+});
+
+// Live bug, 2026-11-22: the Mac (a node paired to the main) posted "0 coding
+// sessions are currently running across 0 unfinished goals" while the main's
+// Active Work listed 5 unfinished OpenAGI goals. The node counted its own,
+// empty Active Work store and rendered "unknown" as zero.
+test("check-in counts: goals come from where they are tracked; unknown is never rendered as zero", async (t) => {
+  const { writeNodeConfig } = await import("../src/cli-client.js");
+  const makeSup = (dir) => new FleetSupervisor({
+    dataDir: dir,
+    runtime: { events: { emit() {} } },
+    config: { enabled: true, mode: "auto", paseo: { enabled: true, only: true }, review: { enabled: false } },
+    deps: { now: () => NOW, listPaseoThreads: async () => [], fetchPrStates: async () => new Map() }
+  });
+
+  // A node paired to a main, with no goals tracked locally.
+  const nodeDir = tempDir(t);
+  writeNodeConfig({ remote: "http://100.64.0.1:43210", token: null, nodeToken: "node-token", nodeEnrollmentConfirmed: true }, nodeDir);
+  const node = makeSup(nodeDir);
+  const onNode = node.trackedGoalSummary();
+  assert.equal(onNode.count, null);
+  assert.equal(onNode.source, "main");
+  assert.doesNotMatch(onNode.text, /: 0\b/, "a node never claims zero goals it does not track");
+  assert.match(onNode.text, /tracked on the main/);
+
+  // The machine that tracks the goals: 5 unverified OpenAGI goals, 0 running.
+  const mainDir = tempDir(t);
+  const main = makeSup(mainDir);
+  for (const goal of ["Check-ins explain decisions", "Dictation survives pauses", "Voice mode slice 1", "Budget top-ups", "Paseo settings"]) {
+    main.activeWork.trackWork({ project: "OpenAGI", goal, doneCriteria: "Verified live by Spencer" });
+  }
+  const items = main.activeWork.state.items;
+  items[0].state = "blocked";
+  items[1].awaitingFollowup = true;
+  const onMain = main.trackedGoalSummary();
+  assert.equal(onMain.source, "local");
+  assert.equal(onMain.count, 5, "all 5 unverified goals are counted, including blocked and awaiting rollout");
+  assert.equal(onMain.blocked, 1);
+  assert.equal(onMain.awaiting, 1);
+  assert.equal(onMain.text, "Unverified tracked goals: 5 (1 blocked, 1 awaiting rollout or verification)");
+  assert.equal(main.runningSessionCount({ counts: { byState: { running: 0 } } }), 0, "zero running is a real zero");
+  assert.equal(main.runningSessionCount(null), null, "no scan is unknown, not zero");
+
+  // A failed Active Work read is unknown.
+  main.activeWork.getActiveWork = () => { throw new Error("disk read failed"); };
+  assert.equal(main.trackedGoalSummary().text, "Unverified tracked goals: unknown (Active Work could not be read)");
 });
