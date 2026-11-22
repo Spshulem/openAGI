@@ -226,7 +226,7 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
 
 // Filters questions whose underlying condition resolved since the question
 // was opened, or routine updates suppressed by "quiet_until_ready" cadence.
-function isQuestionLiveForDeck(question, row, prefs) {
+export function isQuestionLiveForDeck(question, row, prefs) {
   if (!question || question.status !== "open") return false;
   if (row?.muted) return false;
   const prRef = question.prRef ?? row?.prRef ?? null;
