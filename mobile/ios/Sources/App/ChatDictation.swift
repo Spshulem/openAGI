@@ -45,12 +45,15 @@ struct DictationTranscript: Equatable {
     // On-device recognition can restart its transcript after a pause without
     // marking the last one final, and with zero timing. A later result for
     // the same audio never drops two or more words, or shrinks and changes
-    // its first word, so either means a new utterance: keep what came before.
+    // its first word (other than losing a leading filler), so either means a
+    // new utterance: keep what came before.
     nonisolated static func restartsWithoutTiming(live: String, text: String) -> Bool {
         let words = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber || $0 == " " }
             .split(separator: " ").map(String.init) }
         let heard = words(live), next = words(text)
         guard !heard.isEmpty, !next.isEmpty, !next.starts(with: heard) else { return false }
+        // Dropping a leading filler ("um I want" -> "I want") is a revision.
+        if heard.count > next.count, Array(heard.suffix(next.count)) == next, next.count > 1 { return false }
         return next.count + 2 <= heard.count || (next.count < heard.count && next.first != heard.first)
     }
 
