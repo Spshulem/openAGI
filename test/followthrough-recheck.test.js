@@ -90,6 +90,28 @@ test("prose handoff is blocked while a permission prompt is pending", async () =
   assert.match(result.delivery.detail, /permission prompt pending/);
 });
 
+test("a free-text Paseo question accepts the owner's prose answer", async () => {
+  const { supervisor } = fixture();
+  const threadKey = "paseo:bb:question";
+  supervisor.knownThreads.set(threadKey, {
+    key: threadKey, kind: "paseo", id: "question", title: "Question chat", agentStatus: "idle",
+    meta: {
+      serverId: "bb",
+      pendingCard: { requestId: "question-1", items: [{ freeText: true, question: "Which directory?" }] }
+    },
+    prRefs: []
+  });
+  const delivered = [];
+  supervisor.executor.deliver = async (input) => {
+    delivered.push(input);
+    return { status: "sent", route: "paseo-send" };
+  };
+  const result = await supervisor.sendOwnerMessage(threadKey, "Use /work/project for the release handoff.");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "Use /work/project for the release handoff.");
+});
+
 test("pruning keeps accepted pending rechecks and rejects scheduling when pending capacity is full", () => {
   const { supervisor } = fixture();
   const longRunning = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Long follow-through", doneCriteria: "Verified next year" });

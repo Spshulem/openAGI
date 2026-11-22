@@ -2336,10 +2336,20 @@ export class FleetSupervisor {
     // but the agent has not heard it yet.
     const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
       || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
+    // A Paseo question card is also represented as a pending permission, but
+    // its free-text answer must reach deliverPaseo so that it can submit the
+    // answer through the question handler. Keep the early guard for actual
+    // permission prompts (and for cards that explicitly disallow free text).
+    const paseoFreeTextQuestion = Boolean(
+      thread?.kind === "paseo"
+      && thread?.meta?.pendingCard?.items?.some((item) => item?.freeText === true)
+      && !thread?.meta?.blockedOnOwner
+      && !thread?.meta?.pendingPermission
+    );
     const permissionPending = Boolean(
       thread?.meta?.blockedOnOwner === true
       || thread?.meta?.pendingPermission
-      || thread?.meta?.pendingCard?.requestId
+      || (thread?.meta?.pendingCard?.requestId && !paseoFreeTextQuestion)
       || (!refreshedPermissionState && (matchingOpen?.meta?.paseoPermissionId || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")))
     );
     // A free-form handoff is not a permission answer. If a permission prompt
