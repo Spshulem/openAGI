@@ -76,8 +76,10 @@ test("walkthrough omits questions whose deck predicates are no longer live", () 
       { id: "merged", status: "open", kind: "ready", prRef: "acme/api#1", threadKey: "codex:merged", title: "Merge?", options: ["Merge"] },
       { id: "quiet", status: "open", kind: "idle-report", threadKey: "codex:idle", title: "Still waiting?", options: ["Continue"] },
       { id: "superseded", status: "open", kind: "agent-ask", threadKey: "codex:running", createdAt: "2026-01-01T00:00:00Z", title: "Old ask", options: ["Retry"] },
-      { id: "live", status: "open", kind: "prompt", title: "Choose", options: ["Yes"] }
+      { id: "live", status: "open", kind: "prompt", title: "Choose", options: ["Answer question", "Review plan", "Yes"] }
     ]
   };
-  assert.deepEqual(walkthroughItems(supervisorState).map(item => item.id), ["live"]);
+  const items = walkthroughItems(supervisorState);
+  assert.deepEqual(items.map(item => item.id), ["live"]);
+  assert.deepEqual(items[0].options, ["Yes"]);
 });

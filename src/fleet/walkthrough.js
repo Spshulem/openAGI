@@ -7,6 +7,9 @@ const MAX_ITEMS = 40;
 const ID_MAX = 160;
 const OPS = new Set(["view", "start", "next", "back", "skip", "pause", "resume"]);
 const clean = (value, max = 240) => String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
+const supportedOptions = options => (Array.isArray(options) ? options : [])
+  .filter(value => typeof value === "string" && value && !["dismiss", "answer question", "review plan"].includes(value.toLowerCase()))
+  .map(value => clean(value, 60)).slice(0, 4);
 
 export class WalkthroughError extends Error {
   constructor(code, status, message) {
@@ -48,7 +51,7 @@ function cardItem(card) {
     primaryLabel: typeof card.primaryAction?.label === "string" ? clean(card.primaryAction.label, 80) : (typeof card.primaryLabel === "string" ? clean(card.primaryLabel, 80) : null),
     ciState: typeof card.ciState === "string" ? clean(card.ciState, 24) : null,
     pmBrief: typeof card.pmBrief === "string" ? clean(card.pmBrief, 500) : null,
-    options: Array.isArray(card.options) ? card.options.filter(x => typeof x === "string").map(x => clean(x, 60)).slice(0, 4) : []
+    options: supportedOptions(card.options)
   };
 }
 
@@ -61,7 +64,7 @@ function questionItem(question, cards) {
     questionId: clean(question.id, ID_MAX),
     threadKey: typeof question.threadKey === "string" ? clean(question.threadKey, ID_MAX) : null,
     cardId: null, cardKind: null, prRef: typeof question.prRef === "string" ? clean(question.prRef, 100) : null,
-    options: Array.isArray(question.options) ? question.options.filter(x => typeof x === "string").map(x => clean(x, 60)).slice(0, 4) : []
+    options: supportedOptions(question.options)
   };
 }
 
