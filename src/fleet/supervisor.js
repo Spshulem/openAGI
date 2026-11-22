@@ -2254,7 +2254,7 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true, ownerChoice = null } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -2270,6 +2270,21 @@ export class FleetSupervisor {
     // but the agent has not heard it yet.
     const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
       || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
+    const permissionPending = Boolean(
+      thread?.meta?.blockedOnOwner === true
+      || thread?.meta?.pendingPermission
+      || thread?.meta?.pendingCard?.requestId
+      || matchingOpen?.meta?.paseoPermissionId
+      || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")
+    );
+    // A free-form handoff is not a permission answer. If a permission prompt
+    // is pending, refuse with a durable action receipt so prose cannot be
+    // interpreted as Allow/Deny and the caller can retry after fleet_click.
+    if (permissionPending && ownerChoice == null) {
+      const detail = "permission prompt pending; message was not sent. Answer the prompt first, then retry the handoff";
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
+      return { delivery: { status: "blocked", route: null, detail, actionId: action.id, permissionRequired: true } };
+    }
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     if (!thread || !route) {
@@ -2289,7 +2304,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}), ...(ownerChoice != null ? { ownerChoice } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     if (delivery.status === "sent") {
@@ -2635,6 +2650,16 @@ export class FleetSupervisor {
     const result = this.activeWork.trackWork(input);
     this.emitFleet("active-work-updated");
     return result;
+  }
+
+  scheduleActiveWorkRecheck(id, input = {}) {
+    const result = this.activeWork.scheduleRecheck(id, input);
+    if (result?.ok) this.emitFleet("active-work-recheck-scheduled");
+    return result;
+  }
+
+  listActiveWorkRechecks(options = {}) {
+    return this.activeWork.listRechecks(options);
   }
 
   async scanActiveWork(options = {}) {
