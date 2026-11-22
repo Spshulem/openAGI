@@ -15,9 +15,7 @@
 // `missing`, so the caller can ask the owning agent for it before surfacing the
 // ask, or label the gap honestly if the agent cannot be reached.
 
-import { clampText, parsePrRef, redactSecrets, shortHash } from "./contracts.js";
-
-export const DECISION_CONTEXT_PARTS = Object.freeze(["goal", "assignment", "progress", "blocked", "decision"]);
+import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
 
 // How long a new ask is held back while its owning agent supplies missing
 // context. After this it surfaces anyway, with the gaps named, so nothing is
@@ -138,16 +136,23 @@ export function parseAgentSuppliedContext(text) {
   return Object.values(result).some((v) => (Array.isArray(v) ? v.length : Boolean(v))) ? result : null;
 }
 
-function latestAgentContext(messages, agentSummary) {
-  const texts = [
-    ...[...(messages ?? [])].reverse().filter((m) => m?.role !== "user").map((m) => m?.text),
-    agentSummary
-  ];
-  for (const text of texts) {
-    const parsed = parseAgentSuppliedContext(text);
-    if (parsed) return parsed;
+// Only the agent's latest message counts: a block from earlier in the chat
+// may describe an older ask, and must never label a newer, different one.
+// The block also has to name the same decision when the ask has options.
+function latestAgentContext(messages, agentSummary, question = null) {
+  const latest = [...(messages ?? [])].reverse().find((m) => m?.role !== "user")?.text ?? null;
+  // Message windows keep only a message's tail; the fuller agent summary is
+  // used when it is the same latest message.
+  const tail = String(latest ?? "").trim().slice(-80);
+  const sameFuller = agentSummary && (!latest || (tail && String(agentSummary).trim().endsWith(tail))) ? agentSummary : null;
+  const parsed = parseAgentSuppliedContext(latest) ?? parseAgentSuppliedContext(sameFuller);
+  if (!parsed) return null;
+  const asked = realDecisionOptions(question?.options).map((o) => o.toLowerCase());
+  if (asked.length && parsed.options.length) {
+    const offered = parsed.options.map((o) => String(o.label).toLowerCase());
+    if (!asked.some((label) => offered.some((o) => o === label || o.startsWith(label) || label.startsWith(o)))) return null;
   }
-  return null;
+  return parsed;
 }
 
 function sourceRequest(messages) {
@@ -216,7 +221,8 @@ export function classifyAsk(question) {
 }
 
 const OPTION_CONSEQUENCES = [
-  [/^(?:merge(?: pr)?|approve(?: & merge)?)$/i, (c) => `${c.prName ?? "The PR"} merges into the base branch. Deploying is a separate step.`],
+  [/^(?:merge(?: pr)?|approve (?:&|and) merge)$/i, (c) => `${c.prName ?? "The PR"} merges into the base branch. Deploying is a separate step.`],
+  [/^approve$/i, (c) => (c.isMerge ? `${c.prName ?? "The PR"} merges into the base branch. Deploying is a separate step.` : null)],
   [/^merge (?:&|and) deploy$/i, (c) => `${c.prName ?? "The PR"} merges and then deploys.`],
   [/^(?:allow|yes, allow|approve)$/i, (c) => (c.command ? `The agent runs \`${clampText(c.command, 80)}\` and continues.` : "The agent takes the requested step and continues.")],
   [/^(?:deny|no)$/i, () => "The agent skips that step and stays paused until it hears how else to proceed."],
@@ -232,7 +238,11 @@ const OPTION_CONSEQUENCES = [
 ];
 
 function optionConsequence(label, ctx) {
-  for (const [re, fn] of OPTION_CONSEQUENCES) if (re.test(label)) return fn(ctx);
+  for (const [re, fn] of OPTION_CONSEQUENCES) {
+    if (!re.test(label)) continue;
+    const text = fn(ctx);
+    if (text) return text;
+  }
   return null;
 }
 
@@ -261,7 +271,7 @@ export function buildDecisionContext({
   contextRequest = null
 } = {}) {
   const askType = followUp ? "decision" : classifyAsk(question);
-  const supplied = latestAgentContext(recentMessages, agentSummary);
+  const supplied = latestAgentContext(recentMessages, agentSummary, question);
   const req = sourceRequest(recentMessages);
   const prRef = prMeta?.ref ?? question?.prRef ?? followUp?.prRef ?? null;
   const prName = prLabel(prRef);
@@ -364,7 +374,12 @@ export function buildDecisionContext({
     return rest ? `Agent's latest update: ${prose(rest, 280)}` : null;
   }).filter(Boolean).join(" ") || null;
 
-  const consequenceCtx = { prName: prName ?? null, command: permission?.command ?? null, ownerName: prose(followUp?.owner?.label, 60) };
+  const consequenceCtx = {
+    prName: prName ?? null,
+    command: permission?.command ?? null,
+    ownerName: prose(followUp?.owner?.label, 60),
+    isMerge: String(question?.kind ?? "") === "ready" || Boolean(question?.mergeAsk)
+  };
   let options;
   if (supplied?.options?.length) {
     options = supplied.options.map((opt) => ({ label: opt.label, consequence: opt.consequence ?? optionConsequence(opt.label, consequenceCtx) }));
@@ -380,7 +395,10 @@ export function buildDecisionContext({
     });
   }
   options = options.filter((o) => o.label).slice(0, 5);
-  const rec = supplied?.recommendation || prose(recommendation, 240) || null;
+  const rec = supplied?.recommendation
+    || prose(recommendation, 240)
+    || (question?.reviewedAt && reviewBrief?.recommendation ? prose(reviewBrief.recommendation, 240) : null)
+    || null;
 
   const sources = [];
   const prUrl = prUrlFor(prRef, prMeta?.url);
@@ -438,8 +456,25 @@ function gapNote(ctx, part) {
 
 // Plain-English rendering. `markdown` adds bold labels and links; the plain
 // form is for outreach summaries and phone pushes.
-export function renderDecisionContext(ctx, { markdown = false, compact = false } = {}) {
+export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null } = {}) {
   if (!ctx) return "";
+  if (Number.isFinite(maxChars) && maxChars > 0) {
+    // Budget the earlier parts so the decision, options and recommendation
+    // (part 4) always fit: they are what the owner acts on.
+    const full = renderDecisionContext(ctx, { markdown, compact });
+    if (full.length <= maxChars) return full;
+    const per = Math.max(80, Math.floor(maxChars * 0.12));
+    const cut = (v) => (v ? clampText(v, per) : v);
+    const shortCtx = { ...ctx, goal: cut(ctx.goal), assignment: cut(ctx.assignment), verified: cut(ctx.verified), changed: cut(ctx.changed), blocked: cut(ctx.blocked) };
+    const shorter = renderDecisionContext(shortCtx, { markdown, compact: true });
+    if (shorter.length <= maxChars) return shorter;
+    const lines = shorter.split("\n");
+    const four = lines.findIndex((l) => /^4\. /.test(l));
+    const head = lines.slice(0, four).join("\n");
+    const tail = lines.slice(four).join("\n");
+    const room = Math.max(0, maxChars - tail.length - 1);
+    return room > 40 ? `${clampText(head, room)}\n${tail}` : clampText(tail, maxChars);
+  }
   const b = (s) => (markdown ? `**${s}**` : s);
   const gap = (part) => gapNote(ctx, part);
   const lines = [];
@@ -466,11 +501,12 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false }
   return lines.join("\n");
 }
 
-// Stable fingerprint of the decision itself (not of counts or timestamps), so
-// a reworded-but-identical ask never notifies twice.
-export function decisionContextHash(ctx) {
-  if (!ctx) return null;
-  return shortHash(JSON.stringify([ctx.decision, ctx.options.map((o) => o.label.toLowerCase()).sort(), ctx.askType]));
+// Text for compact copies (outreach, glasses, phone feeds): the four parts
+// when the goal or assignment was recovered; otherwise the ask's own words,
+// rather than a page of "not recoverable" lines. Gaps stay on the card.
+export function decisionSummary(ctx, fallbackText, { maxChars = 1400 } = {}) {
+  if (ctx && (ctx.goal || ctx.assignment)) return renderDecisionContext(ctx, { maxChars });
+  return clampText(stripInternalIds(fallbackText ?? ""), maxChars);
 }
 
 // The message sent to the owning agent when an ask is missing context. It asks

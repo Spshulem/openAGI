@@ -24,7 +24,6 @@ import {
   THREAD_KEY_PATTERN,
   clampTail,
   clampText,
-  clampTextLines,
   parsePaseoThreadKey,
   parsePrRef,
   redactSecrets,
@@ -1806,7 +1805,7 @@ export class ActiveWorkManager {
     // A tracked goal is not a running session and not (yet) an open ask:
     // the title says which it is.
     const title = clampText(`Tracked goal · ${ctx.itemName}`, 110);
-    const summary = clampTextLines(renderDecisionContext(ctx), 1400);
+    const summary = renderDecisionContext(ctx, { maxChars: 1400 });
     return { title, summary, ctx };
   }
 

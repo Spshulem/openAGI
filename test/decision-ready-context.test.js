@@ -377,3 +377,67 @@ test("agent-supplied context parses, internal ids strip, and gaps are named rath
   assert.match(text, /1\. Goal: Not recoverable from the source chat or current evidence\./);
   assert.doesNotMatch(text, /undefined|null/);
 });
+
+test("review fixes: stale agent context, permission approvals, reviewed recommendations, and the decision always survive", () => {
+  // An older DECISION CONTEXT block for a merge must not label a newer,
+  // different ask in the same chat.
+  const oldBlock = "DECISION CONTEXT\nGoal: G\nAssigned: A\nVerified: V\nBlocked: B\nDecision: Merge the PR?\nOptions:\n- merge — it merges\n- wait — nothing";
+  const stale = buildDecisionContext({
+    question: { kind: "agent-ask", title: "Delete the staging database?", options: ["delete", "keep"] },
+    recentMessages: [
+      { role: "assistant", text: oldBlock },
+      { role: "user", text: "ok" },
+      { role: "assistant", text: "The staging database is corrupt. Delete it, or keep it for forensics?" }
+    ]
+  });
+  assert.equal(stale.agentSupplied, false);
+  assert.doesNotMatch(stale.decision, /Merge the PR/);
+  // Even as the latest message, a block naming other options is ignored.
+  const mismatched = buildDecisionContext({
+    question: { kind: "agent-ask", title: "Delete the staging database?", options: ["delete", "keep"] },
+    recentMessages: [{ role: "assistant", text: oldBlock }]
+  });
+  assert.equal(mismatched.agentSupplied, false);
+
+  // "Approve" on a tool permission is not a merge.
+  const perm = buildDecisionContext({ question: { kind: "prompt", title: "Run npm test?", options: ["Approve", "Deny"] }, permission: { command: "npm test" } });
+  assert.match(perm.options[0].consequence, /runs `npm test`/);
+  const merge = buildDecisionContext({ question: { kind: "ready", prRef: "o/r#5", title: "PR #5 ready", options: ["Approve", "later"] } });
+  assert.match(merge.options[0].consequence, /PR #5 merges/);
+
+  // A reviewed recommendation reaches notifications and check-ins.
+  const reviewed = decisionContextFromQuestion({
+    kind: "agent-ask", title: "Ship the hotfix?", options: ["ship", "hold"],
+    reviewedAt: "2026-11-22T17:00:00.000Z",
+    reviewBrief: { recommendation: "Hold until the staging smoke test passes." }
+  });
+  assert.equal(reviewed.recommendation, "Hold until the staging smoke test passes.");
+
+  // A long context is budgeted so part 4 is never cut off.
+  const long = "x".repeat(900);
+  const big = buildDecisionContext({
+    question: { kind: "agent-ask", title: "Pick a region?", options: ["us-east", "eu-west"] },
+    recentMessages: [{ role: "user", text: `Move the database ${long}` }, { role: "assistant", text: `Blocked: needs your call on region ${long}. Pick a region?` }]
+  });
+  const text = renderDecisionContext(big, { maxChars: 1400 });
+  assert.ok(text.length <= 1400, `bounded (${text.length})`);
+  assert.match(text, /4\. Decision now: Pick a region\? Options: Us-east; Eu-west\./);
+});
+
+test("the hosted hub mirror honors a context hold and shows the four-part summary", async () => {
+  const { RemoteFleetSupervisor } = await import("../src/fleet/remote.js");
+  const outreach = fakeOutreach();
+  outreach.list = () => [...outreach.items.values()];
+  outreach.resolve = () => {};
+  const base = { status: "open", createdAt: new Date().toISOString(), options: ["proceed", "hold"], kind: "agent-ask" };
+  const questions = [
+    { ...base, id: "fq_held000001", title: "Held ask", body: "Proceed?", contextRequest: { at: new Date().toISOString(), sent: true, missing: ["goal"] } },
+    { ...base, id: "fq_ready00001", title: "Ready ask", body: "Proceed?", contextSnapshot: { recentMessages: [{ role: "user", text: "Ship the onboarding emails before Monday's launch" }, { role: "assistant", text: "Draft is verified in staging. Sending needs your approval. Send now, or hold?" }] } }
+  ];
+  const fake = { runtime: { outreach }, nodeId: "node1", pendingOutreachDecisions: new Set(), getState: () => ({ questions, preferences: null }) };
+  RemoteFleetSupervisor.prototype.mirrorQuestions.call(fake);
+  const posted = [...outreach.items.values()];
+  assert.deepEqual(posted.map((i) => i.sourceRef.id), ["fq_ready00001"], "the held ask is not mirrored yet");
+  assert.match(posted[0].summary, /^1\. Goal: Ship the onboarding emails/m);
+  assert.match(posted[0].summary, /^4\. Decision now: Send now, or hold\?/m);
+});

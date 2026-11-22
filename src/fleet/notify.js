@@ -3,9 +3,9 @@
 // credential: it is read at call time and never stored, returned, or logged.
 
 import fs from "node:fs";
-import { DEFAULTS, clampText, clampTextLines } from "./contracts.js";
+import { DEFAULTS, clampText } from "./contracts.js";
 import { isSuppressedByQuietCadence } from "./preferences.js";
-import { classifyAsk, isGenericAsk, renderDecisionContext, stripInternalIds } from "./decision-context.js";
+import { classifyAsk, decisionSummary, isGenericAsk, stripInternalIds } from "./decision-context.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const PUSH_TIMEOUT_MS = 5_000;
@@ -85,7 +85,7 @@ export function createNotifier({
     const title = clampText(generic && ctx?.itemName && !headline.startsWith(ctx.itemName) ? `${ctx.itemName}: ${headline}` : headline, limits.titleMax);
     return {
       title,
-      summary: ctx ? clampTextLines(renderDecisionContext(ctx), CONTEXT_SUMMARY_MAX) : clampText(stripInternalIds(question.body), limits.bodyMax),
+      summary: ctx ? decisionSummary(ctx, question.body, { maxChars: CONTEXT_SUMMARY_MAX }) : clampText(stripInternalIds(question.body), limits.bodyMax),
       actions: outreachActions(question.options)
     };
   };
