@@ -84,6 +84,9 @@ final class ChatDictation {
     @ObservationIgnored private var recognizer: SFSpeechRecognizer?
     @ObservationIgnored private let requestBox = DictationRequestBox()
     @ObservationIgnored private var lastSegmentEnd: TimeInterval?
+    // The recognition request whose results count; a finalized segment or a
+    // new session replaces it, and late results from the old one are ignored.
+    @ObservationIgnored private var recognitionID = UUID()
 
     func start(draft: String, update: @escaping (String) -> Void) async {
         guard !isListening, !isStarting else { return }
@@ -179,13 +182,17 @@ final class ChatDictation {
         self.request = request
         requestBox.set(request)
         lastSegmentEnd = nil
+        let recognitionID = UUID()
+        self.recognitionID = recognitionID
         task = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, failure in
             let text = result?.bestTranscription.formattedString
             let finished = result?.isFinal == true
             let failed = failure != nil
             let segments = result?.bestTranscription.segments.map { ($0.timestamp, $0.timestamp + $0.duration) } ?? []
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                // Before touching any state, timing included: a late result from
+                // a stopped session or a replaced request must change nothing.
+                guard let self, self.generation == generation, self.recognitionID == recognitionID else { return }
                 // A result that begins after everything heard so far ended is a
                 // new utterance, even if iOS did not mark the last one final.
                 let newUtterance = DictationTranscript.startsNewUtterance(
