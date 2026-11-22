@@ -690,12 +690,12 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
         select.addEventListener('change', function () {
           if (changed || select.disabled) return;
           changed = true; select.disabled = true;
-          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function (saved) {
-            box.replaceChildren();
-            renderPaseoSettings(parent, t);
+          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function () {
+            box.replaceWith(renderPaseoSettings(parent, t));
             say('Paseo ' + label.toLowerCase() + ' change confirmed by readback.');
           }).catch(function (error) {
-            changed = false; select.disabled = settings.status !== 'ready';
+            // Never leave the rejected value displayed as current; reread the session.
+            box.replaceWith(renderPaseoSettings(parent, t));
             say(error.message || 'The setting was not changed.', true);
           });
         });
