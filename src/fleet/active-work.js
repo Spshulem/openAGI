@@ -584,11 +584,22 @@ export class ActiveWorkManager {
     const existing = this.state.rechecks.find((recheck) => recheck.status === "pending" && recheck.itemId === id && recheck.evidenceMark === evidenceMark);
     if (existing) return { ok: true, status: "reused", recheck: structuredClone(existing) };
     const nowMs = this.now();
+    const pending = this.state.rechecks.filter((recheck) => recheck.status === "pending");
+    if (pending.length >= MAX_ITEMS) throw new Error("Active Work recheck capacity is full; existing pending rechecks must run before scheduling another.");
     const recheck = { id: makeId("recheck"), itemId: id, evidenceMark, dueAt: new Date(nowMs + delaySeconds * 1000).toISOString(), createdAt: new Date(nowMs).toISOString(), status: "pending", result: null };
-    this.state.rechecks = [...this.state.rechecks, recheck].slice(-MAX_ITEMS);
+    // Prune completed history first; an accepted pending recheck is never
+    // discarded to make room.
+    const keepCompleted = MAX_ITEMS - pending.length - 1;
+    const completed = keepCompleted > 0 ? this.state.rechecks.filter((candidate) => candidate.status !== "pending").slice(-keepCompleted) : [];
+    this.state.rechecks = [...completed, ...pending, recheck];
     this._recordAudit({ op: "recheck_scheduled", itemId: id, recheckId: recheck.id, evidenceMark });
     this._save();
     return { ok: true, status: "scheduled", recheck: structuredClone(recheck) };
+  }
+
+  hasDueRechecks(now = this.now()) {
+    const nowMs = typeof now === "number" ? now : Date.parse(now);
+    return this.state.rechecks.some((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs);
   }
 
   listRechecks({ status = null } = {}) {
@@ -1847,7 +1858,10 @@ export class ActiveWorkManager {
       const ownerKey = item.owner?.threadKey ?? null;
       const session = ownerKey ? (sessionsByKey.get(ownerKey) ?? null) : null;
       const ownerMissing = Boolean(ownerKey && !session);
-      const inCurrentPage = !ownerKey || sessions.length === 0 || pageSessionKeys.has(ownerKey) || (session ? pageSessionKeys.has(session.key) : false);
+      const dueRecheck = this.state.rechecks.some((recheck) =>
+        recheck.status === "pending" && recheck.itemId === item.id && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs
+      );
+      const inCurrentPage = dueRecheck || !ownerKey || sessions.length === 0 || pageSessionKeys.has(ownerKey) || (session ? pageSessionKeys.has(session.key) : false);
 
       const progressMs = parseIsoMs(item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? item.createdAt) ?? nowMs;
       const staleAfterMs = (item.cadence?.staleAfterHours ?? 24) * HOUR_MS;
@@ -2082,7 +2096,9 @@ export class ActiveWorkManager {
     // result per pass, and only for a verified outcome or one deterministic
     // blocker. No owner turn or model call is needed.
     let recheckNotification = null;
-    const dueRechecks = this.state.rechecks.filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs);
+    const dueRechecks = this.state.rechecks
+      .filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs)
+      .sort((a, b) => Number(this.state.items.find((item) => item.id === b.itemId)?.outcomeVerified === true) - Number(this.state.items.find((item) => item.id === a.itemId)?.outcomeVerified === true));
     for (const recheck of dueRechecks) {
       const rawRecheckItem = this.state.items.find((candidate) => candidate.id === recheck.itemId);
       const projected = rawRecheckItem ? this._projectItem(rawRecheckItem, { nowMs, sessionsByKey, prsByRef }) : null;

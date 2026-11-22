@@ -35,9 +35,13 @@ struct DictationTranscript: Equatable {
         guard let previousEnd, previousEnd > 0, let first = segments.first,
               first.0 > 0, first.1 > first.0 else { return false }
         guard first.0 >= previousEnd + utteranceGap else { return false }
-        // A continuation of what is already live is a revision, whatever the timing says.
-        let liveWords = live.lowercased().split(separator: " "), words = text.lowercased().split(separator: " ")
-        return !(liveWords.first.map { words.first == $0 } ?? false)
+        // Only text that extends everything already live is a continuation;
+        // two utterances may share a first word ("I need milk", "I also need
+        // bread"), and the timing above is what separates them.
+        let normalize = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber || $0 == " " }
+            .split(separator: " ").joined(separator: " ") }
+        let liveText = normalize(live)
+        return liveText.isEmpty || !normalize(text).hasPrefix(liveText)
     }
 
     // The end of the speech in a result, if its timing is set.
@@ -80,6 +84,9 @@ final class ChatDictation {
     @ObservationIgnored private var recognizer: SFSpeechRecognizer?
     @ObservationIgnored private let requestBox = DictationRequestBox()
     @ObservationIgnored private var lastSegmentEnd: TimeInterval?
+    // The recognition request whose results count; a finalized segment or a
+    // new session replaces it, and late results from the old one are ignored.
+    @ObservationIgnored private var recognitionID = UUID()
 
     func start(draft: String, update: @escaping (String) -> Void) async {
         guard !isListening, !isStarting else { return }
@@ -175,13 +182,17 @@ final class ChatDictation {
         self.request = request
         requestBox.set(request)
         lastSegmentEnd = nil
+        let recognitionID = UUID()
+        self.recognitionID = recognitionID
         task = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, failure in
             let text = result?.bestTranscription.formattedString
             let finished = result?.isFinal == true
             let failed = failure != nil
             let segments = result?.bestTranscription.segments.map { ($0.timestamp, $0.timestamp + $0.duration) } ?? []
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                // Before touching any state, timing included: a late result from
+                // a stopped session or a replaced request must change nothing.
+                guard let self, self.generation == generation, self.recognitionID == recognitionID else { return }
                 // A result that begins after everything heard so far ended is a
                 // new utterance, even if iOS did not mark the last one final.
                 let newUtterance = DictationTranscript.startsNewUtterance(

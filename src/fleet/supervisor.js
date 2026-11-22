@@ -624,8 +624,9 @@ function ownerReply(text) {
   return `Owner says: ${text}`;
 }
 
-// "retry" on a logged-out / disk-full question means the owner fixed it.
-const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
+// "retry" on a logged-out / provider-auth / disk-full question means the
+// owner fixed it.
+const RETRY_DELIVERY = "Owner fixed the blocker (login, provider auth or disk). Retry: continue where you stopped.";
 // "added" on an account-cap question means new capacity: resume now.
 const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
 const RESTART_REPEAT_MS = 10 * 60_000;
@@ -3656,6 +3657,15 @@ export class FleetSupervisor {
       store.saveDiagnosis({ error: clampText(redactSecrets(error?.message), 200) });
     }
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
+    // Due one-shot rechecks run from the background loop; a failed pass
+    // leaves them pending for the next tick and never breaks this one.
+    if (this.activeWork?.hasDueRechecks?.(this.now())) {
+      try {
+        await this.scanActiveWork({ pageSize: 12, maxRepoChecks: 2, maxDecisionItems: 4, maxPromptsPerPass: 1 });
+      } catch (error) {
+        store.saveDiagnosis({ error: clampText(redactSecrets(`active-work recheck: ${error?.message}`), 200) });
+      }
+    }
     return snapshot;
   }
 
