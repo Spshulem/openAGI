@@ -5,6 +5,7 @@
 //   - startPaseoSession: spawns a new Paseo coding session in the right workspace & host
 //   - batchActCards: rapid multi-card triage with per-card safety preflight
 
+import { githubThrottle, throttledGh } from "./github-throttle.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -984,9 +985,15 @@ async function resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin, fa
 }
 
 export async function inspectRepoStatus(supervisor, { repo = null, workspace = null, limit = 15, run = null, factory = null } = {}) {
-  const runImpl = run ?? supervisor?.deps?.run ?? runCommand;
+  const rawRun = run ?? supervisor?.deps?.run ?? runCommand;
+  const throttle = supervisor?.githubThrottle ?? githubThrottle;
+  // An owner's read: it waits only for a real limit, not a low background
+  // budget, and shares a read already in flight.
+  const runImpl = (bin, args, options) => throttledGh(rawRun, bin, args, options, { throttle, background: false });
   const ghBin = supervisor?.config?.bins?.gh ?? "gh";
   const maxOpen = Math.min(30, Math.max(1, Number(limit) || 15));
+  const held = throttle.blocking({ background: false });
+  if (held) throw new Error(`GitHub not queried: ${held.message} This is GitHub's limit, not the fleet computer being offline.`);
   const resolvedRepo = await resolveRepoSlug(supervisor, { repo, workspace, runImpl, ghBin, factory });
 
   const [openRes, mergedRes, releaseRes] = await Promise.all([
@@ -1016,6 +1023,9 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
     ).catch(() => ({ code: 1, stdout: "[]", stderr: "" }))
   ]);
 
+  if (openRes.throttled) {
+    throw new Error(`GitHub not queried: ${openRes.cooldown?.message ?? clampText(redactSecrets(openRes.stderr || "GitHub rate limit"), 200)} This is GitHub's limit, not the fleet computer being offline.`);
+  }
   if (openRes.code !== 0) {
     throw new Error(`GitHub PR query failed for ${resolvedRepo}: ${clampText(redactSecrets(openRes.stderr || openRes.stdout || "gh error"), 200)}`);
   }
