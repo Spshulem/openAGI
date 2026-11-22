@@ -78,6 +78,28 @@ export const PERSISTENT_WORK_STATES = Object.freeze([
   "done"
 ]);
 
+// Workflow stage describes where the requested outcome is in its lifecycle.
+// Execution health is deliberately separate: a validating item can be idle,
+// and an implementing item can be blocked.  Keeping these axes independent is
+// what lets the Work view answer both “what stage is it in?” and “is anyone
+// making fresh progress?” without treating a running chat as proof of progress.
+export const WORKFLOW_STAGES = Object.freeze([
+  "queued",
+  "implementing",
+  "validating",
+  "ready_for_review",
+  "deploying",
+  "verified_done"
+]);
+
+export const EXECUTION_HEALTH = Object.freeze([
+  "active",
+  "idle",
+  "stalled",
+  "blocked",
+  "unknown"
+]);
+
 const FOLLOW_THROUGH_PRIORITY = Object.freeze({
   blocked: 100,
   blocked_pr: 96,
@@ -124,6 +146,22 @@ function utcDay(ms) {
 function parseIsoMs(iso) {
   const ts = Date.parse(String(iso ?? ""));
   return Number.isFinite(ts) ? ts : null;
+}
+
+function normalizeWorkflowStage(value, fallback = "queued") {
+  const stage = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return WORKFLOW_STAGES.includes(stage) ? stage : fallback;
+}
+
+function normalizeExecutionHealth(value, fallback = "unknown") {
+  const health = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return EXECUTION_HEALTH.includes(health) ? health : fallback;
+}
+
+function defaultNextCheckAt(nowMs, cadence) {
+  const hours = Number(cadence?.staleAfterHours);
+  const delay = Number.isFinite(hours) ? Math.max(1, hours) : CADENCE_MODES.daily;
+  return new Date(nowMs + delay * HOUR_MS).toISOString();
 }
 
 function emptyPersistentState() {
@@ -691,6 +729,25 @@ export class ActiveWorkManager {
     // request to replace its explicit completion contract with the default.
     const doneCriteria = requestedDoneCriteria ?? existing?.doneCriteria ?? defaultDoneCriteria;
 
+    // These fields form the durable contract shared by the portfolio view,
+    // project-scoped Ask Supervisor, and every follow-through check. Keep the
+    // original ask separate from the mutable goal so later edits never erase
+    // what was actually delegated.
+    const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 600);
+    const acceptanceCriteria = cleanText(input.acceptanceCriteria ?? existing?.acceptanceCriteria ?? requestedDoneCriteria ?? defaultDoneCriteria, 500);
+    const currentStep = cleanText(input.currentStep ?? existing?.currentStep ?? input.progressSummary ?? "Queued for owner work", 300);
+    const nextMilestone = cleanText(input.nextMilestone ?? existing?.nextMilestone ?? nextAction ?? "Fresh owner evidence", 300);
+    const blocker = cleanText(input.blocker ?? existing?.blocker ?? "", 300) || null;
+    const nextActionOwner = cleanText(input.nextActionOwner ?? existing?.nextActionOwner ?? owner.label ?? "Owner", 120) || null;
+    const eta = cleanText(input.eta ?? existing?.eta ?? "", 120) || null;
+    const nextCheckMs = parseIsoMs(input.nextCheckAt ?? existing?.nextCheckAt);
+    const nextCheckAt = nextCheckMs !== null
+      ? new Date(nextCheckMs).toISOString()
+      : (existing?.nextCheckAt ?? defaultNextCheckAt(nowMs, cadence));
+    const requestedWorkflowStage = input.workflowStage !== undefined
+      ? normalizeWorkflowStage(input.workflowStage)
+      : (existing?.workflowStage ?? "queued");
+
     let item;
     let created = false;
     if (existing) {
@@ -731,9 +788,18 @@ export class ActiveWorkManager {
         customer: customer ?? existing.customer ?? null,
         repo: repo ?? existing.repo ?? null,
         goal: rawGoal,
+        originalAsk,
         doneCriteria,
+        acceptanceCriteria,
         goalUpdatedAt: goalChanged ? nowIso : (existing.goalUpdatedAt ?? existing.createdAt ?? nowIso),
         nextAction: nextAction !== null ? nextAction : existing.nextAction,
+        currentStep,
+        nextMilestone,
+        blocker,
+        nextActionOwner,
+        eta,
+        nextCheckAt,
+        workflowStage: requestedWorkflowStage,
         cadence: input.cadence !== undefined ? cadence : existing.cadence,
         permittedNudges: input.permittedNudges !== undefined ? permittedNudges : existing.permittedNudges,
         owner: (input.owner !== undefined || input.threadKey !== undefined) ? owner : existing.owner,
@@ -798,9 +864,18 @@ export class ActiveWorkManager {
         customer,
         repo,
         goal: rawGoal,
+        originalAsk,
         doneCriteria,
+        acceptanceCriteria,
         goalUpdatedAt: nowIso,
         nextAction,
+        currentStep,
+        nextMilestone,
+        blocker,
+        nextActionOwner,
+        eta,
+        nextCheckAt,
+        workflowStage: requestedWorkflowStage,
         cadence,
         permittedNudges,
         owner,
@@ -1305,6 +1380,23 @@ export class ActiveWorkManager {
       verificationQuestion = `${item.project}${item.theme ? ` / ${item.theme}` : ""} has been idle ${idleHours}h. Resume owner, snooze, or confirm done?`;
     }
 
+    const workflowStage = item.outcomeVerified === true
+      ? "verified_done"
+      : (prState === "MERGED"
+          ? "deploying"
+          : (prState === "OPEN" && !prIsDraft && prCiState === "SUCCESS"
+              ? "ready_for_review"
+              : (prState === "OPEN" && prCiState && prCiState !== "SUCCESS"
+                  ? "validating"
+                  : (sessionStatus === "running" ? "implementing" : normalizeWorkflowStage(item.workflowStage)))));
+    const executionHealth = followThroughState === "blocked" || followThroughState === "blocked_pr"
+      ? "blocked"
+      : (isPastCadence && sessionStatus !== "running"
+          ? "stalled"
+          : (sessionStatus === "running" && evidenceFreshness.allFresh
+              ? "active"
+              : (sessionStatus === "idle" ? "idle" : "unknown")));
+
     const choices = this._buildChoices(item, {
       followThroughState,
       hasActiveSessionOwner,
@@ -1324,8 +1416,16 @@ export class ActiveWorkManager {
       customer: item.customer ?? null,
       repo: item.repo ?? null,
       goal: item.goal,
+      originalAsk: item.originalAsk ?? item.goal,
       doneCriteria: item.doneCriteria,
+      acceptanceCriteria: item.acceptanceCriteria ?? item.doneCriteria,
       nextAction: item.nextAction ?? null,
+      currentStep: item.currentStep ?? item.lastMeaningfulProgress?.summary ?? null,
+      nextMilestone: item.nextMilestone ?? item.nextAction ?? null,
+      blocker: item.blocker ?? null,
+      nextActionOwner: item.nextActionOwner ?? item.owner?.label ?? null,
+      eta: item.eta ?? null,
+      nextCheckAt: item.nextCheckAt ?? null,
       cadence: item.cadence,
       permittedNudges: item.permittedNudges,
       owner: {
@@ -1341,10 +1441,13 @@ export class ActiveWorkManager {
       linkedSkill: item.linkedSkill ?? null,
       evidenceLinks: evaluatedLinks,
       evidenceFreshness,
+      lastMeaningfulEvidenceAt: evidenceFreshness.newestEvidenceAt,
       lastMeaningfulProgress: item.lastMeaningfulProgress,
       lastMeaningfulProgressAt: item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? null,
       idleHours,
       state: effectivePersistentState,
+      workflowStage,
+      executionHealth,
       followThroughState,
       actionable,
       priorityRank,
@@ -1498,6 +1601,31 @@ export class ActiveWorkManager {
       proposedProjects: openProposals.length
     };
 
+    const projectSummaries = [...scoped.reduce((groups, item) => {
+      const current = groups.get(item.project) ?? {
+        project: item.project,
+        total: 0,
+        actionable: 0,
+        stages: {},
+        health: {},
+        nextCheckAt: null,
+        nextMilestones: [],
+        blockers: []
+      };
+      current.total += 1;
+      if (item.actionable) current.actionable += 1;
+      current.stages[item.workflowStage] = (current.stages[item.workflowStage] ?? 0) + 1;
+      current.health[item.executionHealth] = (current.health[item.executionHealth] ?? 0) + 1;
+      if (item.nextCheckAt && (!current.nextCheckAt || item.nextCheckAt < current.nextCheckAt)) current.nextCheckAt = item.nextCheckAt;
+      if (item.nextMilestone) current.nextMilestones.push(item.nextMilestone);
+      if (item.blocker) current.blockers.push({ blocker: item.blocker, owner: item.nextActionOwner, id: item.id });
+      return groups.set(item.project, current);
+    }, new Map()).values()].map((summary) => ({
+      ...summary,
+      nextMilestones: [...new Set(summary.nextMilestones)].slice(0, 5),
+      blockers: summary.blockers.slice(0, 5)
+    }));
+
     return {
       at: nowIso,
       distinctFrom: {
@@ -1505,6 +1633,7 @@ export class ActiveWorkManager {
         needsYouApprovals: true
       },
       counts,
+      projectSummaries,
       digest,
       items: visibleItems,
       prompts,

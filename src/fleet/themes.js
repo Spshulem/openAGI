@@ -940,6 +940,33 @@ export async function dispatchManagerGoal(
     ? String(mode ?? "auto").toLowerCase()
     : "auto";
 
+  // A dispatch is never allowed to outrun its durable outcome contract.  This
+  // record is written before any message is sent or new Paseo session starts,
+  // so failed delivery, idle owners, and restarts still leave one truthful
+  // item for Work and project-scoped Ask Supervisor to reconcile.
+  const persistDispatchOutcome = ({ threadKey = null, ownerLabel = null, workflowStage = "queued", nextAction = null } = {}) => {
+    if (normalizedMode === "preview") return null;
+    if (typeof supervisor?.trackWork !== "function") throw new Error("Cannot dispatch without durable Active Work tracking.");
+    return supervisor.trackWork({
+      project: project || "General",
+      theme: theme || null,
+      goal: cleanGoal,
+      originalAsk: cleanGoal,
+      doneCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      acceptanceCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      owner: threadKey ? { threadKey, label: ownerLabel || threadKey } : { label: ownerLabel || "Assigned owner" },
+      currentStep: "Dispatch recorded; awaiting owner evidence",
+      nextMilestone: nextAction || "Owner evidence received and verified",
+      nextAction: nextAction || "Owner evidence received and verified",
+      nextActionOwner: ownerLabel || "Assigned owner",
+      workflowStage,
+      executionHealth: "unknown",
+      cadence: "hourly",
+      permittedNudges: "none",
+      dedupeKey: `dispatch:${String(project || "general").toLowerCase()}:${cleanGoal.toLowerCase()}`
+    });
+  };
+
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
     const cleanKey = String(targetKey).trim();
@@ -949,6 +976,7 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
+    persistDispatchOutcome({ threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
     const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
     const ok = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
@@ -1146,6 +1174,12 @@ export async function dispatchManagerGoal(
     }
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
+    persistDispatchOutcome({
+      threadKey: best.session.key,
+      ownerLabel: best.session.title || best.session.workspace,
+      workflowStage: "implementing",
+      nextAction: "Existing owner acknowledges the request"
+    });
     const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images });
     const delivered = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
@@ -1183,6 +1217,11 @@ export async function dispatchManagerGoal(
     };
   }
 
+  persistDispatchOutcome({
+    ownerLabel: suggestedTitle,
+    workflowStage: "queued",
+    nextAction: "New owner session starts and acknowledges the request"
+  });
   const created = await (typeof supervisor?.startPaseoSession === "function"
     ? supervisor.startPaseoSession({
         workspace: targetProject.name,
@@ -1208,8 +1247,24 @@ export async function dispatchManagerGoal(
         effort,
         modeId,
         images,
-        factory
-      }));
+      factory
+    }));
+
+  if (created?.key && typeof supervisor?.trackWork === "function") {
+    supervisor.trackWork({
+      project: targetProject.name,
+      theme: theme || inferredTheme.name,
+      goal: cleanGoal,
+      dedupeKey: `dispatch:${String(project || targetProject.name).toLowerCase()}:${cleanGoal.toLowerCase()}`,
+      owner: { threadKey: created.key, label: created.title || suggestedTitle },
+      currentStep: "Owner session started; awaiting first meaningful evidence",
+      workflowStage: "implementing",
+      nextMilestone: "Owner evidence received and verified",
+      nextAction: "Owner evidence received and verified",
+      nextActionOwner: created.title || suggestedTitle,
+      permittedNudges: "none"
+    });
+  }
 
   supervisor?.store?.recordAction?.({
     kind: "dispatch-goal",

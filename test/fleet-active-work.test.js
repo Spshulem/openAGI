@@ -1177,6 +1177,7 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
   try {
     // 1. Mobile route allowlist checks
     assert.equal(isMobileRouteAllowed("GET", "/fleet/api/active-work"), true);
+    assert.equal(isMobileRouteAllowed("GET", "/fleet/api/ask-supervisor"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work/scan"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work/tw_abc123/act"), true);
@@ -1242,6 +1243,9 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
 
     const remoteView = await remote.getActiveWork({ project: "Growth" });
     assert.equal(remoteView.items.length, 1);
+    const remoteAsk = await remote.getSupervisorWork({ project: "Growth" });
+    assert.equal(remoteAsk.project, "Growth");
+    assert.equal(remoteAsk.work.items.length, 1);
 
     // Proposal enrollment via RemoteFleetSupervisor
     await remote.scanActiveWork({ pageSize: 20, resetCursor: true });
@@ -1352,5 +1356,56 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
   } finally {
     ctx.cleanup();
     fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("durable Work records keep the original ask, lifecycle stage, health, evidence and project summary", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "UnifiedWork",
+      theme: "Supervisor",
+      goal: "Build unified Supervisor Work",
+      originalAsk: "Build unified Supervisor Work and project-scoped Ask Supervisor",
+      acceptanceCriteria: "Portfolio and project views show owner, evidence, blocker and next check",
+      doneCriteria: "iPhone and Duo QA evidence is recorded",
+      currentStep: "Implementing durable records",
+      nextMilestone: "Project-scoped read returns the same record",
+      nextActionOwner: "OpenAGI supervisor owner",
+      blocker: "PR #325 merge conflicts",
+      eta: "unknown",
+      nextCheckAt: "2026-11-21T13:00:00.000Z",
+      workflowStage: "implementing",
+      cadence: "hourly",
+      permittedNudges: "none"
+    });
+    assert.equal(tracked.item.originalAsk, "Build unified Supervisor Work and project-scoped Ask Supervisor");
+    assert.equal(tracked.item.acceptanceCriteria, "Portfolio and project views show owner, evidence, blocker and next check");
+    assert.equal(tracked.item.workflowStage, "implementing");
+    assert.equal(tracked.item.executionHealth, "unknown");
+    assert.equal(tracked.item.blocker, "PR #325 merge conflicts");
+    assert.equal(tracked.item.nextCheckAt, "2026-11-21T13:00:00.000Z");
+    assert.ok(tracked.item.lastMeaningfulEvidenceAt === null || typeof tracked.item.lastMeaningfulEvidenceAt === "string");
+
+    const projectSummary = ctx.supervisor.getActiveWork({ project: "UnifiedWork" }).projectSummaries
+      .find((entry) => entry.project === "UnifiedWork");
+    assert.ok(projectSummary);
+    assert.equal(projectSummary.total, 1);
+    assert.equal(projectSummary.stages.implementing, 1);
+    assert.equal(projectSummary.health.unknown, 1);
+
+    const route = createFleetRoute({ supervisor: ctx.supervisor });
+    const ask = await route(
+      "GET",
+      "/fleet/api/ask-supervisor",
+      new URL("http://localhost/fleet/api/ask-supervisor?project=UnifiedWork"),
+      async () => ({})
+    );
+    assert.equal(ask.status, 200);
+    assert.equal(ask.body.project, "UnifiedWork");
+    assert.equal(ask.body.work.items[0].originalAsk, "Build unified Supervisor Work and project-scoped Ask Supervisor");
+    assert.match(ask.body.ask.prompt, /UnifiedWork/);
+  } finally {
+    fs.rmSync(ctx.dataDir, { recursive: true, force: true });
   }
 });
