@@ -7,7 +7,7 @@ import { SupervisorWalkthrough, walkthroughItems } from "../src/fleet/walkthroug
 
 function state() {
   return {
-    cards: [{ id: "card-1", kind: "pr_ready", headline: "Review PR one", decisionFact: "CI is green", questionId: "q-1", threadKey: "codex:one" },
+    cards: [{ id: "card-1", kind: "pr_ready", headline: "Review PR one", decisionFact: "CI is green", questionId: "q-1", threadKey: "codex:one", prRef: "acme/api#1", ciState: "passing", primaryAction: { label: "Merge PR" } },
       { id: "card-2", kind: "blocked", headline: "Agent is blocked", decisionFact: "Needs a choice", threadKey: "claude:two" }],
     questions: [{ id: "q-1", title: "Duplicate card question", body: "Should not appear twice", threadKey: "codex:one" },
       { id: "q-3", title: "Choose a route", body: "The agent is waiting", threadKey: "codex:three" }]
@@ -19,6 +19,9 @@ test("walkthrough builds stable card/question identities without duplicates", ()
   assert.deepEqual(items.map(item => item.id), ["card-1", "card-2", "q-3"]);
   assert.equal(items[0].questionId, "q-1");
   assert.equal(items[1].cardId, "card-2");
+  assert.equal(items[0].primaryLabel, "Merge PR");
+  assert.equal(items[0].prRef, "acme/api#1");
+  assert.equal(items[0].ciState, "passing");
 });
 
 test("walkthrough persists start, next, skip, back and pause/resume cursor", () => {

@@ -79,6 +79,7 @@ export class OpenAGIG2App {
   private noticeTimer: ReturnType<typeof setTimeout> | null = null
   private actionIndex = 0
   private actionTarget: InboxItem | null = null
+  private walkthroughActionOrigin = false
   private voiceTarget: InboxItem | null = null
   private lastPingedSupervisor: InboxItem | null = null
   private supervisorWalkthrough: SupervisorWalkthrough | null = null
@@ -318,6 +319,11 @@ export class OpenAGIG2App {
       action: cardId ? 'act-fleet-card' : 'answer-fleet', supervisor: true,
       ...(cardId ? { cardId } : {}), ...(questionId ? { questionId } : {}),
       ...(current.threadKey ? { threadKey: current.threadKey } : {}),
+      ...(current.cardKind ? { cardKind: current.cardKind } : {}),
+      ...(current.primaryLabel ? { primaryLabel: current.primaryLabel } : {}),
+      ...(current.prRef ? { prRef: current.prRef } : {}),
+      ...(current.ciState ? { ciState: current.ciState } : {}),
+      ...(current.pmBrief ? { pmBrief: current.pmBrief } : {}),
       ...(current.options?.length ? { options: current.options } : {})
     }
   }
@@ -692,7 +698,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') void this.sendDraft()
-    else if (this.mode === 'walkthrough') { const item = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null); if (item) { this.actionTarget = { ...item }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() } }
+    else if (this.mode === 'walkthrough') { const item = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null); if (item) { this.actionTarget = { ...item }; this.actionIndex = 0; this.walkthroughActionOrigin = true; this.mode = 'inbox-action'; this.showInboxAction() } }
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
@@ -849,7 +855,12 @@ export class OpenAGIG2App {
     }
     if (this.mode === 'review') { this.showHome(); this.phone.set('Draft kept', 'Tap to return to your question. Discard on the phone to delete it.'); return }
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); return }
-    if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
+    if (this.mode === 'inbox-action') {
+      if (!this.actionTarget?.id) this.showHome()
+      else if (this.walkthroughActionOrigin) { this.walkthroughActionOrigin = false; this.showSupervisorWalkthrough() }
+      else { this.mode = 'inbox-detail'; this.showInboxPage() }
+      return
+    }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
     if (this.mode === 'walkthrough' || this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
     this.navigationBusy = true
@@ -1338,6 +1349,7 @@ export class OpenAGIG2App {
     else this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined))
   }
   private showHome(): void {
+    this.walkthroughActionOrigin = false
     this.phone.history?.(this.store.snapshot().history)
     const state = this.store.snapshot(); if (!state.nodeToken) { this.showUnpaired(); return }
     this.proactive.start()

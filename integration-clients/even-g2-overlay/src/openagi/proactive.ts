@@ -2,7 +2,7 @@ import type { OpenAGIApiClient } from './api-client'
 import { OpenAGIApiError } from './config'
 
 export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[]; questionId?: string; threadKey?: string; cardId?: string; cardKind?: string; pmBrief?: string; primaryLabel?: string; prRef?: string; ciState?: string }
-export interface SupervisorWalkthroughItem { id: string; kind: 'card' | 'question'; title: string; summary: string; questionId?: string | null; threadKey?: string | null; cardId?: string | null; cardKind?: string | null; prRef?: string | null; options?: string[] }
+export interface SupervisorWalkthroughItem { id: string; kind: 'card' | 'question'; title: string; summary: string; questionId?: string | null; threadKey?: string | null; cardId?: string | null; cardKind?: string | null; prRef?: string | null; primaryLabel?: string | null; ciState?: string | null; pmBrief?: string | null; options?: string[] }
 export interface SupervisorWalkthrough { active: boolean; paused: boolean; currentId: string | null; total: number; updatedAt?: string | null; current: SupervisorWalkthroughItem | null; items: SupervisorWalkthroughItem[] }
 // The supervisor's glanceable status: counts by colour, red then yellow threads.
 export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; cardsCount?: number; catchUpSummary?: string | null; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }

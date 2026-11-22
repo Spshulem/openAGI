@@ -44,6 +44,9 @@ function cardItem(card) {
     cardId: clean(card.id, ID_MAX),
     cardKind: typeof card.kind === "string" ? clean(card.kind, 60) : null,
     prRef: typeof card.prRef === "string" ? clean(card.prRef, 100) : null,
+    primaryLabel: typeof card.primaryAction?.label === "string" ? clean(card.primaryAction.label, 80) : (typeof card.primaryLabel === "string" ? clean(card.primaryLabel, 80) : null),
+    ciState: typeof card.ciState === "string" ? clean(card.ciState, 24) : null,
+    pmBrief: typeof card.pmBrief === "string" ? clean(card.pmBrief, 500) : null,
     options: Array.isArray(card.options) ? card.options.filter(x => typeof x === "string").map(x => clean(x, 60)).slice(0, 4) : []
   };
 }
