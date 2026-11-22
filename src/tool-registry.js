@@ -110,13 +110,26 @@ export class ToolRegistry {
   // Why a pending approval may no longer run (its chat is gone, the owner
   // moved on), or null. An unreadable check counts as no longer valid.
   async approvalStillValid(action) {
+    return (await this.approvalVerdict(action))?.reason ?? null;
+  }
+
+  // The same check with what to do next: { reason, reraise } or null. A
+  // tool's check returns a reason string (retire the card), or
+  // { reason, reraise: true } when the request itself still stands and only
+  // needs a fresh "yes" (its target is there; the owner said more since).
+  // A check that throws never re-raises: its target is gone or unreadable.
+  async approvalVerdict(action) {
     const check = this.tools.get(action?.toolName)?.approvalStillValid;
     if (!check) return null;
     try {
-      const reason = await check(action.args, action);
-      return typeof reason === "string" && reason ? reason : null;
+      const verdict = await check(action.args, action);
+      if (typeof verdict === "string" && verdict) return { reason: verdict, reraise: false };
+      if (verdict && typeof verdict === "object" && typeof verdict.reason === "string" && verdict.reason) {
+        return { reason: verdict.reason, reraise: verdict.reraise === true };
+      }
+      return null;
     } catch (error) {
-      return error?.message || "The approval's target changed; ask again.";
+      return { reason: error?.message || "The approval's target changed; ask again.", reraise: false };
     }
   }
 
