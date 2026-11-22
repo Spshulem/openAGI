@@ -2505,9 +2505,12 @@ export class FleetSupervisor {
       }
     }
     const nowIso = new Date(nowMs).toISOString();
+    // Without an explicit id, the id names one occurrence: retries inside the
+    // cooldown window dedupe, a later occurrence of the same report is new.
+    const windowIndex = minGapMs > 0 ? Math.floor(nowMs / minGapMs) : nowMs;
     const stableMsgId = typeof messageId === "string" && /^[\w-]{1,200}$/.test(messageId)
       ? messageId
-      : (dedupeKey ? `msg_sup_${shortHash(dedupeKey)}` : null);
+      : (dedupeKey ? `msg_sup_${shortHash(`${dedupeKey}:${windowIndex}`)}` : null);
     const sharedMsgPayload = {
       ...(stableMsgId ? { id: stableMsgId } : {}),
       role: "assistant",
@@ -2568,9 +2571,12 @@ export class FleetSupervisor {
       } catch { /* best-effort */ }
     }
 
+    // On a node paired to a hub the owner reads the hub's copy: a local-only
+    // fallback is not delivery, so the caller keeps it pending for a retry.
+    const remoteRequired = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     if (deliveredRemote || deliveredLocal) {
-      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
-      return { posted: true, deliveredRemote, deliveredLocal, messageId: stableMsgId };
+      if (dedupeKey && (!remoteRequired || deliveredRemote)) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
+      return { posted: true, deliveredRemote, deliveredLocal, remoteRequired, messageId: stableMsgId };
     }
     return { posted: false, reason: "no-channel" };
   }
@@ -2730,38 +2736,51 @@ export class FleetSupervisor {
     const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
     if (!deltas.length) return { posted: false, reason: "no-delta" };
 
-    const shownDeltas = deltas.slice(0, 3);
-    const overflowCount = Math.max(0, deltas.length - shownDeltas.length);
-    const lines = [
-      deltas.length === 1
-        ? (deltas[0].change === "updated"
-            ? "**Supervisor check-in: one decision changed and needs you.**"
-            : "**Supervisor check-in: one new decision needs you.**")
-        : `**Supervisor check-in: ${deltas.length} new or changed decisions need you.**`
-    ];
-    for (const { question: q, change } of shownDeltas) {
-      const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
-      const badge = change === "updated" ? "Changed" : "New";
-      const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
-      lines.push("", `**${badge}: ${clampText(name, 140)}**`);
-      lines.push(ctx ? renderDecisionContext(ctx, { markdown: true, compact: true }) : clampText(stripInternalIds(redactSecrets(q.body || q.title || "")), 400));
-    }
-    if (overflowCount > 0) {
-      lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
-    }
     // Running sessions, tracked goals, and decisions are different things; say
     // each separately so a count is never mistaken for an ask. A count this
     // machine cannot know is said to be unknown, never rendered as zero.
     const errors = nonDecisions.filter((q) => classifyAsk(q) === "session_error").length;
     const fyis = nonDecisions.length - errors;
-    lines.push("", [
+    const footer = [
       `Decisions waiting on you: ${openActionable.length}`,
       `Sessions running here: ${formatCount(this.runningSessionCount(snapshot))}`,
       this.trackedGoalSummary().text,
       ...(fyis || errors ? [`FYIs / session errors (no decision needed): ${fyis} / ${errors}`] : [])
-    ].join(" · "));
+    ].join(" · ");
 
-    const canonicalPairs = deltas
+    // Each decision gets a fixed share of the message, and only what fits is
+    // sent: a decision cut off by the length cap would otherwise be marked
+    // surfaced without being seen. Unsent decisions stay pending.
+    const DIGEST_MAX = 6000;
+    const PER_DECISION = 1700;
+    const header = (n, change) => (n === 1
+      ? (change === "updated"
+          ? "**Supervisor check-in: one decision changed and needs you.**"
+          : "**Supervisor check-in: one new decision needs you.**")
+      : `**Supervisor check-in: ${n} new or changed decisions need you.**`);
+    const renderDelta = ({ question: q, change }) => {
+      const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
+      const badge = change === "updated" ? "Changed" : "New";
+      const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
+      const body = ctx
+        ? renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION })
+        : clampText(stripInternalIds(redactSecrets(q.body || q.title || "")), 400);
+      return ["", `**${badge}: ${clampText(name, 140)}**`, body];
+    };
+    let shownDeltas = deltas.slice(0, 3);
+    let lines;
+    for (;;) {
+      const overflowCount = deltas.length - shownDeltas.length;
+      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.flatMap(renderDelta)];
+      if (overflowCount > 0) {
+        lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
+      }
+      lines.push("", footer);
+      if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
+      shownDeltas = shownDeltas.slice(0, -1);
+    }
+
+    const canonicalPairs = shownDeltas
       .map((d) => [d.decisionKey, d.materialHash])
       .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
     const deltaSig = shortHash(JSON.stringify(canonicalPairs));
@@ -2774,12 +2793,14 @@ export class FleetSupervisor {
       minGapMs: 24 * 60 * MIN,
       metadata: {
         kind: "proactive_supervisor_delta",
-        deltaCount: deltas.length,
-        decisionKeys: deltas.map((d) => d.decisionKey)
+        deltaCount: shownDeltas.length,
+        decisionKeys: shownDeltas.map((d) => d.decisionKey)
       }
     });
-    if (res?.posted) {
-      this.store.commitSurfacedDecisions(deltas, { now: started });
+    // Only what was shown, and only once it reached the owner's copy (the
+    // hub, on a paired node); the rest stays pending for the next check-in.
+    if (res?.posted && (!res.remoteRequired || res.deliveredRemote)) {
+      this.store.commitSurfacedDecisions(shownDeltas, { now: started });
     }
     return res;
   }
