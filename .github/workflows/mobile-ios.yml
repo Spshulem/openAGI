@@ -149,7 +149,7 @@ jobs:
             -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
-          xcrun simctl terminate "$simulator_id" sh.openagi.OpenAGI >/dev/null 2>&1 || true
+          xcrun simctl terminate "$simulator_id" com.spencershulem.openagi >/dev/null 2>&1 || true
           sleep 2
           xcodebuild test \
             -project OpenAGI.xcodeproj \

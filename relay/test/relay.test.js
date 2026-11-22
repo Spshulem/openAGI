@@ -9,7 +9,7 @@ const subtle = webcrypto.subtle;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-const BUNDLE = "sh.openagi.OpenAGI";
+const BUNDLE = "com.spencershulem.openagi";
 const DEVICE = "ab".repeat(32);
 const START = "cd".repeat(80);
 const CHANNEL = "dHN0LTE2LWNoYW5uZWw=";

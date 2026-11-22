@@ -64,7 +64,7 @@ npx wrangler deploy
 ```
 
 The rate-limit bindings ship enabled. Uncomment the `routes` block (and the
-`REVOKED` KV block, below) in `wrangler.toml` as needed and deploy again. `BUNDLE_ID` defaults to `sh.openagi.OpenAGI` and must equal the iOS app's bundle id (`OPENAGI_BUNDLE_ID`): it is the APNs topic. The App ID also needs the Broadcast Push Notifications capability for Live Activity channels.
+`REVOKED` KV block, below) in `wrangler.toml` as needed and deploy again. `BUNDLE_ID` defaults to `com.spencershulem.openagi` and must equal the iOS app's bundle id (`OPENAGI_BUNDLE_ID`): it is the APNs topic. The App ID also needs the Broadcast Push Notifications capability for Live Activity channels.
 
 ## Pass lifetime and revocation
 

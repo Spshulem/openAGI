@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2026-09-01"
 
 [vars]
-BUNDLE_ID = "sh.openagi.OpenAGI"
+BUNDLE_ID = "com.spencershulem.openagi"
 
 # Secrets (set with `wrangler secret put <NAME>`, never commit values):
 #   APNS_KEY_P8   contents of the AuthKey_XXXX.p8 file (PKCS8 PEM)
