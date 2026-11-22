@@ -323,8 +323,11 @@ test("buildSupervisorDeck and fleetStatus exclude Got-it completion noise from N
   assert.equal(realCard.needsYou, true);
   assert.equal(doneCard?.needsYou, false);
 
-  // 1. User Story preserved in brief.context
+  // 1. User Story preserved in brief.context, currentState populated, and concrete Recommendation always visible
   assert.match(realCard.brief.context, /As a workspace admin managing dozens of customer projects/i);
+  assert.match(realCard.brief.currentState, /decision checkpoint/i);
+  assert.match(realCard.recommendation, /^Recommend:/);
+  assert.doesNotMatch(realCard.recommendation, /Reply right below/i);
   // 2. What Is Done preserves actual PR summary instead of overwriting with process-only review text
   assert.match(realCard.brief.whatChanged, /Rebuilds the Projects v2 header|Redesign Projects v2/i);
   // 3. Decision Needed preserves BOTH full options without truncating at 260 chars!

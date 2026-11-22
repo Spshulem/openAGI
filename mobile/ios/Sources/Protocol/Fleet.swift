@@ -1041,20 +1041,23 @@ public struct SupervisorRecentMessage: Decodable, Sendable, Equatable, Identifia
 
 public struct SupervisorCardBrief: Decodable, Sendable, Equatable {
     public var context: String?
+    public var currentState: String?
     public var whatChanged: String?
     public var decision: String?
 
-    public init(context: String? = nil, whatChanged: String? = nil, decision: String? = nil) {
+    public init(context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil) {
         self.context = context
+        self.currentState = currentState
         self.whatChanged = whatChanged
         self.decision = decision
     }
 
-    private enum CodingKeys: String, CodingKey { case context, whatChanged, decision }
+    private enum CodingKeys: String, CodingKey { case context, currentState, whatChanged, decision }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         context = c.lenient(String.self, .context)
+        currentState = c.lenient(String.self, .currentState)
         whatChanged = c.lenient(String.self, .whatChanged)
         decision = c.lenient(String.self, .decision)
     }

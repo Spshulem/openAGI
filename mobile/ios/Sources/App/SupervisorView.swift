@@ -2181,7 +2181,7 @@ private struct SupervisorCardDeckView: View {
                         }
                     }
             }
-            .frame(height: 145)
+            .frame(height: 235)
 
             if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2302,24 +2302,46 @@ private struct SupervisorCardDeckView: View {
                 }
             }
             if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
-                Text(ctx)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("GOAL")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    Text(ctx)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.ink.opacity(0.9))
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+            }
+            if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("WHERE IT IS")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    Text(stateNow)
+                        .font(Theme.Typography.caption.weight(.medium))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
             }
             let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
             if let summary = mainSummary {
-                if summary.contains("\n") || summary.contains("|") {
-                    MarkdownContent(blocks: MarkdownParser.parse(summary))
-                        .lineLimit(nil)
-                } else {
-                    Text(MarkdownParser.inline(summary))
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.ink.opacity(0.92))
-                        .lineLimit(5)
-                        .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("WHAT TO KNOW")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    if summary.contains("\n") || summary.contains("|") {
+                        MarkdownContent(blocks: MarkdownParser.parse(summary))
+                            .lineLimit(nil)
+                    } else {
+                        Text(MarkdownParser.inline(summary))
+                            .font(Theme.Typography.secondary)
+                            .foregroundStyle(Theme.ink.opacity(0.92))
+                            .lineLimit(6)
+                            .multilineTextAlignment(.leading)
+                    }
                 }
             }
             if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2328,7 +2350,7 @@ private struct SupervisorCardDeckView: View {
                 Text("Decision: \(decision)")
                     .font(Theme.Typography.caption.weight(.medium))
                     .foregroundStyle(Theme.ink)
-                    .lineLimit(2)
+                    .lineLimit(4)
                     .multilineTextAlignment(.leading)
             } else if let nextAction = card.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !nextAction.isEmpty {
@@ -2359,10 +2381,20 @@ private struct SupervisorCardDeckView: View {
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
             if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
-                Text(rec)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("RECOMMENDATION")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.live)
+                    Text(rec)
+                        .font(Theme.Typography.caption.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.35), lineWidth: 1))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2701,11 +2733,32 @@ private struct BoardNeedsYouStage: View {
                             .font(Theme.Typography.caption)
                             .foregroundStyle(Theme.muted)
                     }
+                    if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
+                        Text("Goal: \(ctx)")
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.muted)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
+                    if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
+                        Text(stateNow)
+                            .font(Theme.Typography.caption.weight(.medium))
+                            .foregroundStyle(Theme.ink)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
                     if let summary = mainSummary {
                         Text(MarkdownParser.inline(summary))
                             .font(Theme.Typography.secondary)
                             .foregroundStyle(Theme.ink.opacity(0.9))
                             .lineLimit(4)
+                            .multilineTextAlignment(.leading)
+                    }
+                    if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
+                        Text(rec)
+                            .font(Theme.Typography.caption.weight(.semibold))
+                            .foregroundStyle(Theme.live)
+                            .lineLimit(2)
                             .multilineTextAlignment(.leading)
                     }
                 }
@@ -4108,7 +4161,10 @@ private struct ThreadDetailSheet: View {
                         let decisionTitle = trimmedNonEmpty(card?.headline) ?? trimmedNonEmpty(question?.title) ?? "Decision"
                         Text(decisionTitle).font(.headline)
                         if let ctx = trimmedNonEmpty(card?.brief?.context) {
-                            Text(ctx).font(.footnote).foregroundStyle(.secondary)
+                            Text("Goal: \(ctx)").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        }
+                        if let stateNow = trimmedNonEmpty(card?.brief?.currentState) {
+                            Text("Where it is: \(stateNow)").font(.footnote.weight(.medium)).foregroundStyle(Theme.ink)
                         }
                         let preferredSummary: String? = {
                             if let briefBody = trimmedNonEmpty(card?.brief?.whatChanged) { return briefBody }
@@ -4127,7 +4183,9 @@ private struct ThreadDetailSheet: View {
                                 .foregroundStyle(Theme.ink)
                         }
                         if let rec = trimmedNonEmpty(card?.recommendation) {
-                            Text(rec).font(.footnote).foregroundStyle(.secondary)
+                            Text(rec)
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Theme.live)
                         }
 
                         if let card, card.canReply, !card.suggestedReplies.isEmpty, questionIsOpen {
