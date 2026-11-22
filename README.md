@@ -14,18 +14,22 @@ screen observation or approved computer interaction when you need them.
 **[First-use guide](docs/GETTING_STARTED.md)** ·
 **[Website](https://openagi.sh)**
 
+**[Review the current website preview](companion-site/README.md)** · The
+preview starts with the self-hosted project, links the current release and
+install paths, and labels shipped, historical, and planned behavior.
+
 ## Pick your install
 
 | Platform | Start here | Includes |
 | --- | --- | --- |
 | **macOS** | [Download the latest DMG](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
-| **Windows** | [Download source ZIP](https://github.com/Spshulem/openAGI/archive/refs/heads/main.zip), then [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; Node.js 22+ required for source installs |
-| **Linux / Raspberry Pi** | [Install guide](docs/INSTALL.md#linux-and-raspberry-pi) or [download source archive](https://github.com/Spshulem/openAGI/archive/refs/heads/main.tar.gz) | Browser dashboard, persistent runtime, optional systemd service; Linux x64/arm64 Docker image |
+| **Windows** | [Download the latest portable ZIP](https://github.com/Spshulem/openAGI/releases/latest), or [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; the published bundle includes Node.js |
+| **Linux / Raspberry Pi** | [Download the latest x64/arm64 bundle](https://github.com/Spshulem/openAGI/releases/latest), [use Docker](docs/INSTALL.md#docker), or [follow the install guide](docs/INSTALL.md#linux-and-raspberry-pi) | Browser dashboard, persistent runtime, optional systemd service; Raspberry Pi needs a compatible 64-bit arm64 OS |
 | **iPhone / Android** | [Companion app and pairing](mobile/README.md) | Mobile source with tasks, chat, approvals, and supervisor views; no public store download linked |
 
-The latest release currently has a Mac installer. Releases built with the new
-portable-download workflow also attach Windows x64 and Linux x64/arm64 bundles
-with Node included. See [download availability and launch instructions](docs/INSTALL.md#downloads).
+The latest release publishes the Mac DMG, Windows x64 ZIP, and Linux x64/arm64
+bundles with Node included, plus SHA-256 checksums. See [download availability
+and launch instructions](docs/INSTALL.md#downloads) and the [release page](https://github.com/Spshulem/openAGI/releases/latest).
 Source ZIP/archive links above track `main`; each GitHub release also offers its
 exact source under **Assets → Source code**.
 
