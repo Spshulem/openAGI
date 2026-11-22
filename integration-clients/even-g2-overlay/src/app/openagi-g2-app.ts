@@ -288,6 +288,10 @@ export class OpenAGIG2App {
       saveStatus: text => phone.saveStatus?.(text),
       memoryStatus: (active, detail) => { phone.memoryStatus?.(active, detail); this.listeningPulse(true) },
       consentLost: () => { void this.consentLost() },
+      walkthrough: state => {
+        this.supervisorWalkthrough = state
+        if (this.mode === 'walkthrough') this.showSupervisorWalkthrough()
+      },
     },
     () => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
     item => this.showNotice(item))
@@ -302,7 +306,20 @@ export class OpenAGIG2App {
   private walkthroughIdentity(item: InboxItem): string { return item.cardId ?? item.questionId ?? item.id }
   private walkthroughInboxItem(id: string | null): InboxItem | null {
     if (!id) return null
-    return this.proactive.items.find(item => this.walkthroughIdentity(item) === id || item.id === id) ?? null
+    const existing = this.proactive.items.find(item => this.walkthroughIdentity(item) === id || item.id === id)
+    if (existing) return existing
+    const current = this.supervisorWalkthrough?.current
+    if (!current || current.id !== id) return null
+    const cardId = current.cardId ?? (current.kind === 'card' ? current.id : null)
+    const questionId = current.questionId ?? (current.kind === 'question' ? current.id : null)
+    return {
+      id: cardId ? `card:${cardId}` : `question:${questionId ?? current.id}`,
+      title: current.title, summary: current.summary, category: 'approvals', important: true, seen: false,
+      action: cardId ? 'act-fleet-card' : 'answer-fleet', supervisor: true,
+      ...(cardId ? { cardId } : {}), ...(questionId ? { questionId } : {}),
+      ...(current.threadKey ? { threadKey: current.threadKey } : {}),
+      ...(current.options?.length ? { options: current.options } : {})
+    }
   }
   async startSupervisorWalkthrough(): Promise<void> {
     if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy) return
@@ -317,7 +334,11 @@ export class OpenAGIG2App {
     try {
       this.supervisorWalkthrough = await this.proactive.walkthrough(operation, current)
       this.showSupervisorWalkthrough()
-    } catch (error) { this.phone.set('Needs You changed', `${safeOpenAGIError(error)} Refresh the walkthrough.`) }
+    } catch (error) {
+      this.supervisorWalkthrough = await this.proactive.walkthrough('view').catch(() => null)
+      if (this.supervisorWalkthrough?.active) this.showSupervisorWalkthrough()
+      this.phone.set('Needs You changed', `${safeOpenAGIError(error)} Refreshed the shared walkthrough.`)
+    }
   }
   private showSupervisorWalkthrough(): void {
     const walkthrough = this.supervisorWalkthrough
@@ -446,7 +467,7 @@ export class OpenAGIG2App {
     this.lifelogUserPaused = false; this.lifelogFailures = 0
     this.setLifelog(mode === 'lifelog' ? 'starting' : 'off')
     this.renderer.speaker?.(mode === 'supervisor' ? 'Supervisor' : 'Agent')
-    if (['home', 'status', 'ambient', 'recent', 'answer', 'message', 'reconnecting'].includes(this.mode) || this.mode.startsWith('inbox')) this.showHome()
+    if (['home', 'status', 'ambient', 'recent', 'answer', 'message', 'reconnecting', 'walkthrough'].includes(this.mode) || this.mode.startsWith('inbox')) this.showHome()
     await this.proactive.configure({ supervisorOnly: mode === 'supervisor' })
     if (mode === 'lifelog') await this.startLifelog()
   }

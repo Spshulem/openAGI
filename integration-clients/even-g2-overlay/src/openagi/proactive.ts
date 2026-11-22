@@ -15,6 +15,7 @@ export interface ProactiveView {
   activity?(text: string): void
   saveStatus?(text: string): void
   consentLost?(): void
+  walkthrough?(state: SupervisorWalkthrough): void
 }
 
 export interface MainConsent { id: string; grantedAt?: number | null; until?: number | null }
@@ -105,6 +106,12 @@ export class G2ProactiveClient {
       if (!this.running || signal.aborted || feedGeneration !== this.feedGeneration) return
       this.items = result.items ?? []; this.view.inbox?.(this.items)
       if (result.settings) this.view.proactiveSettings?.(result.settings)
+      // Keep an active G2 walkthrough aligned with the main-owned cursor when
+      // iOS or the main UI advances it. Older mains may not expose this route.
+      try {
+        const walkthrough = await this.walkthrough('view', undefined)
+        if (!signal.aborted && this.running) this.view.walkthrough?.(walkthrough)
+      } catch { /* walkthrough is optional on older mains */ }
       // Do not claim a notification until the app says it can show it safely.
       // Supervisor mode pings for its own questions without the general opt-in.
       const item = this.items.find(i => i.important && !i.seen && !i.notified && (result.settings?.enabled === true || (result.settings?.supervisorOnly === true && i.supervisor === true)))
