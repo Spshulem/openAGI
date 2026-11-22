@@ -1074,6 +1074,9 @@ export class ActiveWorkManager {
 
     if (explicitRemaining !== null && explicitRemaining > 0) {
       item.state = "active";
+      // More work was found after an earlier "0 remaining": the batch is no
+      // longer waiting for sign-off, so continuations may resume.
+      item.awaitingFollowup = false;
       item.updatedAt = nowIso;
       this._save();
       const { byKey: sessionsByKey } = this._knownSessionsByKey();
