@@ -737,7 +737,15 @@ export class ActiveWorkManager {
     // original ask separate from the mutable goal so later edits never erase
     // what was actually delegated.
     const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 4000);
-    const acceptanceCriteria = cleanText(input.acceptanceCriteria ?? existing?.acceptanceCriteria ?? existing?.doneCriteria ?? requestedDoneCriteria ?? defaultDoneCriteria, 500);
+    const acceptanceCriteriaExplicit = input.acceptanceCriteria !== undefined
+      ? Boolean(cleanText(input.acceptanceCriteria, 500))
+      : Boolean(existing?.acceptanceCriteriaExplicit);
+    const acceptanceCriteria = cleanText(
+      input.acceptanceCriteria !== undefined
+        ? input.acceptanceCriteria
+        : (acceptanceCriteriaExplicit ? existing?.acceptanceCriteria : doneCriteria),
+      500
+    );
     const currentStepExplicit = input.currentStep !== undefined
       ? Boolean(cleanText(input.currentStep, 300))
       : Boolean(existing?.currentStepExplicit);
@@ -779,7 +787,8 @@ export class ActiveWorkManager {
     let created = false;
     if (existing) {
       const acceptanceChanged = input.acceptanceCriteria !== undefined
-        && cleanText(input.acceptanceCriteria, 500) !== (existing.acceptanceCriteria ?? existing.doneCriteria ?? "");
+        ? cleanText(input.acceptanceCriteria, 500) !== (existing.acceptanceCriteria ?? existing.doneCriteria ?? "")
+        : (!existing.acceptanceCriteriaExplicit && existing.acceptanceCriteria !== doneCriteria);
       const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria || acceptanceChanged;
       const ownerUpdated = input.owner !== undefined || input.threadKey !== undefined;
       const ownerChanged = ownerUpdated && (
@@ -826,6 +835,7 @@ export class ActiveWorkManager {
         originalAsk,
         doneCriteria,
         acceptanceCriteria,
+        acceptanceCriteriaExplicit,
         goalUpdatedAt: goalChanged ? nowIso : (existing.goalUpdatedAt ?? existing.createdAt ?? nowIso),
         nextAction: nextAction !== null ? nextAction : existing.nextAction,
         currentStep,
@@ -905,6 +915,7 @@ export class ActiveWorkManager {
         originalAsk,
         doneCriteria,
         acceptanceCriteria,
+        acceptanceCriteriaExplicit,
         goalUpdatedAt: nowIso,
         nextAction,
         currentStep,
@@ -1214,6 +1225,7 @@ export class ActiveWorkManager {
         input: {
           goal: item.goal,
           done_criteria: item.doneCriteria,
+          acceptance_criteria: item.acceptanceCriteria ?? item.doneCriteria,
           cursor: item.cursor ?? null,
           latest_evidence: cleanText(evidenceSummary, 500)
         },
@@ -1878,6 +1890,7 @@ export class ActiveWorkManager {
         theme: item.theme ?? null,
         goal: cleanText(item.goal, 240),
         done_criteria: cleanText(item.doneCriteria, 240),
+        acceptance_criteria: cleanText(item.acceptanceCriteria ?? item.doneCriteria, 240),
         session_status: session?.agentStatus ?? "idle",
         untrusted_agent_excerpt: untrusted?.excerpt ?? ""
       }))
