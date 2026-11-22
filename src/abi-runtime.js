@@ -1003,8 +1003,9 @@ export class AbiRuntime {
         this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
         // Respawn with the new code (systemd Restart=always / launchd
         // KeepAlive / Mac DaemonController bring it back). Defer so the
-        // tick result can flush first.
-        setTimeout(() => process.exit(0), 500);
+        // tick result can flush first. An unsupervised portable install
+        // reports restartRequired instead — exiting would never come back.
+        if (!result.restartRequired) setTimeout(() => process.exit(0), 500);
       }
       return result;
     }
