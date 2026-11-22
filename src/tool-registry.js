@@ -1505,11 +1505,14 @@ export function registerCoreTools(registry, runtime) {
           customer: args.customer ?? null,
           goal: args.goal,
           doneCriteria: args.doneCriteria,
-          cadence: args.cadence ?? "daily",
-          permittedNudges: args.permittedNudges ?? "resume_owner",
-          threadKey: args.threadKey ?? null,
-          prRef: args.prRef ?? null,
-          linkedSkill: args.linkedSkill ?? null,
+          // Only settings the caller gave: an update that advances the cursor
+          // must not reset the saved owner, cadence or nudge policy.
+          ...(args.cadence !== undefined ? { cadence: args.cadence } : {}),
+          ...(args.permittedNudges !== undefined ? { permittedNudges: args.permittedNudges } : {}),
+          ...(args.threadKey !== undefined ? { threadKey: args.threadKey } : {}),
+          ...(args.prRef !== undefined ? { prRef: args.prRef } : {}),
+          ...(args.linkedSkill !== undefined ? { linkedSkill: args.linkedSkill } : {}),
+          creationDefaults: { cadence: "daily", permittedNudges: "resume_owner" },
           cursor: args.cursor ?? null,
           ...(Number.isInteger(args.cursor?.remaining) ? { remainingCount: args.cursor.remaining } : {})
         });

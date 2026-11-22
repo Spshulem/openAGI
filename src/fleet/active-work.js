@@ -608,8 +608,11 @@ export class ActiveWorkManager {
       ? cleanText(input.nextAction, 300)
       : null;
 
-    const cadence = normalizeCadence(input.cadence);
-    const { permittedNudges, rejectedPermissions } = normalizePermittedNudges(input.permittedNudges);
+    // creationDefaults apply only when this call creates the goal; an update
+    // that omits a setting keeps the saved one (see the existing branch).
+    const createDefaults = input.creationDefaults && typeof input.creationDefaults === "object" ? input.creationDefaults : {};
+    const cadence = normalizeCadence(input.cadence !== undefined ? input.cadence : createDefaults.cadence);
+    const { permittedNudges, rejectedPermissions } = normalizePermittedNudges(input.permittedNudges !== undefined ? input.permittedNudges : createDefaults.permittedNudges);
     const owner = normalizeOwner(input.owner, rawThreadKey || null, sessionsByKey);
 
     const prRef = typeof input.prRef === "string" && parsePrRef(input.prRef.trim())
