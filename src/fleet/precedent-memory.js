@@ -60,42 +60,149 @@ export const HARD_RED_LINE_RULES = Object.freeze([
 
 const SAFE_READONLY_BINS = new Set([
   "rg", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls", "pwd", "echo", "printf",
-  "which", "stat", "file", "jq", "cut", "sort", "uniq", "tr", "basename", "dirname", "realpath"
+  "which", "stat", "file", "jq", "cut", "sort", "uniq", "tr", "basename", "dirname", "realpath",
+  "df", "du", "ps", "uname", "sw_vers"
 ]);
+
+const DANGEROUS_ENV_VARS = /^(?:PATH|LD_[A-Z0-9_]*|DYLD_[A-Z0-9_]*|NODE_OPTIONS|BASH_ENV|ENV|PROMPT_COMMAND|GIT_SSH_COMMAND|GIT_EXEC_PATH|GIT_EXTERNAL_DIFF|PYTHONPATH|RUBYOPT|PERL5OPT)=/i;
 
 const SENSITIVE_COMMAND_PATHS = /(?:^|[\s"'=/])(?:\.env(?:\.[A-Za-z0-9_.-]+)?|\.ssh\/|id_rsa|id_ed25519|credentials\.json|auth\.json|keychain|secrets?\b|\.npmrc|\.netrc|\.pypirc)(?:$|[\s"'/])/i;
 
+function stripSafeStderrRedirects(input) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === "\\" && quote === "\"" && i + 1 < input.length) {
+        out += ch + input[i + 1];
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    const rest = input.slice(i);
+    const prevOk = i === 0 || /[\s;|&]/.test(input[i - 1]);
+    if (prevOk) {
+      const m = /^(?:2>\/dev\/null|2>&1)(?=$|[\s;|&])/.exec(rest);
+      if (m) {
+        out += " ";
+        i += m[0].length - 1;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function isSafeShellVarAssignment(token) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*=[^;&|<>`$()\n]*$/.test(token)) return false;
+  if (DANGEROUS_ENV_VARS.test(token)) return false;
+  if (SENSITIVE_COMMAND_PATHS.test(token)) return false;
+  return true;
+}
+
 // Strictly verifies that a shell / CodexBash command string is pure read-only
 // repository or GitHub/CI inspection with zero mutation, network exfiltration,
-// subshells, redirections, or secret-file reads.
+// subshells, file output redirects, or secret-file reads.
 export function isSafeReadOnlyCommand(rawCommand) {
   const raw = String(rawCommand ?? "").trim();
-  if (!raw || raw.length > 1000) return false;
+  if (!raw || raw.length > 2000) return false;
   // Strip `Run \`...\`` wrapper if formatted from policy.js permWhat before checking backticks.
-  const unwrapped = /^Run\s+`([^`]+)`$/i.exec(raw)?.[1]?.trim() ?? raw;
+  const unwrapped = stripSafeStderrRedirects(/^Run\s+`([^`]+)`$/i.exec(raw)?.[1]?.trim() ?? raw);
   // Reject command substitutions, backticks, output/input redirects, parameter side-effects, or secret paths.
   if (/[`<>]|\$\(|\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
 
-  // Split on unquoted |, &&, ; (reject || or single & background).
+  // Split on unquoted |, &&, ||, ; (reject single & background).
   if (/(?:^|[^&])&(?:[^&]|$)/.test(unwrapped)) return false;
   const segments = splitShellSegments(unwrapped);
-  if (!segments.length || segments.length > 8) return false;
+  if (!segments.length || segments.length > 10) return false;
 
+  let sawInspectionCmd = false;
   for (const seg of segments) {
     const tokens = tokenizeSegment(seg);
     if (!tokens.length) return false;
-    // Allow leading env Assignments only if harmless (LC_ALL=C, PAGER=cat, GIT_PAGER=cat).
     let idx = 0;
     while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) {
-      if (!/^(?:LC_ALL|LANG|PAGER|GIT_PAGER|NO_COLOR)=/i.test(tokens[idx])) return false;
+      if (!isSafeShellVarAssignment(tokens[idx])) return false;
       idx += 1;
     }
-    if (idx >= tokens.length) return false;
+    // Standalone safe variable assignment segment (e.g. `R=owner/repo; gh api repos/$R/...`).
+    if (idx >= tokens.length) continue;
     const cmd = path.basename(tokens[idx]);
     const args = tokens.slice(idx + 1);
     if (!isAllowedReadOnlySegment(cmd, args)) return false;
+    if (cmd !== "true") sawInspectionCmd = true;
   }
-  return true;
+  return sawInspectionCmd;
+}
+
+// Strictly verifies a local feature-branch / isolated-worktree `git add` + `git commit`
+// sequence (with optional read-only `git status` / `git show` / `git diff`), never
+// allowing `git push`, `--force`, `--no-verify`, history rewrites, or trunk commits.
+export function isSafeLocalWorktreeCommitCommand(rawCommand, thread = null) {
+  const raw = String(rawCommand ?? "").trim();
+  if (!raw || raw.length > 2000) return false;
+  const unwrapped = stripSafeStderrRedirects(/^Run\s+`([^`]+)`$/i.exec(raw)?.[1]?.trim() ?? raw);
+  if (/[`<>]|\$\(|\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
+  if (/(?:^|[^&])&(?:[^&]|$)/.test(unwrapped)) return false;
+
+  const branch = String(thread?.branch ?? "").trim();
+  const cwd = String(thread?.meta?.paseoCwd ?? thread?.cwd ?? "").trim();
+  if (branch && /^(?:main|master|prod(?:uction)?|release|HEAD)$/i.test(branch)) return false;
+  const inIsolatedWorktree = Boolean(
+    (branch && !/^(?:main|master|prod(?:uction)?|release|HEAD)$/i.test(branch))
+    || /\/(?:worktrees|\.conductor)\//i.test(cwd)
+  );
+  if (!inIsolatedWorktree) return false;
+
+  const segments = splitShellSegments(unwrapped);
+  if (!segments.length || segments.length > 8) return false;
+
+  let sawLocalCommitStep = false;
+  for (const seg of segments) {
+    const tokens = tokenizeSegment(seg);
+    if (!tokens.length) return false;
+    let idx = 0;
+    while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) {
+      if (!isSafeShellVarAssignment(tokens[idx])) return false;
+      idx += 1;
+    }
+    if (idx >= tokens.length) continue;
+    const cmd = path.basename(tokens[idx]);
+    const args = tokens.slice(idx + 1);
+    if (isAllowedReadOnlySegment(cmd, args)) continue;
+    if (cmd !== "git") return false;
+    let subIdx = 0;
+    while (subIdx < args.length && args[subIdx].startsWith("-")) {
+      if (args[subIdx] === "-C" || args[subIdx] === "-c") subIdx += 2;
+      else subIdx += 1;
+    }
+    const sub = args[subIdx] ?? "";
+    const subArgs = args.slice(subIdx + 1);
+    if (sub === "add") {
+      if (!subArgs.length) return false;
+      if (subArgs.some((a) => /^-(?:[A-Za-z]*f|-force)$/i.test(a) || a.includes("..") || SENSITIVE_COMMAND_PATHS.test(a))) return false;
+      sawLocalCommitStep = true;
+      continue;
+    }
+    if (sub === "commit") {
+      if (subArgs.some((a) => /^(?:-n|--no-verify|--amend|--allow-empty-message)$/i.test(a))) return false;
+      if (!subArgs.some((a) => /^(?:-m|--message(?:=.*)?)$/i.test(a))) return false;
+      sawLocalCommitStep = true;
+      continue;
+    }
+    return false;
+  }
+  return sawLocalCommitStep;
 }
 
 function splitShellSegments(input) {
@@ -325,6 +432,34 @@ export const BUILTIN_OWNER_PRECEDENTS = Object.freeze([
     approvalCount: 4,
     vetoCount: 0,
     builtIn: true
+  },
+  {
+    id: "prec_local_worktree_commit",
+    category: "local_worktree_commit",
+    repo: "*",
+    project: "*",
+    patternSummary: "Local isolated feature-branch / worktree `git add` + `git commit` (with hooks enabled, never pushing or touching main)",
+    ownerRule: "Allow local feature-branch and worktree commits without interrupting the owner; hold before any merge or production push.",
+    action: "answer",
+    answer: "Allow",
+    directive: null,
+    approvalCount: 6,
+    vetoCount: 0,
+    builtIn: true
+  },
+  {
+    id: "prec_engineering_hygiene",
+    category: "engineering_hygiene",
+    repo: "*",
+    project: "*",
+    patternSummary: "Routine reversible local engineering hygiene (rerunning flaky CI once, closing leftover test browser/process, using external scratch disk `/Volumes/Xtra`, creating a clean worktree)",
+    ownerRule: "Spencer's rule: never block on routine, reversible local engineering hygiene — rerun flaky CI checks once, close leftover local test browsers/processes spawned for verification, use available scratch disk (/Volumes/Xtra) when root disk is low, and keep pushing until a genuine Hard Red Line (PR merge, prod deploy/release, external customer message, paid spend, destructive delete, or human credentials/SSO/sudo).",
+    action: "answer",
+    answer: null,
+    directive: null,
+    approvalCount: 6,
+    vetoCount: 0,
+    builtIn: true
   }
 ]);
 
@@ -530,7 +665,8 @@ export class OwnerPrecedentStore {
       question = null,
       thread = null,
       pr = null,
-      classified = null
+      classified = null,
+      activeGoal = null
     } = {},
     {
       decisionsConfig = {},
@@ -539,7 +675,9 @@ export class OwnerPrecedentStore {
       threshold = DEFAULT_PRECEDENT_CONFIDENCE_THRESHOLD
     } = {}
   ) {
-    const permCommand = thread?.meta?.pendingPermission?.command ?? null;
+    const permCommand = thread?.meta?.pendingPermission?.rawCommand
+      ?? thread?.meta?.pendingPermission?.command
+      ?? null;
     const redLine = checkHardRedLine({
       kind: question?.kind,
       mergeAsk: question?.mergeAsk,
@@ -553,26 +691,33 @@ export class OwnerPrecedentStore {
       return { matched: false, hardRedLine: redLine };
     }
 
-    // 1. Deterministic High-Confidence Rule: Read-only shell / CodexBash inspection or staging MCP read/report tools.
+    // 1. Deterministic High-Confidence Rule: Read-only shell / CodexBash inspection,
+    // isolated feature-worktree commit, or staging MCP read/report tools.
     if (question?.kind === "prompt") {
       const permName = String(thread?.meta?.pendingPermission?.name ?? "");
       const cmdCandidate = permCommand || question.body || "";
       const isStagingMcpTool = /^mcp__buildbetter-staging__(?:success-(?:search|list|get|create-report|update-report|create-lifecycle|update-lifecycle)|read|search|list|get)/i.test(permName)
         || /\bmcp__buildbetter-staging__/i.test(String(question.title ?? ""));
       const isReadOnlyMcp = /^mcp__[A-Za-z0-9_-]+__(?:search|list|get|read|fetch|query|inspect)[A-Za-z0-9_-]*$/i.test(permName);
-      if (isSafeReadOnlyCommand(cmdCandidate) || isStagingMcpTool || isReadOnlyMcp) {
-        const allowOpt = (question.options ?? []).find((opt) => /^(?:allow(?:\s+once|\s+for\s+session|\s+always)?|approve|yes)$/i.test(String(opt).trim()));
-        const precId = isStagingMcpTool ? "prec_appfolio_staging_mcp" : "prec_readonly_bash";
+      const isReadOnlyCmd = isSafeReadOnlyCommand(cmdCandidate);
+      const isLocalCommitCmd = !isReadOnlyCmd && isSafeLocalWorktreeCommitCommand(cmdCandidate, thread);
+      if (isReadOnlyCmd || isLocalCommitCmd || isStagingMcpTool || isReadOnlyMcp) {
+        const allowOpt = (question.options ?? []).find((opt) => /^(?:allow(?:\s+once|\s+for\s+session|\s+this\s+conversation|\s+always)?|approve(?:\s+once)?|yes)$/i.test(String(opt).trim()));
+        const precId = isStagingMcpTool
+          ? "prec_appfolio_staging_mcp"
+          : (isLocalCommitCmd ? "prec_local_worktree_commit" : "prec_readonly_bash");
         const prec = this.state.precedents.find((p) => p.id === precId);
         if (allowOpt && (!prec || (prec.vetoCount ?? 0) === 0)) {
           return {
             matched: true,
-            source: isStagingMcpTool ? "deterministic-staging-mcp-tool" : "deterministic-readonly-bash",
+            source: isStagingMcpTool
+              ? "deterministic-staging-mcp-tool"
+              : (isLocalCommitCmd ? "deterministic-local-worktree-commit" : "deterministic-readonly-bash"),
             precedentId: precId,
-            confidence: 0.99,
+            confidence: isLocalCommitCmd ? 0.97 : 0.99,
             action: "answer",
             answer: allowOpt,
-            summary: `Auto-allowed ${isStagingMcpTool ? `staging MCP tool (${permName || clampText(question.title, 60)})` : `read-only inspection (${clampText(cmdCandidate || permName, 90)})`}`
+            summary: `Auto-allowed ${isStagingMcpTool ? `staging MCP tool (${permName || clampText(question.title, 60)})` : (isLocalCommitCmd ? `local worktree commit (${clampText(cmdCandidate, 90)})` : `read-only inspection (${clampText(cmdCandidate || permName, 90)})`)}`
           };
         }
       }
@@ -610,9 +755,13 @@ export class OwnerPrecedentStore {
       }
     }
 
-    // 3. Deterministic High-Confidence Rule: TestFlight MISSING_EXPORT_COMPLIANCE.
+    // 3. Deterministic High-Confidence Rule: TestFlight MISSING_EXPORT_COMPLIANCE
+    // (skipped when the session's active goal or owner directive explicitly targets public App Store Review submission).
+    const goalContext = [activeGoal?.goal, activeGoal?.doneCriteria, thread?.lastUserText].filter(Boolean).join(" ");
+    const targetsAppReviewSubmission = /\b(?:submit\b[^.\n]{0,60}\breview|app\s+(?:store\s+)?review|waiting\s+for\s+review|prepare\s+for\s+submission)\b/i.test(goalContext);
     if (
       !question
+      && !targetsAppReviewSubmission
       && /\bMISSING_EXPORT_COMPLIANCE\b/.test(hay)
       && thread?.agentStatus === "idle"
     ) {
@@ -655,6 +804,9 @@ export class OwnerPrecedentStore {
       return { matched: false, hardRedLine: null };
     }
 
+    const apiKey = String(decisionsConfig.apiKey ?? env?.OPENAI_API_KEY ?? "").trim();
+    const url = decisionsConfig.url ?? env?.OPENAGI_DECISIONS_URL ?? DEFAULT_DECISIONS_URL;
+    const model = decisionsConfig.model ?? env?.OPENAGI_DECISIONS_MODEL ?? DEFAULT_DECISIONS_MODEL;
     const queryText = [question.title, question.body, question.askContext].filter(Boolean).join(" ");
     const repoSlug = pr?.repo ?? thread?.repo ?? question.contextSnapshot?.repo ?? null;
     const ranked = this.state.precedents
@@ -668,82 +820,161 @@ export class OwnerPrecedentStore {
       .sort((a, b) => b.score - a.score)
       .slice(0, 4);
 
-    if (!ranked.length) return { matched: false, hardRedLine: null };
+    if (ranked.length && apiKey) {
+      const top = ranked[0].precedent;
+      const matchingOption = (question.options ?? []).find(
+        (opt) => String(opt).trim().toLowerCase() === String(top.answer).trim().toLowerCase()
+      );
+      if (matchingOption) {
+        const cacheKey = shortHash(JSON.stringify([question.dedupeKey ?? question.id, top.id, top.updatedAt, matchingOption]));
+        const cached = this.decisionCache.get(cacheKey);
+        if (cached && this.now() - cached.at < 30 * 60_000) {
+          if (cached.result?.matched) return cached.result;
+        } else {
+          const res = await callDecisionsEndpoint({
+            input: {
+              current_question: {
+                title: clampText(redactSecrets(question.title ?? ""), 160),
+                body: clampText(redactSecrets(question.body ?? ""), 400),
+                options: (question.options ?? []).slice(0, 4),
+                repo: repoSlug
+              },
+              candidate_precedents: ranked.map(({ precedent }) => ({
+                id: precedent.id,
+                pattern: precedent.patternSummary,
+                owner_rule: precedent.ownerRule,
+                historical_answer: precedent.answer,
+                approvals: precedent.approvalCount
+              })),
+              proposed_answer: matchingOption
+            },
+            questions: [
+              {
+                type: "predicate",
+                name: "matches_precedent",
+                instructions:
+                  "Did the owner already establish a clear historical precedent in `candidate_precedents` for this exact kind of routine " +
+                  "in-scope question such that answering `proposed_answer` faithfully repeats the owner's prior decision without ambiguity?"
+              },
+              {
+                type: "predicate",
+                name: "crosses_red_line",
+                instructions:
+                  "Would answering `proposed_answer` merge a PR, deploy to production, message a customer externally, spend money, " +
+                  "delete shared data, or choose a novel product direction that has not been decided before?"
+              }
+            ],
+            apiKey,
+            url,
+            model,
+            timeoutMs: Number(decisionsConfig.timeoutMs) || DEFAULT_DECISIONS_TIMEOUT_MS,
+            fetchImpl
+          });
 
-    const top = ranked[0].precedent;
-    const matchingOption = (question.options ?? []).find(
-      (opt) => String(opt).trim().toLowerCase() === String(top.answer).trim().toLowerCase()
-    );
-    if (!matchingOption) return { matched: false, hardRedLine: null };
-
-    const apiKey = String(decisionsConfig.apiKey ?? env?.OPENAI_API_KEY ?? "").trim();
-    const url = decisionsConfig.url ?? env?.OPENAGI_DECISIONS_URL ?? DEFAULT_DECISIONS_URL;
-    const model = decisionsConfig.model ?? env?.OPENAGI_DECISIONS_MODEL ?? DEFAULT_DECISIONS_MODEL;
-    if (!apiKey) return { matched: false, hardRedLine: null };
-
-    const cacheKey = shortHash(JSON.stringify([question.dedupeKey ?? question.id, top.id, top.updatedAt, matchingOption]));
-    const cached = this.decisionCache.get(cacheKey);
-    if (cached && this.now() - cached.at < 30 * 60_000) {
-      return cached.result;
+          if (res.ok) {
+            const pMatch = res.probabilities.get("matches_precedent") ?? 0;
+            const pRedLine = res.probabilities.get("crosses_red_line") ?? 1;
+            const matched = pMatch >= threshold && pRedLine < 0.15;
+            const outcome = matched
+              ? {
+                  matched: true,
+                  source: "decisions-precedent",
+                  precedentId: top.id,
+                  confidence: pMatch,
+                  action: "answer",
+                  answer: matchingOption,
+                  summary: `Matched owner precedent (${Math.round(pMatch * 100)}% confidence): ${clampText(question.title, 80)} -> ${matchingOption}`
+                }
+              : { matched: false, hardRedLine: null, confidence: pMatch, pRedLine };
+            this.decisionCache.set(cacheKey, { at: this.now(), result: outcome });
+            if (outcome.matched) return outcome;
+          }
+        }
+      }
     }
 
-    const res = await callDecisionsEndpoint({
-      input: {
-        current_question: {
-          title: clampText(redactSecrets(question.title ?? ""), 160),
-          body: clampText(redactSecrets(question.body ?? ""), 400),
-          options: (question.options ?? []).slice(0, 4),
-          repo: repoSlug
-        },
-        candidate_precedents: ranked.map(({ precedent }) => ({
-          id: precedent.id,
-          pattern: precedent.patternSummary,
-          owner_rule: precedent.ownerRule,
-          historical_answer: precedent.answer,
-          approvals: precedent.approvalCount
-        })),
-        proposed_answer: matchingOption
-      },
-      questions: [
-        {
-          type: "predicate",
-          name: "matches_precedent",
-          instructions:
-            "Did the owner already establish a clear historical precedent in `candidate_precedents` for this exact kind of routine " +
-            "in-scope question such that answering `proposed_answer` faithfully repeats the owner's prior decision without ambiguity?"
-        },
-        {
-          type: "predicate",
-          name: "crosses_red_line",
-          instructions:
-            "Would answering `proposed_answer` merge a PR, deploy to production, message a customer externally, spend money, " +
-            "delete shared data, or choose a novel product direction that has not been decided before?"
+    // 6. Routine Engineering-Hygiene Unblock via `/v1/decisions` (>= 0.88 confidence, < 0.12 owner-judgment risk)
+    // for reversible local operational questions (e.g. rerun flaky CI once, close local test browser,
+    // use /Volumes/Xtra scratch disk) when exact lexical strings are not yet in precedents.json.
+    const hygienePrec = this.state.precedents.find((p) => p.id === "prec_engineering_hygiene");
+    if (
+      apiKey
+      && ["agent-ask", "agent-card"].includes(question.kind)
+      && (!hygienePrec || (hygienePrec.vetoCount ?? 0) === 0)
+      && !/\b(?:sudo|password|2fa|sso|oauth|api\s*key|secret|apple\s+id|app\s+store|pricing|customer|production|prod\b|merge\b)\b/i.test(queryText)
+    ) {
+      const concreteOptions = (question.options ?? [])
+        .filter((opt) => !/^(?:dismiss|later|skip|wait|stop|open thread|got it|no|cancel)$/i.test(String(opt).trim()))
+        .filter((opt) => !HARD_RED_LINE_RULES.some((r) => r.pattern.test(String(opt))))
+        .slice(0, 3);
+      if (concreteOptions.length > 0) {
+        const hygieneCacheKey = shortHash(JSON.stringify(["hygiene", question.dedupeKey ?? question.id, concreteOptions]));
+        const cachedHygiene = this.decisionCache.get(hygieneCacheKey);
+        if (cachedHygiene && this.now() - cachedHygiene.at < 30 * 60_000) {
+          return cachedHygiene.result;
         }
-      ],
-      apiKey,
-      url,
-      model,
-      timeoutMs: Number(decisionsConfig.timeoutMs) || DEFAULT_DECISIONS_TIMEOUT_MS,
-      fetchImpl
-    });
-
-    if (!res.ok) return { matched: false, hardRedLine: null, error: res.error };
-    const pMatch = res.probabilities.get("matches_precedent") ?? 0;
-    const pRedLine = res.probabilities.get("crosses_red_line") ?? 1;
-    const matched = pMatch >= threshold && pRedLine < 0.15;
-    const outcome = matched
-      ? {
-          matched: true,
-          source: "decisions-precedent",
-          precedentId: top.id,
-          confidence: pMatch,
-          action: "answer",
-          answer: matchingOption,
-          summary: `Matched owner precedent (${Math.round(pMatch * 100)}% confidence): ${clampText(question.title, 80)} -> ${matchingOption}`
+        const hygieneRes = await callDecisionsEndpoint({
+          input: {
+            owner_policy: hygienePrec?.ownerRule ?? "",
+            current_question: {
+              title: clampText(redactSecrets(question.title ?? ""), 160),
+              body: clampText(redactSecrets(question.body ?? ""), 450),
+              ask_context: clampText(redactSecrets(question.askContext ?? ""), 350),
+              candidate_options: concreteOptions,
+              repo: repoSlug
+            }
+          },
+          questions: [
+            ...concreteOptions.map((opt, idx) => ({
+              type: "predicate",
+              name: `opt_${idx}_routine_hygiene`,
+              instructions:
+                `Is choosing option ${JSON.stringify(opt)} an unambiguous, reversible, local engineering-hygiene unblock ` +
+                `(such as rerunning a flaky CI job once, closing a leftover local test browser/process, using an available ` +
+                `external scratch volume like /Volumes/Xtra for builds, or continuing in-scope verification) that Spencer ` +
+                `explicitly wants automated without interrupting him?`
+            })),
+            {
+              type: "predicate",
+              name: "requires_owner_judgment",
+              instructions:
+                "Does this question involve any Hard Red Line (PR merge, production deploy/release, external customer outreach, " +
+                "paid spend, destructive delete, human login/sudo/credentials) OR a genuine product, UX, scope, or architectural " +
+                "trade-off where the owner's preference is uncertain?"
+            }
+          ],
+          apiKey,
+          url,
+          model,
+          timeoutMs: Number(decisionsConfig.timeoutMs) || DEFAULT_DECISIONS_TIMEOUT_MS,
+          fetchImpl
+        });
+        if (hygieneRes.ok) {
+          const pNeedsOwner = hygieneRes.probabilities.get("requires_owner_judgment") ?? 1;
+          const scored = concreteOptions
+            .map((opt, idx) => ({ opt, p: hygieneRes.probabilities.get(`opt_${idx}_routine_hygiene`) ?? 0 }))
+            .sort((a, b) => b.p - a.p);
+          const best = scored[0];
+          const second = scored[1] ?? { p: 0 };
+          const hygieneThreshold = Math.max(0.88, threshold);
+          const unambiguous = best && best.p >= hygieneThreshold && pNeedsOwner < 0.12 && (scored.length === 1 || best.p - second.p >= 0.25);
+          const hygieneOutcome = unambiguous
+            ? {
+                matched: true,
+                source: "decisions-engineering-hygiene",
+                precedentId: "prec_engineering_hygiene",
+                confidence: best.p,
+                action: "answer",
+                answer: best.opt,
+                summary: `Auto-resolved routine engineering unblock (${Math.round(best.p * 100)}% confidence): ${clampText(question.title, 80)} -> ${best.opt}`
+              }
+            : { matched: false, hardRedLine: null, confidence: best?.p ?? 0, pRedLine: pNeedsOwner };
+          this.decisionCache.set(hygieneCacheKey, { at: this.now(), result: hygieneOutcome });
+          return hygieneOutcome;
         }
-      : { matched: false, hardRedLine: null, confidence: pMatch, pRedLine };
+      }
+    }
 
-    this.decisionCache.set(cacheKey, { at: this.now(), result: outcome });
-    return outcome;
+    return { matched: false, hardRedLine: null };
   }
 }

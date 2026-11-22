@@ -11,6 +11,9 @@ import { readThreadConversation, unavailableConversation } from "./conversation.
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
+import { readNodeConfig } from "../cli-client.js";
+import { readOrCreateIdentity } from "../node-registry.js";
+import { appendSharedThreadMessages } from "../shared-conversations.js";
 import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
@@ -314,13 +317,35 @@ function notReadyBlocker(pr) {
 // prMissing: GitHub answered and has no such PR. notReady: a blocker this
 // scan read on the PR (notReadyBlocker).
 export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false, notReady = null } = {}) {
-  const askedAt = Date.parse(question.agentAskedAt ?? question.createdAt ?? "");
+  const effectiveAskedAt = Date.parse(
+    question.agentAskedAt
+    ?? thread?.lastAgentAt
+    ?? question.contextSnapshot?.lastAgentAt
+    ?? thread?.lastActivityAt
+    ?? question.createdAt
+    ?? ""
+  );
+  const askedAt = Number.isFinite(effectiveAskedAt) ? effectiveAskedAt : Date.parse(question.createdAt ?? "");
   if (question.kind === "ready" && prMissing) return "PR not found";
   if (pr && SETTLED_PR_STATES.has(pr.state)) {
-    // An ask made after the merge (a release, QA on it) is not about it.
+    // An ask made after the merge (a release, QA on it) is not about it —
+    // unless the ask explicitly treats the PR as still open/unmerged ("PR #283 is up", mergeAsk).
     const settledAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
-    const after = question.kind === "ready" || !Number.isFinite(settledAt) || !Number.isFinite(askedAt) || settledAt >= askedAt;
-    if (after) return `${parsePrRef(pr.ref)?.number ? `#${parsePrRef(pr.ref).number}` : "PR"} ${pr.state === "MERGED" ? "merged" : "closed"}`;
+    const prNum = parsePrRef(pr.ref)?.number;
+    const textHay = `${question.title ?? ""} ${question.body ?? ""}`;
+    const treatsPrAsOpen = Boolean(
+      !/\bmerged\b/i.test(textHay)
+      && (
+        question.mergeAsk
+        || (prNum && new RegExp(`#${prNum}\\b[^.\\n]{0,50}\\b(?:is\\s+(?:up|open|ready)|to\\s+merge|merge\\s+it)`, "i").test(textHay))
+      )
+    );
+    const after = question.kind === "ready"
+      || treatsPrAsOpen
+      || !Number.isFinite(settledAt)
+      || !Number.isFinite(askedAt)
+      || settledAt >= askedAt;
+    if (after) return `${prNum ? `#${prNum}` : "PR"} ${pr.state === "MERGED" ? "merged" : "closed"}`;
   }
   if (pr?.state === "OPEN" && question.askedHead && pr.headOid && pr.headOid !== question.askedHead) return `PR head moved past ${String(question.askedHead).slice(0, 10)}`;
   if (question.kind === "ready" && notReady) return `PR no longer ready: ${notReady}`;
@@ -2141,6 +2166,10 @@ export class FleetSupervisor {
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
       this.reopenIfUndelivered(id, settling, answer);
+      if (delivery?.status === "sent" && question.threadKey) {
+        const targetThread = this.lastThreads.get(question.threadKey) ?? this.knownThreads.get(question.threadKey) ?? null;
+        if (targetThread) this.registerFollowThroughWatch(targetThread, answer, { source: "owner-answer", question });
+      }
       this.emitFleet("question-answered");
       return { question: answered, delivery };
     } finally {
@@ -2254,6 +2283,10 @@ export class FleetSupervisor {
         });
       } catch { /* precedent learning never blocks owner reply */ }
       this.resolveOutreach(question, "reply", "acted");
+      if (question.threadKey) {
+        const targetThread = this.lastThreads.get(question.threadKey) ?? this.knownThreads.get(question.threadKey) ?? null;
+        if (targetThread) this.registerFollowThroughWatch(targetThread, text, { source: "owner-reply", question });
+      }
       // The store keeps the reply clamped; a failed background send reopens
       // the question only while that stored answer stands.
       this.reopenIfUndelivered(id, settling, answered?.answer ?? text);
@@ -2317,6 +2350,7 @@ export class FleetSupervisor {
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    let followThroughWatch = null;
     if (delivery.status === "sent") {
       this.store.markCompletionReviewed(thread.key, this.now());
       for (const q of this.store.openQuestions()) {
@@ -2325,6 +2359,7 @@ export class FleetSupervisor {
           this.resolveOutreach(q, "reply", "acted");
         }
       }
+      followThroughWatch = this.registerFollowThroughWatch(thread, text, { source: "owner-message", question: matchingOpen });
     }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
@@ -2335,8 +2370,248 @@ export class FleetSupervisor {
       ?? (delivery.status === "sent" ? null : this.store.recordAction({ threadKey, playbook: "owner-message", status: delivery.status ?? "blocked", route: delivery.route ?? route, detail: delivery.detail ?? null })?.id);
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
       ...(actionId ? { actionId } : {}),
+      ...(delivery.messageId ? { messageId: delivery.messageId } : {}),
+      ...(delivery.providerMessageId ? { providerMessageId: delivery.providerMessageId } : {}),
+      ...(delivery.turnId ? { turnId: delivery.turnId } : {}),
+      ...(delivery.verifiedAt ? { verifiedAt: delivery.verifiedAt } : {}),
+      ...(followThroughWatch?.id ? { followThroughWatchId: followThroughWatch.id } : {}),
       ...(delivery.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
+  }
+
+  registerFollowThroughWatch(thread, message, { source = "owner-message", question = null } = {}) {
+    if (!thread?.key) return null;
+    const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? question?.prRef ?? null);
+    const watch = this.store.upsertFollowThroughWatch({
+      threadKey: thread.key,
+      title: thread.title || thread.workspace || thread.key,
+      goalId: activeGoal?.id ?? null,
+      directiveSummary: message,
+      source,
+      sentAt: new Date(this.now()).toISOString(),
+      baselineAgentAt: thread.lastAgentAt ?? null,
+      baselineActivityAt: thread.lastActivityAt ?? null
+    });
+    // When running live (`this.timer` active), schedule a quick follow-up scan
+    // ~25s later so fast post-directive blockers (like a 38s idle turn) surface
+    // immediately without waiting a full 1-5 minute poll cycle.
+    if (this.timer) {
+      const followTimer = setTimeout(() => {
+        if (this.timer) this.tick("follow-through").catch(() => {});
+      }, 25_000);
+      followTimer.unref?.();
+    }
+    return watch;
+  }
+
+  async postSupervisorChatUpdate(content, { dedupeKey = null, minGapMs = 30 * MIN, metadata = {} } = {}) {
+    const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), 1600);
+    if (!cleanContent) return { posted: false, reason: "empty" };
+    const nowMs = this.now();
+    if (dedupeKey) {
+      const prev = this.store.lastSupervisorChatNotice(dedupeKey);
+      const prevMs = Date.parse(prev?.at ?? "");
+      if (Number.isFinite(prevMs) && nowMs - prevMs < minGapMs) {
+        return { posted: false, reason: "deduped" };
+      }
+    }
+    const nowIso = new Date(nowMs).toISOString();
+    const messageEntry = {
+      role: "assistant",
+      text: cleanContent,
+      content: cleanContent,
+      at: nowIso,
+      createdAt: nowIso,
+      metadata: {
+        proactiveSupervisor: true,
+        ...(dedupeKey ? { dedupeKey } : {}),
+        ...metadata
+      }
+    };
+
+    let deliveredRemote = false;
+    let deliveredLocal = false;
+    const nodeConfig = this.dataDir ? readNodeConfig(this.dataDir) : null;
+    if (nodeConfig?.remote && nodeConfig?.ownerProxyToken) {
+      try {
+        const identity = readOrCreateIdentity(this.dataDir);
+        const fetchFn = this.deps.supervisorChatFetch ?? this.deps.fetchImpl ?? globalThis.fetch;
+        if (typeof fetchFn === "function") {
+          const endpoint = `${String(nodeConfig.remote).replace(/\/+$/, "")}/conversations/supervisor/append`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 10_000);
+          timer.unref?.();
+          try {
+            const res = await fetchFn(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${nodeConfig.ownerProxyToken}`,
+                "X-OpenAGI-Node-ID": identity.nodeId
+              },
+              body: JSON.stringify({
+                conversationId: "main",
+                messages: [{ role: "assistant", text: cleanContent, at: nowIso }]
+              }),
+              signal: controller.signal
+            });
+            deliveredRemote = Boolean(res?.ok);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+      } catch { /* fallback to local store if remote hub append fails */ }
+    }
+
+    const sessionStore = this.runtime?.agentHost?.store;
+    if (sessionStore && typeof sessionStore.getSession === "function" && typeof sessionStore.appendMessage === "function") {
+      try {
+        appendSharedThreadMessages(sessionStore, "supervisor", {
+          conversationId: "main",
+          messages: [{ role: "assistant", text: cleanContent, at: nowIso }]
+        });
+        this.runtime?.events?.emit?.("conversation.updated", {
+          sessionId: "devices:supervisor:main",
+          proactive: true,
+          at: nowIso
+        });
+        deliveredLocal = true;
+      } catch { /* best-effort */ }
+    }
+
+    if (deliveredRemote || deliveredLocal) {
+      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
+      return { posted: true, deliveredRemote, deliveredLocal };
+    }
+    return { posted: false, reason: "no-channel" };
+  }
+
+  async reconcileFollowThroughWatches({ byKey, items, started }) {
+    const watches = this.store.openFollowThroughWatches();
+    if (!watches.length) return [];
+    const outcomes = [];
+    for (const watch of watches) {
+      const sentMs = Date.parse(watch.sentAt ?? "") || started;
+      const elapsedMs = Math.max(0, started - sentMs);
+      const thread = byKey.get(watch.threadKey) ?? this.lastThreads.get(watch.threadKey) ?? null;
+      if (!thread) {
+        if (elapsedMs > 6 * 60 * MIN) {
+          this.store.resolveFollowThroughWatch(watch.id, { outcome: "expired", detail: "session no longer visible in scan" });
+        }
+        continue;
+      }
+      const item = items.find((entry) => entry.thread.key === thread.key) ?? null;
+      if (thread.agentStatus === "running" || item?.classified?.state === "running") continue;
+
+      const lastAgentMs = Date.parse(thread.lastAgentAt ?? "") || 0;
+      const baseAgentMs = Date.parse(watch.baselineAgentAt ?? "") || 0;
+      const agentReplied = lastAgentMs > 0 && (baseAgentMs === 0 || lastAgentMs > baseAgentMs);
+      const settledWithoutReply = !agentReplied
+        && elapsedMs >= 90_000
+        && ["idle", "error", "waiting", "stalled", "aborted"].includes(String(thread.agentStatus ?? ""));
+      if (!agentReplied && !settledWithoutReply && !thread.error && !thread.meta?.blockedOnOwner) continue;
+
+      const activeGoal = watch.goalId
+        ? (this.activeWork.state.items.find((it) => it.id === watch.goalId) ?? null)
+        : this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? null);
+      const openQ = this.store.openQuestions().find((q) => q.threadKey === thread.key && q.status === "open") ?? null;
+      const errText = thread.error?.text ?? null;
+      const blockedAsk = item?.classified?.state === "needs-human"
+        ? (item.classified.ask?.text || item.classified.reason)
+        : null;
+      const replyExcerpt = clampText(stripAgentInternalMarkup(thread.lastAgentFull || thread.lastAgentText || ""), 320);
+      const explicitUnfinished = /\b(?:submission:\s*not\s+started|not\s+submitted|blocked\s+on|single\s+owner\s+action|owner\s+action|requires?\s+sudo|failed)\b/i.test(replyExcerpt);
+      const goalUnverified = Boolean(activeGoal && !activeGoal.outcomeVerified);
+
+      const outcomeKind = errText
+        ? "error"
+        : (blockedAsk || openQ || explicitUnfinished)
+          ? "blocked"
+          : goalUnverified
+            ? "unverified"
+            : "completed";
+
+      const detail = errText || blockedAsk || openQ?.title || replyExcerpt || "Turn finished";
+      this.store.resolveFollowThroughWatch(watch.id, { outcome: outcomeKind, detail });
+      outcomes.push({ watchId: watch.id, threadKey: thread.key, outcome: outcomeKind, detail });
+
+      // Whenever an owner-directed session finishes its turn in an error, owner-blocker,
+      // or unverified goal state, report the verified truth back to Supervisor chat immediately.
+      if (["error", "blocked", "unverified"].includes(outcomeKind)) {
+        const label = clampText(redactSecrets(thread.title || thread.workspace || thread.key), 80);
+        const statusHeadline = outcomeKind === "error"
+          ? "hit a session error"
+          : (outcomeKind === "blocked" ? "stopped on an owner blocker" : "finished its turn without completing the tracked goal");
+        const lines = [
+          `**Post-send verification — ${label} ${statusHeadline}**`,
+          `- **Session:** \`${thread.key}\`${activeGoal ? ` · **Goal:** ${clampText(activeGoal.goal, 120)} (\`outcomeVerified: false\`)` : ""}`,
+          `- **What happened:** ${clampText(detail, 280)}`
+        ];
+        if (openQ?.id) {
+          const opts = (openQ.options ?? []).filter((o) => o !== "dismiss").join(" / ");
+          lines.push(`- **Action card:** \`${openQ.id}\`${opts ? ` (options: ${opts})` : ""}`);
+        }
+        await this.postSupervisorChatUpdate(lines.join("\n"), {
+          dedupeKey: `ftw:${thread.key}:${shortHash(detail)}`,
+          minGapMs: 10 * MIN,
+          metadata: { kind: "follow_through_verification", threadKey: thread.key, outcome: outcomeKind, goalId: activeGoal?.id ?? null }
+        });
+      }
+    }
+    return outcomes;
+  }
+
+  async maybePostProactiveSupervisorDigest({ snapshot, started, autoResolvedSummaries = [] }) {
+    const enabled = Boolean(this.timer) || this.config?.proactiveSupervisorChat === true;
+    if (!enabled) return null;
+    const quiet = this.config?.notify?.quietHours ?? null;
+    if (quiet && Number.isInteger(quiet.start) && Number.isInteger(quiet.end)) {
+      const hour = new Date(started).getHours();
+      const inQuiet = quiet.start <= quiet.end
+        ? (hour >= quiet.start && hour < quiet.end)
+        : (hour >= quiet.start || hour < quiet.end);
+      if (inQuiet) return null;
+    }
+
+    const runningCount = Number(snapshot?.counts?.running ?? 0);
+    const awItems = (this.activeWork.getActiveWork({ limit: 40 })?.items ?? [])
+      .filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed");
+    const openActionable = this.store.openQuestions()
+      .filter((q) => q.status === "open" && !["completed"].includes(q.kind) && !this.awaitingReview.has(q.id));
+
+    // Surface proactively when 0 agents are running despite unfinished goals/blockers,
+    // or when autonomous precedents cleared a batch of waiting items alongside remaining owner walls.
+    const zeroRunningStall = runningCount === 0 && (awItems.length > 0 || openActionable.length > 0);
+    const batchClearedWithWalls = autoResolvedSummaries.length >= 2 && openActionable.length > 0;
+    if (!zeroRunningStall && !batchClearedWithWalls) return null;
+
+    const topBlockers = openActionable.slice(0, 5);
+    const sig = shortHash(JSON.stringify([
+      runningCount === 0 ? "zero-running" : "active",
+      topBlockers.map((q) => [q.id, q.kind, q.title]),
+      awItems.filter((it) => it.state === "blocked").map((it) => it.id)
+    ]));
+
+    const lines = [
+      runningCount === 0
+        ? `**Supervisor check-in:** **0 coding sessions are currently running** across **${awItems.length}** unfinished goal${awItems.length === 1 ? "" : "s"} (**${openActionable.length}** item${openActionable.length === 1 ? "" : "s"} waiting on you).`
+        : `**Supervisor check-in:** **${runningCount}** session${runningCount === 1 ? "" : "s"} running · **${openActionable.length}** item${openActionable.length === 1 ? "" : "s"} waiting on your decision.`
+    ];
+    if (autoResolvedSummaries.length > 0) {
+      lines.push(`- **Auto-handled via precedent (${autoResolvedSummaries.length}):** ${autoResolvedSummaries.slice(0, 4).join("; ")}`);
+    }
+    if (topBlockers.length > 0) {
+      lines.push("- **Needs your call (Hard Red Lines / external blockers):**");
+      for (const q of topBlockers) {
+        const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
+        lines.push(`  - \`${q.id}\` — **${clampText(q.title, 110)}**${opts ? ` *(${opts})*` : ""}`);
+      }
+    }
+    return this.postSupervisorChatUpdate(lines.join("\n"), {
+      dedupeKey: `digest:${sig}`,
+      minGapMs: 2 * 60 * MIN,
+      metadata: { kind: "proactive_supervisor_digest", runningCount, openCount: openActionable.length, unfinishedGoals: awItems.length }
+    });
   }
 
   // One thread, expanded for the owner: the agent's last message and when,
@@ -3576,6 +3851,9 @@ export class FleetSupervisor {
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
     }
+    // Auto-link unassigned explicit ActiveWork goals to matching live coding sessions
+    // so `resume_owner` goals do not sit stranded with `owner.threadKey: null`.
+    try { this.activeWork.autoBindUnassignedGoals(threads); } catch { /* best-effort */ }
     const manager = paseoOnly ? null : (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads
@@ -3754,6 +4032,14 @@ export class FleetSupervisor {
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, unknownPrefixes, manager, delivery, storage: storageOn ? this.storage.summary() : null, previous });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
+    try {
+      await this.reconcileFollowThroughWatches({ byKey, items, started });
+      await this.maybePostProactiveSupervisorDigest({
+        snapshot,
+        started,
+        autoResolvedSummaries: this._lastTickAutoResolved ?? []
+      });
+    } catch { /* proactive supervisor chat bridge never breaks a tick */ }
     try { await this.diagnoseTick(); } catch (error) {
       store.saveDiagnosis({ error: clampText(redactSecrets(error?.message), 200) });
     }
@@ -4400,7 +4686,7 @@ export class FleetSupervisor {
         const route = cooldownOk ? chooseRoute(thread, "auto", this.lastDelivery) : null;
         if (route) {
           const precNudge = await this.precedentMemory.evaluateCandidate(
-            { thread, pr: itemPr, classified },
+            { thread, pr: itemPr, classified, activeGoal },
             { decisionsConfig: this.config.decisions, env: this.deps.env ?? process.env, fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl }
           );
           if (precNudge?.matched && precNudge.action === "nudge" && precNudge.directive) {
@@ -4536,6 +4822,7 @@ export class FleetSupervisor {
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
+    this._lastTickAutoResolved = [];
     // A grouped question's member that a capped scan deferred keeps its seat
     // until it is read again: the group is rebuilt with it, not without it.
     const decidedKeys = new Set(decisions.map((decision) => decision.threadKey));
@@ -4638,8 +4925,9 @@ export class FleetSupervisor {
         && !store.mutedUntil(fields.threadKey)
         && sends < config.limits.maxSendsPerTick
       ) {
+        const askActiveGoal = this.activeWork.findActiveGoalForThread(fields.threadKey, askPrRef);
         const precMatch = await this.precedentMemory.evaluateCandidate(
-          { question, thread: askThread, pr: askPr },
+          { question, thread: askThread, pr: askPr, activeGoal: askActiveGoal },
           {
             decisionsConfig: this.config.decisions,
             env: this.deps.env ?? process.env,
@@ -4660,6 +4948,7 @@ export class FleetSupervisor {
               sends += 1;
               attempted.add(targetThread.key);
               autoAnsweredThreads.add(targetThread.key);
+              this._lastTickAutoResolved.push(clampText(precMatch.summary, 110));
               if (uiKey) typedInto.add(uiKey);
               store.answerQuestion(question.id, precMatch.answer);
               this.resolveOutreach(question, precMatch.answer, "acted");

@@ -267,6 +267,7 @@ function extractPaseoPendingPermission(agent) {
     title: blocking.title ? clampText(redactSecrets(String(blocking.title)), 120) : null,
     description: blocking.description ? clampText(redactSecrets(String(blocking.description)), 280) : null,
     command: command ? clampText(redactSecrets(String(command)), 240) : null,
+    rawCommand: command ? redactSecrets(String(command)).slice(0, 2000) : null,
     filePath: filePath ? clampText(redactSecrets(String(filePath)), 200) : null,
     actions: Array.isArray(blocking.actions)
       ? blocking.actions
@@ -470,12 +471,14 @@ export function createPaseoSource({ factory } = {}) {
           ? enabledHosts.filter((h) => h.status !== "online").map((h) => h.serverId)
           : []
       );
-      const explicitSet = new Set([directory.self.serverId, ...explicitIds]);
       const ids = [...new Set([directory.self.serverId, ...explicitIds, ...autoIds])];
       const inventory = [];
       for (const id of ids) {
         signal.throwIfAborted();
-        const isRequiredHost = explicitSet.has(id);
+        // Only the local Paseo daemon (`directory.self.serverId`) is mandatory for
+        // a scan; a transient peer-relay failure on a remote configured host must
+        // preserve cached peer state (`unknownHostIds`) instead of aborting local discovery.
+        const isRequiredHost = id === directory.self.serverId;
         try {
           const api = await hostApi(client, id, directory);
           let cursor;

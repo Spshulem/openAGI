@@ -210,9 +210,15 @@ export class RemoteFleetSupervisor {
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
       const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
       const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
-      const nonOutageError = missingThread || closedCard || missingActiveWork || unsupportedRoute;
-      if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
-      // Preserve the last snapshot/questions through connection outages.
+      const hasSpecificNodeError = reached && Boolean(rawMsg) && rawMsg !== 'Fleet request failed';
+      const nonOutageError = hasSpecificNodeError || missingThread || closedCard || missingActiveWork || unsupportedRoute;
+      if (!nonOutageError && sequence >= this.appliedSequence) {
+        this.state.lastError = !reached && /timed out|timeout|aborted/i.test(rawMsg)
+          ? `Fleet request timed out waiting for ${this.nodeId} (${rawMsg}). Reconcile recent deliveries before resending.`
+          : 'Fleet computer unavailable or request failed. Retry when it is online.';
+      }
+      // Preserve the last snapshot/questions through connection outages, and never
+      // misreport an HTTP error from an online fleet computer as an offline outage.
       throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
     }
   }
@@ -283,7 +289,44 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(Array.isArray(images) && images.length ? { images } : {}) }); }
+  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) {
+    const startedAtMs = Date.now();
+    try {
+      return await this.request('POST', '/fleet/api/send', {
+        threadKey,
+        message,
+        ...(queue === true ? { queue: true } : {}),
+        ...(Array.isArray(images) && images.length ? { images } : {})
+      });
+    } catch (error) {
+      if (!error?.reached) {
+        try {
+          await this.request('GET', '/fleet/api/state');
+          const matched = (this.state.actions ?? []).find((act) => (
+            act?.threadKey === threadKey
+            && act?.playbook === 'owner-message'
+            && act?.status === 'sent'
+            && Number.isFinite(Date.parse(act?.at ?? ''))
+            && Date.parse(act.at) >= startedAtMs - 2000
+          ));
+          if (matched) {
+            return {
+              reconciledAfterTimeout: true,
+              delivery: {
+                status: 'sent',
+                route: matched.route ?? 'paseo-send',
+                actionId: matched.id ?? null,
+                reconciledReceipt: true,
+                verifiedAt: matched.at,
+                detail: matched.detail || 'Verified in fleet action log after remote response timeout; message was delivered.'
+              }
+            };
+          }
+        } catch { /* preserve original error if state reconciliation also fails */ }
+      }
+      throw error;
+    }
+  }
   async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });

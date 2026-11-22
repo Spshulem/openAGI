@@ -312,12 +312,19 @@ export class AbiRuntime {
       // metered model the interval is the single biggest cost lever. Default
       // 30 min; set OPENAGI_AUTOPILOT_INTERVAL_MIN to slow it (e.g. 120 = 2h).
       const autopilotMin = Number(process.env.OPENAGI_AUTOPILOT_INTERVAL_MIN) || 30;
+      const existingPulse = this.cron.jobs?.get?.("agent-pulse") ?? null;
+      const upgradeLegacyPulse = Boolean(
+        existingPulse && !String(existingPulse.input?.prompt ?? "").includes("verify_goal_progress")
+      );
       this.cron.addJob({
         id: "agent-pulse",
         name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
-        enabled: true,
+        enabled: existingPulse ? existingPulse.enabled !== false : true,
+        replace: upgradeLegacyPulse,
         task: "autopilot",
         intervalMs: autopilotMin * 60 * 1000,
+        ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
+        ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
         input: {
           agentId: "main",
           prompt: AGENT_PULSE_PROMPT,

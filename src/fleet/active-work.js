@@ -896,6 +896,102 @@ export class ActiveWorkManager {
     return null;
   }
 
+  // Automatically links unassigned explicit goals (`!dedupeKey.startsWith("pr:")`) to
+  // matching live non-archived sessions by PR ref or strong repo/project + goal keyword
+  // overlap so `resume_owner` goals do not sit stranded with `owner.threadKey: null`.
+  autoBindUnassignedGoals(threads = []) {
+    const { byKey: knownByKey } = this._knownSessionsByKey();
+    const candidates = new Map(knownByKey);
+    for (const t of Array.isArray(threads) ? threads : []) {
+      if (t?.key && !t.archived && !t.excluded) candidates.set(t.key, t);
+    }
+    const liveSessions = [...candidates.values()].filter((s) => s?.key && !s.archived && !s.excluded);
+    if (!liveSessions.length) return [];
+
+    const stopWords = new Set(["the", "and", "for", "with", "that", "this", "from", "into", "all", "are", "was", "has", "have", "get", "make", "ensure", "verify", "fix", "work", "project", "active"]);
+    const tokensOf = (str) => new Set(
+      String(str ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .split(/\s+/)
+        .filter((tok) => tok.length >= 3 && !stopWords.has(tok))
+    );
+
+    const claimedKeys = new Set(
+      this.state.items
+        .filter((it) => it && it.state !== "done" && !it.outcomeVerified && it.owner?.threadKey && candidates.has(it.owner.threadKey))
+        .map((it) => it.owner.threadKey)
+    );
+
+    const nowIso = new Date(this.now()).toISOString();
+    const bound = [];
+    for (const item of this.state.items) {
+      if (!item || item.state === "done" || item.state === "snoozed" || item.outcomeVerified) continue;
+      if (String(item.dedupeKey ?? "").startsWith("pr:")) continue;
+      if (item.owner?.threadKey && candidates.has(item.owner.threadKey)) continue;
+
+      let matchedSession = null;
+      const goalPr = item.prRef ? String(item.prRef).toLowerCase() : null;
+      if (goalPr) {
+        matchedSession = liveSessions
+          .filter((s) => !claimedKeys.has(s.key) && (s.prRefs ?? []).some((r) => String(r).toLowerCase() === goalPr))
+          .sort((a, b) => String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))[0] ?? null;
+      }
+
+      if (!matchedSession) {
+        const itemProjectKey = compactAlnum(item.project ?? "");
+        const itemRepo = item.repo ? String(item.repo).toLowerCase() : null;
+        const goalTokens = tokensOf(`${item.goal ?? ""} ${item.theme ?? ""}`);
+        if (goalTokens.size >= 2) {
+          let bestScore = 0;
+          for (const s of liveSessions) {
+            if (claimedKeys.has(s.key)) continue;
+            const sRepo = s.repo ? String(s.repo).toLowerCase() : null;
+            const sProj = compactAlnum(s.meta?.paseoProjectName || s.workspace || sRepo?.split("/")[1] || "");
+            const sameRepoOrProject = Boolean(
+              (itemRepo && sRepo && itemRepo === sRepo)
+              || (itemProjectKey && sProj && (itemProjectKey === sProj || sProj.includes(itemProjectKey) || itemProjectKey.includes(sProj)))
+            );
+            if (!sameRepoOrProject) continue;
+            const sessionTokens = tokensOf(`${s.title ?? ""} ${s.workspace ?? ""} ${s.branch ?? ""}`);
+            if (!sessionTokens.size) continue;
+            let shared = 0;
+            for (const tok of goalTokens) {
+              if (sessionTokens.has(tok)) shared += 1;
+            }
+            const score = shared / Math.sqrt(goalTokens.size * sessionTokens.size);
+            if (shared >= 2 && score >= 0.25 && score > bestScore) {
+              bestScore = score;
+              matchedSession = s;
+            }
+          }
+        }
+      }
+
+      if (matchedSession) {
+        item.owner = normalizeOwner({ threadKey: matchedSession.key }, matchedSession.key, candidates);
+        item.evidenceLinks = mergeEvidenceLinks(item.evidenceLinks, [{
+          kind: "session",
+          ref: matchedSession.key,
+          label: cleanText(matchedSession.title || matchedSession.workspace || matchedSession.key, 120),
+          state: matchedSession.agentStatus ?? "idle",
+          observedAt: nowIso,
+          updatedAt: matchedSession.lastActivityAt ?? nowIso,
+          trusted: true
+        }], nowIso);
+        item.updatedAt = nowIso;
+        claimedKeys.add(matchedSession.key);
+        bound.push({ itemId: item.id, threadKey: matchedSession.key });
+      }
+    }
+
+    if (bound.length > 0) {
+      this._recordAudit({ op: "auto_bind_unassigned_goals", bound });
+      this._save();
+    }
+    return bound;
+  }
+
   reassignSessionOwner(oldKey, newKey, { label = null, host = null, note = null } = {}) {
     if (!oldKey || !newKey || oldKey === newKey) return [];
     const nowIso = new Date(this.now()).toISOString();

@@ -858,6 +858,10 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         status: "sent",
         route: "paseo-send",
         actionId,
+        messageId: correlated.clientMessageId ?? messageId,
+        ...(correlated.providerMessageId ? { providerMessageId: correlated.providerMessageId } : {}),
+        ...(correlated.turnId ? { turnId: correlated.turnId } : {}),
+        verifiedAt: new Date().toISOString(),
         ...(normalizedImages.length ? { attachedImages: normalizedImages.length } : {}),
         detail: normalizedImages.length ? `Paseo message, ${normalizedImages.length} image(s), and turn confirmed` : "Paseo message and turn confirmed"
       };

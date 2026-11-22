@@ -1159,5 +1159,13 @@ function deliveryReceipt(result) {
   return { status, route: delivery?.route ?? null, detail: clip(delivery?.detail ?? "", 200),
     ...(Number.isInteger(delivery?.attachedImages) && delivery.attachedImages > 0 ? { attachedImages: delivery.attachedImages } : {}),
     ...(delivery?.actionId ? { actionId: delivery.actionId } : {}),
-    ...(delivery?.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}) };
+    ...(delivery?.messageId ? { messageId: delivery.messageId } : {}),
+    ...(delivery?.providerMessageId ? { providerMessageId: delivery.providerMessageId } : {}),
+    ...(delivery?.turnId ? { turnId: delivery.turnId } : {}),
+    ...(delivery?.verifiedAt ? { verifiedAt: delivery.verifiedAt } : {}),
+    ...(delivery?.reconciledReceipt ? { reconciledReceipt: true } : {}),
+    ...(delivery?.followThroughWatchId ? { followThroughWatchId: delivery.followThroughWatchId } : {}),
+    ...(delivery?.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
+    outcomeVerified: false,
+    verificationNote: "Message delivery and turn start confirmed; target goal/submission is NOT complete until post-turn outcome is verified." };
 }
