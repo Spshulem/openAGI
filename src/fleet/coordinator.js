@@ -25,6 +25,7 @@ import { readThreadConversation } from "./conversation.js";
 import { normalizePaseoImages } from "./paseo-delivery.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
+import { readHostModelUsageCounts, resolveDefaultPaseoModeId, selectBestPaseoModel } from "./paseo-delivery.js";
 
 const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
@@ -1226,11 +1227,19 @@ export async function resolvePaseoAgentConfig(api, cwd, {
   provider = null,
   model = null,
   effort = null,
-  modeId = null
+  modeId = null,
+  preferences = null
 } = {}) {
   const rawProv = typeof provider === "string" ? provider.trim() : "";
   const rawModel = typeof model === "string" ? model.trim() : "";
-  const KNOWN_PROVIDERS = new Set(["codex", "claude", "opencode", "gemini", "cursor"]);
+  const KNOWN_PROVIDERS = new Set(["codex", "claude", "antigravity", "opencode", "gemini", "cursor"]);
+  const prefDefaultProvider = String(preferences?.defaultProvider ?? "claude").toLowerCase();
+  const prefPermissionMode = String(preferences?.defaultPermissionMode ?? "bypass").toLowerCase();
+  const prefDefaultModels = preferences?.defaultModels ?? {
+    claude: "claude-opus-5-5",
+    codex: "gpt-6.2-sol",
+    antigravity: "gemini-4-carbon-high"
+  };
 
   let explicitFamily = null;
   let modelQuery = rawModel || null;
@@ -1257,15 +1266,17 @@ export async function resolvePaseoAgentConfig(api, cwd, {
 
   const entries = Array.isArray(snap?.entries) ? snap.entries.filter((e) => e?.status === "ready") : [];
   if (entries.length > 0) {
+    const primaryDefault = prefDefaultProvider === "codex" ? "codex" : prefDefaultProvider === "antigravity" ? "antigravity" : "claude";
+    const secondaryDefault = primaryDefault === "claude" ? "codex" : "claude";
     const orderedEntries = explicitFamily
       ? [
           ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === explicitFamily),
           ...entries.filter((e) => String(e.provider ?? "").toLowerCase() !== explicitFamily)
         ]
       : [
-          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "codex"),
-          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "claude"),
-          ...entries.filter((e) => !["codex", "claude"].includes(String(e.provider ?? "").toLowerCase()))
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === primaryDefault),
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === secondaryDefault),
+          ...entries.filter((e) => ![primaryDefault, secondaryDefault].includes(String(e.provider ?? "").toLowerCase()))
         ];
 
     if (modelQuery) {
@@ -1289,7 +1300,9 @@ export async function resolvePaseoAgentConfig(api, cwd, {
           }
           const hayTokens = tokenizeMatchQuery(`${mid} ${mlabel} ${entry.provider ?? ""}`);
           if (qTokens.length > 0 && qTokens.every((t) => hayTokens.includes(t) || midLower.includes(t) || labelLower.includes(t))) {
-            const score = 50 + qTokens.length + famMatchBonus + (m?.isDefault ? 1 : 0);
+            // Prefer newer semantic generations (e.g. opus 5.5 over opus 4.7 when user says "opus")
+            const genBonus = /5[-.]5/.test(midLower) ? 8 : /-[5-9]\b/.test(midLower) ? 5 : /-4[-.]7/.test(midLower) ? -10 : 0;
+            const score = 50 + qTokens.length + famMatchBonus + genBonus;
             if (score > bestScore) {
               bestScore = score;
               bestMatch = { entry, model: m };
@@ -1301,11 +1314,15 @@ export async function resolvePaseoAgentConfig(api, cwd, {
 
       if (bestMatch) {
         const thinkingOptionId = matchThinkingOptionId(bestMatch.model, effort);
+        const resolvedModeId = resolveDefaultPaseoModeId(bestMatch.entry, {
+          permissionMode: prefPermissionMode,
+          explicitModeId: modeId
+        });
         return {
           provider: `${bestMatch.entry.provider}/${bestMatch.model.id}`,
           model: bestMatch.model.id,
           ...(thinkingOptionId ? { thinkingOptionId } : {}),
-          ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+          ...(resolvedModeId ? { modeId: resolvedModeId } : {})
         };
       }
     }
@@ -1314,27 +1331,44 @@ export async function resolvePaseoAgentConfig(api, cwd, {
       ? entries.find((e) => String(e.provider ?? "").toLowerCase() === explicitFamily)
       : null)
       ?? orderedEntries[0];
-    const pickedModel = picked?.models?.find((m) => m?.isDefault) ?? picked?.models?.[0] ?? null;
+    const pickedProviderLower = String(picked?.provider ?? "").toLowerCase();
+    const usageCounts = await readHostModelUsageCounts(api);
+    const pickedModel = selectBestPaseoModel(picked, {
+      usageCounts,
+      preferredModelId: prefDefaultModels?.[pickedProviderLower] ?? null
+    });
     if (picked?.provider && (modelQuery || pickedModel?.id)) {
       const chosenModelId = modelQuery || pickedModel.id;
       const thinkingOptionId = matchThinkingOptionId(pickedModel, effort);
+      const resolvedModeId = resolveDefaultPaseoModeId(picked, {
+        permissionMode: prefPermissionMode,
+        explicitModeId: modeId
+      });
       return {
         provider: `${picked.provider}/${chosenModelId}`,
         model: chosenModelId,
         ...(thinkingOptionId ? { thinkingOptionId } : {}),
-        ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+        ...(resolvedModeId ? { modeId: resolvedModeId } : {})
       };
     }
   }
 
-  const fallbackFamily = explicitFamily || (modelQuery && /claude|sonnet|opus|haiku/i.test(modelQuery) ? "claude" : "codex");
-  const fallbackSpec = modelQuery ? `${fallbackFamily}/${modelQuery}` : (rawProv || fallbackFamily);
+  const fallbackFamily = explicitFamily
+    || (modelQuery && /gpt|sol|astra|codex/i.test(modelQuery) ? "codex" : (prefDefaultProvider === "codex" ? "codex" : "claude"));
+  const defaultFallbackModel = modelQuery
+    || prefDefaultModels?.[fallbackFamily]
+    || (fallbackFamily === "claude" ? "claude-opus-5-5" : "gpt-6.2-sol");
+  const fallbackSpec = defaultFallbackModel ? `${fallbackFamily}/${defaultFallbackModel}` : (rawProv || fallbackFamily);
   const thinkingOptionId = normalizeEffortId(effort);
+  const resolvedModeId = resolveDefaultPaseoModeId(
+    { provider: fallbackFamily },
+    { permissionMode: prefPermissionMode, explicitModeId: modeId }
+  );
   return {
     provider: fallbackSpec,
-    ...(modelQuery ? { model: modelQuery } : {}),
+    ...(defaultFallbackModel ? { model: defaultFallbackModel } : {}),
     ...(thinkingOptionId ? { thinkingOptionId } : {}),
-    ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+    ...(resolvedModeId ? { modeId: resolvedModeId } : {})
   };
 }
 
@@ -1517,7 +1551,14 @@ export async function startPaseoSession(supervisor, {
   const created = await withPaseo(createCfg, async (client, signal) => {
     const directory = await client.hosts.list();
     const api = await hostApi(client, resolvedServerId, directory);
-    const agentConfig = await resolvePaseoAgentConfig(api, resolvedCwd, { provider, model, effort, modeId });
+    const ownerPreferences = supervisor?.store?.preferences?.() ?? supervisor?.getState?.()?.preferences ?? null;
+    const agentConfig = await resolvePaseoAgentConfig(api, resolvedCwd, {
+      provider,
+      model,
+      effort,
+      modeId,
+      preferences: ownerPreferences
+    });
     signal.throwIfAborted();
     const handle = await api.agents.create({
       config: agentConfig,

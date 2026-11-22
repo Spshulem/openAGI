@@ -121,25 +121,141 @@ function confirmedOwnerSteeredOrQueuedMessage(history, receipt) {
   return history?.agent?.status === "running";
 }
 
-function selectPreferredModel(providerEntry) {
-  const models = Array.isArray(providerEntry?.models) ? providerEntry.models.filter((m) => m?.id) : [];
-  if (!models.length) return null;
-  const p = String(providerEntry?.provider ?? "").toLowerCase();
-  const preferredOrder = p === "claude"
-    ? [/opus-4-[765]/i, /opus/i, /sonnet-4-[65]/i, /sonnet/i]
-    : p === "antigravity"
-      ? [/carbon-high/i, /gemini-4/i, /pro/i]
-      : [/6\.2/i, /6\.1/i, /5\.4/i];
-  for (const rx of preferredOrder) {
-    const hit = models.find((m) => rx.test(String(m.id)) || rx.test(String(m.label ?? "")));
-    if (hit) return hit;
+const hostUsageCache = new WeakMap();
+const HOST_USAGE_TTL_MS = 5 * 60_000;
+
+export function parseModelVersionScore(modelId, provider = "") {
+  const raw = String(modelId ?? "").toLowerCase();
+  const prov = String(provider ?? "").toLowerCase();
+  let major = 0;
+  let minor = 0;
+  const claudeVer = /(?:opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/.exec(raw);
+  const gptVer = /gpt-(\d+)(?:[.-](\d+))?/.exec(raw);
+  const geminiVer = /gemini-(\d+)(?:[.-](\d+))?/.exec(raw);
+  const match = claudeVer || gptVer || geminiVer;
+  if (match) {
+    major = Number(match[1]) || 0;
+    minor = Number(match[2]) || 0;
   }
-  return models.find((m) => m.isDefault) ?? models[0];
+  let tier = 50;
+  if (prov === "claude" || /claude|opus|sonnet|haiku|fable/.test(raw)) {
+    if (raw.includes("opus")) tier = 90;
+    else if (raw.includes("fable")) tier = 80;
+    else if (raw.includes("sonnet")) tier = 65;
+    else if (raw.includes("haiku")) tier = 30;
+  } else if (prov === "codex" || raw.includes("gpt")) {
+    if (raw.includes("sol")) tier = 90;
+    else if (raw.includes("astra")) tier = 85;
+    else if (raw.includes("mini") || raw.includes("nano") || raw.includes("luna")) tier = 25;
+    else tier = 70;
+  } else if (prov === "antigravity" || raw.includes("gemini")) {
+    if (raw.includes("carbon-high") || raw.includes("pro")) tier = 90;
+    else if (raw.includes("argon-high")) tier = 80;
+    else if (raw.includes("medium")) tier = 65;
+  }
+  return major * 1000 + minor * 20 + tier;
 }
 
-function selectExecutionModeId(providerEntry, sourceAgent = null) {
-  const modes = Array.isArray(providerEntry?.modes) ? providerEntry.modes.filter((m) => m?.id && m.id !== "plan") : [];
+export async function readHostModelUsageCounts(api) {
+  if (typeof api?.agents?.list !== "function") return new Map();
+  const cached = hostUsageCache.get(api);
+  if (cached && Date.now() - cached.at < HOST_USAGE_TTL_MS) {
+    return cached.counts;
+  }
+  const counts = new Map();
+  try {
+    const res = await api.agents.list({
+      filter: { includeArchived: false, includeBackground: true },
+      sort: [{ key: "updated_at", direction: "desc" }],
+      page: { limit: 80 }
+    });
+    for (const entry of res?.entries ?? []) {
+      const a = entry?.agent ?? entry;
+      const model = String(a?.model ?? "").trim();
+      const prov = String(a?.provider ?? "").trim().toLowerCase();
+      if (!model) continue;
+      const key = prov ? `${prov}/${model}` : model;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      counts.set(model, (counts.get(model) ?? 0) + 1);
+    }
+    hostUsageCache.set(api, { at: Date.now(), counts });
+  } catch { /* fallback to version & preference ranking */ }
+  return counts;
+}
+
+export function selectBestPaseoModel(providerEntry, { usageCounts = null, preferredModelId = null } = {}) {
+  const rawModels = Array.isArray(providerEntry?.models)
+    ? providerEntry.models.filter((m) => m?.id && m?.isSelectable !== false)
+    : [];
+  if (!rawModels.length) return null;
+  const provider = String(providerEntry?.provider ?? "").toLowerCase();
+
+  // Hard guard: never auto-select deprecated 4.x Claude models (e.g. Opus 4.7)
+  // when 5.x+ models exist in the catalog, even if an older CLI marks 4.7 isDefault.
+  const hasGen5PlusClaude = provider === "claude"
+    && rawModels.some((m) => /(?:opus|sonnet|haiku|fable)-[5-9]\b/.test(String(m.id).toLowerCase()));
+  const candidates = hasGen5PlusClaude
+    ? rawModels.filter((m) => !/(?:opus|sonnet|haiku)-4\b/.test(String(m.id).toLowerCase()))
+    : rawModels;
+
+  const pref = typeof preferredModelId === "string" ? preferredModelId.trim().toLowerCase() : "";
+  if (pref) {
+    const exact = candidates.find(
+      (m) => String(m.id).toLowerCase() === pref || String(m.label ?? "").toLowerCase() === pref
+    );
+    if (exact) return exact;
+  }
+
+  let best = candidates[0];
+  let bestScore = -Infinity;
+  for (let idx = 0; idx < candidates.length; idx += 1) {
+    const m = candidates[idx];
+    const id = String(m.id);
+    const verScore = parseModelVersionScore(id, provider);
+    const uses = usageCounts instanceof Map
+      ? (usageCounts.get(`${provider}/${id}`) ?? usageCounts.get(id) ?? 0)
+      : 0;
+    // Usage frequency boosts models the owner actively uses (e.g. 73 sessions on opus-5-5),
+    // combined with semantic version & tier so newer flagships always beat stale models.
+    const usageBonus = uses > 0 ? Math.round(Math.log2(1 + uses) * 180) : 0;
+    const catalogOrderBonus = Math.max(0, 20 - idx);
+    const total = verScore + usageBonus + catalogOrderBonus;
+    if (total > bestScore) {
+      bestScore = total;
+      best = m;
+    }
+  }
+  return best;
+}
+
+export function resolveDefaultPaseoModeId(
+  providerEntry,
+  { permissionMode = "bypass", explicitModeId = null, sourceAgent = null } = {}
+) {
+  if (typeof explicitModeId === "string" && explicitModeId.trim()) {
+    return explicitModeId.trim();
+  }
+  const provider = String(providerEntry?.provider ?? "").toLowerCase();
+  const modes = Array.isArray(providerEntry?.modes)
+    ? providerEntry.modes.filter((m) => m?.id && m.id !== "plan")
+    : [];
   const modeIds = new Set(modes.map((m) => String(m.id)));
+
+  // Owner default: bypass permissions unless explicitly requested otherwise.
+  if (permissionMode === "bypass") {
+    if (modeIds.has("bypassPermissions")) return "bypassPermissions";
+    if (modeIds.has("full-access")) return "full-access";
+    if (modeIds.has("full")) return "full";
+    if (provider === "claude") return "bypassPermissions";
+    if (provider === "codex" || provider === "antigravity") return "full-access";
+  }
+
+  if (permissionMode === "ask") {
+    if (modeIds.has("default")) return "default";
+    if (modeIds.has("auto")) return "auto";
+    return provider === "claude" ? "default" : "auto";
+  }
+
   const sourceMode = String(sourceAgent?.modeId ?? "").trim();
   if (["full-access", "bypassPermissions"].includes(sourceMode)) {
     if (modeIds.has("bypassPermissions")) return "bypassPermissions";
@@ -147,14 +263,20 @@ function selectExecutionModeId(providerEntry, sourceAgent = null) {
   }
   const def = String(providerEntry?.defaultModeId ?? "").trim();
   if (def && def !== "plan") return def;
-  for (const candidate of ["auto", "auto-review", "acceptEdits", "full-access", "bypassPermissions", "default"]) {
+  for (const candidate of ["bypassPermissions", "full-access", "auto", "auto-review", "acceptEdits", "default"]) {
     if (modeIds.has(candidate)) return candidate;
   }
-  const provider = String(providerEntry?.provider ?? "").toLowerCase();
-  if (provider === "claude") return "auto";
-  if (provider === "codex") return "auto-review";
-  if (provider === "antigravity") return "full-access";
+  if (provider === "claude") return "bypassPermissions";
+  if (provider === "codex" || provider === "antigravity") return "full-access";
   return modes[0]?.id ?? null;
+}
+
+function selectPreferredModel(providerEntry, usageCounts = null, preferredModelId = null) {
+  return selectBestPaseoModel(providerEntry, { usageCounts, preferredModelId });
+}
+
+function selectExecutionModeId(providerEntry, sourceAgent = null, permissionMode = "bypass") {
+  return resolveDefaultPaseoModeId(providerEntry, { permissionMode, sourceAgent });
 }
 
 // Automatically switches a quota-exhausted or auth-blocked Paseo coding session
@@ -220,7 +342,14 @@ export async function failoverPaseoSessionProvider({
       }
     }
     chosen ??= readyAlternates[0];
-    const chosenModel = selectPreferredModel(chosen);
+    const usageCounts = await readHostModelUsageCounts(api);
+    const chosenProviderLower = String(chosen?.provider ?? "").toLowerCase();
+    const defaultPreferredModel = chosenProviderLower === "claude"
+      ? "claude-opus-5-5"
+      : chosenProviderLower === "codex"
+        ? "gpt-6.2-sol"
+        : null;
+    const chosenModel = selectPreferredModel(chosen, usageCounts, defaultPreferredModel);
     if (!chosen?.provider || !chosenModel?.id) {
       return { ok: false, exhaustedProvider, detail: `Alternate provider ${chosen?.provider ?? "?"} has no selectable model.` };
     }
@@ -283,10 +412,15 @@ async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEnt
   }
   const snap = await api.providers.waitForReady({ cwd, timeoutMs: 8000 });
   const entries = Array.isArray(snap?.entries) ? snap.entries : [];
-  const ready = entries.find((e) => e?.status === "ready" && e?.provider === "codex")
-    ?? entries.find((e) => e?.status === "ready" && e?.provider === "claude")
+  const ready = entries.find((e) => e?.status === "ready" && e?.provider === "claude")
+    ?? entries.find((e) => e?.status === "ready" && e?.provider === "codex")
     ?? entries.find((e) => e?.status === "ready");
-  const model = ready?.models?.find((m) => m?.isDefault) ?? ready?.models?.[0] ?? null;
+  const usageCounts = await readHostModelUsageCounts(api);
+  const readyProvLower = String(ready?.provider ?? "").toLowerCase();
+  const model = selectBestPaseoModel(ready, {
+    usageCounts,
+    preferredModelId: readyProvLower === "claude" ? "claude-opus-5-5" : readyProvLower === "codex" ? "gpt-6.2-sol" : null
+  });
   if (!ready?.provider || !model?.id) return null;
 
   const priorTail = (Array.isArray(baselineEntries) ? baselineEntries : [])

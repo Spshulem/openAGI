@@ -144,6 +144,9 @@ function statusFrom(state, now, { midScan = false } = {}) {
       preferences: {
         mergePolicy: state.preferences.mergePolicy ?? "manual_confirm",
         cadence: state.preferences.cadence ?? "balanced",
+        defaultProvider: state.preferences.defaultProvider ?? "claude",
+        defaultPermissionMode: state.preferences.defaultPermissionMode ?? "bypass",
+        defaultModels: state.preferences.defaultModels ?? { claude: "claude-opus-5-5", codex: "gpt-6.2-sol", antigravity: "gemini-4-carbon-high" },
         autoSlices: state.preferences.autoSlices ?? {}
       }
     } : {}),
@@ -331,12 +334,15 @@ export function registerFleetTools(registry, supervisor) {
       return outcome;
     } });
   if (typeof supervisor.updatePreferences === "function") registry.register({ name: "fleet_preferences", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Update the owner's progressive Supervisor preferences (autoApprove mode, notification cadence, routine slice autonomy, or vetoing an autonomous slice back to manual confirmation) when the owner asks to toggle auto-approve, ping less/more often, make a routine slice automatic, keep current defaults, or says 'don't do that'.",
+    description: "Update the owner's Supervisor & Paseo session preferences: default model (e.g. 'claude-opus-5-5', 'gpt-6.2-sol'), default provider ('claude', 'codex', 'antigravity'), default Paseo permission mode ('bypass' = bypassPermissions/full-access, 'auto', 'ask'), autoApprove mode, notification cadence, or routine slice autonomy.",
     parameters: {
       type: "object",
       properties: {
         autoApprove: { type: "boolean" },
         cadence: { type: "string", enum: ["quiet_until_ready", "balanced", "detailed"] },
+        defaultProvider: { type: "string", enum: ["claude", "codex", "antigravity", "auto"] },
+        defaultPermissionMode: { type: "string", enum: ["bypass", "auto", "ask"], description: "Default permission mode for newly started Paseo sessions ('bypass' = bypassPermissions / full-access)" },
+        defaultModel: { type: "string", maxLength: 120, description: "Default model id (e.g. 'claude-opus-5-5', 'gpt-6.2-sol')" },
         choice: { type: "string", maxLength: 120 },
         vetoSlice: { type: "string", maxLength: 80 },
         vetoActionId: { type: "string", maxLength: 120 }
@@ -409,9 +415,10 @@ export function registerFleetTools(registry, supervisor) {
         cwd: { type: "string", maxLength: 400 },
         serverId: { type: "string", maxLength: 120 },
         title: { type: "string", maxLength: 120 },
-        provider: { type: "string", maxLength: 80, description: "Optional provider ('codex', 'claude', or 'provider/model')" },
-        model: { type: "string", maxLength: 120, description: "Optional model name or alias (e.g. 'gpt-6.2-sol', 'sol 6-2', 'claude-sonnet-4-6')" },
+        provider: { type: "string", maxLength: 80, description: "Optional provider ('claude', 'codex', 'antigravity', or 'provider/model'; defaults to owner preference 'claude')" },
+        model: { type: "string", maxLength: 120, description: "Optional model name or alias (defaults to 'claude-opus-5-5' for Claude, 'gpt-6.2-sol' for Codex)" },
         effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max"], description: "Optional reasoning/thinking effort level" },
+        modeId: { type: "string", maxLength: 60, description: "Optional Paseo permission mode override (defaults to 'bypassPermissions' on Claude / 'full-access' on Codex unless specified)" },
         prompt: { type: "string", minLength: 1, maxLength: 4000 },
         attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
@@ -434,6 +441,7 @@ export function registerFleetTools(registry, supervisor) {
         provider: args.provider ?? null,
         model: args.model ?? null,
         effort: args.effort ?? null,
+        modeId: args.modeId ?? null,
         prompt: args.prompt,
         ...(images ? { images } : {})
       });
@@ -724,6 +732,7 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
   const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
   const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
+  const modeId = typeof args?.modeId === "string" && args.modeId.trim() ? clip(args.modeId.trim(), 60) : null;
 
   if (explicitKey && !forceNew) {
     const validated = await Promise.resolve(fleetTarget(supervisor, { key: explicitKey, message: goal }));
@@ -803,6 +812,7 @@ async function fleetStartSessionTarget(supervisor, args = {}) {
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
   const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
   const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
+  const modeId = typeof args?.modeId === "string" && args.modeId.trim() ? clip(args.modeId.trim(), 60) : null;
 
   if (fromThreadKey && (!cwd || !serverId)) {
     const refThread = supervisor?.lastThreads?.get?.(fromThreadKey)
@@ -1004,6 +1014,18 @@ function fleetPreferenceTarget(args = {}) {
   if (typeof args?.cadence === "string") {
     patch.cadence = args.cadence;
     labels.push(`cadence=${args.cadence}`);
+  }
+  if (typeof args?.defaultProvider === "string" && args.defaultProvider.trim()) {
+    patch.defaultProvider = args.defaultProvider.trim();
+    labels.push(`defaultProvider=${patch.defaultProvider}`);
+  }
+  if (typeof args?.defaultPermissionMode === "string" && args.defaultPermissionMode.trim()) {
+    patch.defaultPermissionMode = args.defaultPermissionMode.trim();
+    labels.push(`defaultPermissionMode=${patch.defaultPermissionMode}`);
+  }
+  if (typeof args?.defaultModel === "string" && args.defaultModel.trim()) {
+    patch.defaultModel = args.defaultModel.trim();
+    labels.push(`defaultModel=${patch.defaultModel}`);
   }
   if (typeof args?.choice === "string" && args.choice.trim()) {
     patch.choice = args.choice.trim();

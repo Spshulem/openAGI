@@ -7,6 +7,9 @@ import { CreditLedger } from "./credit-ledger.js";
 // USD per 1M tokens. Keep specific variants (…-nano, …-mini, …-5.5) listed so
 // priceFor's longest-prefix match doesn't bill a nano call at flagship rates.
 const DEFAULT_PRICES = {
+  "claude-opus-5-5": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  "claude-opus-5": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  "claude-sonnet-5-5": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-opus-4-7": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
   "claude-haiku-4-5": { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 },

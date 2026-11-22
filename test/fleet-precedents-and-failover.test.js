@@ -11,7 +11,8 @@ import {
 } from "../src/fleet/precedent-memory.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { paseoThread } from "../src/fleet/sources/paseo.js";
-import { failoverPaseoSessionProvider } from "../src/fleet/paseo-delivery.js";
+import { failoverPaseoSessionProvider, resolveDefaultPaseoModeId, selectBestPaseoModel } from "../src/fleet/paseo-delivery.js";
+import { resolvePaseoAgentConfig } from "../src/fleet/coordinator.js";
 import { buildSupervisorDeck } from "../src/fleet/cards.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { fleetStatus } from "../src/fleet/tools.js";
@@ -212,7 +213,7 @@ test("paseoThread detects [System Error] usage-limit on running sessions and swi
   assert.equal(direct.provider, "claude/claude-opus-4-6");
   assert.equal(direct.newKey, "paseo:srv_bb3.claude-continuation-999");
   assert.equal(createdSpec.cwd, "/home/dev/buildbetter");
-  assert.equal(createdSpec.config.modeId, "auto");
+  assert.equal(createdSpec.config.modeId, "bypassPermissions");
   assert.match(createdSpec.prompt, /Ship Bob unified chat experience/);
 
   // Full FleetSupervisor switchPaseoProvider check with ActiveWork ownership transfer.
@@ -422,4 +423,79 @@ test("editable skills (read_skill, update_skill, create_skill overwrite) and goa
     assert.equal(finalCheck.accomplished, true);
     assert.equal(finalCheck.item.outcomeVerified, true);
   });
+});
+
+test("resolvePaseoAgentConfig & selectBestPaseoModel pick Opus 5.5 (never stale 4.7) and default to bypassPermissions / full-access", async () => {
+  const claudeEntry = {
+    provider: "claude",
+    status: "ready",
+    defaultModeId: "auto",
+    modes: [
+      { id: "plan", label: "Plan Mode" },
+      { id: "default", label: "Always Ask" },
+      { id: "auto", label: "Auto mode" },
+      { id: "bypassPermissions", label: "Bypass" }
+    ],
+    models: [
+      { id: "claude-opus-5-5", label: "Opus 5.5", isDefault: false },
+      { id: "claude-opus-5", label: "Opus 5", isDefault: false },
+      { id: "claude-sonnet-5-5", label: "Sonnet 5.5", isDefault: false },
+      // Simulate older Claude CLI marking 4.7 as isDefault: true
+      { id: "claude-opus-4-7[1m]", label: "Opus 4.7 1M", isDefault: true }
+    ]
+  };
+  const codexEntry = {
+    provider: "codex",
+    status: "ready",
+    defaultModeId: "auto-review",
+    modes: [
+      { id: "auto", label: "Default" },
+      { id: "full-access", label: "Full Access" }
+    ],
+    models: [
+      { id: "gpt-6.2-sol", label: "GPT-6.2 Sol", isDefault: false },
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol", isDefault: true }
+    ]
+  };
+
+  const usage = new Map([
+    ["claude/claude-opus-5-5", 73],
+    ["claude-opus-5-5", 73],
+    ["claude/claude-opus-4-7[1m]", 2],
+    ["codex/gpt-6.2-sol", 105]
+  ]);
+
+  const bestClaude = selectBestPaseoModel(claudeEntry, { usageCounts: usage });
+  assert.equal(bestClaude.id, "claude-opus-5-5");
+  assert.equal(resolveDefaultPaseoModeId(claudeEntry), "bypassPermissions");
+  assert.equal(resolveDefaultPaseoModeId(codexEntry), "full-access");
+  assert.equal(resolveDefaultPaseoModeId(claudeEntry, { explicitModeId: "default" }), "default");
+
+  const mockApi = {
+    providers: {
+      waitForReady: async () => ({ entries: [codexEntry, claudeEntry] })
+    },
+    agents: {
+      list: async () => ({
+        entries: Array.from({ length: 10 }, () => ({ agent: { provider: "claude", model: "claude-opus-5-5" } }))
+      })
+    }
+  };
+
+  // Default call with zero args: picks claude/claude-opus-5-5 + bypassPermissions!
+  const defaultCfg = await resolvePaseoAgentConfig(mockApi, "/home/dev/buildbetter");
+  assert.equal(defaultCfg.provider, "claude/claude-opus-5-5");
+  assert.equal(defaultCfg.model, "claude-opus-5-5");
+  assert.equal(defaultCfg.modeId, "bypassPermissions");
+
+  // Explicit codex provider: picks gpt-6.2-sol + full-access!
+  const codexCfg = await resolvePaseoAgentConfig(mockApi, "/home/dev/buildbetter", { provider: "codex" });
+  assert.equal(codexCfg.provider, "codex/gpt-6.2-sol");
+  assert.equal(codexCfg.model, "gpt-6.2-sol");
+  assert.equal(codexCfg.modeId, "full-access");
+
+  // Fuzzy "opus" query: picks claude-opus-5-5 (never 4.7) + bypassPermissions!
+  const fuzzyOpusCfg = await resolvePaseoAgentConfig(mockApi, "/home/dev/buildbetter", { model: "opus" });
+  assert.equal(fuzzyOpusCfg.model, "claude-opus-5-5");
+  assert.equal(fuzzyOpusCfg.modeId, "bypassPermissions");
 });
