@@ -137,6 +137,26 @@ function selectPreferredModel(providerEntry) {
   return models.find((m) => m.isDefault) ?? models[0];
 }
 
+function selectExecutionModeId(providerEntry, sourceAgent = null) {
+  const modes = Array.isArray(providerEntry?.modes) ? providerEntry.modes.filter((m) => m?.id && m.id !== "plan") : [];
+  const modeIds = new Set(modes.map((m) => String(m.id)));
+  const sourceMode = String(sourceAgent?.modeId ?? "").trim();
+  if (["full-access", "bypassPermissions"].includes(sourceMode)) {
+    if (modeIds.has("bypassPermissions")) return "bypassPermissions";
+    if (modeIds.has("full-access")) return "full-access";
+  }
+  const def = String(providerEntry?.defaultModeId ?? "").trim();
+  if (def && def !== "plan") return def;
+  for (const candidate of ["auto", "auto-review", "acceptEdits", "full-access", "bypassPermissions", "default"]) {
+    if (modeIds.has(candidate)) return candidate;
+  }
+  const provider = String(providerEntry?.provider ?? "").toLowerCase();
+  if (provider === "claude") return "auto";
+  if (provider === "codex") return "auto-review";
+  if (provider === "antigravity") return "full-access";
+  return modes[0]?.id ?? null;
+}
+
 // Automatically switches a quota-exhausted or auth-blocked Paseo coding session
 // onto another healthy provider (e.g. Codex -> Claude or Antigravity) in the
 // exact same host & working directory, preserving bounded transcript + goal context.
@@ -228,8 +248,12 @@ export async function failoverPaseoSessionProvider({
       "Instructions: First run `git status -sb` and `git log -n 3 --oneline` in this workspace to inspect what already landed or is uncommitted. Continue the unfinished in-scope work seamlessly without redoing completed steps. Respect hard red lines: do not merge PRs, deploy to production, send external customer messages, or spend money without explicit owner confirmation."
     ].filter(Boolean).join("\n\n");
 
+    const executionModeId = selectExecutionModeId(chosen, agent);
     const created = await api.agents.create({
-      config: { provider: `${chosen.provider}/${chosenModel.id}` },
+      config: {
+        provider: `${chosen.provider}/${chosenModel.id}`,
+        ...(executionModeId ? { modeId: executionModeId } : {})
+      },
       cwd,
       title: baseTitle,
       prompt
@@ -276,8 +300,12 @@ async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEnt
     ? `Continuing from Paseo session "${baseTitle}" (whose previous ${agent?.provider ?? "agent"} runtime disconnected).\n\nRecent context:\n${priorTail}\n\nNew owner request:\n${cleanOriginal || text}`
     : (cleanOriginal || text);
 
+  const executionModeId = selectExecutionModeId(ready, agent);
   const created = await api.agents.create({
-    config: { provider: `${ready.provider}/${model.id}` },
+    config: {
+      provider: `${ready.provider}/${model.id}`,
+      ...(executionModeId ? { modeId: executionModeId } : {})
+    },
     cwd,
     title: baseTitle,
     prompt: recoveryPrompt

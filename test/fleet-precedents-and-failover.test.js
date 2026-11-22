@@ -212,6 +212,7 @@ test("paseoThread detects [System Error] usage-limit on running sessions and swi
   assert.equal(direct.provider, "claude/claude-opus-4-6");
   assert.equal(direct.newKey, "paseo:srv_bb3.claude-continuation-999");
   assert.equal(createdSpec.cwd, "/home/dev/buildbetter");
+  assert.equal(createdSpec.config.modeId, "auto");
   assert.match(createdSpec.prompt, /Ship Bob unified chat experience/);
 
   // Full FleetSupervisor switchPaseoProvider check with ActiveWork ownership transfer.
