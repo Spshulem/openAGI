@@ -2447,9 +2447,12 @@ export class FleetSupervisor {
       }
     }
     const nowIso = new Date(nowMs).toISOString();
+    // Without an explicit id, the id names one occurrence: retries inside the
+    // cooldown window dedupe, a later occurrence of the same report is new.
+    const windowIndex = minGapMs > 0 ? Math.floor(nowMs / minGapMs) : nowMs;
     const stableMsgId = typeof messageId === "string" && /^[\w-]{1,200}$/.test(messageId)
       ? messageId
-      : (dedupeKey ? `msg_sup_${shortHash(dedupeKey)}` : null);
+      : (dedupeKey ? `msg_sup_${shortHash(`${dedupeKey}:${windowIndex}`)}` : null);
     const sharedMsgPayload = {
       ...(stableMsgId ? { id: stableMsgId } : {}),
       role: "assistant",
@@ -2510,9 +2513,12 @@ export class FleetSupervisor {
       } catch { /* best-effort */ }
     }
 
+    // On a node paired to a hub the owner reads the hub's copy: a local-only
+    // fallback is not delivery, so the caller keeps it pending for a retry.
+    const remoteRequired = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     if (deliveredRemote || deliveredLocal) {
-      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
-      return { posted: true, deliveredRemote, deliveredLocal, messageId: stableMsgId };
+      if (dedupeKey && (!remoteRequired || deliveredRemote)) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
+      return { posted: true, deliveredRemote, deliveredLocal, remoteRequired, messageId: stableMsgId };
     }
     return { posted: false, reason: "no-channel" };
   }
@@ -2626,28 +2632,29 @@ export class FleetSupervisor {
     const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
     if (!deltas.length) return { posted: false, reason: "no-delta" };
 
-    const shownDeltas = deltas.slice(0, 5);
-    const overflowCount = Math.max(0, deltas.length - shownDeltas.length);
-    const lines = [
-      deltas.length === 1
-        ? (deltas[0].change === "updated"
-            ? "**Updated decision needing you:**"
-            : "**New decision needing you:**")
-        : `**${deltas.length} new/updated decisions needing you:**`
-    ];
-    for (const { question: q, change } of shownDeltas) {
-      const badge = change === "updated" ? "[Updated] " : (deltas.length > 1 ? "[New] " : "");
+    // Render only what fits the chat message: a decision cut off by the
+    // length cap would otherwise be marked surfaced without being seen.
+    const DIGEST_MAX = 1600;
+    const header = (n, change) => (n === 1
+      ? (change === "updated" ? "**Updated decision needing you:**" : "**New decision needing you:**")
+      : `**${n} new/updated decisions needing you:**`);
+    const renderDelta = ({ question: q, change }, many) => {
+      const badge = change === "updated" ? "[Updated] " : (many ? "[New] " : "");
       const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
       const contextLine = clampText(redactSecrets(q.reviewBrief?.decision || q.body || ""), 180);
-      lines.push(
-        `- ${badge}\`${q.id}\` — **${clampText(q.title, 120)}**${opts ? ` *(${opts})*` : ""}${contextLine ? `\n  ${contextLine}` : ""}`
-      );
-    }
-    if (overflowCount > 0) {
-      lines.push(`- *(+${overflowCount} more new in Needs You)*`);
+      return `- ${badge}\`${q.id}\` — **${clampText(q.title, 120)}**${opts ? ` *(${opts})*` : ""}${contextLine ? `\n  ${contextLine}` : ""}`;
+    };
+    let shownDeltas = deltas.slice(0, 5);
+    let lines;
+    for (;;) {
+      const overflow = deltas.length - shownDeltas.length;
+      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.map((d) => renderDelta(d, shownDeltas.length > 1))];
+      if (overflow > 0) lines.push(`- *(+${overflow} more new in Needs You)*`);
+      if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
+      shownDeltas = shownDeltas.slice(0, -1);
     }
 
-    const canonicalPairs = deltas
+    const canonicalPairs = shownDeltas
       .map((d) => [d.decisionKey, d.materialHash])
       .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
     const deltaSig = shortHash(JSON.stringify(canonicalPairs));
@@ -2659,12 +2666,14 @@ export class FleetSupervisor {
       minGapMs: 24 * 60 * MIN,
       metadata: {
         kind: "proactive_supervisor_delta",
-        deltaCount: deltas.length,
-        decisionKeys: deltas.map((d) => d.decisionKey)
+        deltaCount: shownDeltas.length,
+        decisionKeys: shownDeltas.map((d) => d.decisionKey)
       }
     });
-    if (res?.posted) {
-      this.store.commitSurfacedDecisions(deltas, { now: started });
+    // Only what was shown, and only once it reached the owner's copy (the
+    // hub, on a paired node); the rest stays pending for the next check-in.
+    if (res?.posted && (!res.remoteRequired || res.deliveredRemote)) {
+      this.store.commitSurfacedDecisions(shownDeltas, { now: started });
     }
     return res;
   }

@@ -94,7 +94,7 @@ function normalizeDecisionText(value) {
   return String(value ?? "")
     .toLowerCase()
     .replace(/\b\d+\s+(threads?|sessions?|chats?|items?|stuck|stopped)\b/g, "# $1")
-    .replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent|for)\s+)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#")
+    .replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent)\s+)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -138,7 +138,10 @@ export function actionableDecisionMaterialHash(question) {
   }
   const rawDedupe = String(question.dedupeKey ?? "").trim().replace(/:\d+$/, "");
   if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(rawDedupe)) {
-    return shortHash(JSON.stringify(["group", rawDedupe, normOpts]));
+    // Which sessions are affected is material (a different session's
+    // blocker is a different decision); how many scans saw it is not.
+    const members = (Array.isArray(question.threadKeys) ? question.threadKeys : []).map(String).sort();
+    return shortHash(JSON.stringify(["group", rawDedupe, normOpts, members]));
   }
   return shortHash(JSON.stringify([
     kind,
@@ -173,10 +176,11 @@ function normalizeSurfacedDecisions(raw, nowMs = Date.now()) {
 
 function seedSurfacedDecisionsFromExisting(questions, notices, nowMs = Date.now()) {
   const out = {};
-  const hadPriorDigests = isObject(notices) && Object.keys(notices).length > 0;
   for (const q of Array.isArray(questions) ? questions : []) {
     if (!isObject(q) || q.status !== "open" || q.kind === "completed") continue;
-    const alreadySurfaced = Boolean(q.outreachId || q.pushedAt || q.reviewedAt || hadPriorDigests);
+    // Only evidence that this question itself reached the owner counts; an
+    // unrelated chat notice does not prove it appeared in a check-in.
+    const alreadySurfaced = Boolean(q.outreachId || q.pushedAt);
     if (!alreadySurfaced) continue;
     const dKey = actionableDecisionKey(q);
     const mHash = actionableDecisionMaterialHash(q);
