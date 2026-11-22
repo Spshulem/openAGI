@@ -49,22 +49,34 @@ final class StoreScreenshotTests: XCTestCase {
         settle()
         capture("agents-01-supervisor-chat", app: app)
 
+        // Off-screen elements in a scroll view throw on isHittable, so judge
+        // visibility from frames and tap the visible midpoint.
+        func midpoint(_ el: XCUIElement) -> CGPoint { CGPoint(x: el.frame.midX, y: el.frame.midY) }
+        func visible(_ el: XCUIElement, in area: CGRect? = nil) -> Bool {
+            el.exists && !el.frame.isEmpty && (area ?? app.frame).insetBy(dx: 4, dy: 4).contains(midpoint(el))
+        }
+        func tapPoint(_ el: XCUIElement) {
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: el.frame.midX, dy: el.frame.midY)).tap()
+        }
         // Channel pills live in a horizontal strip; scroll one into view before tapping.
         func pill(_ prefix: String) -> Bool {
             let button = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
             guard button.waitForExistence(timeout: 5) else { return false }
             let strip = element("supervisor-project-channels", app: app)
-            for attempt in 0..<6 where !button.isHittable {
-                if attempt < 3 { strip.swipeLeft() } else { strip.swipeRight() }
+            let area = strip.exists ? strip.frame.intersection(app.frame) : app.frame
+            for attempt in 0..<8 where !visible(button, in: area) {
+                let start = strip.coordinate(withNormalizedOffset: CGVector(dx: attempt < 4 ? 0.8 : 0.2, dy: 0.5))
+                let end = strip.coordinate(withNormalizedOffset: CGVector(dx: attempt < 4 ? 0.3 : 0.7, dy: 0.5))
+                start.press(forDuration: 0.05, thenDragTo: end)
             }
-            guard button.isHittable else { return false }
-            button.tap()
+            guard visible(button, in: area) else { return false }
+            tapPoint(button)
             return true
         }
         func closeSheet() {
             let done = app.buttons["Done"].firstMatch
-            for _ in 0..<4 where !(done.exists && done.isHittable) { app.swipeDown() }
-            if done.exists && done.isHittable { done.tap() }
+            for _ in 0..<4 where !visible(done) { app.swipeDown() }
+            if visible(done) { tapPoint(done) }
             settle()
         }
         if pill("#needs-you") { settle(); capture("agents-03-needs-you", app: app) }
@@ -73,26 +85,26 @@ final class StoreScreenshotTests: XCTestCase {
         if pill("#api") { settle(); capture("agents-06-project-api", app: app) }
         if pill("#needs-you") { settle() }
         let review = element("supervisor-card-review-card-dark-mode", app: app)
-        if review.waitForExistence(timeout: 5) && review.isHittable {
-            review.tap(); settle(3); capture("agents-07-review-dark-mode", app: app)
+        if review.waitForExistence(timeout: 5) && visible(review) {
+            tapPoint(review); settle(3); capture("agents-07-review-dark-mode", app: app)
             app.swipeUp(); settle(); capture("agents-08-review-dark-mode-scrolled", app: app)
             closeSheet()
         }
         let blocked = element("supervisor-card-review-card-webhooks", app: app)
-        if blocked.waitForExistence(timeout: 5) && blocked.isHittable {
-            blocked.tap(); settle(3); capture("agents-09-review-webhooks", app: app)
+        if blocked.waitForExistence(timeout: 5) && visible(blocked) {
+            tapPoint(blocked); settle(3); capture("agents-09-review-webhooks", app: app)
             closeSheet()
         }
         let details = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Details")).firstMatch
-        if details.waitForExistence(timeout: 4) && details.isHittable {
-            details.tap(); settle(3); capture("agents-10-details-checkout", app: app)
+        if details.waitForExistence(timeout: 4) && visible(details) {
+            tapPoint(details); settle(3); capture("agents-10-details-checkout", app: app)
             closeSheet()
         }
         let board = element("supervisor-board-button", app: app)
-        if board.waitForExistence(timeout: 5) && board.isHittable {
-            board.tap(); settle(3); capture("agents-11-board", app: app)
+        if board.waitForExistence(timeout: 5) && visible(board) {
+            tapPoint(board); settle(3); capture("agents-11-board", app: app)
             let project = app.staticTexts["api"].firstMatch
-            if project.waitForExistence(timeout: 4) && project.isHittable { project.tap(); settle(3); capture("agents-12-board-project", app: app) }
+            if project.waitForExistence(timeout: 4) && visible(project) { tapPoint(project); settle(3); capture("agents-12-board-project", app: app) }
             closeSheet()
         }
         let todayTab = app.tabBars.buttons["Today"].exists ? app.tabBars.buttons["Today"] : app.buttons["Today"].firstMatch
