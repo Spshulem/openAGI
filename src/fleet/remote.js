@@ -3,7 +3,8 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
-import { MODES, resolveFleetConfig } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, resolveFleetConfig, shortHash } from "./contracts.js";
+import { flattenMessage } from "./ui-delivery.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
@@ -89,6 +90,16 @@ const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive|failover))$/;
 
 const FEEDBACK_OUTBOX_MAX = 200;
+
+// Hashes the fleet computer journals for an owner send of this message:
+// the route's text (an image-only send gets its default line), prefixed as
+// the executor types it, raw or flattened for computer-use.
+function ownerMessageHashes(message, images) {
+  const raw = String(message ?? '').trim();
+  const text = raw || (Array.isArray(images) && images.length ? 'Please inspect the attached image(s).' : '');
+  const prefixed = text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`;
+  return new Set([shortHash(prefixed), shortHash(flattenMessage(prefixed))]);
+}
 
 function queuedFeedback(entry) {
   const input = entry.input ?? {};
@@ -219,7 +230,8 @@ export class RemoteFleetSupervisor {
       }
       // Preserve the last snapshot/questions through connection outages, and never
       // misreport an HTTP error from an online fleet computer as an offline outage.
-      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
+      const timedOut = !reached && /timed out|timeout|aborted/i.test(rawMsg);
+      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute, timedOut });
     }
   }
   refresh() {
@@ -299,13 +311,19 @@ export class RemoteFleetSupervisor {
         ...(Array.isArray(images) && images.length ? { images } : {})
       });
     } catch (error) {
-      if (!error?.reached) {
+      // Only an uncertain send (it timed out in flight) may have landed; a
+      // send that never reached the computer did not.
+      if (!error?.reached && error?.timedOut) {
         try {
           await this.request('GET', '/fleet/api/state');
+          // The executor journals shortHash of the prefixed text it sent
+          // (flattened for computer-use); only that exact message counts.
+          const hashes = ownerMessageHashes(message, images);
           const matched = (this.state.actions ?? []).find((act) => (
             act?.threadKey === threadKey
             && act?.playbook === 'owner-message'
             && act?.status === 'sent'
+            && hashes.has(act?.messageHash)
             && Number.isFinite(Date.parse(act?.at ?? ''))
             && Date.parse(act.at) >= startedAtMs - 2000
           ));

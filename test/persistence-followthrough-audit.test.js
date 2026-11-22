@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { RemoteFleetSupervisor } from "../src/fleet/remote.js";
+import { shortHash } from "../src/fleet/contracts.js";
 import {
   OwnerPrecedentStore,
   isSafeLocalWorktreeCommitCommand,
@@ -52,6 +53,7 @@ test("RemoteFleetSupervisor preserves online HTTP errors and reconciles delivere
                     playbook: "owner-message",
                     status: "sent",
                     route: "paseo-send",
+                    messageHash: shortHash("[OpenAGI supervisor] Submit BB Recorder 0.4.1 for review"),
                     at: new Date().toISOString(),
                     detail: "Paseo message and turn confirmed"
                   }
@@ -86,6 +88,52 @@ test("RemoteFleetSupervisor preserves online HTTP errors and reconciles delivere
     assert.equal(sendRes.delivery.reconciledReceipt, true);
     assert.equal(sendRes.delivery.actionId, "act_verified_123");
     assert.ok(callNum >= 3);
+  });
+});
+
+test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlier send on the same thread", async () => {
+  // Regression (#332 review [21]): any owner-message action on the thread in
+  // the last 2s was accepted as proof the new, failed message was sent.
+  await withTempDir(async (dir) => {
+    const threadKey = "paseo:srv_mac.375e1a66";
+    let sendError = new Error("Node command timed out after 300s");
+    const earlier = {
+      id: "act_earlier",
+      threadKey,
+      playbook: "owner-message",
+      status: "sent",
+      route: "paseo-send",
+      messageHash: shortHash("[OpenAGI supervisor] First instruction"),
+      at: new Date().toISOString(),
+      detail: "Paseo message and turn confirmed"
+    };
+    const runtime = {
+      events: { emit() {} },
+      nodeCapabilities: {
+        async dispatch(_nodeId, _cap, _op, payload) {
+          if (payload.path === "/fleet/api/send") throw sendError;
+          if (payload.path === "/fleet/api/state") {
+            return { state: { mode: "auto", questions: [], actions: [earlier], settings: {} }, response: { status: 200, body: { ok: true } } };
+          }
+          throw new Error("unexpected");
+        }
+      }
+    };
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir });
+
+    // A different message timing out must not borrow the earlier receipt.
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "Second instruction"), (err) => err.reached === false);
+
+    // A send that failed outright (not a timeout) is never reconciled, even
+    // when an identical message was just delivered.
+    sendError = new Error("Node is offline");
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
+
+    // The same message timing out is reconciled to its own receipt.
+    sendError = new Error("Node command timed out after 300s");
+    const res = await remote.sendOwnerMessage(threadKey, "First instruction");
+    assert.equal(res.reconciledAfterTimeout, true);
+    assert.equal(res.delivery.actionId, "act_earlier");
   });
 });
 
