@@ -1,4 +1,6 @@
+import AppKit
 import SupervisorChannelsKit
+import SwiftUI
 import XCTest
 @testable import OpenAGI
 
@@ -201,6 +203,37 @@ final class SupervisorQueueControlsTests: XCTestCase {
     XCTAssertTrue(supervisor.saveQueuedEdit())
     try await waitFor("the queue to drain") { supervisor.queuedMessages.isEmpty && !supervisor.isSending }
     XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Running", "Typo fixed", "After it", "Typed meanwhile"])
+  }
+
+  /// QA only: renders the real tray to PNGs when OPENAGI_QA_SNAPSHOT_DIR is
+  /// set (skipped otherwise, so CI never writes files).
+  func testRenderQueueTrayForQA() async throws {
+    guard let dir = ProcessInfo.processInfo.environment["OPENAGI_QA_SNAPSHOT_DIR"] else {
+      throw XCTSkip("QA snapshots only on request")
+    }
+    let supervisor = client()
+    let first = try await busy(supervisor, running: "Check my agents", queued: ["Draft the update for Tuesday", "Also invite Sam", "Book a room"])
+    MacHeldStreamProtocol.answerInterrupt = { id in (200, "{\"status\":\"stopping\",\"tool\":\"fleet_status\",\"requestId\":\"\(id)\"}") }
+    func render(_ name: String) throws {
+      let view = SupervisorQueueTray(supervisor: supervisor)
+        .frame(width: 600)
+        .padding(16)
+        .background(Color(nsColor: .windowBackgroundColor))
+      let renderer = ImageRenderer(content: view)
+      renderer.scale = 2
+      let image = try XCTUnwrap(renderer.nsImage)
+      let rep = try XCTUnwrap(image.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
+      try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
+    }
+    try render("mac-queue-tray")
+    XCTAssertTrue(supervisor.beginEditingQueued(id: supervisor.queuedMessages[0].id))
+    supervisor.queuedEditDraft = "Draft the update for Tuesday, make it Wednesday"
+    try render("mac-queue-editing")
+    XCTAssertTrue(supervisor.saveQueuedEdit())
+    await supervisor.sendQueuedNow(id: supervisor.queuedMessages[1].id)
+    try render("mac-queue-send-now-stopping")
+    MacHeldStreamProtocol.release("Check my agents", frames: Self.stopped)
+    _ = await first.value
   }
 
   func testInterruptAnswersMapOnlyToWhatMainConfirmed() {

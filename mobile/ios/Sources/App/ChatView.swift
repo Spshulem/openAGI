@@ -781,6 +781,8 @@ struct ChatConversationView: View {
                     .foregroundStyle(Theme.ink)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
+                    .accessibilityIdentifier("chat-queued-text")
                 if !item.attachments.isEmpty {
                     Text("\(item.attachments.count) img")
                         .font(.caption2)
@@ -829,18 +831,9 @@ struct ChatConversationView: View {
         .padding(.vertical, 6)
         .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
-        // VoiceOver reads one row and offers its three controls as actions.
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
-        .accessibilityValue(item.sendNow?.label ?? "")
-        .accessibilityAction(named: "Edit") {
-            if conversation.beginEditingQueued(id: item.id) { queuedEditFocused = true }
-        }
-        .accessibilityAction(named: conversation.isSending ? "Interrupt and send now" : "Send next") {
-            guard canSendNow else { return }
-            Task { await conversation.sendQueuedNow(id: item.id) }
-        }
-        .accessibilityAction(named: "Remove") { conversation.removeQueuedSubmission(id: item.id) }
+        // Each control stays its own element, so VoiceOver, Voice Control
+        // ("Tap Edit") and Full Keyboard Access reach every one.
+        .accessibilityElement(children: .contain)
     }
 
     // Inline editor. Return adds a line; only Save changes the message, and

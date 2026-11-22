@@ -53,6 +53,7 @@ struct SupervisorQueueTray: View {
           .foregroundStyle(WorkspaceTheme.ink)
           .lineLimit(2)
           .frame(maxWidth: .infinity, alignment: .leading)
+          .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
         if !item.payload.attachments.isEmpty {
           Text("\(item.payload.attachments.count) img")
             .font(.caption2)
@@ -84,15 +85,9 @@ struct SupervisorQueueTray: View {
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
     .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
-    .accessibilityValue(item.sendNow?.label ?? "")
-    .accessibilityAction(named: "Edit") { openEditor(item.id) }
-    .accessibilityAction(named: supervisor.isSending ? "Interrupt and send now" : "Send next") {
-      guard canSendNow else { return }
-      Task { await supervisor.sendQueuedNow(id: item.id) }
-    }
-    .accessibilityAction(named: "Remove") { supervisor.removeQueued(id: item.id) }
+    // Each control stays its own element for VoiceOver, Voice Control and
+    // Full Keyboard Access.
+    .accessibilityElement(children: .contain)
   }
 
   @ViewBuilder
