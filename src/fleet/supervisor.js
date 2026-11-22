@@ -2979,7 +2979,11 @@ export class FleetSupervisor {
         threadKey: question.threadKey ?? null,
         status: "blocked",
         by: "owner",
-        reason: mergeOutcome.detail
+        reason: mergeOutcome.detail,
+        // policy (GitHub's rules confirmed a block), transient (GitHub had
+        // not decided), refused, or unknown: the card says which.
+        ...(mergeOutcome.haltClass ? { outcome: mergeOutcome.haltClass } : {}),
+        ...(mergeOutcome.reason ? { haltReason: mergeOutcome.reason } : {})
       });
       this.emitFleet("pr-merge-halted");
       return { ok: false, kind: "merge", ...mergeOutcome };
