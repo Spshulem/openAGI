@@ -14,7 +14,11 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
         EmbeddedLoopback.port = 19999
         let directory = FileManager.default.temporaryDirectory.appending(path: "store-capture-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let credentials = Credentials(server: URL(string: "http://127.0.0.1:19999")!,
+        // --store-paired-mac: the phone paired with a Mac that runs the coding
+        // agents, so the Supervisor workspace (deck, channels, board) shows.
+        // Requests are still intercepted below; nothing connects to that host.
+        let paired = ProcessInfo.processInfo.arguments.contains("--store-paired-mac")
+        let credentials = Credentials(server: URL(string: paired ? "http://studio-mac.local:43210" : "http://127.0.0.1:19999")!,
                                       nodeID: "mobile:store-fixture", token: "fictional-store-fixture")
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StoreScreenshotProtocol.self]

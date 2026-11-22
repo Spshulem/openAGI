@@ -29,7 +29,7 @@ final class StoreScreenshotTests: XCTestCase {
     func testCaptureSupervisorAgentScreens() {
         continueAfterFailure = true
         let app = XCUIApplication()
-        app.launchArguments = ["--ui-testing", "--store-screenshots", "-AppleInterfaceStyle", "Light"]
+        app.launchArguments = ["--ui-testing", "--store-screenshots", "--store-paired-mac", "-AppleInterfaceStyle", "Light"]
         app.launch()
         func tapIfPresent(_ id: String, timeout: TimeInterval = 8) -> Bool {
             let target = element(id, app: app)
@@ -81,6 +81,13 @@ final class StoreScreenshotTests: XCTestCase {
             if project.waitForExistence(timeout: 4) && project.isHittable { project.tap(); settle(3); capture("agents-11-board-project", app: app) }
             if app.buttons["Done"].exists { app.buttons["Done"].tap(); settle() }
         }
+        let todayTab = app.tabBars.buttons["Today"].exists ? app.tabBars.buttons["Today"] : app.buttons["Today"].firstMatch
+        if todayTab.waitForExistence(timeout: 5) {
+            todayTab.tap()
+            settle()
+            capture("agents-12-today", app: app)
+            if tapIfPresent("open-settings") { settle(2); capture("agents-13-settings", app: app) }
+        }
         let tree = app.debugDescription
         let attachment = XCTAttachment(string: tree)
         attachment.name = "agents-hierarchy"
@@ -88,7 +95,8 @@ final class StoreScreenshotTests: XCTestCase {
         add(attachment)
     }
 
-    func testCaptureNativeLocalAgentScreens() {
+    func testCaptureNativeLocalAgentScreens() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["STORE_LEGACY"] == "1", "legacy planner captures")
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--ui-testing", "--store-screenshots", "-AppleInterfaceStyle", "Light"]
