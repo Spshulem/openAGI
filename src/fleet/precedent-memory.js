@@ -110,21 +110,44 @@ function isSafeShellVarAssignment(token) {
   return true;
 }
 
+function hasUnquotedShellHazard(input) {
+  let quote = null;
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === "\\" && quote === "\"" && i + 1 < input.length) {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      // Backticks or $(...) inside double quotes execute in bash!
+      if (quote === "\"" && (ch === "`" || (ch === "$" && input[i + 1] === "("))) return true;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "`" || ch === "<" || ch === ">") return true;
+    if (ch === "$" && input[i + 1] === "(") return true;
+    if (ch === "&" && input[i + 1] !== "&" && input[i - 1] !== "&") return true;
+  }
+  return Boolean(quote);
+}
+
 // Strictly verifies that a shell / CodexBash command string is pure read-only
 // repository or GitHub/CI inspection with zero mutation, network exfiltration,
 // subshells, file output redirects, or secret-file reads.
 export function isSafeReadOnlyCommand(rawCommand) {
   const raw = String(rawCommand ?? "").trim();
-  if (!raw || raw.length > 2000) return false;
+  if (!raw || raw.length > 3000) return false;
   // Strip `Run \`...\`` wrapper if formatted from policy.js permWhat before checking backticks.
   const unwrapped = stripSafeStderrRedirects(/^Run\s+`([^`]+)`$/i.exec(raw)?.[1]?.trim() ?? raw);
-  // Reject command substitutions, backticks, output/input redirects, parameter side-effects, or secret paths.
-  if (/[`<>]|\$\(|\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
+  // Reject command substitutions, backticks, unquoted redirects/backgrounding, parameter side-effects, or secret paths.
+  if (hasUnquotedShellHazard(unwrapped) || /\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
 
-  // Split on unquoted |, &&, ||, ; (reject single & background).
-  if (/(?:^|[^&])&(?:[^&]|$)/.test(unwrapped)) return false;
   const segments = splitShellSegments(unwrapped);
-  if (!segments.length || segments.length > 10) return false;
+  if (!segments.length || segments.length > 24) return false;
 
   let sawInspectionCmd = false;
   for (const seg of segments) {
@@ -146,28 +169,23 @@ export function isSafeReadOnlyCommand(rawCommand) {
 }
 
 // Strictly verifies a local feature-branch / isolated-worktree `git add` + `git commit`
-// sequence (with optional read-only `git status` / `git show` / `git diff`), never
-// allowing `git push`, `--force`, `--no-verify`, history rewrites, or trunk commits.
+// or non-force feature-branch `git push -u origin <feature-branch>` (never allowing
+// `main`/`master`/`production` pushes, `--force`, `--no-verify`, or history rewrites).
 export function isSafeLocalWorktreeCommitCommand(rawCommand, thread = null) {
   const raw = String(rawCommand ?? "").trim();
-  if (!raw || raw.length > 2000) return false;
+  if (!raw || raw.length > 3000) return false;
   const unwrapped = stripSafeStderrRedirects(/^Run\s+`([^`]+)`$/i.exec(raw)?.[1]?.trim() ?? raw);
-  if (/[`<>]|\$\(|\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
-  if (/(?:^|[^&])&(?:[^&]|$)/.test(unwrapped)) return false;
+  if (hasUnquotedShellHazard(unwrapped) || /\$\{[^\s}]*:[-=?+]/.test(unwrapped) || SENSITIVE_COMMAND_PATHS.test(unwrapped)) return false;
 
   const branch = String(thread?.branch ?? "").trim();
   const cwd = String(thread?.meta?.paseoCwd ?? thread?.cwd ?? "").trim();
   if (branch && /^(?:main|master|prod(?:uction)?|release|HEAD)$/i.test(branch)) return false;
-  const inIsolatedWorktree = Boolean(
-    (branch && !/^(?:main|master|prod(?:uction)?|release|HEAD)$/i.test(branch))
-    || /\/(?:worktrees|\.conductor)\//i.test(cwd)
-  );
-  if (!inIsolatedWorktree) return false;
 
   const segments = splitShellSegments(unwrapped);
-  if (!segments.length || segments.length > 8) return false;
+  if (!segments.length || segments.length > 12) return false;
 
   let sawLocalCommitStep = false;
+  let sawSafeFeaturePush = false;
   for (const seg of segments) {
     const tokens = tokenizeSegment(seg);
     if (!tokens.length) return false;
@@ -200,9 +218,24 @@ export function isSafeLocalWorktreeCommitCommand(rawCommand, thread = null) {
       sawLocalCommitStep = true;
       continue;
     }
+    if (sub === "push") {
+      // Allow ONLY non-force push to an explicit non-trunk feature branch (`git push [-u] origin <feature-branch>`).
+      if (subArgs.some((a) => /^(?:-f|--force|--force-with-lease|--delete|--mirror|--all|--tags|--no-verify)$/i.test(a) || a.startsWith("+") || a.includes(":"))) return false;
+      const positional = subArgs.filter((a) => !["-u", "--set-upstream"].includes(a));
+      if (positional.length !== 2 || positional[0] !== "origin") return false;
+      const targetBranch = positional[1];
+      if (!targetBranch || /^(?:main|master|prod(?:uction)?|staging|develop|release.*|HEAD)$/i.test(targetBranch)) return false;
+      sawSafeFeaturePush = true;
+      continue;
+    }
     return false;
   }
-  return sawLocalCommitStep;
+  if (sawSafeFeaturePush && !sawLocalCommitStep) return true;
+  const inIsolatedWorktree = Boolean(
+    (branch && !/^(?:main|master|prod(?:uction)?|release|HEAD)$/i.test(branch))
+    || /\/(?:worktrees|\.conductor)\//i.test(cwd)
+  );
+  return inIsolatedWorktree && (sawLocalCommitStep || sawSafeFeaturePush);
 }
 
 function splitShellSegments(input) {
@@ -330,11 +363,19 @@ function isAllowedReadOnlySegment(cmd, args) {
     if (group === "run" && ["view", "list"].includes(action)) return true;
     if (group === "issue" && ["view", "list", "status"].includes(action)) return true;
     if (group === "api") {
-      if (rest.some((a) => /^(?:-X|--method)$/i.test(a))) return false;
+      if (rest.some((a) => /^(?:-X|--method|-f|-F|--field|--raw-field|--input)$/i.test(a))) return false;
       if (rest.some((a) => /mutation\b/i.test(a))) return false;
       return true;
     }
     return false;
+  }
+  if (cmd === "paseo") {
+    return ["ls", "list", "status", "version", "--version"].includes(args[0] ?? "");
+  }
+  if (cmd === "curl") {
+    if (args.some((a) => /^(?:-X|--request|-d|--data.*|-F|--form.*|-T|--upload-file|-o|--output|-O|--remote-name|-K|--config)$/i.test(a))) return false;
+    const urls = args.filter((a) => /^https?:\/\//i.test(a));
+    return urls.length === 1 && /^https:\/\/api\.github\.com\//i.test(urls[0]);
   }
   return false;
 }

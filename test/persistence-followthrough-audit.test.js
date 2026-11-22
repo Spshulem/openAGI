@@ -95,10 +95,32 @@ test("isSafeReadOnlyCommand and isSafeLocalWorktreeCommitCommand clear routine p
     isSafeReadOnlyCommand("sed -n '1,240p' apps/web/src/foo.tsx 2>/dev/null || true"),
     true
   );
-  // Shell variable assignment + gh api GET (`fq_57eefed40f524ea9`)
+  // Shell variable assignment + gh api GET with `&` inside quoted URL (`fq_0dc0ac5b472a4b6a`)
   assert.equal(
-    isSafeReadOnlyCommand("R=buildbetter-app/buildbetter; gh api repos/$R/actions/runs/12345/jobs --jq '.jobs[].name'"),
+    isSafeReadOnlyCommand('R=buildbetter-app/buildbetter; gh api "repos/$R/commits?path=packages/apps/desktop-app/package.json&sha=main&per_page=5" --jq \'.[]|.sha\''),
     true
+  );
+  // Read-only `paseo ls` and GitHub API `curl` GET (`fq_d442445377ef4868`, `fq_9788294b540449a4`)
+  assert.equal(
+    isSafeReadOnlyCommand("paseo ls --json | jq -r '.[] | [.id,.status] | @tsv' | head -80"),
+    true
+  );
+  assert.equal(
+    isSafeReadOnlyCommand("curl -L --max-time 15 -sS https://api.github.com/repos/Spshulem/strictly-regent/pulls/2 | head -c 4000"),
+    true
+  );
+  // Non-force feature-branch push (`fq_0e9093dbd6404bb8`) allowed; main push or --force blocked!
+  assert.equal(
+    isSafeLocalWorktreeCommitCommand("git push -u origin fix/supervisor-composer-return", { branch: "fix/supervisor-composer-return" }),
+    true
+  );
+  assert.equal(
+    isSafeLocalWorktreeCommitCommand("git push -u origin main", { branch: "main" }),
+    false
+  );
+  assert.equal(
+    isSafeLocalWorktreeCommitCommand("git push --force origin fix/supervisor-composer-return", { branch: "fix/supervisor-composer-return" }),
+    false
   );
   // Long untruncated rg command > 240 chars (`fq_d4476da2e1404878`)
   const longRg = `rg -n "useTranscript|SummaryPanel|CallShareTabs|PublicShareView|RecordingHeader" ${"packages/ui/src/components/ ".repeat(10)}apps/web/src`;
@@ -235,6 +257,13 @@ test("classifyThread surfaces Single owner action sudo blocker as needs-human ev
   );
   assert.equal(classified.state, "needs-human");
   assert.match(classified.ask?.text ?? "", /BuildBot2.*xcodebuild -license accept/i);
+
+  // Inline `**Exact owner action:**` mid-line (`375e1a66` live phrasing) also classifies as needs-human!
+  const inlineExactText = "- Only runner: `buildbot2-recorder-macos` **Exact owner action:** On BuildBot2 as `buildbot2`, clean the stale Xcode processes and complete Xcode 27.2’s interactive first-launch/license setup.";
+  const inlineSection = blockedOnSection(inlineExactText);
+  assert.ok(inlineSection);
+  assert.equal(inlineSection.owner.length, 1);
+  assert.match(inlineSection.owner[0].text, /BuildBot2.*Xcode 27\.2/i);
 
   // Stale migrated ask on openAGI #283 where createdAt > mergedAt because agentAskedAt was null
   const settled = settledAsk(
