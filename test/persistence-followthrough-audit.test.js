@@ -818,3 +818,21 @@ test("agent-pulse prompt upgrade keeps the owner's saved cadence, timeout, and n
     assert.match(persisted.input.prompt, /verify_goal_progress/);
   });
 });
+
+test("upsert_goal cursor-only update keeps the saved owner, cadence and nudge policy (#332 review)", async () => {
+  await withTempDir(async (dir) => {
+    const { registry } = goalToolHarness(dir);
+    const upsert = registry.tools.get("upsert_goal");
+    const base = { project: "BuildBetter", goal: "Triage all 30 staging QA issues", doneCriteria: "remaining === 0" };
+    const first = await upsert.handler({ ...base, threadKey: "paseo:srv.sess_owner", permittedNudges: "none", cadence: "weekly", cursor: { total: 30, processed: 0, remaining: 30 } });
+    assert.equal(first.activeWorkItem.permittedNudges, "none");
+    const second = await upsert.handler({ ...base, cursor: { total: 30, processed: 10, remaining: 20 } });
+    assert.equal(second.activeWorkItem.id, first.activeWorkItem.id);
+    assert.equal(second.activeWorkItem.permittedNudges, "none", "the owner's disabled nudges stay disabled");
+    assert.equal(second.activeWorkItem.owner?.threadKey, "paseo:srv.sess_owner", "the session owner is kept");
+    assert.deepEqual(second.activeWorkItem.cadence, first.activeWorkItem.cadence, "cadence is kept");
+    // A brand-new goal still gets the creation defaults.
+    const fresh = await upsert.handler({ project: "BuildBetter", goal: "A different goal", doneCriteria: "done" });
+    assert.equal(fresh.activeWorkItem.permittedNudges, "resume_owner");
+  });
+});
