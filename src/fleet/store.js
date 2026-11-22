@@ -797,6 +797,21 @@ export class FleetStore {
     return { ...question };
   }
 
+  // The owning agent was asked to supply the decision context this ask lacks.
+  // One request per distinct set of gaps; `sent` says whether it reached the agent.
+  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null } = {}) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.contextRequest = {
+      at: iso(toMs(at, this.now())),
+      missing: Array.isArray(missing) ? missing.slice(0, 8).map(String) : [],
+      sent: Boolean(sent),
+      ...(reason ? { reason: clampText(String(reason), 120) } : {})
+    };
+    this._save();
+    return { ...question };
+  }
+
   // The supervisor closed this question itself (a merge settled it) and no
   // copy of it is open. A latest close by the review is left to
   // upsertQuestion, which holds it and keeps its ask time fresh.

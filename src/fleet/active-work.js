@@ -24,6 +24,7 @@ import {
   THREAD_KEY_PATTERN,
   clampTail,
   clampText,
+  clampTextLines,
   parsePaseoThreadKey,
   parsePrRef,
   redactSecrets,
@@ -38,6 +39,7 @@ import {
   callDecisionsEndpoint
 } from "./decisions-gate.js";
 import { buildFleetHierarchy, inferSessionTheme } from "./themes.js";
+import { buildDecisionContext, renderDecisionContext } from "./decision-context.js";
 
 const HOUR_MS = 60 * 60_000;
 const ACTIVE_WORK_FILE = "active-work.json";
@@ -91,6 +93,20 @@ const FOLLOW_THROUGH_PRIORITY = Object.freeze({
   active: 20,
   snoozed: 5,
   done: 0
+});
+
+// The decision each follow-through state puts to the owner, and what the
+// Supervisor recommends. Templates over recorded facts only.
+const FOLLOW_UP_DECISIONS = Object.freeze({
+  blocked: (it) => ({ decision: `Unblock ${it.project}${it.theme ? ` / ${it.theme}` : ""}, or confirm it is done?`, rec: it.owner?.threadKey ? "Resume the existing owner with the blocker above; confirm done only if you have verified the outcome yourself." : "Assign an owner for the blocker above." }),
+  blocked_pr: (it) => ({ decision: `Send ${it.prRef ?? "the PR"} back to be fixed?`, rec: "Resume the existing owner to fix the PR before anything merges." }),
+  owner_followup: (it) => ({ decision: `Has "${it.doneCriteria}" actually been verified?`, rec: "Confirm done only after checking the outcome yourself; otherwise resume the owner to verify it." }),
+  orphan_pr: (it) => ({ decision: `Who should finish ${it.prRef ?? "this PR"}? No live session owns it.`, rec: "Assign an owner so the PR is not left open with nobody watching it." }),
+  ready_pr: (it) => ({ decision: `${it.prRef ?? "The PR"} is green. Is the goal done, or is more follow-through needed?`, rec: "Review the PR yourself before merging; the goal stays open until its outcome is verified." }),
+  stale_commitment: (it) => ({ decision: `${it.project} has had no progress for ${it.idleHours}h. Resume, snooze, or confirm done?`, rec: it.owner?.threadKey ? "Resume the existing owner if this still matters; otherwise snooze it." : "Snooze it unless it still matters now." }),
+  stale_pr: (it) => ({ decision: `${it.prRef ?? "The PR"} has been idle ${it.idleHours}h. Resume, snooze, or confirm done?`, rec: "Resume the existing owner to finish or close the PR." }),
+  paused: (it) => ({ decision: `${it.project} is paused with its outcome unverified. Resume it or keep it paused?`, rec: "Keep it paused unless it is needed now." }),
+  archive_candidate: () => ({ decision: "The outcome is verified and the session is idle. Archive the session?", rec: "Propose archive; nothing is archived until you confirm." })
 });
 
 const IGNORED_PROPOSAL_PROJECTS = new Set(["unknown", "general", "workspace", "default", "misc"]);
@@ -1761,19 +1777,61 @@ export class ActiveWorkManager {
     return { used: true, reason: null, verdicts, inputTokens: Number(res.inputTokens) || 0 };
   }
 
+  // The same four-part decision context every owner ask carries: the tracked
+  // goal, what the owning session was assigned, verified progress and the
+  // blocker, and the decision with options, consequences and recommendation.
+  followUpDecisionContext(projectedItem) {
+    const spec = FOLLOW_UP_DECISIONS[projectedItem.followThroughState]?.(projectedItem) ?? null;
+    const ownerStatus = projectedItem.owner?.sessionStatus;
+    const ownerLabel = projectedItem.owner?.label || null;
+    return buildDecisionContext({
+      question: { kind: "follow-up", prRef: projectedItem.prRef ?? null },
+      itemName: `${projectedItem.project}${projectedItem.theme ? ` / ${projectedItem.theme}` : ""}`,
+      prMeta: projectedItem.prRef ? { ref: projectedItem.prRef, ciState: projectedItem.prCiState ?? null } : null,
+      activeGoal: {
+        goal: projectedItem.goal,
+        nextAction: [
+          ownerLabel ? `${ownerLabel}${ownerStatus ? ` (session ${ownerStatus})` : ""}` : (projectedItem.owner?.kind === "unassigned" ? "No session owns this yet" : null),
+          projectedItem.nextAction
+        ].filter(Boolean).join(": ") || null,
+        doneCriteria: projectedItem.doneCriteria
+      },
+      followUp: { ...projectedItem, verificationQuestion: projectedItem.verificationQuestion ?? spec?.decision ?? null },
+      recommendation: spec?.rec ?? null
+    });
+  }
+
+  _followUpOutreachCopy(projectedItem) {
+    const ctx = this.followUpDecisionContext(projectedItem);
+    // A tracked goal is not a running session and not (yet) an open ask:
+    // the title says which it is.
+    const title = clampText(`Tracked goal · ${ctx.itemName}`, 110);
+    const summary = clampTextLines(renderDecisionContext(ctx), 1400);
+    return { title, summary, ctx };
+  }
+
+  // Rewords an already-open follow-up copy in place (no new notification), so
+  // follow-ups raised before this format carry the same context as new ones.
+  _refreshFollowUpOutreach(outreachId, projectedItem) {
+    const outreach = this.runtime?.outreach;
+    if (!outreachId || typeof outreach?.update !== "function") return false;
+    try {
+      const existing = typeof outreach.get === "function" ? outreach.get(outreachId) : null;
+      if (existing && !["unseen", "seen"].includes(existing.status)) return false;
+      const { title, summary } = this._followUpOutreachCopy(projectedItem);
+      if (existing && existing.title === title && existing.summary === summary) return false;
+      outreach.update(outreachId, { title, summary });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   _emitBoundedPrompt(projectedItem, deltaMark) {
     const outreach = this.runtime?.outreach;
     if (typeof outreach?.append !== "function") return null;
     try {
-      const title = clampText(
-        `Follow-through · ${projectedItem.project}${projectedItem.theme ? ` / ${projectedItem.theme}` : ""}`,
-        110
-      );
-      const choiceLabels = projectedItem.choices.map((c) => c.label).slice(0, 4).join(", ");
-      const summary = clampText(
-        `${projectedItem.whySurfaced}${projectedItem.verificationQuestion ? ` ${projectedItem.verificationQuestion}` : ""}${choiceLabels ? ` (Choices: ${choiceLabels})` : ""}`,
-        260
-      );
+      const { title, summary } = this._followUpOutreachCopy(projectedItem);
       // Use needsDecision: false + actions: ["dismiss"] so generic outreach endpoints
       // clear the notification cleanly while actionable choices run through Active Work APIs/tools.
       const actions = ["dismiss"];
@@ -2138,6 +2196,9 @@ export class ActiveWorkManager {
       const pendingDecision = item.decisionDeferred === true;
       if (!ownerMissing && !inCurrentPage && !crossedStaleBoundary && !snoozeJustWoke && item.lastEvaluatedMark !== null && !pendingPrompt && !pendingDecision) {
         skippedUnchanged += 1;
+        if (item.outreachId && item.lastEvaluatedActionable) {
+          this._refreshFollowUpOutreach(item.outreachId, this._projectItem(item, { nowMs, sessionsByKey, prsByRef }));
+        }
         continue;
       }
 
@@ -2145,6 +2206,9 @@ export class ActiveWorkManager {
       const pendingDecisionForDelta = item.decisionDeferred === true;
       if (!ownerMissing && deltaMark === item.lastEvaluatedMark && !crossedStaleBoundary && !snoozeJustWoke && !pendingPromptForDelta && !pendingDecisionForDelta) {
         skippedUnchanged += 1;
+        if (item.outreachId && item.lastEvaluatedActionable) {
+          this._refreshFollowUpOutreach(item.outreachId, this._projectItem(item, { nowMs, sessionsByKey, prsByRef }));
+        }
         continue;
       }
 
@@ -2314,6 +2378,10 @@ export class ActiveWorkManager {
           // notification. Revisit delivery after the store recovers.
           item.promptDeferred = true;
         }
+      } else if (projected.actionable && item.outreachId && item.lastPromptedMark === deltaMark) {
+        // Unchanged evidence: no new ping, but an open copy written in an
+        // older, context-poor format is reworded in place.
+        this._refreshFollowUpOutreach(item.outreachId, projected);
       } else if (projected.actionable && item.permittedNudges !== "none" && item.lastPromptedMark !== deltaMark) {
         // The evidence was evaluated, but this pass's prompt budget was full
         // (or the outreach store was unavailable). Revisit delivery next pass

@@ -20,6 +20,7 @@ import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
+import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
@@ -910,8 +911,58 @@ export class FleetSupervisor {
 
   get notifier() {
     if (this.deps.notifier) return this.deps.notifier;
-    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl });
+    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, contextFor: (question) => this.decisionContextFor(question) });
     return this._notifier;
+  }
+
+  // The decision-ready context for one stored question, from its source chat,
+  // PR, and tracked goal (see decision-context.js). Never invents a part.
+  decisionContextFor(question) {
+    if (!question) return null;
+    const key = question.threadKey ?? question.threadKeys?.[0] ?? null;
+    const thread = key ? (this.lastThreads?.get?.(key) ?? this.knownThreads.get(key) ?? null) : null;
+    let activeGoal = null;
+    try { activeGoal = key || question.prRef ? this.activeWork.findActiveGoalForThread(key, question.prRef ?? null) : null; } catch { activeGoal = null; }
+    return decisionContextFromQuestion(question, { activeGoal, thread });
+  }
+
+  // A new decision missing part of its context is held while its owning agent
+  // supplies the gaps, once per distinct set of gaps. Only live sessions that
+  // take a plain message are asked (never a pending permission, never typed
+  // into an app UI), and only in auto mode. Returns whether to hold it.
+  async gateDecisionContext(question, { byKey, budgetLeft = 0, started = this.now() } = {}) {
+    const ctx = this.decisionContextFor(question);
+    if (!ctx || ctx.askType !== "decision" || ctx.complete) return { hold: false, sent: false, ctx };
+    const missingKey = ctx.missing.join(",");
+    const prior = question.contextRequest ?? null;
+    let sent = false;
+    if (!prior || prior.missing?.join(",") !== missingKey) {
+      const thread = question.threadKey ? (byKey?.get(question.threadKey) ?? this.knownThreads.get(question.threadKey) ?? null) : null;
+      const route = thread ? chooseRoute(thread, "auto", this.lastDelivery) : null;
+      const reachable = this.mode === "auto"
+        && thread
+        && !thread.watchOnly && !thread.meta?.watchOnly
+        && question.kind !== "prompt"
+        && !thread.meta?.pendingPermission
+        && ["paseo-send", "antigravity-send", "peer-relay"].includes(route)
+        && budgetLeft > 0
+        && !this.store.mutedUntil(thread.key);
+      let reason = reachable ? null : "owning agent not reachable by message";
+      if (reachable) {
+        try {
+          const delivery = await this.executor.deliver({ thread, message: buildContextRequestMessage(ctx), route, playbook: "context-request" });
+          sent = delivery?.status === "sent";
+          if (!sent) reason = clampText(delivery?.detail ?? delivery?.status ?? "not delivered", 120);
+          this.store.recordNudge(thread.key, { playbook: "context-request", route: delivery?.route ?? route, status: sent ? "context-request" : (delivery?.status ?? "failed") });
+        } catch (error) {
+          reason = clampText(redactSecrets(error?.message ?? "delivery failed"), 120);
+        }
+      }
+      this.store.markContextRequested(question.id, { at: started, missing: ctx.missing, sent, reason });
+    }
+    const latest = this.store.question(question.id) ?? question;
+    const latestCtx = this.decisionContextFor(latest);
+    return { hold: shouldHoldForContext(latest, latestCtx, this.now()), sent, ctx: latestCtx };
   }
 
   playbooks() {
@@ -2406,8 +2457,8 @@ export class FleetSupervisor {
     return watch;
   }
 
-  async postSupervisorChatUpdate(content, { dedupeKey = null, messageId = null, minGapMs = 30 * MIN, metadata = {} } = {}) {
-    const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), 1600);
+  async postSupervisorChatUpdate(content, { dedupeKey = null, messageId = null, minGapMs = 30 * MIN, metadata = {}, maxChars = 1600 } = {}) {
+    const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
     if (!cleanContent) return { posted: false, reason: "empty" };
     const nowMs = this.now();
     if (dedupeKey) {
@@ -2563,7 +2614,7 @@ export class FleetSupervisor {
     return outcomes;
   }
 
-  async maybePostProactiveSupervisorDigest({ started }) {
+  async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
     const quiet = this.config?.notify?.quietHours ?? null;
@@ -2578,12 +2629,22 @@ export class FleetSupervisor {
     }
 
     const notifyPrefs = this.store.preferences();
-    const openActionable = this.store.openQuestions().filter((q) => {
-      if (!q || q.status !== "open" || q.kind === "completed") return false;
+    const nowMs = this.now();
+    const contexts = new Map();
+    const openQs = this.store.openQuestions();
+    // FYIs and session errors are reported apart from decisions and never
+    // trigger a check-in on their own.
+    const nonDecisions = openQs.filter((q) => q && q.status === "open" && classifyAsk(q) !== "decision");
+    const openActionable = openQs.filter((q) => {
+      if (!q || q.status !== "open" || classifyAsk(q) !== "decision") return false;
       if (this.awaitingReview.has(q.id)) return false;
       if (isSuppressedByQuietCadence(q, notifyPrefs)) return false;
       const keys = q.threadKeys ?? (q.threadKey ? [q.threadKey] : []);
       if (keys.length && keys.every((key) => this.store.mutedUntil(key))) return false;
+      const ctx = this.decisionContextFor(q);
+      contexts.set(q.id, ctx);
+      // Still waiting on its owning agent for context: not surfaced yet.
+      if (shouldHoldForContext(q, ctx, nowMs)) return false;
       return true;
     });
 
@@ -2594,26 +2655,41 @@ export class FleetSupervisor {
     const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
     if (!deltas.length) return { posted: false, reason: "no-delta" };
 
-    const shownDeltas = deltas.slice(0, 5);
+    const shownDeltas = deltas.slice(0, 3);
     const overflowCount = Math.max(0, deltas.length - shownDeltas.length);
     const lines = [
       deltas.length === 1
         ? (deltas[0].change === "updated"
-            ? "**Updated decision needing you:**"
-            : "**New decision needing you:**")
-        : `**${deltas.length} new/updated decisions needing you:**`
+            ? "**Supervisor check-in: one decision changed and needs you.**"
+            : "**Supervisor check-in: one new decision needs you.**")
+        : `**Supervisor check-in: ${deltas.length} new or changed decisions need you.**`
     ];
     for (const { question: q, change } of shownDeltas) {
-      const badge = change === "updated" ? "[Updated] " : (deltas.length > 1 ? "[New] " : "");
-      const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
-      const contextLine = clampText(redactSecrets(q.reviewBrief?.decision || q.body || ""), 180);
-      lines.push(
-        `- ${badge}\`${q.id}\` — **${clampText(q.title, 120)}**${opts ? ` *(${opts})*` : ""}${contextLine ? `\n  ${contextLine}` : ""}`
-      );
+      const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
+      const badge = change === "updated" ? "Changed" : "New";
+      const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
+      lines.push("", `**${badge}: ${clampText(name, 140)}**`);
+      lines.push(ctx ? renderDecisionContext(ctx, { markdown: true, compact: true }) : clampText(stripInternalIds(redactSecrets(q.body || q.title || "")), 400));
     }
     if (overflowCount > 0) {
-      lines.push(`- *(+${overflowCount} more new in Needs You)*`);
+      lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
     }
+    // Running sessions, tracked goals, and decisions are different things; say
+    // each separately so a count is never mistaken for an ask.
+    let unfinishedGoals = 0;
+    try {
+      unfinishedGoals = (this.activeWork.getActiveWork({ limit: 200 })?.items ?? [])
+        .filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed").length;
+    } catch { unfinishedGoals = 0; }
+    const runningCount = Number(snapshot?.counts?.byState?.running ?? 0);
+    const errors = nonDecisions.filter((q) => classifyAsk(q) === "session_error").length;
+    const fyis = nonDecisions.length - errors;
+    lines.push("", [
+      `Decisions waiting on you: ${openActionable.length}`,
+      `Sessions running: ${runningCount}`,
+      `Unfinished tracked goals: ${unfinishedGoals}`,
+      ...(fyis || errors ? [`FYIs / session errors (no decision needed): ${fyis} / ${errors}`] : [])
+    ].join(" · "));
 
     const canonicalPairs = deltas
       .map((d) => [d.decisionKey, d.materialHash])
@@ -2624,6 +2700,7 @@ export class FleetSupervisor {
     const res = await this.postSupervisorChatUpdate(lines.join("\n"), {
       dedupeKey: `delta:${deltaSig}`,
       messageId,
+      maxChars: 6000,
       minGapMs: 24 * 60 * MIN,
       metadata: {
         kind: "proactive_supervisor_delta",
@@ -5041,6 +5118,13 @@ export class FleetSupervisor {
       if (isSuppressedByQuietCadence(question, notifyPrefs)) continue;
       const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
       if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
+      // Context first: a new decision missing its goal, assignment, progress,
+      // blocker, or options waits while its owning agent fills them in.
+      try {
+        const gate = await this.gateDecisionContext(question, { byKey, budgetLeft: config.limits.maxSendsPerTick - sends, started });
+        if (gate.sent) sends += 1;
+        if (gate.hold) continue;
+      } catch { /* the context gate never blocks a notification on its own failure */ }
       // A blip closed it: its own outreach copy comes back, not a new one.
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }

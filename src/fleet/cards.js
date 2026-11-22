@@ -5,6 +5,7 @@
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { asksToMergePr } from "./policy.js";
+import { buildDecisionContext, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
@@ -876,9 +877,38 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
   return resources;
 }
 
+// Folds the decision context into the brief fields every client already
+// renders (Goal / state / what changed / decision), without dropping what the
+// brief already said, and exposes the structured parts beside them.
+function enrichBriefWithDecisionContext(brief, ctx) {
+  if (!brief || !ctx) return brief;
+  if (!brief.context && ctx.goal) brief.context = clampText(ctx.goal, 420);
+  const extra = [];
+  const whatChanged = String(brief.whatChanged ?? "");
+  if (ctx.assignment && !whatChanged.includes(ctx.assignment.slice(0, 40)) && !String(brief.context ?? "").includes(ctx.assignment.slice(0, 40))) {
+    extra.push(`You asked the agent to: ${ctx.assignment}`);
+  }
+  if (ctx.verified && !whatChanged.includes(ctx.verified.slice(0, 30))) extra.push(`Verified: ${ctx.verified}`);
+  if (whatChanged) extra.push(whatChanged);
+  if (ctx.blocked && !whatChanged.includes(ctx.blocked.slice(0, 30))) extra.push(`Why it can't proceed alone: ${ctx.blocked}`);
+  if (extra.length) brief.whatChanged = clampTextLines(extra.join("\n\n"), 1200);
+  const withConsequence = ctx.options.filter((o) => o.consequence);
+  if (withConsequence.length && !/\bOptions:/.test(String(brief.decision ?? ""))) {
+    brief.decision = clampTextLines(`${brief.decision ?? ctx.decision ?? ""}\n\nOptions:\n${ctx.options.map((o) => `- ${o.label}${o.consequence ? ` — ${o.consequence}` : ""}`).join("\n")}`.trim(), 1400);
+  }
+  brief.goal = ctx.goal;
+  brief.assignment = ctx.assignment;
+  brief.verified = ctx.verified;
+  brief.blocked = ctx.blocked;
+  brief.options = ctx.options;
+  brief.sources = ctx.sources;
+  brief.missing = ctx.missing;
+  return brief;
+}
+
 export function buildSupervisorCard(
   question,
-  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null, activeGoalResolver = null } = {}
+  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null, activeGoalResolver = null, now = Date.now() } = {}
 ) {
   const primaryKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
@@ -1065,6 +1095,26 @@ export function buildSupervisorCard(
     blockingCount: blockingImpact.blockingCount
   });
 
+  // The shared decision-ready standard: goal, assignment, verified/changed/
+  // blocked, and the decision with options, consequences and recommendation.
+  const decisionContext = buildDecisionContext({
+    question,
+    project: project && project !== "general" ? project : null,
+    sessionTitle,
+    prMeta: prMeta ? { ...prMeta, url: prUrl } : null,
+    recentMessages,
+    agentSummary,
+    activeGoal,
+    openChat,
+    currentState: brief.currentState,
+    recommendation,
+    reviewBrief: activeReviewBrief(question),
+    permission: question.kind === "prompt" ? extractPermissionDetail(question, thread) : null,
+    contextRequest: question.contextRequest ?? null
+  });
+  enrichBriefWithDecisionContext(brief, decisionContext);
+  const heldForContext = shouldHoldForContext(question, decisionContext, Number(now) || Date.now());
+
   return {
     id: question.id,
     questionId: question.id,
@@ -1073,6 +1123,10 @@ export function buildSupervisorCard(
     rank,
     headline,
     ...ownerDecision,
+    ...(heldForContext ? { needsYou: false } : {}),
+    askType: decisionContext.askType,
+    contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
+    decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },
     sessionTitle,
     summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
     recommendation,
@@ -1530,7 +1584,7 @@ export function buildSupervisorDeck(
 
   const allQuestionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver }))
+    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver, now }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
   const questionCards = allQuestionCards.filter((card) => card.needsYou !== false);
 
