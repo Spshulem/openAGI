@@ -1,5 +1,6 @@
 import path from "node:path";
 import { readJsonFile, writeJsonAtomic, ensureDir } from "../file-utils.js";
+import { isQuestionLiveForDeck } from "./cards.js";
 
 const VERSION = 1;
 const MAX_ITEMS = 40;
@@ -72,8 +73,17 @@ export function walkthroughItems(supervisorState) {
     .map(card => card.questionId)
     .filter(id => typeof id === "string" && id));
   const cards = rawCards.filter(card => card?.needsYou !== false).map(cardItem).filter(Boolean);
+  const rows = new Map((supervisorState?.snapshot?.threads ?? []).filter(row => row?.key).map(row => [row.key, row]));
+  const preferences = supervisorState?.preferences ?? supervisorState?.snapshot?.preferences ?? null;
   const questions = (Array.isArray(supervisorState?.questions) ? supervisorState.questions : [])
     .filter(question => !blockedQuestionIds.has(question?.id))
+    .filter(question => {
+      if (!question || typeof question !== "object") return false;
+      // Older Supervisor snapshots omitted status; treat those as open while
+      // applying the same settled, superseded, and quiet-cadence predicates.
+      const liveQuestion = question.status == null ? { ...question, status: "open" } : question;
+      return isQuestionLiveForDeck(liveQuestion, question.threadKey ? rows.get(question.threadKey) : null, preferences);
+    })
     .map(q => questionItem(q, cards)).filter(Boolean);
   return [...cards, ...questions].slice(0, MAX_ITEMS);
 }

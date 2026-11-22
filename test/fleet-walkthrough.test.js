@@ -63,3 +63,21 @@ test("walkthrough instances share the durable cursor and omit resolved cards/que
   assert.equal(first.mutate("start", undefined, supervisorState).currentId, "live-card");
   assert.equal(second.read(supervisorState).currentId, "live-card");
 });
+
+test("walkthrough omits questions whose deck predicates are no longer live", () => {
+  const supervisorState = {
+    cards: [],
+    preferences: { cadence: "quiet_until_ready" },
+    snapshot: { threads: [
+      { key: "codex:merged", pr: { ref: "acme/api#1", state: "MERGED" } },
+      { key: "codex:running", agentStatus: "running", lastAgentAt: "2026-01-01T00:05:00Z" }
+    ] },
+    questions: [
+      { id: "merged", status: "open", kind: "ready", prRef: "acme/api#1", threadKey: "codex:merged", title: "Merge?", options: ["Merge"] },
+      { id: "quiet", status: "open", kind: "idle-report", threadKey: "codex:idle", title: "Still waiting?", options: ["Continue"] },
+      { id: "superseded", status: "open", kind: "agent-ask", threadKey: "codex:running", createdAt: "2026-01-01T00:00:00Z", title: "Old ask", options: ["Retry"] },
+      { id: "live", status: "open", kind: "prompt", title: "Choose", options: ["Yes"] }
+    ]
+  };
+  assert.deepEqual(walkthroughItems(supervisorState).map(item => item.id), ["live"]);
+});

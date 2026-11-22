@@ -316,7 +316,7 @@ export class OpenAGIG2App {
     return {
       id: cardId ? `card:${cardId}` : `question:${questionId ?? current.id}`,
       title: current.title, summary: current.summary, category: 'approvals', important: true, seen: false,
-      action: cardId ? 'act-fleet-card' : 'answer-fleet', supervisor: true,
+      action: cardId ? 'act-fleet-card' : 'answer-fleet', supervisor: true, walkthroughOnly: true,
       ...(cardId ? { cardId } : {}), ...(questionId ? { questionId } : {}),
       ...(current.threadKey ? { threadKey: current.threadKey } : {}),
       ...(current.cardKind ? { cardKind: current.cardKind } : {}),
@@ -330,19 +330,25 @@ export class OpenAGIG2App {
   async startSupervisorWalkthrough(): Promise<void> {
     if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy) return
     await this.proactive.refresh()
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.mode === 'listening') return
     try {
       this.supervisorWalkthrough = await this.proactive.walkthrough('start')
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.currentMode === 'listening') return
       this.showSupervisorWalkthrough()
     } catch (error) { this.phone.set('Needs You unavailable', safeOpenAGIError(error)); this.flash('Needs You unavailable', safeOpenAGIError(error)) }
   }
   async supervisorWalkthroughAction(operation: 'next' | 'back' | 'skip' | 'pause' | 'resume'): Promise<void> {
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || !['home', 'status', 'walkthrough'].includes(this.mode)) return
     const current = this.supervisorWalkthrough?.currentId ?? undefined
     try {
-      this.supervisorWalkthrough = await this.proactive.walkthrough(operation, current)
+      const walkthrough = await this.proactive.walkthrough(operation, current)
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || this.currentMode === 'listening') return
+      this.supervisorWalkthrough = walkthrough
       this.showSupervisorWalkthrough()
     } catch (error) {
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || this.currentMode === 'listening') return
       this.supervisorWalkthrough = await this.proactive.walkthrough('view').catch(() => null)
-      if (this.supervisorWalkthrough?.active) this.showSupervisorWalkthrough()
+      if (this.homeMode === 'supervisor' && !this.exited && !this.requestController && !this.navigationBusy && !this.isMode('listening') && this.supervisorWalkthrough?.active) this.showSupervisorWalkthrough()
       this.phone.set('Needs You changed', `${safeOpenAGIError(error)} Refreshed the shared walkthrough.`)
     }
   }
@@ -359,6 +365,7 @@ export class OpenAGIG2App {
     this.phone.supervisorWalkthrough?.(walkthrough)
     if (item) this.voiceTarget = { ...item }
   }
+  private isMode(mode: Mode): boolean { return this.currentMode === mode }
   private showInboxItem(): void {
     const item = this.inboxItems[this.inboxIndex]; if (!item) return
     this.mode = 'inbox'
@@ -403,7 +410,7 @@ export class OpenAGIG2App {
       ...deferCard,
       ...(item?.action === 'complete-task' ? [{ label: 'Complete task on main', op: 'complete-task' as const }] : []),
       ...(item?.action === 'accept-task' && !item.reminder ? [{ label: 'Add as my task', op: 'accept-task' as const }] : []),
-      ...(item?.id ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : [])]
+      ...(item?.id && !item.walkthroughOnly ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : [])]
   }
   private showInboxAction(): void {
     this.renderer.inboxAction?.(this.inboxActions()[this.actionIndex]?.label ?? '', plainAnswer(this.actionTarget?.title ?? ''), this.mode === 'inbox-confirm')
