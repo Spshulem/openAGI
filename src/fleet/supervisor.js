@@ -2573,22 +2573,28 @@ export class FleetSupervisor {
       if (inQuiet) return null;
     }
 
-    const runningCount = Number(snapshot?.counts?.running ?? 0);
+    const runningCount = Number(
+      snapshot?.counts?.byState?.running
+      ?? snapshot?.counts?.byWatch?.working
+      ?? snapshot?.counts?.running
+      ?? 0
+    );
+    const waitingCiCount = Number(snapshot?.counts?.byState?.["waiting-ci"] ?? 0);
     const awItems = (this.activeWork.getActiveWork({ limit: 40 })?.items ?? [])
       .filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed");
     const openActionable = this.store.openQuestions()
       .filter((q) => q.status === "open" && !["completed"].includes(q.kind) && !this.awaitingReview.has(q.id));
 
-    // Surface proactively when 0 agents are running despite unfinished goals/blockers,
-    // or when autonomous precedents cleared a batch of waiting items alongside remaining owner walls.
-    const zeroRunningStall = runningCount === 0 && (awItems.length > 0 || openActionable.length > 0);
-    const batchClearedWithWalls = autoResolvedSummaries.length >= 2 && openActionable.length > 0;
+    // Surface proactively when 0 agents are running (and none waiting on CI) despite
+    // tracked unfinished goals, or when autonomous precedents cleared a batch alongside owner walls.
+    const zeroRunningStall = runningCount === 0 && waitingCiCount === 0 && awItems.length > 0;
+    const batchClearedWithWalls = autoResolvedSummaries.length >= 3 && openActionable.length > 0 && awItems.length > 0;
     if (!zeroRunningStall && !batchClearedWithWalls) return null;
 
     const topBlockers = openActionable.slice(0, 5);
     const sig = shortHash(JSON.stringify([
       runningCount === 0 ? "zero-running" : "active",
-      topBlockers.map((q) => [q.id, q.kind, q.title]),
+      topBlockers.map((q) => [q.id, q.kind]).slice(0, 5),
       awItems.filter((it) => it.state === "blocked").map((it) => it.id)
     ]));
 
