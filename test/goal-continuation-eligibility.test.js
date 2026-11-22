@@ -21,7 +21,7 @@ function idlePaseoThread() {
   };
 }
 
-async function continuationsFor(t, mutateGoal) {
+async function continuationsFor(t, mutateGoal, beforeTick = null) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "goal-cont-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const delivered = [];
@@ -42,6 +42,7 @@ async function continuationsFor(t, mutateGoal) {
   const goal = sup.activeWork.state.items[0];
   mutateGoal(goal);
   sup.activeWork._save?.();
+  if (beforeTick) await beforeTick(sup, goal);
   await sup._tick("timer");
   return delivered.filter((d) => d.playbook === "goal-continuation");
 }
@@ -64,4 +65,13 @@ test("a snoozed goal is not resumed automatically", async (t) => {
 test("a finished batch awaiting owner sign-off is not restarted", async (t) => {
   const zeroCursor = await continuationsFor(t, (goal) => { goal.cursor = { remaining: 0 }; goal.awaitingFollowup = true; });
   assert.equal(zeroCursor.length, 0);
+});
+
+test("a goal that reports 0 remaining and then finds more work gets continuations again", async (t) => {
+  const sent = await continuationsFor(t, () => {}, async (sup, goal) => {
+    await sup.activeWork.verifyGoalProgress({ id: goal.id, evidenceSummary: "batch done", cursor: { remaining: 0 } });
+    await sup.activeWork.verifyGoalProgress({ id: goal.id, evidenceSummary: "found 10 more tables", cursor: { remaining: 10 } });
+    assert.equal(sup.activeWork.state.items[0].awaitingFollowup, false, "stale sign-off flag cleared");
+  });
+  assert.equal(sent.length, 1);
 });
