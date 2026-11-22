@@ -63,8 +63,15 @@ function questionItem(question, cards) {
 
 /** Build one bounded, stable Needs You list from the Supervisor's current cards. */
 export function walkthroughItems(supervisorState) {
-  const cards = (Array.isArray(supervisorState?.cards) ? supervisorState.cards : []).map(cardItem).filter(Boolean);
-  const questions = (Array.isArray(supervisorState?.questions) ? supervisorState.questions : []).map(q => questionItem(q, cards)).filter(Boolean);
+  const rawCards = Array.isArray(supervisorState?.cards) ? supervisorState.cards : [];
+  const blockedQuestionIds = new Set(rawCards
+    .filter(card => card && typeof card === "object" && card.needsYou === false)
+    .map(card => card.questionId)
+    .filter(id => typeof id === "string" && id));
+  const cards = rawCards.filter(card => card?.needsYou !== false).map(cardItem).filter(Boolean);
+  const questions = (Array.isArray(supervisorState?.questions) ? supervisorState.questions : [])
+    .filter(question => !blockedQuestionIds.has(question?.id))
+    .map(q => questionItem(q, cards)).filter(Boolean);
   return [...cards, ...questions].slice(0, MAX_ITEMS);
 }
 
@@ -80,7 +87,15 @@ export class SupervisorWalkthrough {
     writeJsonAtomic(this.file, this.state);
   }
 
+  reload() {
+    this.state = normalizeState(readJsonFile(this.file, {}));
+  }
+
   read(supervisorState) {
+    // Fleet routes and G2 proactive dispatch each own a handler instance, but
+    // the cursor is one durable main-owned state. Reload before every read so
+    // a mutation from another surface is visible immediately.
+    this.reload();
     const items = walkthroughItems(supervisorState);
     const live = new Set(items.map(item => item.id));
     this.state.itemIds = this.state.itemIds.filter(id => live.has(id));

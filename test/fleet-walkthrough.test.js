@@ -41,3 +41,22 @@ test("walkthrough refuses stale card identity before navigation", () => {
   walkthrough.mutate("start", undefined, state());
   assert.throws(() => walkthrough.mutate("next", "card-2", state()), /changed/);
 });
+
+test("walkthrough instances share the durable cursor and omit resolved cards/questions", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-walkthrough-shared-"));
+  const supervisorState = {
+    cards: [
+      { id: "resolved-card", needsYou: false, questionId: "resolved-q", title: "Done", summary: "Already handled" },
+      { id: "live-card", needsYou: true, questionId: "live-q", title: "Review", summary: "Needs you" }
+    ],
+    questions: [
+      { id: "resolved-q", title: "Resolved", body: "Already handled" },
+      { id: "live-q", title: "Live", body: "Needs you" }
+    ]
+  };
+  const first = new SupervisorWalkthrough({ dataDir: dir });
+  const second = new SupervisorWalkthrough({ dataDir: dir });
+  assert.deepEqual(walkthroughItems(supervisorState).map(item => item.id), ["live-card"]);
+  assert.equal(first.mutate("start", undefined, supervisorState).currentId, "live-card");
+  assert.equal(second.read(supervisorState).currentId, "live-card");
+});

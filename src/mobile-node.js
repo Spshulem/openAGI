@@ -78,6 +78,7 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/walkthrough",
   "GET /fleet/api/diagnose",
   "GET /fleet/api/search",
   "GET /fleet/api/workspaces",
@@ -90,6 +91,7 @@ const EXACT = new Set([
   "POST /fleet/api/scan",
   "POST /fleet/api/reconcile",
   "POST /fleet/api/mode",
+  "POST /fleet/api/walkthrough",
   "POST /fleet/api/preferences",
   "POST /fleet/api/route",
   "POST /fleet/api/dispatch",
