@@ -541,6 +541,29 @@ test("resolvePaseoAgentConfig & selectBestPaseoModel pick Opus 5.5 (never stale 
   assert.equal(fuzzyOpusCfg.modeId, "bypassPermissions");
 });
 
+test("resolvePaseoAgentConfig fallback after failed discovery honors the default provider and the requested model's family", async () => {
+  // Regression (#332 review [28]): with discovery down the fallback dropped an
+  // Antigravity default and paired an explicit Claude model with Codex.
+  const failedApi = {
+    providers: {
+      waitForReady: async () => { throw new Error("timed out"); },
+      snapshot: async () => ({ entries: [] })
+    }
+  };
+  const antigravityDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { preferences: { defaultProvider: "antigravity" } });
+  assert.equal(antigravityDefault.provider, "antigravity/gemini-4-carbon-high");
+  assert.equal(antigravityDefault.model, "gemini-4-carbon-high");
+
+  const claudeOnCodexDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { model: "claude-sonnet-4-6", preferences: { defaultProvider: "codex" } });
+  assert.equal(claudeOnCodexDefault.provider, "claude/claude-sonnet-4-6");
+
+  const gptOnClaudeDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { model: "gpt-6.2-sol" });
+  assert.equal(gptOnClaudeDefault.provider, "codex/gpt-6.2-sol");
+
+  const codexDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { preferences: { defaultProvider: "codex" } });
+  assert.equal(codexDefault.provider, "codex/gpt-6.2-sol");
+});
+
 test("groupQuestions and supervisor.act handle orphan ActiveWork ready PRs (threadKey: null) without throwing startsWith on null", async () => {
   await withTempDir(async (dir) => {
     const grouped = groupQuestions(
