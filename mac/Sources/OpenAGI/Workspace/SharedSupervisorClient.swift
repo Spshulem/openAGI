@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SupervisorChannelsKit
 import UniformTypeIdentifiers
 
 struct WorkspaceImageAttachment: Identifiable, Equatable {
@@ -410,6 +411,16 @@ private struct SupervisorStreamDelta: Decodable {
 
 private struct SupervisorStreamFailure: Decodable {
   let error: String?
+  let code: String?
+}
+
+/// The reply was stopped by Send Now (the owner's own interrupt). Not an
+/// error to show: main stored a "Stopped" line in the thread.
+private struct SupervisorReplyInterrupted: Error {}
+
+private struct SupervisorInterruptAnswer: Decodable {
+  let status: String?
+  let tool: String?
 }
 
 struct MacTaskLease: Decodable, Equatable, Sendable {
@@ -482,6 +493,14 @@ struct QueuedSupervisorMessage: Identifiable, Equatable {
   var attachments: [WorkspaceImageAttachment]
 }
 
+/// What a queued Supervisor chat message carries besides its text.
+struct SupervisorQueuedPayload: Equatable {
+  var focusedCardId: String?
+  var attachments: [WorkspaceImageAttachment]
+}
+
+typealias QueuedSupervisorTurn = QueuedTurn<SupervisorQueuedPayload>
+
 /// Keeps Mac Supervisor Quick Ask, Supervisor Workspace Window, Paseo, iPhone,
 /// and Even G2 synced via `devices:supervisor:main` + `/tasks`.
 @MainActor
@@ -492,7 +511,16 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var tasks: [MacTaskItem] = []
   @Published private(set) var allTasks: [MacTaskItem] = []
   @Published private(set) var isSending = false
-  @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
+  /// Messages sent while a reply runs: one at a time, in order. Edit holds
+  /// the queue at that item; Send Now interrupts the running reply and sends
+  /// the item next (see SupervisorChannelsKit's QueuedTurnQueue).
+  @Published private(set) var queue = QueuedTurnQueue<SupervisorQueuedPayload>()
+  /// The open queued-message editor's text. Saving never sends.
+  @Published var queuedEditDraft = ""
+  /// The turn id of the reply streaming now, when main was sent one.
+  private(set) var runningRequestId: String? = nil
+  /// A reply is streaming now (with or without a turn id main knows).
+  private(set) var replyInFlight = false
   @Published private(set) var streamingReplyText: String? = nil
   /// The assistant messages already shown when the current reply started,
   /// and the question it answers. A new assistant message right after that
@@ -531,16 +559,130 @@ final class SharedSupervisorClient: ObservableObject {
     lastError = nil
   }
 
-  func removeQueued(id: String) {
-    queuedMessages.removeAll { $0.id == id }
+  // MARK: - Queued messages
+
+  var queuedMessages: [QueuedSupervisorTurn] { queue.items }
+
+  nonisolated static func newRequestId() -> String { "mac-" + UUID().uuidString.lowercased() }
+
+  func removeQueued(id: UUID) {
+    guard queue.remove(id) != nil else { return }
+    if queue.editingID == nil { queuedEditDraft = "" }
+    drainIfIdle()
   }
 
-  func popQueuedForEdit(id: String) -> QueuedSupervisorMessage? {
-    guard let index = queuedMessages.firstIndex(where: { $0.id == id }) else { return nil }
-    return queuedMessages.remove(at: index)
+  /// Opens the inline editor; the queue waits at this item until Save or
+  /// Cancel, so the old text is never sent and nothing jumps ahead.
+  @discardableResult
+  func beginEditingQueued(id: UUID) -> Bool {
+    guard let text = queue.beginEditing(id) else { return false }
+    queuedEditDraft = text
+    return true
   }
 
-  private init() {}
+  /// Saves in place (same position, same turn id). Never sends by itself.
+  @discardableResult
+  func saveQueuedEdit() -> Bool {
+    guard let id = queue.editingID, let item = queue.item(id) else { return false }
+    var text = queuedEditDraft
+    if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !item.payload.attachments.isEmpty {
+      text = "Please inspect the attached screenshot(s)."
+    }
+    guard queue.saveEdit(id, text: text) else { return false }
+    queuedEditDraft = ""
+    drainIfIdle()
+    return true
+  }
+
+  func cancelQueuedEdit() {
+    queue.cancelEdit()
+    queuedEditDraft = ""
+    drainIfIdle()
+  }
+
+  func canSendQueuedNow(id: UUID) -> Bool { queue.canSendNow(id) }
+
+  /// Moves the item to the front and asks main to stop the running reply.
+  /// It goes next whatever main answers; its row shows what main confirmed.
+  func sendQueuedNow(id: UUID) async {
+    switch queue.beginSendNow(id, replyRunning: replyInFlight, runningRequestID: runningRequestId) {
+    case .ignored, .cannotInterrupt:
+      return
+    case .sendNext:
+      drainIfIdle()
+    case .interrupt(let requestId):
+      let outcome = await interruptReply(requestId: requestId)
+      queue.applyInterrupt(id, outcome: outcome)
+    }
+  }
+
+  /// `POST /conversations/supervisor/interrupt`. Never reports a stop main
+  /// did not confirm: no answer is `.unreachable`; a main without the route
+  /// (404/405) is `.unsupported`.
+  private func interruptReply(requestId: String) async -> TurnInterruptOutcome {
+    var req = URLRequest(url: AppState.buildURL(base: baseURL, path: "/conversations/supervisor/interrupt"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: ["requestId": requestId])
+    req.timeoutInterval = 20
+    authed(&req)
+    do {
+      let (data, response) = try await session.data(for: req)
+      return Self.interruptOutcome(data: data, status: (response as? HTTPURLResponse)?.statusCode ?? 0)
+    } catch {
+      return .unreachable
+    }
+  }
+
+  nonisolated static func interruptOutcome(data: Data, status: Int) -> TurnInterruptOutcome {
+    if [404, 405].contains(status) { return .unsupported }
+    guard (200..<300).contains(status),
+          let answer = try? JSONDecoder().decode(SupervisorInterruptAnswer.self, from: data)
+    else { return .unreachable }
+    return TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool)
+  }
+
+  /// Sends the queue when nothing is running: after an edit closes, a
+  /// removal, or a Send Now with no reply in flight.
+  private func drainIfIdle() {
+    guard !isSending, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
+    isSending = true
+    Task {
+      defer {
+        isSending = false
+        streamingReplyText = nil
+        progressStage = nil
+      }
+      await drainQueue()
+    }
+  }
+
+  private func drainQueue() async {
+    while let next = queue.takeNext() {
+      _ = await executeSingleMessage(next.text, focusedCardId: next.payload.focusedCardId,
+                                     attachments: next.payload.attachments, requestId: next.requestID)
+    }
+  }
+
+  /// Where requests go. The app uses the shared session, its daemon and its
+  /// token; tests inject a stubbed session so nothing reaches a real daemon.
+  private let session: URLSession
+  private let baseURLOverride: URL?
+  private let tokenOverride: String?
+  private var baseURL: URL { baseURLOverride ?? AppState.shared.baseURL }
+
+  private init() {
+    session = .shared
+    baseURLOverride = nil
+    tokenOverride = nil
+  }
+
+  /// A separate client for tests: its own session, daemon URL and token.
+  init(testSession: URLSession, baseURL: URL, token: String) {
+    session = testSession
+    baseURLOverride = baseURL
+    tokenOverride = token
+  }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
   /// `src/hosted-interface.js` (`requestNodeId` gate). Never include client-only
@@ -581,12 +723,12 @@ final class SharedSupervisorClient: ObservableObject {
 
   func refreshModelSettings() async {
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/settings/models"))
     authed(&req)
     req.timeoutInterval = 8
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
       applyModelSettings(decoded)
@@ -618,7 +760,7 @@ final class SharedSupervisorClient: ObservableObject {
       body[modelField] = modelId
     }
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/settings/models"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -626,7 +768,7 @@ final class SharedSupervisorClient: ObservableObject {
     req.timeoutInterval = 15
     authed(&req)
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(ModelSettingsResponse.self, from: data)
       applyModelSettings(decoded)
@@ -640,7 +782,7 @@ final class SharedSupervisorClient: ObservableObject {
 
   func setFleetMode(_ mode: String) async {
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/fleet/api/mode"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -648,7 +790,7 @@ final class SharedSupervisorClient: ObservableObject {
     req.timeoutInterval = 15
     authed(&req)
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       await FleetConsumer.shared.refresh()
     } catch {
@@ -685,12 +827,12 @@ final class SharedSupervisorClient: ObservableObject {
 
   func refreshMessages() async {
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/conversations/supervisor/messages?limit=50"))
     authed(&req)
     req.timeoutInterval = 8
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(SyncedHistoryResponse.self, from: data)
       messages = decoded.messages
@@ -703,12 +845,12 @@ final class SharedSupervisorClient: ObservableObject {
   func refreshTasks() async {
     func fetchQueue(_ queue: String) async -> [MacTaskItem] {
       var req = URLRequest(url: AppState.buildURL(
-        base: AppState.shared.baseURL,
+        base: baseURL,
         path: "/tasks?queue=\(queue)&limit=100"))
       authed(&req)
       req.timeoutInterval = 8
       do {
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await session.data(for: req)
         try AppState.ensureOK(response, data)
         return try JSONDecoder().decode(TasksListResponse.self, from: data).tasks
       } catch {
@@ -734,13 +876,12 @@ final class SharedSupervisorClient: ObservableObject {
   func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
-    if isSending {
-      queuedMessages.append(QueuedSupervisorMessage(
-        id: "q-\(UUID().uuidString)",
-        text: text,
-        focusedCardId: focusedCardId,
-        attachments: attachments
-      ))
+    // Busy, or messages still wait (one is being edited): this one goes
+    // after them, never ahead.
+    if isSending || !queue.isEmpty {
+      queue.enqueue(text: text, payload: SupervisorQueuedPayload(focusedCardId: focusedCardId, attachments: attachments),
+                    requestID: Self.newRequestId())
+      drainIfIdle()
       return true
     }
     isSending = true
@@ -749,15 +890,13 @@ final class SharedSupervisorClient: ObservableObject {
       streamingReplyText = nil
       progressStage = nil
     }
-    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments)
-    while !queuedMessages.isEmpty {
-      let next = queuedMessages.removeFirst()
-      _ = await executeSingleMessage(next.text, focusedCardId: next.focusedCardId, attachments: next.attachments)
-    }
+    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments, requestId: Self.newRequestId())
+    await drainQueue()
     return ok
   }
 
-  private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
+  private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],
+                                    requestId: String) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
     replyBaselineIds = previousAssistantIds
@@ -784,24 +923,28 @@ final class SharedSupervisorClient: ObservableObject {
       .trimmingCharacters(in: .whitespacesAndNewlines)
       .range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil
 
-    var attempts: [(includeThread: Bool, includeFocusedCard: Bool)] = [(true, true)]
+    // Every rejection below is a 400 during validation, before the turn
+    // runs, so trying again with fewer fields cannot send twice. The turn id
+    // goes first: a main older than turn ids still gets the shared thread.
+    var attempts: [(includeThread: Bool, includeFocusedCard: Bool, includeRequestId: Bool)] = [(true, true, true), (true, true, false)]
     if hasValidCardId {
-      attempts.append((true, false))
+      attempts.append((true, false, false))
     }
-    attempts.append((false, false))
+    attempts.append((false, false, false))
 
     do {
       var replyText: String? = nil
       for (index, attempt) in attempts.enumerated() {
         do {
-          let payload = Self.buildMessagePayload(
+          var payload = Self.buildMessagePayload(
             text: displayText,
             focusedCardId: focusedCardId,
             attachments: attachments,
             includeThread: attempt.includeThread,
             includeFocusedCard: attempt.includeFocusedCard
           )
-          replyText = try await performStreamedMessage(payload: payload)
+          if attempt.includeRequestId { payload["requestId"] = requestId }
+          replyText = try await streamTracked(payload: payload, requestId: attempt.includeRequestId ? requestId : nil)
           break
         } catch is UnsupportedFieldsError {
           if index == attempts.count - 1 {
@@ -828,6 +971,15 @@ final class SharedSupervisorClient: ObservableObject {
       await refreshMessages()
       await refreshTasks()
       return true
+    } catch is SupervisorReplyInterrupted {
+      // Send Now stopped this reply. Main stored the question and a
+      // "Stopped" line; show those, not an error.
+      await refreshMessages()
+      if messages.contains(where: { $0.id != localId && $0.role == "user" && $0.text == displayText }) {
+        messages.removeAll { $0.id == localId }
+      }
+      lastError = nil
+      return true
     } catch {
       await refreshMessages()
       let persistedAssistantReply = messages.contains {
@@ -845,8 +997,20 @@ final class SharedSupervisorClient: ObservableObject {
     }
   }
 
+  /// Marks the reply as running (and interruptible by its turn id) for
+  /// exactly as long as its stream is open.
+  private func streamTracked(payload: [String: Any], requestId: String?) async throws -> String? {
+    replyInFlight = true
+    runningRequestId = requestId
+    defer {
+      replyInFlight = false
+      runningRequestId = nil
+    }
+    return try await performStreamedMessage(payload: payload)
+  }
+
   private func performStreamedMessage(payload: [String: Any]) async throws -> String? {
-    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/message"))
+    var req = URLRequest(url: AppState.buildURL(base: baseURL, path: "/message"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -854,7 +1018,7 @@ final class SharedSupervisorClient: ObservableObject {
     req.timeoutInterval = 180
     authed(&req)
 
-    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+    let (bytes, response) = try await session.bytes(for: req)
     guard let http = response as? HTTPURLResponse else {
       throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
         NSLocalizedDescriptionKey: "The daemon returned an invalid response."
@@ -907,6 +1071,7 @@ final class SharedSupervisorClient: ObservableObject {
         return decoded?.reply ?? streamingReplyText
       case "failure":
         let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
+        if failure?.code == "stopped" { throw SupervisorReplyInterrupted() }
         let message = failure?.error ?? "Supervisor could not complete that request."
         throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
       default:
@@ -943,7 +1108,7 @@ final class SharedSupervisorClient: ObservableObject {
       batch.append(["id": "mac_\(UUID().uuidString)", "role": "assistant", "text": a])
     }
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/conversations/supervisor/append"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -953,7 +1118,7 @@ final class SharedSupervisorClient: ObservableObject {
     ])
     req.timeoutInterval = 8
     authed(&req)
-    _ = try? await URLSession.shared.data(for: req)
+    _ = try? await session.data(for: req)
     await refreshMessages()
   }
 
@@ -992,14 +1157,14 @@ final class SharedSupervisorClient: ObservableObject {
       if let model, !model.isEmpty { body["model"] = model }
       if let effort, !effort.isEmpty { body["effort"] = effort }
 
-      var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/fleet/api/tasks/claim"))
+      var req = URLRequest(url: AppState.buildURL(base: baseURL, path: "/fleet/api/tasks/claim"))
       req.httpMethod = "POST"
       req.setValue("application/json", forHTTPHeaderField: "Content-Type")
       req.httpBody = try? JSONSerialization.data(withJSONObject: body)
       req.timeoutInterval = 45
       authed(&req)
       do {
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await session.data(for: req)
         try AppState.ensureOK(response, data)
         await refreshTasks()
         await FleetConsumer.shared.refresh()
@@ -1019,13 +1184,13 @@ final class SharedSupervisorClient: ObservableObject {
     if let project, !project.isEmpty { body["project"] = project }
     if let subchannel, !subchannel.isEmpty { body["subchannel"] = subchannel }
     if !labels.isEmpty { body["labels"] = labels }
-    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/tasks"))
+    var req = URLRequest(url: AppState.buildURL(base: baseURL, path: "/tasks"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     authed(&req)
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       await refreshTasks()
       return true
@@ -1050,14 +1215,14 @@ final class SharedSupervisorClient: ObservableObject {
     if let model, !model.isEmpty { body["model"] = model }
     if let effort, !effort.isEmpty { body["effort"] = effort }
 
-    var req = URLRequest(url: AppState.buildURL(base: AppState.shared.baseURL, path: "/fleet/api/tasks/claim"))
+    var req = URLRequest(url: AppState.buildURL(base: baseURL, path: "/fleet/api/tasks/claim"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     req.timeoutInterval = 45
     authed(&req)
     do {
-      let (data, response) = try await URLSession.shared.data(for: req)
+      let (data, response) = try await session.data(for: req)
       try AppState.ensureOK(response, data)
       await refreshTasks()
       await FleetConsumer.shared.refresh()
@@ -1075,18 +1240,18 @@ final class SharedSupervisorClient: ObservableObject {
 
   func completeTask(_ id: String) async {
     var req = URLRequest(url: AppState.buildURL(
-      base: AppState.shared.baseURL,
+      base: baseURL,
       path: "/tasks/\(id)/complete"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.httpBody = Data("{}".utf8)
     authed(&req)
-    _ = try? await URLSession.shared.data(for: req)
+    _ = try? await session.data(for: req)
     await refreshTasks()
   }
 
   private func authed(_ req: inout URLRequest) {
-    if let token = AppState.shared.authToken(), !token.isEmpty {
+    if let token = tokenOverride ?? AppState.shared.authToken(), !token.isEmpty {
       req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
   }

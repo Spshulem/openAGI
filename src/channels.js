@@ -52,6 +52,9 @@ export class ChannelManager {
       // keep a slow tool-using turn visibly alive.
       onProgress: options.onProgress,
       onTextDelta: options.onTextDelta,
+      // The live turn's abort signal (message-turns.js): set by the transport
+      // when the owner may interrupt this turn, never read from `body`.
+      ...(options.signal ? { signal: options.signal } : {}),
       // Minted by the transport after its auth (owner-authority.js); a body
       // field can never become one.
       principal: options.principal ?? null,

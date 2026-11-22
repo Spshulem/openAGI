@@ -3,6 +3,7 @@ import { InMemoryAgentStore } from "./agent-store.js";
 import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
 import { detectTaskInChat } from "./task-store.js";
+import { isOwnerInterrupt, ownerInterruptReason } from "./message-turns.js";
 import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZE_RE } from "./signal-axes.js";
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
@@ -47,13 +48,29 @@ export class AgentHost {
       input?.sessionId ?? `${input?.channel ?? "local"}:${input?.from ?? "user"}:${input?.agentId ?? "main"}`
     );
     const prior = this.sessionTurnTails.get(queueKey) ?? Promise.resolve();
-    const run = prior.catch(() => {}).then(() => this.handleMessageNow(input, options));
+    let started = false;
+    const run = prior.catch(() => {}).then(() => {
+      started = true;
+      return this.handleMessageNow(input, options);
+    });
     this.sessionTurnTails.set(queueKey, run);
-    try {
-      return await run;
-    } finally {
+    // The tail is released when the turn itself settles, never when a caller
+    // stops waiting for it: the next turn must not overlap this one.
+    run.catch(() => {}).finally(() => {
       if (this.sessionTurnTails.get(queueKey) === run) this.sessionTurnTails.delete(queueKey);
-    }
+    });
+    const signal = options.signal;
+    // A turn interrupted while it still waits behind another one ends now.
+    // When its slot comes it throws before doing anything (handleMessageNow
+    // checks the signal first), so it never runs.
+    if (!signal || typeof signal.addEventListener !== "function" || signal.aborted) return run;
+    return await new Promise((resolve, reject) => {
+      // A turn already running is left to stop itself at its next check, so
+      // its stopped record is written before the caller hears the outcome.
+      const onAbort = () => { if (!started) reject(signal.reason ?? new Error("Request cancelled.")); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      run.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }
 
   async handleMessageNow(input, options = {}) {
@@ -549,7 +566,10 @@ export class AgentHost {
       output
     };
     } catch (error) {
-      const failure = normalizeTurnFailure(error);
+      // The owner stopped this turn (message-turns.js interruptTurn). Judge
+      // that by the signal, not by whatever a provider threw while aborting.
+      const interrupted = isOwnerInterrupt(options.signal);
+      const failure = interrupted ? ownerInterruptReason() : normalizeTurnFailure(error);
       failure.openagiSessionId = sessionId;
       failure.openagiRequestId = requestId || null;
       const publicFailure = classifyAgentFailure(failure);
@@ -564,7 +584,7 @@ export class AgentHost {
         try {
           failedSession = this.store.appendMessage(sessionId, {
             role: "assistant",
-            content: `I couldn't complete that request: ${publicFailure.message}`,
+            content: interrupted ? publicFailure.message : `I couldn't complete that request: ${publicFailure.message}`,
             agentId,
             channel,
             from: "openagi",

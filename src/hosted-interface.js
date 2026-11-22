@@ -71,7 +71,7 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
-import { LiveTurns, storedTurn, replayedResult, replayedFailure } from "./message-turns.js";
+import { LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn } from "./message-turns.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -107,6 +107,7 @@ import {
   observeSharedThreads,
   parseLifelogMomentsQuery,
   sharedHistoryThread,
+  sharedInterruptThread,
   sharedSessionId,
   sharedThreadForSession,
   sharedThreadHistory,
@@ -311,6 +312,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // Turns a paired phone named with its own request id, while they run: a
   // repeat of the id attaches here instead of running the turn again.
   const liveTurns = new LiveTurns();
+  // How long an interrupt waits for the turn to stop before answering
+  // "stopping" (it is waiting on a running tool). Tests shorten it.
+  const interruptSettleMs = Number.isFinite(options.interruptSettleMs) ? options.interruptSettleMs : 4_000;
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -2048,6 +2052,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
       }
+      // Stop a running turn in a shared thread so the owner's next message
+      // goes first (message-turns.js interruptTurn). Same callers as the
+      // thread's history, minus G2. The answer says whether the turn has
+      // actually stopped; a tool already running finishes and is not undone.
+      if (method === "POST" && sharedInterruptThread(pathname) !== null) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store || !channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some((key) => !["requestId", "conversationId"].includes(key))
+            || typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.requestId)) {
+          return sendJson(res, 400, { error: "invalid_interrupt", message: "Send the requestId of the turn to stop." });
+        }
+        try {
+          const sessionId = sharedSessionId(sharedInterruptThread(pathname), body.conversationId ?? "main");
+          return sendJson(res, 200, await interruptTurn({ liveTurns, store, sessionId, requestId: body.requestId, settleMs: interruptSettleMs }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
       if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
         res.setHeader("Cache-Control", "no-store");
         if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
@@ -2299,14 +2328,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // An owner UI such as Paseo joins the same named shared thread as
         // paired devices. Resolve its identity here, never in the client.
         if (!requestNodeId && body?.thread !== undefined) {
+          // The owner's Mac names its turns as phones do, so it can follow,
+          // replay and interrupt them in the shared thread. Owner UIs that
+          // already sent some other value keep working: it is ignored.
+          const ownerTurnId = typeof body.requestId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(body.requestId) ? body.requestId : null;
+          if (ownerTurnId) clientTurnId = ownerTurnId;
           try {
             const safeFocusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
               ? body.focusedCardId
               : undefined;
+            const ownerBody = { ...body };
+            delete ownerBody.requestId;
             body = {
-              ...body,
+              ...ownerBody,
               sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
-              metadata: { ...body.metadata, thread: body.thread, ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}) }
+              metadata: {
+                ...body.metadata, thread: body.thread,
+                ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}),
+                ...(ownerTurnId ? { requestId: ownerTurnId } : {})
+              }
             };
           } catch (error) {
             if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });

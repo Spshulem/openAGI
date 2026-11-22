@@ -21,7 +21,10 @@ const PUBLIC_FAILURES = Object.freeze({
   "device-model-unavailable": "The phone's on-device model isn't ready. Check it in Chat options and keep OpenAGI open while it replies.",
   "device-model-timeout": "The phone's on-device model took too long to reply. Keep OpenAGI open and try again.",
   "input-limit": "This request exceeds the configured input limit. Shorten your message, or increase OPENAGI_MAX_INPUT_TOKENS in your .env file and restart the daemon.",
-  "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
+  "agent-error": "The agent couldn't complete that request. Check the local daemon log for details.",
+  // Not a fault: the owner stopped the reply to send something else first.
+  // An action that was already running may have finished; none is undone.
+  stopped: "Stopped so your next message could go first. Anything already under way may have finished; nothing was undone."
 });
 
 const loggedFailures = new WeakSet();
@@ -30,6 +33,7 @@ const loggedFailures = new WeakSet();
 // public taxonomy before they reach chat history, HTTP responses, or browser
 // events; the detailed diagnostic belongs only in the daemon's local log.
 export function classifyAgentFailure(error) {
+  if (error?.code === "OWNER_INTERRUPTED") return { code: "stopped", message: PUBLIC_FAILURES.stopped };
   if (error?.code === "IMAGE_INPUT_UNSUPPORTED") return { code: "image-input-unsupported", message: PUBLIC_FAILURES["image-input-unsupported"] };
   const code = safeErrorField(error, "code");
   const name = safeErrorField(error, "name");
@@ -83,6 +87,13 @@ export function logAgentFailure(error, context = {}) {
   }
 
   const failure = classifyAgentFailure(error);
+  // The owner stopping a reply is not a fault: one line, no stack.
+  if (failure.code === "stopped") {
+    const note = { at: new Date().toISOString(), event: "agent-turn-interrupted", level: "info", component: "agent",
+      sessionId: boundedString(context.sessionId, 500) || null, requestId: boundedString(context.requestId, 200) || null };
+    try { process.stderr.write(`[openagi] ${JSON.stringify(note)}\n`); } catch { /* diagnostics are best-effort */ }
+    return;
+  }
   const diagnostic = redactFailureDiagnostic(safeErrorDiagnostic(error)).slice(0, 16_000);
   const record = {
     at: new Date().toISOString(),

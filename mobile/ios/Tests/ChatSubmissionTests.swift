@@ -218,15 +218,18 @@ final class ChatSubmissionTests: XCTestCase {
         conversation.removeQueuedSubmission(id: cancelID)
         XCTAssertEqual(conversation.queuedSubmissions.map(\.text), ["Second queued", "Third queued"])
 
+        // Edit happens in place: the composer is untouched and the edit
+        // keeps its position (it used to go to the back of the queue).
         let editID = conversation.queuedSubmissions[0].id
-        let popped = conversation.popQueuedSubmissionForEdit(id: editID)
-        XCTAssertEqual(popped?.text, "Second queued")
-        conversation.draft = "Second edited"
-        XCTAssertTrue(conversation.submitDraft())
+        XCTAssertTrue(conversation.beginEditingQueued(id: editID))
+        XCTAssertEqual(conversation.queuedEditDraft, "Second queued")
+        XCTAssertEqual(conversation.draft, "")
+        conversation.queuedEditDraft = "Second edited"
+        XCTAssertTrue(conversation.saveQueuedEdit())
 
         for _ in 0..<200 where conversation.isSending { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertFalse(conversation.isSending)
         XCTAssertTrue(conversation.queuedSubmissions.isEmpty)
-        XCTAssertEqual(sent.withLock { $0 }, ["First turn", "Third queued", "Second edited"])
+        XCTAssertEqual(sent.withLock { $0 }, ["First turn", "Second edited", "Third queued"])
     }
 }
