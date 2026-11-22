@@ -893,7 +893,11 @@ export class OwnerPrecedentStore {
       return { matched: false, hardRedLine: null };
     }
 
-    const apiKey = String(decisionsConfig.apiKey ?? env?.OPENAI_API_KEY ?? "").trim();
+    // An explicit Decisions opt-out (`decisions.enabled: false`, which
+    // OPENAGI_FLEET_DECISIONS=0 resolves to) blocks every endpoint call below.
+    const apiKey = decisionsConfig.enabled === false
+      ? ""
+      : String(decisionsConfig.apiKey ?? env?.OPENAI_API_KEY ?? "").trim();
     const url = decisionsConfig.url ?? env?.OPENAGI_DECISIONS_URL ?? DEFAULT_DECISIONS_URL;
     const model = decisionsConfig.model ?? env?.OPENAGI_DECISIONS_MODEL ?? DEFAULT_DECISIONS_MODEL;
     const queryText = [question.title, question.body, question.askContext].filter(Boolean).join(" ");

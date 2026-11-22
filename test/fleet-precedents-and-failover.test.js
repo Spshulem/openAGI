@@ -435,7 +435,7 @@ test("editable skills (read_skill, update_skill, create_skill overwrite) and goa
       cursor: { total: 20, processed: 20, remaining: 0 },
       ownerConfirmedDone: true,
       evidenceSummary: "All 20 issues triaged and verified."
-    });
+    }, { __confirmed: true });
     assert.equal(finalCheck.accomplished, true);
     assert.equal(finalCheck.item.outcomeVerified, true);
   });

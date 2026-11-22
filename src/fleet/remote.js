@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/act|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -491,15 +491,46 @@ export class RemoteFleetSupervisor {
     const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/failover`, input);
     return body?.result ?? { ok: false, detail: 'Provider failover returned no result.' };
   }
-  async verifyGoalProgress(input = {}) {
-    const active = await this.getActiveWork({ limit: 50, includeDone: true });
-    const match = (active?.items ?? []).find((it) => (input.id && it.id === input.id) || (input.project && String(it.project ?? '').toLowerCase() === String(input.project).toLowerCase()));
-    if (!match) return { ok: false, verified: false, reason: 'No matching goal found.' };
-    if (input.confirmDone === true || (Number.isInteger(input.remaining) && input.remaining === 0)) {
-      const acted = await this.actActiveWork(match.id, { op: 'confirm_done', note: input.evidenceSummary ?? 'Verified via verify_goal_progress' });
-      return { ok: Boolean(acted?.ok), verified: Boolean(acted?.ok), item: acted?.item ?? match };
+  // Same input ({ id, evidenceSummary, cursor, ownerConfirmedDone }) and
+  // result ({ accomplished, continueRequired, item, ... }) as the local
+  // ActiveWorkManager.verifyGoalProgress, run on the owning Fleet computer.
+  async verifyGoalProgress({ id, evidenceSummary = '', cursor = null, ownerConfirmedDone = false } = {}) {
+    const cleanId = String(id ?? '').trim();
+    if (!cleanId) throw new Error('Pass the tracked goal id.');
+    const body = {
+      evidenceSummary: String(evidenceSummary ?? ''),
+      ...(cursor && typeof cursor === 'object' ? { cursor } : {}),
+      ownerConfirmedDone: ownerConfirmedDone === true
+    };
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(cleanId)}/verify`, body)).result ?? null;
+    } catch (error) {
+      if (!error.unsupportedRoute) throw error;
     }
-    return { ok: true, verified: Boolean(match.outcomeVerified), item: match };
+    // An older Fleet computer without the verify route: record owner-confirmed
+    // completion through confirm_done; otherwise report the cursor verdict.
+    if (ownerConfirmedDone === true) {
+      const acted = await this.actActiveWork(cleanId, { op: 'confirm_done', note: body.evidenceSummary || 'Verified via verify_goal_progress' });
+      if (!acted) throw new Error(`No tracked goal with id "${cleanId}".`);
+      const accomplished = Boolean(acted.ok);
+      return { ok: accomplished, id: cleanId, accomplished, continueRequired: !accomplished, confidence: accomplished ? 1 : 0, item: acted.item ?? null };
+    }
+    const active = await this.getActiveWork({ limit: 100, includeDone: true });
+    const item = (active?.items ?? []).find((it) => it.id === cleanId) ?? null;
+    if (!item) throw new Error(`No tracked goal with id "${cleanId}".`);
+    const remaining = Number.isInteger(cursor?.remaining) ? cursor.remaining : null;
+    const accomplished = remaining === 0 || item.outcomeVerified === true;
+    return {
+      ok: true,
+      id: cleanId,
+      accomplished,
+      continueRequired: !accomplished,
+      confidence: accomplished ? 1 : 0,
+      note: accomplished
+        ? 'All tracked batches satisfied; ready for owner verification (`confirm_done`).'
+        : 'Definition of Done is not yet satisfied; continue next batch.',
+      item
+    };
   }
   async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
   async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
