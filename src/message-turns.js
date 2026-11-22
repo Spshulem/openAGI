@@ -31,9 +31,66 @@ export function isOwnerInterrupt(signal) {
   return Boolean(signal?.aborted && signal.reason?.code === OWNER_INTERRUPTED);
 }
 
+// What the owner reads where a stopped reply would be (agent-failure.js
+// PUBLIC_FAILURES.stopped says the same).
+export const STOPPED_TEXT = "Stopped so your next message could go first. Anything already under way may have finished; nothing was undone.";
+
+// The signal a running tool sees. An owner interrupt stops the turn before
+// its next model call or tool, never the action already running: a typing
+// or paste computer action must finish, and its approval must survive. Any
+// other abort (a cancelled G2 request, shutdown) still reaches the tool.
+const toolSignals = new WeakMap();
+export function toolSignal(signal) {
+  if (!signal || typeof signal.addEventListener !== "function") return signal;
+  if (isOwnerInterrupt(signal)) return new AbortController().signal;
+  if (signal.aborted) return signal;
+  let derived = toolSignals.get(signal);
+  if (!derived) {
+    const controller = new AbortController();
+    signal.addEventListener("abort", () => { if (!isOwnerInterrupt(signal)) controller.abort(signal.reason); }, { once: true });
+    derived = controller.signal;
+    toolSignals.set(signal, derived);
+  }
+  return derived;
+}
+
+// Owner-stopped turns, remembered in memory so a repeat of the id (a second
+// interrupt, a resend after a dropped stream) replays the stop instead of
+// running a message the owner replaced. A turn stopped while it still waited
+// behind another has no stored records until its slot comes (AgentHost then
+// writes them), so this covers that gap. Bounded; oldest go first.
+const STOPPED_LIMIT = 500;
+const STOPPED_TTL_MS = 6 * 60 * 60 * 1000;
+
 export class LiveTurns {
-  constructor() {
+  constructor({ now = () => Date.now() } = {}) {
     this.turns = new Map();
+    this.stopped = new Map();
+    this.now = now;
+  }
+
+  markStopped(sessionId, requestId) {
+    const key = LiveTurns.key(sessionId, requestId);
+    this.stopped.delete(key);
+    this.stopped.set(key, this.now());
+    while (this.stopped.size > STOPPED_LIMIT) this.stopped.delete(this.stopped.keys().next().value);
+  }
+
+  wasStopped(sessionId, requestId) {
+    const key = LiveTurns.key(sessionId, requestId);
+    const at = this.stopped.get(key);
+    if (at === undefined) return false;
+    if (this.now() - at > STOPPED_TTL_MS) { this.stopped.delete(key); return false; }
+    return true;
+  }
+
+  // The same shape storedTurn returns for a failed turn, for a stop main
+  // remembers but has not stored yet.
+  stoppedTurn(store, sessionId, requestId) {
+    if (!this.wasStopped(sessionId, requestId)) return null;
+    let messageCount = 0;
+    try { messageCount = store?.getSession?.(sessionId)?.messages?.length ?? 0; } catch { /* count is advisory */ }
+    return { status: "failed", sessionId, messageCount, code: "stopped", message: { content: STOPPED_TEXT } };
   }
 
   static key(sessionId, requestId) {
@@ -86,9 +143,12 @@ export class LiveTurns {
         turn.settled = { status: "complete" };
         return result;
       } catch (error) {
-        turn.settled = isOwnerInterrupt(controller.signal)
-          ? { status: "interrupted" }
-          : { status: "failed", code: typeof error?.code === "string" ? error.code : null };
+        if (isOwnerInterrupt(controller.signal)) {
+          turn.settled = { status: "interrupted" };
+          this.markStopped(sessionId, requestId);
+        } else {
+          turn.settled = { status: "failed", code: typeof error?.code === "string" ? error.code : null };
+        }
         throw error;
       } finally {
         if (this.turns.get(key) === turn) this.turns.delete(key);
@@ -125,7 +185,7 @@ export async function interruptTurn({ liveTurns, store, sessionId, requestId, se
     return settledOutcome(live.settled, requestId);
   }
   const stored = storedTurn(store, sessionId, requestId);
-  if (!stored) return { status: "not_found", requestId };
+  if (!stored) return liveTurns?.wasStopped(sessionId, requestId) ? { status: "interrupted", requestId } : { status: "not_found", requestId };
   if (stored.status === "failed" && stored.code === "stopped") return { status: "interrupted", requestId };
   return { status: "finished", outcome: stored.status, requestId };
 }

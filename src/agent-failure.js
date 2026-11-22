@@ -1,3 +1,4 @@
+import { STOPPED_TEXT } from "./message-turns.js";
 const PUBLIC_FAILURES = Object.freeze({
   "image-input-unsupported": "This model cannot view images. Choose a vision-capable model in Model settings, then send the images again.",
   budget: "Daily budget exceeded",
@@ -24,7 +25,7 @@ const PUBLIC_FAILURES = Object.freeze({
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details.",
   // Not a fault: the owner stopped the reply to send something else first.
   // An action that was already running may have finished; none is undone.
-  stopped: "Stopped so your next message could go first. Anything already under way may have finished; nothing was undone."
+  stopped: STOPPED_TEXT
 });
 
 const loggedFailures = new WeakSet();

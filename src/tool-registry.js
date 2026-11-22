@@ -1,3 +1,4 @@
+import { toolSignal } from "./message-turns.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { describeSchedule, parseScheduleDays, scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
@@ -294,7 +295,10 @@ export class ToolRegistry {
 
   async runHandler(tool, args, context) {
     try {
-      const result = await tool.handler(args, context);
+      // An owner's interrupt never cuts short the action running now
+      // (message-turns.js toolSignal); other aborts still reach it.
+      const handlerContext = context?.signal ? { ...context, signal: toolSignal(context.signal) } : context;
+      const result = await tool.handler(args, handlerContext);
       // Tool results are data: they can only ever taint the turn, never
       // write any other part of the server-built context.
       taintTurn(tool, context);

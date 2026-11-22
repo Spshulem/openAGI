@@ -2385,7 +2385,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (clientTurnId && typeof body.sessionId === "string") {
           const sessionId = body.sessionId;
           const live = liveTurns.get(sessionId, clientTurnId);
-          const stored = live ? null : storedTurn(runtime.agentHost?.store ?? channels?.agentHost?.store, sessionId, clientTurnId);
+          const turnStore = runtime.agentHost?.store ?? channels?.agentHost?.store;
+          // A turn the owner stopped before it ever ran has no records yet:
+          // replay the stop, never run the replaced message.
+          const stored = live ? null : (storedTurn(turnStore, sessionId, clientTurnId) ?? liveTurns.stoppedTurn(turnStore, sessionId, clientTurnId));
           if (live) {
             runTurn = (hooks) => {
               const off = liveTurns.subscribe(live, (kind, data) => { if (kind === "progress") hooks.onProgress?.(data); });

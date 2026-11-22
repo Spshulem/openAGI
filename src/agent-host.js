@@ -3,7 +3,7 @@ import { InMemoryAgentStore } from "./agent-store.js";
 import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
 import { detectTaskInChat } from "./task-store.js";
-import { isOwnerInterrupt, ownerInterruptReason } from "./message-turns.js";
+import { isOwnerInterrupt, ownerInterruptReason, STOPPED_TEXT } from "./message-turns.js";
 import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZE_RE } from "./signal-axes.js";
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
@@ -74,6 +74,7 @@ export class AgentHost {
   }
 
   async handleMessageNow(input, options = {}) {
+    if (isOwnerInterrupt(options.signal)) this.recordStoppedBeforeStart(input);
     options.signal?.throwIfAborted();
     const reportProgress = progressReporter(options.onProgress);
     const reportTextDelta = textDeltaReporter(options.onTextDelta);
@@ -609,6 +610,33 @@ export class AgentHost {
       });
       throw failure;
     }
+  }
+
+  // The owner stopped this turn while it waited behind another one. Its
+  // slot has come, so the thread is in order: store the question and the
+  // stop, so a resend after a restart replays the stop instead of running a
+  // message the owner replaced. Never runs anything.
+  recordStoppedBeforeStart(input) {
+    const requestId = boundedText(input?.metadata?.requestId, 200);
+    if (input?.ephemeral === true || !requestId || typeof input?.sessionId !== "string") return;
+    const text = String(input.text ?? input.message ?? "").trim();
+    if (!text) return;
+    try {
+      const channel = input.channel ?? "local";
+      const from = input.from ?? "user";
+      const agentId = input.agentId ?? "main";
+      const sessionId = this.store.sessionKey({ channel, from, agentId, sessionId: input.sessionId });
+      const keep = {};
+      for (const key of ["thread", "sourceNodeId", "sourceName"]) {
+        const value = boundedText(input.metadata?.[key], 500);
+        if (value) keep[key] = value;
+      }
+      this.store.appendMessage(sessionId, { role: "user", content: text, agentId, channel, from, metadata: { ...keep, requestId } });
+      this.store.appendMessage(sessionId, {
+        role: "assistant", content: STOPPED_TEXT, agentId, channel, from: "openagi",
+        metadata: { status: "failed", code: "stopped", requestId }
+      });
+    } catch { /* the in-memory stop still answers repeats until restart */ }
   }
 
   // Runs or denies the pending card the owner's spoken confirm names and

@@ -236,10 +236,68 @@ test("a turn still waiting behind another one is dropped without running, and or
   assert.equal((await running).find((f) => f.event === "final").data.reply, "Answer to from the Mac");
   assert.equal((await correction).find((f) => f.event === "final").data.reply, "Answer to better question");
   assert.deepEqual(calls, ["from the Mac", "better question"], "the dropped turn never reached the model");
-  assert.deepEqual(stored().map(([role, , id]) => [role, id]), [
-    ["user", "turn-mac-aaaaaaa"], ["assistant", "turn-mac-aaaaaaa"],
-    ["user", "turn-next-aaaaa"], ["assistant", "turn-next-aaaaa"]
+  // Stored in order once its slot came: the question and its stop.
+  assert.deepEqual(stored(), [
+    ["user", "from the Mac", "turn-mac-aaaaaaa"], ["assistant", "Answer to from the Mac", "turn-mac-aaaaaaa"],
+    ["user", "stale question", "turn-wait-aaaaa"], ["assistant", STOPPED, "turn-wait-aaaaa"],
+    ["user", "better question", "turn-next-aaaaa"], ["assistant", "Answer to better question", "turn-next-aaaaa"]
   ]);
+  assert.deepEqual((await interrupt("turn-wait-aaaaa")).body, { status: "interrupted", requestId: "turn-wait-aaaaa" });
+});
+
+test("a turn stopped before it ran is never run by a resend of its id, even before its records exist", async (t) => {
+  const first = gate();
+  const { calls, send, interrupt, stored } = await app(t, async (request, n) => {
+    if (n === 1) await first.opened;
+    return reply(`Answer to ${request.input}`);
+  }, { interruptSettleMs: 1_000 });
+  const running = readAll(await send({ text: "long one", requestId: "turn-long-aaaaa" }, { who: "owner" }));
+  await until(() => calls.length === 1);
+  const waiting = readAll(await send({ text: "replaced", requestId: "turn-repl-aaaaa" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal((await interrupt("turn-repl-aaaaa")).body.status, "interrupted");
+  await waiting;
+
+  // Still behind the first turn, nothing stored for it yet.
+  assert.equal(stored().some(([, , id]) => id === "turn-repl-aaaaa"), false);
+  assert.deepEqual((await interrupt("turn-repl-aaaaa")).body, { status: "interrupted", requestId: "turn-repl-aaaaa" }, "a second interrupt agrees");
+  const resend = await readAll(await send({ text: "replaced", requestId: "turn-repl-aaaaa" }));
+  assert.equal(resend.find((f) => f.event === "failure").data.code, "stopped", "a resend replays the stop");
+
+  first.open();
+  await running;
+  await until(() => stored().some(([, , id]) => id === "turn-repl-aaaaa"));
+  assert.deepEqual(calls, ["long one"], "the replaced message never ran");
+  assert.equal(stored().filter(([, , id]) => id === "turn-repl-aaaaa").length, 2, "one question, one stop");
+});
+
+test("an owner interrupt never cancels the action running now; other aborts still do", async () => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const { ownerInterruptReason } = await import("../src/message-turns.js");
+  const registry = new ToolRegistry();
+  const seen = [];
+  const release = gate();
+  registry.register({
+    name: "type_text", description: "types", parameters: { type: "object", properties: {} },
+    async handler(_args, context) {
+      const aborted = new Promise((resolve) => context.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
+      seen.push(await Promise.race([aborted, release.opened.then(() => "finished")]));
+      return { ok: true };
+    }
+  });
+  const owner = new AbortController();
+  const ownerRun = registry.invoke("type_text", {}, { signal: owner.signal });
+  owner.abort(ownerInterruptReason());
+  setTimeout(release.open, 30);
+  assert.equal((await ownerRun).ok, true);
+  assert.deepEqual(seen, ["finished"], "the running action completed despite the owner's stop");
+  assert.equal((await registry.invoke("type_text", {}, { signal: owner.signal })).ok, false, "but no new action starts");
+
+  const shutdown = new AbortController();
+  const other = registry.invoke("type_text", {}, { signal: shutdown.signal });
+  shutdown.abort(new Error("request cancelled"));
+  await other;
+  assert.equal(seen.at(-1), "aborted", "a cancelled request still reaches the tool");
 });
 
 test("a phone whose stream dropped can still interrupt its turn", async (t) => {
