@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import { threadHealth } from "./classify.js";
 import { normalizeBatchCardsInput, selectBatchTargetCards } from "./coordinator.js";
+import { ACTIVE_WORK_TOOL_NAMES, registerActiveWorkTools } from "./active-work.js";
 import { registerVoiceTools } from "./voice-tools.js";
 
 const SOURCE = "integration:fleet-supervisor";
@@ -17,7 +18,8 @@ const TOOL_NAMES = [
   "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app",
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
-  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project"
+  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project",
+  ...ACTIVE_WORK_TOOL_NAMES
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
 const LABEL_MAX = 80;
@@ -621,6 +623,7 @@ export function registerFleetTools(registry, supervisor) {
       return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null, alias: args.alias ?? null });
     }
   });
+  registerActiveWorkTools(registry, supervisor, { source: SOURCE });
 }
 
 async function fleetDispatchGoalTarget(supervisor, args = {}) {

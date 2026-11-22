@@ -334,7 +334,7 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
 // Refresh immediately before dispatch; steer is preferable to interrupt if a
 // turn starts concurrently. Paseo may fall back to interruption when steering
 // is unsupported: its public API does not offer an atomic idle-only send.
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null }) {
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const silentStuckRecovery = !ownerInitiated
@@ -472,6 +472,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         if (ownerInitiated) {
           writeJsonAtomic(file, { ...intent, pending: false });
           const errReason = clampText(redactSecrets(String(sendErr?.message ?? "runtime disconnected")), 120);
+          if (!recoverDisconnected) return blocked(`Paseo delivery failed: ${errReason}; existing session only`);
           const recovered = await recoverDisconnectedPaseoSession({
             api,
             agent,
@@ -517,7 +518,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       });
       if (turnOutcome.systemError) {
         writeJsonAtomic(file, { ...correlated, pending: false });
-        if (ownerInitiated) {
+        if (ownerInitiated && recoverDisconnected) {
           const recovered = await recoverDisconnectedPaseoSession({
             api,
             agent,
@@ -538,7 +539,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
             };
           }
         }
-        return blocked(`Paseo session runtime error: ${turnOutcome.systemError}`);
+        return blocked(`Paseo session runtime error: ${turnOutcome.systemError}${recoverDisconnected ? "" : "; existing session only"}`);
       }
       if (!turnOutcome.confirmed) {
         if (ownerInitiated) {

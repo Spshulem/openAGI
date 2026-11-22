@@ -41,6 +41,7 @@ import * as codex from "./sources/codex.js";
 import * as conductor from "./sources/conductor.js";
 import * as github from "./sources/github.js";
 import * as processes from "./sources/processes.js";
+import { ActiveWorkManager } from "./active-work.js";
 
 const MIN = 60_000;
 const SOURCE_TIMEOUT_MS = 90_000;
@@ -2253,7 +2254,7 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -2288,7 +2289,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     if (delivery.status === "sent") {
@@ -2348,6 +2349,11 @@ export class FleetSupervisor {
       }
     };
     setBounded(this.knownThreads, thread.key, merged);
+    // Live inventory refreshes can arrive through listWorkspaces while the
+    // previous tick's snapshot is still in lastThreads. Keep both caches in
+    // sync so the next digest does not let the stale tick overwrite fresh
+    // running/idle state.
+    if (this.lastThreads.has(thread.key)) setBounded(this.lastThreads, thread.key, merged);
     return merged;
   }
 
@@ -2606,6 +2612,41 @@ export class FleetSupervisor {
       factory: options.factory ?? this.deps.paseoFactory,
       decisionsFetch: options.decisionsFetch ?? this.deps.decisionsFetch ?? this.deps.fetchImpl
     });
+  }
+
+  get activeWork() {
+    this._activeWork ??= new ActiveWorkManager({
+      dir: this.store.dir,
+      store: this.store,
+      runtime: this.runtime,
+      supervisor: this,
+      config: this.config,
+      deps: this.deps,
+      now: () => this.now()
+    });
+    return this._activeWork;
+  }
+
+  getActiveWork(options = {}) {
+    return this.activeWork.getActiveWork(options);
+  }
+
+  trackWork(input = {}) {
+    const result = this.activeWork.trackWork(input);
+    this.emitFleet("active-work-updated");
+    return result;
+  }
+
+  async scanActiveWork(options = {}) {
+    const pass = await this.activeWork.scanInventory(options);
+    this.emitFleet("active-work-scanned");
+    return pass;
+  }
+
+  async actActiveWork(id, input = {}, sendOptions = {}) {
+    const result = await this.activeWork.actOnWork(id, input, sendOptions);
+    if (result?.ok) this.emitFleet("active-work-acted");
+    return result;
   }
 
   // Lightweight, event-driven reconciliation of ONLY open questions' watched
