@@ -208,10 +208,13 @@ export function registerFleetTools(registry, supervisor) {
     parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX } }, required: ["key"], additionalProperties: false },
     handler: (args) => fleetThread(supervisor, args) });
   if (typeof supervisor.sendOwnerMessage === "function") registry.register({ name: "fleet_send_message", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Send the owner's own message to one coding thread the supervisor watches (key from fleet_status or fleet_search). For Paseo sessions (`paseo:<serverId>.<agentId>`), images attached to this Supervisor turn are automatically forwarded alongside the message (unless `forwardImages: false`), and setting `attachRecentImages: true` attaches images from an earlier message in this Supervisor conversation (use when the owner asks to 'attach it' or send an earlier screenshot). Never claim you cannot attach images to Paseo sessions. Runs immediately on the owner's instruction when Auto-Approve is on. A blocked or failed delivery is NOT success; report the detail.",
+    description: "Send the owner's own message to one coding thread the supervisor watches (key from fleet_status or fleet_search). For Paseo sessions (`paseo:<serverId>.<agentId>`), images attached to this Supervisor turn are automatically forwarded alongside the message (unless `forwardImages: false`), and setting `attachRecentImages: true` attaches images from an earlier message in this Supervisor conversation (use when the owner asks to 'attach it' or send an earlier screenshot). Never claim you cannot attach images to Paseo sessions. Runs immediately on the owner's instruction when Auto-Approve is on. A blocked or failed delivery is NOT success; report the detail. Never work around a blocked send by starting another session, or by asking the owner to paste the message: that duplicates the chat or the message.",
     parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX }, message: { type: "string", minLength: 1, maxLength: MESSAGE_MAX }, queue: { type: "boolean", description: "Conductor only: true queues it behind the chat's running background tasks (its Send button); default sends it now (⌘↩)." }, forwardImages: { type: "boolean", description: "Paseo only: forward images attached to this Supervisor turn (default true)." }, attachRecentImages: { type: "boolean", description: "Paseo only: attach image(s) from the owner's recent message in this conversation when none are attached on this exact turn (e.g. 'can you attach it?')." } }, required: ["key", "message"], additionalProperties: false },
     prepareApprovalArgs: (args) => fleetTarget(supervisor, args),
-    approvalTtlMs: 10 * 60_000,
+    // Valid while its chat is and the owner has not written to it since;
+    // a day at most. The send itself checks the chat again as it goes out.
+    approvalTtlMs: 24 * 60 * 60_000,
+    approvalStillValid: (args, action) => fleetSendStillValid(supervisor, args, action),
     // One card per chat, thread and text: a repeated ask reuses it.
     approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message, args.queue === true, args.attachRecentImages === true])}`,
     summarize: (args) => `Send to ${args.name} (${args.key})${args.queue === true ? ", queued behind its background tasks" : ""}:\n${args.message}`,
@@ -819,6 +822,21 @@ function fleetTarget(supervisor, args = {}) {
     }
   }
   throw new Error(`No fleet thread with key "${clip(key, KEY_MAX)}". Call fleet_status for the current keys.`);
+}
+
+async function fleetSendStillValid(supervisor, args, action) {
+  await fleetTarget(supervisor, args);
+  // Anything written to the chat since the card was (last) raised: the
+  // owner's own words, or a supervisor message. Either can change what a
+  // waiting "yes" or "go ahead" would answer.
+  const thread = supervisor.lastThreads?.get?.(args?.key) ?? null;
+  const row = (readState(supervisor).snapshot?.threads ?? []).find((item) => item?.key === args?.key);
+  const wroteAt = Math.max(Date.parse(thread?.lastUserAt ?? "") || 0, Date.parse(row?.lastOwnerAt ?? "") || 0);
+  const askedAt = Date.parse(action?.raisedAt ?? action?.createdAt ?? "");
+  if (wroteAt && Number.isFinite(askedAt) && wroteAt > askedAt) {
+    return `${clip(args?.name || args?.key, 80)} has new messages since this was asked, so it was not sent. Ask again if you still want it.`;
+  }
+  return null;
 }
 
 function fleetCardTarget(supervisor, args = {}) {

@@ -1759,6 +1759,46 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.at(-1).queue, false);
 });
 
+test("an owner send that is refused always leaves a receipt saying why", async (t) => {
+  const { supervisor } = fixture(t, { threads: [makeThread()] });
+  await supervisor.tick();
+  supervisor.deps.executor.deliver = async () => ({ status: "blocked", route: "codex-exec", detail: "the supervisor's own session: it is not nudged automatically", actionId: null });
+  supervisor._executor = null;
+  const result = await supervisor.sendOwnerMessage("codex:t1", "Pick up Active Work.");
+  assert.equal(result.delivery.status, "blocked");
+  assert.ok(result.delivery.actionId, "a receipt id");
+  const receipt = supervisor.getState().actions.find((action) => action.id === result.delivery.actionId);
+  assert.equal(receipt.playbook, "owner-message");
+  assert.match(receipt.detail, /own session/);
+});
+
+test("a long prompt already in the chat as the owner's last message is not sent again", async (t) => {
+  const prompt = "Build a first shippable slice of Supervisor Active Work / Follow-through, distinct from single-thread nudges.";
+  const { supervisor, delivered } = fixture(t, { threads: [makeThread({ lastUserText: prompt, lastUserAt: ago(5 * MIN) })] });
+  await supervisor.tick();
+  const again = await supervisor.sendOwnerMessage("codex:t1", ` ${prompt} `);
+  assert.equal(again.delivery.status, "blocked");
+  assert.equal(again.delivery.duplicate, true);
+  assert.match(again.delivery.detail, /already in this chat as your message at \d\d:\d\d UTC/);
+  assert.ok(again.delivery.actionId);
+  assert.equal(delivered.length, 0);
+  // A correction that differs only in case or inner spacing is new.
+  const { supervisor: fixed, delivered: fixedSent } = fixture(t, { threads: [makeThread({ lastUserText: prompt, lastUserAt: ago(5 * MIN) })] });
+  await fixed.tick();
+  assert.equal((await fixed.sendOwnerMessage("codex:t1", prompt.replace("Active Work", "active work"))).delivery.status, "sent");
+  assert.equal((await fixed.sendOwnerMessage("codex:t1", prompt.replace("slice of", "slice  of"))).delivery.status, "sent");
+  assert.equal(fixedSent.length, 2);
+  // Short words are meant to repeat, and an old prompt may be sent again.
+  const { supervisor: short, delivered: shortSent } = fixture(t, { threads: [makeThread({ lastUserText: "continue", lastUserAt: ago(MIN) })] });
+  await short.tick();
+  assert.equal((await short.sendOwnerMessage("codex:t1", "continue")).delivery.status, "sent");
+  assert.equal(shortSent.length, 1);
+  const { supervisor: old, delivered: oldSent } = fixture(t, { threads: [makeThread({ lastUserText: prompt, lastUserAt: ago(45 * MIN) })] });
+  await old.tick();
+  assert.equal((await old.sendOwnerMessage("codex:t1", prompt)).delivery.status, "sent");
+  assert.equal(oldSent.length, 1);
+});
+
 test("the ledger keeps the route a send actually took, not the one it was asked for", async (t) => {
   const { supervisor } = fixture(t, { threads: [makeThread()], delivery: "computer-use", deps: { uiDriver: readyDriver() } });
   await supervisor.tick();

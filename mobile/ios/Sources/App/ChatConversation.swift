@@ -74,6 +74,10 @@ final class ChatConversation {
     private var recoveryTask: Task<Void, Never>?
     private var recoveryToken = UUID()
     private var lastPage: ConversationPage?
+    // The reply whose `/message` stream is open now, and how to close it.
+    private var openStream: (replyID: UUID, close: @Sendable () -> Void)?
+    // Between `enterBackground` and the next `resume`.
+    private var isAway = false
 
     init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String,
          conversationID: String = "main", isReadOnly: Bool = false) {
@@ -216,13 +220,30 @@ final class ChatConversation {
                 requestId: requestID
             )
             openedStream = true
-            for try await event in stream {
+            // Relayed so `enterBackground` can end this loop: a socket iOS
+            // cut while the phone was locked may never report an error.
+            let (events, relay) = AsyncThrowingStream<ChatEvent, Error>.makeStream()
+            let pump = Task {
+                do {
+                    for try await event in stream { relay.yield(event) }
+                    relay.finish()
+                } catch {
+                    relay.finish(throwing: error)
+                }
+            }
+            relay.onTermination = { _ in pump.cancel() }
+            openStream = (replyID, { relay.finish() })
+            defer { if openStream?.replyID == replyID { openStream = nil } }
+            for try await event in events {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
                 case .delta(let frame):
                     // Text means main is running the turn, whatever frames
                     // came before it.
                     messages[index].accepted = true
+                    // Accepted after the app left: let go now, as
+                    // enterBackground does, rather than suspend on it.
+                    if isAway { relay.finish() }
                     // The working line stays under the text received so far
                     // until `final` (DESIGN.md); tokens don't clear it.
                     if frame.reset {
@@ -251,6 +272,7 @@ final class ChatConversation {
                     messages[index].accepted = true
                     grace.end()
                     persist()
+                    if isAway { relay.finish() }
                 }
             }
             // The daemon closes the stream only after `final` or `failure`;
@@ -269,6 +291,8 @@ final class ChatConversation {
             if !sawTerminalFrame { await connectionLost(replyID) }
         }
         persist()
+        // Away, nothing polls: `resume` catches up on return.
+        guard !isAway else { return }
         await refresh()
         startRecoveryIfNeeded()
     }
@@ -304,6 +328,7 @@ final class ChatConversation {
     // keep finding replies whose stream was lost, and resend (once, same id)
     // a send main never confirmed.
     func resume() async {
+        isAway = false
         await refresh()
         startRecoveryIfNeeded()
         if historyStatus == .synced, !isSending,
@@ -321,8 +346,21 @@ final class ChatConversation {
         recoveryTask = nil
     }
 
+    // The app went to the background (locked, or another app). iOS suspends
+    // it within seconds, and a stream it cut can look open on return, so
+    // a reply main has accepted leaves the stream now and is found again in
+    // history on `resume`. A send main has not confirmed keeps its stream:
+    // the background grace period exists to finish handing it over.
+    func enterBackground() {
+        isAway = true
+        pauseRecovery()
+        guard let open = openStream,
+              messages.first(where: { $0.id == open.replyID })?.accepted == true else { return }
+        open.close()
+    }
+
     private func startRecoveryIfNeeded() {
-        guard recoveryTask == nil, !forgotten, messages.contains(where: \.isDetached) else { return }
+        guard recoveryTask == nil, !forgotten, !isAway, messages.contains(where: \.isDetached) else { return }
         let token = UUID()
         recoveryToken = token
         recoveryTask = Task { [weak self] in

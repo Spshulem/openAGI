@@ -30,7 +30,9 @@ object SupervisorAlerts {
     private const val DISMISS = "dismiss"
     // "open thread" asks the owner to open the agent's own app; posting it as
     // an answer delivers nothing. Tapping the notification opens Supervisor.
-    private val NON_ACTIONS = listOf(DISMISS, "open thread")
+    // "Answer question" needs typed text, which is the Reply field's job.
+    private const val ANSWER_QUESTION = "Answer question"
+    private val NON_ACTIONS = listOf(DISMISS, "open thread", ANSWER_QUESTION)
     private const val FALLBACK_TITLE = "Needs you"
 
     // Every open question is posted once. "notified" is what stops a second
@@ -67,6 +69,13 @@ object SupervisorAlerts {
             .filter { it.isNotBlank() && NON_ACTIONS.none { skip -> it.trim().equals(skip, ignoreCase = true) } }
             .distinct()
             .take(MAX_ACTIONS)
+
+    // Whether the question's notification gets a Reply field: the answer
+    // route takes { reply } for the agent's own ask (canReply), and for a
+    // suggestion whose "Answer question" carries it as the clarification.
+    // The same rule as the daemon's push alerts (src/mobile-push.js).
+    fun acceptsReply(q: FleetQuestion): Boolean =
+        q.canReply || (q.kind == "suggestion" && ANSWER_QUESTION in q.options)
 
     fun title(q: FleetQuestion): String =
         cap(q.title?.trim().orEmpty().ifEmpty { FALLBACK_TITLE }, TITLE_MAX)

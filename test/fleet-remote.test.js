@@ -668,3 +668,34 @@ test("a reply the fleet computer refuses surfaces as an error on the main", asyn
   const res = await route('POST', '/fleet/api/questions/fq_one', null, async () => ({ reply: 'Use main.' }));
   assert.equal(res.status, 409, 'the main reads canReply from the mirrored state');
 });
+
+test('feedback said while the fleet computer is unreachable is kept on the main and sent once it is back', async t => {
+  const { dir, state } = fixture(t);
+  const recorded = [];
+  let online = false;
+  const fake = createFleetCapability({
+    getState: () => structuredClone(state),
+    recordFeedback: (input) => { const record = { id: `fb_${recorded.length + 1}`, status: 'new', ...input }; recorded.push(record); return record; },
+    feedback: () => [...recorded].reverse()
+  });
+  const runtime = { nodeCapabilities: { dispatch: async (_node, _cap, operation, payload) => {
+    if (!online) throw new Error('offline');
+    return fake.invoke(operation, payload);
+  } } };
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  const queued = await remote.recordFeedback({ utterance: 'Approvals still ask for codes', intent: 'fix', source: 'text' });
+  assert.equal(queued.status, 'queued');
+  assert.match(queued.id, /^fb_local_/);
+  assert.equal(recorded.length, 0);
+  // Survives a restart of the main.
+  const restarted = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  assert.equal(restarted.feedbackOutbox.length, 1);
+  online = true;
+  await restarted.refresh();
+  assert.deepEqual(recorded.map(r => r.utterance), ['Approvals still ask for codes']);
+  assert.equal(restarted.feedbackOutbox.length, 0);
+  assert.equal(new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir }).feedbackOutbox.length, 0, 'sent once, not again');
+  // Online, it goes straight through.
+  const direct = await restarted.recordFeedback({ utterance: 'Thanks', intent: 'dismiss', source: 'text' });
+  assert.equal(direct.id, 'fb_2');
+});

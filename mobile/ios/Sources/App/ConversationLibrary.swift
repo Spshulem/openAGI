@@ -102,6 +102,19 @@ final class ConversationLibrary {
         await refresh()
     }
 
+    // App-wide, not per screen: a reply keeps streaming in a chat that is
+    // not on screen (Supervisor's Needs you channel, another tab), and that
+    // chat must catch up on return just like the visible one.
+    func enterBackground() {
+        chats.values.forEach { $0.enterBackground() }
+    }
+
+    func resumeOpenChats() {
+        guard active else { return }
+        // Side by side: one chat's once-only resend must not hold up another.
+        for chat in chats.values { Task { await chat.resume() } }
+    }
+
     func suspend() {
         active = false
         chats.values.forEach { $0.suspend() }

@@ -30,7 +30,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@getpaseo/client": "0.15.0",
+    "@getpaseo/client": "0.16.2",
     "ws": "8.21.3"
   },
   "bin": {

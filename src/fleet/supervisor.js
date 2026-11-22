@@ -32,6 +32,7 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
+import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -571,6 +572,22 @@ export function canReplyTo(question) {
 const RISKY_NO_ROUTE = "risky ask: it is only typed into the agent's app, and this Mac cannot type into it; approve it in the chat";
 const RISKY_WAITS = "risky ask: it is only typed into the agent's app";
 // Whether the Mac can type into this thread's app later (not a CLI-only Mac).
+// The chat's last owner message is this same text, sent within the last
+// half hour: its time (HH:MM UTC), else null. Short words ("continue",
+// "yes") are meant to repeat; only a real prompt counts.
+const DUPLICATE_WINDOW_MS = 30 * 60_000;
+const DUPLICATE_MIN_CHARS = 60;
+// Exact text, outer whitespace aside: case and inner spacing can be the
+// whole correction (an identifier, a Python indent).
+const sameWords = (value) => String(value ?? "").trim();
+
+function sameRecentOwnerText(thread, text, now) {
+  const at = Date.parse(thread?.lastUserAt ?? "");
+  if (!Number.isFinite(at) || now - at > DUPLICATE_WINDOW_MS || sameWords(text).length < DUPLICATE_MIN_CHARS) return null;
+  if (sameWords(thread.lastUserText) !== sameWords(text)) return null;
+  return `${new Date(at).toISOString().slice(11, 16)} UTC`;
+}
+
 function typesLater(thread, deliveryState) {
   return Boolean(uiTargetFor(thread)) && ["computer-use", "computer-use-first"].includes(deliveryState?.mode);
 }
@@ -2213,6 +2230,14 @@ export class FleetSupervisor {
       const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
       return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
     }
+    // Already in the chat: the owner pasted it, or an earlier send that
+    // looked lost got through. Sending it again would run it twice.
+    const already = sameRecentOwnerText(thread, text, this.now());
+    if (already) {
+      const detail = `already in this chat as your message at ${already}; not sent again`;
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route, detail });
+      return { delivery: { status: "blocked", route, detail, actionId: action.id, duplicate: true } };
+    }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
@@ -2231,8 +2256,12 @@ export class FleetSupervisor {
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
+    // Every owner send leaves a receipt, a refused one too, so "blocked"
+    // always says why in the thread's history.
+    const actionId = delivery.actionId
+      ?? (delivery.status === "sent" ? null : this.store.recordAction({ threadKey, playbook: "owner-message", status: delivery.status ?? "blocked", route: delivery.route ?? route, detail: delivery.detail ?? null })?.id);
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
-      ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(actionId ? { actionId } : {}),
       ...(delivery.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
@@ -2304,6 +2333,25 @@ export class FleetSupervisor {
 
   async inspectRepoStatus(options = {}) {
     return inspectRepoStatus(this, { ...options, factory: options.factory ?? this.deps.paseoFactory });
+  }
+
+  async paseoSessionSettings(threadKey, options = {}) {
+    const target = parsePaseoSettingsTarget(threadKey);
+    if (!target) return { ok: false, status: "wrong-target", detail: "Choose one exact Paseo session." };
+    return readPaseoSessionSettings(this.config, {
+      ...target,
+      factory: options.factory ?? this.deps.paseoFactory
+    });
+  }
+
+  async updatePaseoSessionSettings(threadKey, body = {}, options = {}) {
+    const target = parsePaseoSettingsTarget(threadKey);
+    if (!target) return { ok: false, status: "wrong-target", detail: "Choose one exact Paseo session." };
+    return applyPaseoSessionSettings(this.config, {
+      ...target,
+      body,
+      factory: options.factory ?? this.deps.paseoFactory
+    });
   }
 
   async startPaseoSession(options = {}) {
