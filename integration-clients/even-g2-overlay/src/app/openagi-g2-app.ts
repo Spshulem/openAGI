@@ -338,7 +338,8 @@ export class OpenAGIG2App {
     } catch (error) { this.phone.set('Needs You unavailable', safeOpenAGIError(error)); this.flash('Needs You unavailable', safeOpenAGIError(error)) }
   }
   async supervisorWalkthroughAction(operation: 'next' | 'back' | 'skip' | 'pause' | 'resume'): Promise<void> {
-    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || !['home', 'status', 'walkthrough'].includes(this.mode)) return
+    const walkthroughResult = this.mode === 'message' && this.walkthroughActionOrigin
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || (!['home', 'status', 'walkthrough'].includes(this.mode) && !walkthroughResult)) return
     const current = this.supervisorWalkthrough?.currentId ?? undefined
     try {
       const walkthrough = await this.proactive.walkthrough(operation, current)
@@ -392,7 +393,8 @@ export class OpenAGIG2App {
     const isMergeCard = item?.cardKind === 'merge_ready' || item?.cardKind === 'pr_ready'
     const ciFailed = ['failing', 'failure', 'error'].includes((item?.ciState ?? '').toLowerCase())
     const primaryIsFix = /fix ci|rebase/i.test(item?.primaryLabel ?? '')
-    const primaryCard = item?.supervisor && item.cardId && (item.action === 'act-fleet-card' || isMergeCard || item.cardKind === 'preference')
+    const unsupportedPrimary = /^(?:answer question|review plan)$/i.test(item?.primaryLabel?.trim() ?? '')
+    const primaryCard = item?.supervisor && item.cardId && !unsupportedPrimary && (item.action === 'act-fleet-card' || isMergeCard || item.cardKind === 'preference')
       ? [{ label: isMergeCard && !primaryIsFix ? `${item.primaryLabel || 'Merge PR'}${item.prRef ? ` (${item.prRef})` : ''}` : (item.primaryLabel || 'Approve'), op: 'act-card' as const, cardOp: 'primary' as const }]
       : []
     const fixCiCard = item?.supervisor && item.cardId && ciFailed && !primaryIsFix
@@ -758,6 +760,7 @@ export class OpenAGIG2App {
     this.clearNotice()
     if (this.mode === 'cue') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showCuePage() }
     else if (this.mode === 'walkthrough') void this.supervisorWalkthroughAction(direction < 0 ? 'next' : 'back')
+    else if (this.mode === 'message' && this.walkthroughActionOrigin) void this.supervisorWalkthroughAction(direction < 0 ? 'next' : 'back')
     else if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
     else if (this.mode === 'inbox-detail') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showInboxPage() }
     else if (this.mode === 'inbox-action') { this.actionIndex = Math.max(0, Math.min(this.inboxActions().length - 1, this.actionIndex - direction)); this.showInboxAction() }
