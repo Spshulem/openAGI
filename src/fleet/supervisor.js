@@ -397,8 +397,8 @@ export function groupQuestions(asks, byKey) {
   const groups = { limit: [], open: [], deliver: [] };
   const single = (decision) => ({
     ...decision.question,
-    threadKey: decision.threadKey.startsWith("infra:") ? null : decision.threadKey,
-    prRef: byKey.get(decision.threadKey)?.prRefs?.[0] ?? null,
+    threadKey: String(decision.threadKey ?? "").startsWith("infra:") ? null : (decision.threadKey ?? null),
+    prRef: decision.question.prRef ?? (decision.threadKey ? byKey.get(decision.threadKey)?.prRefs?.[0] : null) ?? null,
     playbook: decision.playbook
   });
   for (const decision of asks) {
@@ -3604,9 +3604,12 @@ export class FleetSupervisor {
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors, ranked);
     await this.preferOpenPrs(inScope, config, run);
     const unreadPrs = new Set();
-    // An open question's PR is read too, even once its thread moved to
-    // another PR or left the scan: its merge settles the question.
-    const askedPrs = this.store.openQuestions().map((question) => question.prRef);
+    // An open question's PR and any ActiveWork PR are read too, even once
+    // their thread moved to another PR or left the scan: a merge settles them.
+    const askedPrs = [
+      ...this.store.openQuestions().map((question) => question.prRef),
+      ...(this.activeWork.getActiveWork({ limit: 60 })?.items ?? []).map((item) => item?.prRef)
+    ];
     const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs, askedPrs), unreadPrs);
 
     const infra = {
@@ -4060,7 +4063,7 @@ export class FleetSupervisor {
       } else if (health[kind].up) {
         // A resume the judge has not read yet (its cap, a failure) is still due.
         const pending = new Set(recovering
-          .filter((decision) => !decision.threadKey.startsWith("infra:") && !attempted.has(decision.threadKey)
+          .filter((decision) => !String(decision.threadKey ?? "").startsWith("infra:") && !attempted.has(decision.threadKey)
             && ((decision.action === "nudge" && decision.route) || (decision.judgePending && decision.playbook === "infra-recovered")) && mode === "auto")
           .map((decision) => decision.threadKey));
         const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
@@ -4409,14 +4412,13 @@ export class FleetSupervisor {
               route,
               judged: true,
               reason: precNudge.summary,
-              message: precNudge.directive
-            });
-            this.precedentMemory.recordApplication({
-              precedentId: precNudge.precedentId,
-              threadKey: thread.key,
-              summary: precNudge.summary,
-              confidence: precNudge.confidence,
-              source: precNudge.source
+              message: precNudge.directive,
+              precedentMeta: {
+                precedentId: precNudge.precedentId,
+                summary: precNudge.summary,
+                confidence: precNudge.confidence,
+                source: precNudge.source
+              }
             });
             askedThreadKeys.add(thread.key);
             continue;
@@ -4855,6 +4857,12 @@ export class FleetSupervisor {
         const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
         if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
         if (delivery.status !== "blocked") sends += 1;
+        if (delivery.status === "sent" && decision.precedentMeta) {
+          this.precedentMemory.recordApplication({
+            ...decision.precedentMeta,
+            threadKey: decision.threadKey
+          });
+        }
         if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
         if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
         else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
@@ -5184,7 +5192,7 @@ export class FleetSupervisor {
     }
     for (const r of rows) setBounded(this.knownRows, r.key, r);
     for (const key of this.watchSince.keys()) if (!seen.has(key)) this.watchSince.delete(key);
-    const infraDecisions = decisions.filter((decision) => decision.threadKey.startsWith("infra:"))
+    const infraDecisions = decisions.filter((decision) => String(decision.threadKey ?? "").startsWith("infra:"))
       .map((decision) => ({ key: decision.threadKey, action: decision.action, reason: clampText(decision.reason, 200), notBefore: decision.notBefore ?? null }));
     const sources = Object.fromEntries(THREAD_KINDS.map((kind) => [kind, 0]));
     for (const thread of threads) sources[thread.kind] = (sources[thread.kind] ?? 0) + 1;

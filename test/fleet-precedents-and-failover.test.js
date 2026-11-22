@@ -11,10 +11,15 @@ import {
 } from "../src/fleet/precedent-memory.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { paseoThread } from "../src/fleet/sources/paseo.js";
-import { failoverPaseoSessionProvider, resolveDefaultPaseoModeId, selectBestPaseoModel } from "../src/fleet/paseo-delivery.js";
+import {
+  deliverPaseo,
+  failoverPaseoSessionProvider,
+  resolveDefaultPaseoModeId,
+  selectBestPaseoModel
+} from "../src/fleet/paseo-delivery.js";
 import { resolvePaseoAgentConfig } from "../src/fleet/coordinator.js";
 import { buildSupervisorDeck } from "../src/fleet/cards.js";
-import { FleetSupervisor } from "../src/fleet/supervisor.js";
+import { FleetSupervisor, groupQuestions } from "../src/fleet/supervisor.js";
 import { fleetStatus } from "../src/fleet/tools.js";
 import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
 import { SkillRegistry } from "../src/skills.js";
@@ -498,4 +503,163 @@ test("resolvePaseoAgentConfig & selectBestPaseoModel pick Opus 5.5 (never stale 
   const fuzzyOpusCfg = await resolvePaseoAgentConfig(mockApi, "/home/dev/buildbetter", { model: "opus" });
   assert.equal(fuzzyOpusCfg.model, "claude-opus-5-5");
   assert.equal(fuzzyOpusCfg.modeId, "bypassPermissions");
+});
+
+test("groupQuestions and supervisor.act handle orphan ActiveWork ready PRs (threadKey: null) without throwing startsWith on null", async () => {
+  await withTempDir(async (dir) => {
+    const grouped = groupQuestions(
+      [
+        {
+          threadKey: null,
+          action: "ask-user",
+          playbook: null,
+          question: {
+            kind: "ready",
+            dedupeKey: "ready:buildbetter-app/buildbetter#9253",
+            threadKey: null,
+            prRef: "buildbetter-app/buildbetter#9253",
+            project: "BuildBetter",
+            title: "PR #9253 ready for merge review",
+            body: "CI is green on buildbetter-app/buildbetter#9253.",
+            options: ["Check PR", "skip"]
+          }
+        }
+      ],
+      new Map()
+    );
+    assert.equal(grouped.length, 1);
+    assert.equal(grouped[0].threadKey, null);
+    assert.equal(grouped[0].prRef, "buildbetter-app/buildbetter#9253");
+
+    const sup = new FleetSupervisor({
+      dataDir: dir,
+      config: { enabled: false, mode: "auto", paseo: { enabled: false }, review: { enabled: false } },
+      skip: { bb3: true, github: true }
+    });
+    sup.activeWork.getActiveWork = () => ({
+      items: [
+        {
+          id: "aw_orphan_9253",
+          project: "BuildBetter",
+          goal: "Merge review PR #9253",
+          prRef: "buildbetter-app/buildbetter#9253",
+          prState: "OPEN",
+          prCiState: "SUCCESS",
+          prIsDraft: false,
+          followThroughState: "orphan_pr",
+          category: "orphan_pr",
+          owner: { threadKey: null }
+        }
+      ]
+    });
+    const prs = new Map([
+      [
+        "buildbetter-app/buildbetter#9253",
+        {
+          ref: "buildbetter-app/buildbetter#9253",
+          state: "OPEN",
+          isDraft: false,
+          ci: { state: "SUCCESS" },
+          title: "Fix orphan PR surfacing",
+          headOid: "abc1234567"
+        }
+      ]
+    ]);
+    await sup.act([], {
+      mode: "auto",
+      byKey: new Map(),
+      manager: null,
+      started: Date.now(),
+      config: sup.config,
+      items: [],
+      prs
+    });
+    const open = sup.store.openQuestions();
+    assert.equal(open.length, 1);
+    assert.equal(open[0].prRef, "buildbetter-app/buildbetter#9253");
+    assert.equal(open[0].threadKey, null);
+  });
+});
+
+test("deliverPaseo allows precedent error-recovery nudges when Paseo session status is error", async () => {
+  await withTempDir(async (dir) => {
+    const store = new FleetStore({ dir });
+    let sentText = null;
+    let sentMessageId = null;
+    let mockAgent = {
+      id: "736b7417-09e7-43e9-9e0b-b4988966fdcd",
+      status: "error",
+      activeTurn: null,
+      archivedAt: null,
+      cwd: "/home/dev/openAGI",
+      workspaceId: null,
+      updatedAt: "2026-11-22T06:00:00.000Z",
+      pendingPermissions: []
+    };
+    const thread = {
+      key: "paseo:srv_test.736b7417-09e7-43e9-9e0b-b4988966fdcd",
+      id: mockAgent.id,
+      kind: "paseo",
+      excluded: null,
+      archived: false,
+      meta: {
+        serverId: "srv_test",
+        paseoCwd: "/home/dev/openAGI",
+        workspaceId: null,
+        updatedAt: "2026-11-22T06:00:00.000Z"
+      }
+    };
+    const mockRef = {
+      refresh: async () => {},
+      current: () => mockAgent,
+      timeline: {
+        refetch: async () => ({
+          agent: mockAgent,
+          entries: sentMessageId
+            ? [
+                {
+                  turnId: "turn_recover_1",
+                  item: {
+                    type: "user_message",
+                    clientMessageId: sentMessageId,
+                    text: sentText
+                  }
+                }
+              ]
+            : [],
+          hasNewer: false,
+          error: null
+        })
+      },
+      send: async (msg, opts) => {
+        sentText = msg;
+        sentMessageId = opts?.messageId ?? "msg_1";
+        mockAgent = {
+          ...mockAgent,
+          status: "running",
+          activeTurn: { turnId: "turn_recover_1" }
+        };
+        return { turnId: "turn_recover_1" };
+      }
+    };
+    const factory = () => ({
+      agents: { ref: () => mockRef },
+      connect: async () => {},
+      close: async () => {},
+      hosts: {
+        list: async () => ({ self: { serverId: "srv_test" }, hosts: [] })
+      }
+    });
+    const res = await deliverPaseo({
+      config: { paseo: { enabled: true, endpoint: "ws://127.0.0.1:6767" } },
+      thread,
+      text: "[OpenAGI supervisor] Stream disconnected mid-turn — retry and continue.",
+      store,
+      actionId: "act_prec_err",
+      base: { playbook: "precedent:prec_stream_disconnect_retry", messageHash: "h123" },
+      factory
+    });
+    assert.equal(res.status, "sent");
+    assert.match(String(sentText), /Stream disconnected mid-turn/);
+  });
 });

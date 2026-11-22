@@ -611,10 +611,11 @@ async function respondPaseoPermission(api, ref, agentId, requestId, response) {
   throw new Error("Paseo client does not support respondToPermission");
 }
 
-function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false } = {}) {
+function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false, errorRecovery = false } = {}) {
   if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
-  if (!ownerInitiated && !silentStuckRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  if (errorRecovery && (!["idle", "error"].includes(agent.status) || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
   if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
@@ -633,6 +634,10 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const silentStuckRecovery = !ownerInitiated
     && Boolean(thread?.meta?.silentStuck)
     && ["status-check", "resume", "unblock-snag"].includes(base?.playbook);
+  const errorRecovery = !ownerInitiated && (
+    base?.playbook === "error-retry"
+    || String(base?.playbook ?? "").startsWith("precedent:")
+  );
   const normalizedImages = normalizePaseoImages(images);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
@@ -731,14 +736,14 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
         }
       }
-      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery });
+      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
       if (preflight) return blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: ownerInitiated ? 8 : 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
       // refetch updates the SDK handle; check both snapshots so a newer event
       // or an unavailable baseline cannot be hidden by the other snapshot.
-      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery });
+      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
       if (changed) return blocked(changed);
       const messageId = randomUUID();
       const cursor = timelineCursor(baseline);
