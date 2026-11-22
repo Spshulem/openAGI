@@ -23,6 +23,29 @@ struct DictationTranscript: Equatable {
 
     // startsNewUtterance: the recognizer began a new utterance without first
     // marking the last one final; keep what was heard rather than drop it.
+    // Whether a result begins a new utterance the recognizer did not mark
+    // final. Only real, advancing timing counts: on-device partial results
+    // often carry zero timestamps and durations, and an ordinary revision
+    // ("Before" -> "Before the") must never be taken for a new utterance.
+    // Segments are (start, end) in seconds; previousEnd is where the last
+    // result's speech ended.
+    static let utteranceGap: TimeInterval = 0.3
+    nonisolated static func startsNewUtterance(previousEnd: TimeInterval?, segments: [(TimeInterval, TimeInterval)],
+                                               live: String, text: String) -> Bool {
+        guard let previousEnd, previousEnd > 0, let first = segments.first,
+              first.0 > 0, first.1 > first.0 else { return false }
+        guard first.0 >= previousEnd + utteranceGap else { return false }
+        // A continuation of what is already live is a revision, whatever the timing says.
+        let liveWords = live.lowercased().split(separator: " "), words = text.lowercased().split(separator: " ")
+        return !(liveWords.first.map { words.first == $0 } ?? false)
+    }
+
+    // The end of the speech in a result, if its timing is set.
+    nonisolated static func speechEnd(of segments: [(TimeInterval, TimeInterval)]) -> TimeInterval? {
+        guard let end = segments.last?.1, end > 0 else { return nil }
+        return end
+    }
+
     mutating func receive(_ text: String, isFinal: Bool, startsNewUtterance: Bool = false) -> String {
         if startsNewUtterance, !live.isEmpty { finished.append(live); live = "" }
         live = text
@@ -161,8 +184,9 @@ final class ChatDictation {
                 guard let self else { return }
                 // A result that begins after everything heard so far ended is a
                 // new utterance, even if iOS did not mark the last one final.
-                let newUtterance = segments.first.map { first in self.lastSegmentEnd.map { first.0 >= $0 } ?? false } ?? false
-                if let end = segments.last?.1 { self.lastSegmentEnd = end }
+                let newUtterance = DictationTranscript.startsNewUtterance(
+                    previousEnd: self.lastSegmentEnd, segments: segments, live: self.transcript.live, text: text ?? "")
+                if let end = DictationTranscript.speechEnd(of: segments) { self.lastSegmentEnd = end }
                 self.handle(text: text, isFinal: finished, failed: failed, startsNewUtterance: newUtterance, generation: generation)
             }
         }

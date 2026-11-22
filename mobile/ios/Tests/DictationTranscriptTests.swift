@@ -42,4 +42,41 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertEqual(t.receive("", isFinal: true), "Hello.")
         XCTAssertEqual(t.receive("Again", isFinal: false), "Hello. Again")
     }
+
+    // Codex review on #341: on-device partials often have zero timing. A
+    // plain revision must not be taken for a new utterance and duplicated.
+    func testZeroTimingRevisionsAreNeverANewUtterance() {
+        var t = DictationTranscript(base: "")
+        var previousEnd: TimeInterval?
+        var draft = ""
+        for text in ["Before", "Before the", "Before the pause"] {
+            let segments: [(TimeInterval, TimeInterval)] = text.split(separator: " ").map { _ in (0, 0) }
+            let fresh = DictationTranscript.startsNewUtterance(previousEnd: previousEnd, segments: segments, live: t.live, text: text)
+            XCTAssertFalse(fresh, "unset timing must never start a new utterance")
+            if let end = DictationTranscript.speechEnd(of: segments) { previousEnd = end }
+            draft = t.receive(text, isFinal: false, startsNewUtterance: fresh)
+        }
+        XCTAssertEqual(draft, "Before the pause")
+        XCTAssertNil(previousEnd, "zero timing is never recorded as where speech ended")
+    }
+
+    func testRevisionsWithRealTimingAreNotANewUtterance() {
+        // Same utterance: the first word keeps its start; later words extend it.
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 0.9, segments: [(0.2, 0.5), (0.5, 0.9), (0.9, 1.4)],
+                                                             live: "Before the", text: "Before the pause"))
+        // Timing advanced but the text continues the live words: still a revision.
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 0.9, segments: [(1.5, 1.8)],
+                                                             live: "Before the", text: "Before the pause"))
+    }
+
+    func testANewUtteranceNeedsRealTimingThatStartsAfterAGap() {
+        XCTAssertTrue(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.9), (2.9, 3.3)],
+                                                            live: "Before the pause", text: "After the pause"))
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(1.5, 1.8)],
+                                                             live: "Before the pause", text: "After"), "no real gap")
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [(2.6, 2.9)],
+                                                             live: "", text: "After"), "nothing heard before")
+        XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.6)],
+                                                             live: "Before", text: "After"), "zero duration is unset timing")
+    }
 }
