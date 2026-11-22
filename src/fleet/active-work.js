@@ -611,7 +611,10 @@ export class ActiveWorkManager {
     const { byKey: sessionsByKey } = this._knownSessionsByKey();
     const prsByRef = this._livePrMap();
 
-    const rawGoal = cleanText(input.goal ?? "", 600);
+    // Manager dispatch accepts up to 4,000 characters. Preserve the complete
+    // delegated ask so late accessibility/release requirements survive in the
+    // durable Work record and verification context.
+    const rawGoal = cleanText(input.goal ?? "", 4000);
     if (!rawGoal) throw new Error("Provide a goal describing the outcome or commitment to track.");
 
     const rawThreadKey = typeof input.threadKey === "string" && input.threadKey.trim()
@@ -733,12 +736,20 @@ export class ActiveWorkManager {
     // project-scoped Ask Supervisor, and every follow-through check. Keep the
     // original ask separate from the mutable goal so later edits never erase
     // what was actually delegated.
-    const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 600);
-    const acceptanceCriteria = cleanText(input.acceptanceCriteria ?? existing?.acceptanceCriteria ?? requestedDoneCriteria ?? defaultDoneCriteria, 500);
+    const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 4000);
+    const acceptanceCriteria = cleanText(input.acceptanceCriteria ?? existing?.acceptanceCriteria ?? existing?.doneCriteria ?? requestedDoneCriteria ?? defaultDoneCriteria, 500);
     const currentStep = cleanText(input.currentStep ?? existing?.currentStep ?? input.progressSummary ?? "Queued for owner work", 300);
     const nextMilestone = cleanText(input.nextMilestone ?? existing?.nextMilestone ?? nextAction ?? "Fresh owner evidence", 300);
     const blocker = cleanText(input.blocker ?? existing?.blocker ?? "", 300) || null;
-    const nextActionOwner = cleanText(input.nextActionOwner ?? existing?.nextActionOwner ?? owner.label ?? "Owner", 120) || null;
+    const nextActionOwnerExplicit = input.nextActionOwner !== undefined
+      ? Boolean(cleanText(input.nextActionOwner, 120))
+      : Boolean(existing?.nextActionOwnerExplicit);
+    const nextActionOwner = cleanText(
+      input.nextActionOwner !== undefined
+        ? input.nextActionOwner
+        : (nextActionOwnerExplicit ? existing?.nextActionOwner : owner.label),
+      120
+    ) || null;
     const eta = cleanText(input.eta ?? existing?.eta ?? "", 120) || null;
     const nextCheckMs = parseIsoMs(input.nextCheckAt ?? existing?.nextCheckAt);
     const nextCheckAt = nextCheckMs !== null
@@ -769,6 +780,12 @@ export class ActiveWorkManager {
 
       let nextState = requestedState ?? existing.state ?? "active";
       let outcomeVerified = Boolean(existing.outcomeVerified);
+      if (input.dispatching === true) {
+        // A new execution of an already-verified directive is a fresh open
+        // outcome; never let the prior completion hide the rerun.
+        nextState = requestedState && requestedState !== "done" ? requestedState : "active";
+        outcomeVerified = false;
+      }
       if (goalChanged && input.confirmDone !== true) {
         if (existing.state === "done") nextState = "active";
         outcomeVerified = false;
@@ -799,7 +816,8 @@ export class ActiveWorkManager {
         nextActionOwner,
         eta,
         nextCheckAt,
-        workflowStage: requestedWorkflowStage,
+        workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
+        nextActionOwnerExplicit,
         cadence: input.cadence !== undefined ? cadence : existing.cadence,
         permittedNudges: input.permittedNudges !== undefined ? permittedNudges : existing.permittedNudges,
         owner: (input.owner !== undefined || input.threadKey !== undefined) ? owner : existing.owner,
@@ -875,7 +893,8 @@ export class ActiveWorkManager {
         nextActionOwner,
         eta,
         nextCheckAt,
-        workflowStage: requestedWorkflowStage,
+        workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
+        nextActionOwnerExplicit,
         cadence,
         permittedNudges,
         owner,
@@ -1380,6 +1399,7 @@ export class ActiveWorkManager {
       verificationQuestion = `${item.project}${item.theme ? ` / ${item.theme}` : ""} has been idle ${idleHours}h. Resume owner, snooze, or confirm done?`;
     }
 
+    const explicitWorkflowStage = normalizeWorkflowStage(item.workflowStage);
     const workflowStage = item.outcomeVerified === true
       ? "verified_done"
       : (prState === "MERGED"
@@ -1388,7 +1408,9 @@ export class ActiveWorkManager {
               ? "ready_for_review"
               : (prState === "OPEN" && prCiState && prCiState !== "SUCCESS"
                   ? "validating"
-                  : (sessionStatus === "running" ? "implementing" : normalizeWorkflowStage(item.workflowStage)))));
+                  : (explicitWorkflowStage !== "queued" && explicitWorkflowStage !== "implementing"
+                      ? explicitWorkflowStage
+                      : (sessionStatus === "running" ? "implementing" : explicitWorkflowStage)))));
     const executionHealth = followThroughState === "blocked" || followThroughState === "blocked_pr"
       ? "blocked"
       : (isPastCadence && sessionStatus !== "running"

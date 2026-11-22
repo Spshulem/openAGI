@@ -2,7 +2,7 @@
 // Scoped Project Supervisor hierarchy, and Manager-Level Goal Dispatch
 // ("Go work on <feature> in <project>").
 
-import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets } from "./contracts.js";
+import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets, shortHash } from "./contracts.js";
 import { listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, matchGoalWithDecisions } from "./decisions-gate.js";
 import { hostApi, isLocalPaseoUrl, withPaseo } from "./sources/paseo.js";
@@ -20,6 +20,11 @@ export const PASEO_LABEL_COLORS = Object.freeze([
   "blue",
   "red"
 ]);
+
+function dispatchDedupeKey(project, theme, goal) {
+  const slug = (value) => String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general";
+  return `dispatch:${slug(project)}:${slug(theme)}:${shortHash(goal)}`;
+}
 
 const THEME_RULES = [
   {
@@ -944,12 +949,13 @@ export async function dispatchManagerGoal(
   // record is written before any message is sent or new Paseo session starts,
   // so failed delivery, idle owners, and restarts still leave one truthful
   // item for Work and project-scoped Ask Supervisor to reconcile.
-  const persistDispatchOutcome = ({ threadKey = null, ownerLabel = null, workflowStage = "queued", nextAction = null } = {}) => {
+  const persistDispatchOutcome = ({ projectName = null, themeName = theme, threadKey = null, ownerLabel = null, workflowStage = "queued", nextAction = null } = {}) => {
     if (normalizedMode === "preview") return null;
     if (typeof supervisor?.trackWork !== "function") throw new Error("Cannot dispatch without durable Active Work tracking.");
+    const resolvedProject = projectName || project || "General";
     return supervisor.trackWork({
-      project: project || "General",
-      theme: theme || null,
+      project: resolvedProject,
+      theme: themeName || null,
       goal: cleanGoal,
       originalAsk: cleanGoal,
       doneCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
@@ -963,7 +969,8 @@ export async function dispatchManagerGoal(
       executionHealth: "unknown",
       cadence: "hourly",
       permittedNudges: "none",
-      dedupeKey: `dispatch:${String(project || "general").toLowerCase()}:${cleanGoal.toLowerCase()}`
+      dispatching: true,
+      dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal)
     });
   };
 
@@ -976,7 +983,7 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
-    persistDispatchOutcome({ threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
+    persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
     const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
     const ok = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
@@ -1175,6 +1182,8 @@ export async function dispatchManagerGoal(
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
     persistDispatchOutcome({
+      projectName: targetProject.name,
+      themeName: theme || inferredTheme.name,
       threadKey: best.session.key,
       ownerLabel: best.session.title || best.session.workspace,
       workflowStage: "implementing",
@@ -1217,7 +1226,9 @@ export async function dispatchManagerGoal(
     };
   }
 
-  persistDispatchOutcome({
+  const persisted = persistDispatchOutcome({
+    projectName: targetProject.name,
+    themeName: theme || inferredTheme.name,
     ownerLabel: suggestedTitle,
     workflowStage: "queued",
     nextAction: "New owner session starts and acknowledges the request"
@@ -1252,17 +1263,19 @@ export async function dispatchManagerGoal(
 
   if (created?.key && typeof supervisor?.trackWork === "function") {
     supervisor.trackWork({
+      id: persisted?.item?.id,
       project: targetProject.name,
       theme: theme || inferredTheme.name,
       goal: cleanGoal,
-      dedupeKey: `dispatch:${String(project || targetProject.name).toLowerCase()}:${cleanGoal.toLowerCase()}`,
+      dedupeKey: persisted?.item?.dedupeKey ?? dispatchDedupeKey(targetProject.name, theme || inferredTheme.name, cleanGoal),
       owner: { threadKey: created.key, label: created.title || suggestedTitle },
       currentStep: "Owner session started; awaiting first meaningful evidence",
       workflowStage: "implementing",
       nextMilestone: "Owner evidence received and verified",
       nextAction: "Owner evidence received and verified",
       nextActionOwner: created.title || suggestedTitle,
-      permittedNudges: "none"
+      permittedNudges: "none",
+      dispatching: true
     });
   }
 
