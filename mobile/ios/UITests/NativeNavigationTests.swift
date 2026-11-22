@@ -681,6 +681,28 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Approve the first synthetic action"].waitForExistence(timeout: 5))
     }
 
+    // Owner's repro: start dictating, pause about a second (iOS finalizes
+    // that segment), then keep talking. The mic must stay on and every word
+    // must stay in the same unsent draft.
+    func testDictationPauseKeepsListeningAndKeepsEverythingInOneUnsentDraft() {
+        let app = launch(["--ui-dictation-pause-fixture"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let both = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "After the pause it continues."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [both], timeout: 6), .completed, "Speech after the pause must reach the draft")
+        let draft = field.value as? String ?? ""
+        XCTAssertTrue(draft.hasPrefix("Before the pause."), "Text from before the pause must not be replaced or lost: \(draft)")
+        XCTAssertEqual(mic.label, "Stop dictation", "The microphone must still be listening after a pause")
+        XCTAssertFalse(app.staticTexts["After the pause it continues."].exists, "Dictation must never send by itself")
+        capture("native-dictation-pause", app: app)
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues.")
+    }
+
     func testLongLiveDictationStaysInBoundedEditorWithAccessibleControls() {
         let app = launch(["--ui-dictation-fixture", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tab(app, "Chat")
