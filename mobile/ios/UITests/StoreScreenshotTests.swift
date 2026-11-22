@@ -49,44 +49,58 @@ final class StoreScreenshotTests: XCTestCase {
         settle()
         capture("agents-01-supervisor-chat", app: app)
 
-        if tapIfPresent("supervisor-expand-deck", timeout: 3) { settle(); capture("agents-02-deck-expanded", app: app) }
-        if tapIfPresent("supervisor-channel-needs-you") { settle(); capture("agents-03-needs-you", app: app) }
-        let sessions = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "#sessions")).firstMatch
-        if sessions.waitForExistence(timeout: 5) { sessions.tap(); settle(); capture("agents-04-sessions", app: app) }
-        let activity = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "#activity")).firstMatch
-        if activity.waitForExistence(timeout: 5) { activity.tap(); settle(); capture("agents-05-activity", app: app) }
-        let api = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "#api")).firstMatch
-        if api.waitForExistence(timeout: 5) { api.tap(); settle(); capture("agents-06-project-api", app: app) }
-        if tapIfPresent("supervisor-channel-needs-you") { settle() }
-
-        if tapIfPresent("supervisor-card-review-card-checkout", timeout: 5) {
-            settle(3); capture("agents-07-review-checkout", app: app)
-            for _ in 0..<2 { app.swipeUp() }
-            settle(); capture("agents-08-review-checkout-scrolled", app: app)
+        // Channel pills live in a horizontal strip; scroll one into view before tapping.
+        func pill(_ prefix: String) -> Bool {
+            let button = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+            guard button.waitForExistence(timeout: 5) else { return false }
+            let strip = element("supervisor-project-channels", app: app)
+            for attempt in 0..<6 where !button.isHittable {
+                if attempt < 3 { strip.swipeLeft() } else { strip.swipeRight() }
+            }
+            guard button.isHittable else { return false }
+            button.tap()
+            return true
+        }
+        func closeSheet() {
             let done = app.buttons["Done"].firstMatch
             for _ in 0..<4 where !(done.exists && done.isHittable) { app.swipeDown() }
-            if done.exists { done.tap() } else { app.swipeDown(velocity: .fast) }
+            if done.exists && done.isHittable { done.tap() }
             settle()
         }
-        if tapIfPresent("supervisor-question-context-q-dark-mode", timeout: 4) {
-            settle(3); capture("agents-09-thread-dark-mode", app: app)
-            let done = app.buttons["Done"].firstMatch
-            for _ in 0..<4 where !(done.exists && done.isHittable) { app.swipeDown() }
-            if done.exists { done.tap() }
-            settle()
+        if pill("#needs-you") { settle(); capture("agents-03-needs-you", app: app) }
+        if pill("#sessions") { settle(); capture("agents-04-sessions", app: app) }
+        if pill("#activity") { settle(); capture("agents-05-activity", app: app) }
+        if pill("#api") { settle(); capture("agents-06-project-api", app: app) }
+        if pill("#needs-you") { settle() }
+        let review = element("supervisor-card-review-card-dark-mode", app: app)
+        if review.waitForExistence(timeout: 5) && review.isHittable {
+            review.tap(); settle(3); capture("agents-07-review-dark-mode", app: app)
+            app.swipeUp(); settle(); capture("agents-08-review-dark-mode-scrolled", app: app)
+            closeSheet()
         }
-        if tapIfPresent("supervisor-board-button") {
-            settle(3); capture("agents-10-board", app: app)
+        let blocked = element("supervisor-card-review-card-webhooks", app: app)
+        if blocked.waitForExistence(timeout: 5) && blocked.isHittable {
+            blocked.tap(); settle(3); capture("agents-09-review-webhooks", app: app)
+            closeSheet()
+        }
+        let details = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Details")).firstMatch
+        if details.waitForExistence(timeout: 4) && details.isHittable {
+            details.tap(); settle(3); capture("agents-10-details-checkout", app: app)
+            closeSheet()
+        }
+        let board = element("supervisor-board-button", app: app)
+        if board.waitForExistence(timeout: 5) && board.isHittable {
+            board.tap(); settle(3); capture("agents-11-board", app: app)
             let project = app.staticTexts["api"].firstMatch
-            if project.waitForExistence(timeout: 4) && project.isHittable { project.tap(); settle(3); capture("agents-11-board-project", app: app) }
-            if app.buttons["Done"].exists { app.buttons["Done"].tap(); settle() }
+            if project.waitForExistence(timeout: 4) && project.isHittable { project.tap(); settle(3); capture("agents-12-board-project", app: app) }
+            closeSheet()
         }
         let todayTab = app.tabBars.buttons["Today"].exists ? app.tabBars.buttons["Today"] : app.buttons["Today"].firstMatch
         if todayTab.waitForExistence(timeout: 5) {
             todayTab.tap()
             settle()
-            capture("agents-12-today", app: app)
-            if tapIfPresent("open-settings") { settle(2); capture("agents-13-settings", app: app) }
+            capture("agents-13-today", app: app)
+            if tapIfPresent("open-settings") { settle(2); capture("agents-14-settings", app: app) }
         }
         let tree = app.debugDescription
         let attachment = XCTAttachment(string: tree)

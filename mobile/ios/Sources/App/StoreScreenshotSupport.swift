@@ -72,9 +72,13 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
         // The iPad layout shows the conversation list beside the chat; without
         // this it read "Conversation list unavailable" in the store image.
         case "/conversations":
+            let paired = ProcessInfo.processInfo.arguments.contains("--store-paired-mac")
+            let agentChat: [String: Any] = ["id": "main", "thread": "agent",
+                                             "title": paired ? "Release checklist" : "Plan my morning",
+                                             "preview": paired ? "Draft the 2.4 release notes" : "Let's keep it simple",
+                                             "updatedAt": Self.date, "messageCount": 2, "readOnly": false]
             object = ["conversations": [
-                ["id": "main", "thread": "agent", "title": "Plan my morning",
-                 "preview": "Let's keep it simple", "updatedAt": Self.date, "messageCount": 2, "readOnly": false],
+                agentChat,
                 ["id": "main", "thread": "supervisor", "title": "Supervisor",
                  "preview": "Three decisions need you", "updatedAt": Self.date, "messageCount": 2, "readOnly": false]
             ]]
