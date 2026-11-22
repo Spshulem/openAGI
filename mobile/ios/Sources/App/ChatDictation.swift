@@ -35,9 +35,13 @@ struct DictationTranscript: Equatable {
         guard let previousEnd, previousEnd > 0, let first = segments.first,
               first.0 > 0, first.1 > first.0 else { return false }
         guard first.0 >= previousEnd + utteranceGap else { return false }
-        // A continuation of what is already live is a revision, whatever the timing says.
-        let liveWords = live.lowercased().split(separator: " "), words = text.lowercased().split(separator: " ")
-        return !(liveWords.first.map { words.first == $0 } ?? false)
+        // Only text that extends everything already live is a continuation;
+        // two utterances may share a first word ("I need milk", "I also need
+        // bread"), and the timing above is what separates them.
+        let normalize = { (value: String) in value.lowercased().filter { $0.isLetter || $0.isNumber || $0 == " " }
+            .split(separator: " ").joined(separator: " ") }
+        let liveText = normalize(live)
+        return liveText.isEmpty || !normalize(text).hasPrefix(liveText)
     }
 
     // The end of the speech in a result, if its timing is set.
