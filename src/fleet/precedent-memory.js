@@ -128,7 +128,9 @@ function hasUnquotedShellHazard(input) {
       quote = ch;
       continue;
     }
-    if (ch === "`" || ch === "<" || ch === ">") return true;
+    // An unquoted newline is a command separator the segment parser does not
+    // split on; a second command could hide in what looks like arguments.
+    if (ch === "`" || ch === "<" || ch === ">" || ch === "\n" || ch === "\r") return true;
     if (ch === "$" && input[i + 1] === "(") return true;
     if (ch === "&" && input[i + 1] !== "&" && input[i - 1] !== "&") return true;
   }
@@ -160,7 +162,10 @@ export function isSafeReadOnlyCommand(rawCommand) {
     }
     // Standalone safe variable assignment segment (e.g. `R=owner/repo; gh api repos/$R/...`).
     if (idx >= tokens.length) continue;
-    const cmd = path.basename(tokens[idx]);
+    // A path (./scripts/cat, /tmp/x/cat) can be any program; only bare names
+    // resolve to the system utilities this allowlist describes.
+    if (!isBareExecutable(tokens[idx])) return false;
+    const cmd = tokens[idx];
     const args = tokens.slice(idx + 1);
     if (!isAllowedReadOnlySegment(cmd, args)) return false;
     if (cmd !== "true") sawInspectionCmd = true;
@@ -195,15 +200,16 @@ export function isSafeLocalWorktreeCommitCommand(rawCommand, thread = null) {
       idx += 1;
     }
     if (idx >= tokens.length) continue;
-    const cmd = path.basename(tokens[idx]);
+    if (!isBareExecutable(tokens[idx])) return false;
+    const cmd = tokens[idx];
     const args = tokens.slice(idx + 1);
     if (isAllowedReadOnlySegment(cmd, args)) continue;
     if (cmd !== "git") return false;
+    // The isolation check is about this thread's own worktree: any option that
+    // points git at another repository or rewrites its config is refused.
+    if (args.some(isGitRepoOrConfigOverride)) return false;
     let subIdx = 0;
-    while (subIdx < args.length && args[subIdx].startsWith("-")) {
-      if (args[subIdx] === "-C" || args[subIdx] === "-c") subIdx += 2;
-      else subIdx += 1;
-    }
+    while (subIdx < args.length && args[subIdx].startsWith("-")) subIdx += 1;
     const sub = args[subIdx] ?? "";
     const subArgs = args.slice(subIdx + 1);
     if (sub === "add") {
@@ -328,28 +334,67 @@ function tokenizeSegment(seg) {
   return tokens;
 }
 
+function isBareExecutable(token) {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(String(token ?? ""));
+}
+
+function isGitRepoOrConfigOverride(arg) {
+  return /^(?:-C|-c|--git-dir(?:=.*)?|--work-tree(?:=.*)?|--namespace(?:=.*)?|--exec-path(?:=.*)?|--config-env(?:=.*)?)$/.test(arg)
+    || /^-[Cc].+/.test(arg);
+}
+
+// Short-option clusters ("-uo", "-no") still carry the flag.
+function hasShortFlag(args, letter) {
+  return args.some((a) => /^-[A-Za-z]+$/.test(a) && !a.startsWith("--") && a.slice(1).includes(letter));
+}
+
+// Options that make an otherwise read-only utility write files or run
+// another program.
+const MUTATING_OPTIONS = {
+  sort: (args) => hasShortFlag(args, "o") || args.some((a) => /^--(?:output|compress-program)(?:=|$)/.test(a)),
+  // `uniq IN OUT` writes OUT.
+  uniq: (args) => args.filter((a) => !a.startsWith("-")).length > 1,
+  rg: (args) => args.some((a) => /^--pre(?:-glob)?(?:=|$)/.test(a)),
+  file: (args) => hasShortFlag(args, "C") || args.some((a) => /^--compile$/.test(a)),
+  tail: (args) => hasShortFlag(args, "f") || hasShortFlag(args, "F") || args.some((a) => /^--(?:follow|retry)/.test(a))
+};
+
+// sed is allowed only to print: `-n` with p-only scripts such as `1,20p`,
+// `$p`, or `/re/p`; no w/W (write), e (execute), or script files.
+function isPrintOnlySedScript(script) {
+  return String(script ?? "").split(/\s*;\s*/).every((part) => /^(?:\d+|\$|\/[^/]*\/)?(?:,(?:\d+|\$|\/[^/]*\/))?p$/.test(part.trim()));
+}
+
 function isAllowedReadOnlySegment(cmd, args) {
   if (cmd === "true") return args.length === 0;
   if (SAFE_READONLY_BINS.has(cmd)) {
-    return !args.some((a) => /^-(?:f|-follow)\b/.test(a) && cmd === "tail");
+    return !(MUTATING_OPTIONS[cmd]?.(args));
   }
   if (cmd === "sed") {
-    // Only `sed -n` (no `-i` / `--in-place` / `w` write flag).
-    if (args.some((a) => /^-(?:[A-Za-z]*i|-in-place)/i.test(a))) return false;
-    return args.includes("-n");
+    if (args.some((a) => /^-(?:[A-Za-z]*[if]|-in-place|-file)/i.test(a))) return false;
+    if (!args.includes("-n")) return false;
+    const scripts = [];
+    for (let i = 0; i < args.length; i += 1) {
+      if (args[i] === "-e" || args[i] === "--expression") { scripts.push(args[i + 1]); i += 1; continue; }
+      if (/^--expression=/.test(args[i])) { scripts.push(args[i].slice(13)); continue; }
+      if (args[i].startsWith("-")) continue;
+      if (!scripts.length) scripts.push(args[i]);
+    }
+    return scripts.length > 0 && scripts.every(isPrintOnlySedScript);
   }
   if (cmd === "find") {
-    if (args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fls|fprint|fprintf)$/i.test(a))) return false;
+    if (args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fls|fprint|fprint0|fprintf)$/i.test(a))) return false;
     return true;
   }
   if (cmd === "git") {
+    if (args.some(isGitRepoOrConfigOverride)) return false;
+    // --output writes a file; -O / --open-files-in-pager runs a program;
+    // --ext-diff runs a configured external diff.
+    if (args.some((a) => /^(?:--output(?:=|$)|-O.*|--open-files-in-pager(?:=|$)|--ext-diff$)/.test(a))) return false;
     let subIdx = 0;
-    while (subIdx < args.length && args[subIdx].startsWith("-")) {
-      if (args[subIdx] === "-C" || args[subIdx] === "-c") subIdx += 2;
-      else subIdx += 1;
-    }
+    while (subIdx < args.length && args[subIdx].startsWith("-")) subIdx += 1;
     const sub = args[subIdx] ?? "";
-    if (!["status", "log", "diff", "show", "rev-parse", "branch", "ls-files", " grep", "grep", " blame", "blame"].includes(sub)) {
+    if (!["status", "log", "diff", "show", "rev-parse", "branch", "ls-files", "grep", "blame"].includes(sub)) {
       return false;
     }
     if (sub === "branch") {
@@ -735,8 +780,11 @@ export class OwnerPrecedentStore {
     // 1. Deterministic High-Confidence Rule: Read-only shell / CodexBash inspection,
     // isolated feature-worktree commit, or staging MCP read/report tools.
     if (question?.kind === "prompt") {
-      const permName = String(thread?.meta?.pendingPermission?.name ?? "");
-      const cmdCandidate = permCommand || question.body || "";
+      const pending = thread?.meta?.pendingPermission ?? null;
+      const permName = String(pending?.name ?? "");
+      // Only the complete command may be approved by rule: never a display
+      // excerpt, the question text, or a command cut short.
+      const cmdCandidate = pending?.rawCommand && pending.rawCommandTruncated !== true ? pending.rawCommand : "";
       const isStagingMcpTool = /^mcp__buildbetter-staging__(?:success-(?:search|list|get|create-report|update-report|create-lifecycle|update-lifecycle)|read|search|list|get)/i.test(permName)
         || /\bmcp__buildbetter-staging__/i.test(String(question.title ?? ""));
       const isReadOnlyMcp = /^mcp__[A-Za-z0-9_-]+__(?:search|list|get|read|fetch|query|inspect)[A-Za-z0-9_-]*$/i.test(permName);

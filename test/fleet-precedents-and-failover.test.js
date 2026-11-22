@@ -99,11 +99,19 @@ test("OwnerPrecedentStore backfills FleetStore history, routes AppFolio to build
       },
       thread: {
         key: "paseo:srv_1.agent_ro",
-        meta: { pendingPermission: { command: "rg -n \"AppFolio\" src/" } }
+        meta: { pendingPermission: { command: "rg -n \"AppFolio\" src/", rawCommand: "rg -n \"AppFolio\" src/" } }
       }
     });
     assert.equal(roEval.matched, true);
     assert.equal(roEval.answer, "Allow");
+
+    // Only the complete command is approved by rule: a display excerpt alone
+    // (whitespace-collapsed, possibly truncated) is refused.
+    const excerptOnly = await precStore.evaluateCandidate({
+      question: { kind: "prompt", title: "CodexBash permission", body: "Run `rg -n x src/`", options: ["Allow", "Deny"] },
+      thread: { key: "paseo:srv_1.agent_ro2", meta: { pendingPermission: { command: "rg -n x src/" } } }
+    });
+    assert.notEqual(excerptOnly.precedentId, "prec_readonly_bash");
 
     // 2. AppFolio Lifecycles report blocked on prod MCP routes to buildbetter-staging MCP.
     const appfolioEval = await precStore.evaluateCandidate({

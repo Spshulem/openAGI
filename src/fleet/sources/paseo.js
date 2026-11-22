@@ -268,6 +268,7 @@ function extractPaseoPendingPermission(agent) {
     description: blocking.description ? clampText(redactSecrets(String(blocking.description)), 280) : null,
     command: command ? clampText(redactSecrets(String(command)), 240) : null,
     rawCommand: command ? redactSecrets(String(command)).slice(0, 2000) : null,
+    ...(command && String(command).length > 2000 ? { rawCommandTruncated: true } : {}),
     filePath: filePath ? clampText(redactSecrets(String(filePath)), 200) : null,
     actions: Array.isArray(blocking.actions)
       ? blocking.actions
