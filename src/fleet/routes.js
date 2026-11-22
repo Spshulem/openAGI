@@ -23,7 +23,7 @@ const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
-const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive", "failover"]);
 const BATCH_OPS = new Set([
   "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
 ]);
@@ -794,6 +794,19 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
           if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
           const result = await supervisor.pushNow(threadKey, sendOptions);
           return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (parts[2] === "failover") {
+          if (typeof supervisor.switchPaseoProvider !== "function") return fail(503, "Provider failover is not available.");
+          const body = (await readObject(readBody)) ?? {};
+          const preferredProviders = Array.isArray(body.preferredProviders)
+            ? body.preferredProviders.filter((p) => typeof p === "string").slice(0, 3)
+            : undefined;
+          const reason = typeof body.reason === "string" ? body.reason.slice(0, 240) : null;
+          const result = await supervisor.switchPaseoProvider(threadKey, { preferredProviders, reason });
+          if (!result?.ok) {
+            return fail(400, result?.detail ?? "Could not switch Paseo provider.", { status: result?.status ?? "blocked", state: state() });
+          }
+          return ok({ result, state: state() });
         }
         if (parts[2] === "archive") {
           if (typeof supervisor.archiveThread !== "function") return fail(503, "Session archiving is not available.");

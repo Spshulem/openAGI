@@ -769,6 +769,17 @@ export class ActiveWorkManager {
           promptDeferred: false
         } : {}),
         ...(remainingCount !== null ? { remainingCount, remainingCountSource: "explicit" } : {}),
+        ...(input.linkedSkill !== undefined ? { linkedSkill: input.linkedSkill ? cleanText(input.linkedSkill, 80) : null } : {}),
+        ...(input.cursor && typeof input.cursor === "object" ? {
+          cursor: {
+            processed: Number.isInteger(input.cursor.processed) ? Math.max(0, input.cursor.processed) : (existing.cursor?.processed ?? 0),
+            remaining: Number.isInteger(input.cursor.remaining) ? Math.max(0, input.cursor.remaining) : (remainingCount ?? existing.cursor?.remaining ?? null),
+            total: Number.isInteger(input.cursor.total) ? Math.max(0, input.cursor.total) : (existing.cursor?.total ?? null),
+            lastCursorToken: input.cursor.lastCursorToken ? cleanText(input.cursor.lastCursorToken, 160) : (existing.cursor?.lastCursorToken ?? null),
+            batchSummary: input.cursor.batchSummary ? cleanText(input.cursor.batchSummary, 260) : (existing.cursor?.batchSummary ?? null),
+            updatedAt: nowIso
+          }
+        } : {}),
         ...(input.awaitingFollowup !== undefined ? { awaitingFollowup: Boolean(input.awaitingFollowup) } : {}),
         updatedAt: nowIso
       };
@@ -815,6 +826,17 @@ export class ActiveWorkManager {
         snoozedFromState: null,
         remainingCount,
         remainingCountSource: remainingCount !== null ? "explicit" : null,
+        linkedSkill: input.linkedSkill ? cleanText(input.linkedSkill, 80) : null,
+        cursor: input.cursor && typeof input.cursor === "object"
+          ? {
+              processed: Number.isInteger(input.cursor.processed) ? Math.max(0, input.cursor.processed) : 0,
+              remaining: Number.isInteger(input.cursor.remaining) ? Math.max(0, input.cursor.remaining) : remainingCount,
+              total: Number.isInteger(input.cursor.total) ? Math.max(0, input.cursor.total) : null,
+              lastCursorToken: input.cursor.lastCursorToken ? cleanText(input.cursor.lastCursorToken, 160) : null,
+              batchSummary: input.cursor.batchSummary ? cleanText(input.cursor.batchSummary, 260) : null,
+              updatedAt: nowIso
+            }
+          : null,
         awaitingFollowup: Boolean(input.awaitingFollowup),
         untrustedSignals: null,
         decisionsVerdict: null,
@@ -859,6 +881,161 @@ export class ActiveWorkManager {
       created,
       deduped: !created,
       ...(rejectedPermissions.length ? { rejectedPermissions } : {})
+    };
+  }
+
+  findActiveGoalForThread(threadKey = null, prRef = null) {
+    const cleanKey = typeof threadKey === "string" ? threadKey.trim() : "";
+    const cleanPr = typeof prRef === "string" ? prRef.trim().toLowerCase() : "";
+    if (!cleanKey && !cleanPr) return null;
+    for (const item of this.state.items) {
+      if (!item || item.state === "done" || item.outcomeVerified) continue;
+      if (cleanKey && item.owner?.threadKey === cleanKey) return item;
+      if (cleanPr && item.prRef && String(item.prRef).toLowerCase() === cleanPr) return item;
+    }
+    return null;
+  }
+
+  reassignSessionOwner(oldKey, newKey, { label = null, host = null, note = null } = {}) {
+    if (!oldKey || !newKey || oldKey === newKey) return [];
+    const nowIso = new Date(this.now()).toISOString();
+    const { byKey: sessionsByKey } = this._knownSessionsByKey();
+    const updatedIds = [];
+    for (const item of this.state.items) {
+      if (item?.owner?.threadKey !== oldKey) continue;
+      item.owner = normalizeOwner({ threadKey: newKey, label: label ?? item.owner.label, host: host ?? item.owner.host }, newKey, sessionsByKey);
+      item.evidenceLinks = mergeEvidenceLinks(item.evidenceLinks, [{
+        kind: "session",
+        ref: newKey,
+        label: note ? cleanText(note, 140) : "Provider failover continuation",
+        state: "running",
+        observedAt: nowIso,
+        updatedAt: nowIso,
+        trusted: true
+      }], nowIso);
+      item.updatedAt = nowIso;
+      updatedIds.push(item.id);
+    }
+    if (updatedIds.length > 0) {
+      this._recordAudit({ op: "reassign_session_owner", oldKey, newKey, updatedIds });
+      this._save();
+    }
+    return updatedIds;
+  }
+
+  async verifyGoalProgress({ id, evidenceSummary = "", cursor = null, ownerConfirmedDone = false } = {}) {
+    const cleanId = String(id ?? "").trim();
+    const item = this.state.items.find((it) => it.id === cleanId);
+    if (!item) throw new Error(`No tracked goal with id "${cleanId}".`);
+    const nowMs = this.now();
+    const nowIso = new Date(nowMs).toISOString();
+
+    if (cursor && typeof cursor === "object") {
+      item.cursor = {
+        processed: Number.isInteger(cursor.processed) ? Math.max(0, cursor.processed) : (item.cursor?.processed ?? 0),
+        remaining: Number.isInteger(cursor.remaining) ? Math.max(0, cursor.remaining) : (item.cursor?.remaining ?? item.remainingCount ?? null),
+        total: Number.isInteger(cursor.total) ? Math.max(0, cursor.total) : (item.cursor?.total ?? null),
+        lastCursorToken: cursor.lastCursorToken ? cleanText(cursor.lastCursorToken, 160) : (item.cursor?.lastCursorToken ?? null),
+        batchSummary: cursor.batchSummary ? cleanText(cursor.batchSummary, 260) : cleanText(evidenceSummary, 260),
+        updatedAt: nowIso
+      };
+      if (Number.isInteger(cursor.remaining)) {
+        item.remainingCount = Math.max(0, cursor.remaining);
+        item.remainingCountSource = "explicit";
+      }
+    }
+    if (evidenceSummary) {
+      item.lastMeaningfulProgressAt = nowIso;
+      item.lastMeaningfulProgress = {
+        at: nowIso,
+        summary: cleanText(evidenceSummary, 240),
+        kind: "batch_progress",
+        ref: item.prRef ?? item.owner?.threadKey ?? null
+      };
+    }
+
+    const explicitRemaining = Number.isInteger(item.remainingCount) ? item.remainingCount : null;
+    if (ownerConfirmedDone === true) {
+      item.outcomeVerified = true;
+      item.verifiedAt = nowIso;
+      item.verifiedBy = "owner";
+      item.state = "done";
+      item.remainingCount = 0;
+      item.updatedAt = nowIso;
+      this._save();
+      const { byKey: sessionsByKey } = this._knownSessionsByKey();
+      return {
+        ok: true,
+        id: item.id,
+        accomplished: true,
+        continueRequired: false,
+        confidence: 1,
+        item: this._projectItem(item, { nowMs, sessionsByKey, prsByRef: this._livePrMap() })
+      };
+    }
+
+    if (explicitRemaining !== null && explicitRemaining > 0) {
+      item.state = "active";
+      item.updatedAt = nowIso;
+      this._save();
+      const { byKey: sessionsByKey } = this._knownSessionsByKey();
+      return {
+        ok: true,
+        id: item.id,
+        accomplished: false,
+        continueRequired: true,
+        confidence: 0,
+        note: `${explicitRemaining} items remain before doneCriteria is met; continue next batch.`,
+        item: this._projectItem(item, { nowMs, sessionsByKey, prsByRef: this._livePrMap() })
+      };
+    }
+
+    let pAccomplished = 0;
+    const settings = this.config?.decisions ?? {};
+    const env = this.deps?.env ?? process.env ?? {};
+    const apiKey = String(settings.apiKey ?? env.OPENAI_API_KEY ?? "").trim();
+    const fetchImpl = this.deps?.decisionsFetch ?? this.deps?.fetchImpl ?? globalThis.fetch;
+    if (apiKey) {
+      const res = await callDecisionsEndpoint({
+        input: {
+          goal: item.goal,
+          done_criteria: item.doneCriteria,
+          cursor: item.cursor ?? null,
+          latest_evidence: cleanText(evidenceSummary, 500)
+        },
+        questions: [
+          {
+            type: "predicate",
+            name: "goal_accomplished",
+            instructions:
+              "Based on `done_criteria`, `cursor`, and `latest_evidence`, is the entire `goal` genuinely accomplished " +
+              "with zero remaining batches or unverified acceptance steps (as opposed to only finishing one partial batch or audit)?"
+          }
+        ],
+        apiKey,
+        url: settings.url ?? env.OPENAGI_DECISIONS_URL ?? DEFAULT_DECISIONS_URL,
+        model: settings.model ?? env.OPENAGI_DECISIONS_MODEL ?? DEFAULT_DECISIONS_MODEL,
+        timeoutMs: Number(settings.timeoutMs) || DEFAULT_DECISIONS_TIMEOUT_MS,
+        fetchImpl
+      });
+      if (res.ok) pAccomplished = res.probabilities.get("goal_accomplished") ?? 0;
+    }
+
+    const readyForOwnerSignoff = (explicitRemaining === 0) || pAccomplished >= 0.85;
+    item.awaitingFollowup = readyForOwnerSignoff;
+    item.updatedAt = nowIso;
+    this._save();
+    const { byKey: sessionsByKey } = this._knownSessionsByKey();
+    return {
+      ok: true,
+      id: item.id,
+      accomplished: readyForOwnerSignoff,
+      continueRequired: !readyForOwnerSignoff,
+      confidence: Math.round(pAccomplished * 100) / 100,
+      note: readyForOwnerSignoff
+        ? "All tracked batches satisfied; ready for owner verification (`confirm_done`)."
+        : "Definition of Done is not yet satisfied; continue next batch.",
+      item: this._projectItem(item, { nowMs, sessionsByKey, prsByRef: this._livePrMap() })
     };
   }
 
@@ -1061,6 +1238,9 @@ export class ActiveWorkManager {
       prRef,
       prState,
       prCiState,
+      prIsDraft,
+      cursor: item.cursor ?? null,
+      linkedSkill: item.linkedSkill ?? null,
       evidenceLinks: evaluatedLinks,
       evidenceFreshness,
       lastMeaningfulProgress: item.lastMeaningfulProgress,

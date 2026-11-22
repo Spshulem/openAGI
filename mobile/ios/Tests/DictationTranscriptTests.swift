@@ -79,4 +79,20 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.6)],
                                                              live: "Before", text: "After"), "zero duration is unset timing")
     }
+
+    func testSilenceTimeoutCommitsLiveWordsAndClassifiesRecoverablePauseErrors() {
+        var t = DictationTranscript(base: "Initial:")
+        _ = t.receive("spoken before silence", isFinal: false)
+        XCTAssertEqual(t.commitLive(), "Initial: spoken before silence")
+        XCTAssertEqual(t.receive("and after silence", isFinal: false), "Initial: spoken before silence and after silence")
+
+        let noSpeech = NSError(domain: "kAFAssistantErrorDomain", code: 1110, userInfo: [NSLocalizedDescriptionKey: "No speech detected"])
+        XCTAssertTrue(ChatDictation.isRecoverablePauseError(noSpeech))
+
+        let canceled = NSError(domain: "kAFAssistantErrorDomain", code: 216, userInfo: [NSLocalizedDescriptionKey: "Recognition request was canceled"])
+        XCTAssertTrue(ChatDictation.isRecoverablePauseError(canceled))
+
+        let fatalHardware = NSError(domain: "AVAudioEngineErrorDomain", code: -10851, userInfo: [NSLocalizedDescriptionKey: "Hardware unavailable"])
+        XCTAssertFalse(ChatDictation.isRecoverablePauseError(fatalHardware))
+    }
 }

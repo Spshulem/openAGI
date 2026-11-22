@@ -19,6 +19,7 @@ const TOOL_NAMES = [
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
   "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project",
+  "fleet_switch_provider", "fleet_precedents",
   ...ACTIVE_WORK_TOOL_NAMES
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
@@ -106,28 +107,39 @@ function statusFrom(state, now, { midScan = false } = {}) {
     freshness: "Scans run every few minutes. stillAsked: true means the latest scan found the question still standing; false means that scan could not recheck it (its source failed, see failedSources), so treat it as unverified. reviewedMinutesAgo and review are the supervisor's own last re-check of it. fleet_scan runs a new scan now.",
     counts: snapshot?.counts ?? null,
     byHealth,
-    questions: (state.questions ?? []).map((q) => ({
-      id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
-      firstAskedMinutesAgo: minutesSince(q.createdAt, now),
-      askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
-      // Mid-scan, question records may already be updated past the snapshot.
-      stillAsked: midScan ? null : stillAsked(q, snapshot),
-      reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
-      review: q.reviewReason ? clip(q.reviewReason, 200) : null
-    })),
+    questions: (state.questions ?? [])
+      .filter((q) => q?.needsYou !== false && q?.kind !== "completed")
+      .map((q) => ({
+        id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
+        firstAskedMinutesAgo: minutesSince(q.createdAt, now),
+        askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
+        // Mid-scan, question records may already be updated past the snapshot.
+        stillAsked: midScan ? null : stillAsked(q, snapshot),
+        reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
+        review: q.reviewReason ? clip(q.reviewReason, 200) : null
+      })),
     ...(Array.isArray(state.cards) ? {
-      cards: state.cards.map((c) => ({
-        id: c.id,
-        kind: c.kind,
-        headline: clip(c.headline, 120),
-        recommendation: c.recommendation ? clip(c.recommendation, 160) : null,
-        primaryAction: c.primaryAction ?? null,
-        secondaryAction: c.secondaryAction ?? null,
-        threadKey: c.threadKey ?? null,
-        prRef: c.prRef ?? null,
-        ciState: c.ciState ?? null
-      }))
+      cards: state.cards
+        .filter((c) => c?.needsYou !== false)
+        .map((c) => ({
+          id: c.id,
+          kind: c.kind,
+          headline: clip(c.headline, 120),
+          recommendation: c.recommendation ? clip(c.recommendation, 200) : null,
+          brief: c.brief ? {
+            whatChanged: c.brief.whatChanged ? clip(c.brief.whatChanged, 280) : null,
+            decision: c.brief.decision ? clip(c.brief.decision, 500) : null,
+            context: c.brief.context ? clip(c.brief.context, 280) : null
+          } : null,
+          primaryAction: c.primaryAction ?? null,
+          secondaryAction: c.secondaryAction ?? null,
+          threadKey: c.threadKey ?? null,
+          prRef: c.prRef ?? null,
+          ciState: c.ciState ?? null
+        })),
+      completedNoticesCount: state.cards.filter((c) => c?.needsYou === false).length
     } : {}),
+    ...(state.precedentsSummary ? { precedentsSummary: state.precedentsSummary } : {}),
     ...(state.preferences ? {
       preferences: {
         mergePolicy: state.preferences.mergePolicy ?? "manual_confirm",
@@ -623,6 +635,82 @@ export function registerFleetTools(registry, supervisor) {
       return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null, alias: args.alias ?? null });
     }
   });
+  if (typeof supervisor.switchPaseoProvider === "function") {
+    registry.register({
+      name: "fleet_switch_provider",
+      source: SOURCE,
+      needsConfirmation: true,
+      supervisorAutoApprove: true,
+      description:
+        "Fail over a Paseo coding session (`paseo:<serverId>.<agentId>`) that hit a provider usage/quota/auth limit onto a ready alternate provider (such as Claude or Antigravity) in the exact same workspace directory, transferring Active Work goal ownership and bounded conversation context.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", minLength: 1, maxLength: KEY_MAX, description: "Paseo session key (`paseo:<serverId>.<agentId>`)" },
+          preferredProviders: {
+            type: "array",
+            items: { type: "string", enum: ["claude", "antigravity", "codex"] },
+            maxItems: 3,
+            description: "Ordered fallback provider preference (defaults to ['claude', 'antigravity'])"
+          },
+          reason: { type: "string", maxLength: 240, description: "Reason for provider switch (e.g. 'Codex usage limit reached')" }
+        },
+        required: ["key"],
+        additionalProperties: false
+      },
+      prepareApprovalArgs: (args = {}) => {
+        const key = typeof args.key === "string" ? args.key.trim() : "";
+        if (!key.startsWith("paseo:")) throw new Error("Pass a Paseo session key (`paseo:<serverId>.<agentId>`).");
+        return {
+          key,
+          preferredProviders: Array.isArray(args.preferredProviders) && args.preferredProviders.length
+            ? args.preferredProviders
+            : ["claude", "antigravity"],
+          ...(args.reason ? { reason: clip(args.reason, 240) } : {})
+        };
+      },
+      approvalTtlMs: 10 * 60_000,
+      approvalDedupeKey: (args, context) => `fleet-switch-provider:${digest([context?.sessionId ?? null, args.key, args.preferredProviders])}`,
+      summarize: (args) => `Switch Paseo session ${args.key} onto ${args.preferredProviders.join(" / ")}`,
+      handler: async (args, context) => {
+        if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+        const res = await supervisor.switchPaseoProvider(args.key, {
+          preferredProviders: args.preferredProviders,
+          reason: args.reason ?? null
+        });
+        if (!res?.ok) {
+          throw new Error(`Provider switch halted (${res?.status ?? "blocked"}): ${clip(res?.detail ?? "unavailable", 220)}`);
+        }
+        return res;
+      }
+    });
+  }
+  if (supervisor.precedentMemory || typeof supervisor.listPrecedents === "function") {
+    registry.register({
+      name: "fleet_precedents",
+      source: SOURCE,
+      sideEffects: false,
+      description:
+        "Inspect learned and built-in owner decision precedents (plus recent autonomous precedent applications) that allow OpenAGI to resolve routine non-red-line blockers from Spencer's historical decisions.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", minimum: 1, maximum: 100 }
+        },
+        additionalProperties: false
+      },
+      handler: (args = {}) => {
+        const limit = Number.isInteger(args.limit) ? args.limit : 40;
+        if (supervisor.precedentMemory) {
+          return {
+            precedents: supervisor.precedentMemory.list({ limit }),
+            recentApplications: supervisor.precedentMemory.applications(20)
+          };
+        }
+        return readState(supervisor).precedentsSummary ?? { precedents: [], recentApplications: [] };
+      }
+    });
+  }
   registerActiveWorkTools(registry, supervisor, { source: SOURCE });
 }
 

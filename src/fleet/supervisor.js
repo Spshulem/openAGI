@@ -33,7 +33,9 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
+import { failoverPaseoSessionProvider } from "./paseo-delivery.js";
 import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
+import { OwnerPrecedentStore } from "./precedent-memory.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -1064,18 +1066,23 @@ export class FleetSupervisor {
       }
     };
     const projectAliases = store.projectAliases?.() ?? null;
-      const deck = buildSupervisorDeck(baseState, {
-        preferences: store.preferences(),
-        now: this.now(),
-        threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
-        prsByKey: this.lastPrs,
-        knownRows: this.knownRows,
-        blockingResolver,
-        projectAliases
-      });
-      const watchdog = this.buildWatchdogSummary(snapshot);
-      return { ...baseState, ...deck, watchdog };
-    }
+    const deck = buildSupervisorDeck(baseState, {
+      preferences: store.preferences(),
+      now: this.now(),
+      threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
+      prsByKey: this.lastPrs,
+      knownRows: this.knownRows,
+      blockingResolver,
+      projectAliases,
+      activeGoalResolver: (tKey, prRef) => this.activeWork.findActiveGoalForThread(tKey, prRef)
+    });
+    const watchdog = this.buildWatchdogSummary(snapshot);
+    const precedentsSummary = {
+      total: this.precedentMemory.list().length,
+      recentApplications: this.precedentMemory.applications(5)
+    };
+    return { ...baseState, ...deck, watchdog, precedentsSummary };
+  }
 
     buildWatchdogSummary(snapshot) {
       const rows = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
@@ -2122,6 +2129,15 @@ export class FleetSupervisor {
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
       this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "answer", question, answer, now: this.now() }));
+      try {
+        this.precedentMemory.recordOwnerDecision({
+          question,
+          answer,
+          repo: question.contextSnapshot?.repo ?? null,
+          project: question.project ?? question.contextSnapshot?.workspace ?? null,
+          at: new Date(this.now()).toISOString()
+        });
+      } catch { /* precedent learning never blocks owner answer */ }
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
       this.reopenIfUndelivered(id, settling, answer);
@@ -2228,6 +2244,15 @@ export class FleetSupervisor {
         return { question: this.store.question(id), delivery: sent.delivery };
       }
       const answered = this.store.answerQuestion(id, text);
+      try {
+        this.precedentMemory.recordOwnerDecision({
+          question,
+          directive: text,
+          repo: question.contextSnapshot?.repo ?? null,
+          project: question.project ?? question.contextSnapshot?.workspace ?? null,
+          at: new Date(this.now()).toISOString()
+        });
+      } catch { /* precedent learning never blocks owner reply */ }
       this.resolveOutreach(question, "reply", "acted");
       // The store keeps the reply clamped; a failed background send reopens
       // the question only while that stored answer stands.
@@ -2614,6 +2639,19 @@ export class FleetSupervisor {
     });
   }
 
+  get precedentMemory() {
+    if (!this._precedentMemory) {
+      this._precedentMemory = new OwnerPrecedentStore({
+        dir: this.store.dir,
+        now: () => this.now()
+      });
+      try {
+        this._precedentMemory.backfillFromFleetStore(this.store);
+      } catch { /* best-effort historical backfill */ }
+    }
+    return this._precedentMemory;
+  }
+
   get activeWork() {
     this._activeWork ??= new ActiveWorkManager({
       dir: this.store.dir,
@@ -2635,6 +2673,92 @@ export class FleetSupervisor {
     const result = this.activeWork.trackWork(input);
     this.emitFleet("active-work-updated");
     return result;
+  }
+
+  async verifyGoalProgress(input = {}) {
+    const result = await this.activeWork.verifyGoalProgress(input);
+    this.emitFleet("active-work-updated");
+    return result;
+  }
+
+  async switchPaseoProvider(threadKey, { preferredProviders = ["claude", "antigravity"], reason = null } = {}) {
+    const cleanKey = typeof threadKey === "string" ? threadKey.trim() : "";
+    const parsed = parsePaseoThreadKey(cleanKey);
+    if (!parsed) {
+      return { ok: false, status: "unsupported", detail: "Only Paseo coding sessions (`paseo:<serverId>.<agentId>`) support automatic provider failover." };
+    }
+    const matchingOpen = this.store.openQuestions().find((q) => q.threadKey === cleanKey || (q.threadKeys ?? []).includes(cleanKey)) ?? null;
+    const thread = this.lastThreads.get(cleanKey)
+      ?? this.knownThreads.get(cleanKey)
+      ?? this.syntheticPaseoThread(cleanKey, matchingOpen);
+    if (!thread) {
+      return { ok: false, status: "not_found", detail: "No Paseo session found with that key." };
+    }
+    const goalContext = this.activeWork.findActiveGoalForThread(cleanKey, thread.prRefs?.[0] ?? null);
+    const failoverReason = String(reason || thread.error?.text || "provider usage limit reached").trim();
+    let switched;
+    try {
+      switched = await failoverPaseoSessionProvider({
+        config: this.config,
+        thread,
+        reason: failoverReason,
+        goalContext,
+        preferredProviders: Array.isArray(preferredProviders) && preferredProviders.length
+          ? preferredProviders
+          : ["claude", "antigravity"],
+        factory: this.deps.paseoFactory
+      });
+    } catch (err) {
+      return { ok: false, status: "failed", detail: clampText(err?.message ?? "Provider failover failed.", 220) };
+    }
+    if (!switched?.ok || !switched.newKey) {
+      return { ok: false, status: "blocked", detail: switched?.detail ?? "No healthy alternate Paseo provider available." };
+    }
+
+    const prevAssign = this.store.threadAssignment?.(cleanKey) ?? null;
+    if (prevAssign) {
+      this.store.assignThread(switched.newKey, prevAssign);
+    }
+    const reassignedGoalIds = this.activeWork.reassignSessionOwner(cleanKey, switched.newKey, {
+      label: switched.title || thread.title || null,
+      note: `Switched from ${switched.exhaustedProvider} to ${switched.provider}`
+    });
+
+    const resetMs = Date.parse(thread.error?.resetAt ?? "");
+    const nowMs = this.now();
+    const muteHours = Number.isFinite(resetMs) && resetMs > nowMs
+      ? Math.min(72, Math.max(1, Math.ceil((resetMs - nowMs) / (60 * MIN))))
+      : 12;
+    this.store.markCompletionReviewed(cleanKey, nowMs);
+    this.store.mute(cleanKey, nowMs + muteHours * 60 * MIN);
+
+    for (const q of this.store.openQuestions()) {
+      const coversSingle = q.threadKey === cleanKey
+        || (Array.isArray(q.threadKeys) && q.threadKeys.length === 1 && q.threadKeys[0] === cleanKey);
+      if (coversSingle && ["limit", "session-error", "stuck"].includes(q.kind)) {
+        this.store.resolveQuestion(q.id, `provider failover continued in ${switched.newKey} (${switched.provider})`);
+        this.resolveOutreach(q, "failover", "acted");
+      }
+    }
+
+    const action = this.store.recordAction({
+      kind: "nudge",
+      playbook: "provider-failover",
+      threadKey: switched.newKey,
+      route: "paseo-create",
+      status: "sent",
+      reason: clampText(`Switched "${switched.title || cleanKey}" from ${switched.exhaustedProvider} to ${switched.provider} (${failoverReason})`, 240),
+      detail: `Continued from ${cleanKey} in ${switched.newKey}`
+    });
+    this.emitFleet("provider-failover");
+    return {
+      ok: true,
+      status: "switched",
+      ...switched,
+      reassignedGoalIds,
+      actionId: action?.id ?? null,
+      detail: `Switched from ${switched.exhaustedProvider} to ${switched.provider} in ${switched.newKey}.`
+    };
   }
 
   async scanActiveWork(options = {}) {
@@ -4212,20 +4336,127 @@ export class FleetSupervisor {
     const typedInto = new Set();
     const autoAnsweredThreads = new Set();
 
+    // Auto-failover quota-exhausted or logged-out Paseo sessions onto a ready
+    // alternate provider (Claude / Antigravity) in the exact same workspace cwd.
+    const failedOverKeys = new Set();
+    if (this.mode === "auto") {
+      let failoversThisTick = 0;
+      for (const { thread, classified } of items) {
+        if (failoversThisTick >= 2) break;
+        if (!thread?.key || thread.kind !== "paseo" || thread.excluded || thread.archived) continue;
+        if (store.mutedUntil(thread.key)) continue;
+        if (classified?.state !== "infra-blocked") continue;
+        if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
+        const resetAtMs = Date.parse(thread.error?.resetAt ?? "");
+        if (Number.isFinite(resetAtMs) && resetAtMs > started && resetAtMs - started <= 20 * MIN) continue;
+        const switched = await this.switchPaseoProvider(thread.key, {
+          reason: classified.reason || thread.error?.text || "usage limit reached"
+        });
+        if (switched?.ok) {
+          failoversThisTick += 1;
+          sends += 1;
+          failedOverKeys.add(thread.key);
+          autoAnsweredThreads.add(thread.key);
+        }
+      }
+    }
+
     // A Codex question card is asked beside the thread's own decision.
-    const asks = decisions.flatMap((decision) => [
-      ...(decision.action === "ask-user" && decision.question ? [decision] : []),
-      ...(decision.cardQuestion ? [{ ...decision, action: "ask-user", question: decision.cardQuestion, playbook: null }] : [])
-    ]);
+    const asks = decisions
+      .filter((decision) => !failedOverKeys.has(decision.threadKey))
+      .flatMap((decision) => [
+        ...(decision.action === "ask-user" && decision.question ? [decision] : []),
+        ...(decision.cardQuestion ? [{ ...decision, action: "ask-user", question: decision.cardQuestion, playbook: null }] : [])
+      ]);
     // Surface unreviewed session completions and errors ("a chat isn't done
     // until marked done or archived") whenever Paseo flags requiresAttention
     // ("finished" / "error") or completionCards is explicitly enabled.
-    const askedThreadKeys = new Set(asks.flatMap((a) => [a.threadKey, ...(a.question?.threadKeys ?? [])]).filter(Boolean));
-    for (const { thread, classified } of items) {
+    const askedThreadKeys = new Set([
+      ...failedOverKeys,
+      ...asks.flatMap((a) => [a.threadKey, ...(a.question?.threadKeys ?? [])]).filter(Boolean)
+    ]);
+    for (const { thread, classified, pr: itemPr } of items) {
       if (!thread?.key || thread.excluded || thread.archived) continue;
       if (askedThreadKeys.has(thread.key) || store.mutedUntil(thread.key)) continue;
-      if (classified.state === "running" || classified.state === "waiting-ci") continue;
+      if (!classified || classified.state === "running" || classified.state === "waiting-ci") continue;
+
+      const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? null);
       const attnReason = thread.meta?.requiresAttention === true ? String(thread.meta?.attentionReason ?? "") : "";
+      const isErr = attnReason === "error" || Boolean(thread.error);
+
+      // Historical owner precedent recovery nudges (e.g. AppFolio -> buildbetter-staging MCP,
+      // TestFlight MISSING_EXPORT_COMPLIANCE, transient stream disconnect).
+      if (
+        this.mode === "auto"
+        && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
+      ) {
+        const ledger = store.ledgerFor(thread.key);
+        const lastNudgeMs = Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0;
+        const cooldownOk = started - lastNudgeMs >= config.limits.nudgeCooldownMs
+          && (ledger.nudgesSinceProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
+        const route = cooldownOk ? chooseRoute(thread, "auto", this.lastDelivery) : null;
+        if (route) {
+          const precNudge = await this.precedentMemory.evaluateCandidate(
+            { thread, pr: itemPr, classified },
+            { decisionsConfig: this.config.decisions, env: this.deps.env ?? process.env, fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl }
+          );
+          if (precNudge?.matched && precNudge.action === "nudge" && precNudge.directive) {
+            decisions.push({
+              threadKey: thread.key,
+              state: classified.state,
+              action: "nudge",
+              playbook: `precedent:${precNudge.precedentId}`,
+              route,
+              judged: true,
+              reason: precNudge.summary,
+              message: precNudge.directive
+            });
+            this.precedentMemory.recordApplication({
+              precedentId: precNudge.precedentId,
+              threadKey: thread.key,
+              summary: precNudge.summary,
+              confidence: precNudge.confidence,
+              source: precNudge.source
+            });
+            askedThreadKeys.add(thread.key);
+            continue;
+          }
+        }
+      }
+
+      // Suppress premature "finished / Got it" completion receipts while an ActiveWork
+      // goal for this session is still unverified, and resume if permittedNudges === "resume_owner".
+      if (!isErr && activeGoal && !activeGoal.outcomeVerified) {
+        if (
+          this.mode === "auto"
+          && activeGoal.permittedNudges === "resume_owner"
+          && ["idle-no-pr", "done"].includes(classified.state)
+          && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
+        ) {
+          const ledger = store.ledgerFor(thread.key);
+          const lastNudgeMs = Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0;
+          const cooldownOk = started - lastNudgeMs >= config.limits.nudgeCooldownMs
+            && (ledger.nudgesSinceProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
+          const route = cooldownOk ? chooseRoute(thread, "auto", this.lastDelivery) : null;
+          if (route) {
+            const cursorNote = activeGoal.cursor?.remaining != null
+              ? ` (${activeGoal.cursor.remaining} remaining)`
+              : (Number.isInteger(activeGoal.remainingCount) && activeGoal.remainingCount > 0 ? ` (${activeGoal.remainingCount} remaining)` : "");
+            decisions.push({
+              threadKey: thread.key,
+              state: classified.state,
+              action: "nudge",
+              playbook: "goal-continuation",
+              route,
+              judged: true,
+              reason: `active goal unverified${cursorNote}: ${clampText(activeGoal.goal, 120)}`,
+              message: `Active goal continuation${cursorNote}: "${clampText(activeGoal.goal, 260)}". Definition of Done: "${clampText(activeGoal.doneCriteria || "Verify all in-scope items are complete", 260)}". Continue the next batch or remaining verification steps until Done Criteria is met (do not merge PRs, deploy to production, send external customer messages, or spend money without owner approval). If blocked on the owner, state the exact decision needed.`
+            });
+          }
+        }
+        continue;
+      }
+
       const isPaseoAttention = attnReason === "finished" || attnReason === "error";
       const isConfiguredCompletion = this.config?.completionCards === true
         && ["idle-no-pr", "done"].includes(classified.state)
@@ -4237,7 +4468,6 @@ export class FleetSupervisor {
       const stampMs = Date.parse(stampIso ?? "") || 0;
       const reviewedMs = store.reviewedCompletionAt(thread.key);
       if (reviewedMs > 0 && stampMs > 0 && reviewedMs >= stampMs - 500) continue;
-      const isErr = attnReason === "error" || Boolean(thread.error);
       const qKind = isErr ? "session-error" : "completed";
       const label = clampText(redactSecrets(thread.title || thread.workspace || thread.key), 72);
       asks.push({
@@ -4257,6 +4487,50 @@ export class FleetSupervisor {
       });
       askedThreadKeys.add(thread.key);
     }
+
+    // Surface green non-draft ready/orphan PRs tracked in ActiveWork into Needs You
+    // even when their original coding thread aged out of the 32-thread shortlist.
+    try {
+      const awItems = this.activeWork.getActiveWork({ limit: 60 })?.items ?? [];
+      const coveredPrRefs = new Set(
+        asks
+          .map((a) => String(a.question?.prRef ?? "").toLowerCase())
+          .filter(Boolean)
+      );
+      for (const aw of awItems) {
+        if (!["ready_pr", "orphan_pr"].includes(aw?.followThroughState ?? aw?.category) || !aw?.prRef) continue;
+        const lowerRef = String(aw.prRef).toLowerCase();
+        if (coveredPrRefs.has(lowerRef)) continue;
+        const livePr = prs.get(aw.prRef) ?? this.lastPrs.get(aw.prRef) ?? null;
+        const prState = livePr?.state ?? aw.prState;
+        const isDraft = livePr?.isDraft ?? aw.prIsDraft ?? aw.isDraft ?? false;
+        const ciState = livePr?.ci?.state ?? aw.prCiState ?? aw.ciState;
+        if (prState !== "OPEN" || isDraft || ciState !== "SUCCESS") continue;
+        const parsedPr = parsePrRef(aw.prRef);
+        if (!parsedPr) continue;
+        asks.push({
+          threadKey: aw.owner?.threadKey ?? null,
+          action: "ask-user",
+          playbook: null,
+          question: {
+            kind: "ready",
+            dedupeKey: `ready:${aw.prRef}`,
+            threadKey: aw.owner?.threadKey ?? null,
+            prRef: aw.prRef,
+            project: aw.project ?? null,
+            title: `PR #${parsedPr.number} ready for merge review: ${clampText(redactSecrets(livePr?.title || aw.goal || aw.prRef), 100)}`,
+            body: clampText(
+              redactSecrets(
+                `CI is green on ${aw.prRef}${aw.goal ? ` (Goal: ${aw.goal})` : ""}. Spencer reviews every merge — inspect the PR diff and merge when satisfied.`
+              ),
+              600
+            ),
+            options: ["Check PR", "skip"]
+          }
+        });
+        coveredPrRefs.add(lowerRef);
+      }
+    } catch { /* ActiveWork ready-PR surfacing is best-effort */ }
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
@@ -4348,6 +4622,63 @@ export class FleetSupervisor {
               );
             }
             continue;
+          }
+        }
+      }
+      // Historical Owner-Decision Precedent Engine: auto-resolve read-only permissions
+      // (`prec_readonly_bash`) and high-confidence (`>= 0.85`) historical owner precedents
+      // without ever crossing Hard Red Lines (merges, prod deploys, external sends, spend, deletes, SSO).
+      if (
+        this.mode === "auto"
+        && ["prompt", "agent-ask", "agent-card"].includes(fields.kind)
+        && fields.threadKey
+        && !fields.mergeAsk
+        && !store.mutedUntil(fields.threadKey)
+        && sends < config.limits.maxSendsPerTick
+      ) {
+        const precMatch = await this.precedentMemory.evaluateCandidate(
+          { question, thread: askThread, pr: askPr },
+          {
+            decisionsConfig: this.config.decisions,
+            env: this.deps.env ?? process.env,
+            fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl
+          }
+        );
+        if (precMatch?.matched && precMatch.action === "answer" && precMatch.answer) {
+          const targetThread = byKey.get(fields.threadKey) ?? askThread;
+          const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
+          const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
+          if (targetThread && route && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
+            const msg = fields.kind === "prompt" ? precMatch.answer : ownerDelivery(precMatch.answer);
+            const sent = await this.deliverToAsker(question, precMatch.answer, msg, {
+              startedAt: started,
+              ownerChoice: precMatch.answer
+            });
+            if (sent?.delivery?.status === "sent") {
+              sends += 1;
+              attempted.add(targetThread.key);
+              autoAnsweredThreads.add(targetThread.key);
+              if (uiKey) typedInto.add(uiKey);
+              store.answerQuestion(question.id, precMatch.answer);
+              this.resolveOutreach(question, precMatch.answer, "acted");
+              this.precedentMemory.recordApplication({
+                precedentId: precMatch.precedentId,
+                threadKey: targetThread.key,
+                summary: precMatch.summary,
+                confidence: precMatch.confidence,
+                source: precMatch.source
+              });
+              store.recordAction({
+                kind: "nudge",
+                playbook: `precedent:${precMatch.precedentId}`,
+                threadKey: targetThread.key,
+                route: sent.delivery.route ?? route,
+                status: "sent",
+                reason: clampText(precMatch.summary, 240),
+                at
+              });
+              continue;
+            }
           }
         }
       }
@@ -4882,8 +5213,8 @@ export class FleetSupervisor {
         sources,
         byState,
         byWatch,
-        // Only questions the owner can see (getState hides ones held for review).
-        needsYou: this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id)).length,
+        // Only genuine owner decisions count toward Needs You (excludes completion "Got it" receipts).
+        needsYou: this.store.openQuestions().filter((q) => !this.awaitingReview.has(q.id) && needsOwnerDecision(q)).length,
         actions: decisions.filter((decision) => SENDING.has(decision.action)).length
       },
       manager: manager ? { key: manager.key, title: clampText(manager.title, 80), live: Boolean(manager.live), agentStatus: manager.agentStatus, error: manager.error?.kind ?? null } : null,

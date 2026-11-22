@@ -3105,6 +3105,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Pass extraCookies so /fleet?token= signs in like the dashboard does.
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
       }
+      if (pathname === "/goals" && (method === "GET" || method === "POST")) {
+        res.setHeader("Cache-Control", "no-store");
+        if (method === "GET") {
+          const activeWork = typeof runtime.fleetSupervisor?.getActiveWork === "function"
+            ? await Promise.resolve(runtime.fleetSupervisor.getActiveWork({ includeSnoozed: true, includeDone: url.searchParams.get("includeDone") === "true" })).catch(() => null)
+            : null;
+          const taskGoals = typeof runtime.tasks?.listGoals === "function"
+            ? runtime.tasks.listGoals({}).map((g) => ({ ...g, progress: runtime.tasks.goalProgress?.(g.id) ?? null }))
+            : [];
+          return sendJson(res, 200, {
+            activeWork,
+            taskGoals
+          });
+        }
+        const body = await readJsonLimited(req, 32 * 1024).catch(() => null);
+        if (!body || typeof body.goal !== "string" || !body.goal.trim()) {
+          return sendJson(res, 400, { error: "invalid_goal", message: "Provide { goal, doneCriteria, project?, cadence? }." });
+        }
+        const doneCriteria = typeof body.doneCriteria === "string" && body.doneCriteria.trim()
+          ? body.doneCriteria.trim()
+          : `Verify ${body.goal.trim().slice(0, 120)}`;
+        const tracked = typeof runtime.fleetSupervisor?.trackWork === "function"
+          ? await runtime.fleetSupervisor.trackWork({
+              project: body.project ?? "General",
+              theme: body.theme ?? null,
+              customer: body.customer ?? null,
+              goal: body.goal.trim(),
+              doneCriteria,
+              cadence: body.cadence ?? "daily",
+              permittedNudges: body.permittedNudges ?? "resume_owner",
+              threadKey: body.threadKey ?? null,
+              prRef: body.prRef ?? null,
+              linkedSkill: body.linkedSkill ?? null,
+              cursor: body.cursor ?? null
+            })
+          : null;
+        return sendJson(res, 200, { ok: true, tracked });
+      }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
         const acceptsImages = method === "POST" && (

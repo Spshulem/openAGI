@@ -499,7 +499,7 @@ function cardIntent(ctx, card) {
   const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
   const namedHeader = item.header && !/^question\s+\d+$/i.test(String(item.header).trim()) ? item.header : null;
   const head = clampText(namedHeader || item.question, 50);
-  const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
+  const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join("\n");
   const extra = item.multiSelect ? " Pick any." : "";
   const others = items.filter((other) => other !== item).map((other) => {
     const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
@@ -508,7 +508,7 @@ function cardIntent(ctx, card) {
     return clampText(label, 60);
   });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
-  const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
+  const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join("\n");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
   const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
@@ -520,15 +520,15 @@ function cardIntent(ctx, card) {
     ? [...rawChoices.map((opt, idx) => (needsNumberPrefix ? clampText(`${idx + 1}. ${opt}`, 40) : opt)), "open thread"]
     : ["open thread"];
   const question = {
-    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: Math.max(limits.cardBodyMax ?? 900, 1200) }),
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
       items: items.map((open) => ({
         itemId: String(open.itemId),
         source: { app: card.app, cardId: String(card.cardId), itemId: String(open.itemId), threadKey: thread.key },
-        question: clampText(stripTags(open.question || open.header || "Owner decision"), 180),
-        options: open.options.map((option) => clampText(option, 80)),
+        question: clampText(stripTags(open.question || open.header || "Owner decision"), 260),
+        options: open.options.map((option) => clampText(option, 240)),
         multiSelect: open.multiSelect === true,
         freeText: open.freeText === true
       })),

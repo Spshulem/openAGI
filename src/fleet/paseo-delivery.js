@@ -121,6 +121,137 @@ function confirmedOwnerSteeredOrQueuedMessage(history, receipt) {
   return history?.agent?.status === "running";
 }
 
+function selectPreferredModel(providerEntry) {
+  const models = Array.isArray(providerEntry?.models) ? providerEntry.models.filter((m) => m?.id) : [];
+  if (!models.length) return null;
+  const p = String(providerEntry?.provider ?? "").toLowerCase();
+  const preferredOrder = p === "claude"
+    ? [/opus-4-[765]/i, /opus/i, /sonnet-4-[65]/i, /sonnet/i]
+    : p === "antigravity"
+      ? [/carbon-high/i, /gemini-4/i, /pro/i]
+      : [/6\.2/i, /6\.1/i, /5\.4/i];
+  for (const rx of preferredOrder) {
+    const hit = models.find((m) => rx.test(String(m.id)) || rx.test(String(m.label ?? "")));
+    if (hit) return hit;
+  }
+  return models.find((m) => m.isDefault) ?? models[0];
+}
+
+// Automatically switches a quota-exhausted or auth-blocked Paseo coding session
+// onto another healthy provider (e.g. Codex -> Claude or Antigravity) in the
+// exact same host & working directory, preserving bounded transcript + goal context.
+export async function failoverPaseoSessionProvider({
+  config,
+  thread,
+  reason = "provider usage limit",
+  goalContext = null,
+  preferredProviders = ["claude", "antigravity", "codex"],
+  factory
+} = {}) {
+  if (!config?.paseo?.enabled || thread?.kind !== "paseo") {
+    return { ok: false, detail: "Paseo is not enabled for this thread." };
+  }
+  const serverId = thread?.meta?.serverId;
+  const agentId = thread?.id;
+  if (!serverId || !agentId) {
+    return { ok: false, detail: "Missing Paseo serverId or agentId." };
+  }
+
+  return withPaseo(config, async (client, signal) => {
+    const api = await hostApi(client, serverId);
+    const ref = api.agents.ref(agentId);
+    await ref.refresh().catch(() => {});
+    signal.throwIfAborted();
+    const agent = ref.current();
+    const cwd = String(agent?.cwd ?? thread?.meta?.paseoCwd ?? "").trim();
+    if (!cwd || typeof api?.providers?.waitForReady !== "function" || typeof api?.agents?.create !== "function") {
+      return { ok: false, detail: "Paseo host does not expose provider catalog or session creation for this workspace." };
+    }
+
+    const currentProviderRaw = String(agent?.provider ?? thread?.meta?.provider ?? "").trim().toLowerCase();
+    const exhaustedProvider = currentProviderRaw.split("/")[0] || "codex";
+
+    let timelineEntries = [];
+    try {
+      const history = await ref.timeline.refetch({ direction: "tail", limit: 30 });
+      timelineEntries = Array.isArray(history?.entries) ? history.entries : [];
+    } catch { /* fallback to cached thread conversation */ }
+    signal.throwIfAborted();
+
+    const snap = await api.providers.waitForReady({ cwd, timeoutMs: 8000 });
+    const entries = Array.isArray(snap?.entries) ? snap.entries : [];
+    const readyAlternates = entries.filter(
+      (e) => e?.status === "ready" && e?.provider && String(e.provider).toLowerCase() !== exhaustedProvider
+    );
+    if (!readyAlternates.length) {
+      return {
+        ok: false,
+        exhaustedProvider,
+        detail: `No healthy alternate Paseo provider is ready on ${serverId} (exhausted: ${exhaustedProvider}).`
+      };
+    }
+
+    let chosen = null;
+    for (const pref of preferredProviders) {
+      const match = readyAlternates.find((e) => String(e.provider).toLowerCase() === String(pref).toLowerCase());
+      if (match) {
+        chosen = match;
+        break;
+      }
+    }
+    chosen ??= readyAlternates[0];
+    const chosenModel = selectPreferredModel(chosen);
+    if (!chosen?.provider || !chosenModel?.id) {
+      return { ok: false, exhaustedProvider, detail: `Alternate provider ${chosen?.provider ?? "?"} has no selectable model.` };
+    }
+
+    const priorTail = (timelineEntries.length
+      ? timelineEntries
+          .filter((e) => ["user_message", "assistant_message"].includes(e?.item?.type) && !/^\[System Error\]/i.test(String(e?.item?.text ?? "").trim()))
+          .slice(-6)
+          .map((e) => `${e.item.type === "user_message" ? "Owner" : "Assistant"}: ${clampText(redactSecrets(String(e.item.text ?? "")), 420)}`)
+      : (thread?.meta?.conversation ?? [])
+          .filter((m) => !/^\[System Error\]/i.test(String(m?.text ?? "").trim()))
+          .slice(-6)
+          .map((m) => `${m.role === "user" ? "Owner" : "Assistant"}: ${clampText(redactSecrets(String(m.text ?? "")), 420)}`)
+    ).join("\n");
+
+    const baseTitle = clampText(redactSecrets(String(agent?.title ?? thread?.title ?? path.basename(cwd))), 72) || path.basename(cwd);
+    const prLine = thread?.prRefs?.length ? `Linked PR(s): ${thread.prRefs.slice(0, 3).join(", ")}\n` : "";
+    const goalLine = goalContext?.goal
+      ? `Tracked Goal: ${clampText(redactSecrets(goalContext.goal), 260)}\nDefinition of Done: ${clampText(redactSecrets(goalContext.doneCriteria || "Verify all in-scope work is complete."), 260)}\n`
+      : "";
+    const prompt = [
+      `[OpenAGI supervisor] Automatic provider failover: continuing "${baseTitle}" on ${chosen.provider}/${chosenModel.id} because the previous ${exhaustedProvider} runtime hit ${clampText(redactSecrets(reason), 120)}.`,
+      prLine + goalLine,
+      priorTail ? `Recent conversation before quota block:\n${priorTail}` : "",
+      "Instructions: First run `git status -sb` and `git log -n 3 --oneline` in this workspace to inspect what already landed or is uncommitted. Continue the unfinished in-scope work seamlessly without redoing completed steps. Respect hard red lines: do not merge PRs, deploy to production, send external customer messages, or spend money without explicit owner confirmation."
+    ].filter(Boolean).join("\n\n");
+
+    const created = await api.agents.create({
+      config: { provider: `${chosen.provider}/${chosenModel.id}` },
+      cwd,
+      title: baseTitle,
+      prompt
+    });
+    if (!created?.id) {
+      return { ok: false, exhaustedProvider, detail: "Paseo host returned no session id when creating failover continuation." };
+    }
+
+    return {
+      ok: true,
+      oldKey: thread.key,
+      newKey: `paseo:${serverId}.${created.id}`,
+      serverId,
+      agentId: created.id,
+      exhaustedProvider,
+      provider: `${chosen.provider}/${chosenModel.id}`,
+      cwd,
+      title: baseTitle
+    };
+  }, factory);
+}
+
 async function recoverDisconnectedPaseoSession({ api, agent, thread, baselineEntries, text, images, serverId }) {
   const cwd = String(agent?.cwd ?? thread?.meta?.paseoCwd ?? "").trim();
   if (!cwd || typeof api?.providers?.waitForReady !== "function" || typeof api?.agents?.create !== "function") {

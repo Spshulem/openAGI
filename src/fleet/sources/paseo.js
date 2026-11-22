@@ -313,15 +313,38 @@ export async function hostApi(client, serverId, directory = null) {
 // Keep it out of conversation/PR extraction, but pass it to the existing
 // infrastructure policy. Quoted errors and failed tools are not turn failures.
 function currentError(agent, entries) {
-  if (agent.archivedAt || agent.activeTurn || ["running", "initializing", "closed"].includes(agent.status)) return null;
+  if (agent.archivedAt) return null;
   let failure = null;
   for (const entry of entries) {
-    if (["user_message", "assistant_message"].includes(entry.item?.type)) failure = null;
-    else if (entry.item?.type === "error") failure = entry;
+    if (entry.item?.type === "user_message") {
+      failure = null;
+    } else if (entry.item?.type === "assistant_message") {
+      const rawText = String(entry.item?.text ?? "").trim();
+      if (/^\[System Error\]/i.test(rawText)) {
+        failure = {
+          timestamp: entry.timestamp,
+          isSystemErrorMsg: true,
+          item: {
+            type: "error",
+            message: rawText.replace(/^\[System Error\]\s*/i, "").trim() || rawText
+          }
+        };
+      } else {
+        failure = null;
+      }
+    } else if (entry.item?.type === "error") {
+      failure = entry;
+    }
   }
   // A newer retry may fall outside the bounded history page. A current
   // error snapshot is authoritative even when its event is outside that page.
   if (Date.parse(agent.lastUserMessageAt) > Date.parse(failure?.timestamp)) failure = null;
+  // An active turn or initializing/closed state clears old error events; only an
+  // unrecovered `[System Error]` assistant message on a stuck `"running"` session
+  // (where Paseo emitted the quota/auth error without clearing `status: "running"`)
+  // remains an active error.
+  if (agent.activeTurn || ["initializing", "closed"].includes(agent.status)) return null;
+  if (agent.status === "running" && !failure?.isSystemErrorMsg) return null;
   const snapshotError = agent.status === "error" ? redactSecrets(agent.lastError ?? "").slice(0, 8000).trim() : "";
   if (!snapshotError && !failure && agent.status !== "error") return null;
   const eventError = redactSecrets(failure?.item.message ?? "").slice(0, 8000).trim();
@@ -373,13 +396,17 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
       .filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX))
       .map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp }))
   );
+  const detectedError = currentError(agent, entries);
+  const hardTerminalError = Boolean(
+    detectedError && ["usage-limit", "session-limit", "model-limit", "logged-out", "disk-full"].includes(detectedError.kind)
+  );
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
     cwd: null, workspace: cleanWorkspace, repo: parsePrRef(prRefs[0])?.repo ?? workspaceMeta?.repo ?? null, branch: workspaceMeta?.branch ?? null,
-    agentStatus: hasBlockingPermission ? "waiting" : silentStuck ? "stalled" : agent.activeTurn || agent.status === "initializing" ? "running"
+    agentStatus: hasBlockingPermission ? "waiting" : hardTerminalError ? "error" : silentStuck ? "stalled" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status
       : (sleepingActive && !agent.archivedAt && agent.status === "closed") ? "idle" : "unknown",
     archived: Boolean(agent.archivedAt),
@@ -389,7 +416,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
     lastActivityAt: agent.updatedAt, lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
     lastUserText: stripAgentInternalMarkup(redactSecrets(owner?.item.text ?? "")).slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
     lastAgentText: clampTailLines(text, 900), lastAgentTail: text, lastAgentFull: text,
-    error: currentError(agent, entries), openTasks: [], prRefs, live: null, writerLocked: false,
+    error: detectedError, openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       model: clampText(redactSecrets(agent.model ?? ""), 100) || null,
       settings: {
@@ -476,8 +503,9 @@ export function createPaseoSource({ factory } = {}) {
         if (!retainedUnknown) cache.delete(key);
       }
       const scanStartedAt = meta.startedAt ?? Date.now();
-      const lookbackMs = Math.max(1, Number(config.lookbackHours ?? 48)) * 3600_000;
+      const lookbackMs = Math.max(1, Number(config.lookbackHours ?? 168)) * 3600_000;
       const liveStallMs = config.limits?.liveServerStallMs ?? 2 * 3600_000;
+      const runningRefreshMs = 3 * 60_000;
       const isRecentSleeping = (a) => Boolean(
         !a.archivedAt && a.status === "closed" && (Date.parse(a.updatedAt ?? "") || 0) >= scanStartedAt - lookbackMs
       );
@@ -488,8 +516,14 @@ export function createPaseoSource({ factory } = {}) {
         && (Date.parse(a.updatedAt ?? "") || 0) > 0
         && scanStartedAt - (Date.parse(a.updatedAt ?? "") || 0) >= liveStallMs
       );
+      const isRunningNeedsErrorProbe = (a, key) => Boolean(
+        !a.archivedAt
+        && (a.activeTurn || a.status === "running")
+        && cache.get(key)?.stamp !== a.updatedAt
+        && scanStartedAt - (cache.get(key)?.attempted ?? 0) >= runningRefreshMs
+      );
       const candidates = inventory.filter(({ agent: a, key }) => !a.archivedAt
-        && (["idle", "error"].includes(a.status) || isRecentSleeping(a) || isSilentRunning(a))
+        && (["idle", "error"].includes(a.status) || isRecentSleeping(a) || isSilentRunning(a) || isRunningNeedsErrorProbe(a, key))
         && cache.get(key)?.stamp !== a.updatedAt).sort((a, b) =>
           (Number(a.agent.status === "closed") - Number(b.agent.status === "closed"))
           || ((cache.get(a.key)?.attempted ?? 0) - (cache.get(b.key)?.attempted ?? 0))
