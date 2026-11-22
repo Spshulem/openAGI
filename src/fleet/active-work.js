@@ -1234,8 +1234,8 @@ export class ActiveWorkManager {
             type: "predicate",
             name: "goal_accomplished",
             instructions:
-              "Based on `done_criteria`, `cursor`, and `latest_evidence`, is the entire `goal` genuinely accomplished " +
-              "with zero remaining batches or unverified acceptance steps (as opposed to only finishing one partial batch or audit)?"
+              "Based on `done_criteria`, `acceptance_criteria`, `cursor`, and `latest_evidence`, is the entire `goal` genuinely accomplished " +
+              "with zero remaining batches and every acceptance requirement verified (as opposed to only finishing one partial batch or audit)?"
           }
         ],
         apiKey,

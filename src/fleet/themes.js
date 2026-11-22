@@ -21,9 +21,9 @@ export const PASEO_LABEL_COLORS = Object.freeze([
   "red"
 ]);
 
-function dispatchDedupeKey(project, theme, goal) {
+function dispatchDedupeKey(project, theme, goal, dispatchId = "") {
   const slug = (value) => String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general";
-  return `dispatch:${slug(project)}:${slug(theme)}:${shortHash(goal)}`;
+  return `dispatch:${slug(project)}:${slug(theme)}:${shortHash(`${goal}:${dispatchId}`)}`;
 }
 
 const THEME_RULES = [
@@ -944,6 +944,10 @@ export async function dispatchManagerGoal(
   const normalizedMode = ["preview", "auto", "execute", "force_new"].includes(String(mode ?? "auto").toLowerCase())
     ? String(mode ?? "auto").toLowerCase()
     : "auto";
+  // Each manager dispatch is a distinct execution, even when it repeats the
+  // same wording. The returned Work id is reused only for the post-start
+  // owner attachment, so no completed execution can hide a rerun.
+  const dispatchId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${shortHash(`${cleanGoal}:${project ?? ""}:${theme ?? ""}`)}`;
 
   // A dispatch is never allowed to outrun its durable outcome contract.  This
   // record is written before any message is sent or new Paseo session starts,
@@ -976,7 +980,7 @@ export async function dispatchManagerGoal(
       permittedNudges: "none",
       dispatching: true,
       resetVerification: true,
-      dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal)
+      dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal, dispatchId)
     });
   };
 
@@ -1273,7 +1277,7 @@ export async function dispatchManagerGoal(
       project: targetProject.name,
       theme: theme || inferredTheme.name,
       goal: cleanGoal,
-      dedupeKey: persisted?.item?.dedupeKey ?? dispatchDedupeKey(targetProject.name, theme || inferredTheme.name, cleanGoal),
+      dedupeKey: persisted?.item?.dedupeKey ?? dispatchDedupeKey(targetProject.name, theme || inferredTheme.name, cleanGoal, dispatchId),
       owner: { threadKey: created.key, label: created.title || suggestedTitle },
       currentStep: "Owner session started; awaiting first meaningful evidence",
       workflowStage: "implementing",
