@@ -720,6 +720,22 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues. Still here.")
     }
 
+    // On a real iPhone the recognizer can restart its transcript after a
+    // pause with no final marker and zero timing. Earlier words must stay.
+    func testTranscriptRestartAfterPauseKeepsEarlierWords() {
+        let app = launch(["--ui-dictation-pause-fixture", "--ui-dictation-reset"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "After the pause it continues."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 8), .completed)
+        XCTAssertEqual(mic.label, "Stop dictation")
+        mic.tap()
+        XCTAssertEqual(field.value as? String, "Before the pause After the pause it continues.")
+    }
+
     func testLongLiveDictationStaysInBoundedEditorWithAccessibleControls() {
         let app = launch(["--ui-dictation-fixture", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tab(app, "Chat")

@@ -119,4 +119,31 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertTrue(ChatDictation.failureEndsDictation(listenedFor: 8, quickFailures: 0, microphoneRunning: false).ends,
                       "a stopped microphone ends dictation")
     }
+
+    // On-device recognition may restart its transcript after a pause with no
+    // final marker and zero timing. Earlier words must stay.
+    func testATranscriptRestartWithoutTimingKeepsEarlierWords() {
+        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "Before the pause", text: "After"))
+        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "I need milk", text: "I"), "a shared first word")
+        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "Hello there", text: "Bye"))
+        var t = DictationTranscript(base: "")
+        for text in ["Before the", "Before the pause", "After", "After the pause it continues."] {
+            _ = t.receive(text, isFinal: false,
+                          startsNewUtterance: DictationTranscript.restartsWithoutTiming(live: t.live, text: text))
+        }
+        XCTAssertEqual(t.draft, "Before the pause After the pause it continues.")
+    }
+
+    func testOrdinaryRevisionsAreNotARestart() {
+        for (live, text) in [("Before", "Before the"), ("I want to", "I wanted two"), ("Before the pause it", "Before the pause"),
+                             ("um I want to go", "I want to go"), ("I wanted two", "I wanted to go."), ("Kept", "Kept,"),
+                             ("", "Anything"), ("Something", "")] {
+            XCTAssertFalse(DictationTranscript.restartsWithoutTiming(live: live, text: text), "\(live) -> \(text)")
+        }
+    }
+
+    func testImmediateFailuresWaitLongerBeforeTheNextTry() {
+        XCTAssertEqual(ChatDictation.retryDelay(afterQuickFailures: 1), 250)
+        XCTAssertEqual(ChatDictation.retryDelay(afterQuickFailures: 2), 500)
+    }
 }
