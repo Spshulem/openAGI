@@ -622,8 +622,9 @@ function ownerReply(text) {
   return `Owner says: ${text}`;
 }
 
-// "retry" on a logged-out / disk-full question means the owner fixed it.
-const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
+// "retry" on a logged-out / provider-auth / disk-full question means the
+// owner fixed it.
+const RETRY_DELIVERY = "Owner fixed the blocker (login, provider auth or disk). Retry: continue where you stopped.";
 // "added" on an account-cap question means new capacity: resume now.
 const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
 const RESTART_REPEAT_MS = 10 * 60_000;
