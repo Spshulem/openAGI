@@ -553,21 +553,26 @@ export class OwnerPrecedentStore {
       return { matched: false, hardRedLine: redLine };
     }
 
-    // 1. Deterministic High-Confidence Rule: Read-only shell / CodexBash inspection.
+    // 1. Deterministic High-Confidence Rule: Read-only shell / CodexBash inspection or staging MCP read/report tools.
     if (question?.kind === "prompt") {
+      const permName = String(thread?.meta?.pendingPermission?.name ?? "");
       const cmdCandidate = permCommand || question.body || "";
-      if (isSafeReadOnlyCommand(cmdCandidate)) {
-        const allowOpt = (question.options ?? []).find((opt) => /^(?:allow(?:\s+once|\s+for\s+session)?|approve|yes)$/i.test(String(opt).trim()));
-        const prec = this.state.precedents.find((p) => p.id === "prec_readonly_bash");
+      const isStagingMcpTool = /^mcp__buildbetter-staging__(?:success-(?:search|list|get|create-report|update-report|create-lifecycle|update-lifecycle)|read|search|list|get)/i.test(permName)
+        || /\bmcp__buildbetter-staging__/i.test(String(question.title ?? ""));
+      const isReadOnlyMcp = /^mcp__[A-Za-z0-9_-]+__(?:search|list|get|read|fetch|query|inspect)[A-Za-z0-9_-]*$/i.test(permName);
+      if (isSafeReadOnlyCommand(cmdCandidate) || isStagingMcpTool || isReadOnlyMcp) {
+        const allowOpt = (question.options ?? []).find((opt) => /^(?:allow(?:\s+once|\s+for\s+session|\s+always)?|approve|yes)$/i.test(String(opt).trim()));
+        const precId = isStagingMcpTool ? "prec_appfolio_staging_mcp" : "prec_readonly_bash";
+        const prec = this.state.precedents.find((p) => p.id === precId);
         if (allowOpt && (!prec || (prec.vetoCount ?? 0) === 0)) {
           return {
             matched: true,
-            source: "deterministic-readonly-bash",
-            precedentId: "prec_readonly_bash",
+            source: isStagingMcpTool ? "deterministic-staging-mcp-tool" : "deterministic-readonly-bash",
+            precedentId: precId,
             confidence: 0.99,
             action: "answer",
             answer: allowOpt,
-            summary: `Auto-allowed read-only inspection (${clampText(cmdCandidate, 90)})`
+            summary: `Auto-allowed ${isStagingMcpTool ? `staging MCP tool (${permName || clampText(question.title, 60)})` : `read-only inspection (${clampText(cmdCandidate || permName, 90)})`}`
           };
         }
       }
