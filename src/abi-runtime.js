@@ -749,7 +749,7 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else if (!options.ephemeral && !options.isolatedContext) {
+    } else if (!options.ephemeral && !options.isolatedContext && options.memoryWrite !== false) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
