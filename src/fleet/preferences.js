@@ -10,6 +10,13 @@ import { clampText, redactSecrets } from "./contracts.js";
 
 export const MERGE_POLICIES = Object.freeze(["manual_confirm", "queue_when_green"]);
 export const CADENCE_MODES = Object.freeze(["quiet_until_ready", "balanced", "detailed"]);
+export const PASEO_PROVIDERS = Object.freeze(["claude", "codex", "antigravity", "auto"]);
+export const PASEO_PERMISSION_MODES = Object.freeze(["bypass", "auto", "ask"]);
+export const DEFAULT_PASEO_MODELS = Object.freeze({
+  claude: "claude-opus-5-5",
+  codex: "gpt-6.2-sol",
+  antigravity: "gemini-4-carbon-high"
+});
 
 export const SAFE_SLICES = Object.freeze({
   in_scope_test_fix: {
@@ -57,6 +64,9 @@ export function defaultPreferences() {
     autoApprove: true,
     mergePolicy: "manual_confirm",
     cadence: "balanced",
+    defaultProvider: "claude",
+    defaultPermissionMode: "bypass",
+    defaultModels: { ...DEFAULT_PASEO_MODELS },
     autoSlices: Object.fromEntries(Object.keys(SAFE_SLICES).map((key) => [key, "ask"])),
     streaks: {
       dismissals: 0,
@@ -74,6 +84,20 @@ export function normalizePreferences(raw) {
   const autoApprove = typeof raw.autoApprove === "boolean" ? raw.autoApprove : base.autoApprove;
   const mergePolicy = MERGE_POLICIES.includes(raw.mergePolicy) ? raw.mergePolicy : base.mergePolicy;
   const cadence = CADENCE_MODES.includes(raw.cadence) ? raw.cadence : base.cadence;
+  const defaultProvider = PASEO_PROVIDERS.includes(raw.defaultProvider) ? raw.defaultProvider : base.defaultProvider;
+  const defaultPermissionMode = PASEO_PERMISSION_MODES.includes(raw.defaultPermissionMode)
+    ? raw.defaultPermissionMode
+    : base.defaultPermissionMode;
+  const defaultModels = { ...base.defaultModels };
+  if (isObject(raw.defaultModels)) {
+    for (const key of Object.keys(DEFAULT_PASEO_MODELS)) {
+      const val = typeof raw.defaultModels[key] === "string" ? raw.defaultModels[key].trim() : "";
+      // Never retain deprecated 4.7 as a saved Claude default when 5.5 is the standard.
+      if (val && !(key === "claude" && /4[-.]7/.test(val))) {
+        defaultModels[key] = clampText(val, 120);
+      }
+    }
+  }
   const autoSlices = { ...base.autoSlices };
   if (isObject(raw.autoSlices)) {
     for (const key of Object.keys(SAFE_SLICES)) {
@@ -116,7 +140,19 @@ export function normalizePreferences(raw) {
         reverted: item.reverted === true
       }))
     : [];
-  return { autoApprove, mergePolicy, cadence, autoSlices, streaks, dismissedPrompts, ciMergeWatchPrompt, autonomousActions };
+  return {
+    autoApprove,
+    mergePolicy,
+    cadence,
+    defaultProvider,
+    defaultPermissionMode,
+    defaultModels,
+    autoSlices,
+    streaks,
+    dismissedPrompts,
+    ciMergeWatchPrompt,
+    autonomousActions
+  };
 }
 
 // Identifies whether a question belongs to a safe routine slice. Risky,
@@ -270,6 +306,25 @@ export function applyPreferencePatch(rawPrefs, patch = {}, { now = Date.now() } 
   if (CADENCE_MODES.includes(patch.cadence)) {
     prefs.cadence = patch.cadence;
     prefs.streaks.dismissals = 0;
+  }
+  if (PASEO_PROVIDERS.includes(patch.defaultProvider)) {
+    prefs.defaultProvider = patch.defaultProvider;
+  }
+  if (PASEO_PERMISSION_MODES.includes(patch.defaultPermissionMode)) {
+    prefs.defaultPermissionMode = patch.defaultPermissionMode;
+  }
+  if (typeof patch.defaultModel === "string" && patch.defaultModel.trim()) {
+    const m = clampText(patch.defaultModel.trim(), 120);
+    if (/claude|opus|sonnet|haiku/i.test(m)) prefs.defaultModels.claude = m;
+    else if (/gemini|carbon|argon/i.test(m)) prefs.defaultModels.antigravity = m;
+    else prefs.defaultModels.codex = m;
+  }
+  if (isObject(patch.defaultModels)) {
+    for (const key of Object.keys(DEFAULT_PASEO_MODELS)) {
+      if (typeof patch.defaultModels[key] === "string" && patch.defaultModels[key].trim()) {
+        prefs.defaultModels[key] = clampText(patch.defaultModels[key].trim(), 120);
+      }
+    }
   }
   if (isObject(patch.autoSlices)) {
     for (const [slice, mode] of Object.entries(patch.autoSlices)) {
