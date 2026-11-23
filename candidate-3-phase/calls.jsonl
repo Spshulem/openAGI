@@ -1,0 +1,26 @@
+{"at":"2026-11-23T17:52:04.508Z","call":1,"phase":"start","input":"qa warm-up","requestId":null}
+{"at":"2026-11-23T17:52:04.509Z","call":1,"phase":"end","requestId":null}
+{"at":"2026-11-23T17:53:12.235Z","call":2,"phase":"start","input":"[slow] QA running turn from the iPhone","requestId":"ios-e8ced7cf-a9b0-4ab1-9e73-54c835d39989"}
+{"at":"2026-11-23T17:53:32.238Z","call":2,"phase":"end","requestId":"ios-e8ced7cf-a9b0-4ab1-9e73-54c835d39989"}
+{"at":"2026-11-23T17:53:32.432Z","call":3,"phase":"start","input":"[mac-1] Mac tagged message one","requestId":"mac-8e574089-1a50-45ef-b36f-30063d1220ee"}
+{"at":"2026-11-23T17:53:32.433Z","call":3,"phase":"end","requestId":"mac-8e574089-1a50-45ef-b36f-30063d1220ee"}
+{"at":"2026-11-23T17:53:32.632Z","call":4,"phase":"start","input":"[mac-2] Mac tagged message two","requestId":"mac-5bc9cca9-5404-4373-9e51-da7c3609bd94"}
+{"at":"2026-11-23T17:53:32.632Z","call":4,"phase":"end","requestId":"mac-5bc9cca9-5404-4373-9e51-da7c3609bd94"}
+{"at":"2026-11-23T17:53:32.887Z","call":5,"phase":"start","input":"[ios-1] iPhone tagged message one","requestId":"ios-95205dc1-273e-4bff-b86c-7f80bbf63b32"}
+{"at":"2026-11-23T17:53:32.888Z","call":5,"phase":"end","requestId":"ios-95205dc1-273e-4bff-b86c-7f80bbf63b32"}
+{"at":"2026-11-23T17:53:33.068Z","call":6,"phase":"start","input":"[ios-2] iPhone tagged message two","requestId":"ios-d0762dd6-c0c3-4f2d-96a9-2ffe5bc80eeb"}
+{"at":"2026-11-23T17:53:33.068Z","call":6,"phase":"end","requestId":"ios-d0762dd6-c0c3-4f2d-96a9-2ffe5bc80eeb"}
+{"at":"2026-11-23T17:54:31.893Z","call":7,"phase":"start","input":"[slow] second running turn from the iPhone","requestId":"ios-0f11c576-2032-42fc-b1e9-128a5a4c30c0"}
+{"at":"2026-11-23T17:54:42.077Z","call":7,"phase":"stopped","requestId":"ios-0f11c576-2032-42fc-b1e9-128a5a4c30c0"}
+{"at":"2026-11-23T17:54:42.164Z","call":8,"phase":"start","input":"[ios-6] iPhone message the Mac will send now","requestId":"ios-791c0cd4-21da-40ea-930f-e5876cf3c2ca"}
+{"at":"2026-11-23T17:54:42.164Z","call":8,"phase":"end","requestId":"ios-791c0cd4-21da-40ea-930f-e5876cf3c2ca"}
+{"at":"2026-11-23T17:54:42.288Z","call":9,"phase":"start","input":"[mac-3] edited on the Mac while the iPhone tried","requestId":"mac-f374ea63-b23d-439a-a804-6d679671bc92"}
+{"at":"2026-11-23T17:54:42.288Z","call":9,"phase":"end","requestId":"mac-f374ea63-b23d-439a-a804-6d679671bc92"}
+{"at":"2026-11-23T17:55:40.291Z","call":10,"phase":"start","input":"[slow] third running turn from the iPhone","requestId":"ios-1026fd6b-e67c-4b70-a9e7-cf1468225421"}
+{"at":"2026-11-23T17:55:47.405Z","call":10,"phase":"stopped","requestId":"ios-1026fd6b-e67c-4b70-a9e7-cf1468225421"}
+{"at":"2026-11-23T17:55:47.484Z","call":11,"phase":"start","input":"[mac-6] Mac sends anyway","requestId":"mac-0d15c70a-c952-4998-84c0-c9f5478eeeee"}
+{"at":"2026-11-23T17:55:47.484Z","call":11,"phase":"end","requestId":"mac-0d15c70a-c952-4998-84c0-c9f5478eeeee"}
+{"at":"2026-11-23T17:55:47.651Z","call":12,"phase":"start","input":"[ios-7] iPhone queued this, then closed the app","requestId":"ios-515c6d1c-34cc-4c80-baba-62d383ebd5fd"}
+{"at":"2026-11-23T17:55:47.651Z","call":12,"phase":"end","requestId":"ios-515c6d1c-34cc-4c80-baba-62d383ebd5fd"}
+{"at":"2026-11-23T17:55:47.819Z","call":13,"phase":"start","input":"[mac-5] Mac queued this while the iPhone's app was closed","requestId":"mac-c664fb32-c87e-425d-9eef-7118cc7ac1af"}
+{"at":"2026-11-23T17:55:47.820Z","call":13,"phase":"end","requestId":"mac-c664fb32-c87e-425d-9eef-7118cc7ac1af"}
