@@ -126,7 +126,7 @@ test("an old unanswered question is reworked in place with recovered context, wi
     runtime: { outreach },
     now: () => new Date(NOW),
     fetchImpl: async (_url, init) => { pushes.push(JSON.parse(init.body)); return { ok: true, status: 200 }; },
-    contextFor: (q) => decisionContextFromQuestion(q)
+    contextFor: (q) => decisionContextFromQuestion(q, { now: NOW })
   });
   const result = await notifier.notifyQuestion(question);
   assert.equal(result.pushed, false);
@@ -135,8 +135,11 @@ test("an old unanswered question is reworked in place with recovered context, wi
   assert.equal(outreach.calls.append, 0, "no second outreach copy");
   const copy = outreach.get("out_old_1");
   assert.match(copy.summary, /^1\. Goal: bb-recorder TestFlight upload\. Get the bb-recorder macOS build onto TestFlight/m);
-  assert.match(copy.summary, /^2\. You asked the agent to:/m);
-  assert.match(copy.summary, /^3\. Where it stands: Verified: CI is green on PR #88\./m);
+  // The assignment is the same request as the goal, so it is not repeated.
+  assert.doesNotMatch(copy.summary, /^2\. /m);
+  // One short status from the newest evidence, with the real blocker kept.
+  assert.match(copy.summary, /^3\. Where it stands: Built and signed the macOS app; notarization verified locally\. The TestFlight upload is blocked: the App Store Connect API key expired and rotating it needs owner approval\.$/m);
+  assert.doesNotMatch(copy.summary, /Supervisor review|Not recoverable|Verified:|Changed:|Blocked:/);
   assert.match(copy.summary, /^4\. Decision now: .*Options: Rotate key; Hold \(Nothing changes now/m);
   assert.doesNotMatch(`${copy.title}\n${copy.summary}`, INTERNAL_ID_RE);
 
@@ -283,7 +286,7 @@ test("a context-poor new card is held while its owning agent supplies context, t
   assert.match(chat[0], /one new decision needs you/i);
   assert.match(chat[0], /1\. \*\*Goal:\*\* .*double-counting refunds/);
   assert.match(chat[0], /2\. \*\*You asked the agent to:\*\* Fix the refund double-count/);
-  assert.match(chat[0], /3\. \*\*Where it stands:\*\* Verified: Re-ran October/);
+  assert.match(chat[0], /3\. \*\*Where it stands:\*\* Export job dedupes refunds by charge id\. Shipping it rewrites last month's already-sent CSV, which only Spencer can approve\.\n/);
   assert.match(chat[0], /4\. \*\*Decision now:\*\* Re-send October's corrected CSV.*Recommendation: proceed/);
   assert.match(chat[0], /Decisions waiting on you: 1 · Sessions running here: 0 · Unverified tracked goals: 0/);
   assert.doesNotMatch(chat[0], INTERNAL_ID_RE, "check-ins use names, not ids");
@@ -354,7 +357,7 @@ test("an existing open follow-up is reworded with the four-part context without 
   assert.equal(copy.title, "Tracked goal · OpenAGI / Supervisor", "a tracked goal is labeled as one, not as a running session");
   assert.match(copy.summary, /^1\. Goal: OpenAGI \/ Supervisor\. Every Supervisor ask explains itself/m);
   assert.match(copy.summary, /^2\. You asked the agent to: No session owns this yet: Ship the shared decision-context format; done when Spencer confirms/m);
-  assert.match(copy.summary, /^3\. Where it stands: Changed: Last progress: Drafted the context standard.* Blocked: No meaningful progress for 30h/m);
+  assert.match(copy.summary, /^3\. Where it stands: No meaningful progress for 30h \(cadence 1h\)\. Drafted the context standard; tests not written yet\.$/m);
   assert.match(copy.summary, /^4\. Decision now: OpenAGI \/ Supervisor has been idle 30h\. Resume owner, snooze, or confirm done\? Options: Assign orphan \(A session is assigned/m);
   assert.match(copy.summary, /Confirm done \(The goal is marked verified complete/);
   assert.doesNotMatch(copy.summary, INTERNAL_ID_RE);
@@ -379,8 +382,10 @@ test("agent-supplied context parses, internal ids strip, and gaps are named rath
   assert.equal(bare.complete, false);
   assert.deepEqual(bare.missing, ["goal", "assignment", "progress", "blocked", "decision"]);
   const text = renderDecisionContext(bare);
-  assert.match(text, /1\. Goal: Not recoverable from the source chat or current evidence\./);
-  assert.doesNotMatch(text, /undefined|null/);
+  // Gaps are named in ctx.missing (and requested from the agent), not
+  // printed as boilerplate: only what is known is rendered.
+  assert.equal(text, "4. Decision now: Options: Yes; No (The agent skips that step and stays paused until it hears how else to proceed).");
+  assert.doesNotMatch(text, /undefined|null|Not recoverable/);
 });
 
 test("review fixes: stale agent context, permission approvals, reviewed recommendations, and the decision always survive", () => {
@@ -546,4 +551,57 @@ test("#348 review: a context request that never reached the agent is retried aft
   assert.equal(attempts.length, 2, "retried after the backoff");
   assert.equal(sup.store.question(q.id).contextRequest.sent, true);
   assert.equal(sup.store.question(q.id).contextRequest.attempts, 2);
+});
+
+// Spencer's regression (2026-11-23): "Bob on calls launch" showed the Google
+// sign-in text twice plus a contradictory unknown blocker. With his new
+// update, "Where it stands" must read as one current status.
+test("Where it stands: one current status for Bob on calls launch, details kept for drill-down", () => {
+  const now = Date.parse("2026-11-23T06:00:00.000Z");
+  const signIn1 = "---\n\nGoogle still reports **“You don’t have permission to view this page”** for `@buildbetterai`; the chat approval did not authenticate the YouTube account. I’m reopening the Google sign-in handoff now—please sign in to the account that owns the BuildBetter channel in that browser tab.";
+  const signIn2 = "---\n\nGoogle still blocks the BuildBetter Studio channel with “You don’t have permission.” The browser is reopened at the Google sign-in page; sign in to the account that owns `@buildbetterai`, then reply **done**.";
+  const question = {
+    id: "fq_951599d71b744bf3", kind: "agent-ask", status: "open",
+    threadKey: "paseo:srv_x.70428329-339b-4e56-bac3-4593096f3f06",
+    title: "Bob on calls launch: sign in to YouTube",
+    body: signIn2, options: ["sign in and done", "open thread"],
+    reviewedAt: "2026-11-20T18:20:00.000Z",
+    reviewReason: "The Bob on calls launch thread still requires owner Google sign-in; its latest agent message at 2026-11-20T18:15:13Z requests replying done afterward.",
+    reviewBrief: {
+      context: "Upload the BuildBetter Studio launch video to the channel owned by @buildbetterai.",
+      whatChanged: "Upload is blocked because Google still denies access to the BuildBetter Studio channel. The browser is reopened at Google sign-in; the owner must authenticate the account owning @buildbetterai, then confirm done.",
+      decision: "Sign in to the owning Google account and confirm, or leave the upload blocked.",
+      recommendation: "Recommend: Sign in to the @buildbetterai owner account and reply done."
+    }
+  };
+  const history = [
+    { role: "user", text: "Make the Bob on calls launch video and upload it unlisted to @buildbetterai.", at: "2026-11-20T17:00:00.000Z" },
+    { role: "user", text: "approved continue here", at: "2026-11-20T18:13:51.293Z" },
+    { role: "assistant", text: signIn1, at: "2026-11-20T18:14:55.408Z" },
+    { role: "assistant", text: signIn2, at: "2026-11-20T18:15:13.917Z" }
+  ];
+  const card = (messages) => buildSupervisorCard(question, {
+    threadsByKey: new Map([[question.threadKey, { key: question.threadKey, title: "Bob on calls launch video", lastAgentFull: messages.at(-1).text, meta: { conversation: messages } }]]),
+    now
+  });
+
+  // With the new update and the agent's reply to it.
+  const updated = card([...history,
+    { role: "user", text: "The video is ready. I'm signed in as @buildbetterai in Safari now.", at: "2026-11-23T05:50:00.000Z" },
+    { role: "assistant", text: "Video ready. Checking whether Safari can access YouTube Studio as @buildbetterai.", at: "2026-11-23T05:51:00.000Z" }
+  ]);
+  assert.equal(updated.decisionContext.status, "Video ready. Checking whether Safari can access YouTube Studio as @buildbetterai.");
+  assert.equal(updated.brief.whatChanged, updated.decisionContext.status, "the card shows the short status");
+  assert.doesNotMatch(updated.decisionContext.text, /Supervisor review|Not recoverable|Google still|Verified:|Changed:|Blocked:/);
+  assert.match(updated.brief.details, /Google still denies access/, "the earlier source detail stays in drill-down");
+
+  // The owner's update before the agent has replied is the current state.
+  const pending = card([...history, { role: "user", text: "The video is ready. I'm signed in as @buildbetterai in Safari now.", at: "2026-11-23T05:50:00.000Z" }]);
+  assert.equal(pending.decisionContext.status, "You said: The video is ready. The agent hasn't replied yet.");
+
+  // Without any update, the old blocker is shown once and as last known.
+  const stale = card(history);
+  assert.match(stale.decisionContext.status, /^Last known \(Nov 20\): /);
+  assert.equal((stale.decisionContext.status.match(/Google still/g) ?? []).length, 1, "the duplicated sign-in text appears once");
+  assert.ok(stale.decisionContext.status.length <= 300);
 });

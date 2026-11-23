@@ -100,6 +100,9 @@ export function parseAgentSuppliedContext(text) {
     const m = /^([A-Za-z][A-Za-z /']{1,40}?)\**\s*[:\-—]\s*(.*)$/.exec(trimmed);
     const field = m ? Object.keys(labels).find((name) => labels[name].test(m[1].trim())) : null;
     if (field) {
+      // The first value in the block wins: an agent that restates its
+      // original ask afterwards ("Blocked on: …") must not overwrite it.
+      if (field !== "options" && out[field] !== undefined) { current = null; continue; }
       current = field;
       if (field === "options") {
         out.options = out.options ?? [];
@@ -172,6 +175,92 @@ function sourceRequest(messages) {
 const BLOCKER_SENTENCE_RE = /\b(?:blocked|cannot|can't|can not|unable to|requires? (?:sudo|admin|your|owner|spencer|credentials?|approval)|needs? (?:your|owner|spencer|sudo|admin|credentials?|approval)|owner action|only you|waiting (?:on|for) (?:you|your|spencer|owner))\b/i;
 // Card state lines that only restate "waiting for you" carry no reason.
 const GENERIC_STATE_RE = /^(?:Paused at a decision checkpoint|Blocked at an external\/environment gate)/i;
+
+// ---- "Where it stands": one plain status sentence (two at most) ----------
+
+const OWNER_ACTION_RE = /\b(?:sign in|log in|reply|approve|allow|drag|grant|confirm|choose|pick|you need to|please)\b/i;
+const STATUS_NOISE_RE = /^(?:-{2,}|\*{2,}|!\[|\[image\]|supervisor review:|not recoverable|agent's latest update:)/i;
+const LAST_KNOWN_MS = 24 * 60 * 60 * 1000;
+
+function tokens(text) {
+  return new Set(String(text ?? "").toLowerCase().replace(/[^a-z0-9@#.\s]/g, " ").split(/\s+/).filter((w) => w.length > 2));
+}
+
+// Two sentences saying the same thing ("Google still blocks the channel…"
+// and "Google still reports … permission…") count as one.
+function similar(a, b) {
+  const ta = tokens(a);
+  const tb = tokens(b);
+  if (!ta.size || !tb.size) return false;
+  let shared = 0;
+  for (const w of ta) if (tb.has(w)) shared += 1;
+  // Against the longer sentence: sharing a few words (a PR number, a
+  // project name) with the decision is not a repeat.
+  return shared / Math.max(ta.size, tb.size) >= 0.6;
+}
+
+function statusSentences(text) {
+  return splitSentences(String(text ?? "").replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
+    .map((t) => t.replace(/^[-*•]\s+/, "").trim())
+    .filter((t) => t.length >= 6 && !STATUS_NOISE_RE.test(t) && !/^\[?openagi supervisor\]?/i.test(t));
+}
+
+function messageMs(message) {
+  const ms = Date.parse(message?.at ?? "");
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isSubstantive(message) {
+  const text = String(message?.text ?? "").trim();
+  if (!text || /^!\[[^\]]*\]\([^)]*\)\s*$/.test(text)) return false;
+  if (message?.role === "user" && (TRIVIAL_USER_MSG_RE.test(text) || SUPERVISOR_MSG_RE.test(text))) return false;
+  return true;
+}
+
+function shortDate(ms) {
+  return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+// Builds the status from the newest evidence: the agent's latest update, or
+// the owner's newer update the agent has not answered yet. A blocker from
+// before the newest update is "last known" and left to the details.
+function buildStatus({ recentMessages, supplied, fallbacks, avoid, nowMs }) {
+  const msgs = (recentMessages ?? []).filter(isSubstantive);
+  const lastAgent = [...msgs].reverse().find((m) => m.role !== "user") ?? null;
+  const lastUser = [...msgs].reverse().find((m) => m.role === "user") ?? null;
+  const agentMs = messageMs(lastAgent);
+  const userMs = messageMs(lastUser);
+  const ownerNewer = lastUser && (agentMs === null ? !lastAgent : userMs !== null && userMs > agentMs);
+
+  let picked = [];
+  let atMs = null;
+  if (supplied && (supplied.changed || supplied.blocked)) {
+    picked = [supplied.changed, supplied.blocked].filter(Boolean).flatMap(statusSentences);
+    atMs = agentMs;
+  } else if (ownerNewer) {
+    const said = statusSentences(lastUser.text)[0];
+    picked = said ? [`You said: ${said.replace(/[.!]?$/, ".")} The agent hasn't replied yet.`] : [];
+    atMs = userMs;
+  } else if (lastAgent) {
+    picked = statusSentences(lastAgent.text).filter((t) => !/\?$/.test(t));
+    atMs = agentMs;
+  }
+  if (!picked.length) picked = fallbacks.filter(Boolean).flatMap(statusSentences);
+
+  const out = [];
+  for (const sentence of picked) {
+    if (avoid.some((a) => a && similar(sentence, a))) continue;
+    if (out.some((kept) => similar(sentence, kept))) continue;
+    out.push(/[.!?…:)]$/.test(sentence) ? sentence : `${sentence}.`);
+    if (out.length === 2) break;
+  }
+  if (!out.length) return null;
+  let text = clampText(out.join(" "), 260);
+  if (atMs !== null && Number.isFinite(nowMs) && nowMs - atMs > LAST_KNOWN_MS) {
+    text = `Last known (${shortDate(atMs)}): ${text}`;
+  }
+  return text;
+}
 
 // Asks that carry no decision of their own ("needs your call. Answer?").
 const GENERIC_ASK_RE = /^(?:answer\??|proceed\??|continue\??|question \d+.*|.{0,60}needs your (?:call|decision|input)\.?\s*(?:answer\?)?|.{0,40}\bAnswer\?)$/i;
@@ -268,7 +357,8 @@ export function buildDecisionContext({
   reviewBrief = null,
   permission = null,
   followUp = null,
-  contextRequest = null
+  contextRequest = null,
+  now = Date.now()
 } = {}) {
   const askType = followUp ? "decision" : classifyAsk(question);
   const supplied = latestAgentContext(recentMessages, agentSummary, question);
@@ -374,6 +464,25 @@ export function buildDecisionContext({
     return rest ? `Agent's latest update: ${prose(rest, 280)}` : null;
   }).filter(Boolean).join(" ") || null;
 
+  // One short "where it stands": the newest evidence, without repeating the
+  // goal or the decision; the full verified/changed/blocked stay as details.
+  const status = buildStatus({
+    recentMessages,
+    supplied,
+    // Without agent messages: what the work actually changed first (a PR's
+    // summary), then a real blocker, then verification, never review notes.
+    fallbacks: [
+      followUp?.whySurfaced,
+      followUp?.lastMeaningfulProgress?.summary,
+      changed ? changed.replace(/^Agent's latest update:\s*/i, "") : null,
+      blocked && !/^(?:It is waiting|It needs permission|Merging needs)/.test(blocked) ? blocked : null,
+      ...verified.filter((v) => !/^Supervisor review:/i.test(v)),
+      blocked
+    ],
+    avoid: [goal, decision, assignment],
+    nowMs: Number(now)
+  });
+
   const consequenceCtx = {
     prName: prName ?? null,
     command: permission?.command ?? null,
@@ -429,6 +538,8 @@ export function buildDecisionContext({
     verified: verified.length ? verified.join(" ") : null,
     changed,
     blocked,
+    status,
+    details: [verified.length ? `Verified: ${verified.join(" ")}` : null, changed ? `Changed: ${changed}` : null, blocked ? `Blocked: ${blocked}` : null].filter(Boolean).join("\n") || null,
     decision,
     options,
     recommendation: rec,
@@ -448,12 +559,6 @@ const PART_LABELS = {
   decision: "the options for this decision"
 };
 
-function gapNote(ctx, part) {
-  return ctx.contextRequested
-    ? `Not in the source chat yet; the owning agent was asked for ${PART_LABELS[part]}.`
-    : `Not recoverable from the source chat or current evidence.`;
-}
-
 // Plain-English rendering. `markdown` adds bold labels and links; the plain
 // form is for outreach summaries and phone pushes.
 export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null } = {}) {
@@ -465,7 +570,7 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
     if (full.length <= maxChars) return full;
     const per = Math.max(80, Math.floor(maxChars * 0.12));
     const cut = (v) => (v ? clampText(v, per) : v);
-    const shortCtx = { ...ctx, goal: cut(ctx.goal), assignment: cut(ctx.assignment), verified: cut(ctx.verified), changed: cut(ctx.changed), blocked: cut(ctx.blocked) };
+    const shortCtx = { ...ctx, goal: cut(ctx.goal), assignment: cut(ctx.assignment), status: cut(ctx.status) };
     const shorter = renderDecisionContext(shortCtx, { markdown, compact: true });
     if (shorter.length <= maxChars) return shorter;
     const lines = shorter.split("\n");
@@ -476,23 +581,17 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
     return room > 40 ? `${clampText(head, room)}\n${tail}` : clampText(tail, maxChars);
   }
   const b = (s) => (markdown ? `**${s}**` : s);
-  const gap = (part) => gapNote(ctx, part);
+  // Only what is known is shown: an empty part is left out rather than
+  // filled with "not recoverable" boilerplate (ctx.missing still records it).
   const lines = [];
   const what = ctx.itemName ? `${ctx.itemName}. ` : "";
-  lines.push(`1. ${b("Goal:")} ${what}${ctx.goal ?? gap("goal")}`);
-  const assignment = ctx.assignment && ctx.assignment === ctx.goal ? "The same request quoted in 1." : ctx.assignment;
-  lines.push(`2. ${b("You asked the agent to:")} ${assignment ?? gap("assignment")}`);
-  const p3 = [
-    ctx.verified ? `Verified: ${ctx.verified}` : null,
-    ctx.changed ? `Changed: ${compact ? clampText(ctx.changed, 220) : ctx.changed}` : null,
-    !ctx.verified && !ctx.changed ? gap("progress") : null,
-    `Blocked: ${ctx.blocked ?? gap("blocked")}`
-  ].filter(Boolean).join(" ");
-  lines.push(`3. ${b("Where it stands:")} ${p3}`);
-  const opts = ctx.options.length
-    ? ctx.options.map((o) => `${o.label}${o.consequence ? ` (${o.consequence.replace(/\.$/, "")})` : ""}`).join("; ")
-    : gap("decision");
-  lines.push(`4. ${b("Decision now:")} ${ctx.decision ?? gap("decision")} Options: ${opts.replace(/\.$/, "")}.${ctx.recommendation ? ` ${/^recommend/i.test(ctx.recommendation) ? ctx.recommendation : `Recommendation: ${ctx.recommendation}`}` : ""}`);
+  if (ctx.goal || ctx.itemName) lines.push(`1. ${b("Goal:")} ${what}${ctx.goal ?? ""}`.trimEnd());
+  if (ctx.assignment && !similar(ctx.assignment, ctx.goal ?? "")) lines.push(`2. ${b("You asked the agent to:")} ${ctx.assignment}`);
+  if (ctx.status) lines.push(`3. ${b("Where it stands:")} ${compact ? clampText(ctx.status, 220) : ctx.status}`);
+  const opts = ctx.options.map((o) => `${o.label}${o.consequence ? ` (${o.consequence.replace(/\.$/, "")})` : ""}`).join("; ");
+  const rec = ctx.recommendation ? (/^recommend/i.test(ctx.recommendation) ? ctx.recommendation : `Recommendation: ${ctx.recommendation}`) : null;
+  const four = [ctx.decision, opts ? `Options: ${opts.replace(/\.$/, "")}.` : null, rec].filter(Boolean).join(" ");
+  if (four) lines.push(`4. ${b("Decision now:")} ${four}`);
   if (ctx.sources.length) {
     lines.push(markdown
       ? `Sources: ${ctx.sources.map((s) => `[${s.label}](${s.url})`).join(" · ")}`
@@ -547,7 +646,7 @@ export function shouldHoldForContext(question, ctx, nowMs = Date.now()) {
 
 // Derives context for a stored question from its persisted snapshot, for
 // callers that do not have a live card (notifications, check-ins).
-export function decisionContextFromQuestion(question, { activeGoal = null, thread = null, recommendation = null } = {}) {
+export function decisionContextFromQuestion(question, { activeGoal = null, thread = null, recommendation = null, now = Date.now() } = {}) {
   const snap = question?.contextSnapshot && typeof question.contextSnapshot === "object" ? question.contextSnapshot : {};
   const pr = snap.pr && typeof snap.pr === "object" ? snap.pr : null;
   const messages = Array.isArray(thread?.meta?.conversation) && thread.meta.conversation.length
@@ -570,6 +669,7 @@ export function decisionContextFromQuestion(question, { activeGoal = null, threa
     recommendation,
     reviewBrief: question?.reviewedAt ? question.reviewBrief : null,
     permission: permCmd ? { command: String(permCmd) } : null,
-    contextRequest: question?.contextRequest ?? null
+    contextRequest: question?.contextRequest ?? null,
+    now
   });
 }

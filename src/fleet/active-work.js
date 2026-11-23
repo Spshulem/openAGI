@@ -1807,7 +1807,8 @@ export class ActiveWorkManager {
         doneCriteria: projectedItem.doneCriteria
       },
       followUp: { ...projectedItem, verificationQuestion: projectedItem.verificationQuestion ?? spec?.decision ?? null },
-      recommendation: spec?.rec ?? null
+      recommendation: spec?.rec ?? null,
+      now: this.now()
     });
   }
 

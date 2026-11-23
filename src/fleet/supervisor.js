@@ -969,7 +969,7 @@ export class FleetSupervisor {
     const thread = key ? (this.lastThreads?.get?.(key) ?? this.knownThreads.get(key) ?? null) : null;
     let activeGoal = null;
     try { activeGoal = key || question.prRef ? this.activeWork.findActiveGoalForThread(key, question.prRef ?? null) : null; } catch { activeGoal = null; }
-    return decisionContextFromQuestion(question, { activeGoal, thread });
+    return decisionContextFromQuestion(question, { activeGoal, thread, now: this.now() });
   }
 
   // A new decision missing part of its context is held while its owning agent

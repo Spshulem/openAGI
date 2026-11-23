@@ -883,15 +883,11 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
 function enrichBriefWithDecisionContext(brief, ctx) {
   if (!brief || !ctx) return brief;
   if (!brief.context && ctx.goal) brief.context = clampText(ctx.goal, 420);
-  const extra = [];
-  const whatChanged = String(brief.whatChanged ?? "");
-  if (ctx.assignment && !whatChanged.includes(ctx.assignment.slice(0, 40)) && !String(brief.context ?? "").includes(ctx.assignment.slice(0, 40))) {
-    extra.push(`You asked the agent to: ${ctx.assignment}`);
-  }
-  if (ctx.verified && !whatChanged.includes(ctx.verified.slice(0, 30))) extra.push(`Verified: ${ctx.verified}`);
-  if (whatChanged) extra.push(whatChanged);
-  if (ctx.blocked && !whatChanged.includes(ctx.blocked.slice(0, 30))) extra.push(`Why it can't proceed alone: ${ctx.blocked}`);
-  if (extra.length) brief.whatChanged = clampTextLines(extra.join("\n\n"), 1200);
+  // "Where it stands" is one short status; the longer source text moves to
+  // details for drill-down instead of being stacked into the summary.
+  const fullDetails = [brief.whatChanged, ctx.details].filter(Boolean).join("\n\n");
+  if (ctx.status) brief.whatChanged = ctx.status;
+  brief.details = fullDetails ? clampTextLines(fullDetails, 2000) : null;
   // The recovered decision replaces a generic one ("Proceed?"): clients and
   // the Fleet tool read brief.decision, not the context.
   const briefFirstLine = String(brief.decision ?? "").split(/\n/)[0].trim();
@@ -904,6 +900,7 @@ function enrichBriefWithDecisionContext(brief, ctx) {
   }
   brief.goal = ctx.goal;
   brief.assignment = ctx.assignment;
+  brief.whereItStands = ctx.status;
   brief.verified = ctx.verified;
   brief.blocked = ctx.blocked;
   brief.options = ctx.options;
@@ -1120,7 +1117,8 @@ export function buildSupervisorCard(
     recommendation,
     reviewBrief: activeReviewBrief(question),
     permission: question.kind === "prompt" ? extractPermissionDetail(question, thread) : null,
-    contextRequest: question.contextRequest ?? null
+    contextRequest: question.contextRequest ?? null,
+    now: Number(now) || Date.now()
   });
   enrichBriefWithDecisionContext(brief, decisionContext);
   // The agent's own recommendation, recovered from its context reply, is the
