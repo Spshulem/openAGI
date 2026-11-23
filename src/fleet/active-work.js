@@ -778,10 +778,16 @@ export class ActiveWorkManager {
       120
     ) || null;
     const eta = cleanText(input.eta ?? existing?.eta ?? "", 120) || null;
+    const nextCheckInputMs = parseIsoMs(input.nextCheckAt);
+    const nextCheckExplicit = input.nextCheckAt !== undefined
+      ? nextCheckInputMs !== null
+      : Boolean(existing?.nextCheckExplicit);
+    const cadenceChanged = Boolean(existing && input.cadence !== undefined
+      && cadence.staleAfterHours !== existing.cadence?.staleAfterHours);
     const nextCheckMs = parseIsoMs(input.nextCheckAt ?? existing?.nextCheckAt);
-    const nextCheckAt = nextCheckMs !== null
+    const nextCheckAt = nextCheckMs !== null && !(cadenceChanged && !nextCheckExplicit)
       ? new Date(nextCheckMs).toISOString()
-      : (existing?.nextCheckAt ?? defaultNextCheckAt(nowMs, cadence));
+      : defaultNextCheckAt(nowMs, cadence);
     const requestedWorkflowStage = input.workflowStage !== undefined
       ? normalizeWorkflowStage(input.workflowStage)
       : (existing?.workflowStage ?? "queued");
@@ -849,6 +855,7 @@ export class ActiveWorkManager {
         nextActionOwner,
         eta,
         nextCheckAt,
+        nextCheckExplicit,
         workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
         nextActionOwnerExplicit,
         cadence: input.cadence !== undefined ? cadence : existing.cadence,
@@ -929,6 +936,7 @@ export class ActiveWorkManager {
         nextActionOwner,
         eta,
         nextCheckAt,
+        nextCheckExplicit,
         workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
         nextActionOwnerExplicit,
         cadence,
@@ -2481,6 +2489,13 @@ export class ActiveWorkManager {
       item.wasStaleAtLastEval = (nowMs - currentProgressMs) >= ((item.cadence?.staleAfterHours ?? 24) * HOUR_MS);
       item.lastEvaluatedMark = deltaMark;
       item.lastEvaluatedAt = nowIso;
+      // An omitted deadline is a moving cadence window. Once this pass has
+      // evaluated the item, advance that inferred check so Work and Ask
+      // Supervisor do not keep showing the deadline that just elapsed. An
+      // owner-supplied deadline remains fixed until explicitly changed.
+      if (item.nextCheckExplicit !== true) {
+        item.nextCheckAt = defaultNextCheckAt(nowMs, item.cadence);
+      }
 
       const projected = this._projectItem(item, { nowMs, sessionsByKey, prsByRef });
       item.lastEvaluatedActionable = projected.actionable;

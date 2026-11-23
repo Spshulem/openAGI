@@ -2339,7 +2339,7 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true, goalId = null } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
@@ -2386,7 +2386,7 @@ export class FleetSupervisor {
           this.resolveOutreach(q, "reply", "acted");
         }
       }
-      followThroughWatch = this.registerFollowThroughWatch(thread, text, { source: "owner-message", question: matchingOpen });
+      followThroughWatch = this.registerFollowThroughWatch(thread, text, { source: "owner-message", question: matchingOpen, goalId });
     }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
@@ -2406,9 +2406,13 @@ export class FleetSupervisor {
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
-  registerFollowThroughWatch(thread, message, { source = "owner-message", question = null } = {}) {
+  registerFollowThroughWatch(thread, message, { source = "owner-message", question = null, goalId = null } = {}) {
     if (!thread?.key) return null;
-    const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? question?.prRef ?? null);
+    const requestedGoal = typeof goalId === "string" && goalId.trim()
+      ? this.activeWork.state.items.find((item) => item?.id === goalId.trim() && item.state !== "done" && !item.outcomeVerified)
+      : null;
+    const activeGoal = requestedGoal
+      ?? this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? question?.prRef ?? null);
     const watch = this.store.upsertFollowThroughWatch({
       threadKey: thread.key,
       title: thread.title || thread.workspace || thread.key,

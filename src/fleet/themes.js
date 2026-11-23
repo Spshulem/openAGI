@@ -993,8 +993,8 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
-    persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
-    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
+    const persisted = persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
+    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const ok = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
@@ -1191,7 +1191,7 @@ export async function dispatchManagerGoal(
     }
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
-    persistDispatchOutcome({
+    const persisted = persistDispatchOutcome({
       projectName: targetProject.name,
       themeName: theme || inferredTheme.name,
       threadKey: best.session.key,
@@ -1199,7 +1199,7 @@ export async function dispatchManagerGoal(
       workflowStage: "implementing",
       nextAction: "Existing owner acknowledges the request"
     });
-    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images });
+    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const delivered = sent?.delivery?.status === "sent";
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
