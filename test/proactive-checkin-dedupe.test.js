@@ -269,7 +269,8 @@ test("proactive Supervisor check-ins: silent on unchanged blockers, count/reorde
 
     chatMsgs = runtime.getSupervisorMessages();
     assert.equal(chatMsgs.length, 2, "genuinely new blocker emits exactly 1 delta message");
-    assert.match(chatMsgs[1].content, /New decision needing you/i);
+    assert.match(chatMsgs[1].content, /one new decision needs you/i);
+    assert.doesNotMatch(chatMsgs[1].content, /\bfq_[0-9a-z]+/i, "check-ins never show internal question ids");
     assert.match(chatMsgs[1].content, /xcodebuild -license accept|bb-recorder/i);
     assert.doesNotMatch(chatMsgs[1].content, /10344/, "old unanswered blockerA is NOT re-listed");
     assert.doesNotMatch(chatMsgs[1].content, /server port|Paseo/i, "old unanswered blockerB is NOT re-listed");
@@ -297,7 +298,7 @@ test("proactive Supervisor check-ins: silent on unchanged blockers, count/reorde
 
     chatMsgs = runtime.getSupervisorMessages();
     assert.equal(chatMsgs.length, 3, "materially changed blocker emits exactly 1 delta message");
-    assert.match(chatMsgs[2].content, /Updated decision needing you|\[Updated\]/i);
+    assert.match(chatMsgs[2].content, /one decision changed and needs you|\*\*Changed:/i);
     assert.match(chatMsgs[2].content, /TLS certificate|rotate production cert/i);
     assert.doesNotMatch(chatMsgs[2].content, /10344/, "unchanged blockerA excluded from delta");
     assert.doesNotMatch(chatMsgs[2].content, /xcodebuild/i, "unchanged blockerC excluded from delta");

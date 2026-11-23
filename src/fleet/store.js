@@ -88,7 +88,8 @@ function emptyState() {
     followThroughWatches: [],
     supervisorChatNotices: {},
     surfacedDecisions: {},
-    providerFailovers: {}
+    providerFailovers: {},
+    contextRequestLog: {}
   };
 }
 
@@ -811,6 +812,22 @@ export class FleetStore {
     return { ...question };
   }
 
+  // The owning agent was asked to supply the decision context this ask lacks.
+  // One request per distinct set of gaps; `sent` says whether it reached the agent.
+  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null, attempts = 1 } = {}) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.contextRequest = {
+      at: iso(toMs(at, this.now())),
+      missing: Array.isArray(missing) ? missing.slice(0, 8).map(String) : [],
+      sent: Boolean(sent),
+      attempts: Math.max(1, Math.min(10, Number(attempts) || 1)),
+      ...(reason ? { reason: clampText(String(reason), 120) } : {})
+    };
+    this._save();
+    return { ...question };
+  }
+
   // The supervisor closed this question itself (a merge settled it) and no
   // copy of it is open. A latest close by the review is left to
   // upsertQuestion, which holds it and keeps its ask time fresh.
@@ -1487,7 +1504,8 @@ export class FleetStore {
       surfacedDecisions: isObject(raw.surfacedDecisions)
         ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
         : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
-      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {}
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {},
+      contextRequestLog: isObject(raw.contextRequestLog) ? raw.contextRequestLog : {}
     };
   }
 
@@ -1797,6 +1815,24 @@ export class FleetStore {
     if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
     this._save();
     return { ...entry };
+  }
+
+  // When a session was last asked for decision context. An agent that
+  // restates its ask creates a new question id; this cap is per session.
+  recordThreadContextRequest(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.contextRequestLog ??= {};
+    this.state.contextRequestLog[key] = { at: iso(toMs(at, this.now())) };
+    const keys = Object.keys(this.state.contextRequestLog);
+    if (keys.length > 500) delete this.state.contextRequestLog[keys[0]];
+    this._save();
+    return { ...this.state.contextRequestLog[key] };
+  }
+
+  lastThreadContextRequest(threadKey) {
+    const entry = this.state.contextRequestLog?.[String(threadKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   providerFailoverFor(oldKey) {

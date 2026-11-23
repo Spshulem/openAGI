@@ -14,12 +14,13 @@ import { resolveDataDir } from "../data-dir.js";
 import { readNodeConfig } from "../cli-client.js";
 import { readOrCreateIdentity } from "../node-registry.js";
 import { appendSharedThreadMessages } from "../shared-conversations.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
+import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, groupItemName, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
@@ -520,6 +521,14 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
   }
 }
 
+const CONTEXT_REQUEST_RETRY_MS = 30 * 60_000;
+const CONTEXT_REQUEST_MAX_ATTEMPTS = 3;
+const CONTEXT_REQUEST_THREAD_COOLDOWN_MS = 6 * 60 * 60_000;
+
+function formatCount(value) {
+  return value === null || value === undefined ? "unknown" : String(value);
+}
+
 // Infra blocks the policy resolves without the owner: limits wait for their
 // reset, overload and network back off, codex-lb and BuildBot3 wait for
 // recovery.
@@ -551,6 +560,16 @@ function goalAcceptsAutoContinuation(goal, nowMs = Date.now()) {
   return true;
 }
 
+// The agent's latest reply for a question's snapshot: its tail, except that
+// a DECISION CONTEXT block is kept whole from its marker, so a long context
+// reply is not cut before its goal and assignment.
+function snapshotAgentSummary(thread) {
+  const full = redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || "");
+  const marker = full.toUpperCase().lastIndexOf("DECISION CONTEXT");
+  if (marker !== -1) return clampTextLines(full.slice(marker), 6000) || null;
+  return clampTailLines(full, 1600) || null;
+}
+
 function buildQuestionContextSnapshot(thread, pr) {
   if (!thread && !pr) return null;
   const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
@@ -566,7 +585,7 @@ function buildQuestionContextSnapshot(thread, pr) {
     paseoHasWorkspaceId: Boolean(thread?.meta && Object.prototype.hasOwnProperty.call(thread.meta, "workspaceId") && thread.meta.workspaceId !== undefined),
     serverId: thread?.meta?.serverId ?? null,
     aliases: Array.isArray(thread?.meta?.aliases) ? thread.meta.aliases.slice(0, 4) : [],
-    agentSummary: clampTailLines(redactSecrets(thread?.lastAgentFull || thread?.lastAgentText || ""), 1600) || null,
+    agentSummary: snapshotAgentSummary(thread),
     lastUserText: clampTailLines(redactSecrets(thread?.lastUserText || ""), 600) || null,
     lastUserAt: thread?.lastUserAt ?? null,
     lastAgentAt: thread?.lastAgentAt ?? null,
@@ -944,8 +963,77 @@ export class FleetSupervisor {
     if (this.deps.notifier) return this.deps.notifier;
     // The notifier shares the supervisor's clock, so quiet hours and push
     // caps are judged at the same time the scan runs (and are testable).
-    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, now: () => new Date(this.now()) });
+    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, now: () => new Date(this.now()), contextFor: (question) => this.decisionContextFor(question) });
     return this._notifier;
+  }
+
+  // The decision-ready context for one stored question, from its source chat,
+  // PR, and tracked goal (see decision-context.js). Never invents a part.
+  decisionContextFor(question) {
+    if (!question) return null;
+    // A grouped question ("4 stopped") belongs to no single session: never
+    // borrow its first member's chat, title or goal as the group's context.
+    const key = question.threadKey ?? null;
+    const thread = key ? (this.lastThreads?.get?.(key) ?? this.knownThreads.get(key) ?? null) : null;
+    let activeGoal = null;
+    try { activeGoal = key || question.prRef ? this.activeWork.findActiveGoalForThread(key, question.prRef ?? null) : null; } catch { activeGoal = null; }
+    const itemName = key ? null : groupItemName(question, (k) => this.lastThreads?.get?.(k) ?? this.knownThreads.get(k) ?? null);
+    return decisionContextFromQuestion(question, { activeGoal, thread, now: this.now(), itemName });
+  }
+
+  // A new decision missing part of its context is held while its owning agent
+  // supplies the gaps, once per distinct set of gaps. Only live sessions that
+  // take a plain message are asked (never a pending permission, never typed
+  // into an app UI), and only in auto mode. Returns whether to hold it.
+  async gateDecisionContext(question, { byKey, budgetLeft = 0, started = this.now() } = {}) {
+    const ctx = this.decisionContextFor(question);
+    if (!ctx || ctx.askType !== "decision" || ctx.complete) return { hold: false, sent: false, ctx };
+    const missingKey = ctx.missing.join(",");
+    const prior = question.contextRequest ?? null;
+    let sent = false;
+    // A request that never reached the agent (no send budget, agent busy,
+    // delivery failed) is retried after a backoff, a few times at most.
+    const priorMs = Date.parse(prior?.at ?? "");
+    const attempts = Number(prior?.attempts ?? 1);
+    const retryUnsent = Boolean(prior && prior.sent !== true && attempts < CONTEXT_REQUEST_MAX_ATTEMPTS
+      && Number.isFinite(priorMs) && started - priorMs >= CONTEXT_REQUEST_RETRY_MS);
+    if (!prior || prior.missing?.join(",") !== missingKey || retryUnsent) {
+      const thread = question.threadKey ? (byKey?.get(question.threadKey) ?? this.knownThreads.get(question.threadKey) ?? null) : null;
+      const route = thread ? chooseRoute(thread, "auto", this.lastDelivery) : null;
+      const reachable = this.mode === "auto"
+        && thread
+        && !thread.watchOnly && !thread.meta?.watchOnly
+        // Only an agent's own ask: Supervisor-raised questions (limits,
+        // capped models, stuck groups) have no agent that knows more.
+        && ["agent-ask", "agent-card"].includes(question.kind)
+        && !thread.meta?.pendingPermission
+        && !["running", "error"].includes(String(thread.agentStatus ?? "").toLowerCase())
+        && ["paseo-send", "antigravity-send", "peer-relay"].includes(route)
+        && budgetLeft > 0
+        && !this.store.mutedUntil(thread.key);
+      // At most one context request per session per cooldown, whatever new
+      // question ids its restated asks create (live 2026-11-23: 7 requests
+      // to one agent in 65 minutes).
+      const lastAsked = thread ? Date.parse(this.store.lastThreadContextRequest(thread.key)?.at ?? "") : NaN;
+      const recentlyAsked = Number.isFinite(lastAsked) && started - lastAsked < CONTEXT_REQUEST_THREAD_COOLDOWN_MS;
+      let reason = !reachable ? "owning agent not reachable by message" : (recentlyAsked ? "this session was asked for context recently" : null);
+      if (reachable && !recentlyAsked) {
+        try {
+          const delivery = await this.executor.deliver({ thread, message: buildContextRequestMessage(ctx), route, playbook: "context-request" });
+          sent = delivery?.status === "sent";
+          if (sent) this.store.recordThreadContextRequest(thread.key, started);
+          if (!sent) reason = clampText(delivery?.detail ?? delivery?.status ?? "not delivered", 120);
+          this.store.recordNudge(thread.key, { playbook: "context-request", route: delivery?.route ?? route, status: sent ? "context-request" : (delivery?.status ?? "failed") });
+        } catch (error) {
+          reason = clampText(redactSecrets(error?.message ?? "delivery failed"), 120);
+        }
+      }
+      const sameGaps = prior && prior.missing?.join(",") === missingKey;
+      this.store.markContextRequested(question.id, { at: started, missing: ctx.missing, sent, reason, attempts: sameGaps ? attempts + 1 : 1 });
+    }
+    const latest = this.store.question(question.id) ?? question;
+    const latestCtx = this.decisionContextFor(latest);
+    return { hold: shouldHoldForContext(latest, latestCtx, this.now()), sent, ctx: latestCtx };
   }
 
   playbooks() {
@@ -2440,8 +2528,8 @@ export class FleetSupervisor {
     return watch;
   }
 
-  async postSupervisorChatUpdate(content, { dedupeKey = null, messageId = null, minGapMs = 30 * MIN, metadata = {} } = {}) {
-    const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), 1600);
+  async postSupervisorChatUpdate(content, { dedupeKey = null, messageId = null, minGapMs = 30 * MIN, metadata = {}, maxChars = 1600 } = {}) {
+    const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
     if (!cleanContent) return { posted: false, reason: "empty" };
     const nowMs = this.now();
     if (dedupeKey) {
@@ -2606,7 +2694,43 @@ export class FleetSupervisor {
     return outcomes;
   }
 
-  async maybePostProactiveSupervisorDigest({ started }) {
+  // Sessions this machine's own scan saw running; null when it has no scan.
+  runningSessionCount(snapshot) {
+    const raw = snapshot?.counts?.byState?.running ?? snapshot?.counts?.byWatch?.working ?? snapshot?.counts?.running;
+    const value = Number(raw);
+    return raw === undefined || raw === null || !Number.isFinite(value) ? null : value;
+  }
+
+  // Unverified tracked goals, from the store that actually holds them. A node
+  // paired to a main tracks goals on the main: an empty local store there is
+  // "not tracked here", not zero. A read failure is "unknown".
+  trackedGoalSummary() {
+    let items;
+    try {
+      items = this.activeWork.projectAllItems();
+    } catch {
+      items = null;
+    }
+    if (!Array.isArray(items)) return { count: null, source: "unknown", text: "Unverified tracked goals: unknown (Active Work could not be read)" };
+    const unverified = items.filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed");
+    let pairedToMain = false;
+    try { pairedToMain = Boolean(this.dataDir && readNodeConfig(this.dataDir)?.remote); } catch { pairedToMain = false; }
+    if (pairedToMain && items.length === 0) {
+      return { count: null, source: "main", text: "Unverified tracked goals: tracked on the main, not counted on this node" };
+    }
+    const blocked = unverified.filter((it) => ["blocked", "blocked_pr"].includes(it.followThroughState)).length;
+    const awaiting = unverified.filter((it) => ["owner_followup", "ready_pr", "orphan_pr", "stale_pr"].includes(it.followThroughState)).length;
+    const parts = [blocked ? `${blocked} blocked` : null, awaiting ? `${awaiting} awaiting rollout or verification` : null].filter(Boolean);
+    return {
+      count: unverified.length,
+      source: "local",
+      blocked,
+      awaiting,
+      text: `Unverified tracked goals: ${unverified.length}${parts.length ? ` (${parts.join(", ")})` : ""}`
+    };
+  }
+
+  async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
     const quiet = this.config?.notify?.quietHours ?? null;
@@ -2621,12 +2745,22 @@ export class FleetSupervisor {
     }
 
     const notifyPrefs = this.store.preferences();
-    const openActionable = this.store.openQuestions().filter((q) => {
-      if (!q || q.status !== "open" || q.kind === "completed") return false;
+    const nowMs = this.now();
+    const contexts = new Map();
+    const openQs = this.store.openQuestions();
+    // FYIs and session errors are reported apart from decisions and never
+    // trigger a check-in on their own.
+    const nonDecisions = openQs.filter((q) => q && q.status === "open" && classifyAsk(q) !== "decision");
+    const openActionable = openQs.filter((q) => {
+      if (!q || q.status !== "open" || classifyAsk(q) !== "decision") return false;
       if (this.awaitingReview.has(q.id)) return false;
       if (isSuppressedByQuietCadence(q, notifyPrefs)) return false;
       const keys = q.threadKeys ?? (q.threadKey ? [q.threadKey] : []);
       if (keys.length && keys.every((key) => this.store.mutedUntil(key))) return false;
+      const ctx = this.decisionContextFor(q);
+      contexts.set(q.id, ctx);
+      // Still waiting on its owning agent for context: not surfaced yet.
+      if (shouldHoldForContext(q, ctx, nowMs)) return false;
       return true;
     });
 
@@ -2637,24 +2771,46 @@ export class FleetSupervisor {
     const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
     if (!deltas.length) return { posted: false, reason: "no-delta" };
 
-    // Render only what fits the chat message: a decision cut off by the
-    // length cap would otherwise be marked surfaced without being seen.
-    const DIGEST_MAX = 1600;
+    // Running sessions, tracked goals, and decisions are different things; say
+    // each separately so a count is never mistaken for an ask. A count this
+    // machine cannot know is said to be unknown, never rendered as zero.
+    const errors = nonDecisions.filter((q) => classifyAsk(q) === "session_error").length;
+    const fyis = nonDecisions.length - errors;
+    const footer = [
+      `Decisions waiting on you: ${openActionable.length}`,
+      `Sessions running here: ${formatCount(this.runningSessionCount(snapshot))}`,
+      this.trackedGoalSummary().text,
+      ...(fyis || errors ? [`FYIs / session errors (no decision needed): ${fyis} / ${errors}`] : [])
+    ].join(" · ");
+
+    // Each decision gets a fixed share of the message, and only what fits is
+    // sent: a decision cut off by the length cap would otherwise be marked
+    // surfaced without being seen. Unsent decisions stay pending.
+    const DIGEST_MAX = 6000;
+    const PER_DECISION = 1700;
     const header = (n, change) => (n === 1
-      ? (change === "updated" ? "**Updated decision needing you:**" : "**New decision needing you:**")
-      : `**${n} new/updated decisions needing you:**`);
-    const renderDelta = ({ question: q, change }, many) => {
-      const badge = change === "updated" ? "[Updated] " : (many ? "[New] " : "");
-      const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
-      const contextLine = clampText(redactSecrets(q.reviewBrief?.decision || q.body || ""), 180);
-      return `- ${badge}\`${q.id}\` — **${clampText(q.title, 120)}**${opts ? ` *(${opts})*` : ""}${contextLine ? `\n  ${contextLine}` : ""}`;
+      ? (change === "updated"
+          ? "**Supervisor check-in: one decision changed and needs you.**"
+          : "**Supervisor check-in: one new decision needs you.**")
+      : `**Supervisor check-in: ${n} new or changed decisions need you.**`);
+    const renderDelta = ({ question: q, change }) => {
+      const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
+      const badge = change === "updated" ? "Changed" : "New";
+      const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
+      const body = ctx
+        ? renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION })
+        : clampText(stripInternalIds(redactSecrets(q.body || q.title || "")), 400);
+      return ["", `**${badge}: ${clampText(name, 140)}**`, body];
     };
-    let shownDeltas = deltas.slice(0, 5);
+    let shownDeltas = deltas.slice(0, 3);
     let lines;
     for (;;) {
-      const overflow = deltas.length - shownDeltas.length;
-      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.map((d) => renderDelta(d, shownDeltas.length > 1))];
-      if (overflow > 0) lines.push(`- *(+${overflow} more new in Needs You)*`);
+      const overflowCount = deltas.length - shownDeltas.length;
+      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.flatMap(renderDelta)];
+      if (overflowCount > 0) {
+        lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
+      }
+      lines.push("", footer);
       if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
       shownDeltas = shownDeltas.slice(0, -1);
     }
@@ -2668,6 +2824,7 @@ export class FleetSupervisor {
     const res = await this.postSupervisorChatUpdate(lines.join("\n"), {
       dedupeKey: `delta:${deltaSig}`,
       messageId,
+      maxChars: 6000,
       minGapMs: 24 * 60 * MIN,
       metadata: {
         kind: "proactive_supervisor_delta",
@@ -5097,6 +5254,13 @@ export class FleetSupervisor {
       if (isSuppressedByQuietCadence(question, notifyPrefs)) continue;
       const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
       if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
+      // Context first: a new decision missing its goal, assignment, progress,
+      // blocker, or options waits while its owning agent fills them in.
+      try {
+        const gate = await this.gateDecisionContext(question, { byKey, budgetLeft: config.limits.maxSendsPerTick - sends, started });
+        if (gate.sent) sends += 1;
+        if (gate.hold) continue;
+      } catch { /* the context gate never blocks a notification on its own failure */ }
       // A blip closed it: its own outreach copy comes back, not a new one.
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }

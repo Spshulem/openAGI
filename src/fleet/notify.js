@@ -5,11 +5,14 @@
 import fs from "node:fs";
 import { DEFAULTS, clampText } from "./contracts.js";
 import { isSuppressedByQuietCadence } from "./preferences.js";
+import { classifyAsk, decisionSummary, isGenericAsk, stripInternalIds } from "./decision-context.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const PUSH_TIMEOUT_MS = 5_000;
 // Matches the body cap the installed BuzzKit hook uses.
 const PUSH_BODY_MAX = 180;
+// Outreach copies carry the full four-part context.
+const CONTEXT_SUMMARY_MAX = 1400;
 
 export function isQuietHour(date, quietHours = DEFAULTS.quietHours) {
   const hour = date.getHours();
@@ -40,7 +43,10 @@ export function createNotifier({
   fetchImpl = globalThis.fetch,
   readFile = fs.readFileSync,
   now = () => new Date(),
-  log = console.warn
+  log = console.warn,
+  // Supplies the decision-ready context for a question (goal, assignment,
+  // progress, decision). Without it the raw question text is shown.
+  contextFor = null
 } = {}) {
   const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
   const current = () => {
@@ -60,11 +66,29 @@ export function createNotifier({
     }
   };
 
-  const shown = (question) => ({
-    title: clampText(question.title, limits.titleMax),
-    summary: clampText(question.body, limits.bodyMax),
-    actions: outreachActions(question.options)
-  });
+  const contextOf = (question) => {
+    if (typeof contextFor !== "function") return null;
+    try { return contextFor(question) ?? null; } catch { return null; }
+  };
+
+  // Meaningful names, never internal ids, and the four-part context when the
+  // supervisor can recover it. The same question always renders the same text,
+  // so a refresh in place is not a new ping.
+  const shown = (question) => {
+    const ctx = contextOf(question);
+    // The stored (often review-polished) title stands; only an empty or
+    // generic one ("needs your call. Answer?") is replaced by the item's name
+    // and the agent's actual question.
+    const rawTitle = stripInternalIds(question.title);
+    const generic = !rawTitle || isGenericAsk(rawTitle);
+    const headline = generic && ctx?.decision ? ctx.decision : (rawTitle || "Needs your decision");
+    const title = clampText(generic && ctx?.itemName && !headline.startsWith(ctx.itemName) ? `${ctx.itemName}: ${headline}` : headline, limits.titleMax);
+    return {
+      title,
+      summary: ctx ? decisionSummary(ctx, question.body, { maxChars: CONTEXT_SUMMARY_MAX }) : clampText(stripInternalIds(question.body), limits.bodyMax),
+      actions: outreachActions(question.options)
+    };
+  };
 
   const postOutreach = (question) => {
     const outreach = runtime?.outreach;
@@ -74,7 +98,7 @@ export function createNotifier({
         type: "fleet-question",
         sourceRef: { kind: "fleet", id: question.id },
         ...shown(question),
-        needsDecision: question.kind !== "completed",
+        needsDecision: classifyAsk(question) === "decision",
         dedupeOpen: true
       });
       return item?.id ?? null;
@@ -100,7 +124,13 @@ export function createNotifier({
     const endpoint = readEndpoint();
     if (!endpoint) return skip("no-endpoint");
     if (typeof fetchImpl !== "function") return skip("no-fetch");
-    const body = clampText(question.body, PUSH_BODY_MAX);
+    const ctx = contextOf(question);
+    const body = clampText(
+      ctx?.decision
+        ? `${ctx.decision}${ctx.recommendation ? ` ${ctx.recommendation}` : ""}`
+        : stripInternalIds(question.body),
+      PUSH_BODY_MAX
+    );
     const url = deepLink(config?.publicUrl, question.id);
     const message = {
       title: clampText(question.title, limits.titleMax),
@@ -138,6 +168,9 @@ export function createNotifier({
       return { outreachId: null, pushed: false, skipped: "quiet-cadence" };
     }
     const at = current();
+    // FYIs and session errors are visible in Fleet but are not decisions:
+    // they never ping the phone.
+    const isDecision = classifyAsk(latest) === "decision";
     const outreachId = latest.outreachId ?? postOutreach(latest);
     if (outreachId) {
       if (latest.outreachId) {
@@ -145,7 +178,7 @@ export function createNotifier({
       }
       refreshOutreach(outreachId, latest);
     }
-    const result = allowPush ? await push(latest, at) : skip("suggestion-cap");
+    const result = !isDecision ? skip("not-a-decision") : (allowPush ? await push(latest, at) : skip("suggestion-cap"));
     if (store && ((outreachId && outreachId !== latest.outreachId) || result.pushed)) {
       store.markQuestionNotified?.(latest.id, { outreachId, pushedAt: result.pushed ? at.toISOString() : undefined });
     }

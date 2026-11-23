@@ -70,16 +70,21 @@ test("check-in shows only what fits and marks only shown decisions surfaced", as
   const dir = tmp(t);
   const { msgs, runtime } = chatRuntime();
   const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
-  const long = "x".repeat(170);
+  const long = "detail ".repeat(140);
   for (let i = 0; i < 5; i += 1) {
-    sup.store.upsertQuestion({ dedupeKey: `ask:${i}`, kind: "agent-ask", threadKey: `paseo:s.${i}`, title: `Decision ${i}: ${long}`, body: `Context ${i}: ${long}`, options: [`option a ${long}`.slice(0, 60), `option b ${long}`.slice(0, 60), "hold"] });
+    const reply = `DECISION CONTEXT\nGoal: Goal ${i} ${long}\nAssigned: Task ${i} ${long}\nVerified: Checked ${i} ${long}\nBlocked: Needs owner ${i} ${long}\nDecision: Pick ${i}?\nOptions:\n- go — ships ${long}\n- hold — waits\nRecommendation: go`;
+    sup.store.upsertQuestion({
+      dedupeKey: `ask:${i}`, kind: "agent-ask", threadKey: `paseo:s.${i}`, title: `Decision ${i}: pick a path`, body: `Pick ${i}?`, options: ["go", "hold"],
+      contextSnapshot: { threadTitle: `Workstream ${i}`, recentMessages: [{ role: "user", text: `Please handle workstream ${i} end to end` }, { role: "assistant", text: reply }], agentSummary: reply }
+    });
   }
   const res = await sup.maybePostProactiveSupervisorDigest({ started: NOW });
   assert.equal(res.posted, true);
-  assert.ok(msgs[0].text.length <= 1600, `fits (${msgs[0].text.length})`);
-  const shown = (msgs[0].text.match(/Decision \d/g) ?? []).length;
+  const text = msgs[0].text;
+  assert.ok(text.length <= 6000, `fits (${text.length})`);
+  const shown = (text.match(/\*\*New: Workstream \d/g) ?? []).length;
   assert.ok(shown >= 1 && shown < 5, `some decisions deferred (${shown} shown)`);
-  assert.match(msgs[0].text, /Decision 0|Decision 4/, "the first rendered decision is intact");
+  assert.match(text, /\*\*New: Workstream \d/, "the first rendered decision is intact");
   const { deltas } = sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: NOW });
   assert.equal(deltas.length, 5 - shown, "deferred decisions stay pending for the next check-in");
 });
