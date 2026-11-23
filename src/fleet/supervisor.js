@@ -7,6 +7,8 @@
 // effects; hosted-interface calls start() on listen and stop() on close.
 
 import path from "node:path";
+import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { readThreadConversation, unavailableConversation } from "./conversation.js";
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
@@ -2293,6 +2295,9 @@ export class FleetSupervisor {
         this.store.recordAction({ threadKey: thread.key, playbook: "owner-message", status: "queued", route, detail: `${entry.detail}; sends when the host is back (approval ${key})` });
         return { delivery: handoffDelivery(entry) };
       }
+      // Any other outcome (sent, unconfirmed, refused): this approval is the
+      // chat's latest; an older one still waiting must never go out after it.
+      this.handoffs.supersedeWaiting(thread.key, key);
       if (delivery.status === "sent") {
         this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "sent" });
         this.handoffs.update(key, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
@@ -2334,13 +2339,21 @@ export class FleetSupervisor {
           this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: the chat is not listed yet" });
           continue;
         }
+        // A resume that started sending and never recorded its outcome (the
+        // process stopped): its receipt decides, never a second send.
+        if (entry.dispatchingAt) {
+          const settled = this.reconcileHandoffDispatch(entry);
+          if (settled) { this.handoffs.update(entry.key, { dispatchingAt: null, ...settled }); continue; }
+        }
         const attempts = (entry.attempts ?? 0) + 1;
+        this.handoffs.update(entry.key, { dispatchingAt: new Date(this.now()).toISOString() });
         let delivery;
         try {
           delivery = (await this.sendOwnerMessage(entry.threadKey, entry.message, { images: entry.images ?? null, resume: true }))?.delivery ?? null;
         } catch (error) {
           delivery = { status: "blocked", detail: clampText(String(error?.message ?? error), 200) };
         }
+        this.handoffs.update(entry.key, { dispatchingAt: null });
         if (delivery?.status === "sent") {
           this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
         } else if (delivery?.unconfirmed) {
@@ -2353,6 +2366,34 @@ export class FleetSupervisor {
       }
     })().finally(() => { this.resumingHandoffs = null; });
     return this.resumingHandoffs;
+  }
+
+  // What became of a dispatch whose outcome was never recorded: the
+  // journal's receipt for this exact message since the dispatch started, or
+  // the chat's Paseo delivery receipt for it. null: no trace it was ever
+  // sent, so it is safe to send.
+  reconcileHandoffDispatch(entry) {
+    const hash = shortHash(String(entry.message ?? "").trim().startsWith(SUPERVISOR_PREFIX) ? String(entry.message).trim() : `${SUPERVISOR_PREFIX} ${String(entry.message ?? "").trim()}`);
+    const since = (Date.parse(entry.dispatchingAt) || 0) - 5_000;
+    const journaled = this.store.actions(200).find((action) => action.threadKey === entry.threadKey && action.messageHash === hash
+      && (Date.parse(action.at ?? "") || 0) >= since && ["sent", "blocked"].includes(action.status));
+    if (journaled?.status === "sent") {
+      return { status: "delivered", deliveredAt: journaled.at, deliveredActionId: journaled.id ?? null, detail: "delivered before a restart (journal receipt); not sent again" };
+    }
+    let receipt = null;
+    try {
+      const file = path.join(this.dataDir, "fleet", "paseo-deliveries", `${createHash("sha256").update(entry.threadKey).digest("hex")}.json`);
+      receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch { receipt = null; }
+    if (receipt?.messageHash === hash) {
+      return receipt.pending
+        ? { status: "unconfirmed", detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" }
+        : { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), detail: "delivered before a restart (Paseo receipt); not sent again" };
+    }
+    if (journaled?.status === "blocked" && journaled.unconfirmed) {
+      return { status: "unconfirmed", detail: "an earlier attempt is unconfirmed; not sent again" };
+    }
+    return null;
   }
 
   // One thread, expanded for the owner: the agent's last message and when,

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { HANDOFF_TTL_MS } from "../src/fleet/handoff-queue.js";
 import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
@@ -237,4 +237,75 @@ test("lost acknowledgement: the same owner text with an unconfirmed earlier send
   assert.equal(reconciled.status, "sent");
   assert.equal(reconciled.reconciled, true);
   assert.equal(sent.length, 1, "the earlier send was the delivery");
+});
+
+// Review fix (#361, Codex P1): A waits for its host; after recovery the owner
+// approves B, whose send is accepted but unconfirmed. A must never go out
+// after B.
+test("a newer approval that ends unconfirmed still retires the older waiting handoff", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "A: first wording.", { idempotencyKey: "act_A" });
+  f.host.up = true; f.host.unconfirmed = true;
+  const b = await f.supervisor.sendOwnerMessage(KEY, "B: replacement wording.", { idempotencyKey: "act_B" });
+  assert.equal(b.delivery.unconfirmed, true);
+  assert.equal(f.supervisor.handoffs.get("act_A").status, "superseded");
+  f.host.unconfirmed = false;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.deepEqual(sends(f.delivered).map((d) => d.message), ["A: first wording.", "B: replacement wording."]);
+});
+
+// Review fix (#361): the process stopped after a resumed send went out but
+// before "delivered" was saved. The restart reconciles, never resends.
+test("a restart mid-dispatch reconciles the journal receipt instead of sending again", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_95" });
+  const started = new Date(f.now.value + MIN).toISOString();
+  f.supervisor.handoffs.update("act_95", { dispatchingAt: started });
+  f.supervisor.store.recordAction({ threadKey: KEY, playbook: "owner-message", route: "paseo-send", status: "sent",
+    messageHash: shortHash(`${SUPERVISOR_PREFIX} Submit for review.`), detail: "Paseo message and turn confirmed", at: new Date(f.now.value + MIN + 2000).toISOString() });
+  f.host.up = true;
+  f.now.value += 3 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_95").status, "delivered");
+  assert.match(f.supervisor.handoffs.get("act_95").detail, /not sent again/);
+  assert.equal(sends(f.delivered).length, 1, "only the original offline attempt");
+});
+
+test("a restart mid-dispatch with no trace of the send sends it once", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_95" });
+  f.supervisor.handoffs.update("act_95", { dispatchingAt: new Date(f.now.value + MIN).toISOString() });
+  f.host.up = true;
+  f.now.value += 3 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_95").status, "delivered");
+  assert.equal(sends(f.delivered).length, 2);
+});
+
+// Review fix (#361): the same words with a different screenshot are a
+// different message, never "already delivered".
+test("same text with different images is not reconciled as the earlier send", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-images-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const initial = { id: "chat", status: "idle", updatedAt: "2026-01-01T00:00:00Z", cwd: "/workspace/repo", workspaceId: "workspace" };
+  const sent = [];
+  let confirmed = false;
+  const ref = { refresh: async () => {}, current: () => initial, send: async (text, options) => { sent.push({ text, options }); },
+    timeline: { refetch: async () => ({ agent: initial, entries: confirmed && sent.length
+      ? [{ item: { type: "user_message", messageId: sent.at(-1).options.messageId }, turnId: "turn-1", timestamp: initial.updatedAt, seqEnd: 1 }, { item: { type: "assistant_message", text: "working" }, turnId: "turn-1", seqStart: 2 }]
+      : [] }) } };
+  const factory = () => ({ connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "host" }, hosts: [] }) }, agents: { ref: () => ref } });
+  const args = { config: { paseo: { enabled: true, timeoutMs: 2000 } }, thread: paseoThread(initial, "host"), text: "Please fix this screenshot.", store: { dir }, actionId: "a1",
+    base: { messageHash: "same-text", playbook: "owner-message" }, factory };
+  const png = (n) => [{ mimeType: "image/png", data: Buffer.from(`image-${n}`).toString("base64") }];
+  await deliverPaseo({ ...args, images: png(1) });
+  assert.equal(sent.length, 1);
+  confirmed = true;
+  const second = await deliverPaseo({ ...args, actionId: "a2", images: png(2) });
+  assert.notEqual(second.reconciled, true, "a new screenshot is not the old one");
+  assert.equal(sent.length, 2, "the new image is actually sent");
 });

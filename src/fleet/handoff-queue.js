@@ -60,6 +60,24 @@ export class HandoffQueue {
     return { entry, created: true };
   }
 
+  // A newer approved send to this chat was processed (whatever its
+  // outcome): earlier waiting handoffs there are obsolete and never sent.
+  supersedeWaiting(threadKey, exceptKey) {
+    const at = new Date(this.now()).toISOString();
+    let changed = 0;
+    for (const entry of this.entries) {
+      if (entry.status === "waiting" && entry.threadKey === threadKey && entry.key !== exceptKey) {
+        entry.status = "superseded";
+        entry.updatedAt = at;
+        entry.detail = `replaced by a newer approved send (${exceptKey})`;
+        delete entry.images;
+        changed += 1;
+      }
+    }
+    if (changed) this.save();
+    return changed;
+  }
+
   update(key, patch) {
     const entry = this.get(key);
     if (!entry) return null;

@@ -337,6 +337,11 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const normalizedImages = normalizePaseoImages(images);
+  // Part of what makes two sends the same: the same words with different
+  // attachments are a different message.
+  const imagesHash = normalizedImages.length
+    ? createHash("sha256").update(normalizedImages.map((image) => `${image?.mediaType ?? image?.mimeType ?? ""}:${image?.data ?? image?.url ?? ""}`).join("\n")).digest("hex").slice(0, 16)
+    : null;
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
     : Boolean(thread?.excluded);
@@ -363,7 +368,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         // The same owner text was already dispatched to this chat and its
         // outcome is pending: a lost reply, not a lost message. Its own
         // receipt decides; it is never sent a second time.
-        if (ownerInitiated && previous.messageHash && previous.messageHash === base?.messageHash) {
+        if (ownerInitiated && previous.messageHash && previous.messageHash === base?.messageHash && (previous.imagesHash ?? null) === imagesHash) {
           if (priorCheck.confirmed) {
             writeJsonAtomic(file, { ...previous, pending: false });
             return { status: "sent", route: "paseo-send", actionId, reconciled: true, messageId: previous.clientMessageId ?? previous.messageId ?? null,
@@ -461,6 +466,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         messageId,
         clientMessageId: messageId,
         messageHash: base.messageHash,
+        ...(imagesHash ? { imagesHash } : {}),
         activityAt: agent.updatedAt,
         ...(cursor ? { cursor } : {}),
         pending: true,
