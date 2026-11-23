@@ -2276,7 +2276,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, ...(risky ? { typedOnly: true } : {}), ...(resume ? { noPermissionReply: true } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     if (delivery.status === "sent") {
@@ -2298,6 +2298,12 @@ export class FleetSupervisor {
       // Any other outcome (sent, unconfirmed, refused): this approval is the
       // chat's latest; an older one still waiting must never go out after it.
       this.handoffs.supersedeWaiting(thread.key, key);
+      // Accepted but unconfirmed: it may be in the chat, so this approval is
+      // never sent again, even after other messages replace its receipt.
+      if (delivery.unconfirmed) {
+        this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "unconfirmed" });
+        this.handoffs.update(key, { status: "unconfirmed", detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+      }
       if (delivery.status === "sent") {
         this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "sent" });
         this.handoffs.update(key, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
@@ -2345,6 +2351,9 @@ export class FleetSupervisor {
           const settled = this.reconcileHandoffDispatch(entry);
           if (settled) { this.handoffs.update(entry.key, { dispatchingAt: null, ...settled }); continue; }
         }
+        // A newer approval may have replaced it while an earlier entry in
+        // this pass was sending.
+        if (this.handoffs.get(entry.key)?.status !== "waiting") continue;
         const attempts = (entry.attempts ?? 0) + 1;
         this.handoffs.update(entry.key, { dispatchingAt: new Date(this.now()).toISOString() });
         let delivery;
@@ -2358,6 +2367,8 @@ export class FleetSupervisor {
           this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
         } else if (delivery?.unconfirmed) {
           this.handoffs.update(entry.key, { status: "unconfirmed", attempts, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+        } else if (/pending permission prompt; a held handoff is never sent into it/.test(String(delivery?.detail ?? ""))) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat has a pending permission prompt; it waits until that prompt is answered" });
         } else if (HOST_UNAVAILABLE.test(String(delivery?.detail ?? ""))) {
           this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: `held: Paseo host ${entry.serverId ?? ""} is still offline` });
         } else {
@@ -2380,10 +2391,13 @@ export class FleetSupervisor {
     if (journaled?.status === "sent") {
       return { status: "delivered", deliveredAt: journaled.at, deliveredActionId: journaled.id ?? null, detail: "delivered before a restart (journal receipt); not sent again" };
     }
+    // The chat's Paseo receipt counts only if it was written for this
+    // dispatch (at or after it started): an older receipt for the same text
+    // is a different send.
     let receipt = null;
     try {
       const file = path.join(this.dataDir, "fleet", "paseo-deliveries", `${createHash("sha256").update(entry.threadKey).digest("hex")}.json`);
-      receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (fs.statSync(file).mtimeMs >= since) receipt = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch { receipt = null; }
     if (receipt?.messageHash === hash) {
       return receipt.pending

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { DEFAULTS, SUPERVISOR_PREFIX, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { HANDOFF_TTL_MS } from "../src/fleet/handoff-queue.js";
@@ -40,12 +41,14 @@ function fixture(t, { dataDir = null, threads = null } = {}) {
   const dir = dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "fleet-handoff-"));
   if (!dataDir) t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const now = { value: T0 };
-  const host = { up: false, unconfirmed: false };
+  const host = { up: false, unconfirmed: false, permission: false, onDeliver: null };
   const delivered = [];
   const list = threads ?? [makeThread(KEY), makeThread(OTHER)];
   const executor = {
     deliver: async (args) => {
-      delivered.push({ key: args.thread.key, message: args.message });
+      if (host.onDeliver) await host.onDeliver(args);
+      if (host.up && host.permission && args.noPermissionReply) return { status: "blocked", route: args.route, detail: "Paseo chat has a pending permission prompt; a held handoff is never sent into it" };
+      delivered.push({ key: args.thread.key, message: args.message, noPermissionReply: args.noPermissionReply === true });
       if (!host.up) return { status: "blocked", route: args.route, detail: HOST_DOWN, actionId: `fa_${delivered.length}` };
       if (host.unconfirmed) return { status: "blocked", unconfirmed: true, route: args.route, detail: "Message accepted by Paseo; turn start unconfirmed. No automatic resend.", actionId: `fa_${delivered.length}` };
       return { status: "sent", route: args.route, detail: "Paseo message and turn confirmed", actionId: `fa_${delivered.length}` };
@@ -308,4 +311,96 @@ test("same text with different images is not reconciled as the earlier send", as
   const second = await deliverPaseo({ ...args, actionId: "a2", images: png(2) });
   assert.notEqual(second.reconciled, true, "a new screenshot is not the old one");
   assert.equal(sent.length, 2, "the new image is actually sent");
+});
+
+// Review fix (#361, Codex P1): a prompt that appeared while the handoff
+// waited is never answered by it.
+test("a held handoff never answers a permission prompt that appeared while it waited", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Approve the release handoff.", { idempotencyKey: "act_77" });
+  f.host.up = true; f.host.permission = true;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  const held = f.supervisor.handoffs.get("act_77");
+  assert.equal(held.status, "waiting");
+  assert.match(held.detail, /pending permission prompt/);
+  assert.equal(sends(f.delivered).length, 1, "nothing reached the chat on resume");
+  f.host.permission = false;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_77").status, "delivered");
+  assert.equal(sends(f.delivered).at(-1).noPermissionReply, true);
+});
+
+test("deliverPaseo refuses a no-reply send into an open prompt before dispatching", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-perm-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const agent = { id: "chat", status: "idle", updatedAt: "2026-01-01T00:00:00Z", cwd: "/w", workspaceId: "w", pendingPermissions: [{ id: "perm-1", kind: "tool", actions: [{ id: "allow", label: "Allow", behavior: "allow" }] }] };
+  let sent = 0, answered = 0;
+  const ref = { refresh: async () => {}, current: () => agent, send: async () => { sent += 1; }, timeline: { refetch: async () => ({ agent, entries: [] }) } };
+  const factory = () => ({ connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "host" }, hosts: [] }) },
+    agents: { ref: () => ref }, permissions: { respond: async () => { answered += 1; } } });
+  const thread = paseoThread(agent, "host");
+  const result = await deliverPaseo({ config: { paseo: { enabled: true, timeoutMs: 2000 } }, thread, text: "Approve the release handoff.", store: { dir }, actionId: "a1",
+    base: { messageHash: "h", playbook: "owner-message" }, factory, noPermissionReply: true });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /never sent into it/);
+  assert.equal(sent, 0);
+  assert.equal(answered, 0);
+});
+
+// Review fix (#361, Codex P1): a handoff superseded while an earlier one in
+// the same resume pass was sending is not sent.
+test("a handoff superseded mid-pass is not sent by that pass", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "First chat: old.", { idempotencyKey: "act_1" });
+  await f.supervisor.sendOwnerMessage(OTHER, "Second chat: old.", { idempotencyKey: "act_2" });
+  f.host.up = true;
+  let fired = false;
+  f.host.onDeliver = async (args) => {
+    if (fired || args.thread.key !== KEY) return;
+    fired = true;
+    await f.supervisor.sendOwnerMessage(OTHER, "Second chat: replacement.", { idempotencyKey: "act_3" });
+  };
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_2").status, "superseded");
+  assert.deepEqual(sends(f.delivered, OTHER).map((d) => d.message), ["Second chat: old.", "Second chat: replacement."]);
+});
+
+// Review fix (#361): an unconfirmed first send is recorded under its
+// approval, so replaying that approval never sends it again.
+test("an unconfirmed first send is never resent when its approval is replayed", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  f.host.up = true; f.host.unconfirmed = true;
+  const first = await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_9" });
+  assert.equal(first.delivery.unconfirmed, true);
+  f.host.unconfirmed = false;
+  await f.supervisor.sendOwnerMessage(KEY, "Unrelated later message.", { idempotencyKey: "act_10" });
+  const replay = await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_9" });
+  assert.equal(replay.delivery.unconfirmed, true);
+  assert.deepEqual(sends(f.delivered).map((d) => d.message), ["Submit for review.", "Unrelated later message."]);
+});
+
+// Review fix (#361): an older Paseo receipt for the same text is a different
+// send and never settles a newly approved handoff.
+test("restart recovery ignores an older Paseo receipt with the same text", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_95" });
+  const receiptDir = path.join(f.dir, "fleet", "paseo-deliveries");
+  fs.mkdirSync(receiptDir, { recursive: true });
+  const file = path.join(receiptDir, `${createHash("sha256").update(KEY).digest("hex")}.json`);
+  fs.writeFileSync(file, JSON.stringify({ messageId: "old", messageHash: shortHash(`${SUPERVISOR_PREFIX} Submit for review.`), pending: false }));
+  const old = new Date("2020-01-01T00:00:00Z");
+  fs.utimesSync(file, old, old);
+  f.supervisor.handoffs.update("act_95", { dispatchingAt: new Date(f.now.value + MIN).toISOString() });
+  f.host.up = true;
+  f.now.value += 3 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_95").status, "delivered");
+  assert.equal(sends(f.delivered).length, 2, "it was actually sent, not settled by the old receipt");
 });

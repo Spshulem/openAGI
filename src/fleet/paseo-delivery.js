@@ -333,7 +333,10 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false } = {}) {
 // Refresh immediately before dispatch; steer is preferable to interrupt if a
 // turn starts concurrently. Paseo may fall back to interruption when steering
 // is unsupported: its public API does not offer an atomic idle-only send.
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null }) {
+// noPermissionReply: this text was approved before any prompt now open in
+// the chat existed (a held handoff resuming), so it must never be read as an
+// answer to one: with a prompt open it is refused before anything is sent.
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, noPermissionReply = false }) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const normalizedImages = normalizePaseoImages(images);
@@ -400,6 +403,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         ?? null;
       if (ownerInitiated && expectedPermissionId && !livePerms.some((p) => p && String(p.id) === String(expectedPermissionId))) {
         return blocked("Paseo permission changed; scan again before sending");
+      }
+      if (noPermissionReply && livePerms.length > 0) {
+        return blocked("Paseo chat has a pending permission prompt; a held handoff is never sent into it");
       }
       if (ownerInitiated && agent && !agent.archivedAt && agent.status !== "closed" && livePerms.length > 0) {
         if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) {
