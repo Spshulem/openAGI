@@ -9,18 +9,23 @@ final class DictationTranscriptTests: XCTestCase {
     // device a pause often ends an utterance without isFinal and without
     // timing; the next partial restarts from empty. The earlier words must
     // stay, and the new ones append without duplication.
-    private func feed(_ steps: [(String, Bool)], base: String = "") -> String {
+    // Each step: text, whether iOS ended the utterance, seconds since the
+    // previous result, and whether it was final.
+    private func feed(_ steps: [(String, Bool)], base: String = "", gap: TimeInterval = 0.2,
+                      pauses: Set<Int> = []) -> String {
         var t = DictationTranscript(base: base)
         var draft = base
-        for (text, ends) in steps {
-            let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: t.live, text: text)
+        for (i, (text, ends)) in steps.enumerated() {
+            let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: t.live, text: text,
+                                                               sinceLastResult: pauses.contains(i) ? 1.2 : gap)
             draft = t.receive(text, isFinal: false, startsNewUtterance: fresh, endsUtterance: ends)
         }
         return draft
     }
 
     func testARestartWithoutFinalOrTimingKeepsTheEarlierWords() {
-        XCTAssertEqual(feed([("Before", false), ("Before the pause", false), ("After", false), ("After the pause it continues", false)]),
+        XCTAssertEqual(feed([("Before", false), ("Before the pause", false), ("After", false), ("After the pause it continues", false)],
+                            pauses: [2]),
                        "Before the pause After the pause it continues")
     }
 
@@ -44,9 +49,32 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertEqual(feed([("Before", false), ("Before the", false), ("Before the pause", false)]), "Before the pause")
     }
 
+    // Codex review on #364: a correction that merges words is not a restart
+    // when no silence came before it.
+    func testAWordBoundaryCorrectionWithoutAPauseIsARevision() {
+        XCTAssertEqual(feed([("some thing", false), ("something", false), ("something else", false)]), "something else")
+    }
+
+    // Codex review on #364: saying the same thing again in a fresh request
+    // (after a final result) keeps both.
+    func testRepeatingTheSameWordsAfterAFinalResultKeepsBoth() {
+        var t = DictationTranscript(base: "")
+        _ = t.receive("No.", isFinal: true)
+        XCTAssertEqual(t.receive("No.", isFinal: true), "No. No.")
+    }
+
+    // Codex review on #364: cumulative results across several utterance
+    // ends drop everything already committed in that request.
+    func testCumulativeResultsAcrossSeveralUtteranceEndsAreNotDuplicated() {
+        XCTAssertEqual(feed([("First thought.", true), ("First thought. Second thought.", true),
+                             ("First thought. Second thought. Third thought.", true)]),
+                       "First thought. Second thought. Third thought.")
+    }
+
     func testTypedDraftThenTwoUtterancesAcrossAPause() {
         // Partials grow word by word, so a restart begins with a short result.
-        XCTAssertEqual(feed([("First", false), ("First part", false), ("Second", false), ("Second part", false)], base: "Typed"),
+        XCTAssertEqual(feed([("First", false), ("First part", false), ("Second", false), ("Second part", false)], base: "Typed",
+                            pauses: [2]),
                        "Typed First part Second part")
     }
 
