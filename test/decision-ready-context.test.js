@@ -312,6 +312,10 @@ test("FYIs and session errors are kept apart from decisions and never pushed", a
   const done = store.upsertQuestion({ dedupeKey: "done:a", kind: "completed", threadKey: "paseo:srv_local.a", title: "Docs refresh finished", options: ["dismiss"] });
   const crashed = store.upsertQuestion({ dedupeKey: "err:b", kind: "session-error", threadKey: "paseo:srv_local.b", title: "Session hit a provider error", options: ["retry", "dismiss"] });
   assert.equal(classifyAsk(done), "fyi");
+  // The grouped "Nudges can't get through … done/skip" card is Supervisor
+  // recovery, not an owner decision (live smoke 2026-11-23).
+  assert.equal(classifyAsk({ kind: "deliver", dedupeKey: "deliver:group", threadKey: null, threadKeys: ["paseo:s.a"], options: ["done", "skip"] }), "session_error");
+  assert.equal(classifyAsk({ kind: "limit", dedupeKey: "limit:group", threadKey: null, threadKeys: ["paseo:s.a"], options: ["wait", "added"] }), "decision", "adding an account is still the owner's call");
   assert.equal(classifyAsk(crashed), "session_error");
   for (const q of [done, crashed]) {
     const res = await notifier.notifyQuestion(q);

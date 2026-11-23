@@ -306,6 +306,10 @@ export function classifyAsk(question) {
   const kind = String(question?.kind ?? "").toLowerCase();
   if (kind === "completed") return "fyi";
   if (kind === "session-error") return "session_error";
+  // "Nudges can't get through" is the Supervisor's own delivery recovery
+  // (retry, failover, waiting out a quota), not an owner decision: it is
+  // shown with session errors and never pushed or announced in check-ins.
+  if (kind === "deliver" && !question?.threadKey) return "session_error";
   return "decision";
 }
 
