@@ -360,6 +360,18 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       if (previous?.pending) {
         const priorCheck = await readPaseoConfirmation(ref, previous, signal, save, Infinity, { ownerInitiated });
         signal.throwIfAborted();
+        // The same owner text was already dispatched to this chat and its
+        // outcome is pending: a lost reply, not a lost message. Its own
+        // receipt decides; it is never sent a second time.
+        if (ownerInitiated && previous.messageHash && previous.messageHash === base?.messageHash) {
+          if (priorCheck.confirmed) {
+            writeJsonAtomic(file, { ...previous, pending: false });
+            return { status: "sent", route: "paseo-send", actionId, reconciled: true, messageId: previous.clientMessageId ?? previous.messageId ?? null,
+              detail: "Paseo message and turn confirmed (earlier send of this same message; not sent again)" };
+          }
+          return { status: "blocked", unconfirmed: true, route: "paseo-send", actionId,
+            detail: "An earlier send of this same message to this chat is unconfirmed; not sent again so it cannot arrive twice" };
+        }
         if (!priorCheck.confirmed) {
           if (!ownerInitiated) return blocked("Previous delivery has no confirmed turn; no automatic resend");
           // Owner explicitly initiated a new send; clear stale unconfirmed marker so older background nudges never brick manual coordination.

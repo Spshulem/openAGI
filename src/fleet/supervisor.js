@@ -25,6 +25,7 @@ import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } fr
 import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
+import { HANDOFF_RETRY_MS, HandoffQueue, handoffStaleReason } from "./handoff-queue.js";
 import { applyPreferencePatch, classifyQuestionSlice, isSuppressedByQuietCadence, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, createDecisionsKeepAliveGate, evaluateQuestionsRelevanceWithDecisions } from "./decisions-gate.js";
@@ -474,6 +475,23 @@ function askTimes(questions) {
 
 // The owner's last message in the chat: null when the last user turn is the
 // supervisor's own (it arrives as a user turn too) or none was read.
+// The chat's Paseo host was not reachable: retryable once it is back.
+const HOST_UNAVAILABLE = /Paseo host unavailable/i;
+
+// What a held or finished handoff reports to the caller.
+function handoffDelivery(entry) {
+  if (entry.status === "delivered") {
+    return { status: "sent", route: "paseo-send", reconciled: true, actionId: entry.deliveredActionId ?? null, handoffKey: entry.key,
+      detail: `already delivered for this approval at ${entry.deliveredAt ?? entry.updatedAt}; not sent again` };
+  }
+  if (entry.status === "waiting") {
+    return { status: "queued", route: "paseo-send", handoffKey: entry.key,
+      detail: `${entry.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.` };
+  }
+  return { status: "blocked", route: "paseo-send", handoffKey: entry.key, ...(entry.status === "unconfirmed" ? { unconfirmed: true } : {}),
+    detail: `approved handoff ${entry.status}: ${entry.detail}` };
+}
+
 function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
 }
@@ -730,6 +748,12 @@ export class FleetSupervisor {
     return this._uiBlockedSince;
   }
 
+  // Owner-approved handoffs held while their chat's Paseo host is offline.
+  get handoffs() {
+    this._handoffs ??= new HandoffQueue({ dir: path.join(this.dataDir, "fleet"), now: () => this.now() });
+    return this._handoffs;
+  }
+
   get store() {
     if (!this._store) {
       this._store = new FleetStore({
@@ -976,7 +1000,9 @@ export class FleetSupervisor {
     if (this.running) return this.running;
     this.runningReason = reason;
     this.running = this._tick(reason, { deferUi })
-      .then((snapshot) => { this.lastError = null; return snapshot; })
+      // A scan refreshes which chats and hosts are reachable: held handoffs
+      // whose host is back go out now.
+      .then(async (snapshot) => { this.lastError = null; await this.resumeHandoffs().catch(() => {}); return snapshot; })
       .catch((error) => {
         this.lastError = clampText(error?.message ?? String(error), 300);
         throw error;
@@ -1071,7 +1097,7 @@ export class FleetSupervisor {
       blockingResolver,
       projectAliases
     });
-    return { ...baseState, ...deck };
+    return { ...baseState, ...deck, handoffs: this.handoffs.summary() };
   }
 
   enrichQuestionView(questionView, rows, blockingResolver) {
@@ -2205,10 +2231,18 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null } = {}) {
+  // idempotencyKey: the owner approval this send carries out. The same
+  // approval is never sent twice, and if the chat's Paseo host is offline
+  // it is held (status "queued") and sent when the host is back.
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, idempotencyKey = null, resume = false } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
+    const key = typeof idempotencyKey === "string" && idempotencyKey.trim() ? idempotencyKey.trim().slice(0, 160) : null;
+    if (key && !resume) {
+      const known = this.handoffs.get(key);
+      if (known) return { delivery: handoffDelivery(known) };
+    }
     const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
     const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
     const thread = this.lastThreads.get(threadKey)
@@ -2252,6 +2286,18 @@ export class FleetSupervisor {
         }
       }
     }
+    if (key && !resume && thread.kind === "paseo") {
+      if (delivery.status === "blocked" && HOST_UNAVAILABLE.test(String(delivery.detail ?? "")) && !delivery.unconfirmed) {
+        const { entry } = this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, images,
+          reason: `held: Paseo host ${thread.meta?.serverId ?? "for this chat"} is offline` });
+        this.store.recordAction({ threadKey: thread.key, playbook: "owner-message", status: "queued", route, detail: `${entry.detail}; sends when the host is back (approval ${key})` });
+        return { delivery: handoffDelivery(entry) };
+      }
+      if (delivery.status === "sent") {
+        this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "sent" });
+        this.handoffs.update(key, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+      }
+    }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
@@ -2263,6 +2309,50 @@ export class FleetSupervisor {
       ...(actionId ? { actionId } : {}),
       ...(delivery.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
+  }
+
+  // Sends each held handoff whose chat's host is back, once, to that exact
+  // chat. Delivered only on a confirmed send; a send Paseo accepted without
+  // a confirmed turn is never repeated; one no longer safe to send stops
+  // with its reason.
+  async resumeHandoffs() {
+    if (this.resumingHandoffs) return this.resumingHandoffs;
+    this.resumingHandoffs = (async () => {
+      const now = this.now();
+      for (const entry of this.handoffs.waiting()) {
+        if ((Date.parse(entry.nextTryAt ?? "") || 0) > now) continue;
+        const thread = this.lastThreads.get(entry.threadKey) ?? this.knownThreads.get(entry.threadKey) ?? null;
+        const stale = handoffStaleReason(entry, thread ? { archived: Boolean(thread.archived), ownerSpokeAt: ownerSpokeAt(thread) } : null, now);
+        if (stale) {
+          this.handoffs.update(entry.key, { status: "stale", detail: stale });
+          this.store.recordAction({ threadKey: entry.threadKey, playbook: "owner-message", status: "blocked", route: "paseo-send", detail: `held handoff not sent: ${stale}` });
+          continue;
+        }
+        // Not listed yet (host still offline, or the scan has not seen it
+        // since a restart): keep waiting.
+        if (!thread) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: the chat is not listed yet" });
+          continue;
+        }
+        const attempts = (entry.attempts ?? 0) + 1;
+        let delivery;
+        try {
+          delivery = (await this.sendOwnerMessage(entry.threadKey, entry.message, { images: entry.images ?? null, resume: true }))?.delivery ?? null;
+        } catch (error) {
+          delivery = { status: "blocked", detail: clampText(String(error?.message ?? error), 200) };
+        }
+        if (delivery?.status === "sent") {
+          this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+        } else if (delivery?.unconfirmed) {
+          this.handoffs.update(entry.key, { status: "unconfirmed", attempts, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+        } else if (HOST_UNAVAILABLE.test(String(delivery?.detail ?? ""))) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: `held: Paseo host ${entry.serverId ?? ""} is still offline` });
+        } else {
+          this.handoffs.update(entry.key, { status: "blocked", attempts, detail: clampText(delivery?.detail ?? "send failed", 200) });
+        }
+      }
+    })().finally(() => { this.resumingHandoffs = null; });
+    return this.resumingHandoffs;
   }
 
   // One thread, expanded for the owner: the agent's last message and when,

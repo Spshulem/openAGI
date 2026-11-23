@@ -377,9 +377,12 @@ export class RemoteFleetSupervisor {
   // all; one it received but did not answer may have gone out, so its own
   // receipt decides, and with none it is reported unconfirmed, never sent
   // and never sent twice. Every attempt is in the result.
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { queue = false, images = null, idempotencyKey = null } = {}) {
     const hasImages = Array.isArray(images) && images.length > 0;
-    const body = { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(hasImages ? { images } : {}) };
+    // The approval's key travels with every attempt: the fleet computer
+    // never carries out the same approval twice, and holds it while the
+    // chat's host is offline.
+    const body = { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
     const startedAt = Date.now();
     const attempts = [];
     for (let attempt = 1; ; attempt += 1) {
