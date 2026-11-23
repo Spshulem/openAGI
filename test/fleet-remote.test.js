@@ -835,3 +835,19 @@ test('failed attempts are kept across a restart without the message text', async
   assert.equal(attempt.path, '/fleet/api/send');
   assert.doesNotMatch(fs.readFileSync(path.join(dir, 'fleet-remote-attempts.json'), 'utf8'), /secret layout notes|AAAA/);
 });
+
+// Review fix (#350): a command the node acknowledged and then failed may have
+// run; it is reconciled, never sent again.
+test('an acknowledged failure that is not a timeout is reconciled, not retried', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') { await deliver(...args); throw Object.assign(new Error('node-capability-command-failed'), { nodeAcknowledged: true }); }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'unknown');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(sends(), 1, 'never sent a second time');
+});

@@ -4763,6 +4763,9 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        // When the supervisor itself last wrote there (a time, no text), so
+        // a remote approval check can tell its own message from the owner's.
+        lastSupervisorAt: thread.meta?.lastSupervisorAt ?? null,
         requiresAttention: Boolean(thread.meta?.requiresAttention),
         attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).

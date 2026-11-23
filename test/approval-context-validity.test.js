@@ -14,7 +14,9 @@ function setup(t, { now }) {
   const rows = [{ key: "paseo:s.a", workspace: "amman", title: "Fix billing", lastOwnerAt: null }];
   const sent = [];
   const actions = [];
+  const lastThreads = new Map();
   const supervisor = {
+    lastThreads,
     getState: () => ({ mode: "auto", enabled: true, questions: [], actions, snapshot: { threads: rows } }),
     sendOwnerMessage: async (key, message) => { sent.push({ key, message }); return { delivery: { status: "sent", route: "paseo", detail: "ok" } }; }
   };
@@ -22,7 +24,7 @@ function setup(t, { now }) {
   const tools = new ToolRegistry();
   tools.bindPendingActions(pendingActions);
   registerFleetTools(tools, supervisor);
-  return { rows, sent, actions, pendingActions, runtime: { pendingActions, tools } };
+  return { rows, sent, actions, lastThreads, pendingActions, runtime: { pendingActions, tools } };
 }
 
 test("an unanswered send approval lasts while its chat does, not a fixed ten minutes", async (t) => {
@@ -79,7 +81,8 @@ test("a supervisor delivery receipt in the journal also counts as the supervisor
   const h = setup(t, { now });
   const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
   const landedAt = now.value + 11 * 60_000;
-  h.rows[0].lastOwnerAt = new Date(landedAt).toISOString();
+  // The reader's own view of the chat (local): its window held no owner turn.
+  h.lastThreads.set("paseo:s.a", { key: "paseo:s.a", lastUserAt: new Date(landedAt).toISOString(), lastUserText: "", meta: {} });
   h.actions.push({ threadKey: "paseo:s.a", playbook: "goal-continuation", status: "sent", route: "paseo-send", finishedAt: new Date(landedAt + 3_000).toISOString() });
   now.value += 30 * 60_000;
   const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
@@ -129,4 +132,54 @@ test("a card whose chat is gone is retired without raising another", async (t) =
   assert.equal(gone.status, 410);
   assert.equal(gone.body.reraised, undefined);
   assert.equal(h.pendingActions.list({ status: "pending" }).length, 0);
+});
+
+// Review fix (#350): a remote snapshot row carries no owner text, so a
+// supervisor delivery receipt near an owner turn must not hide that turn.
+test("on a remote row, a nearby delivery receipt does not hide the owner's turn", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
+  const ownerAt = now.value + 10 * 60_000;
+  h.rows[0].lastOwnerAt = new Date(ownerAt).toISOString();
+  h.actions.push({ threadKey: "paseo:s.a", playbook: "goal-continuation", status: "sent", route: "paseo-send", finishedAt: new Date(ownerAt + 30_000).toISOString() });
+  now.value += 30 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 410, "fails closed: a fresh yes is needed");
+  assert.equal(h.sent.length, 0);
+});
+
+test("on a remote row, the reader's own supervisor stamp still identifies the supervisor's write", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
+  const nudgeAt = now.value + 10 * 60_000;
+  h.rows[0].lastOwnerAt = new Date(nudgeAt).toISOString();
+  h.rows[0].lastSupervisorAt = new Date(nudgeAt + 600).toISOString();
+  now.value += 30 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 200);
+  assert.equal(h.sent.length, 1);
+});
+
+// Review fix (#350): a card denied on another surface while its check runs
+// is not raised again.
+test("a card denied elsewhere during the validity check is not raised again", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate" }, { sessionId: "s1" });
+  h.rows[0].lastOwnerAt = new Date(now.value + 60_000).toISOString();
+  h.rows[0].lastOwnerText = "never mind";
+  const check = h.runtime.tools.approvalVerdict.bind(h.runtime.tools);
+  h.runtime.tools.approvalVerdict = async (action) => {
+    h.pendingActions.decide(action.id, { decision: "deny", decidedBy: "owner:dashboard" });
+    return check(action);
+  };
+  now.value += 5 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 410);
+  assert.equal(ran.body.reraised, undefined);
+  assert.equal(h.pendingActions.get(queued.result.actionId).status, "denied");
+  assert.equal(h.pendingActions.list({ status: "pending" }).length, 0);
+  assert.equal(h.sent.length, 0);
 });

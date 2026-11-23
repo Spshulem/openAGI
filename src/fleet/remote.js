@@ -123,8 +123,11 @@ export function classifyFleetRequestError(error, { reached = false, status = nul
   if (/exceeded the transport limit|not serializable/i.test(raw)) {
     return { kind: 'too-large', message: `Not sent: the request is over the ${Math.round(MAX_TRANSPORT_BYTES / 1024)} KB limit of the link to the fleet computer. Retrying cannot help; send less (for example without images).`, retryable: false, uncertain: false };
   }
-  if (/timed out/i.test(raw) && error?.nodeAcknowledged === true) {
-    return { kind: 'uncertain', message: 'The fleet computer took the request but did not answer in time; it may still have run. Check its receipts before trying again.', retryable: false, uncertain: true };
+  // The computer took it, so it may have run (a timeout, or a failure it
+  // reported after executing, such as an oversized result): reconcile
+  // against its receipts, never send again.
+  if (error?.nodeAcknowledged === true) {
+    return { kind: 'uncertain', message: `The fleet computer took the request but ${/timed out/i.test(raw) ? 'did not answer in time' : 'reported a failure after taking it'}; it may still have run. Check its receipts before trying again.`, retryable: false, uncertain: true };
   }
   return { kind: 'unreachable', message: `Fleet computer unavailable${raw ? ` (${clampText(raw, 120)})` : ''}. Retry when it is online.`, retryable: true, uncertain: false };
 }
