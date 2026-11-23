@@ -33,7 +33,7 @@ struct DictationTranscript: Equatable {
     nonisolated static func startsNewUtterance(previousEnd: TimeInterval?, segments: [(TimeInterval, TimeInterval)],
                                                live: String, text: String) -> Bool {
         guard let previousEnd, previousEnd > 0, let first = segments.first,
-              first.0 > 0, first.1 > first.0 else { return false }
+              first.0 > 0, first.1 > first.0 else { return restartsWithoutTiming(live: live, text: text) }
         guard first.0 >= previousEnd + utteranceGap else { return false }
         // Only text that extends everything already live is a continuation;
         // two utterances may share a first word ("I need milk", "I also need
@@ -44,17 +44,48 @@ struct DictationTranscript: Equatable {
         return liveText.isEmpty || !normalize(text).hasPrefix(liveText)
     }
 
+    // On device, a pause often ends an utterance with neither isFinal nor
+    // timing: the next partial simply restarts from empty ("Before the
+    // pause" -> "After"). Read that from the words. A revision rewrites the
+    // live words in place, so it keeps the same first word or extends them;
+    // a restart is shorter and begins differently.
+    nonisolated static func restartsWithoutTiming(live: String, text: String) -> Bool {
+        let liveWords = words(live), textWords = words(text)
+        guard liveWords.count >= 2, !textWords.isEmpty, textWords.count < liveWords.count,
+              textWords.first != liveWords.first else { return false }
+        return !liveWords.starts(with: textWords)
+    }
+
+    nonisolated static func words(_ value: String) -> [String] {
+        value.lowercased().split(separator: " ").map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+    }
+
     // The end of the speech in a result, if its timing is set.
     nonisolated static func speechEnd(of segments: [(TimeInterval, TimeInterval)]) -> TimeInterval? {
         guard let end = segments.last?.1, end > 0 else { return nil }
         return end
     }
 
-    mutating func receive(_ text: String, isFinal: Bool, startsNewUtterance: Bool = false) -> String {
+    // endsUtterance: iOS marked this result as the end of an utterance
+    // (speech metadata) without finishing the request; the next result
+    // starts the next utterance.
+    mutating func receive(_ text: String, isFinal: Bool, startsNewUtterance: Bool = false, endsUtterance: Bool = false) -> String {
         if startsNewUtterance, !live.isEmpty { finished.append(live); live = "" }
-        live = text
-        if isFinal { finished.append(live); live = "" }
+        live = Self.droppingRepeat(of: finished.last, from: text)
+        if isFinal || endsUtterance { finished.append(live); live = "" }
         return draft
+    }
+
+    // A result that repeats the utterance already kept ("Before the pause.
+    // After") keeps only what is new, so nothing appears twice.
+    nonisolated static func droppingRepeat(of kept: String?, from text: String) -> String {
+        guard let kept else { return text }
+        let keptWords = words(kept)
+        guard !keptWords.isEmpty else { return text }
+        let tokens = text.split(separator: " ", omittingEmptySubsequences: true)
+        let normalized = tokens.map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
+        guard normalized.count >= keptWords.count, Array(normalized.prefix(keptWords.count)) == keptWords else { return text }
+        return tokens.dropFirst(keptWords.count).joined(separator: " ")
     }
 }
 
@@ -112,6 +143,23 @@ final class ChatDictation {
                 for (text, isFinal, delay) in script {
                     try? await Task.sleep(for: .milliseconds(delay))
                     handle(text: text, isFinal: isFinal, failed: false, generation: generation)
+                }
+            }
+            return
+        }
+        // The same report on device: the pause ends the utterance without
+        // isFinal or timing, and the next partial restarts from empty.
+        if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-restart-fixture") {
+            self.updateDraft = update
+            isListening = true
+            Task {
+                let script: [(String, Int)] = [
+                    ("Before", 200), ("Before the pause", 200), ("After", 1200), ("After the pause it continues.", 200)
+                ]
+                for (text, delay) in script {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: transcript.live, text: text)
+                    handle(text: text, isFinal: false, failed: false, startsNewUtterance: fresh, generation: generation)
                 }
             }
             return
@@ -189,6 +237,9 @@ final class ChatDictation {
             let finished = result?.isFinal == true
             let failed = failure != nil
             let segments = result?.bestTranscription.segments.map { ($0.timestamp, $0.timestamp + $0.duration) } ?? []
+            // iOS 17+ attaches speech metadata to the last result of an
+            // utterance, final or not.
+            let utteranceEnded = result?.speechRecognitionMetadata != nil
             Task { @MainActor [weak self] in
                 // Before touching any state, timing included: a late result from
                 // a stopped session or a replaced request must change nothing.
@@ -198,7 +249,8 @@ final class ChatDictation {
                 let newUtterance = DictationTranscript.startsNewUtterance(
                     previousEnd: self.lastSegmentEnd, segments: segments, live: self.transcript.live, text: text ?? "")
                 if let end = DictationTranscript.speechEnd(of: segments) { self.lastSegmentEnd = end }
-                self.handle(text: text, isFinal: finished, failed: failed, startsNewUtterance: newUtterance, generation: generation)
+                self.handle(text: text, isFinal: finished, failed: failed, startsNewUtterance: newUtterance,
+                            endsUtterance: utteranceEnded, generation: generation)
             }
         }
     }
@@ -206,9 +258,12 @@ final class ChatDictation {
     // One recognizer result, real or replayed by a UI test fixture. A pause
     // finalizes a segment; that is never the end of dictation: only Stop (or
     // a real failure) ends it, and nothing is ever sent automatically.
-    private func handle(text: String?, isFinal: Bool, failed: Bool, startsNewUtterance: Bool = false, generation: UUID) {
+    private func handle(text: String?, isFinal: Bool, failed: Bool, startsNewUtterance: Bool = false,
+                        endsUtterance: Bool = false, generation: UUID) {
         guard self.generation == generation else { return }
-        if let text { updateDraft?(transcript.receive(text, isFinal: isFinal, startsNewUtterance: startsNewUtterance)) }
+        if let text {
+            updateDraft?(transcript.receive(text, isFinal: isFinal, startsNewUtterance: startsNewUtterance, endsUtterance: endsUtterance))
+        }
         if failed {
             stop()
             if text == nil { error = "Dictation stopped. Your draft is saved; tap the microphone to try again." }

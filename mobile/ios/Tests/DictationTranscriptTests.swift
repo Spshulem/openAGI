@@ -5,6 +5,51 @@ import XCTest
 // finalizes the first segment and starts a fresh transcript for the next one;
 // every word must stay, in order, in the same unsent draft.
 final class DictationTranscriptTests: XCTestCase {
+    // The owner's report after #341, through the built-in composer mic: on
+    // device a pause often ends an utterance without isFinal and without
+    // timing; the next partial restarts from empty. The earlier words must
+    // stay, and the new ones append without duplication.
+    private func feed(_ steps: [(String, Bool)], base: String = "") -> String {
+        var t = DictationTranscript(base: base)
+        var draft = base
+        for (text, ends) in steps {
+            let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: t.live, text: text)
+            draft = t.receive(text, isFinal: false, startsNewUtterance: fresh, endsUtterance: ends)
+        }
+        return draft
+    }
+
+    func testARestartWithoutFinalOrTimingKeepsTheEarlierWords() {
+        XCTAssertEqual(feed([("Before", false), ("Before the pause", false), ("After", false), ("After the pause it continues", false)]),
+                       "Before the pause After the pause it continues")
+    }
+
+    func testAnUtteranceEndMarkerCommitsTheWordsHeardSoFar() {
+        // iOS 17+ marks the end of an utterance with speech metadata.
+        XCTAssertEqual(feed([("Before the pause.", true), ("After", false), ("After the pause.", false)]),
+                       "Before the pause. After the pause.")
+    }
+
+    func testACumulativeTranscriptAfterAnUtteranceEndIsNotDuplicated() {
+        // Some results repeat everything heard; nothing may appear twice.
+        XCTAssertEqual(feed([("Before the pause.", true), ("Before the pause. After", false),
+                             ("Before the pause. After the pause.", false)]),
+                       "Before the pause. After the pause.")
+    }
+
+    // Known limit: a one-word utterance cannot be told apart from a revision
+    // of that word without timing or an utterance-end marker.
+    func testRevisionsWithoutTimingStillReplaceOnlyTheLiveWords() {
+        XCTAssertEqual(feed([("I want to", false), ("I wanted two", false), ("I wanted to go", false)]), "I wanted to go")
+        XCTAssertEqual(feed([("Before", false), ("Before the", false), ("Before the pause", false)]), "Before the pause")
+    }
+
+    func testTypedDraftThenTwoUtterancesAcrossAPause() {
+        // Partials grow word by word, so a restart begins with a short result.
+        XCTAssertEqual(feed([("First", false), ("First part", false), ("Second", false), ("Second part", false)], base: "Typed"),
+                       "Typed First part Second part")
+    }
+
     func testAPauseFinalizesASegmentAndLaterSpeechIsAppendedNotReplaced() {
         var t = DictationTranscript(base: "")
         XCTAssertEqual(t.receive("Before the", isFinal: false), "Before the")
