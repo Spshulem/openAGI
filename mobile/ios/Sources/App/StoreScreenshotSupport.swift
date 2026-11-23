@@ -56,6 +56,10 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
             object = ["preference": "on-device", "active": ["provider": "on-device", "model": "Apple Intelligence"],
                       "providers": ["anthropic": ["configured": false], "openai": ["configured": false],
                                     "chatgpt": ["signedIn": false]]]
+        case "/budget":
+            object = ["today": "2026-10-18", "dailyUsdLimit": 25.0, "bonusUsdToday": 0.0,
+                      "effectiveLimitUsd": 25.0, "spentUsd": 1.42, "remainingUsd": 23.58,
+                      "exceeded": false, "calls": 18]
         case "/workspace/persona":
             object = ["markdown": "# My agent\n\nHelp me make thoughtful plans and keep track of what matters.\nKeep answers clear and ask when you need my input."]
         case "/workspace/skills": object = ["skills": []]

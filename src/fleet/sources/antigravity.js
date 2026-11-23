@@ -261,9 +261,20 @@ function silentBusy(row, steps, lastActivityAt, now, limits) {
   return now - (Date.parse(lastActivityAt ?? "") || 0) >= limits.silentTurnMs;
 }
 
+// Even when the language server stays running, a busy run or not_fully_idle
+// conversation with zero new steps past liveServerStallMs (default 2h) is
+// wedged (e.g. a 15-16h hung Antigravity subagent or background command).
+function liveServerStalled(row, steps, lastActivityAt, now, limits) {
+  if (truthy(row.killed) || steps.waiting) return false;
+  if (!RUN_BUSY.has(runStatusOf(row.status)) && !steps.active && !truthy(row.not_fully_idle)) return false;
+  const threshold = limits.liveServerStallMs ?? 2 * 60 * 60_000;
+  return now - (Date.parse(lastActivityAt ?? "") || 0) >= threshold;
+}
+
 function statusOf(row, steps, lastActivityAt, now, limits, serverAlive) {
   if (truthy(row.killed)) return "aborted";
   if (steps.waiting) return "waiting";
+  if (liveServerStalled(row, steps, lastActivityAt, now, limits)) return "stalled";
   if (RUN_BUSY.has(runStatusOf(row.status)) || steps.active) {
     // A server that died mid-run leaves its row busy.
     return !serverAlive && silentBusy(row, steps, lastActivityAt, now, limits) ? "stalled" : "running";
@@ -337,6 +348,7 @@ function buildThread(row, steps, { config, now, serverAlive }) {
       blockedOnOwner: agentStatus === "waiting" && steps.waiting,
       runStatus: String(row.status ?? "") || null,
       notFullyIdle: truthy(row.not_fully_idle),
+      ...(liveServerStalled(row, steps, lastActivityAt, now, limits) ? { silentStuck: true } : {}),
       projectId: String(row.project_id ?? "") || null,
       stepCount: Number(row.step_count) || 0,
       openChat: null,

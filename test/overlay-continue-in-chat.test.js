@@ -232,6 +232,36 @@ test("the chat tab resolves the ?session= the popover deep-links to", async () =
   assert.equal(deepLinkSessionId("?tab=chat&session=local%3Abrowser-17%3Amain"), "local:browser-17:main");
 });
 
+test("chat composer submits only unmodified Return and preserves multiline IME input", async () => {
+  const { script } = await boot();
+  const shouldSubmitComposerKey = new Function(
+    `${extractFunction(script, "shouldSubmitComposerKey")}; return shouldSubmitComposerKey;`
+  )();
+  const key = (overrides = {}) => ({
+    key: "Enter",
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    isComposing: false,
+    keyCode: 13,
+    ...overrides
+  });
+
+  assert.equal(shouldSubmitComposerKey(key()), true, "plain Return submits");
+  assert.equal(shouldSubmitComposerKey(key({ shiftKey: true })), false, "Shift+Return inserts a newline");
+  assert.equal(shouldSubmitComposerKey(key({ ctrlKey: true })), false, "Control+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ altKey: true })), false, "Option+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ metaKey: true })), false, "Command+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ isComposing: true })), false, "active IME composition is preserved");
+  assert.equal(shouldSubmitComposerKey(key({ keyCode: 229 })), false, "IME keyCode 229 is preserved");
+
+  // A second Return after a send reaches submit with an empty draft; the
+  // shipped submit guard must keep it from issuing another request.
+  assert.match(script, /const text = input\.value\.trim\(\);\n    if \(!text\) return;/);
+  assert.match(script, /input\.value = "";/);
+});
+
 test("no ?session= means no deep link (plain /?tab=chat still opens a fresh chat)", async () => {
   const { script } = await boot();
   const deepLinkSessionId = new Function(

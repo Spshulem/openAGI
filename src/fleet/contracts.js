@@ -45,7 +45,7 @@ export const AGENT_STATUS = Object.freeze(["running", "idle", "waiting", "stalle
 
 // Why a turn ended on an infrastructure problem instead of real work.
 export const ERROR_KINDS = Object.freeze([
-  "session-limit", "model-limit", "usage-limit", "overloaded", "network", "lb", "logged-out", "disk-full", "other"
+  "session-limit", "model-limit", "usage-limit", "overloaded", "network", "lb", "logged-out", "provider-auth", "disk-full", "other"
 ]);
 
 // Supervisor-level classification. Order matters: first match wins.
@@ -104,6 +104,11 @@ export const DEFAULTS = Object.freeze({
   // No transcript row this long: a Conductor "working" turn is hung, and a
   // wait on a background task gets the agent asked for a status.
   silentTurnMs: 60 * MIN,
+  // A live Antigravity or Paseo turn silent past this window is treated as a
+  // wedged/stuck turn (prevents 15-16h hangs when the host daemon stays up).
+  liveServerStallMs: 2 * 60 * MIN,
+  // Maximum age of an idle declarative blocker/snag that Supervisor auto-unblocks.
+  snagMaxAgeMs: 24 * 60 * MIN,
   // An idle-report nudge only for a turn that stopped within this long.
   idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
@@ -199,6 +204,12 @@ export function defaultPaths(home = os.homedir(), exists = fs.existsSync) {
     path.join(home, ".config", "codex-lb", "env"),
     path.join(home, ".config", "ccodex", "env")
   ];
+  const antigravityAppHome = path.join(home, ".gemini", "antigravity");
+  const antigravityCliHome = path.join(home, ".gemini", "antigravity-cli");
+  const antigravityHome = !exists(path.join(antigravityAppHome, "conversation_summaries.db"))
+    && exists(path.join(antigravityCliHome, "conversation_summaries.db"))
+    ? antigravityCliHome
+    : antigravityAppHome;
   return {
     home,
     codexHome: path.join(home, ".codex"),
@@ -211,7 +222,7 @@ export function defaultPaths(home = os.homedir(), exists = fs.existsSync) {
     lbWatchLog: path.join(home, "Library", "Logs", "lb-watch.log"),
     relayCwd: path.join(home, ".agent-supervisor", "relay"),
     // Antigravity's data: conversation_summaries.db and conversations/<id>.db.
-    antigravityHome: path.join(home, ".gemini", "antigravity")
+    antigravityHome
   };
 }
 
@@ -241,7 +252,10 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     rm: pick(["/bin/rm"], "rm"),
     // A shim that runs the app's language server with "agentapi". The server
     // binary itself is how the running instance is found in ps.
-    agentapi: pick([path.join(home, ".gemini", "antigravity", "bin", "agentapi")], null),
+    agentapi: pick([
+      path.join(home, ".gemini", "antigravity", "bin", "agentapi"),
+      path.join(home, ".gemini", "antigravity-cli", "bin", "agentapi")
+    ], null),
     antigravityLs: pick([ANTIGRAVITY_LS, path.join(home, "Applications", "Antigravity.app", "Contents", "Resources", "bin", "language_server")], ANTIGRAVITY_LS)
   };
 }
@@ -502,7 +516,13 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     antigravity: {
       enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
     },
-    limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
+    limits: {
+      ...DEFAULTS,
+      ...(Number.isFinite(Number(env.OPENAGI_FLEET_LIVE_STALL_MIN)) && Number(env.OPENAGI_FLEET_LIVE_STALL_MIN) > 0
+        ? { liveServerStallMs: Number(env.OPENAGI_FLEET_LIVE_STALL_MIN) * MIN }
+        : {}),
+      ...(overrides.limits ?? {})
+    },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
   };
