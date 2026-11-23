@@ -5,6 +5,79 @@ import XCTest
 // finalizes the first segment and starts a fresh transcript for the next one;
 // every word must stay, in order, in the same unsent draft.
 final class DictationTranscriptTests: XCTestCase {
+    // The owner's report after #341, through the built-in composer mic: on
+    // device a pause often ends an utterance without isFinal and without
+    // timing; the next partial restarts from empty. The earlier words must
+    // stay, and the new ones append without duplication.
+    // Each step: text, whether iOS ended the utterance, seconds since the
+    // previous result, and whether it was final.
+    private func feed(_ steps: [(String, Bool)], base: String = "", gap: TimeInterval = 0.2,
+                      pauses: Set<Int> = []) -> String {
+        var t = DictationTranscript(base: base)
+        var draft = base
+        for (i, (text, ends)) in steps.enumerated() {
+            let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: t.live, text: text,
+                                                               sinceLastResult: pauses.contains(i) ? 1.2 : gap)
+            draft = t.receive(text, isFinal: false, startsNewUtterance: fresh, endsUtterance: ends)
+        }
+        return draft
+    }
+
+    func testARestartWithoutFinalOrTimingKeepsTheEarlierWords() {
+        XCTAssertEqual(feed([("Before", false), ("Before the pause", false), ("After", false), ("After the pause it continues", false)],
+                            pauses: [2]),
+                       "Before the pause After the pause it continues")
+    }
+
+    func testAnUtteranceEndMarkerCommitsTheWordsHeardSoFar() {
+        // iOS 17+ marks the end of an utterance with speech metadata.
+        XCTAssertEqual(feed([("Before the pause.", true), ("After", false), ("After the pause.", false)]),
+                       "Before the pause. After the pause.")
+    }
+
+    func testACumulativeTranscriptAfterAnUtteranceEndIsNotDuplicated() {
+        // Some results repeat everything heard; nothing may appear twice.
+        XCTAssertEqual(feed([("Before the pause.", true), ("Before the pause. After", false),
+                             ("Before the pause. After the pause.", false)]),
+                       "Before the pause. After the pause.")
+    }
+
+    // Known limit: a one-word utterance cannot be told apart from a revision
+    // of that word without timing or an utterance-end marker.
+    func testRevisionsWithoutTimingStillReplaceOnlyTheLiveWords() {
+        XCTAssertEqual(feed([("I want to", false), ("I wanted two", false), ("I wanted to go", false)]), "I wanted to go")
+        XCTAssertEqual(feed([("Before", false), ("Before the", false), ("Before the pause", false)]), "Before the pause")
+    }
+
+    // Codex review on #364: a correction that merges words is not a restart
+    // when no silence came before it.
+    func testAWordBoundaryCorrectionWithoutAPauseIsARevision() {
+        XCTAssertEqual(feed([("some thing", false), ("something", false), ("something else", false)]), "something else")
+    }
+
+    // Codex review on #364: saying the same thing again in a fresh request
+    // (after a final result) keeps both.
+    func testRepeatingTheSameWordsAfterAFinalResultKeepsBoth() {
+        var t = DictationTranscript(base: "")
+        _ = t.receive("No.", isFinal: true)
+        XCTAssertEqual(t.receive("No.", isFinal: true), "No. No.")
+    }
+
+    // Codex review on #364: cumulative results across several utterance
+    // ends drop everything already committed in that request.
+    func testCumulativeResultsAcrossSeveralUtteranceEndsAreNotDuplicated() {
+        XCTAssertEqual(feed([("First thought.", true), ("First thought. Second thought.", true),
+                             ("First thought. Second thought. Third thought.", true)]),
+                       "First thought. Second thought. Third thought.")
+    }
+
+    func testTypedDraftThenTwoUtterancesAcrossAPause() {
+        // Partials grow word by word, so a restart begins with a short result.
+        XCTAssertEqual(feed([("First", false), ("First part", false), ("Second", false), ("Second part", false)], base: "Typed",
+                            pauses: [2]),
+                       "Typed First part Second part")
+    }
+
     func testAPauseFinalizesASegmentAndLaterSpeechIsAppendedNotReplaced() {
         var t = DictationTranscript(base: "")
         XCTAssertEqual(t.receive("Before the", isFinal: false), "Before the")
@@ -120,27 +193,7 @@ final class DictationTranscriptTests: XCTestCase {
                       "a stopped microphone ends dictation")
     }
 
-    // On-device recognition may restart its transcript after a pause with no
-    // final marker and zero timing. Earlier words must stay.
-    func testATranscriptRestartWithoutTimingKeepsEarlierWords() {
-        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "Before the pause", text: "After"))
-        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "I need milk", text: "I"), "a shared first word")
-        XCTAssertTrue(DictationTranscript.restartsWithoutTiming(live: "Hello there", text: "Bye"))
-        var t = DictationTranscript(base: "")
-        for text in ["Before the", "Before the pause", "After", "After the pause it continues."] {
-            _ = t.receive(text, isFinal: false,
-                          startsNewUtterance: DictationTranscript.restartsWithoutTiming(live: t.live, text: text))
-        }
-        XCTAssertEqual(t.draft, "Before the pause After the pause it continues.")
-    }
 
-    func testOrdinaryRevisionsAreNotARestart() {
-        for (live, text) in [("Before", "Before the"), ("I want to", "I wanted two"), ("Before the pause it", "Before the pause"),
-                             ("um I want to go", "I want to go"), ("I wanted two", "I wanted to go."), ("Kept", "Kept,"),
-                             ("", "Anything"), ("Something", "")] {
-            XCTAssertFalse(DictationTranscript.restartsWithoutTiming(live: live, text: text), "\(live) -> \(text)")
-        }
-    }
 
     func testImmediateFailuresWaitLongerBeforeTheNextTry() {
         XCTAssertEqual(ChatDictation.retryDelay(afterQuickFailures: 1), 250)
