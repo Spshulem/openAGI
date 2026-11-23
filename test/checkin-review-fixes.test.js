@@ -112,3 +112,12 @@ test("on a paired node, a hub failure keeps decisions pending and the hub is ret
   assert.equal(hubCalls.length, 2, "the hub was retried");
   assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: nowMs }).deltas.length, 0);
 });
+
+test("a reworded merge ask at the same head is not a new decision; a new head is", () => {
+  const base = { kind: "agent-ask", mergeAsk: true, prRef: "acme/app#10346", threadKey: "paseo:s.m", options: ["merge", "run mac tests"] };
+  const a = actionableDecisionMaterialHash({ ...base, askedHead: "328aeec", title: "#10346: run Mac tests or merge?", body: "CI failing on main-health." });
+  const reworded = actionableDecisionMaterialHash({ ...base, askedHead: "328aeec", title: "buildbetter #10346 awaiting merge confirmation", body: "BuildBot3 passed; Mac Swift tests unrun." });
+  const newHead = actionableDecisionMaterialHash({ ...base, askedHead: "9f00d1e", title: "#10346: run Mac tests or merge?", body: "CI failing on main-health." });
+  assert.equal(a, reworded);
+  assert.notEqual(a, newHead);
+});

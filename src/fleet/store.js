@@ -136,6 +136,11 @@ export function actionableDecisionMaterialHash(question) {
   if (kind === "ready" && prRef) {
     return shortHash(JSON.stringify(["ready", prRef]));
   }
+  // A merge decision is the PR at a head with its choices: an agent or the
+  // review rewording the ask is not a new decision; a new head is.
+  if (question.mergeAsk === true && prRef) {
+    return shortHash(JSON.stringify(["merge", prRef, String(question.askedHead ?? ""), normOpts]));
+  }
   const rawDedupe = String(question.dedupeKey ?? "").trim().replace(/:\d+$/, "");
   if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(rawDedupe)) {
     // Which sessions are affected is material (a different session's
