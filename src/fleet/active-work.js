@@ -2768,6 +2768,12 @@ export class ActiveWorkManager {
       const delivery = sent?.delivery ?? { status: "blocked", detail: "Delivery unavailable" };
       if (delivery.status === "sent") {
         if (item.state === "paused") item.state = "active";
+        if (typeof item.blocker === "string" && item.blocker.startsWith("Dispatch delivery blocked:")) {
+          item.blocker = null;
+          if (item.state === "blocked") item.state = "active";
+          item.nextAction = "Owner evidence received and verified";
+          item.currentStep = "Owner resumed; awaiting fresh evidence";
+        }
         item.updatedAt = nowIso;
         this._resolveItemOutreach(item, "resume_owner", "acted");
       }

@@ -1000,6 +1000,22 @@ export async function dispatchManagerGoal(
       permittedNudges: "none"
     });
   };
+  const recordRecoveredOwner = (persisted, sent) => {
+    const item = persisted?.item;
+    const recovered = sent?.delivery?.recoveredSession;
+    if (!item || !recovered?.key || typeof supervisor?.trackWork !== "function") return;
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      threadKey: recovered.key,
+      owner: { threadKey: recovered.key, label: recovered.title || recovered.workspace || recovered.key },
+      currentStep: "Replacement owner session received the dispatch; awaiting fresh evidence",
+      nextAction: "Replacement owner evidence received and verified",
+      workflowStage: item.workflowStage || "implementing"
+    });
+  };
 
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
@@ -1014,6 +1030,7 @@ export async function dispatchManagerGoal(
     const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const ok = sent?.delivery?.status === "sent";
     if (!ok) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
@@ -1220,6 +1237,7 @@ export async function dispatchManagerGoal(
     const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const delivered = sent?.delivery?.status === "sent";
     if (!delivered) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
