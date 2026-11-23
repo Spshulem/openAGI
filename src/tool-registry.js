@@ -467,6 +467,115 @@ function safeApprovalDedupeKey(fn, args, context) {
 
 export function registerCoreTools(registry, runtime) {
   registry.register({
+    name: "get_budget",
+    sideEffects: false,
+    trustedOutput: true,
+    description: "Inspect the current OpenAGI daily model spend budget, today's spend, remaining allowance, and any extra budget added for today.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    handler: async () => {
+      if (!runtime?.budget?.status) return { configured: false, error: "Budget guard is not configured on this runtime." };
+      return { configured: true, ...runtime.budget.status() };
+    }
+  });
+
+  registry.register({
+    name: "update_budget",
+    needsConfirmation: true,
+    trustedOutput: true,
+    description: "Add extra spend headroom for today (addUsdToday), change the recurring daily USD budget limit (dailyUsdLimit), or reset today's extra top-up. Direct owner budget commands execute immediately; background or untrusted requests raise an inline budget approval card.",
+    parameters: {
+      type: "object",
+      properties: {
+        addUsdToday: {
+          type: "number",
+          minimum: 0.01,
+          maximum: 10000,
+          description: "Extra USD to add to today's budget only (e.g. 10 or 25) without changing future days' cap."
+        },
+        dailyUsdLimit: {
+          type: "number",
+          minimum: 0.5,
+          maximum: 10000,
+          description: "New recurring daily USD spend cap (persists OPENAGI_DAILY_USD_LIMIT)."
+        },
+        resetTodayBonus: {
+          type: "boolean",
+          description: "When true, clears any extra one-day top-up added earlier today."
+        },
+        reason: {
+          type: "string",
+          description: "Short note explaining why the budget change is requested."
+        }
+      },
+      additionalProperties: false
+    },
+    summarize: (args = {}) => {
+      const parts = [];
+      if (Number.isFinite(Number(args.addUsdToday)) && Number(args.addUsdToday) > 0) {
+        parts.push(`Add +$${Number(args.addUsdToday).toFixed(2)} to today's budget`);
+      }
+      if (Number.isFinite(Number(args.dailyUsdLimit)) && Number(args.dailyUsdLimit) >= 0.5) {
+        parts.push(`Set daily budget limit to $${Number(args.dailyUsdLimit).toFixed(2)}/day`);
+      }
+      if (args.resetTodayBonus === true) {
+        parts.push("Reset today's extra budget");
+      }
+      return parts.join(" and ") || "Update OpenAGI daily budget";
+    },
+    approvalDedupeKey: (args = {}, context = {}) => {
+      const add = Number.isFinite(Number(args.addUsdToday)) ? Number(args.addUsdToday).toFixed(2) : "0";
+      const lim = Number.isFinite(Number(args.dailyUsdLimit)) ? Number(args.dailyUsdLimit).toFixed(2) : "keep";
+      const rst = args.resetTodayBonus === true ? "1" : "0";
+      return `budget:${context?.sessionId ?? "global"}:${add}:${lim}:${rst}`;
+    },
+    handler: async (args = {}) => {
+      if (!runtime?.budget) throw new Error("Budget guard is not configured on this runtime.");
+      const hasLimit = args.dailyUsdLimit !== undefined && args.dailyUsdLimit !== null;
+      const hasBonus = args.addUsdToday !== undefined && args.addUsdToday !== null;
+      const hasReset = args.resetTodayBonus === true;
+      if (!hasLimit && !hasBonus && !hasReset) {
+        throw new Error("Provide addUsdToday, dailyUsdLimit, or resetTodayBonus.");
+      }
+      if (hasLimit) {
+        const parsed = Number(args.dailyUsdLimit);
+        if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+          throw new Error("Daily budget limit must be between $0.50 and $10,000.");
+        }
+      }
+      if (hasBonus) {
+        const parsedBonus = Number(args.addUsdToday);
+        if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+          throw new Error("Added budget for today must be between $0.01 and $10,000.");
+        }
+      }
+      if (hasLimit) {
+        runtime.budget.setDailyLimit(Number(args.dailyUsdLimit));
+        process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({
+            dataDir: runtime.dataDir ?? resolveDataDir(),
+            values: { OPENAGI_DAILY_USD_LIMIT: String(runtime.budget.dailyUsdLimit) }
+          });
+        } catch { /* in-memory budget limit already updated */ }
+      }
+      if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+        runtime.budget.clearBonusToday();
+      }
+      if (hasBonus) {
+        runtime.budget.addBonusToday(Number(args.addUsdToday));
+      }
+      const updated = runtime.budget.status();
+      runtime.events?.emit?.("budget-updated", updated);
+      return updated;
+    }
+  });
+
+  registry.register({
     name: "remember",
     description: "Save a piece of information to long-lived memory so it can be recalled in future turns. Use when the user says 'remember', 'save', or shares a durable fact.",
     parameters: {
@@ -749,33 +858,91 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_skills",
     sideEffects: false,
-    description: "List the skills (named prompts) available to this agent.",
+    description: "List the skills (named prompts) available to this agent, including whether each is editable under ~/.openagi/skills/.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
-      const skills = runtime.skills?.list?.() ?? [];
-      return { count: skills.length, items: skills.map((s) => ({ name: s.name, description: s.description })) };
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { listSkills } = await import("./skill-files.js");
+      const items = runtime.skills?.skills ? listSkills(runtime.skills, dataDir) : (runtime.skills?.list?.() ?? []);
+      return { count: items.length, items };
+    }
+  });
+
+  registry.register({
+    name: "read_skill",
+    sideEffects: false,
+    description: "Read the full SKILL.md instructions and description of a named skill before running or editing it.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill slug (see list_skills)." }
+      },
+      required: ["name"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { readSkill } = await import("./skill-files.js");
+      const skill = readSkill(runtime.skills, dataDir, String(args.name ?? "").trim());
+      if (!skill) throw new Error(`Unknown skill: ${args.name}`);
+      return skill;
     }
   });
 
   registry.register({
     name: "create_skill",
-    description: "Save a reusable, agent-authored workflow as a SKILL.md in the user's OpenAGI skills directory and reload it immediately. Use when the user explicitly asks to create, program, or save a reusable capability. The instructions may compose any existing core/MCP tools and may use {{input}} plus {{args.field}} templates. Never include credentials or literal secret values. THIS REQUIRES USER APPROVAL so the user can inspect the complete instructions before they become durable.",
+    description: "Save or update a reusable, agent-authored workflow as an editable SKILL.md in the user's OpenAGI skills directory (~/.openagi/skills/<slug>/SKILL.md) and reload it immediately. Pass overwrite=true to update an existing user skill in place rather than creating a -2 copy. Never include credentials or literal secret values.",
     needsConfirmation: true,
+    supervisorAutoApprove: true,
     sideEffects: true,
-    summarize: (args) => `Create reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    summarize: (args) => `${args.overwrite ? "Save/update" : "Create"} reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
     parameters: {
       type: "object",
       properties: {
         name: { type: "string", description: "Short skill name. It is normalized to a lowercase filesystem-safe slug." },
         description: { type: "string", description: "One-sentence description shown in the skills list." },
-        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." }
+        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." },
+        overwrite: { type: "boolean", description: "When true, updates ~/.openagi/skills/<slug>/SKILL.md in place if it already exists." }
       },
       required: ["name", "description", "instructions"],
       additionalProperties: false
     },
     handler: async (args) => {
       if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
-      const { createSkillFromPrompt } = await import("./skill-materialize.js");
+      const { slugify } = await import("./skill-materialize.js");
+      const { readSkill, writeSkill } = await import("./skill-files.js");
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const slug = slugify(args.name);
+      if (args.overwrite === true) {
+        const existing = readSkill(runtime.skills, dataDir, slug);
+        if (existing && !existing.editable) {
+          throw new Error(`Built-in skill '${slug}' is read-only; write an override under a distinct slug or copy.`);
+        }
+        const savedPath = writeSkill(dataDir, slug, {
+          description: args.description,
+          instructions: args.instructions
+        });
+        runtime.skills.reload();
+        return {
+          name: slug,
+          path: savedPath,
+          updated: Boolean(existing),
+          note: "Skill saved in ~/.openagi/skills and reloaded immediately."
+        };
+      }
+      const { createSkillFromPrompt, pickUserSkillsDir } = await import("./skill-materialize.js");
+      if (!pickUserSkillsDir(runtime)) {
+        const savedPath = writeSkill(dataDir, slug, {
+          description: args.description,
+          instructions: args.instructions
+        });
+        runtime.skills.reload();
+        return {
+          name: slug,
+          path: savedPath,
+          note: "Skill created and loaded. It can now be run with run_skill, edited with update_skill, or scheduled with schedule_message."
+        };
+      }
       const result = createSkillFromPrompt({
         runtime,
         name: args.name,
@@ -786,7 +953,45 @@ export function registerCoreTools(registry, runtime) {
       return {
         name: result.slug,
         path: result.path,
-        note: "Skill created and loaded. It can now be run with run_skill or scheduled with schedule_message."
+        note: "Skill created and loaded. It can now be run with run_skill, edited with update_skill, or scheduled with schedule_message."
+      };
+    }
+  });
+
+  registry.register({
+    name: "update_skill",
+    description: "Create or modify an editable SKILL.md in ~/.openagi/skills/<name>/SKILL.md and reload it immediately. Use when the owner asks to adjust how a project skill (like aiseo-daily-manager or customer-report-verifier) behaves.",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    sideEffects: true,
+    summarize: (args) => `Update skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill slug (lowercase letters, digits, dashes)." },
+        description: { type: "string", description: "Updated one-sentence description (omit to keep existing description)." },
+        instructions: { type: "string", description: "Complete updated SKILL.md markdown body (without frontmatter)." }
+      },
+      required: ["name", "instructions"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { slugify } = await import("./skill-materialize.js");
+      const { readSkill, writeSkill } = await import("./skill-files.js");
+      const slug = slugify(args.name);
+      const existing = readSkill(runtime.skills, dataDir, slug);
+      const savedPath = writeSkill(dataDir, slug, {
+        description: args.description ?? existing?.description ?? slug,
+        instructions: args.instructions
+      });
+      runtime.skills.reload();
+      return {
+        name: slug,
+        path: savedPath,
+        updated: Boolean(existing),
+        note: `Skill '${slug}' updated at ${savedPath} and reloaded.`
       };
     }
   });
@@ -1266,6 +1471,199 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "upsert_goal",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    description: "Create or update a persistent project/multi-batch Goal with explicit Definition of Done (`doneCriteria`), check-in `cadence` (`hourly`, `twice_daily`, `daily`, `weekly`, `quiet`), batch `cursor` (`processed`, `remaining`, `total`, `lastCursorToken`), and optional `linkedSkill`. Enrolls both Fleet Active Work (when Fleet Supervisor is present) and an agent continuation task when `remaining > 0`.",
+    summarize: (args) => `Track goal in ${args.project || "General"}: ${String(args.goal ?? args.title ?? "").slice(0, 120)}`,
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project or domain name (e.g. 'Sales', 'BB Recorder', 'AI SEO', 'Inbox')." },
+        theme: { type: "string", description: "Optional sub-theme or workstream." },
+        customer: { type: "string", description: "Optional customer name (e.g. 'AppFolio', 'Brex', 'StayVista')." },
+        goal: { type: "string", description: "Clear outcome statement." },
+        doneCriteria: { type: "string", description: "Concrete checklist that must be verified before this goal is considered done." },
+        cadence: { type: "string", enum: ["hourly", "twice_daily", "daily", "weekly", "quiet"] },
+        permittedNudges: { type: "string", enum: ["none", "propose_only", "resume_owner"] },
+        threadKey: { type: "string", description: "Optional Paseo/coding session key owning this goal." },
+        prRef: { type: "string", description: "Optional GitHub PR ref (owner/repo#number)." },
+        linkedSkill: { type: "string", description: "Optional skill slug (e.g. 'aiseo-daily-manager', 'customer-report-verifier', 'exhaustive-goal-loop')." },
+        enqueueContinuationTask: { type: "boolean", description: "When true, also ensures an active agent-queue continuation task exists so autopilot pulses keep working batches." },
+        cursor: {
+          type: "object",
+          properties: {
+            processed: { type: "integer", minimum: 0 },
+            remaining: { type: "integer", minimum: 0 },
+            total: { type: "integer", minimum: 0 },
+            lastCursorToken: { type: "string" },
+            batchSummary: { type: "string" }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ["goal", "doneCriteria"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const project = String(args.project || "General").trim();
+      let tracked = null;
+      if (typeof runtime.fleetSupervisor?.trackWork === "function") {
+        tracked = await runtime.fleetSupervisor.trackWork({
+          project,
+          theme: args.theme ?? null,
+          customer: args.customer ?? null,
+          goal: args.goal,
+          doneCriteria: args.doneCriteria,
+          // Only settings the caller gave: an update that advances the cursor
+          // must not reset the saved owner, cadence or nudge policy.
+          ...(args.cadence !== undefined ? { cadence: args.cadence } : {}),
+          ...(args.permittedNudges !== undefined ? { permittedNudges: args.permittedNudges } : {}),
+          ...(args.threadKey !== undefined ? { threadKey: args.threadKey } : {}),
+          ...(args.prRef !== undefined ? { prRef: args.prRef } : {}),
+          ...(args.linkedSkill !== undefined ? { linkedSkill: args.linkedSkill } : {}),
+          creationDefaults: { cadence: "daily", permittedNudges: "resume_owner" },
+          cursor: args.cursor ?? null,
+          ...(Number.isInteger(args.cursor?.remaining) ? { remainingCount: args.cursor.remaining } : {})
+        });
+      }
+      const activeWorkId = tracked?.item?.id ?? null;
+      const goalTitle = `${project}: ${args.goal}`.slice(0, 180);
+      const goalDescription = `Done criteria: ${args.doneCriteria}${args.linkedSkill ? ` | Skill: ${args.linkedSkill}` : ""}`;
+      // Re-upserting the same goal (a new batch cursor) updates the task goal
+      // and its open continuation instead of queuing a duplicate whose stale
+      // cursor autopilot would also work.
+      let existingContinuation = openGoalContinuations(runtime.tasks, { activeWorkId })[0] ?? null;
+      const continuationGoal = existingContinuation?.parentGoalId
+        ? runtime.tasks?.getGoal?.(existingContinuation.parentGoalId) ?? null
+        : null;
+      const existingGoal = (continuationGoal && !["completed", "cancelled"].includes(continuationGoal.status) ? continuationGoal : null)
+        ?? (runtime.tasks?.listGoals?.({ status: "active" }) ?? []).find((g) => g.title === goalTitle)
+        ?? null;
+      let taskGoal = null;
+      if (existingGoal) {
+        taskGoal = (existingGoal.description !== goalDescription && runtime.tasks?.updateGoal
+          ? runtime.tasks.updateGoal(existingGoal.id, { description: goalDescription })
+          : null) ?? existingGoal;
+      } else if (runtime.tasks?.addGoal) {
+        taskGoal = runtime.tasks.addGoal({ title: goalTitle, description: goalDescription });
+      }
+      existingContinuation ??= openGoalContinuations(runtime.tasks, { goalId: taskGoal?.id ?? null })[0] ?? null;
+      let continuationTask = null;
+      if ((args.enqueueContinuationTask === true || (Number.isInteger(args.cursor?.remaining) && args.cursor.remaining > 0)) && runtime.tasks?.add) {
+        const description = `Done criteria: ${args.doneCriteria}\nCursor: ${JSON.stringify(args.cursor ?? {})}`;
+        const sourceMeta = {
+          ...(existingContinuation?.sourceMeta ?? {}),
+          activeWorkId: activeWorkId ?? existingContinuation?.sourceMeta?.activeWorkId ?? null,
+          project,
+          linkedSkill: args.linkedSkill ?? null,
+          cursor: args.cursor ?? null
+        };
+        continuationTask = existingContinuation && runtime.tasks.update
+          ? runtime.tasks.update(existingContinuation.id, {
+              description,
+              sourceMeta,
+              ...(taskGoal?.id && existingContinuation.parentGoalId !== taskGoal.id ? { parentGoalId: taskGoal.id } : {})
+            })
+          : runtime.tasks.add(
+              {
+                title: `Continue goal until done: ${args.goal}`.slice(0, 180),
+                description,
+                bucket: "today",
+                priority: 80,
+                parentGoalId: taskGoal?.id ?? undefined,
+                sourceMeta
+              },
+              { source: "goal-ledger", queue: "agent" }
+            );
+      }
+      return {
+        ok: true,
+        activeWorkItem: tracked?.item ?? null,
+        taskGoalId: taskGoal?.id ?? null,
+        continuationTaskId: continuationTask?.id ?? null
+      };
+    }
+  });
+
+  registry.register({
+    name: "verify_goal_progress",
+    // Routine cursor/evidence updates run ungated. Recording the owner's
+    // sign-off (`ownerConfirmedDone`) closes the goal, so only the owner's
+    // own turn or an approved card may do it.
+    needsConfirmation: true,
+    confirmationRequired: (args) => args?.ownerConfirmedDone === true,
+    summarize: (args) => `Mark goal ${args.id} done (owner-confirmed): ${String(args.evidenceSummary ?? "").slice(0, 120)}`,
+    description: "Update batch cursor/evidence on a tracked Goal and evaluate via deterministic checks + OpenAI /v1/decisions whether `doneCriteria` is genuinely accomplished (>= 0.85). If `remaining > 0` or `goal_accomplished < 0.85`, keeps the goal active and ensures the next continuation batch stays scheduled in `queue: 'agent'` instead of stopping prematurely.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Active Work goal id ('tw_...') or task goal id." },
+        evidenceSummary: { type: "string", description: "What was verified or completed in this batch." },
+        ownerConfirmedDone: { type: "boolean", description: "True ONLY when the human owner explicitly confirmed the goal is done." },
+        cursor: {
+          type: "object",
+          properties: {
+            processed: { type: "integer", minimum: 0 },
+            remaining: { type: "integer", minimum: 0 },
+            total: { type: "integer", minimum: 0 },
+            lastCursorToken: { type: "string" },
+            batchSummary: { type: "string" }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ["id", "evidenceSummary"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      if (args.ownerConfirmedDone === true && context?.__confirmed !== true) {
+        throw new Error("Recording owner-confirmed completion requires the owner's approval.");
+      }
+      if (typeof runtime.fleetSupervisor?.verifyGoalProgress === "function" && String(args.id).startsWith("tw_")) {
+        const verdict = await runtime.fleetSupervisor.verifyGoalProgress(args);
+        if (verdict?.accomplished) {
+          retireGoalContinuations(runtime.tasks, { activeWorkId: args.id });
+        } else if (runtime.tasks?.add) {
+          const existing = openGoalContinuations(runtime.tasks, { activeWorkId: args.id })[0] ?? null;
+          if (existing) {
+            runtime.tasks.update(existing.id, {
+              status: "pending",
+              description: `Continue next batch. Done criteria: ${verdict?.item?.doneCriteria ?? ""}\nLatest batch: ${args.evidenceSummary}\nCursor: ${JSON.stringify(args.cursor ?? verdict?.item?.cursor ?? {})}`,
+              sourceMeta: { ...(existing.sourceMeta ?? {}), cursor: args.cursor ?? verdict?.item?.cursor ?? null }
+            });
+          } else if (verdict?.item && !verdict.item.owner?.threadKey) {
+            runtime.tasks.add(
+              {
+                title: `Continue goal batch: ${verdict.item.goal}`.slice(0, 180),
+                description: `Done criteria: ${verdict.item.doneCriteria}\nLatest batch: ${args.evidenceSummary}\nCursor: ${JSON.stringify(args.cursor ?? verdict.item.cursor ?? {})}`,
+                bucket: "today",
+                priority: 80,
+                sourceMeta: { activeWorkId: args.id, project: verdict.item.project, cursor: args.cursor ?? null }
+              },
+              { source: "goal-ledger", queue: "agent" }
+            );
+          }
+        }
+        return verdict;
+      }
+      const remaining = Number.isInteger(args.cursor?.remaining) ? args.cursor.remaining : null;
+      const accomplished = Boolean(args.ownerConfirmedDone === true || remaining === 0);
+      if (accomplished) retireGoalContinuations(runtime.tasks, { goalId: args.id });
+      return {
+        ok: true,
+        id: args.id,
+        accomplished,
+        continueRequired: !accomplished,
+        cursor: args.cursor ?? null,
+        note: accomplished
+          ? "Goal progress verified complete."
+          : `Goal still has remaining scope (${remaining ?? "unverified"}); keep continuing batches until doneCriteria is satisfied.`
+      };
+    }
+  });
+
+  registry.register({
     name: "agent_pick_next",
     description: "Claim the next task from the agent's own queue. Returns the highest-priority available task, or null if there is nothing to work. Claiming is a time-boxed lease: the task is marked in_progress and held for you, but if you don't call complete_task or move_task the lease expires and the task returns to the queue. Tasks whose draft is already waiting for the user's review are NOT returned — that work is done.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
@@ -1536,6 +1934,29 @@ export function summarizeRegisterMcpServer(args = {}) {
     return `Register http MCP '${name}' → ${args.url ?? "(no url)"} (auth=${auth})`;
   }
   return `Register MCP '${name}' (${transport})`;
+}
+
+// Open agent-queue continuation tasks for a tracked goal, linked either by
+// Active Work id or by the task goal they roll up to.
+function openGoalContinuations(tasks, { activeWorkId = null, goalId = null } = {}) {
+  if ((!activeWorkId && !goalId) || typeof tasks?.list !== "function") return [];
+  return (tasks.list({ queue: "agent", status: "active", limit: Infinity }) ?? []).filter((t) =>
+    !["completed", "cancelled"].includes(t.status)
+    && ((activeWorkId && t.sourceMeta?.activeWorkId === activeWorkId)
+      || (goalId && t.source === "goal-ledger" && t.parentGoalId === goalId)));
+}
+
+// A goal with nothing left to do retires its queued continuations so
+// autopilot does not pick finished work back up with a stale cursor.
+function retireGoalContinuations(tasks, link) {
+  const retired = [];
+  for (const task of openGoalContinuations(tasks, link)) {
+    const done = typeof tasks.complete === "function"
+      ? tasks.complete(task.id, "goal-verified")
+      : tasks.update?.(task.id, { status: "completed", completedVia: "goal-verified" });
+    if (done) retired.push(task.id);
+  }
+  return retired;
 }
 
 // Schedules hold the owner's routines, prompts and recipients. Only the

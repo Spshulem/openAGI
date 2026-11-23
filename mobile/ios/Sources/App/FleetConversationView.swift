@@ -95,12 +95,19 @@ struct FleetConversationView: View {
 
     @ViewBuilder
     private var headerBadges: some View {
-        if thread.actorLabel != nil || thread.nextCheckAt != nil {
+        if thread.actorLabel != nil || thread.watchdog?.badgeText != nil || thread.nextCheckAt != nil {
             HStack(spacing: 6) {
                 if let actor = thread.actorLabel, !actor.isEmpty {
                     BoardActorPill(actor: actor)
                 }
-                if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
+                if let wd = thread.watchdog, let wdText = wd.badgeText {
+                    Text(wdText)
+                        .font(Theme.Typography.caption.weight(wd.isAlert ? .semibold : .regular))
+                        .foregroundStyle(wd.isAlert ? Theme.alert : Theme.muted)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background((wd.isAlert ? Theme.alert : Theme.muted).opacity(0.12), in: Capsule())
+                } else if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
                     BoardQuietCheckPill(label: check)
                 }
             }

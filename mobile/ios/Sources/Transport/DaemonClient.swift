@@ -1053,6 +1053,7 @@ public actor DaemonClient {
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(nodeID, forHTTPHeaderField: "X-OpenAGI-Node-ID")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
         request.timeoutInterval = 12
         return request
     }
@@ -1214,6 +1215,34 @@ extension DaemonClient {
 
     public func testModel() async throws -> ModelTestResult {
         try await json(ModelTestResult.self, path: "/settings/models/test", method: "POST", body: Data("{}".utf8), timeout: 45)
+    }
+
+    public func budget() async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "GET")
+    }
+
+    public func updateBudget(_ update: BudgetUpdate) async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "POST", body: try ProtocolDecoder.jsonEncoder.encode(update), timeout: 20)
+    }
+
+    private func performBudgetRequest<T: Decodable>(_ type: T.Type, path: String, method: String, body: Data? = nil, timeout: TimeInterval? = nil) async throws -> T {
+        do {
+            return try await json(type, path: path, method: method, body: body, timeout: timeout)
+        } catch DaemonError.unauthorized {
+            // A main server running OpenAGI v0.0.83 or earlier rejects `/budget`
+            // at the mobile scope gate (401/403) even when this phone's pairing
+            // is healthy. Prove pairing health via heartbeat and report `.notFound`
+            // so the UI asks to update main instead of blaming connectivity.
+            try await heartbeat()
+            throw DaemonError.notFound
+        } catch DaemonError.mainConnection(.authorizationRequired) {
+            // Same case when routed through a worker (`routeMainData` maps an
+            // older main's 401/403 on `/budget` to 502 `main-pairing-required`).
+            if (try? await heartbeat()) != nil {
+                throw DaemonError.notFound
+            }
+            throw DaemonError.mainConnection(.authorizationRequired)
+        }
     }
 
     public func persona() async throws -> PersonaDocument {

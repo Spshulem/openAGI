@@ -163,6 +163,7 @@ struct SettingsView: View {
             .navigationDestination(for: WorkspaceDestination.self) { destination in
                 switch destination {
                 case .model: ModelSettingsView()
+                case .budget: BudgetSettingsView()
                 case .instructions: InstructionsView()
                 case .integrations: IntegrationsView()
                 case .skills: SkillsView()
