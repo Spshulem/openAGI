@@ -5,7 +5,7 @@
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { asksToMergePr } from "./policy.js";
-import { buildDecisionContext, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
+import { buildDecisionContext, groupItemName, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
@@ -1100,18 +1100,25 @@ export function buildSupervisorCard(
 
   // The shared decision-ready standard: goal, assignment, verified/changed/
   // blocked, and the decision with options, consequences and recommendation.
+  // A grouped question ("4 stopped") is not about its first member: no
+  // member's chat, title or goal is used as the group's context.
+  const groupedQuestion = !question.threadKey && Array.isArray(question.threadKeys) && question.threadKeys.length > 0;
+  const groupName = groupedQuestion
+    ? groupItemName(question, (k) => rowsByKey.get(k) ?? threadsByKey.get(k) ?? null)
+    : null;
   const decisionContext = buildDecisionContext({
     question,
-    project: project && project !== "general" ? project : null,
-    sessionTitle,
+    itemName: groupName,
+    project: groupedQuestion ? null : (project && project !== "general" ? project : null),
+    sessionTitle: groupedQuestion ? null : sessionTitle,
     prMeta: prMeta ? { ...prMeta, url: prUrl } : null,
-    recentMessages,
+    recentMessages: groupedQuestion ? [] : recentMessages,
     // The full latest reply, not the 700/1600-char excerpts: a long
     // DECISION CONTEXT block must still be parsed from its marker.
-    agentSummary: thread?.lastAgentFull
+    agentSummary: groupedQuestion ? null : (thread?.lastAgentFull
       ? redactSecrets(stripAttachmentMarkdown(thread.lastAgentFull))
-      : (snap?.agentSummary ? redactSecrets(String(snap.agentSummary)) : agentSummary),
-    activeGoal,
+      : (snap?.agentSummary ? redactSecrets(String(snap.agentSummary)) : agentSummary)),
+    activeGoal: groupedQuestion ? null : activeGoal,
     openChat,
     currentState: brief.currentState,
     recommendation,
@@ -1137,7 +1144,9 @@ export function buildSupervisorCard(
     rank,
     headline,
     ...ownerDecision,
-    ...(heldForContext ? { needsYou: false } : {}),
+    // Held for context, or Supervisor delivery recovery ("N stopped. Nudges
+    // can't get through"): neither waits on the owner, so no Done is needed.
+    ...(heldForContext || (question.kind === "deliver" && decisionContext.askType === "session_error") ? { needsYou: false } : {}),
     askType: decisionContext.askType,
     contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
     decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },

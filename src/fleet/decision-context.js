@@ -650,7 +650,17 @@ export function shouldHoldForContext(question, ctx, nowMs = Date.now()) {
 
 // Derives context for a stored question from its persisted snapshot, for
 // callers that do not have a live card (notifications, check-ins).
-export function decisionContextFromQuestion(question, { activeGoal = null, thread = null, recommendation = null, now = Date.now() } = {}) {
+// The name of a grouped question: how many sessions and which, never one
+// member standing in for the whole group.
+export function groupItemName(question, lookup = () => null) {
+  const keys = Array.isArray(question?.threadKeys) ? question.threadKeys : [];
+  if (!keys.length) return null;
+  const titles = keys.map((k) => prose(lookup(k)?.title, 40)).filter(Boolean);
+  const head = `${keys.length} session${keys.length === 1 ? "" : "s"}`;
+  return clampText(titles.length ? `${head}: ${titles.slice(0, 3).join(", ")}${keys.length > 3 ? ", …" : ""}` : head, 120);
+}
+
+export function decisionContextFromQuestion(question, { activeGoal = null, thread = null, recommendation = null, now = Date.now(), itemName = null } = {}) {
   const snap = question?.contextSnapshot && typeof question.contextSnapshot === "object" ? question.contextSnapshot : {};
   const pr = snap.pr && typeof snap.pr === "object" ? snap.pr : null;
   const messages = Array.isArray(thread?.meta?.conversation) && thread.meta.conversation.length
@@ -661,8 +671,10 @@ export function decisionContextFromQuestion(question, { activeGoal = null, threa
   const openChat = question?.openChat?.url ? question.openChat : null;
   const perm = thread?.meta?.pendingPermission;
   const permCmd = perm?.input?.command ?? perm?.command ?? null;
+  const grouped = !question?.threadKey && Array.isArray(question?.threadKeys) && question.threadKeys.length > 0;
   return buildDecisionContext({
     question,
+    itemName: itemName ?? (grouped ? groupItemName(question) : null),
     project: question?.project ?? null,
     sessionTitle: thread?.title ?? snap.threadTitle ?? snap.workspace ?? null,
     prMeta: pr ? { ...pr, rawBody: pr.bodySummary, failingChecks: pr.failingChecks ?? [] } : (question?.prRef ? { ref: question.prRef } : null),

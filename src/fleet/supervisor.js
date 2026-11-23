@@ -20,7 +20,7 @@ import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
 import { createNotifier } from "./notify.js";
-import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
+import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, groupItemName, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
@@ -970,11 +970,14 @@ export class FleetSupervisor {
   // PR, and tracked goal (see decision-context.js). Never invents a part.
   decisionContextFor(question) {
     if (!question) return null;
-    const key = question.threadKey ?? question.threadKeys?.[0] ?? null;
+    // A grouped question ("4 stopped") belongs to no single session: never
+    // borrow its first member's chat, title or goal as the group's context.
+    const key = question.threadKey ?? null;
     const thread = key ? (this.lastThreads?.get?.(key) ?? this.knownThreads.get(key) ?? null) : null;
     let activeGoal = null;
     try { activeGoal = key || question.prRef ? this.activeWork.findActiveGoalForThread(key, question.prRef ?? null) : null; } catch { activeGoal = null; }
-    return decisionContextFromQuestion(question, { activeGoal, thread, now: this.now() });
+    const itemName = key ? null : groupItemName(question, (k) => this.lastThreads?.get?.(k) ?? this.knownThreads.get(k) ?? null);
+    return decisionContextFromQuestion(question, { activeGoal, thread, now: this.now(), itemName });
   }
 
   // A new decision missing part of its context is held while its owning agent

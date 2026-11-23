@@ -609,3 +609,26 @@ test("Where it stands: one current status for Bob on calls launch, details kept 
   assert.equal((stale.decisionContext.status.match(/Google still/g) ?? []).length, 1, "the duplicated sign-in text appears once");
   assert.ok(stale.decisionContext.status.length <= 300);
 });
+
+// Live 2026-11-23: the grouped "N stopped. Nudges can't get through. Nudge
+// them?" card took its first member's chat and goal ("🧭 Make Bob Useful…")
+// and sat in Needs You asking for Done. Delivery recovery is the
+// Supervisor's job: the card names the group and is not an owner decision.
+test("a grouped delivery card names the group, borrows no member's context, and needs no Done", async () => {
+  const { buildSupervisorDeck } = await import("../src/fleet/cards.js");
+  const bob = { key: "paseo:srv_x.92b67cef", title: "🧭 Make Bob Useful, Actionable, and Habit-Forming", lastAgentFull: "[System Error] You've hit your usage limit.", meta: { conversation: [{ role: "user", text: "Make Bob useful, actionable and habit-forming for every customer" }] } };
+  const ios = { key: "paseo:srv_x.305dfb97", title: "iOS Native App", meta: {} };
+  const group = {
+    id: "fq_group000001", kind: "deliver", status: "open", dedupeKey: "deliver:group", threadKey: null,
+    threadKeys: [bob.key, ios.key], title: "2 stopped. Nudges can't get through. Nudge them?",
+    body: "Sends keep failing: Make Bob Useful, iOS Native App.", options: ["done", "skip"], createdAt: new Date(NOW).toISOString()
+  };
+  const threadsByKey = new Map([[bob.key, bob], [ios.key, ios]]);
+  const card = buildSupervisorCard(group, { threadsByKey, now: NOW, activeGoalResolver: () => ({ goal: "Bob goal that belongs to one member" }) });
+  assert.equal(card.askType, "session_error");
+  assert.equal(card.needsYou, false, "routine delivery recovery never waits on Done");
+  assert.equal(card.decisionContext.itemName, "2 sessions: 🧭 Make Bob Useful, Actionable, and Hab…, iOS Native App");
+  assert.doesNotMatch(card.decisionContext.goal ?? "", /Bob goal|habit-forming for every customer/i, "no member's goal or chat stands in for the group");
+  const deck = buildSupervisorDeck({ questions: [group], preferences: null }, { threadsByKey, now: NOW });
+  assert.ok(!deck.cards.some((c) => c.questionId === group.id && c.needsYou !== false), "not in Needs You");
+});
