@@ -410,6 +410,10 @@ struct ChatConversationView: View {
                     scrollToLatest()
                     // Lazy message rows resolve their wrapped height after
                     // materializing; settle onto the true end once laid out.
+                    // Only when history first loads: on an ordinary append
+                    // (a send and its reply) a short pane keeps the sent
+                    // message in view instead of snapping past it.
+                    guard old.isEmpty else { return }
                     Task { @MainActor in
                         await Task.yield()
                         if !messages.isEmpty && isPinnedToBottom && !userIsScrolling {
