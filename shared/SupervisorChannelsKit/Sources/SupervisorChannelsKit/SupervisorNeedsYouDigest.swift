@@ -96,12 +96,15 @@ public struct SupervisorNeedsYouDigest: Equatable, Sendable {
     public struct Section: Identifiable, Equatable, Sendable {
         public let kind: SectionKind
         public let text: String
-        public var id: String { kind.rawValue }
+        /// Position in the digest: evidence can repeat, ids must not.
+        public let ordinal: Int
+        public var id: String { "\(kind.rawValue)-\(ordinal)" }
         public var title: String { kind.title }
 
-        public init(kind: SectionKind, text: String) {
+        public init(kind: SectionKind, text: String, ordinal: Int = 0) {
             self.kind = kind
             self.text = text
+            self.ordinal = ordinal
         }
     }
 
@@ -133,7 +136,7 @@ public struct SupervisorNeedsYouDigest: Equatable, Sendable {
             let norm = Self.normalized(text)
             guard !norm.isEmpty, !seen.contains(where: { Self.repeats(norm, $0) }) else { return }
             seen.append(norm)
-            out.append(Section(kind: kind, text: text))
+            out.append(Section(kind: kind, text: text, ordinal: out.count))
         }
 
         add(.goal, goal)

@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "mac/**"
+      - "shared/SupervisorChannelsKit/**"
       - "src/phone-pairing-page.js"
       - "src/hosted-interface.js"
       - "src/chatgpt-auth.js"
@@ -23,7 +24,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Mac app and run Fleet and privacy-link regressions
-        run: swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing|PendingApproval|AttentionBadge'
+        # The snapshot directory makes FleetNeedsYouSnapshotTests render the
+        # synthetic Needs You screens for review; nothing else reads it.
+        run: OPENAGI_UI_SNAPSHOT_DIR="$RUNNER_TEMP/needs-you-shots" swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing|PendingApproval|AttentionBadge'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: needs-you-mac-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/needs-you-shots
+          if-no-files-found: ignore
+          retention-days: 14
 
   onboarding-and-pairing-tests:
     runs-on: ubuntu-latest

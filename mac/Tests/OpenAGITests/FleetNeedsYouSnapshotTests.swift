@@ -36,32 +36,23 @@ final class FleetNeedsYouSnapshotTests: XCTestCase {
     }
   }
 
-  // MARK: - Rendering
+  func testRenderSelectedDecisionInInspector() throws {
+    for (name, appearance) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
+      let nav = SupervisorWorkspaceNavigation()
+      nav.selectedChannel = .needsYou
+      nav.requestedQuestionID = "ny-deploy"
+      try render(SupervisorWorkspaceView(nav: nav), appearance: appearance, file: "mac-needs-you-inspector-\(name).png")
+    }
+  }
 
-  private func render<V: View>(_ view: V, appearance: NSAppearance.Name, file: String, size: NSSize = NSSize(width: 1320, height: 860)) throws {
-    let host = NSHostingController(rootView: view)
-    let window = NSWindow(contentViewController: host)
-    window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-    window.toolbarStyle = .unified
-    window.title = "OpenAGI"
-    window.appearance = NSAppearance(named: appearance)
-    window.setContentSize(size)
-    window.orderFront(nil)
-    defer { window.orderOut(nil) }
-    // Let SwiftUI lay out, run its .task refreshes (which fail with no
-    // daemon), and settle.
-    RunLoop.main.run(until: Date().addingTimeInterval(2.5))
-    let frameView = window.contentView?.superview ?? window.contentView!
-    let bounds = frameView.bounds
-    guard let rep = frameView.bitmapImageRepForCachingDisplay(in: bounds) else {
-      XCTFail("No bitmap for \(file)")
-      return
-    }
-    frameView.cacheDisplay(in: bounds, to: rep)
-    guard let png = rep.representation(using: .png, properties: [:]), let dir = outputDirectory else {
-      XCTFail("No PNG for \(file)")
-      return
-    }
-    try png.write(to: dir.appendingPathComponent(file))
+  func testRenderProjectChannelDecisions() throws {
+    let nav = SupervisorWorkspaceNavigation()
+    nav.selectedChannel = .project("harbor")
+    try render(SupervisorWorkspaceView(nav: nav), appearance: .darkAqua, file: "mac-project-harbor-dark.png")
+  }
+
+  private func render<V: View>(_ view: V, appearance: NSAppearance.Name, file: String) throws {
+    guard let dir = outputDirectory else { return }
+    try WorkspaceSnapshotRenderer.render(view, appearance: appearance, directory: dir, name: (file as NSString).deletingPathExtension)
   }
 }

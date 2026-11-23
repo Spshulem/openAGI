@@ -17,6 +17,8 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var openQuestionIDs: Set<String> = []
   /// The last scan's threads, for the Watching list under the questions.
   @Published private(set) var threads: [FleetThread] = []
+  /// The hub's decision brief for each open question, by question id.
+  @Published private(set) var cardBriefs: [String: FleetCardBrief] = [:]
   @Published private(set) var activityEvents: [FleetActivityEvent] = []
   @Published private(set) var nextTickAt: String? = nil
   /// Watching groups the owner opened that start collapsed (Quiet).
@@ -829,6 +831,7 @@ final class FleetConsumer: ObservableObject {
       currentQuestionIndex = max(0, questions.count - 1)
     }
     openQuestionIDs = Set(state.questions.map(\.id))
+    cardBriefs = Dictionary(state.cards.map { ($0.questionKey, $0) }, uniquingKeysWith: { first, _ in first })
     threads = state.threads
     activityEvents = state.activityEvents
     nextTickAt = state.nextTickAt
@@ -888,6 +891,7 @@ final class FleetConsumer: ObservableObject {
     generation &+= 1
     questions = []
     openQuestionIDs = []
+    cardBriefs = [:]
     threads = []
     activityEvents = []
     nextTickAt = nil
