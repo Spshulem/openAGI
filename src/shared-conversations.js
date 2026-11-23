@@ -35,6 +35,12 @@ export function sharedThreadForSession(sessionId) { return DEVICE_SESSION.exec(s
 export function sharedConversationForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[2] ?? null; }
 export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
 export function sharedInterruptThread(pathname) { return INTERRUPT_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+// /conversations/:thread/queue[/:requestId[/send-now]] (conversation-queue.js).
+const QUEUE_PATH = /^\/conversations\/(agent|supervisor)\/queue(?:\/([A-Za-z0-9_-]{8,128})(\/send-now)?)?$/;
+export function sharedQueueRoute(pathname) {
+  const match = QUEUE_PATH.exec(String(pathname ?? ""));
+  return match ? { thread: match[1], requestId: match[2] ?? null, sendNow: Boolean(match[3]) } : null;
+}
 
 // Paired owner phones can read human-visible web chat, but never address its
 // session on /message. Continuing makes a separate shared-device session;
@@ -86,7 +92,7 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
 // Same projection as the G2 history view: user and assistant text only, never
 // tool calls, tool results or private metadata. Oldest-first; `before` pages
 // toward older messages and `nextBefore` is the cursor for the next page.
-export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main", liveTurns = null } = {}) {
+export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main", liveTurns = null, queue = null } = {}) {
   if (!store?.getSession) throw fail("history_unavailable", 503, "Main history is not configured.");
   const sessionId = visibleSessionID(store, thread, conversationId);
   const size = limit === undefined || limit === null ? 50 : limit;
@@ -114,7 +120,10 @@ export function sharedThreadHistory(store, thread, { before, limit, conversation
     // Turns still running here with no client attached (the phone that sent
     // one was backgrounded or lost its stream): "still working", not gone.
     // Only the latest page can contain them.
-    ...(before || !liveTurns ? {} : { inFlight: liveTurns.list(sessionId) })
+    ...(before || !liveTurns ? {} : { inFlight: liveTurns.list(sessionId) }),
+    // The hub's queue for this conversation, in order, so every device shows
+    // the same waiting messages (conversation-queue.js). Newest page only.
+    ...(before || !queue ? {} : { queue: queue.snapshot(sessionId) })
   };
 }
 

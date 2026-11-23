@@ -71,7 +71,8 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
-import { LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn } from "./message-turns.js";
+import { LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn, STOPPED_TEXT } from "./message-turns.js";
+import { ConversationQueue, QueueError, submissionDigest } from "./conversation-queue.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -110,6 +111,8 @@ import {
   sharedInterruptThread,
   sharedSessionId,
   sharedThreadForSession,
+  sharedConversationForSession,
+  sharedQueueRoute,
   sharedThreadHistory,
   appendSharedThreadMessages,
   sharedConversations,
@@ -315,6 +318,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // How long an interrupt waits for the turn to stop before answering
   // "stopping" (it is waiting on a running tool). Tests shorten it.
   const interruptSettleMs = Number.isFinite(options.interruptSettleMs) ? options.interruptSettleMs : 4_000;
+  // The hub's queue for each shared device conversation (conversation-queue.js).
+  // Every named turn a phone or the owner's Mac sends to a shared thread runs
+  // through it, in order, with the sender's authority.
+  const conversationQueue = new ConversationQueue({
+    dir: path.join(dataDir, "conversation-queues"),
+    liveTurns,
+    ...(Number.isFinite(options.queueHoldMs) ? { holdMs: options.queueHoldMs } : {}),
+    startTurn: (item, hooks) => {
+      if (!channels) return Promise.reject(Object.assign(new Error("agent host disabled"), { code: "agent-host-disabled" }));
+      return channels.handleLocalMessage(item.body, { ...hooks, principal: item.principalObject ?? null });
+    },
+    // After a restart: the same authority, only while that sender may still
+    // speak for the owner (a phone that was unpaired may not).
+    mintPrincipal: (spec) => {
+      if (!spec || typeof spec.via !== "string") return null;
+      if (spec.via === "phone") {
+        return nodeRegistry.enrollment?.(spec.nodeId)?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", spec.nodeId) : null;
+      }
+      try { return ownerPrincipal(spec.via, spec.nodeId ?? null); } catch { return null; }
+    },
+    onChange: ({ sessionId, revision }) => {
+      const thread = sharedThreadForSession(sessionId);
+      if (thread) events.emit("conversation.updated", { thread, conversationId: sharedConversationForSession(sessionId) ?? "main", queueRevision: revision });
+    }
+  });
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -387,6 +415,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // it, tells the other devices to reload that thread's history.
   const unobserveSharedThreads = [...new Set([runtime.agentHost?.store, channels?.agentHost?.store, channels?.g2?.agentHost?.store].filter(Boolean))]
     .map(store => observeSharedThreads(store, data => events.emit("conversation.updated", data)));
+  // Messages that were waiting when the hub last stopped run now.
+  try { conversationQueue.restore(); } catch (error) { console.error(`[openagi] conversation queue restore failed: ${error?.message ?? error}`); }
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -2023,7 +2053,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
-          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main", liveTurns }));
+          const historyActor = requestNodeId ? `node:${requestNodeId}` : "owner";
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main", liveTurns,
+            queue: { snapshot: (sessionId) => conversationQueue.snapshot(sessionId, historyActor) } }));
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2052,6 +2084,63 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
       }
+      // The hub's conversation queue (conversation-queue.js): read it, edit
+      // or hold an item, remove one, or send one now. Same callers as the
+      // interrupt route. POST .../queue (adding) is handled with /message.
+      const queueRoute = sharedQueueRoute(pathname);
+      if (queueRoute && !(method === "POST" && queueRoute.requestId === null)) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store || !channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const actorKey = requestNodeId ? `node:${requestNodeId}` : "owner";
+        const actor = { key: actorKey, name: requestNodeId ? boundedMobileNodeName(requestEnrollment?.name) : "Mac" };
+        try {
+          const conversationId = url.searchParams.get("conversationId") ?? "main";
+          if (method === "GET" && !queueRoute.requestId) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            return sendJson(res, 200, { thread: queueRoute.thread, conversationId, ...conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (!queueRoute.requestId) return sendJson(res, 405, { error: "method_not_allowed" });
+          if (method === "PATCH" && !queueRoute.sendNow) {
+            const body = await readJsonLimited(req, 96 * 1024).catch(() => null);
+            if (!body || typeof body !== "object" || Array.isArray(body)
+                || Object.keys(body).some((key) => !["text", "hold", "baseRevision", "conversationId"].includes(key))
+                || (body.text !== undefined && typeof body.text !== "string")
+                || (body.hold !== undefined && typeof body.hold !== "boolean")
+                || (body.baseRevision !== undefined && !Number.isSafeInteger(body.baseRevision))) {
+              return sendJson(res, 400, { error: "invalid_queue_edit" });
+            }
+            const sessionId = sharedSessionId(queueRoute.thread, body.conversationId ?? conversationId);
+            const item = conversationQueue.update(sessionId, queueRoute.requestId, actor, body);
+            return sendJson(res, 200, { item, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (method === "DELETE" && !queueRoute.sendNow) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            const raw = url.searchParams.get("baseRevision");
+            if (raw !== null && !/^\d{1,9}$/.test(raw)) return sendJson(res, 400, { error: "invalid_queue_edit" });
+            conversationQueue.remove(sessionId, queueRoute.requestId, actor, { baseRevision: raw === null ? undefined : Number(raw) });
+            return sendJson(res, 200, { removed: queueRoute.requestId, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (method === "POST" && queueRoute.sendNow) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            const moved = conversationQueue.moveToFront(sessionId, queueRoute.requestId, actor);
+            // Whichever device's message is running now is the one to stop.
+            const outcome = moved.running
+              ? await interruptTurn({ liveTurns, store, sessionId, requestId: moved.running, settleMs: interruptSettleMs })
+              : { status: "next" };
+            conversationQueue.dispatch(sessionId);
+            return sendJson(res, 200, { ...outcome, interrupted: moved.running ?? null, item: moved.item, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          return sendJson(res, 405, { error: "method_not_allowed" });
+        } catch (error) {
+          if (error instanceof QueueError) return sendJson(res, error.status, { error: error.code, message: error.message, ...(error.item ? { item: error.item } : {}) });
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
       // Stop a running turn in a shared thread so the owner's next message
       // goes first (message-turns.js interruptTurn). Same callers as the
       // thread's history, minus G2. The answer says whether the turn has
@@ -2071,7 +2160,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         try {
           const sessionId = sharedSessionId(sharedInterruptThread(pathname), body.conversationId ?? "main");
-          return sendJson(res, 200, await interruptTurn({ liveTurns, store, sessionId, requestId: body.requestId, settleMs: interruptSettleMs }));
+          const outcome = await interruptTurn({ liveTurns, store, sessionId, requestId: body.requestId, settleMs: interruptSettleMs });
+          // A queued message that left the hub's queue without running has no
+          // records; the queue remembers how it ended.
+          const gone = outcome.status === "not_found" ? conversationQueue.tombstoneFor(sessionId, body.requestId) : null;
+          if (gone) return sendJson(res, 200, gone.outcome === "stopped" ? { status: "interrupted", requestId: body.requestId } : { status: "finished", outcome: gone.outcome, requestId: body.requestId });
+          return sendJson(res, 200, outcome);
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2257,9 +2351,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
 
-      if (method === "POST" && pathname === "/message") {
+      // POST /conversations/:thread/queue: a busy client adds a message to the
+      // hub's queue without holding a stream open. Same checks and binding
+      // as /message; answered as soon as the message is durably queued.
+      const enqueueRoute = method === "POST" && sharedQueueRoute(pathname)?.requestId === null ? sharedQueueRoute(pathname) : null;
+      if (method === "POST" && (pathname === "/message" || enqueueRoute)) {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
+        if (enqueueRoute) {
+          if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(res, 400, { error: "message must be an object" });
+          if (typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.requestId)) {
+            return sendJson(res, 400, { error: "invalid_request_id", message: "A queued message needs its requestId (8-128 letters, digits, _ or -)." });
+          }
+          if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+          body.thread = enqueueRoute.thread;
+        }
+        const rawFrom = typeof body?.from === "string" ? body.from.slice(0, 120) : null;
         let clientTurnId = null;
         try {
           if (body && typeof body === "object" && !Array.isArray(body)) {
@@ -2382,16 +2489,72 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // runs follows that run (progress and its final reply); a repeat
         // after it ended replays how it ended. Neither reaches the model.
         let runTurn = (hooks) => channels.handleLocalMessage(body, { ...hooks, principal });
+        if (enqueueRoute && !(clientTurnId && typeof body.sessionId === "string")) {
+          return sendJson(res, 400, { error: "invalid_queue_message", message: "Queue a message in a shared thread with its requestId." });
+        }
         if (clientTurnId && typeof body.sessionId === "string") {
           const sessionId = body.sessionId;
+          // Shared device threads queue on the hub (conversation-queue.js).
+          const shared = sharedThreadForSession(sessionId) !== null;
+          const digest = shared ? submissionDigest({ text: body.text, attachments: body.attachments, focusedCardId: body.metadata?.focusedCardId ?? null }) : null;
+          const queued = shared ? conversationQueue.find(sessionId, clientTurnId) : null;
+          if (queued && queued.digest !== digest) {
+            return sendJson(res, 409, { error: "request_conflict", message: "This message id already belongs to a different message." });
+          }
           const live = liveTurns.get(sessionId, clientTurnId);
           const turnStore = runtime.agentHost?.store ?? channels?.agentHost?.store;
-          // A turn the owner stopped before it ever ran has no records yet:
-          // replay the stop, never run the replaced message.
-          const stored = live ? null : (storedTurn(turnStore, sessionId, clientTurnId) ?? liveTurns.stoppedTurn(turnStore, sessionId, clientTurnId));
-          if (live) {
+          // A turn the owner stopped before it ever ran has no records yet,
+          // and a message removed from the queue never had any: replay how it
+          // ended, never run the replaced or removed message.
+          const gone = !live && shared ? conversationQueue.tombstoneFor(sessionId, clientTurnId) : null;
+          const stored = live ? null : (storedTurn(turnStore, sessionId, clientTurnId)
+            ?? liveTurns.stoppedTurn(turnStore, sessionId, clientTurnId)
+            ?? (gone ? { status: "failed", sessionId, messageCount: 0, code: gone.outcome, message: { content: gone.message } } : null));
+          const actorKey = requestNodeId ? `node:${requestNodeId}` : "owner";
+          if (enqueueRoute) {
+            if (live || stored) {
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: true, ...(stored ? { outcome: stored.status === "complete" ? "complete" : stored.code ?? stored.status } : {}), queue: conversationQueue.snapshot(sessionId, actorKey) });
+            }
+          }
+          if (shared && !live && !stored) {
+            let submitted;
+            try {
+              submitted = conversationQueue.submit({
+                sessionId, requestId: clientTurnId, thread: sharedThreadForSession(sessionId),
+                conversationId: sharedConversationForSession(sessionId) ?? "main",
+                text: body.text, body, digest,
+                source: requestNodeId
+                  ? { device: ownerProxyRoute ? "owner" : "phone", key: actorKey, nodeId: requestNodeId, name: String(body.metadata?.sourceName ?? (ownerProxyRoute ? "Mac" : "Phone")).slice(0, 80) }
+                  : { device: "owner", key: actorKey, nodeId: null, name: rawFrom === "mac-supervisor" ? "Mac" : "Owner" },
+                principal,
+                principalSpec: principal ? { via: principal.via, nodeId: principal.nodeId ?? null } : null
+              });
+            } catch (error) {
+              if (error instanceof QueueError) return sendJson(res, error.status, { error: error.code, message: error.message });
+              throw error;
+            }
+            if (enqueueRoute) {
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: false, queue: conversationQueue.snapshot(sessionId, actorKey) });
+            }
+            const turn = submitted.turn;
             runTurn = (hooks) => {
-              const off = liveTurns.subscribe(live, (kind, data) => { if (kind === "progress") hooks.onProgress?.(data); });
+              const off = liveTurns.subscribe(turn, (kind, data) => {
+                if (kind === "progress") hooks.onProgress?.(data);
+                else hooks.onTextDelta?.(data);
+              });
+              // Durably queued on the hub: accepted, even before it runs.
+              hooks.onProgress?.({ stage: "queued", session: { id: sessionId } });
+              return turn.promise.finally(off);
+            };
+          } else if (live) {
+            // A turn still waiting in the queue has sent no text yet, so a
+            // client attaching now can follow its text from the start.
+            const fromStart = live.stage === "queued";
+            runTurn = (hooks) => {
+              const off = liveTurns.subscribe(live, (kind, data) => {
+                if (kind === "progress") hooks.onProgress?.(data);
+                else if (fromStart) hooks.onTextDelta?.(data);
+              });
               hooks.onProgress?.({ stage: live.stage, session: { id: sessionId } });
               return live.promise.finally(off);
             };
@@ -4301,6 +4464,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      conversationQueue.close();
       closing = true;
       for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();

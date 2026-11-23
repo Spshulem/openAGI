@@ -108,6 +108,11 @@ const EXACT = new Set([
   // Stop a running reply so a corrected message goes first.
   "POST /conversations/agent/interrupt",
   "POST /conversations/supervisor/interrupt",
+  // The hub's queue for a shared conversation: read it, add to it.
+  "GET /conversations/agent/queue",
+  "GET /conversations/supervisor/queue",
+  "POST /conversations/agent/queue",
+  "POST /conversations/supervisor/queue",
   "POST /conversations/supervisor/append",
   "GET /conversations",
   "POST /conversations",
@@ -131,6 +136,10 @@ const EXACT = new Set([
 ]);
 
 const PATTERNS = [
+  // Edit/hold, remove, or send now one queued message (conversation-queue.js).
+  { method: "PATCH", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}$/ },
+  { method: "DELETE", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}$/ },
+  { method: "POST", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}\/send-now$/ },
   { method: "PUT", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
   { method: "DELETE", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
   { method: "POST", re: /^\/workspace\/integrations\/(linear|buildbetter)\/sync$/ },

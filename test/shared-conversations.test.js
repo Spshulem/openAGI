@@ -254,7 +254,7 @@ test("history pages oldest-first with before/limit and projects text only", asyn
   const all = await (await ctx.asOwner("/conversations/agent/messages")).json();
   assert.equal(all.messages.length, 6);
   const empty = await (await ctx.as(PHONE_A, "/conversations/supervisor/messages")).json();
-  assert.deepEqual(empty, { thread: "supervisor", messages: [], nextBefore: null, inFlight: [] });
+  assert.deepEqual(empty, { thread: "supervisor", messages: [], nextBefore: null, inFlight: [], queue: { revision: 0, items: [] } });
   for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) {
     assert.equal((await ctx.as(PHONE_A, `/conversations/agent/messages?${query}`)).status, 400, query);
   }

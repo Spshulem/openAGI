@@ -1,0 +1,337 @@
+// The hub owns one queue per shared device conversation. A paired iPhone and
+// the owner's Mac send to it at nearly the same moment while a turn runs:
+// both must see the same waiting messages in the same order, nothing may run
+// before the turn ahead of it, a resend of one id may never queue or run
+// twice, and distinct messages may never replace or hide each other. Edits,
+// removals and Send Now from one device apply for both, with conflicts
+// refused, and the queue survives a hub restart.
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { createDurableRuntime, createHostedInterface } from "../src/index.js";
+import { NodeRegistry } from "../src/node-registry.js";
+
+const SESSION = "devices:supervisor:main";
+const phone = { id: "mobile:queue-phone", token: "q".repeat(43) };
+const glasses = { id: "g2:queue-glasses", token: "h".repeat(43) };
+
+function gate() {
+  let open;
+  const opened = new Promise((resolve) => { open = resolve; });
+  return { opened, open };
+}
+
+function untilAborted(signal, promise) {
+  return Promise.race([promise, new Promise((_, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+  })]);
+}
+
+async function until(check, timeoutMs = 4_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("condition not met in time");
+}
+
+async function frames(response) {
+  return (await response.text()).split("\n\n").map((block) => block.trim()).filter(Boolean).map((block) => {
+    const lines = block.split("\n");
+    return { event: lines.find((l) => l.startsWith("event: "))?.slice(7), data: JSON.parse(lines.filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n") || "null") };
+  });
+}
+
+// A hub with a model that blocks on "[slow]" until released (or stopped).
+async function hub(t, { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-")), keep = false, holdMs } = {}) {
+  const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
+  if (!nodeRegistry.enrollment(phone.id)) nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
+  if (!nodeRegistry.enrollment(glasses.id)) nodeRegistry.enroll(glasses.id, glasses.token, { platform: "even-g2", name: "G2" });
+  const runtime = createDurableRuntime({ dataDir });
+  const calls = [];
+  const slow = gate();
+  runtime.agentHost.modelProvider = {
+    name: "queue-test", model: "test", isConfigured: () => true,
+    async generate(request) {
+      calls.push(request.input);
+      if (String(request.input).includes("[slow]")) await untilAborted(request.context.signal, slow.opened);
+      return { id: `r${calls.length}`, text: `Ack: ${request.input}`, provider: "test", model: "test", toolCalls: [] };
+    }
+  };
+  const app = createHostedInterface(runtime, { host: "127.0.0.1", port: 0, authToken: "owner", dataDir, nodeRegistry, tickerMs: 60_000, interruptSettleMs: 300, ...(holdMs ? { queueHoldMs: holdMs } : {}) });
+  const { url: base } = await app.listen();
+  // Releases any turn still waiting on the model first, unless the test is
+  // cutting it off on purpose (a restart).
+  const close = async ({ release = true } = {}) => { if (release) slow.open(); await app.close(); };
+  t.after(async () => { await close().catch(() => {}); if (!keep) fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const auth = (who) => who === "mac" ? { authorization: "Bearer owner" }
+    : who === "g2" ? { authorization: `Bearer ${glasses.token}`, "x-openagi-node-id": glasses.id }
+      : { authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id };
+  const json = async (response) => ({ status: response.status, body: await response.json().catch(() => null) });
+  const api = {
+    base, runtime, calls, slow, dataDir, close,
+    // A streamed send, as each app sends when it believes nothing is running.
+    message: (who, body, { stream = true } = {}) => fetch(`${base}/message`, {
+      method: "POST", headers: { ...auth(who), "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json" },
+      body: JSON.stringify({ thread: "supervisor", ...(who === "mac" ? { from: "mac-supervisor" } : {}), ...body })
+    }),
+    // A send while the app knows something is running: queued, no stream.
+    enqueue: async (who, body) => json(await fetch(`${base}/conversations/supervisor/queue`, {
+      method: "POST", headers: { ...auth(who), "content-type": "application/json" },
+      body: JSON.stringify({ ...(who === "mac" ? { from: "mac-supervisor" } : {}), ...body })
+    })),
+    queue: async (who) => json(await fetch(`${base}/conversations/supervisor/queue`, { headers: auth(who) })),
+    history: async (who) => json(await fetch(`${base}/conversations/supervisor/messages`, { headers: auth(who) })),
+    edit: async (who, id, body) => json(await fetch(`${base}/conversations/supervisor/queue/${id}`, {
+      method: "PATCH", headers: { ...auth(who), "content-type": "application/json" }, body: JSON.stringify(body)
+    })),
+    remove: async (who, id, baseRevision) => json(await fetch(`${base}/conversations/supervisor/queue/${id}${baseRevision ? `?baseRevision=${baseRevision}` : ""}`, {
+      method: "DELETE", headers: auth(who)
+    })),
+    sendNow: async (who, id) => json(await fetch(`${base}/conversations/supervisor/queue/${id}/send-now`, { method: "POST", headers: auth(who) })),
+    stored: () => runtime.agentHost.store.getSession(SESSION).messages
+      .filter((m) => ["user", "assistant"].includes(m.role)).map((m) => [m.role, m.content, m.metadata?.requestId ?? null])
+  };
+  return api;
+}
+
+const texts = (snapshot) => snapshot.items.map((item) => item.text);
+
+test("an iPhone and a Mac sending at once while a turn runs see one queue, in one order, and nothing runs early", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("phone", { text: "[slow] long running turn", requestId: "ios-running-0001" }));
+  await until(() => h.calls.length === 1);
+
+  // Nearly simultaneous: both devices, both transports.
+  const sent = await Promise.all([
+    h.enqueue("phone", { text: "[ios-1] phone one", requestId: "ios-tagged-0001" }),
+    h.message("mac", { text: "[mac-1] mac one", requestId: "mac-tagged-0001" }),
+    h.enqueue("phone", { text: "[ios-2] phone two", requestId: "ios-tagged-0002" }),
+    h.enqueue("mac", { text: "[mac-2] mac two", requestId: "mac-tagged-0002" })
+  ]);
+  const macStream = frames(sent[1]);
+  assert.deepEqual([sent[0].status, sent[2].status, sent[3].status], [202, 202, 202]);
+
+  const fromPhone = (await h.queue("phone")).body;
+  const fromMac = (await h.queue("mac")).body;
+  assert.equal(fromPhone.items.length, 5, "the running turn and all four waiting messages");
+  assert.deepEqual(texts(fromPhone), texts(fromMac), "both devices see the same queue in the same order");
+  assert.equal(fromPhone.items[0].state, "running");
+  assert.deepEqual(fromPhone.items.slice(1).map((i) => i.state), ["queued", "queued", "queued", "queued"]);
+  assert.deepEqual(fromPhone.items.slice(1).map((i) => i.source.name).sort(), ["Mac", "Mac", "iPhone", "iPhone"]);
+  assert.deepEqual(fromPhone.items.map((i) => i.mine), [true, ...fromPhone.items.slice(1).map((i) => i.source.name === "iPhone")]);
+  assert.deepEqual(fromMac.items.map((i) => i.mine), fromPhone.items.map((i) => !i.mine), "each device knows which are its own");
+  assert.deepEqual((await h.history("phone")).body.queue.items.map((i) => i.requestId), fromPhone.items.map((i) => i.requestId), "history carries the same queue");
+  assert.deepEqual(h.calls, ["[slow] long running turn"], "nothing queued runs before the turn ahead of it");
+
+  h.slow.open();
+  await running;
+  assert.equal((await macStream).find((f) => f.event === "final").data.reply, "Ack: [mac-1] mac one", "the Mac's streamed send gets its own reply");
+  await until(async () => (await h.queue("mac")).body.items.length === 0);
+  assert.deepEqual(h.calls, ["[slow] long running turn", ...texts(fromPhone).slice(1)], "they run in the queue's order");
+  assert.deepEqual(h.stored().filter(([role]) => role === "user").map(([, text]) => text), texts(fromPhone), "history matches the queue");
+});
+
+test("a resend of the same id never queues or runs twice; the same id for different text is refused", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00001" }));
+  await until(() => h.calls.length === 1);
+  const first = await h.enqueue("phone", { text: "only once", requestId: "ios-retry-00001" });
+  const again = await h.enqueue("phone", { text: "only once", requestId: "ios-retry-00001" });
+  assert.equal(first.body.duplicate, false);
+  assert.equal(again.status, 202);
+  assert.equal(again.body.duplicate, true);
+  const conflict = await h.enqueue("phone", { text: "something else", requestId: "ios-retry-00001" });
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.body.error, "request_conflict");
+  // The phone lost its response and resends on /message: it follows the queued item.
+  const attached = frames(await h.message("phone", { text: "only once", requestId: "ios-retry-00001" }));
+  assert.equal((await h.queue("phone")).body.items.filter((i) => i.requestId === "ios-retry-00001").length, 1);
+  h.slow.open();
+  await running;
+  assert.equal((await attached).find((f) => f.event === "final").data.reply, "Ack: only once");
+  assert.deepEqual(h.calls, ["[slow] busy", "only once"], "ran once");
+  const afterwards = await h.enqueue("phone", { text: "only once", requestId: "ios-retry-00001" });
+  assert.equal(afterwards.body.duplicate, true, "a resend after it ran replays, never re-queues");
+  assert.equal(afterwards.body.outcome, "complete");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(h.calls, ["[slow] busy", "only once"]);
+});
+
+test("many distinct messages from two devices at once are all kept, once each", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("phone", { text: "[slow] busy", requestId: "ios-busy-000001" }));
+  await until(() => h.calls.length === 1);
+  const sends = [];
+  for (let i = 0; i < 12; i += 1) {
+    sends.push(h.enqueue("phone", { text: `phone ${i}`, requestId: `ios-many-${String(i).padStart(5, "0")}` }));
+    sends.push(h.enqueue("mac", { text: `mac ${i}`, requestId: `mac-many-${String(i).padStart(5, "0")}` }));
+  }
+  const results = await Promise.all(sends);
+  assert.ok(results.every((r) => r.status === 202));
+  const queued = (await h.queue("mac")).body.items.slice(1);
+  assert.equal(queued.length, 24);
+  assert.equal(new Set(queued.map((i) => i.requestId)).size, 24);
+  h.slow.open();
+  await running;
+  await until(async () => (await h.queue("mac")).body.items.length === 0, 8_000);
+  const ran = h.calls.slice(1);
+  assert.equal(ran.length, 24);
+  assert.deepEqual([...ran].sort(), [...queued.map((i) => i.text)].sort(), "every message ran exactly once");
+  assert.deepEqual(ran, queued.map((i) => i.text), "in queue order");
+});
+
+test("an edit on the iPhone shows on the Mac; a stale or concurrent edit is refused; the hold keeps the old text from running", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00002" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("phone", { text: "Tuesday", requestId: "ios-edit-000001" });
+  await h.enqueue("mac", { text: "after it", requestId: "mac-after-00001" });
+  const seen = (await h.queue("phone")).body.items[1];
+  assert.equal(seen.revision, 1);
+
+  // The phone opens its editor: the item is held for it.
+  const held = await h.edit("phone", "ios-edit-000001", { hold: true });
+  assert.equal(held.body.item.state, "held");
+  assert.equal((await h.queue("mac")).body.items[1].heldBy, "iPhone", "the Mac sees who is editing");
+  const macTry = await h.edit("mac", "ios-edit-000001", { text: "Thursday", baseRevision: 1, hold: false });
+  assert.equal(macTry.status, 409);
+  assert.equal(macTry.body.error, "held");
+  assert.equal((await h.remove("mac", "ios-edit-000001")).body.error, "held", "nor removed while held");
+
+  // The running turn ends while the editor is open: the queue waits there.
+  h.slow.open();
+  await running;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.deepEqual(h.calls, ["[slow] busy"], "neither the old text nor the item behind it ran");
+
+  const saved = await h.edit("phone", "ios-edit-000001", { text: "Wednesday", baseRevision: 1, hold: false });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.item.revision, 2);
+  await until(() => h.calls.length === 3);
+  assert.deepEqual(h.calls, ["[slow] busy", "Wednesday", "after it"]);
+
+  // A stale revision (the Mac saw revision 1) is a conflict, not a silent win.
+  const h2 = await hub(t);
+  const busy2 = frames(await h2.message("phone", { text: "[slow] busy", requestId: "ios-busy-00003" }));
+  await until(() => h2.calls.length === 1);
+  await h2.enqueue("mac", { text: "draft", requestId: "mac-draft-00001" });
+  assert.equal((await h2.edit("phone", "mac-draft-00001", { text: "phone's version", baseRevision: 1 })).status, 200);
+  const stale = await h2.edit("mac", "mac-draft-00001", { text: "mac's version", baseRevision: 1 });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.error, "conflict");
+  assert.equal(stale.body.item.text, "phone's version", "the refusal shows what it is now");
+  assert.equal((await h2.edit("mac", "mac-draft-00001", { text: "no revision" })).status, 400);
+  h2.slow.open();
+  await busy2;
+  await until(() => h2.calls.length === 2);
+  assert.deepEqual(h2.calls, ["[slow] busy", "phone's version"]);
+  assert.equal((await h2.edit("mac", "mac-draft-00001", { text: "late", baseRevision: 2 })).body.error, "already_sent");
+});
+
+test("an edit hold that is not renewed lapses, so a device that went away cannot block the queue", async (t) => {
+  const h = await hub(t, { holdMs: 150 });
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00004" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("phone", { text: "held then dropped", requestId: "ios-lapse-00001" });
+  await h.edit("phone", "ios-lapse-00001", { hold: true });
+  h.slow.open();
+  await running;
+  await until(() => h.calls.length === 2, 2_000);
+  assert.deepEqual(h.calls, ["[slow] busy", "held then dropped"]);
+});
+
+test("a removal on the Mac takes the iPhone's message out for both, ends its stream, and a resend never brings it back", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00005" }));
+  await until(() => h.calls.length === 1);
+  const phoneStream = frames(await h.message("phone", { text: "never mind", requestId: "ios-remove-0001" }));
+  await h.enqueue("phone", { text: "keep me", requestId: "ios-keep-000001" });
+  await until(async () => (await h.queue("mac")).body.items.length === 3);
+  const removed = await h.remove("mac", "ios-remove-0001", 1);
+  assert.equal(removed.status, 200);
+  assert.deepEqual(texts((await h.queue("phone")).body), ["[slow] busy", "keep me"]);
+  const ended = (await phoneStream).find((f) => f.event === "failure");
+  assert.equal(ended.data.code, "removed", "the sender hears it was removed");
+  const resend = await frames(await h.message("phone", { text: "never mind", requestId: "ios-remove-0001" }));
+  assert.equal(resend.find((f) => f.event === "failure").data.code, "removed");
+  h.slow.open();
+  await running;
+  await until(() => h.calls.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(h.calls, ["[slow] busy", "keep me"]);
+  assert.equal((await h.remove("mac", "ios-keep-000001")).body.error, "already_sent");
+});
+
+test("Send Now on the Mac moves the iPhone's message first and stops the iPhone's running turn", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("phone", { text: "[slow] phone's long turn", requestId: "ios-long-000001" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("mac", { text: "mac first", requestId: "mac-first-00001" });
+  await h.enqueue("phone", { text: "correction", requestId: "ios-corr-000001" });
+  await h.enqueue("mac", { text: "mac last", requestId: "mac-last-000001" });
+  const now = await h.sendNow("mac", "ios-corr-000001");
+  assert.equal(now.status, 200);
+  assert.equal(now.body.status, "interrupted", "the running turn really stopped");
+  assert.equal(now.body.interrupted, "ios-long-000001");
+  assert.equal((await running).find((f) => f.event === "failure").data.code, "stopped");
+  await until(() => h.calls.length === 4);
+  assert.deepEqual(h.calls, ["[slow] phone's long turn", "correction", "mac first", "mac last"]);
+  const sendAgain = await h.sendNow("phone", "ios-corr-000001");
+  assert.equal(sendAgain.body.error, "already_sent");
+});
+
+test("waiting messages survive a hub restart and run afterwards; the one that was running is not rerun", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-restart-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const first = await hub(t, { dataDir, keep: true });
+  const cut = new AbortController();
+  const running = fetch(`${first.base}/message`, {
+    method: "POST", signal: cut.signal,
+    headers: { authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id, "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ thread: "supervisor", text: "[slow] cut off by a restart", requestId: "ios-cut-0000001" })
+  }).then((r) => r.text()).catch(() => null);
+  await until(() => first.calls.length === 1);
+  await first.enqueue("phone", { text: "phone after restart", requestId: "ios-survive-001" });
+  await first.enqueue("mac", { text: "mac after restart", requestId: "mac-survive-001" });
+  cut.abort();
+  await running;
+  // The hub stops while that turn is still mid-model: it never finishes.
+  await first.close({ release: false });
+
+  const second = await hub(t, { dataDir, keep: true });
+  await until(() => second.calls.length === 2);
+  assert.deepEqual(second.calls, ["phone after restart", "mac after restart"], "queued work ran in order; the cut-off turn did not rerun");
+  const replies = second.stored().filter(([role]) => role === "assistant").map(([, text]) => text);
+  assert.ok(replies.includes("Ack: phone after restart") && replies.includes("Ack: mac after restart"));
+  assert.equal((await second.queue("mac")).body.items.length, 0);
+});
+
+test("only paired phones and the owner may use the queue", async (t) => {
+  const h = await hub(t);
+  assert.ok([401, 403].includes((await h.queue("g2")).status));
+  assert.ok([401, 403].includes((await h.enqueue("g2", { text: "x", requestId: "g2-try-0000001" })).status));
+  assert.equal((await h.enqueue("phone", { text: "no id" })).status, 400);
+  assert.equal((await h.edit("phone", "ios-unknown-001", { text: "x", baseRevision: 1 })).body.error, "already_sent");
+});
+
+test("every queue change tells connected devices to reload", async (t) => {
+  const h = await hub(t);
+  const controller = new AbortController();
+  const events = await fetch(`${h.base}/events`, { headers: { authorization: "Bearer owner" }, signal: controller.signal });
+  const reader = events.body.getReader();
+  let seen = "";
+  const reading = (async () => { for (;;) { const { value, done } = await reader.read(); if (done) break; seen += new TextDecoder().decode(value); } })().catch(() => {});
+  const running = frames(await h.message("phone", { text: "[slow] busy", requestId: "ios-busy-00009" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("phone", { text: "notify", requestId: "ios-notify-0001" });
+  await until(() => /event: conversation\.updated\ndata: \{[^\n]*"queueRevision"/.test(seen));
+  controller.abort();
+  await reading;
+  h.slow.open();
+  await running;
+});
