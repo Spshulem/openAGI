@@ -42,6 +42,8 @@ import { buildFleetHierarchy, inferSessionTheme } from "./themes.js";
 const HOUR_MS = 60 * 60_000;
 const ACTIVE_WORK_FILE = "active-work.json";
 const MAX_ITEMS = 400;
+// Passes a due recheck may wait for its repo's PR evidence before using cached evidence.
+const MAX_RECHECK_REPO_DEFERRALS = 3;
 const MAX_PROPOSALS = 150;
 const MAX_EVIDENCE_LINKS = 24;
 const MAX_ACTIONS_LOG = 200;
@@ -1953,8 +1955,11 @@ export class ActiveWorkManager {
     // 2. Bounded repo preflight for enrolled projects/repos (reusing inspectRepoStatus).
     const enrolledRepos = [];
     const repoToProject = new Map();
+    const itemRepo = (item) => item?.repo ?? parsePrRef(item?.prRef)?.repo ?? null;
+    // Repos whose PR evidence was refreshed this pass; a due recheck waits for its own.
+    const inspectedRepos = new Set();
     for (const item of this.state.items) {
-      const r = item.repo ?? parsePrRef(item.prRef)?.repo ?? null;
+      const r = itemRepo(item);
       if (r && !repoToProject.has(r.toLowerCase())) {
         repoToProject.set(r.toLowerCase(), item.project);
         enrolledRepos.push(r);
@@ -1965,7 +1970,7 @@ export class ActiveWorkManager {
     if (boundedRepos > 0 && enrolledRepos.length > 0 && this.supervisor) {
       const dueRepos = new Set(this.state.rechecks
         .filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs)
-        .map((recheck) => this.state.items.find((item) => item.id === recheck.itemId)?.repo)
+        .map((recheck) => itemRepo(this.state.items.find((item) => item.id === recheck.itemId)))
         .filter(Boolean)
         .map((repo) => String(repo).toLowerCase()));
       const repoStart = (this.state.inventoryCursor.repoOffset ?? 0) % enrolledRepos.length;
@@ -1980,6 +1985,7 @@ export class ActiveWorkManager {
             ? await this.supervisor.inspectRepoStatus({ repo: repoSlug, limit: 15 })
             : await inspectRepoStatus(this.supervisor, { repo: repoSlug, limit: 15 });
           repoChecksRun += 1;
+          inspectedRepos.add(String(repoSlug).toLowerCase());
           for (const openPr of status?.openPrs ?? []) {
             if (!openPr?.ref) continue;
             const prevPr = prsByRef.get(openPr.ref.toLowerCase()) ?? null;
@@ -2389,6 +2395,13 @@ export class ActiveWorkManager {
       .sort((a, b) => Number(this.state.items.find((item) => item.id === b.itemId)?.outcomeVerified === true) - Number(this.state.items.find((item) => item.id === a.itemId)?.outcomeVerified === true));
     for (const recheck of dueRechecks) {
       const rawRecheckItem = this.state.items.find((candidate) => candidate.id === recheck.itemId);
+      // Never complete a recheck on cached PR evidence: wait (bounded) until
+      // its repo's turn in the repo preflight comes up.
+      const recheckRepo = itemRepo(rawRecheckItem)?.toLowerCase() ?? null;
+      if (boundedRepos > 0 && this.supervisor && recheckRepo && !inspectedRepos.has(recheckRepo) && (recheck.deferredPasses ?? 0) < MAX_RECHECK_REPO_DEFERRALS) {
+        recheck.deferredPasses = (recheck.deferredPasses ?? 0) + 1;
+        continue;
+      }
       const projected = rawRecheckItem ? this._projectItem(rawRecheckItem, { nowMs, sessionsByKey, prsByRef }) : null;
       const verified = projected?.outcomeVerified === true;
       const blocked = ["blocked", "blocked_pr"].includes(projected?.followThroughState);

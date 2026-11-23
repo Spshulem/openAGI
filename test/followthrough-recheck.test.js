@@ -191,3 +191,29 @@ test("a due recheck re-evaluates its item even when the owner is outside the cur
   const item = supervisor.getActiveWork({ includeDone: true }).items.find((candidate) => candidate.id === tracked.item.id);
   assert.notEqual(item.remainingCount, 1, "the obsolete transcript count was replaced");
 });
+
+test("a due recheck waits for its repo's PR evidence instead of reporting cached CI", async () => {
+  const { supervisor, outreach, advance } = fixture();
+  const repos = ["acme/one", "acme/two", "acme/three"];
+  const inspected = [];
+  supervisor.inspectRepoStatus = async ({ repo }) => {
+    inspected.push(repo);
+    return { openPrs: [{ ref: `${repo}#1`, state: "OPEN", ciState: "SUCCESS", mergeState: "CLEAN", updatedAt: "2026-11-22T12:00:20.000Z" }] };
+  };
+  for (const repo of repos) {
+    // Cached evidence says CI is failing; the live inspection says green.
+    supervisor.lastPrs.set(`${repo}#1`, { ref: `${repo}#1`, state: "OPEN", ciState: "FAILURE", ci: { state: "FAILURE" }, mergeState: "CLEAN" });
+    const tracked = supervisor.trackWork({ project: repo.split("/")[1], theme: "Release", repo, prRef: `${repo}#1`, goal: `Ship ${repo}`, doneCriteria: "PR merged" });
+    supervisor.scheduleActiveWorkRecheck(tracked.item.id, { delaySeconds: 30 });
+  }
+  advance(31);
+
+  const first = await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 2, maxPromptsPerPass: 0, resetCursor: true });
+  assert.equal(first.repoChecksRun, 2);
+  assert.equal(supervisor.listActiveWorkRechecks({ status: "pending" }).length, 1, "the uninspected repo's recheck stays pending");
+  const second = await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 2, maxPromptsPerPass: 0 });
+  assert.deepEqual([...new Set(inspected)].sort(), [...repos].sort(), "every due repo is inspected");
+  assert.equal(supervisor.listActiveWorkRechecks({ status: "pending" }).length, 0);
+  for (const pass of [first, second]) assert.notEqual(pass.recheckNotification?.type, "actionable_blocker");
+  assert.equal(outreach.some((entry) => entry.type === "fleet-active-work-recheck"), false);
+});
