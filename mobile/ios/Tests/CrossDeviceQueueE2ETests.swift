@@ -31,7 +31,14 @@ final class CrossDeviceQueueE2ETests: XCTestCase {
         let view: [String: Any] = [
             "device": "iphone", "label": label, "at": ISO8601DateFormatter().string(from: Date()),
             "isSending": chat.isSending,
-            "queued": chat.queuedSubmissions.map { ["text": $0.text, "requestId": $0.requestID] },
+            "hubQueue": chat.hubQueueAvailable,
+            "hubRunning": chat.hubRunning?.text ?? NSNull(),
+            "queued": chat.queuedSubmissions.map { item -> [String: Any] in
+                ["text": item.text, "requestId": item.requestID, "from": item.origin?.sourceName ?? NSNull(),
+                 "mine": item.origin?.mine ?? true, "heldBy": item.origin?.heldBy ?? NSNull(),
+                 "pending": item.origin?.pendingUpload ?? false, "error": item.origin?.error ?? NSNull(),
+                 "sendNow": item.sendNow?.label ?? NSNull()]
+            },
             "messages": chat.messages.map { message -> [String: Any] in
                 ["role": message.role == .user ? "user" : "assistant", "text": String(message.text.prefix(120)),
                  "requestId": message.requestID ?? NSNull(), "onServer": message.serverID != nil,
@@ -73,11 +80,44 @@ final class CrossDeviceQueueE2ETests: XCTestCase {
         try await until(env.t0.addingTimeInterval(5)); await chat.refresh(); record(chat, "t0+5", to: file)
 
         let deadline = Date().addingTimeInterval(90)
-        while (chat.isSending || !chat.queuedSubmissions.isEmpty), Date() < deadline {
-            try await Task.sleep(for: .milliseconds(250))
+        while (chat.isSending || !chat.queuedSubmissions.isEmpty || chat.hubRunning != nil), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(500))
+            await chat.refresh()
         }
         await chat.refresh(); record(chat, "settled", to: file)
         try await Task.sleep(for: .seconds(10))
         await chat.refresh(); record(chat, "final", to: file)
+
+        // Phase 2 (hub queue only): edits, removals and Send Now across devices.
+        guard chat.hubQueueAvailable else { return }
+        let t1 = env.t0.addingTimeInterval(70)
+        try await until(t1)
+        chat.draft = "[slow] second running turn from the iPhone"
+        XCTAssertTrue(chat.submitDraft())
+        try await until(t1.addingTimeInterval(3))
+        chat.draft = "[ios-6] iPhone message the Mac will send now"
+        XCTAssertTrue(chat.submitDraft())
+        record(chat, "p2-queued-ios-6", to: file)
+        try await until(t1.addingTimeInterval(7)); await chat.refresh()
+        if let macThree = chat.queuedSubmissions.first(where: { $0.text.hasPrefix("[mac-3]") }) {
+            // The Mac is editing it: this phone must be refused.
+            let opened = chat.beginEditingQueued(id: macThree.id)
+            if opened { try await Task.sleep(for: .seconds(1)) }
+            record(chat, opened ? "p2-edit-mac-3-opened" : "p2-edit-mac-3-refused", to: file)
+            if chat.editingQueuedID != nil { chat.cancelQueuedEdit() }
+        } else {
+            record(chat, "p2-mac-3-missing", to: file)
+        }
+        try await until(t1.addingTimeInterval(9)); await chat.refresh()
+        if let macFour = chat.queuedSubmissions.first(where: { $0.text.hasPrefix("[mac-4]") }) {
+            chat.removeQueuedSubmission(id: macFour.id)
+        }
+        try await Task.sleep(for: .seconds(1)); record(chat, "p2-removed-mac-4", to: file)
+        try await until(t1.addingTimeInterval(16)); await chat.refresh(); record(chat, "p2-t1+16", to: file)
+        let deadline2 = Date().addingTimeInterval(60)
+        while (chat.isSending || !chat.queuedSubmissions.isEmpty || chat.hubRunning != nil), Date() < deadline2 {
+            try await Task.sleep(for: .milliseconds(500)); await chat.refresh()
+        }
+        record(chat, "p2-final", to: file)
     }
 }

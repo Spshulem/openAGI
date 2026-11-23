@@ -52,6 +52,16 @@ final class ChatConversation {
     var editingQueuedID: UUID? { queue.editingID }
     // The open queued-message editor's text. Saving never sends.
     var queuedEditDraft = ""
+    // The hub keeps this conversation's queue (its history answered with
+    // one): the tray then mirrors it -- every device's waiting messages, in
+    // the hub's order -- and Edit, Remove and Send Now are hub requests. A
+    // hub without one leaves the queue on this phone, as before.
+    private(set) var hubQueueAvailable = false
+    // The message the hub runs now, when it came through the queue.
+    private(set) var hubRunning: HubQueueItem?
+    var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
+    private var uploadTask: Task<Void, Never>?
+    private var holdRenewal: Task<Void, Never>?
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
@@ -112,7 +122,27 @@ final class ChatConversation {
 
     // MARK: - Queued messages
 
+    private func isOnHub(_ item: QueuedChatSubmission?) -> Bool {
+        hubQueueAvailable && item != nil && item?.origin?.pendingUpload != true
+    }
+
     func removeQueuedSubmission(id: UUID) {
+        guard let item = queue.item(id) else { return }
+        if isOnHub(item) {
+            // Removed here at once; the hub's answer (or a refresh) is final.
+            let revision = item.origin?.revision
+            queue.remove(id)
+            if queue.editingID == nil { queuedEditDraft = "" }
+            Task {
+                do {
+                    applyHubQueue(try await client.removeQueued(thread: thread, requestId: item.requestID, baseRevision: revision, conversationId: conversationID))
+                } catch {
+                    await refresh()
+                    noteQueueError(item.requestID, error, fallback: "Couldn't reach main, so it is still queued.")
+                }
+            }
+            return
+        }
         guard queue.remove(id) != nil else { return }
         if queue.editingID == nil { queuedEditDraft = "" }
         drainIfIdle()
@@ -120,12 +150,40 @@ final class ChatConversation {
 
     // Opens the inline editor. The queue waits at this message (it never
     // sends the old text, and nothing after it jumps ahead) until Save or
-    // Cancel.
+    // Cancel. On a hub queue the message is held there for this phone, so
+    // no device runs or changes it meanwhile.
     @discardableResult
     func beginEditingQueued(id: UUID) -> Bool {
-        guard !isReadOnly, let text = queue.beginEditing(id) else { return false }
+        guard !isReadOnly, let item = queue.item(id), item.origin?.heldBy == nil, let text = queue.beginEditing(id) else { return false }
+        queue.setOrigin(id) { $0.error = nil }
         queuedEditDraft = text
+        if isOnHub(item) { holdWhileEditing(item) }
         return true
+    }
+
+    // Holds the item on the hub and renews the hold while the editor is
+    // open. Refused (another device is editing it, or it already ran): the
+    // editor closes and the row says why.
+    private func holdWhileEditing(_ item: QueuedChatSubmission) {
+        holdRenewal?.cancel()
+        holdRenewal = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.queue.editingID == item.id else { return }
+                do {
+                    self.applyHubQueue(try await self.client.updateQueued(thread: self.thread, requestId: item.requestID, hold: true, conversationId: self.conversationID))
+                } catch let refused as HubQueueRefused {
+                    if self.queue.editingID == item.id {
+                        self.queue.cancelEdit()
+                        self.queuedEditDraft = ""
+                    }
+                    self.queue.setOrigin(item.id) { $0.error = refused.displayMessage }
+                    return
+                } catch {
+                    // Offline: keep editing here; Save says if it can't reach main.
+                }
+                try? await Task.sleep(for: .seconds(45))
+            }
+        }
     }
 
     // Saves in place: same position, same turn id. Never sends by itself;
@@ -137,25 +195,71 @@ final class ChatConversation {
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !item.attachments.isEmpty {
             text = "Please describe the attached images."
         }
+        let onHub = isOnHub(item)
+        let revision = item.origin?.revision
         guard queue.saveEdit(id, text: text) else { return false }
         queuedEditDraft = ""
-        drainIfIdle()
+        holdRenewal?.cancel()
+        if onHub {
+            let saved = queue.item(id)?.text ?? text
+            Task {
+                do {
+                    applyHubQueue(try await client.updateQueued(thread: thread, requestId: item.requestID, text: saved, hold: false,
+                                                                baseRevision: revision, conversationId: conversationID))
+                } catch {
+                    // Not saved: show what main has, and why.
+                    await refresh()
+                    noteQueueError(item.requestID, error, fallback: "Couldn't reach main, so your edit wasn't saved.")
+                }
+            }
+        } else if item.origin?.pendingUpload == true {
+            queue.setOrigin(id) { $0.error = nil }
+            uploadPending()
+        } else {
+            drainIfIdle()
+        }
         return true
     }
 
     func cancelQueuedEdit() {
+        let item = queue.editingID.flatMap { queue.item($0) }
         queue.cancelEdit()
         queuedEditDraft = ""
+        holdRenewal?.cancel()
+        if isOnHub(item), let item {
+            Task { applyHubQueue(try? await client.updateQueued(thread: thread, requestId: item.requestID, hold: false, conversationId: conversationID)) }
+        }
         drainIfIdle()
     }
 
-    func canSendQueuedNow(id: UUID) -> Bool { !isReadOnly && !forgotten && queue.canSendNow(id) }
+    func canSendQueuedNow(id: UUID) -> Bool {
+        guard !isReadOnly, !forgotten, let item = queue.item(id) else { return false }
+        if hubQueueAvailable && (item.origin?.pendingUpload == true || item.origin?.heldBy != nil) { return false }
+        return queue.canSendNow(id)
+    }
 
     // "Send now": the message moves to the front and main is asked to stop
     // the running reply. It goes next whatever main answers; its row says
     // what main confirmed. Repeated taps while that is settling do nothing.
+    // On a hub queue the hub moves it and stops whatever runs now, whichever
+    // device sent that.
     func sendQueuedNow(id: UUID) async {
         guard !isReadOnly, !forgotten else { return }
+        if let item = queue.item(id), isOnHub(item) {
+            guard canSendQueuedNow(id: id), queue.beginHubSendNow(id) else { return }
+            do {
+                let (outcome, snapshot) = try await client.sendQueuedNow(thread: thread, requestId: item.requestID, conversationId: conversationID)
+                queue.applyInterrupt(id, outcome: outcome)
+                applyHubQueue(snapshot)
+            } catch let refused as HubQueueRefused {
+                queue.clearSendNow(id)
+                queue.setOrigin(id) { $0.error = refused.displayMessage }
+                await refresh()
+            } catch {
+                queue.applyInterrupt(id, outcome: .unreachable)
+            }
+            return
+        }
         let target = interruptTarget
         switch queue.beginSendNow(id, replyRunning: target.running, runningRequestID: target.requestID) {
         case .ignored, .cannotInterrupt:
@@ -181,10 +285,63 @@ final class ChatConversation {
         return (false, nil)
     }
 
+    // The hub's queue, as the newest history page or a queue request
+    // returned it. nil (an older hub) leaves the phone's own queue alone.
+    private func applyHubQueue(_ snapshot: HubQueueSnapshot?) {
+        mirrorHub(snapshot)
+        uploadPending()
+        startRecoveryIfNeeded()
+    }
+
+    private func mirrorHub(_ snapshot: HubQueueSnapshot?) {
+        guard let snapshot, !forgotten else { return }
+        if !hubQueueAvailable {
+            // Anything queued here before the hub was known goes to the hub.
+            for item in queue.items where item.origin == nil {
+                queue.setOrigin(item.id) { $0.pendingUpload = true; $0.mine = true }
+            }
+            hubQueueAvailable = true
+        }
+        hubRunning = snapshot.running
+        // A message this phone sent on a stream is already in the chat.
+        let shown = Set(messages.compactMap(\.requestID))
+        queue.mirror(snapshot, payload: { _ in ChatQueuedPayload(attachments: [], focusedCardID: nil) }, skip: shown)
+    }
+
+    private func noteQueueError(_ requestID: String, _ error: Error, fallback: String) {
+        guard let item = queue.item(requestID: requestID) else { return }
+        let text = (error as? HubQueueRefused)?.displayMessage ?? fallback
+        queue.setOrigin(item.id) { $0.error = text }
+    }
+
+    // Sends messages the hub has not accepted yet, oldest first, each with
+    // its own turn id: a resend after a lost answer is the same message, so
+    // the hub keeps one. Offline, they wait here for the next refresh.
+    private func uploadPending() {
+        guard hubQueueAvailable, uploadTask == nil, !forgotten else { return }
+        uploadTask = Task { [weak self] in
+            while let self, !self.forgotten,
+                  let next = self.queue.items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) {
+                do {
+                    let snapshot = try await self.client.enqueueMessage(thread: self.thread, text: next.text, attachments: next.attachments,
+                                                                        focusedCardId: next.payload.focusedCardID, requestId: next.requestID,
+                                                                        conversationId: self.conversationID)
+                    self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
+                    self.mirrorHub(snapshot)
+                } catch let refused as HubQueueRefused {
+                    self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
+                } catch {
+                    break
+                }
+            }
+            self?.uploadTask = nil
+        }
+    }
+
     // Starts sending the queue when nothing is running: after an edit
-    // closes, a removal, or a retry ends.
+    // closes, a removal, or a retry ends. A hub queue runs on the hub.
     private func drainIfIdle() {
-        guard !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
+        guard !hubQueueAvailable, !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
         isSending = true
         Task {
             defer { isSending = false }
@@ -193,7 +350,7 @@ final class ChatConversation {
     }
 
     private func drainQueue() async {
-        while !forgotten, let next = queue.takeNext() {
+        while !hubQueueAvailable, !forgotten, let next = queue.takeNext() {
             appendTurn(text: next.text, attachments: next.attachments, requestID: next.requestID)
             await streamReply(text: next.text, attachments: next.attachments, replyID: messages[messages.count - 1].id,
                               focusedCardID: next.payload.focusedCardID)
@@ -207,9 +364,9 @@ final class ChatConversation {
         guard canSubmitDraft else { return false }
         let text = draft
         let attachments = draftAttachments
-        // Busy, or messages are still waiting (one is being edited): this one
-        // goes after them, never ahead.
-        if isSending || !queue.isEmpty {
+        // Busy, or messages are still waiting (one is being edited), here or
+        // on the hub: this one goes after them, never ahead.
+        if isBusy {
             guard !forgotten else { return false }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
@@ -217,8 +374,9 @@ final class ChatConversation {
             draftAttachments = []
             composerRevision += 1
             queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
-                          requestID: Self.newRequestID())
-            drainIfIdle()
+                          requestID: Self.newRequestID(),
+                          origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)
+            if hubQueueAvailable { uploadPending() } else { drainIfIdle() }
             return true
         }
         guard let turn = beginSend(text, attachments: attachments) else { return false }
@@ -458,8 +616,14 @@ final class ChatConversation {
         open.close()
     }
 
+    // Detached replies to find again, or hub-queued work still waiting or
+    // running (in case /events is down): keep checking while active.
+    private var needsPolling: Bool {
+        messages.contains(where: \.isDetached) || (hubQueueAvailable && (!queue.isEmpty || hubRunning != nil))
+    }
+
     private func startRecoveryIfNeeded() {
-        guard recoveryTask == nil, !forgotten, !isAway, messages.contains(where: \.isDetached) else { return }
+        guard recoveryTask == nil, !forgotten, !isAway, needsPolling else { return }
         let token = UUID()
         recoveryToken = token
         recoveryTask = Task { [weak self] in
@@ -468,8 +632,7 @@ final class ChatConversation {
                 try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
                 // Re-check after waking: the reply may have arrived meanwhile
                 // (another refresh, an /events update), or the chat was closed.
-                guard let self, !Task.isCancelled, !self.forgotten,
-                      self.messages.contains(where: \.isDetached) else { break }
+                guard let self, !Task.isCancelled, !self.forgotten, self.needsPolling else { break }
                 await self.refresh()
                 delay = min(delay * 2, 15)
             }
@@ -511,7 +674,7 @@ final class ChatConversation {
         refreshIssued += 1
         let sequence = refreshIssued
         do {
-            let page = try await client.conversationMessages(thread: thread, conversationId: conversationID)
+            let (page, hubQueue) = try await client.conversationPageWithQueue(thread: thread, conversationId: conversationID)
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .synced
@@ -525,6 +688,7 @@ final class ChatConversation {
                 messages = merged
                 persist()
             }
+            applyHubQueue(hubQueue)
             if !didLoadOlder || !overlaps {
                 // Start at the returned page, not the oldest cached line:
                 // time spent offline can leave an unloaded gap in between.
@@ -585,12 +749,17 @@ final class ChatConversation {
     func suspend() {
         persist()
         pauseRecovery()
+        uploadTask?.cancel()
+        holdRenewal?.cancel()
         forgotten = true
     }
 
     // On revoke: the cache belongs to the pairing being forgotten, and a
     // reply still streaming must not write it back afterwards.
     func forget() {
+        uploadTask?.cancel()
+        holdRenewal?.cancel()
+        hubRunning = nil
         draft = ""
         draftAttachments = []
         queue.removeAll()

@@ -495,6 +495,90 @@ public actor DaemonClient {
         }
     }
 
+    // MARK: - The hub's conversation queue (mobile/PROTOCOL.md §3.1)
+
+    private struct QueueEnvelope: Decodable { let queue: HubQueueSnapshot? }
+    private struct QueueRefusalBody: Decodable { let error: String?; let message: String? }
+    private struct SendNowAnswer: Decodable { let status: String?; let tool: String?; let queue: HubQueueSnapshot? }
+
+    // The newest history page and the hub's queue from the same response.
+    // The queue is nil from a hub that does not keep one (then the phone
+    // keeps its own, as before).
+    public func conversationPageWithQueue(thread: ConversationThread, conversationId: String = "main") async throws -> (ConversationPage, HubQueueSnapshot?) {
+        var items = [URLQueryItem(name: "limit", value: "50")]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        let page = try Self.decodeJSON(ConversationPage.self, from: data)
+        let queue = (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+        return (page, queue)
+    }
+
+    // Sends one queue request. A refusal (held, conflict, already sent, full)
+    // is a HubQueueRefused with the hub's own code, never a generic failure.
+    private func queueCall(_ path: String, method: String, body: [String: Any]? = nil, query: [URLQueryItem] = []) async throws -> Data {
+        var request = try authorizedRequest(path: path, method: method, queryItems: query)
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        request.timeoutInterval = 20
+        let (data, response) = try await Self.networkCall(request, session: session)
+        guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
+        if [400, 409, 429].contains(http.statusCode) {
+            let refusal = try? ProtocolDecoder.json.decode(QueueRefusalBody.self, from: data)
+            throw HubQueueRefused(code: refusal?.error ?? "status_\(http.statusCode)", message: refusal?.message)
+        }
+        _ = try validate(response, data: data)
+        return data
+    }
+
+    // Adds a message to the hub's queue without holding a stream open. Safe
+    // to repeat with the same requestId: the hub keeps one.
+    public func enqueueMessage(thread: ConversationThread, text: String, attachments: [ChatAttachment] = [],
+                               focusedCardId: String? = nil, requestId: String, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+        var body: [String: Any] = ["text": text, "requestId": requestId]
+        if !attachments.isEmpty {
+            try await requireImageSupport()
+            body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
+        }
+        if let focusedCardId, !focusedCardId.isEmpty { body["focusedCardId"] = focusedCardId }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue", method: "POST", body: body)
+        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+    }
+
+    // Edit (hold the item while its editor is open; save text against the
+    // revision it was opened at) or release it.
+    public func updateQueued(thread: ConversationThread, requestId: String, text: String? = nil, hold: Bool? = nil,
+                             baseRevision: Int? = nil, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+        var body: [String: Any] = [:]
+        if let text { body["text"] = text }
+        if let hold { body["hold"] = hold }
+        if let baseRevision { body["baseRevision"] = baseRevision }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)", method: "PATCH", body: body)
+        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+    }
+
+    public func removeQueued(thread: ConversationThread, requestId: String, baseRevision: Int?, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+        var query: [URLQueryItem] = []
+        if let baseRevision { query.append(URLQueryItem(name: "baseRevision", value: String(baseRevision))) }
+        if conversationId != "main" { query.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)", method: "DELETE", query: query)
+        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+    }
+
+    // Moves the item first and has the hub stop whatever runs now (any
+    // device's turn). The outcome is only what the hub confirmed.
+    public func sendQueuedNow(thread: ConversationThread, requestId: String, conversationId: String = "main") async throws -> (TurnInterruptOutcome, HubQueueSnapshot?) {
+        var query: [URLQueryItem] = []
+        if conversationId != "main" { query.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)/send-now", method: "POST", query: query)
+        let answer = try Self.decodeJSON(SendNowAnswer.self, from: data)
+        return (TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool), answer.queue)
+    }
+
     public func conversations() async throws -> [ConversationSummary] {
         let request = try authorizedRequest(path: "/conversations", method: "GET")
         let (data, http) = try await performConversationRequest(request)
@@ -1203,4 +1287,12 @@ extension DaemonClient {
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(type, from: data)
     }
+}
+
+// The hub refused a queue change (mobile/PROTOCOL.md §3.1): "held",
+// "conflict", "already_sent", "already_removed", "queue_full", ...
+public struct HubQueueRefused: Error, Equatable, Sendable {
+    public let code: String
+    public let message: String?
+    public var displayMessage: String { HubQueueRefusal.message(code: code, fallback: message) }
 }

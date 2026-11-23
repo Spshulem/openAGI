@@ -17,10 +17,11 @@ echo "== build iOS tests"; (cd "$REPO/mobile/ios" && /opt/homebrew/bin/xcodegen 
 xcrun simctl boot "$SIM" 2>/dev/null || true
 
 echo "== start hub"
-(cd "$REPO" && "$NODE" qa/supervisor-queue/hub.mjs --host "$HOST" --port "$PORT" --out "$OUT" --slow-ms 20000 >"$OUT/hub.log" 2>&1) &
+(cd "$REPO" && exec "$NODE" qa/supervisor-queue/hub.mjs --host "$HOST" --port "$PORT" --out "$OUT" --slow-ms 20000 >"$OUT/hub.log" 2>&1) &
 HUB=$!
 trap 'kill $HUB 2>/dev/null || true' EXIT
-for _ in $(seq 1 50); do [ -s "$OUT/hub.json" ] && break; sleep 0.2; done
+for _ in $(seq 1 600); do [ -s "$OUT/hub.json" ] && break; sleep 0.2; done
+[ -s "$OUT/hub.json" ] || { echo "hub did not start"; cat "$OUT/hub.log"; exit 1; }
 URL=$("$NODE" -e 'console.log(require(process.argv[1]).url)' "$OUT/hub.json")
 OWNER=$("$NODE" -e 'console.log(require(process.argv[1]).ownerToken)' "$OUT/hub.json")
 PID=$("$NODE" -e 'console.log(require(process.argv[1]).phone.id)' "$OUT/hub.json")

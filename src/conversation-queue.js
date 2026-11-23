@@ -314,7 +314,10 @@ export class ConversationQueue {
       source: { device: item.source?.device ?? null, name: item.source?.name ?? null, nodeId: item.source?.nodeId ?? null },
       ...(actorKey ? { mine: item.source?.key === actorKey } : {}),
       state: item.state === "running" ? "running" : this.isHeld(item) ? "held" : "queued",
-      ...(this.isHeld(item) && item.state !== "running" ? { heldBy: item.hold.name, heldUntil: new Date(item.hold.until).toISOString() } : {}),
+      ...(this.isHeld(item) && item.state !== "running" ? {
+        heldBy: item.hold.name, heldUntil: new Date(item.hold.until).toISOString(),
+        ...(actorKey ? { heldByMe: item.hold.key === actorKey } : {})
+      } : {}),
       position: state.items.indexOf(item),
       revision: item.revision,
       createdAt: item.createdAt,

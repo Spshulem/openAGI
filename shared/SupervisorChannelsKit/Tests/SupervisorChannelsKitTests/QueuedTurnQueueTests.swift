@@ -129,3 +129,66 @@ final class QueuedTurnQueueTests: XCTestCase {
         }
     }
 }
+
+final class HubQueueMirrorTests: XCTestCase {
+    private func hub(_ items: [(String, String, String, Bool)], revision: Int = 1) -> HubQueueSnapshot {
+        HubQueueSnapshot(revision: revision, items: items.enumerated().map { index, entry in
+            HubQueueItem(requestId: entry.0, text: entry.1, source: .init(device: entry.3 ? "phone" : "owner", name: entry.3 ? "iPhone" : "Mac", nodeId: nil),
+                         mine: entry.3, state: entry.2, heldBy: entry.2 == "held" ? "Mac" : nil, position: index, revision: 1)
+        })
+    }
+
+    func testMirrorShowsEveryDevicesWaitingMessagesInTheHubsOrder() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("r", "running", "running", false), ("a", "from mac", "queued", false), ("b", "from phone", "held", true)]), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.text), ["from mac", "from phone"], "the running one is not waiting")
+        XCTAssertEqual(q.items.map { $0.origin?.sourceName }, ["Mac", "iPhone"])
+        XCTAssertEqual(q.items.map { $0.origin?.mine }, [false, true])
+        XCTAssertEqual(q.items[1].origin?.heldBy, "Mac")
+    }
+
+    func testMirrorKeepsLocalStateAndMessagesTheHubHasNotAcceptedYet() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("a", "one", "queued", true), ("b", "two", "queued", false)]), payload: { _ in 0 })
+        let a = q.items[0].id
+        _ = q.beginEditing(a)
+        XCTAssertTrue(q.beginHubSendNow(q.items[1].id))
+        q.enqueue(text: "offline", payload: 9, requestID: "c", origin: QueuedOrigin(pendingUpload: true))
+        // The hub moved b first after Send Now, and has not seen c.
+        q.mirror(hub([("b", "two", "queued", false), ("a", "one", "queued", true)], revision: 2), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.requestID), ["b", "a", "c"], "hub order, then what it has not accepted")
+        XCTAssertEqual(q.editingID, a, "the open editor survives a refresh")
+        XCTAssertEqual(q.items[0].sendNow, .requesting)
+        XCTAssertEqual(q.items[2].payload, 9)
+        XCTAssertEqual(q.items[2].origin?.pendingUpload, true)
+        // Once accepted, it appears once, from the hub.
+        q.mirror(hub([("b", "two", "queued", false), ("a", "one", "queued", true), ("c", "offline", "queued", true)], revision: 3), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.requestID), ["b", "a", "c"])
+        XCTAssertEqual(q.items[2].origin?.pendingUpload, false)
+    }
+
+    func testMirrorDropsItemsThatRanOrWereRemovedElsewhereAndClosesTheirEditor() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("a", "one", "queued", true), ("b", "two", "queued", false)]), payload: { _ in 0 })
+        _ = q.beginEditing(q.items[1].id)
+        q.mirror(hub([("a", "one", "queued", true)], revision: 2), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.requestID), ["a"])
+        XCTAssertNil(q.editingID)
+    }
+
+    func testMirrorSkipsMessagesAlreadyShownAsSentInThisChat() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("a", "streamed here", "queued", true), ("b", "two", "queued", false)]), payload: { _ in 0 }, skip: ["a"])
+        XCTAssertEqual(q.items.map(\.requestID), ["b"])
+    }
+
+    func testHubSnapshotDecodesAndRefusalsReadPlainly() throws {
+        let json = #"{"revision":4,"items":[{"requestId":"ios-1","text":"hi","attachmentCount":0,"source":{"device":"phone","name":"iPhone","nodeId":"mobile:x"},"mine":true,"state":"running","position":0,"revision":1,"createdAt":"x","updatedAt":"y"}]}"#
+        let snapshot = try JSONDecoder().decode(HubQueueSnapshot.self, from: Data(json.utf8))
+        XCTAssertEqual(snapshot.running?.requestId, "ios-1")
+        XCTAssertEqual(TurnInterruptOutcome.fromServer(status: "next", tool: nil), .nothingRunning)
+        XCTAssertEqual(QueuedSendNowState.answered(.nothingRunning).label, "Nothing was running. This sends next.")
+        XCTAssertTrue(HubQueueRefusal.message(code: "conflict", fallback: nil).contains("changed on another device"))
+        XCTAssertEqual(HubQueueRefusal.message(code: "held", fallback: "Mac is editing that message."), "Mac is editing that message.")
+    }
+}

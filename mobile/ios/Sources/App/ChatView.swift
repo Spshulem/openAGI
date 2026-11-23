@@ -751,6 +751,13 @@ struct ChatConversationView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.muted)
                 .accessibilityAddTraits(.isHeader)
+            if let running = conversation.hubRunning, running.mine != true {
+                Text("Running now from \(running.source?.name ?? "another device"): \(running.text)")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .accessibilityIdentifier("chat-queue-running")
+            }
             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                 if conversation.editingQueuedID == item.id {
                     queuedEditor(item)
@@ -794,7 +801,7 @@ struct ChatConversationView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.live)
                 .buttonStyle(.plain)
-                .disabled(conversation.editingQueuedID != nil)
+                .disabled(conversation.editingQueuedID != nil || item.origin?.heldBy != nil)
                 .accessibilityLabel("Edit queued message")
                 .accessibilityIdentifier("chat-queued-edit")
                 Button {
@@ -816,8 +823,30 @@ struct ChatConversationView: View {
                         .foregroundStyle(Theme.muted)
                 }
                 .buttonStyle(.plain)
+                .disabled(item.origin?.heldBy != nil)
                 .accessibilityLabel("Remove queued message")
                 .accessibilityIdentifier("chat-queued-remove")
+            }
+            if let origin = item.origin {
+                // Where this message is on the hub's shared queue.
+                let notes = [
+                    origin.mine ? nil : "From \(origin.sourceName ?? "another device")",
+                    origin.heldBy.map { "Being edited on \($0)" },
+                    origin.pendingUpload && origin.error == nil ? "Not on main yet; sends when connected" : nil
+                ].compactMap { $0 }
+                if !notes.isEmpty {
+                    Text(notes.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .accessibilityIdentifier("chat-queued-origin")
+                }
+                if let error = origin.error {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.caution)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("chat-queued-error")
+                }
             }
             if let state = item.sendNow {
                 Text(state.label)

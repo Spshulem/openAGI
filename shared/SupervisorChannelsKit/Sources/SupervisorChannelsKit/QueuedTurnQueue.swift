@@ -21,6 +21,8 @@ public enum TurnInterruptOutcome: Equatable, Sendable {
     case stopping(tool: String?)
     /// It had already ended on its own. Nothing was interrupted.
     case finished
+    /// Nothing was running, so nothing needed stopping; it goes next.
+    case nothingRunning
     /// Main has no running reply by that id (it may not have reached main).
     case notFound
     /// This main is too old to interrupt replies.
@@ -35,6 +37,7 @@ public enum TurnInterruptOutcome: Equatable, Sendable {
         case "stopping": return .stopping(tool: tool)
         case "finished": return .finished
         case "not_found": return .notFound
+        case "next": return .nothingRunning
         default: return .unreachable
         }
     }
@@ -43,7 +46,7 @@ public enum TurnInterruptOutcome: Equatable, Sendable {
     /// and a second Send Now has nothing left to do.
     public var settlesNext: Bool {
         switch self {
-        case .interrupted, .stopping, .finished: return true
+        case .interrupted, .stopping, .finished, .nothingRunning: return true
         case .notFound, .unsupported, .unreachable: return false
         }
     }
@@ -68,6 +71,8 @@ public enum QueuedSendNowState: Equatable, Sendable {
             return "Stopping after \(action) finishes; it won't be undone. This sends next."
         case .answered(.finished):
             return "The reply had already finished. This sends next."
+        case .answered(.nothingRunning):
+            return "Nothing was running. This sends next."
         case .answered(.notFound):
             return "Couldn't stop the reply: main doesn't see it running. This sends when it ends."
         case .answered(.unsupported):
@@ -89,6 +94,30 @@ public enum QueuedSendNowState: Equatable, Sendable {
     }
 }
 
+/// Where a queued message lives when the hub keeps the queue (see
+/// HubQueueSnapshot): who sent it, whether this device did, who is editing
+/// it, and the revision an edit must name.
+public struct QueuedOrigin: Equatable, Sendable {
+    public var sourceName: String?
+    public var mine: Bool
+    public var heldBy: String?
+    public var revision: Int
+    /// Not yet accepted by the hub (offline, or the request failed): kept
+    /// here and sent again with the same turn id.
+    public var pendingUpload: Bool
+    /// The last hub refusal for this item, shown on its row.
+    public var error: String?
+
+    public init(sourceName: String? = nil, mine: Bool = true, heldBy: String? = nil, revision: Int = 0, pendingUpload: Bool = false, error: String? = nil) {
+        self.sourceName = sourceName
+        self.mine = mine
+        self.heldBy = heldBy
+        self.revision = revision
+        self.pendingUpload = pendingUpload
+        self.error = error
+    }
+}
+
 public struct QueuedTurn<Payload: Equatable>: Identifiable, Equatable {
     public let id: UUID
     public var text: String
@@ -97,13 +126,16 @@ public struct QueuedTurn<Payload: Equatable>: Identifiable, Equatable {
     /// queue time, so a resend of the same item can never run twice.
     public let requestID: String
     public var sendNow: QueuedSendNowState?
+    /// Set when the hub keeps the queue; nil for a queue only this device has.
+    public var origin: QueuedOrigin?
 
-    public init(id: UUID = UUID(), text: String, payload: Payload, requestID: String, sendNow: QueuedSendNowState? = nil) {
+    public init(id: UUID = UUID(), text: String, payload: Payload, requestID: String, sendNow: QueuedSendNowState? = nil, origin: QueuedOrigin? = nil) {
         self.id = id
         self.text = text
         self.payload = payload
         self.requestID = requestID
         self.sendNow = sendNow
+        self.origin = origin
     }
 }
 
@@ -146,9 +178,42 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     }
 
     @discardableResult
-    public mutating func enqueue(text: String, payload: Payload, requestID: String, id: UUID = UUID()) -> UUID {
-        items.append(QueuedTurn(id: id, text: text, payload: payload, requestID: requestID))
+    public mutating func enqueue(text: String, payload: Payload, requestID: String, id: UUID = UUID(), origin: QueuedOrigin? = nil) -> UUID {
+        items.append(QueuedTurn(id: id, text: text, payload: payload, requestID: requestID, origin: origin))
         return id
+    }
+
+    public func item(requestID: String) -> QueuedTurn<Payload>? { items.first { $0.requestID == requestID } }
+
+    public mutating func setOrigin(_ id: UUID, _ change: (inout QueuedOrigin) -> Void) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        var origin = items[index].origin ?? QueuedOrigin()
+        change(&origin)
+        items[index].origin = origin
+    }
+
+    /// Replaces the queue with the hub's (waiting items only, in its order),
+    /// keeping what only this device knows: the open editor, a Send Now
+    /// status, and messages the hub has not accepted yet (kept last, in
+    /// order). `skip` names turn ids already shown as sent in this chat.
+    public mutating func mirror(_ snapshot: HubQueueSnapshot, payload: (HubQueueItem) -> Payload, skip: Set<String> = []) {
+        let previous = Dictionary(items.map { ($0.requestID, $0) }, uniquingKeysWith: { first, _ in first })
+        let hubIDs = Set(snapshot.items.map(\.requestId))
+        var next: [QueuedTurn<Payload>] = []
+        for hubItem in snapshot.items where hubItem.state != "running" && !skip.contains(hubItem.requestId) {
+            let known = previous[hubItem.requestId]
+            let origin = QueuedOrigin(sourceName: hubItem.source?.name, mine: hubItem.mine ?? false,
+                                      heldBy: hubItem.state == "held" && hubItem.heldByMe != true ? hubItem.heldBy : nil, revision: hubItem.revision,
+                                      pendingUpload: false, error: known?.origin?.error)
+            next.append(QueuedTurn(id: known?.id ?? UUID(), text: hubItem.text, payload: known?.payload ?? payload(hubItem),
+                                   requestID: hubItem.requestId, sendNow: known?.sendNow, origin: origin))
+        }
+        // Not on the hub yet: this device's own, still to be sent.
+        for item in items where item.origin?.pendingUpload == true && !hubIDs.contains(item.requestID) && !skip.contains(item.requestID) {
+            next.append(item)
+        }
+        items = next
+        if let editingID, !items.contains(where: { $0.id == editingID }) { self.editingID = nil }
     }
 
     public func item(_ id: UUID) -> QueuedTurn<Payload>? { items.first { $0.id == id } }
@@ -212,6 +277,24 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
         return .interrupt(requestID: runningRequestID)
     }
 
+    /// Send Now when the hub keeps the queue: moved first here at once
+    /// (the hub's answer reorders for real) and marked as asking.
+    @discardableResult
+    public mutating func beginHubSendNow(_ id: UUID) -> Bool {
+        guard canSendNow(id), let index = items.firstIndex(where: { $0.id == id }) else { return false }
+        var item = items.remove(at: index)
+        for other in items.indices where items[other].sendNow != nil { items[other].sendNow = nil }
+        item.sendNow = .requesting
+        items.insert(item, at: 0)
+        return true
+    }
+
+    /// The hub refused Send Now (held elsewhere, already sent): no status.
+    public mutating func clearSendNow(_ id: UUID) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].sendNow = nil
+    }
+
     /// Records main's answer. A no-op when the item was removed or already
     /// sent while the request was out.
     public mutating func applyInterrupt(_ id: UUID, outcome: TurnInterruptOutcome) {
@@ -232,5 +315,68 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     public mutating func removeAll() {
         items = []
         editingID = nil
+    }
+}
+
+// MARK: - The hub's queue on the wire (GET /conversations/:thread/queue, and
+// `queue` in the newest history page).
+
+public struct HubQueueItem: Codable, Equatable, Sendable, Identifiable {
+    public struct Source: Codable, Equatable, Sendable {
+        public let device: String?
+        public let name: String?
+        public let nodeId: String?
+    }
+    public let requestId: String
+    public let text: String
+    public let attachmentCount: Int?
+    public let source: Source?
+    public let mine: Bool?
+    /// "running", "queued" or "held" (being edited on some device).
+    public let state: String
+    public let heldBy: String?
+    /// True when this device holds the edit (its own open editor).
+    public let heldByMe: Bool?
+    public let position: Int?
+    public let revision: Int
+    public var id: String { requestId }
+
+    public init(requestId: String, text: String, attachmentCount: Int? = nil, source: Source? = nil, mine: Bool? = nil,
+                state: String, heldBy: String? = nil, heldByMe: Bool? = nil, position: Int? = nil, revision: Int) {
+        self.requestId = requestId
+        self.text = text
+        self.attachmentCount = attachmentCount
+        self.source = source
+        self.mine = mine
+        self.state = state
+        self.heldBy = heldBy
+        self.heldByMe = heldByMe
+        self.position = position
+        self.revision = revision
+    }
+}
+
+public struct HubQueueSnapshot: Codable, Equatable, Sendable {
+    public let revision: Int
+    public let items: [HubQueueItem]
+    public init(revision: Int, items: [HubQueueItem]) {
+        self.revision = revision
+        self.items = items
+    }
+    /// The message the hub is running now, if it came through the queue.
+    public var running: HubQueueItem? { items.first { $0.state == "running" } }
+}
+
+/// Plain words for a hub refusal of an edit, removal or Send Now.
+public enum HubQueueRefusal {
+    public static func message(code: String?, fallback: String?) -> String {
+        switch code {
+        case "held": return fallback ?? "Someone else is editing this message."
+        case "conflict": return "This message changed on another device. Review it and try again."
+        case "already_sent": return "This message was already sent, so it can't be changed."
+        case "already_removed": return "This message was already removed."
+        case "queue_full": return "The queue is full. Wait for some messages to send."
+        default: return fallback ?? "Couldn't update the queue. Try again."
+        }
     }
 }
