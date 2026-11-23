@@ -561,6 +561,7 @@ export class RemoteFleetSupervisor {
     return rest;
   }
   async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async scheduleActiveWorkRecheck(id, input = {}) { return this.actActiveWork(id, { ...input, op: 'schedule_recheck' }); }
   async actActiveWork(id, input = {}) {
     try {
       return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
