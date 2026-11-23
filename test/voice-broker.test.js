@@ -10,7 +10,7 @@ import { AgentHost } from "../src/agent-host.js";
 import { matchConfirmation, ownerPrincipal } from "../src/owner-authority.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { VoiceSession, createVoiceSessionFactory, createVoiceSpend, digitsFromWords, voiceDailyCapUsd, voiceEnabled, voiceModel } from "../src/voice/broker.js";
+import { VoiceSession, createVoiceSessionFactory, createVoiceSpend, digitsFromWords, voiceCapMessage, voiceDailyCapUsd, voiceEnabled, voiceModel } from "../src/voice/broker.js";
 import { BudgetGuard } from "../src/budget-guard.js";
 import { createResampler, realtimeCostUsd, realtimePrice, resamplePcm16 } from "../src/voice/audio.js";
 
@@ -105,14 +105,14 @@ function harness(t, { handsFree = false, capUsd = 5, spentToday = 0, focus = nul
 const callDone = (name, args, callId = "call_1") => ({ type: "response.done", response: { status: "completed", output: [{ type: "function_call", name, call_id: callId, arguments: JSON.stringify(args) }], usage: null } });
 const sayDone = (text, usage = null) => ({ type: "response.done", response: { status: "completed", output: [{ type: "message", content: [{ type: "output_audio", transcript: text }] }], usage } });
 
-test("env: off unless OPENAGI_VOICE=1, gpt-realtime-2.1 by default, never a mini model, $5 a day", () => {
+test("env: off unless OPENAGI_VOICE=1, gpt-realtime-2.1 by default, never a mini model, no separate daily cap by default", () => {
   assert.equal(voiceEnabled({}), false);
   assert.equal(voiceEnabled({ OPENAGI_VOICE: "1" }), true);
   assert.equal(voiceModel({}), "gpt-realtime-2.1");
   assert.equal(voiceModel({ OPENAGI_VOICE_MODEL: "gpt-realtime-2.1-mini" }), "gpt-realtime-2.1");
   assert.equal(voiceModel({ OPENAGI_VOICE_MODEL: "gpt-realtime-2.2" }), "gpt-realtime-2.1");
   assert.equal(voiceModel({ OPENAGI_VOICE_MODEL: "gpt-6.1-sol" }), "gpt-realtime-2.1");
-  assert.equal(voiceDailyCapUsd({}), 5);
+  assert.equal(voiceDailyCapUsd({}), Infinity, "voice counts against the shared OpenAGI budget, not a cap of its own");
   assert.equal(voiceDailyCapUsd({ OPENAGI_VOICE_DAILY_USD: "2.5" }), 2.5);
 });
 
@@ -386,6 +386,19 @@ test("spend goes to the ledger as channel voice, and the daily cap ends the sess
   const capped = harness(t, { capUsd: 1, spentToday: 1 });
   assert.equal(capped.upstream, null);
   assert.equal(capped.ends[0].code, "voice_cap");
+});
+
+test("a reply is in the shared thread before the phone hears reply.done", async (t) => {
+  const h = harness(t);
+  h.ready();
+  let threadLengthAtDone = null;
+  const send = h.session.io.send;
+  h.session.io.send = (event) => { if (event.type === "reply.done") threadLengthAtDone = h.thread.length; send(event); };
+  h.upstream.event({ type: "response.created" });
+  h.upstream.event(sayDone("Here's the first item."));
+  await flush();
+  assert.equal(threadLengthAtDone, 1, "the phone reloads the chat on reply.done; the reply must already be saved");
+  assert.equal(h.thread.at(-1).content, "Here's the first item.");
 });
 
 test("transcripts go to the shared supervisor thread; feedback keeps the owner's words and focus", async (t) => {
@@ -701,6 +714,27 @@ test("voice persistence failures recover after a successful retry or UTC rollove
   now += 86_400_000;
   assert.equal(spend.capped(), false);
   assert.equal(spend.reserve("fourth", 0.01), false, "a fresh write must still succeed");
+});
+
+test("by default voice has no cap of its own: the shared budget alone limits it, both ways", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "voice-shared-budget-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const budget = new BudgetGuard({ storePath: path.join(dir, "usage.json"), dailyUsdLimit: 1 });
+  const spend = createVoiceSpend({ budget, capUsd: voiceDailyCapUsd({}) });
+  // More than the old $5 voice-only default would ever matter here; only the
+  // shared $1 limit applies.
+  assert.equal(spend.reserve("phone", 0.6), true);
+  // A voice reservation holds shared room: a text turn cannot spend it.
+  assert.throws(() => budget.check(0.5), { code: "BUDGET_EXCEEDED" });
+  spend.add(0.6, "gpt-realtime-2.1", {}, "phone");
+  assert.equal(budget.status().spentUsd, 0.6, "voice spend is in the shared daily total");
+  budget.recordUsd(0.4, "text-model");
+  assert.equal(spend.capped(), true, "the shared limit stops voice");
+  assert.match(voiceCapMessage(spend), /OpenAGI budget is used up/);
+  assert.doesNotMatch(voiceCapMessage(spend), /\$Infinity|voice cap/);
+  const capped = createVoiceSpend({ budget: new BudgetGuard({ storePath: path.join(dir, "u2.json"), dailyUsdLimit: 10 }), capUsd: 0.5 });
+  capped.add(0.5, "gpt-realtime-2.1");
+  assert.match(voiceCapMessage(capped), /\$0\.5 voice cap/, "an explicit voice cap is still honoured and named");
 });
 
 test("voice obeys the global budget at creation and across concurrent reservations", async (t) => {
