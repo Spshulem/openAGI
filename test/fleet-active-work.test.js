@@ -1387,7 +1387,7 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
     assert.equal(tracked.item.originalAsk, "Build unified Supervisor Work and project-scoped Ask Supervisor");
     assert.equal(tracked.item.acceptanceCriteria, "Portfolio and project views show owner, evidence, blocker and next check");
     assert.equal(tracked.item.workflowStage, "implementing");
-    assert.equal(tracked.item.executionHealth, "unknown");
+    assert.equal(tracked.item.executionHealth, "blocked");
     assert.equal(tracked.item.blocker, "PR #325 merge conflicts");
     assert.equal(tracked.item.nextCheckAt, "2026-11-21T13:00:00.000Z");
     assert.ok(tracked.item.lastMeaningfulEvidenceAt === null || typeof tracked.item.lastMeaningfulEvidenceAt === "string");
@@ -1397,7 +1397,7 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
     assert.ok(projectSummary);
     assert.equal(projectSummary.total, 1);
     assert.equal(projectSummary.stages.implementing, 1);
-    assert.equal(projectSummary.health.unknown, 1);
+    assert.equal(projectSummary.health.blocked, 1);
 
     const route = createFleetRoute({ supervisor: ctx.supervisor });
     const ask = await route(

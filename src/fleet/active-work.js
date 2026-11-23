@@ -1396,6 +1396,7 @@ export class ActiveWorkManager {
       whySurfaced = "Workstream is paused while outcome remains unverified.";
     } else if (
       effectivePersistentState === "blocked"
+      || Boolean(item.blocker)
       || (effectiveRemainingCount !== null && effectiveRemainingCount > 0 && sessionStatus !== "running")
       || untrusted?.claimsBlocked
       || item.decisionsVerdict?.classification === "blocked"
@@ -1403,7 +1404,7 @@ export class ActiveWorkManager {
       followThroughState = "blocked";
       whySurfaced = effectiveRemainingCount !== null && effectiveRemainingCount > 0
         ? `${effectiveRemainingCount} remaining/blocked items reported${sessionStatus === "idle" ? " after coding chat finished" : ""}; outcome not yet complete.`
-        : "Blocked on unresolved issue or external dependency.";
+        : (item.blocker ? `Blocked on: ${item.blocker}` : "Blocked on unresolved issue or external dependency.");
       verificationQuestion = `Resolve or verify blocker for ${item.project}${item.theme ? ` / ${item.theme}` : ""}: ${item.doneCriteria}`;
     } else if (prState === "OPEN" && (prCiState === "FAILURE" || prMergeState === "DIRTY")) {
       followThroughState = "blocked_pr";
