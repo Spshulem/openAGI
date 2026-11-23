@@ -1,0 +1,156 @@
+{
+  "thread": "supervisor",
+  "messages": [
+    {
+      "id": "msg_7cbc5a00d5594a5e",
+      "role": "user",
+      "text": "[slow] QA running turn from the iPhone",
+      "at": "2026-11-23T09:12:33.168Z",
+      "sourceNodeId": "mobile:qa-2cb1b471",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-aaa4f099-66e8-4614-a892-5f90dd308190"
+    },
+    {
+      "id": "msg_8e20dc9753484f47",
+      "role": "assistant",
+      "text": "Ack: [slow] QA running turn from the iPhone",
+      "at": "2026-11-23T09:12:53.337Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-aaa4f099-66e8-4614-a892-5f90dd308190"
+    },
+    {
+      "id": "msg_237c83e8f3c34fe9",
+      "role": "user",
+      "text": "[ios-1] iPhone tagged message one",
+      "at": "2026-11-23T09:12:53.466Z",
+      "sourceNodeId": "mobile:qa-2cb1b471",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-52fd2007-aee5-4126-bbc4-b5562fa147d0"
+    },
+    {
+      "id": "msg_1225a301b1304beb",
+      "role": "assistant",
+      "text": "Ack: [ios-1] iPhone tagged message one",
+      "at": "2026-11-23T09:12:53.527Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-52fd2007-aee5-4126-bbc4-b5562fa147d0"
+    },
+    {
+      "id": "msg_1fae1c9e0b804ed1",
+      "role": "user",
+      "text": "[ios-2] iPhone tagged message two",
+      "at": "2026-11-23T09:12:53.570Z",
+      "sourceNodeId": "mobile:qa-2cb1b471",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-8c7b4a69-0551-418d-8425-bf74e220e386"
+    },
+    {
+      "id": "msg_53dd783ffb224c05",
+      "role": "assistant",
+      "text": "Ack: [ios-2] iPhone tagged message two",
+      "at": "2026-11-23T09:12:53.633Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-8c7b4a69-0551-418d-8425-bf74e220e386"
+    },
+    {
+      "id": "msg_9e9a0ebcc8674f41",
+      "role": "user",
+      "text": "[mac-1] Mac tagged message one",
+      "at": "2026-11-23T09:12:53.664Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-5b75af15-bf8c-4614-8664-da4fcd8be45b"
+    },
+    {
+      "id": "msg_c22d7dce56e7400f",
+      "role": "assistant",
+      "text": "Ack: [mac-1] Mac tagged message one",
+      "at": "2026-11-23T09:12:53.726Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-5b75af15-bf8c-4614-8664-da4fcd8be45b"
+    },
+    {
+      "id": "msg_84c1205d2a954184",
+      "role": "user",
+      "text": "[mac-2] Mac tagged message two",
+      "at": "2026-11-23T09:12:53.760Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-b11cf214-5200-475a-9bfb-7a808d6ea10e"
+    },
+    {
+      "id": "msg_0a860e261eb04147",
+      "role": "assistant",
+      "text": "Ack: [mac-2] Mac tagged message two",
+      "at": "2026-11-23T09:12:53.812Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-b11cf214-5200-475a-9bfb-7a808d6ea10e"
+    },
+    {
+      "id": "msg_25aab405edd34b1b",
+      "role": "user",
+      "text": "[slow] second running turn from the iPhone",
+      "at": "2026-11-23T09:13:51.093Z",
+      "sourceNodeId": "mobile:qa-2cb1b471",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-3edbdaa7-3a6e-44f0-aa92-37e47c563af5"
+    },
+    {
+      "id": "msg_457293d2c07d4267",
+      "role": "assistant",
+      "text": "Stopped so your next message could go first. Anything already under way may have finished; nothing was undone.",
+      "at": "2026-11-23T09:14:03.036Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-3edbdaa7-3a6e-44f0-aa92-37e47c563af5",
+      "status": "failed"
+    },
+    {
+      "id": "msg_3d687cff41114839",
+      "role": "user",
+      "text": "[ios-6] iPhone message the Mac will send now",
+      "at": "2026-11-23T09:14:03.074Z",
+      "sourceNodeId": "mobile:qa-2cb1b471",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-c2c41038-d84d-43ee-a6d0-cc7d1946bfa1"
+    },
+    {
+      "id": "msg_52d9e24aa3f04589",
+      "role": "assistant",
+      "text": "Ack: [ios-6] iPhone message the Mac will send now",
+      "at": "2026-11-23T09:14:03.118Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-c2c41038-d84d-43ee-a6d0-cc7d1946bfa1"
+    },
+    {
+      "id": "msg_eb04c9df51f740ab",
+      "role": "user",
+      "text": "[mac-3] edited on the Mac while the iPhone tried",
+      "at": "2026-11-23T09:14:03.158Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-f44ab641-c076-4b10-aaa8-6b0d54652125"
+    },
+    {
+      "id": "msg_4e25cb4abc18415d",
+      "role": "assistant",
+      "text": "Ack: [mac-3] edited on the Mac while the iPhone tried",
+      "at": "2026-11-23T09:14:03.221Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-f44ab641-c076-4b10-aaa8-6b0d54652125"
+    }
+  ],
+  "nextBefore": null,
+  "inFlight": [],
+  "queue": {
+    "revision": 30,
+    "items": []
+  }
+}

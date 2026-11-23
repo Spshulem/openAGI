@@ -1,0 +1,97 @@
+{
+  "thread": "supervisor",
+  "messages": [
+    {
+      "id": "msg_1d799c555d2f42be",
+      "role": "user",
+      "text": "[slow] QA running turn from the iPhone",
+      "at": "2026-11-23T08:32:37.519Z",
+      "sourceNodeId": "mobile:qa-e6af7500",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-24e2ca58-5483-423e-8699-61a0b4dd6e8f"
+    },
+    {
+      "id": "msg_56f57f0e6c2d45b3",
+      "role": "assistant",
+      "text": "Ack: [slow] QA running turn from the iPhone",
+      "at": "2026-11-23T08:32:57.588Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-24e2ca58-5483-423e-8699-61a0b4dd6e8f"
+    },
+    {
+      "id": "msg_50b07516d1e54c73",
+      "role": "user",
+      "text": "[mac-1] Mac tagged message one",
+      "at": "2026-11-23T08:32:57.610Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-3dc4e578-713a-4cc8-a3ec-e53b6e4c4329"
+    },
+    {
+      "id": "msg_377d3eae65f744a5",
+      "role": "assistant",
+      "text": "Ack: [mac-1] Mac tagged message one",
+      "at": "2026-11-23T08:32:57.690Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-3dc4e578-713a-4cc8-a3ec-e53b6e4c4329"
+    },
+    {
+      "id": "msg_be84984e621f4c57",
+      "role": "user",
+      "text": "[ios-1] iPhone tagged message one",
+      "at": "2026-11-23T08:32:57.728Z",
+      "sourceNodeId": "mobile:qa-e6af7500",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-21425bdf-80ec-4b6e-b1c3-c9b93f1fcdbc"
+    },
+    {
+      "id": "msg_aa1347eb09604ad0",
+      "role": "assistant",
+      "text": "Ack: [ios-1] iPhone tagged message one",
+      "at": "2026-11-23T08:32:57.785Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-21425bdf-80ec-4b6e-b1c3-c9b93f1fcdbc"
+    },
+    {
+      "id": "msg_779140614b1c4ce5",
+      "role": "user",
+      "text": "[mac-2] Mac tagged message two",
+      "at": "2026-11-23T08:32:57.814Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-f4816044-f4b2-4dc9-a846-b972a1d248ec"
+    },
+    {
+      "id": "msg_7c9f8925e8864205",
+      "role": "assistant",
+      "text": "Ack: [mac-2] Mac tagged message two",
+      "at": "2026-11-23T08:32:57.896Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "mac-f4816044-f4b2-4dc9-a846-b972a1d248ec"
+    },
+    {
+      "id": "msg_e8b68e1f63b847b0",
+      "role": "user",
+      "text": "[ios-2] iPhone tagged message two",
+      "at": "2026-11-23T08:32:57.913Z",
+      "sourceNodeId": "mobile:qa-e6af7500",
+      "sourceName": "QA iPhone",
+      "requestId": "ios-88b42998-9c5f-4835-bbd8-2de8144e5311"
+    },
+    {
+      "id": "msg_8c895f88885340d0",
+      "role": "assistant",
+      "text": "Ack: [ios-2] iPhone tagged message two",
+      "at": "2026-11-23T08:32:57.997Z",
+      "sourceNodeId": null,
+      "sourceName": null,
+      "requestId": "ios-88b42998-9c5f-4835-bbd8-2de8144e5311"
+    }
+  ],
+  "nextBefore": null,
+  "inFlight": []
+}
