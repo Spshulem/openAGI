@@ -100,8 +100,11 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertTrue(element(app, "needs-you-conversation").isHittable, "Conversation and sources come last")
         capture("needs-you-detail-scrolled-dark", app: app)
 
-        let back = app.navigationBars["Decision"].buttons.element(boundBy: 0)
-        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        // Duo puts its native Back button in the vertical toolbar, outside
+        // the navigation bar; ordinary iPhones keep it in the bar.
+        let duoBack = app.buttons["BackButton"].firstMatch
+        let back = duoBack.exists ? duoBack : app.navigationBars["Decision"].buttons.element(boundBy: 0)
+        XCTAssertTrue(back.waitForExistence(timeout: 5), "Missing Back from Decision")
         back.tap()
         XCTAssertTrue(element(app, "needs-you-row-ny-deploy").waitForExistence(timeout: 5), "Back returns to the list")
         XCTAssertFalse(element(app, "needs-you-detail").exists)

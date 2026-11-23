@@ -568,37 +568,30 @@ struct SupervisorThreadInspectorView: View {
   private var actionStrip: some View {
     if let q = resolvedQuestion {
       let busy = fleet.inFlight.contains(q.id) || fleet.stillSending.contains(q.id)
-      HStack(spacing: 6) {
-        ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { idx, opt in
-          let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
-          WorkspaceActionButton(prominent: idx == 0 && !q.risky, small: true) {
-            if opt == "Answer question" {
-              replyFocused = true
-            } else if opt == "Review plan", q.plan != nil {
-              showPlanDetails.toggle()
-            } else {
-              Task { await fleet.answer(q, option: opt) }
-            }
-          } label: {
-            Text(q.label(for: opt))
+      VStack(alignment: .leading, spacing: 8) {
+        // The agent's options side by side when they fit the inspector,
+        // else one per line: never truncated.
+        ViewThatFits(in: .horizontal) {
+          HStack(spacing: 6) { optionButtons(q, busy: busy) }
+          VStack(alignment: .leading, spacing: 6) { optionButtons(q, busy: busy) }
+        }
+        HStack(spacing: 6) {
+          Button("Ask Supervisor") {
+            onOpenQuestionInChat(q)
           }
-          .disabled(busy && !handlesLocally)
-        }
-        Button("Ask Supervisor") {
-          onOpenQuestionInChat(q)
-        }
-        .buttonStyle(.borderless)
-        .font(.caption.weight(.medium))
-        .foregroundStyle(WorkspaceTheme.live)
+          .buttonStyle(.borderless)
+          .font(.caption.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.live)
 
-        Spacer(minLength: 0)
-        Button("Dismiss") {
-          Task { await fleet.dismiss(q) }
+          Spacer(minLength: 0)
+          Button("Dismiss") {
+            Task { await fleet.dismiss(q) }
+          }
+          .buttonStyle(.borderless)
+          .font(.caption)
+          .foregroundStyle(WorkspaceTheme.muted)
+          .disabled(busy)
         }
-        .buttonStyle(.borderless)
-        .font(.caption)
-        .foregroundStyle(WorkspaceTheme.muted)
-        .disabled(busy)
       }
     } else if let task = resolvedTask {
       HStack(spacing: 8) {
@@ -653,6 +646,26 @@ struct SupervisorThreadInspectorView: View {
           Label("Link Task", systemImage: "checklist")
         }
       }
+    }
+  }
+
+  @ViewBuilder
+  private func optionButtons(_ q: FleetQuestion, busy: Bool) -> some View {
+    ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { idx, opt in
+      let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
+      WorkspaceActionButton(prominent: idx == 0 && !q.risky, small: true) {
+        if opt == "Answer question" {
+          replyFocused = true
+        } else if opt == "Review plan", q.plan != nil {
+          showPlanDetails.toggle()
+        } else {
+          Task { await fleet.answer(q, option: opt) }
+        }
+      } label: {
+        Text(q.label(for: opt))
+          .fixedSize()
+      }
+      .disabled(busy && !handlesLocally)
     }
   }
 

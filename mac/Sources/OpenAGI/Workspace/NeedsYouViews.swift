@@ -178,12 +178,16 @@ struct NeedsYouSections: View {
   let kinds: Set<SupervisorNeedsYouDigest.SectionKind>
 
   var body: some View {
-    ForEach(digest.sections.filter { kinds.contains($0.kind) }) { section in
+    let shown = digest.sections.filter { kinds.contains($0.kind) }
+    ForEach(Array(shown.enumerated()), id: \.element.id) { index, section in
       VStack(alignment: .leading, spacing: 3) {
-        Text(section.title)
-          .font(.caption.weight(.semibold))
-          .foregroundStyle(WorkspaceTheme.muted)
-          .accessibilityAddTraits(.isHeader)
+        // Several evidence items share one heading.
+        if index == 0 || shown[index - 1].kind != section.kind {
+          Text(section.title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.muted)
+            .accessibilityAddTraits(.isHeader)
+        }
         WorkspaceMarkdownContent(
           blocks: WorkspaceMarkdownParser.parse(section.text),
           bodyFont: WorkspaceTheme.Typography.secondary,
