@@ -216,3 +216,17 @@ test("repo status during a cooldown says it is GitHub's limit, not the fleet com
   );
   assert.equal(calls, 0);
 });
+
+// #351 review (Codex P2): two reads in flight; a delayed answer from the same
+// window must not lift the cooldown a newer answer set.
+test("a delayed same-window response never lifts a newer cooldown; a later window does", () => {
+  const { fn } = clock();
+  const throttle = new GithubThrottle({ now: fn, floor: 150 });
+  const answer = (remaining, resetAt) => ({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining, resetAt } } }) });
+  throttle.observe(answer(0, RESET));
+  assert.equal(throttle.current()?.kind, "primary");
+  throttle.observe(answer(200, RESET));
+  assert.equal(throttle.current()?.kind, "primary", "still held: same window");
+  throttle.observe(answer(4900, "2026-11-22T22:00:37Z"));
+  assert.equal(throttle.current(), null, "a new window lifts it");
+});

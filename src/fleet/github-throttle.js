@@ -121,12 +121,24 @@ export class GithubThrottle {
       this.enter(remaining <= 0 ? "primary" : "low-budget", { resetAt, remaining });
       return;
     }
-    // A fresh window: whatever held polling back is over.
-    if (remaining > this.floor && this.cooldown && this.cooldown.kind !== "secondary") {
+    // A fresh window: whatever held polling back is over. Only a response
+    // from a later window counts: a delayed answer from the same window
+    // (two reads in flight) must not lift a newer cooldown.
+    if (remaining > this.floor && this.cooldown && this.cooldown.kind !== "secondary" && this.isNewerWindow(resetAt)) {
       this.cooldown = null;
       this.primaryStreak = 0;
       this.save();
     }
+  }
+
+  isNewerWindow(resetAt) {
+    const reset = Date.parse(resetAt ?? "");
+    if (!Number.isFinite(reset)) return false;
+    const held = Date.parse(this.cooldown?.windowResetAt ?? "");
+    // A cooldown with no known window (estimated) ends with any window
+    // that resets after it began.
+    if (!Number.isFinite(held)) return reset > (Date.parse(this.cooldown?.since ?? "") || 0);
+    return reset > held + 1000;
   }
 
   enter(kind, { resetAt = null, retryAfterSec = null, remaining = null } = {}) {
@@ -158,6 +170,7 @@ export class GithubThrottle {
       until: new Date(until).toISOString(),
       since: previous?.since ?? new Date(now).toISOString(),
       resetKnown,
+      ...(kind !== "secondary" && Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() } : {}),
       probed: previous?.probed === true && !resetKnown,
       ...(Number.isFinite(remaining) ? { remaining } : {})
     };
