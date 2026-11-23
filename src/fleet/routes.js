@@ -217,7 +217,7 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         }
         return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
       }
-      if (parts[0] === "active-work" && (parts.length === 1 || (parts.length === 2 && parts[1] === "scan") || (parts.length === 3 && parts[2] === "act"))) {
+      if (parts[0] === "active-work" && (parts.length === 1 || (parts.length === 2 && parts[1] === "scan") || (parts.length === 3 && (parts[2] === "act" || parts[2] === "verify")))) {
         if (parts.length === 1 && method === "GET") {
           if (typeof supervisor.getActiveWork !== "function") {
             return fail(503, "Active Work tracking is not available.");
@@ -270,6 +270,27 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
             return ok({ pass, activeWork, state: state() });
           } catch (err) {
             return safeActiveWorkError(err, "Active Work inventory scan failed.");
+          }
+        }
+        if (parts.length === 3 && parts[2] === "verify") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad Active Work id.");
+          if (typeof supervisor.verifyGoalProgress !== "function") {
+            return fail(503, "Goal verification is not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body) return fail(400, "Send a JSON object with { evidenceSummary, cursor }.");
+          try {
+            const result = await supervisor.verifyGoalProgress({
+              id: parts[1],
+              evidenceSummary: typeof body.evidenceSummary === "string" ? body.evidenceSummary : "",
+              cursor: body.cursor && typeof body.cursor === "object" && !Array.isArray(body.cursor) ? body.cursor : null,
+              ownerConfirmedDone: body.ownerConfirmedDone === true
+            });
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ result, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not verify goal progress.");
           }
         }
         if (parts.length === 3 && parts[2] === "act") {

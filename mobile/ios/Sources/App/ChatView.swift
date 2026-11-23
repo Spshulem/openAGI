@@ -410,6 +410,10 @@ struct ChatConversationView: View {
                     scrollToLatest()
                     // Lazy message rows resolve their wrapped height after
                     // materializing; settle onto the true end once laid out.
+                    // Only when history first loads: on an ordinary append
+                    // (a send and its reply) a short pane keeps the sent
+                    // message in view instead of snapping past it.
+                    guard old.isEmpty else { return }
                     Task { @MainActor in
                         await Task.yield()
                         if !messages.isEmpty && isPinnedToBottom && !userIsScrolling {
@@ -1007,6 +1011,25 @@ enum ChatRetry {
         else { return nil }
         return (index, user.text, user.attachments)
     }
+
+    enum BudgetResend: Equatable {
+        case send(text: String, attachments: [ChatAttachment])
+        case attachmentsUnavailable
+        case nothingToResend
+    }
+
+    // "+$10 & retry" for a reply that is not retry-safe: re-send the user
+    // turn immediately before the blocked reply, attachments included. Never
+    // search further back -- that would re-send an older, different request.
+    static func budgetResend(failedID: UUID, in messages: [ChatMessage]) -> BudgetResend {
+        guard let index = messages.firstIndex(where: { $0.id == failedID }),
+              let user = messages[..<index].last(where: { $0.role == .user })
+        else { return .nothingToResend }
+        guard user.attachments.allSatisfy({ $0.data != nil }) else { return .attachmentsUnavailable }
+        guard !user.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !user.attachments.isEmpty
+        else { return .nothingToResend }
+        return .send(text: user.text, attachments: user.attachments)
+    }
 }
 
 // DESIGN.md's copy rules ("Never: ... an error that does not say what to do
@@ -1429,11 +1452,15 @@ private struct ChatBudgetExceededBar: View {
             guard retryTurn else { return }
             if message.isFailed && message.retrySafe {
                 await conversation.retry(message)
-            } else if let idx = conversation.messages.firstIndex(where: { $0.id == message.id }),
-                      let priorUser = conversation.messages[..<idx].last(where: {
-                          $0.role == .user && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.attachments.isEmpty
-                      }) {
-                await conversation.send(priorUser.text)
+            } else {
+                switch ChatRetry.budgetResend(failedID: message.id, in: conversation.messages) {
+                case .send(let text, let attachments):
+                    await conversation.send(text, attachments: attachments)
+                case .attachmentsUnavailable:
+                    note = ("Budget added, but the images in that message can't be re-sent. Attach them again and send.", true)
+                case .nothingToResend:
+                    break
+                }
             }
         } catch {
             note = (BudgetSettingsErrorCopy.saveMessage(for: error), true)

@@ -53,7 +53,11 @@ const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
 // The owner being active is no failure. A presence probe that keeps failing
 // ("front app unknown", "presence check too slow") is: it builds the streak
 // so the owner hears why nothing lands.
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on)/;
+// A chat stopped on a provider limit, a nudge found delivered (its turn
+// confirmed, answered, running, or failed), or one status check sent after
+// an unconfirmable delivery, is not a route failing either: the Supervisor
+// owns what comes next.
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|Provider (?:usage|session)-limit until |Previous nudge was delivered|Previous Paseo turn confirmed|Sent one status check)/;
 
 function emptyState() {
   return {
@@ -82,7 +86,8 @@ function emptyState() {
     preferences: defaultPreferences(),
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
-    supervisorChatNotices: {}
+    supervisorChatNotices: {},
+    providerFailovers: {}
   };
 }
 
@@ -1341,7 +1346,8 @@ export class FleetStore {
       preferences: normalizePreferences(raw.preferences),
       organization: normalizeOrganization(raw.organization),
       followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
-      supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {}
+      supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {}
     };
   }
 
@@ -1557,6 +1563,26 @@ export class FleetStore {
     }
     this._save();
     return { ...entry };
+  }
+
+  // Which replacement session took over a failed one, for which failure. A
+  // later scan seeing the same failure on the old session must not fail it
+  // over again; a different failure (or a resumed session) may.
+  recordProviderFailover(oldKey, { newKey, failureSig } = {}) {
+    const key = String(oldKey ?? "").trim();
+    if (!key || !newKey) return null;
+    this.state.providerFailovers ??= {};
+    const entry = { newKey: String(newKey), failureSig: String(failureSig ?? ""), at: iso(this.now()) };
+    this.state.providerFailovers[key] = entry;
+    const keys = Object.keys(this.state.providerFailovers);
+    if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
+    this._save();
+    return { ...entry };
+  }
+
+  providerFailoverFor(oldKey) {
+    const entry = this.state.providerFailovers?.[String(oldKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   _save() {

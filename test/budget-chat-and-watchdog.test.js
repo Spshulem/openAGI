@@ -366,3 +366,113 @@ test("adaptive check-in timer estimates duration by work phase and surfaces over
   assert.equal(state.watchdog.items[0].threadKey, "paseo:srv_1.a1");
   assert.equal(state.watchdog.items[0].expectedMinutes, 25);
 });
+
+test("watchdog bookkeeping writes to a linked task do not reset its check-in timer", async (t) => {
+  // Regression (#332 review [2]): TaskStore.update() bumps task.updatedAt, so a
+  // progress anchor that included it reset an overdue session every scan.
+  const dataDir = makeTempDir(t, "watchdog-anchor-");
+  let now = Date.parse("2026-11-21T09:00:00.000Z");
+  const thread = {
+    key: "paseo:srv_1.a1",
+    kind: "paseo",
+    id: "a1",
+    title: "Fix mobile header alignment",
+    agentStatus: "running",
+    lastActivityAt: new Date(now - 35 * MIN).toISOString(),
+    lastUserText: "Fix the mobile header alignment",
+    prRefs: [],
+    meta: { serverId: "srv_1" }
+  };
+  const task = {
+    id: "task_1",
+    status: "in_progress",
+    createdAt: new Date(now - 2 * HOUR).toISOString(),
+    updatedAt: new Date(now - 40 * MIN).toISOString(),
+    statusHistory: [{ status: "in_progress", at: new Date(now - 40 * MIN).toISOString() }],
+    sourceMeta: { threadKey: thread.key }
+  };
+  const tasks = new Map([[task.id, task]]);
+  const writes = [];
+  const taskStore = {
+    tasks,
+    update(id, patch) {
+      const next = { ...tasks.get(id), ...patch, updatedAt: new Date(now).toISOString() };
+      tasks.set(id, next);
+      writes.push(next);
+      return next;
+    }
+  };
+  const sup = new FleetSupervisor({
+    dataDir,
+    runtime: { tasks: taskStore },
+    config: resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" }, { home: dataDir }),
+    skip: { bb3: true, github: true },
+    deps: { now: () => now, listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => sup.stop());
+
+  await sup.tick({ reason: "manual" });
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].sourceMeta.watchdog.status, "overdue");
+  // The watchdog's own write made updatedAt === now; the next scan must still see it overdue.
+  const est = estimateExpectedCheckIn(thread, { classified: { state: "running" }, task: tasks.get(task.id), now });
+  assert.equal(est.status, "overdue");
+  assert.equal(est.anchorAt, thread.lastActivityAt);
+
+  now += 5 * MIN;
+  await sup.tick({ reason: "manual" });
+  const latest = tasks.get(task.id);
+  assert.equal(latest.sourceMeta.watchdog.status, "overdue");
+  assert.equal(latest.sourceMeta.watchdog.checkInDueAt, writes[0].sourceMeta.watchdog.checkInDueAt);
+  assert.equal(sup.getState().watchdog.overdueCount, 1);
+});
+
+test("Paseo running session with recent tool activity is not marked stalled", async (t) => {
+  // Regression (#332 review [4]): the history cache keeps only messages and
+  // errors, so a tool call one minute ago was ignored when measuring silence.
+  const storeDir = makeTempDir(t, "paseo-tool-activity-");
+  const now = Date.now();
+  const threeHoursAgo = new Date(now - 3 * HOUR).toISOString();
+  const oneMinuteAgo = new Date(now - MIN).toISOString();
+  const timelineEntries = [
+    { timestamp: threeHoursAgo, item: { type: "user_message", messageId: "m1", text: "Run the staging QA analysis" } },
+    { timestamp: threeHoursAgo, item: { type: "assistant_message", messageId: "m2", text: "Starting the staging QA analysis now." } },
+    { timestamp: oneMinuteAgo, item: { type: "tool_call", name: "run_command", detail: { input: { command: "npm test" } } } }
+  ];
+  const agent = {
+    id: "tool-active-agent",
+    title: "Staging QA Report Analysis",
+    provider: "antigravity",
+    status: "running",
+    activeTurn: { turnId: "turn-1" },
+    cwd: "/home/dev/openAGI",
+    workspaceId: "openAGI",
+    updatedAt: threeHoursAgo,
+    lastUserMessageAt: threeHoursAgo,
+    pendingPermissions: []
+  };
+  const fakeFactory = () => ({
+    async connect() {},
+    async close() {},
+    hosts: { async list() { return { self: { serverId: "srv_local" }, hosts: [] }; } },
+    agents: {
+      async list() { return { entries: [{ agent }], pageInfo: { hasMore: false } }; },
+      ref() {
+        return {
+          async refresh() {},
+          current() { return agent; },
+          timeline: {
+            async refetch() {
+              return { agent, entries: timelineEntries, epoch: "e1", endCursor: { seq: timelineEntries.length }, hasNewer: false };
+            }
+          }
+        };
+      }
+    }
+  });
+
+  const cfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: storeDir });
+  const [thread] = await createPaseoSource({ factory: fakeFactory })(cfg);
+  assert.notEqual(thread.agentStatus, "stalled");
+  assert.equal(thread.meta.silentStuck, undefined);
+});

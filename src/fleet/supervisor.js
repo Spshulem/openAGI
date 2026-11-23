@@ -520,6 +520,37 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
   }
 }
 
+// Infra blocks the policy resolves without the owner: limits wait for their
+// reset, overload and network back off, codex-lb and BuildBot3 wait for
+// recovery.
+const SUPERVISOR_RECOVERED_INFRA = new Set(["usage-limit", "session-limit", "overloaded", "network", "lb", "bb3"]);
+
+// Identifies one failure of a session (its error, not the scan time), so a
+// failover is attempted once per failure.
+function failoverSignature(thread) {
+  return shortHash(JSON.stringify([
+    String(thread?.error?.kind ?? ""),
+    String(thread?.error?.text ?? "").slice(0, 300),
+    // When the error message was posted: a new failure is a new message.
+    String(thread?.error?.at ?? thread?.lastAgentAt ?? "")
+  ]));
+}
+
+// A goal the owner snoozed or paused, or whose last batch is done and waits
+// for the owner's sign-off, is never restarted automatically: the sign-off
+// request is surfaced by Active Work follow-through instead.
+function goalAcceptsAutoContinuation(goal, nowMs = Date.now()) {
+  if (!goal || goal.outcomeVerified || goal.state === "done" || goal.state === "paused") return false;
+  if (goal.state === "snoozed") {
+    const until = Date.parse(goal.snoozedUntil ?? "");
+    if (!Number.isFinite(until) || until > nowMs) return false;
+  }
+  if (goal.awaitingFollowup === true) return false;
+  if (goal.cursor && Number(goal.cursor.remaining) === 0) return false;
+  if (goal.remainingCountSource === "explicit" && goal.remainingCount === 0) return false;
+  return true;
+}
+
 function buildQuestionContextSnapshot(thread, pr) {
   if (!thread && !pr) return null;
   const rawWorkspace = typeof thread?.workspace === "string" ? thread.workspace.trim() : "";
@@ -2525,8 +2556,11 @@ export class FleetSupervisor {
     for (const watch of watches) {
       const sentMs = Date.parse(watch.sentAt ?? "") || started;
       const elapsedMs = Math.max(0, started - sentMs);
-      const thread = byKey.get(watch.threadKey) ?? this.lastThreads.get(watch.threadKey) ?? null;
+      const thread = byKey.get(watch.threadKey) ?? null;
       if (!thread) {
+        // A row kept from a source that failed this scan is not a current
+        // observation: its pre-send idle state must not settle the watch.
+        if (this.lastThreads.has(watch.threadKey)) continue;
         if (elapsedMs > 6 * 60 * MIN) {
           this.store.resolveFollowThroughWatch(watch.id, { outcome: "expired", detail: "session no longer visible in scan" });
         }
@@ -3029,7 +3063,8 @@ export class FleetSupervisor {
         preferredProviders: Array.isArray(preferredProviders) && preferredProviders.length
           ? preferredProviders
           : ["claude", "antigravity"],
-        factory: this.deps.paseoFactory
+        factory: this.deps.paseoFactory,
+        permissionMode: this.store.preferences()?.defaultPermissionMode ?? "bypass"
       });
     } catch (err) {
       return { ok: false, status: "failed", detail: clampText(err?.message ?? "Provider failover failed.", 220) };
@@ -3054,6 +3089,7 @@ export class FleetSupervisor {
       : 12;
     this.store.markCompletionReviewed(cleanKey, nowMs);
     this.store.mute(cleanKey, nowMs + muteHours * 60 * MIN);
+    this.store.recordProviderFailover(cleanKey, { newKey: switched.newKey, failureSig: failoverSignature(thread) });
 
     for (const q of this.store.openQuestions()) {
       const coversSingle = q.threadKey === cleanKey
@@ -4695,6 +4731,9 @@ export class FleetSupervisor {
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
         const resetAtMs = Date.parse(thread.error?.resetAt ?? "");
         if (Number.isFinite(resetAtMs) && resetAtMs > started && resetAtMs - started <= 20 * MIN) continue;
+        // Already handed off for this same failure: the replacement owns the
+        // work now, even after the old session's mute expires.
+        if (store.providerFailoverFor(thread.key)?.failureSig === failoverSignature(thread)) continue;
         const switched = await this.switchPaseoProvider(thread.key, {
           reason: classified.reason || thread.error?.text || "usage limit reached"
         });
@@ -4725,6 +4764,10 @@ export class FleetSupervisor {
       if (!thread?.key || thread.excluded || thread.archived) continue;
       if (askedThreadKeys.has(thread.key) || store.mutedUntil(thread.key)) continue;
       if (!classified || classified.state === "running" || classified.state === "waiting-ci") continue;
+      // A provider limit, overload or outage is the Supervisor's to wait out
+      // and resume (reset scheduling, backoff, provider failover): no
+      // "session hit an error" card and no precedent resend into it.
+      if (classified.state === "infra-blocked" && SUPERVISOR_RECOVERED_INFRA.has(classified.infraKind)) continue;
 
       const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? null);
       const attnReason = thread.meta?.requiresAttention === true ? String(thread.meta?.attentionReason ?? "") : "";
@@ -4775,6 +4818,7 @@ export class FleetSupervisor {
         if (
           this.mode === "auto"
           && activeGoal.permittedNudges === "resume_owner"
+          && goalAcceptsAutoContinuation(activeGoal, started)
           && ["idle-no-pr", "done"].includes(classified.state)
           && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
         ) {

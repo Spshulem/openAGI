@@ -316,22 +316,30 @@ export class AbiRuntime {
       const upgradeLegacyPulse = Boolean(
         existingPulse && !String(existingPulse.input?.prompt ?? "").includes("verify_goal_progress")
       );
-      this.cron.addJob({
-        id: "agent-pulse",
-        name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
-        enabled: existingPulse ? existingPulse.enabled !== false : true,
-        replace: upgradeLegacyPulse,
-        task: "autopilot",
-        intervalMs: autopilotMin * 60 * 1000,
-        ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
-        ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
-        input: {
-          agentId: "main",
-          prompt: AGENT_PULSE_PROMPT,
-          // Only fire (spend a base-model call) when there's queued agent work.
-          requireQueuedWork: true
-        }
-      });
+      if (upgradeLegacyPulse && typeof this.cron.updateJob === "function") {
+        // Upgrade only the prompt: the owner's saved cadence, timeout, enabled
+        // state, and next run stay exactly as they were configured.
+        this.cron.updateJob("agent-pulse", {
+          input: { ...(existingPulse.input ?? {}), prompt: AGENT_PULSE_PROMPT, requireQueuedWork: true }
+        });
+      } else {
+        this.cron.addJob({
+          id: "agent-pulse",
+          name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
+          enabled: existingPulse ? existingPulse.enabled !== false : true,
+          replace: upgradeLegacyPulse,
+          task: "autopilot",
+          intervalMs: autopilotMin * 60 * 1000,
+          ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
+          ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
+          input: {
+            agentId: "main",
+            prompt: AGENT_PULSE_PROMPT,
+            // Only fire (spend a base-model call) when there's queued agent work.
+            requireQueuedWork: true
+          }
+        });
+      }
       this.cron.addJob({
         id: "weekly-harsh-review",
         name: "Weekly harsh review",
@@ -1003,8 +1011,9 @@ export class AbiRuntime {
         this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
         // Respawn with the new code (systemd Restart=always / launchd
         // KeepAlive / Mac DaemonController bring it back). Defer so the
-        // tick result can flush first.
-        setTimeout(() => process.exit(0), 500);
+        // tick result can flush first. An unsupervised portable install
+        // reports restartRequired instead — exiting would never come back.
+        if (!result.restartRequired) setTimeout(() => process.exit(0), 500);
       }
       return result;
     }

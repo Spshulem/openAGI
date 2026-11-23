@@ -759,7 +759,7 @@ function resolveNudge(ctx, intent, base) {
   }
   const cooledAt = addMs(ledger.lastNudgeAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
-  const undelivered = undeliveredStreak(ledger, thread);
+  const undelivered = undeliveredStreak(ledger, thread, ctx.classified);
   if (undelivered) {
     // Asked once per failure streak: after the owner's answer it only retries.
     if (undeliveredAskDue(ctx, undelivered)) return undeliveredDecision(ctx, decision, undelivered);
@@ -1010,11 +1010,21 @@ function undeliveredAskDue(ctx, streak) {
   return streak.count >= UNDELIVERED_ASK_COUNT && ctx.now - Date.parse(streak.since) >= UNDELIVERED_ASK_MS;
 }
 
-function undeliveredStreak(ledger, thread) {
+function undeliveredStreak(ledger, thread, classified = null) {
   const streak = ledger?.undelivered;
   if (!streak?.count || !Number.isFinite(Date.parse(streak.lastAt ?? "")) || !Number.isFinite(Date.parse(streak.since ?? ""))) return null;
   const activity = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
-  return Number.isFinite(activity) && activity > Date.parse(streak.lastAt) ? null : streak;
+  if (Number.isFinite(activity) && activity > Date.parse(streak.lastAt)) return null;
+  // Sends refused between a provider limit and its reset met the quota, not
+  // a broken route: the resume after the reset is the first real attempt,
+  // and only a refusal after the reset builds a streak the owner hears.
+  if (classified?.state === "infra-blocked" && LIMIT_KINDS.has(classified.infraKind)) {
+    const errorAt = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
+    const resetAt = Date.parse(thread.error?.resetAt ?? "");
+    if (Number.isFinite(errorAt) && Number.isFinite(resetAt)
+      && Date.parse(streak.since) >= errorAt && Date.parse(streak.lastAt) <= resetAt) return null;
+  }
+  return streak;
 }
 
 // What the owner can do about a known failure.

@@ -1505,39 +1505,67 @@ export function registerCoreTools(registry, runtime) {
           customer: args.customer ?? null,
           goal: args.goal,
           doneCriteria: args.doneCriteria,
-          cadence: args.cadence ?? "daily",
-          permittedNudges: args.permittedNudges ?? "resume_owner",
-          threadKey: args.threadKey ?? null,
-          prRef: args.prRef ?? null,
-          linkedSkill: args.linkedSkill ?? null,
+          // Only settings the caller gave: an update that advances the cursor
+          // must not reset the saved owner, cadence or nudge policy.
+          ...(args.cadence !== undefined ? { cadence: args.cadence } : {}),
+          ...(args.permittedNudges !== undefined ? { permittedNudges: args.permittedNudges } : {}),
+          ...(args.threadKey !== undefined ? { threadKey: args.threadKey } : {}),
+          ...(args.prRef !== undefined ? { prRef: args.prRef } : {}),
+          ...(args.linkedSkill !== undefined ? { linkedSkill: args.linkedSkill } : {}),
+          creationDefaults: { cadence: "daily", permittedNudges: "resume_owner" },
           cursor: args.cursor ?? null,
           ...(Number.isInteger(args.cursor?.remaining) ? { remainingCount: args.cursor.remaining } : {})
         });
       }
-      const taskGoal = runtime.tasks?.addGoal
-        ? runtime.tasks.addGoal({
-            title: `${project}: ${args.goal}`.slice(0, 180),
-            description: `Done criteria: ${args.doneCriteria}${args.linkedSkill ? ` | Skill: ${args.linkedSkill}` : ""}`
-          })
+      const activeWorkId = tracked?.item?.id ?? null;
+      const goalTitle = `${project}: ${args.goal}`.slice(0, 180);
+      const goalDescription = `Done criteria: ${args.doneCriteria}${args.linkedSkill ? ` | Skill: ${args.linkedSkill}` : ""}`;
+      // Re-upserting the same goal (a new batch cursor) updates the task goal
+      // and its open continuation instead of queuing a duplicate whose stale
+      // cursor autopilot would also work.
+      let existingContinuation = openGoalContinuations(runtime.tasks, { activeWorkId })[0] ?? null;
+      const continuationGoal = existingContinuation?.parentGoalId
+        ? runtime.tasks?.getGoal?.(existingContinuation.parentGoalId) ?? null
         : null;
+      const existingGoal = (continuationGoal && !["completed", "cancelled"].includes(continuationGoal.status) ? continuationGoal : null)
+        ?? (runtime.tasks?.listGoals?.({ status: "active" }) ?? []).find((g) => g.title === goalTitle)
+        ?? null;
+      let taskGoal = null;
+      if (existingGoal) {
+        taskGoal = (existingGoal.description !== goalDescription && runtime.tasks?.updateGoal
+          ? runtime.tasks.updateGoal(existingGoal.id, { description: goalDescription })
+          : null) ?? existingGoal;
+      } else if (runtime.tasks?.addGoal) {
+        taskGoal = runtime.tasks.addGoal({ title: goalTitle, description: goalDescription });
+      }
+      existingContinuation ??= openGoalContinuations(runtime.tasks, { goalId: taskGoal?.id ?? null })[0] ?? null;
       let continuationTask = null;
       if ((args.enqueueContinuationTask === true || (Number.isInteger(args.cursor?.remaining) && args.cursor.remaining > 0)) && runtime.tasks?.add) {
-        continuationTask = runtime.tasks.add(
-          {
-            title: `Continue goal until done: ${args.goal}`.slice(0, 180),
-            description: `Done criteria: ${args.doneCriteria}\nCursor: ${JSON.stringify(args.cursor ?? {})}`,
-            bucket: "today",
-            priority: 80,
-            parentGoalId: taskGoal?.id ?? undefined,
-            sourceMeta: {
-              activeWorkId: tracked?.item?.id ?? null,
-              project,
-              linkedSkill: args.linkedSkill ?? null,
-              cursor: args.cursor ?? null
-            }
-          },
-          { source: "goal-ledger", queue: "agent" }
-        );
+        const description = `Done criteria: ${args.doneCriteria}\nCursor: ${JSON.stringify(args.cursor ?? {})}`;
+        const sourceMeta = {
+          ...(existingContinuation?.sourceMeta ?? {}),
+          activeWorkId: activeWorkId ?? existingContinuation?.sourceMeta?.activeWorkId ?? null,
+          project,
+          linkedSkill: args.linkedSkill ?? null,
+          cursor: args.cursor ?? null
+        };
+        continuationTask = existingContinuation && runtime.tasks.update
+          ? runtime.tasks.update(existingContinuation.id, {
+              description,
+              sourceMeta,
+              ...(taskGoal?.id && existingContinuation.parentGoalId !== taskGoal.id ? { parentGoalId: taskGoal.id } : {})
+            })
+          : runtime.tasks.add(
+              {
+                title: `Continue goal until done: ${args.goal}`.slice(0, 180),
+                description,
+                bucket: "today",
+                priority: 80,
+                parentGoalId: taskGoal?.id ?? undefined,
+                sourceMeta
+              },
+              { source: "goal-ledger", queue: "agent" }
+            );
       }
       return {
         ok: true,
@@ -1550,6 +1578,12 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "verify_goal_progress",
+    // Routine cursor/evidence updates run ungated. Recording the owner's
+    // sign-off (`ownerConfirmedDone`) closes the goal, so only the owner's
+    // own turn or an approved card may do it.
+    needsConfirmation: true,
+    confirmationRequired: (args) => args?.ownerConfirmedDone === true,
+    summarize: (args) => `Mark goal ${args.id} done (owner-confirmed): ${String(args.evidenceSummary ?? "").slice(0, 120)}`,
     description: "Update batch cursor/evidence on a tracked Goal and evaluate via deterministic checks + OpenAI /v1/decisions whether `doneCriteria` is genuinely accomplished (>= 0.85). If `remaining > 0` or `goal_accomplished < 0.85`, keeps the goal active and ensures the next continuation batch stays scheduled in `queue: 'agent'` instead of stopping prematurely.",
     parameters: {
       type: "object",
@@ -1572,14 +1606,16 @@ export function registerCoreTools(registry, runtime) {
       required: ["id", "evidenceSummary"],
       additionalProperties: false
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
+      if (args.ownerConfirmedDone === true && context?.__confirmed !== true) {
+        throw new Error("Recording owner-confirmed completion requires the owner's approval.");
+      }
       if (typeof runtime.fleetSupervisor?.verifyGoalProgress === "function" && String(args.id).startsWith("tw_")) {
         const verdict = await runtime.fleetSupervisor.verifyGoalProgress(args);
-        if (!verdict?.accomplished && runtime.tasks?.add) {
-          const openAgentTasks = runtime.tasks.list({ queue: "agent" }) ?? [];
-          const existing = openAgentTasks.find(
-            (t) => t.sourceMeta?.activeWorkId === args.id && !["completed", "cancelled"].includes(t.status)
-          );
+        if (verdict?.accomplished) {
+          retireGoalContinuations(runtime.tasks, { activeWorkId: args.id });
+        } else if (runtime.tasks?.add) {
+          const existing = openGoalContinuations(runtime.tasks, { activeWorkId: args.id })[0] ?? null;
           if (existing) {
             runtime.tasks.update(existing.id, {
               status: "pending",
@@ -1603,6 +1639,7 @@ export function registerCoreTools(registry, runtime) {
       }
       const remaining = Number.isInteger(args.cursor?.remaining) ? args.cursor.remaining : null;
       const accomplished = Boolean(args.ownerConfirmedDone === true || remaining === 0);
+      if (accomplished) retireGoalContinuations(runtime.tasks, { goalId: args.id });
       return {
         ok: true,
         id: args.id,
@@ -1887,6 +1924,29 @@ export function summarizeRegisterMcpServer(args = {}) {
     return `Register http MCP '${name}' → ${args.url ?? "(no url)"} (auth=${auth})`;
   }
   return `Register MCP '${name}' (${transport})`;
+}
+
+// Open agent-queue continuation tasks for a tracked goal, linked either by
+// Active Work id or by the task goal they roll up to.
+function openGoalContinuations(tasks, { activeWorkId = null, goalId = null } = {}) {
+  if ((!activeWorkId && !goalId) || typeof tasks?.list !== "function") return [];
+  return (tasks.list({ queue: "agent", status: "active", limit: Infinity }) ?? []).filter((t) =>
+    !["completed", "cancelled"].includes(t.status)
+    && ((activeWorkId && t.sourceMeta?.activeWorkId === activeWorkId)
+      || (goalId && t.source === "goal-ledger" && t.parentGoalId === goalId)));
+}
+
+// A goal with nothing left to do retires its queued continuations so
+// autopilot does not pick finished work back up with a stale cursor.
+function retireGoalContinuations(tasks, link) {
+  const retired = [];
+  for (const task of openGoalContinuations(tasks, link)) {
+    const done = typeof tasks.complete === "function"
+      ? tasks.complete(task.id, "goal-verified")
+      : tasks.update?.(task.id, { status: "completed", completedVia: "goal-verified" });
+    if (done) retired.push(task.id);
+  }
+  return retired;
 }
 
 // Schedules hold the owner's routines, prompts and recipients. Only the

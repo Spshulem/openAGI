@@ -99,11 +99,19 @@ test("OwnerPrecedentStore backfills FleetStore history, routes AppFolio to build
       },
       thread: {
         key: "paseo:srv_1.agent_ro",
-        meta: { pendingPermission: { command: "rg -n \"AppFolio\" src/" } }
+        meta: { pendingPermission: { command: "rg -n \"AppFolio\" src/", rawCommand: "rg -n \"AppFolio\" src/" } }
       }
     });
     assert.equal(roEval.matched, true);
     assert.equal(roEval.answer, "Allow");
+
+    // Only the complete command is approved by rule: a display excerpt alone
+    // (whitespace-collapsed, possibly truncated) is refused.
+    const excerptOnly = await precStore.evaluateCandidate({
+      question: { kind: "prompt", title: "CodexBash permission", body: "Run `rg -n x src/`", options: ["Allow", "Deny"] },
+      thread: { key: "paseo:srv_1.agent_ro2", meta: { pendingPermission: { command: "rg -n x src/" } } }
+    });
+    assert.notEqual(excerptOnly.precedentId, "prec_readonly_bash");
 
     // 2. AppFolio Lifecycles report blocked on prod MCP routes to buildbetter-staging MCP.
     const appfolioEval = await precStore.evaluateCandidate({
@@ -220,6 +228,31 @@ test("paseoThread detects [System Error] usage-limit on running sessions and swi
   assert.equal(createdSpec.cwd, "/home/dev/buildbetter");
   assert.equal(createdSpec.config.modeId, "bypassPermissions");
   assert.match(createdSpec.prompt, /Ship Bob unified chat experience/);
+
+  // The owner's saved "ask" policy survives failover: no silent escalation
+  // to bypassPermissions for the replacement session.
+  await failoverPaseoSessionProvider({
+    config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+    thread: mapped,
+    reason: mapped.error.text,
+    factory: fakeFactory,
+    permissionMode: "ask"
+  });
+  assert.equal(createdSpec.config.modeId, "default", "ask policy creates the Claude replacement in default (asking) mode");
+  await withTempDir(async (dir) => {
+    const askSup = new FleetSupervisor({
+      dataDir: dir,
+      config: { enabled: false, mode: "auto", paseo: { enabled: true, only: true } },
+      deps: { paseoFactory: fakeFactory },
+      skip: { bb3: true, github: true }
+    });
+    askSup.store.savePreferences({ ...askSup.store.preferences(), defaultPermissionMode: "ask" });
+    askSup.knownThreads.set(mapped.key, mapped);
+    createdSpec = null;
+    const viaSupervisor = await askSup.switchPaseoProvider(mapped.key, { reason: mapped.error.text });
+    assert.equal(viaSupervisor.ok, true);
+    assert.equal(createdSpec.config.modeId, "default", "supervisor failover honors the saved ask policy");
+  });
 
   // Full FleetSupervisor switchPaseoProvider check with ActiveWork ownership transfer.
   await withTempDir(async (dir) => {
@@ -427,7 +460,7 @@ test("editable skills (read_skill, update_skill, create_skill overwrite) and goa
       cursor: { total: 20, processed: 20, remaining: 0 },
       ownerConfirmedDone: true,
       evidenceSummary: "All 20 issues triaged and verified."
-    });
+    }, { __confirmed: true });
     assert.equal(finalCheck.accomplished, true);
     assert.equal(finalCheck.item.outcomeVerified, true);
   });
@@ -506,6 +539,29 @@ test("resolvePaseoAgentConfig & selectBestPaseoModel pick Opus 5.5 (never stale 
   const fuzzyOpusCfg = await resolvePaseoAgentConfig(mockApi, "/home/dev/buildbetter", { model: "opus" });
   assert.equal(fuzzyOpusCfg.model, "claude-opus-5-5");
   assert.equal(fuzzyOpusCfg.modeId, "bypassPermissions");
+});
+
+test("resolvePaseoAgentConfig fallback after failed discovery honors the default provider and the requested model's family", async () => {
+  // Regression (#332 review [28]): with discovery down the fallback dropped an
+  // Antigravity default and paired an explicit Claude model with Codex.
+  const failedApi = {
+    providers: {
+      waitForReady: async () => { throw new Error("timed out"); },
+      snapshot: async () => ({ entries: [] })
+    }
+  };
+  const antigravityDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { preferences: { defaultProvider: "antigravity" } });
+  assert.equal(antigravityDefault.provider, "antigravity/gemini-4-carbon-high");
+  assert.equal(antigravityDefault.model, "gemini-4-carbon-high");
+
+  const claudeOnCodexDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { model: "claude-sonnet-4-6", preferences: { defaultProvider: "codex" } });
+  assert.equal(claudeOnCodexDefault.provider, "claude/claude-sonnet-4-6");
+
+  const gptOnClaudeDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { model: "gpt-6.2-sol" });
+  assert.equal(gptOnClaudeDefault.provider, "codex/gpt-6.2-sol");
+
+  const codexDefault = await resolvePaseoAgentConfig(failedApi, "/home/dev/x", { preferences: { defaultProvider: "codex" } });
+  assert.equal(codexDefault.provider, "codex/gpt-6.2-sol");
 });
 
 test("groupQuestions and supervisor.act handle orphan ActiveWork ready PRs (threadKey: null) without throwing startsWith on null", async () => {

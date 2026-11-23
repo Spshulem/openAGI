@@ -2015,6 +2015,7 @@ private struct SupervisorCardDeckView: View {
     let onAct: (SupervisorCard, SupervisorCardAction) -> Void
 
     @State private var revealedPlanCardIDs: Set<String> = []
+    @State private var detailsContentHeight: CGFloat = 0
 
     private var card: SupervisorCard { cards[index] }
     private var isBusy: Bool { busyCardID == card.id }
@@ -2170,8 +2171,12 @@ private struct SupervisorCardDeckView: View {
                     .accessibilityIdentifier(contextID)
             }
 
-            // Fixed-height scrollable body so stepper controls never jump vertically
-            // and tapping anywhere on the summary opens full context.
+            // Scrollable body: tapping anywhere on the summary opens full
+            // context. It keeps the compact 145 pt floor so stepper controls
+            // stay put for short cards, and grows to 235 pt only when the
+            // card's content needs it. A fixed 235 pt, together with the
+            // voice bar and composer below, left a folded phone's chat
+            // history about one line tall.
             ScrollView(.vertical, showsIndicators: true) {
                 cardDetailsContent
                     .padding(.trailing, 2)
@@ -2181,7 +2186,12 @@ private struct SupervisorCardDeckView: View {
                         }
                     }
             }
-            .frame(height: 235)
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentSize.height
+            } action: { _, height in
+                detailsContentHeight = height
+            }
+            .frame(height: min(max(detailsContentHeight, 145), 235))
 
             if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
