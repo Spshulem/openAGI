@@ -300,11 +300,15 @@ export class RemoteFleetSupervisor {
   // The fleet computer's own receipt for an owner message sent since
   // startedAt (its journal hashes the text as it went into the chat), or
   // null. Refreshes first: after a lost reply the last state predates it.
-  async findSendReceipt(threadKey, message, startedAt) {
+  // known: receipt ids that already existed when this request started. They
+  // belong to earlier sends (the same short text can be sent twice on
+  // purpose) and never count as this one's.
+  async findSendReceipt(threadKey, message, startedAt, known = new Set()) {
     try { await this.refresh(); } catch { /* still unreachable: judge on what is here */ }
     const hash = shortHash(withSupervisorPrefix(message));
     const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
     return actions.findLast((action) => action?.threadKey === threadKey
+      && !known.has(action.id)
       && action.playbook === 'owner-message'
       && action.messageHash === hash
       && (Date.parse(action.finishedAt ?? action.at ?? '') || 0) >= startedAt - RECEIPT_SKEW_MS) ?? null;
@@ -387,6 +391,7 @@ export class RemoteFleetSupervisor {
     // chat's host is offline.
     const body = { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
     const startedAt = Date.now();
+    const known = new Set((Array.isArray(this.state.actions) ? this.state.actions : []).map((action) => action?.id).filter(Boolean));
     const attempts = [];
     for (let attempt = 1; ; attempt += 1) {
       try {
@@ -397,7 +402,7 @@ export class RemoteFleetSupervisor {
       } catch (error) {
         attempts.push(attemptSummary(attempt, error));
         if (error.uncertain) {
-          const receipt = await this.findSendReceipt(threadKey, message, startedAt);
+          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known);
           if (receipt) {
             return { delivery: { status: receipt.status, route: receipt.route ?? null,
               detail: `${clampText(receipt.detail ?? '', 160)} (the fleet computer's receipt; its reply to this request was lost)`,
@@ -419,7 +424,7 @@ export class RemoteFleetSupervisor {
         // It never reached the computer, so nothing went out; but if an
         // earlier reply was lost, its receipt says so before sending again.
         await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
-        const receipt = await this.findSendReceipt(threadKey, message, startedAt);
+        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known);
         if (receipt?.status === 'sent') {
           return { delivery: { status: 'sent', route: receipt.route ?? null, detail: clampText(receipt.detail ?? '', 200), actionId: receipt.id ?? null, reconciled: true, attempts } };
         }
