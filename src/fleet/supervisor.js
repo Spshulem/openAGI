@@ -520,6 +520,11 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
   }
 }
 
+// Infra blocks the policy resolves without the owner: limits wait for their
+// reset, overload and network back off, codex-lb and BuildBot3 wait for
+// recovery.
+const SUPERVISOR_RECOVERED_INFRA = new Set(["usage-limit", "session-limit", "overloaded", "network", "lb", "bb3"]);
+
 // Identifies one failure of a session (its error, not the scan time), so a
 // failover is attempted once per failure.
 function failoverSignature(thread) {
@@ -4709,6 +4714,10 @@ export class FleetSupervisor {
       if (!thread?.key || thread.excluded || thread.archived) continue;
       if (askedThreadKeys.has(thread.key) || store.mutedUntil(thread.key)) continue;
       if (!classified || classified.state === "running" || classified.state === "waiting-ci") continue;
+      // A provider limit, overload or outage is the Supervisor's to wait out
+      // and resume (reset scheduling, backoff, provider failover): no
+      // "session hit an error" card and no precedent resend into it.
+      if (classified.state === "infra-blocked" && SUPERVISOR_RECOVERED_INFRA.has(classified.infraKind)) continue;
 
       const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? null);
       const attnReason = thread.meta?.requiresAttention === true ? String(thread.meta?.attentionReason ?? "") : "";

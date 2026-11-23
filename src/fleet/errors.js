@@ -76,8 +76,15 @@ export function parseResetAt(text, now = new Date()) {
   return date.toISOString();
 }
 
+// Providers print their notices with typographic quotes: Codex's quota
+// message reads "You\u2019ve hit your usage limit", which no rule written
+// with a straight apostrophe matches. Rules see one apostrophe form.
+function plainQuotes(text) {
+  return String(text ?? "").replace(/[\u2018\u2019\u02BC\u2032\uFF07]/g, "'");
+}
+
 export function classifyErrorText(text, now = new Date()) {
-  const source = String(text ?? "");
+  const source = plainQuotes(text);
   if (!source.trim()) return null;
   for (const rule of RULES) {
     if (rule.pattern.test(source)) {
@@ -110,7 +117,8 @@ export function providerAuthDetail(text) {
 // Codex task_complete.error codes map straight to kinds; "other" falls back
 // to the message text. An explicit auth_not_found in the message wins over
 // the code: Codex reports the proxy's 503 as server_overloaded.
-export function classifyCodexErrorCode(code, message, now = new Date()) {
+export function classifyCodexErrorCode(code, rawMessage, now = new Date()) {
+  const message = rawMessage == null ? rawMessage : plainQuotes(rawMessage);
   if (PROVIDER_AUTH.test(String(message ?? ""))) return { kind: "provider-auth", resetAt: null };
   const normalized = String(code ?? "").toLowerCase();
   if (normalized === "usage_limit_exceeded" || normalized === "usagelimitexceeded") {

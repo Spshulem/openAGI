@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { writeJsonAtomic } from "../file-utils.js";
 import { clampText, redactSecrets } from "./contracts.js";
-import { withPaseo, hostApi } from "./sources/paseo.js";
+import { withPaseo, hostApi, providerLimitNotice } from "./sources/paseo.js";
 
 const active = new Set();
 
@@ -97,7 +97,8 @@ function detectImmediatePaseoSystemError(history, receipt) {
     if (entry?.item?.type === "error") {
       return clampText(redactSecrets(String(entry.item.message ?? "Paseo runtime error")), 160);
     }
-    if (entry?.item?.type === "assistant_message" && /^\[System Error\]/i.test(String(entry.item.text ?? "").trim())) {
+    const said = String(entry?.item?.text ?? "").trim();
+    if (entry?.item?.type === "assistant_message" && (/^\[System Error\]/i.test(said) || providerLimitNotice(said))) {
       return clampText(redactSecrets(String(entry.item.text ?? "").replace(/^\[System Error\]\s*/i, "")), 160);
     }
   }
@@ -619,9 +620,29 @@ async function respondPaseoPermission(api, ref, agentId, requestId, response) {
   throw new Error("Paseo client does not support respondToPermission");
 }
 
+// Provider account limits the Supervisor waits out and then resumes itself.
+const LIMIT_KINDS = new Set(["usage-limit", "session-limit"]);
+// Failures a plain resend clears once the provider recovers: the policy's
+// own "resume" after a limit reset or an overload backoff.
+const RESUMABLE_ERROR_KINDS = new Set([...LIMIT_KINDS, "overloaded", "network"]);
+
+// A limit whose reset is still ahead: no send can run a turn before it.
+function limitHeld(thread, nowMs = Date.now()) {
+  const error = thread?.error;
+  if (!LIMIT_KINDS.has(error?.kind)) return null;
+  const resetMs = Date.parse(error.resetAt ?? "");
+  return Number.isFinite(resetMs) && resetMs > nowMs ? new Date(resetMs).toISOString() : null;
+}
+
 function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRecovery = false, errorRecovery = false } = {}) {
   if (!agent || agent.archivedAt) return "Paseo chat is active, closed, or unavailable";
   if (!ownerInitiated && agent.status === "closed") return "Paseo chat is active, closed, or unavailable";
+  // A chat stopped on its own error is not a route that failed: say so,
+  // rather than the generic refusal that hid Codex's quota notice.
+  if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && agent.status === "error" && !agent.activeTurn) {
+    const kind = thread?.error?.kind;
+    return `Paseo chat stopped on ${kind && kind !== "other" ? `a ${kind} error` : "an error"}; only Supervisor error recovery resends`;
+  }
   if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
   if (errorRecovery && (!["idle", "error"].includes(agent.status) || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
   if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
@@ -649,7 +670,14 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const errorRecovery = !ownerInitiated && (
     base?.playbook === "error-retry"
     || String(base?.playbook ?? "").startsWith("precedent:")
+    // The policy's resume after a limit reset or an overload backoff: the
+    // chat still shows the error status until a new turn runs.
+    || (base?.playbook === "resume" && RESUMABLE_ERROR_KINDS.has(thread?.error?.kind))
   );
+  // Before a limit resets, a send only meets the same quota notice. The
+  // Supervisor resumes the chat after the reset; this is no delivery failure.
+  const heldUntil = ownerInitiated ? null : limitHeld(thread);
+  if (heldUntil) return blocked(`Provider ${thread.error.kind} until ${heldUntil}; Supervisor resumes after the reset`);
   const normalizedImages = normalizePaseoImages(images);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
@@ -674,7 +702,14 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       if (previous?.pending) {
         const priorCheck = await readPaseoConfirmation(ref, previous, signal, save, Infinity, { ownerInitiated });
         signal.throwIfAborted();
-        if (!priorCheck.confirmed) {
+        if (priorCheck.systemError) {
+          // The earlier message reached the chat (its own ID is in the
+          // timeline) and the turn it started then failed: delivered, not
+          // undeliverable. Settle it, and reassess on the next scan, which
+          // sees the failure (a quota waits for its reset).
+          writeJsonAtomic(file, { ...previous, pending: false, executionError: priorCheck.systemError });
+          if (!ownerInitiated) return blocked(`Previous nudge was delivered; its turn then failed (${priorCheck.systemError}); reassess before another send`);
+        } else if (!priorCheck.confirmed) {
           if (!ownerInitiated) return blocked("Previous delivery has no confirmed turn; no automatic resend");
           // Owner explicitly initiated a new send; clear stale unconfirmed marker so older background nudges never brick manual coordination.
           writeJsonAtomic(file, { ...previous, pending: false });
