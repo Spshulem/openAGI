@@ -859,27 +859,36 @@ async function fleetSendStillValid(supervisor, args, action) {
 // When the supervisor itself last wrote to a chat: the reader's stamp of its
 // newest message there, and the chat's sent (or possibly sent) deliveries in
 // the journal, as [earliest, latest] times that message may carry.
+// stamps: the reader's own record of the supervisor's newest message (exact
+// to a few seconds); receipts: the journal's sends, whose window is wider.
 function supervisorWriteMarks(state, key, thread, row) {
-  const marks = [];
+  const stamps = [];
+  const receipts = [];
   for (const at of [thread?.meta?.lastSupervisorAt, row?.meta?.lastSupervisorAt, row?.lastSupervisorAt]) {
     const ms = Date.parse(at ?? "");
-    if (Number.isFinite(ms)) marks.push([ms - SUPERVISOR_STAMP_SKEW_MS, ms + SUPERVISOR_STAMP_SKEW_MS]);
+    if (Number.isFinite(ms)) stamps.push([ms - SUPERVISOR_STAMP_SKEW_MS, ms + SUPERVISOR_STAMP_SKEW_MS]);
   }
   for (const entry of Array.isArray(state?.actions) ? state.actions : []) {
     if (entry?.threadKey !== key || !SUPERVISOR_WROTE.has(entry.status)) continue;
     const end = Date.parse(entry.finishedAt ?? entry.at ?? "");
     if (!Number.isFinite(end)) continue;
     const start = Date.parse(entry.apiStartedAt ?? "");
-    marks.push([Number.isFinite(start) ? start - SUPERVISOR_STAMP_SKEW_MS : end - SUPERVISOR_DELIVERY_WINDOW_MS, end + SUPERVISOR_STAMP_SKEW_MS]);
+    receipts.push([Number.isFinite(start) ? start - SUPERVISOR_STAMP_SKEW_MS : end - SUPERVISOR_DELIVERY_WINDOW_MS, end + SUPERVISOR_STAMP_SKEW_MS]);
   }
-  return marks;
+  return { stamps, receipts };
 }
 
-function supervisorWrote(ms, text, marks) {
+// text: the chat's own text for that turn when the reader had it ("" when
+// its window held no owner turn), undefined when it did not travel (a
+// remote snapshot row). Without it, only the reader's exact stamp counts:
+// a receipt window could otherwise hide a real owner turn.
+function supervisorWrote(ms, text, { stamps, receipts }) {
   if (String(text ?? "").startsWith(SUPERVISOR_PREFIX)) return true;
   // A chat's own text for the owner's turn is never the supervisor's.
   if (String(text ?? "").trim()) return false;
-  return marks.some(([from, to]) => ms >= from && ms <= to);
+  const within = ([from, to]) => ms >= from && ms <= to;
+  if (stamps.some(within)) return true;
+  return typeof text === "string" && receipts.some(within);
 }
 
 function fleetCardTarget(supervisor, args = {}) {

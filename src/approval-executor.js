@@ -24,8 +24,10 @@ export async function executeApprovedAction(runtime, id, { decidedBy = "user", c
     : staleVerdict(await runtime.tools?.approvalStillValid?.(action));
   const stale = verdict?.reason ?? null;
   if (stale) {
-    runtime.pendingActions.expire?.(id, stale);
-    const reraised = verdict.reraise ? reraiseStaleApproval(runtime, action, stale) : null;
+    // Re-raised only if this call retired it: a card denied or run on
+    // another surface meanwhile stays as it is.
+    const expired = runtime.pendingActions.expire?.(id, stale) ?? null;
+    const reraised = verdict.reraise && expired ? reraiseStaleApproval(runtime, action, stale) : null;
     // Nothing ran: say so in words a model cannot read as "on its way".
     const error = reraised
       ? `${stale} Nothing was sent or started. A fresh approval is waiting${reraised.confirmCode ? ` (code ${reraised.confirmCode})` : ""}; approve it to send.`
