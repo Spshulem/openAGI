@@ -11,6 +11,7 @@ import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
+import { classifyAsk, decisionContextFromQuestion, decisionSummary, shouldHoldForContext } from './decision-context.js';
 import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
 import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
@@ -905,18 +906,23 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
+    const nowMs = Date.now();
     for (const q of liveQuestions) {
+      const ctx = q.kind === 'storage' ? null : decisionContextFromQuestion(q);
+      // Held on the coding node while its agent supplies context: the hub
+      // waits too, instead of posting the context-poor ask early.
+      if (ctx && shouldHoldForContext(q, ctx, nowMs)) continue;
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'
         ? { title: q.title, summary: 'Storage cleanup can permanently delete files. Review the full warning and choose in the main app.', actions: ['dismiss'] }
-        : { title: q.title, summary: q.card || q.body, actions: outreachActions(q.options) };
+        : { title: q.title, summary: decisionSummary(ctx, q.card || q.body, { maxChars: 1400 }), actions: outreachActions(q.options) };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
       const item = (last && outreach.reopen?.(last.id))
         || outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
-          ...shown, needsDecision: true, dedupeOpen: true });
+          ...shown, needsDecision: classifyAsk(q) === 'decision', dedupeOpen: true });
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
     }

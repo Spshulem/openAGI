@@ -69,7 +69,10 @@ test('persists host correlation and accepts an exact returned turn without guess
   ? { epoch: 'epoch-1', endCursor: { epoch: 'epoch-1', seq: 10 }, agent: f.ref.current(), entries: [] }
   : { agent: { ...f.ref.current(), status: 'running', activeTurn: { turnId: 'turn-1', startedAt: '2026-01-01T00:00:01Z' } }, entries: [] };
  assert.equal((await deliverPaseo(f.args)).status, 'sent');
- assert.deepEqual(receipt(f), {
+ const saved = receipt(f);
+ assert.match(saved.sentAt, /^\d{4}-\d\d-\d\dT/);
+ delete saved.sentAt;
+ assert.deepEqual(saved, {
   messageId: f.sent[0].options.messageId,
   clientMessageId: f.sent[0].options.messageId,
   messageHash: 'hash',
