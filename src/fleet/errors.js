@@ -5,6 +5,8 @@
 
 const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
+const PROVIDER_AUTH = /\bauth_not_found\b|\bno auth available\b/i;
+
 const RULES = [
   // Order matters: the most specific signal wins.
   { kind: "model-limit", pattern: /You've reached your \w[\w .-]* limit|Switch to another model|Selected model is at capacity|model is at capacity/i },
@@ -15,6 +17,12 @@ const RULES = [
   // read as overloaded. The quota resets on its own, so it waits like a cap.
   { kind: "usage-limit", pattern: /Individual quota reached|\bQUOTA_EXHAUSTED\b|exhausted your quota on this model/i },
   { kind: "logged-out", pattern: /Not logged in|Please run \/login|authentication_failed|OAuth token (?:has )?expired/i },
+  // A model proxy with no signed-in account for the provider answers
+  // "503 Service Unavailable: auth_not_found: no auth available
+  // (providers=codex, model=...)". The structured code is explicit, so it
+  // wins over the generic 503 (overloaded) and LB rules below: resending
+  // continue fails the same way until someone fixes the proxy's auth.
+  { kind: "provider-auth", pattern: PROVIDER_AUTH },
   { kind: "disk-full", pattern: /ENOSPC|no space left on device/i },
   { kind: "lb", pattern: /No available accounts|degraded mode|session bridge is cooling down|Previous response owner account|Invalid [`']?previous_response_id|continuity sources conflict|CODEX_LB_API_KEY|100\.99\.3\.113:2455|Incorrect API key provided/i },
   { kind: "overloaded", pattern: /\b529\b|Overloaded|MODEL_CAPACITY_EXHAUSTED|PREFILL_QUEUE_OVERLOADED|servers are experiencing high traffic|server_overloaded|serverOverloaded|\b50[0234]\b.*(?:error|Internal|Bad Gateway|Unavailable)|Internal server error|rate_limit_error|\b429\b/i },
@@ -68,8 +76,15 @@ export function parseResetAt(text, now = new Date()) {
   return date.toISOString();
 }
 
+// Providers print their notices with typographic quotes: Codex's quota
+// message reads "You\u2019ve hit your usage limit", which no rule written
+// with a straight apostrophe matches. Rules see one apostrophe form.
+function plainQuotes(text) {
+  return String(text ?? "").replace(/[\u2018\u2019\u02BC\u2032\uFF07]/g, "'");
+}
+
 export function classifyErrorText(text, now = new Date()) {
-  const source = String(text ?? "");
+  const source = plainQuotes(text);
   if (!source.trim()) return null;
   for (const rule of RULES) {
     if (rule.pattern.test(source)) {
@@ -80,9 +95,31 @@ export function classifyErrorText(text, now = new Date()) {
   return null;
 }
 
+// The provider and model a provider-auth failure names, from its
+// "(providers=codex, model=gpt-6.2-sol)" suffix. Only these two names are
+// kept, each limited to identifier characters, so nothing else from the
+// error (a header, a key, an account) reaches the owner.
+const AUTH_FIELD = /\b(providers?|model)\s*=\s*([A-Za-z0-9._:/-]{1,64}(?:\s*[,|]\s*(?![A-Za-z]+\s*=)[A-Za-z0-9._:/-]{1,64})*)/gi;
+
+export function providerAuthDetail(text) {
+  const source = String(text ?? "");
+  if (!PROVIDER_AUTH.test(source)) return null;
+  let providers = [];
+  let model = null;
+  for (const match of source.matchAll(AUTH_FIELD)) {
+    const values = match[2].split(/\s*[,|]\s*/).filter(Boolean);
+    if (/^model$/i.test(match[1])) model ??= values[0] ?? null;
+    else if (!providers.length) providers = [...new Set(values)].slice(0, 4);
+  }
+  return { providers, model };
+}
+
 // Codex task_complete.error codes map straight to kinds; "other" falls back
-// to the message text.
-export function classifyCodexErrorCode(code, message, now = new Date()) {
+// to the message text. An explicit auth_not_found in the message wins over
+// the code: Codex reports the proxy's 503 as server_overloaded.
+export function classifyCodexErrorCode(code, rawMessage, now = new Date()) {
+  const message = rawMessage == null ? rawMessage : plainQuotes(rawMessage);
+  if (PROVIDER_AUTH.test(String(message ?? ""))) return { kind: "provider-auth", resetAt: null };
   const normalized = String(code ?? "").toLowerCase();
   if (normalized === "usage_limit_exceeded" || normalized === "usagelimitexceeded") {
     return { kind: "usage-limit", resetAt: parseResetAt(message, now) };
