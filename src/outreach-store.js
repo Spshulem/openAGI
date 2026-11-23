@@ -125,6 +125,11 @@ export class OutreachStore {
     if ("title" in patch) next.title = String(patch.title ?? "").trim() || "(untitled)";
     if ("summary" in patch) next.summary = String(patch.summary ?? "");
     if ("actions" in patch) next.actions = Array.isArray(patch.actions) ? patch.actions : [];
+    if ("sourceRef" in patch) {
+      next.sourceRef = patch.sourceRef && typeof patch.sourceRef === "object"
+        ? structuredClone(patch.sourceRef)
+        : null;
+    }
     const changed = Object.keys(next).filter((key) => JSON.stringify(i[key]) !== JSON.stringify(next[key]));
     if (!changed.length) return i;
     for (const key of changed) i[key] = next[key];

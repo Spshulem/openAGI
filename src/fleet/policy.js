@@ -213,7 +213,19 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
-    case "stopped": return nudge("resume", classified.reason);
+    case "stopped": {
+      if (classified.snag?.playbook === "status-check") {
+        return nudge("status-check", classified.reason, {
+          vars: { what: "a long-running turn", quiet: String(classified.snag.silentMinutes ?? 120) }
+        });
+      }
+      if (classified.snag?.playbook === "unblock-snag") {
+        return nudge("unblock-snag", classified.reason, {
+          vars: { snag: classified.snag.snagLabel ?? "a blocker" }
+        });
+      }
+      return nudge("resume", classified.reason);
+    }
     // It said it would keep going ("Next: ...", "merging once they pass"),
     // then its turn ended: nothing wakes it but a nudge. A finished report
     // is left alone.
@@ -514,7 +526,7 @@ function cardIntent(ctx, card) {
   const late = card.app === "codex" && now - Date.parse(oldest.at ?? "") >= CARD_STALE_MS;
   const namedHeader = item.header && !/^question\s+\d+$/i.test(String(item.header).trim()) ? item.header : null;
   const head = clampText(namedHeader || item.question, 50);
-  const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join(" ");
+  const choices = item.options.map((label, i) => `${i + 1}. ${label}`).join("\n");
   const extra = item.multiSelect ? " Pick any." : "";
   const others = items.filter((other) => other !== item).map((other) => {
     const label = /^question\s+\d+$/i.test(String(other.header ?? "").trim())
@@ -523,7 +535,7 @@ function cardIntent(ctx, card) {
     return clampText(label, 60);
   });
   const also = others.length ? `Also open: ${others.join(" | ")}` : "";
-  const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join(" ");
+  const body = [item.question, choices, item.freeText ? `Or your own answer.${extra}` : extra.trim(), also].filter(Boolean).join("\n");
   const key = `card:${thread.key}:${oldest.itemId}`;
   const count = items.length > 1 ? ` (${items.length} open)` : "";
   const rawChoices = card.app === "paseo" && items.length === 1 && item.options.length > 0 && !item.multiSelect
@@ -535,15 +547,15 @@ function cardIntent(ctx, card) {
     ? [...rawChoices.map((opt, idx) => (needsNumberPrefix ? clampText(`${idx + 1}. ${opt}`, 40) : opt)), "open thread"]
     : ["open thread"];
   const question = {
-    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: limits.cardBodyMax }),
+    ...clampQuestion({ title: `${late ? "Still open: " : ""}${ctx.facts.label}: ${head}${count}`, body: stripTags(redactSecrets(body)), options: inlineOptions, dedupeKey: late ? `${key}:late` : key, kind: "agent-card" }, { ...limits, bodyMax: Math.max(limits.cardBodyMax ?? 900, 1200) }),
     // The raw labels, for answering in the app later; never sent to an agent.
     meta: {
       app: card.app, cardId: String(card.cardId), itemId: String(item.itemId), itemIds: items.map((open) => String(open.itemId)),
       items: items.map((open) => ({
         itemId: String(open.itemId),
         source: { app: card.app, cardId: String(card.cardId), itemId: String(open.itemId), threadKey: thread.key },
-        question: clampText(stripTags(open.question || open.header || "Owner decision"), 180),
-        options: open.options.map((option) => clampText(option, 80)),
+        question: clampText(stripTags(open.question || open.header || "Owner decision"), 260),
+        options: open.options.map((option) => clampText(option, 240)),
         multiSelect: open.multiSelect === true,
         freeText: open.freeText === true
       })),
@@ -635,12 +647,16 @@ function agentAskIntent(ctx) {
         ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["opened", "later"], `prompt:${thread.key}`, "prompt")
     };
   }
-  const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
+  const topicTitle = ask.wall ? "hit an access or login wall. Unblock?" : (TOPIC_TITLES[ask.topic] ?? "asks you. Answer?");
   // A "Blocked on:" ask brings its own answers ("open thread" at least).
-  const options = ask.structured || ask.blocked ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
+  const options = ask.structured || ask.blocked || ask.wall ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   // A "Blocked on:" item that points at a list ("the two P1s above") shows it.
   const excerpt = ownerExcerpt(ask.context ? `${ask.text}: ${ask.context}` : ask.text || thread.lastAgentText, ctx.limits.bodyMax);
   // A sealed Codex ask brings its own key: its shown text is a stand-in.
+  const askMeta = {
+    ...(thread.meta?.hasPlanArtifact ? { hasPlanArtifact: "true" } : {}),
+    ...(ask.wall ? { wall: "true" } : {})
+  };
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
     question: {
@@ -650,7 +666,7 @@ function agentAskIntent(ctx) {
       // The body is only the ask sentence; the review needs what it is about.
       askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
       agentAskedAt: thread.lastAgentAt ?? null,
-      ...(thread.meta?.hasPlanArtifact ? { meta: { hasPlanArtifact: "true" } } : {})
+      ...(Object.keys(askMeta).length ? { meta: askMeta } : {})
     }
   };
 }
@@ -743,7 +759,7 @@ function resolveNudge(ctx, intent, base) {
   }
   const cooledAt = addMs(ledger.lastNudgeAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
-  const undelivered = undeliveredStreak(ledger, thread);
+  const undelivered = undeliveredStreak(ledger, thread, ctx.classified);
   if (undelivered) {
     // Asked once per failure streak: after the owner's answer it only retries.
     if (undeliveredAskDue(ctx, undelivered)) return undeliveredDecision(ctx, decision, undelivered);
@@ -994,11 +1010,21 @@ function undeliveredAskDue(ctx, streak) {
   return streak.count >= UNDELIVERED_ASK_COUNT && ctx.now - Date.parse(streak.since) >= UNDELIVERED_ASK_MS;
 }
 
-function undeliveredStreak(ledger, thread) {
+function undeliveredStreak(ledger, thread, classified = null) {
   const streak = ledger?.undelivered;
   if (!streak?.count || !Number.isFinite(Date.parse(streak.lastAt ?? "")) || !Number.isFinite(Date.parse(streak.since ?? ""))) return null;
   const activity = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
-  return Number.isFinite(activity) && activity > Date.parse(streak.lastAt) ? null : streak;
+  if (Number.isFinite(activity) && activity > Date.parse(streak.lastAt)) return null;
+  // Sends refused between a provider limit and its reset met the quota, not
+  // a broken route: the resume after the reset is the first real attempt,
+  // and only a refusal after the reset builds a streak the owner hears.
+  if (classified?.state === "infra-blocked" && LIMIT_KINDS.has(classified.infraKind)) {
+    const errorAt = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
+    const resetAt = Date.parse(thread.error?.resetAt ?? "");
+    if (Number.isFinite(errorAt) && Number.isFinite(resetAt)
+      && Date.parse(streak.since) >= errorAt && Date.parse(streak.lastAt) <= resetAt) return null;
+  }
+  return streak;
 }
 
 // What the owner can do about a known failure.

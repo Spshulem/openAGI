@@ -8,7 +8,7 @@ import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZ
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
 import { agentTurnTask } from "./model-router.js";
-import { authorityRecord, isOwnerPrincipal, matchConfirmation, matchConfirmations, ownerIntentText } from "./owner-authority.js";
+import { authorityRecord, isOwnerPrincipal, matchConfirmation, matchConfirmations, ownerIntentText, parseDirectBudgetCommand } from "./owner-authority.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { GET_STARTED_GUIDANCE } from "./get-started.js";
 import { LEARNED_HEADS, learnedModeFor, patchOutcomeMetadata } from "./learning/learned-scores.js";
@@ -19,6 +19,7 @@ import { clusterRuleFires } from "./propagation-controller.js";
 // scoped allowlist (selected at propagation from the bounded scope).
 const SPECIALIST_CORE_TOOLS = [
   "recall", "remember",
+  "get_budget", "update_budget",
   // A routed owner turn must still be able to set up or change a schedule.
   "schedule_message", "list_cron_jobs", "update_cron_job", "cancel_cron_job",
   "list_tasks", "agent_pick_next", "complete_task", "move_task", "save_draft"
@@ -176,7 +177,111 @@ export class AgentHost {
     });
 
     let assistantPersisted = false;
+    let preConfirmed = null;
     try {
+    // Allow the authenticated owner to approve/deny a pending budget card or
+    // run a direct budget top-up/limit command even while the daily budget is
+    // currently exhausted (0 LLM tokens required).
+    const isBudgetCurrentlyBlocked = () => {
+      try {
+        this.modelProvider.budgetGuard?.check?.();
+        return false;
+      } catch (err) {
+        return classifyAgentFailure(err).code === "budget";
+      }
+    };
+    if (principal && !ephemeral && isBudgetCurrentlyBlocked()) {
+      const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
+      const spoken = principal.via === "voice" ? matchConfirmation(text) : null;
+      const spokenBatch = principal.via !== "voice" ? matchConfirmations(text) : null;
+      if (spoken) {
+        preConfirmed = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+      } else if (spokenBatch) {
+        preConfirmed = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+      }
+      if (preConfirmed && isBudgetCurrentlyBlocked()) {
+        const statusNow = this.runtime.budget?.status?.();
+        const replyText = preConfirmed.decision === "deny"
+          ? `Cancelled pending action${preConfirmed.code ? ` (code ${preConfirmed.code})` : ""}. Daily budget remains $${Number(statusNow?.effectiveLimitUsd ?? statusNow?.dailyUsdLimit ?? 0).toFixed(2)}.`
+          : `Processed confirmation${preConfirmed.code ? ` (code ${preConfirmed.code})` : ""}: ${preConfirmed.status}.`;
+        const sessionAfter = this.store.appendMessage(sessionId, {
+          role: "assistant",
+          content: replyText,
+          agentId,
+          channel,
+          from: "openagi",
+          metadata: {
+            provider: "internal",
+            model: "budget-guard",
+            ...(requestId ? { requestId } : {}),
+            ownerTurn: { untrusted: false }
+          }
+        });
+        assistantPersisted = true;
+        reportProgress("complete", {
+          session: { id: sessionAfter.id, messageCount: sessionAfter.messages.length },
+          sessionId: sessionAfter.id
+        });
+        return {
+          id: createId("turn"),
+          createdAt: nowIso(),
+          agent,
+          session: { id: sessionAfter.id, messageCount: sessionAfter.messages.length },
+          reply: replyText,
+          model: { provider: "internal", model: "budget-guard", configured: this.modelProvider.isConfigured() },
+          output: null
+        };
+      }
+      const directBudget = !preConfirmed && principal.via !== "voice" ? parseDirectBudgetCommand(text) : null;
+      if (directBudget && this.runtime.tools?.has?.("update_budget")) {
+        const invokeOut = await this.runtime.tools.invoke("update_budget", directBudget, {
+          sessionId,
+          agentId,
+          channel,
+          from,
+          runtime: this.runtime,
+          __owner: principal,
+          __turn: { untrusted: false, intent: ownerIntentText(text) }
+        });
+        if (invokeOut?.ok && invokeOut.result) {
+          const b = invokeOut.result;
+          const headline = directBudget.addUsdToday
+            ? `Added +$${Number(directBudget.addUsdToday).toFixed(2)} to today's budget.`
+            : directBudget.dailyUsdLimit
+              ? `Updated daily budget limit to $${Number(b.dailyUsdLimit ?? directBudget.dailyUsdLimit).toFixed(2)}/day.`
+              : "Reset today's extra budget.";
+          const replyText = `${headline} Today's spend is $${Number(b.spentUsd ?? 0).toFixed(2)} of $${Number(b.effectiveLimitUsd ?? b.dailyUsdLimit ?? 0).toFixed(2)} ($${Math.max(0, Number(b.remainingUsd ?? 0)).toFixed(2)} remaining). Send or retry your request whenever you're ready.`;
+          const sessionAfter = this.store.appendMessage(sessionId, {
+            role: "assistant",
+            content: replyText,
+            agentId,
+            channel,
+            from: "openagi",
+            metadata: {
+              provider: "internal",
+              model: "budget-guard",
+              ...(requestId ? { requestId } : {}),
+              ownerTurn: { untrusted: false },
+              toolCalls: [{ name: "update_budget", arguments: directBudget, ok: true }]
+            }
+          });
+          assistantPersisted = true;
+          reportProgress("complete", {
+            session: { id: sessionAfter.id, messageCount: sessionAfter.messages.length },
+            sessionId: sessionAfter.id
+          });
+          return {
+            id: createId("turn"),
+            createdAt: nowIso(),
+            agent,
+            session: { id: sessionAfter.id, messageCount: sessionAfter.messages.length },
+            reply: replyText,
+            model: { provider: "internal", model: "budget-guard", configured: this.modelProvider.isConfigured() },
+            output: null
+          };
+        }
+      }
+    }
     // Refuse known budget-blocked requests before expensive memory/signal
     // processing and snapshot writes. Keep the provider's own later check
     // for concurrent spending, and retain the normal durable failure reply.
@@ -313,8 +418,8 @@ export class AgentHost {
         configurable: true,
       });
     }
-    let confirmation = null;
-    if (principal && !ephemeral) {
+    let confirmation = preConfirmed;
+    if (principal && !ephemeral && !confirmation) {
       if (principal.via === "voice") {
         const spoken = matchConfirmation(text);
         if (spoken) {

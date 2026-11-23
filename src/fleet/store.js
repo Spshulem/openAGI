@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { REMEDIES, suggestionPlan } from "./remedies.js";
-import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets } from "./contracts.js";
+import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets, shortHash } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
 import { defaultPreferences, normalizePreferences } from "./preferences.js";
@@ -53,7 +53,11 @@ const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
 // The owner being active is no failure. A presence probe that keeps failing
 // ("front app unknown", "presence check too slow") is: it builds the streak
 // so the owner hears why nothing lands.
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on)/;
+// A chat stopped on a provider limit, a nudge found delivered (its turn
+// confirmed, answered, running, or failed), or one status check sent after
+// an unconfirmable delivery, is not a route failing either: the Supervisor
+// owns what comes next.
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|Provider (?:usage|session)-limit until |Previous nudge was delivered|Previous Paseo turn confirmed|Sent one status check)/;
 
 function emptyState() {
   return {
@@ -80,8 +84,126 @@ function emptyState() {
     fixCommands: {},
     selfSessions: [],
     preferences: defaultPreferences(),
-    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} }
+    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
+    followThroughWatches: [],
+    supervisorChatNotices: {},
+    surfacedDecisions: {},
+    providerFailovers: {},
+    contextRequestLog: {}
   };
+}
+
+const SURFACED_DECISIONS_MAX = 500;
+
+function normalizeDecisionText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\b\d+\s+(threads?|sessions?|chats?|items?|stuck|stopped)\b/g, "# $1")
+    .replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent)\s+)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function actionableDecisionKey(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  if (kind === "ready" && prRef) return `ready:${prRef}`;
+  if (question.mergeAsk === true && prRef) return `merge:${prRef}`;
+  const rawDedupe = String(question.dedupeKey ?? "").trim();
+  const groupBase = rawDedupe.replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(groupBase)) {
+    return `group:${groupBase}`;
+  }
+  if (question.threadKey) {
+    if (kind === "prompt") return `prompt:${question.threadKey}`;
+    if (kind === "agent-card" && rawDedupe) return `card:${question.threadKey}:${rawDedupe}`;
+    return `thread:${question.threadKey}:${kind}:${prRef}`;
+  }
+  if (groupBase) return `dedupe:${groupBase}`;
+  const rawTitle = normalizeDecisionText(question.askedAs?.title ?? question.title);
+  return `other:${kind}:${shortHash(rawTitle)}`;
+}
+
+export function actionableDecisionMaterialHash(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  const rawTitle = question.askedAs?.title ?? question.title ?? "";
+  const rawOptions = Array.isArray(question.askedAs?.options) && question.askedAs.options.length > 0
+    ? question.askedAs.options
+    : (Array.isArray(question.options) ? question.options : []);
+  const normOpts = rawOptions
+    .filter((opt) => typeof opt === "string" && opt.toLowerCase() !== "dismiss")
+    .map(normalizeDecisionText)
+    .filter(Boolean)
+    .sort();
+  if (kind === "ready" && prRef) {
+    return shortHash(JSON.stringify(["ready", prRef]));
+  }
+  // A merge decision is the PR at a head with its choices: an agent or the
+  // review rewording the ask is not a new decision; a new head is.
+  if (question.mergeAsk === true && prRef) {
+    return shortHash(JSON.stringify(["merge", prRef, String(question.askedHead ?? ""), normOpts]));
+  }
+  const rawDedupe = String(question.dedupeKey ?? "").trim().replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(rawDedupe)) {
+    // Which sessions are affected is material (a different session's
+    // blocker is a different decision); how many scans saw it is not.
+    const members = (Array.isArray(question.threadKeys) ? question.threadKeys : []).map(String).sort();
+    return shortHash(JSON.stringify(["group", rawDedupe, normOpts, members]));
+  }
+  return shortHash(JSON.stringify([
+    kind,
+    prRef,
+    Boolean(question.mergeAsk),
+    normalizeDecisionText(rawTitle),
+    normalizeDecisionText(question.body ?? ""),
+    normOpts
+  ]));
+}
+
+function normalizeSurfacedDecisions(raw, nowMs = Date.now()) {
+  if (!isObject(raw)) return {};
+  const out = {};
+  const entries = Object.entries(raw)
+    .filter(([key, val]) => Boolean(key) && isObject(val) && typeof val.materialHash === "string")
+    .filter(([, val]) => {
+      const seenMs = toMs(val.lastSeenAt ?? val.surfacedAt, 0);
+      return seenMs === 0 || nowMs - seenMs < QUESTION_TTL_MS;
+    })
+    .slice(-SURFACED_DECISIONS_MAX);
+  for (const [key, val] of entries) {
+    out[key] = {
+      materialHash: String(val.materialHash),
+      surfacedAt: typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs),
+      lastSeenAt: typeof val.lastSeenAt === "string" ? val.lastSeenAt : (typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs)),
+      questionId: typeof val.questionId === "string" ? val.questionId : null
+    };
+  }
+  return out;
+}
+
+function seedSurfacedDecisionsFromExisting(questions, notices, nowMs = Date.now()) {
+  const out = {};
+  for (const q of Array.isArray(questions) ? questions : []) {
+    if (!isObject(q) || q.status !== "open" || q.kind === "completed") continue;
+    // Only evidence that this question itself reached the owner counts; an
+    // unrelated chat notice does not prove it appeared in a check-in.
+    const alreadySurfaced = Boolean(q.outreachId || q.pushedAt);
+    if (!alreadySurfaced) continue;
+    const dKey = actionableDecisionKey(q);
+    const mHash = actionableDecisionMaterialHash(q);
+    if (!dKey || !mHash) continue;
+    const stamp = typeof q.updatedAt === "string" ? q.updatedAt : (typeof q.createdAt === "string" ? q.createdAt : iso(nowMs));
+    out[dKey] = {
+      materialHash: mHash,
+      surfacedAt: stamp,
+      lastSeenAt: stamp,
+      questionId: typeof q.id === "string" ? q.id : null
+    };
+  }
+  return out;
 }
 
 const ORG_PROJECTS_MAX = 60;
@@ -690,6 +812,22 @@ export class FleetStore {
     return { ...question };
   }
 
+  // The owning agent was asked to supply the decision context this ask lacks.
+  // One request per distinct set of gaps; `sent` says whether it reached the agent.
+  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null, attempts = 1 } = {}) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.contextRequest = {
+      at: iso(toMs(at, this.now())),
+      missing: Array.isArray(missing) ? missing.slice(0, 8).map(String) : [],
+      sent: Boolean(sent),
+      attempts: Math.max(1, Math.min(10, Number(attempts) || 1)),
+      ...(reason ? { reason: clampText(String(reason), 120) } : {})
+    };
+    this._save();
+    return { ...question };
+  }
+
   // The supervisor closed this question itself (a merge settled it) and no
   // copy of it is open. A latest close by the review is left to
   // upsertQuestion, which holds it and keeps its ask time fresh.
@@ -1262,6 +1400,22 @@ export class FleetStore {
     return latest;
   }
 
+  hasPriorUnansweredPush(question, now = this.now()) {
+    const nowMs = toMs(now, this.now());
+    const dKey = actionableDecisionKey(question);
+    const mHash = actionableDecisionMaterialHash(question);
+    if (!dKey || !mHash) return false;
+    for (const q of this.state.questions) {
+      if (!q || q.id === question.id) continue;
+      if (OWNER_CLOSED.has(q.status) || isReviewClosed(q)) continue;
+      if (!q.pushedAt) continue;
+      const pushedMs = toMs(q.pushedAt, 0);
+      if (!pushedMs || nowMs - pushedMs >= QUESTION_TTL_MS) continue;
+      if (actionableDecisionKey(q) === dKey && actionableDecisionMaterialHash(q) === mHash) return true;
+    }
+    return false;
+  }
+
   _closeQuestion(id, status, answer, extra = {}) {
     const now = this.now();
     this._expireQuestions(now);
@@ -1272,6 +1426,13 @@ export class FleetStore {
     question.answeredAt = iso(now);
     question.updatedAt = iso(now);
     Object.assign(question, extra);
+    // If the owner explicitly answered or dismissed the decision, clear its surfaced
+    // ledger slot so a genuinely new future ask after the owner hold ends can surface;
+    // automatic supervisor resolves retain the slot across transient close/reissue churn.
+    if (OWNER_CLOSED.has(status) && isObject(this.state.surfacedDecisions)) {
+      const dKey = actionableDecisionKey(question);
+      if (dKey) delete this.state.surfacedDecisions[dKey];
+    }
     this._save();
     return { ...question };
   }
@@ -1337,7 +1498,14 @@ export class FleetStore {
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
       selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
       preferences: normalizePreferences(raw.preferences),
-      organization: normalizeOrganization(raw.organization)
+      organization: normalizeOrganization(raw.organization),
+      followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
+      supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
+      surfacedDecisions: isObject(raw.surfacedDecisions)
+        ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
+        : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {},
+      contextRequestLog: isObject(raw.contextRequestLog) ? raw.contextRequestLog : {}
     };
   }
 
@@ -1486,6 +1654,190 @@ export class FleetStore {
       this._save();
     }
     return { ...assignment };
+  }
+
+  openFollowThroughWatches() {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    return list.filter((w) => w?.status === "watching").map((w) => ({ ...w }));
+  }
+
+  upsertFollowThroughWatch(input = {}) {
+    const threadKey = String(input.threadKey ?? "").trim();
+    if (!threadKey) return null;
+    const nowIso = iso(this.now());
+    this.state.followThroughWatches = (this.state.followThroughWatches ?? []).map((w) => (
+      w?.threadKey === threadKey && w.status === "watching"
+        ? { ...w, status: "superseded", resolvedAt: nowIso }
+        : w
+    ));
+    const watch = {
+      id: makeId("ftw"),
+      status: "watching",
+      threadKey,
+      title: clampText(redactSecrets(String(input.title ?? threadKey)), 120),
+      goalId: input.goalId ? clampText(String(input.goalId), 80) : null,
+      directiveSummary: clampText(redactSecrets(String(input.directiveSummary ?? "")), 240),
+      source: clampText(String(input.source ?? "owner-message"), 40),
+      sentAt: typeof input.sentAt === "string" && Number.isFinite(Date.parse(input.sentAt)) ? input.sentAt : nowIso,
+      baselineAgentAt: typeof input.baselineAgentAt === "string" ? input.baselineAgentAt : null,
+      baselineActivityAt: typeof input.baselineActivityAt === "string" ? input.baselineActivityAt : null,
+      createdAt: nowIso
+    };
+    this.state.followThroughWatches = [...this.state.followThroughWatches, watch].slice(-60);
+    this._save();
+    return { ...watch };
+  }
+
+  resolveFollowThroughWatch(id, { outcome = "settled", detail = null } = {}) {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    const match = list.find((w) => w?.id === id);
+    if (!match) return null;
+    match.status = "resolved";
+    match.outcome = clampText(String(outcome), 40);
+    match.detail = detail ? clampText(redactSecrets(String(detail)), 300) : null;
+    match.resolvedAt = iso(this.now());
+    this._save();
+    return { ...match };
+  }
+
+  lastSupervisorChatNotice(dedupeKey) {
+    if (!dedupeKey) return null;
+    const entry = this.state.supervisorChatNotices?.[dedupeKey];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  recordSupervisorChatNotice(dedupeKey, summary = "") {
+    const key = String(dedupeKey ?? "").trim().slice(0, 120);
+    if (!key) return null;
+    this.state.supervisorChatNotices ??= {};
+    const entry = {
+      at: iso(this.now()),
+      summary: clampText(redactSecrets(String(summary ?? "")), 220)
+    };
+    this.state.supervisorChatNotices[key] = entry;
+    const keys = Object.keys(this.state.supervisorChatNotices);
+    if (keys.length > 100) {
+      delete this.state.supervisorChatNotices[keys[0]];
+    }
+    this._save();
+    return { ...entry };
+  }
+
+  surfacedDecisions() {
+    const nowMs = this.now();
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    return structuredClone(this.state.surfacedDecisions);
+  }
+
+  // Computes only genuinely new or materially changed actionable decisions relative to
+  // the persistent surfacedDecisions ledger, refreshing lastSeenAt on unchanged open
+  // items while keeping all open items untouched in Needs You.
+  diffSurfacedDecisions(openQuestions = [], { now = this.now() } = {}) {
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    const ledger = this.state.surfacedDecisions;
+
+    const deltas = [];
+    const seenKeys = new Set();
+    let unchangedCount = 0;
+    let touchedSeen = false;
+
+    for (const q of Array.isArray(openQuestions) ? openQuestions : []) {
+      if (!q || q.status !== "open" || q.kind === "completed") continue;
+      const decisionKey = actionableDecisionKey(q);
+      const materialHash = actionableDecisionMaterialHash(q);
+      if (!decisionKey || !materialHash || seenKeys.has(decisionKey)) continue;
+      seenKeys.add(decisionKey);
+
+      const existing = ledger[decisionKey] ?? null;
+      if (existing && existing.materialHash === materialHash) {
+        unchangedCount += 1;
+        if (existing.lastSeenAt !== nowIso || existing.questionId !== q.id) {
+          existing.lastSeenAt = nowIso;
+          existing.questionId = q.id;
+          touchedSeen = true;
+        }
+        continue;
+      }
+      deltas.push({
+        question: q,
+        decisionKey,
+        materialHash,
+        change: existing ? "updated" : "new",
+        previousHash: existing?.materialHash ?? null
+      });
+    }
+
+    if (touchedSeen) this._save();
+    return { deltas, unchangedCount };
+  }
+
+  commitSurfacedDecisions(deltas = [], { now = this.now() } = {}) {
+    if (!Array.isArray(deltas) || deltas.length === 0) return 0;
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    let committed = 0;
+    for (const entry of deltas) {
+      const decisionKey = entry?.decisionKey ?? actionableDecisionKey(entry?.question ?? entry);
+      const materialHash = entry?.materialHash ?? actionableDecisionMaterialHash(entry?.question ?? entry);
+      const questionId = entry?.question?.id ?? entry?.questionId ?? null;
+      if (!decisionKey || !materialHash) continue;
+      this.state.surfacedDecisions[decisionKey] = {
+        materialHash,
+        surfacedAt: nowIso,
+        lastSeenAt: nowIso,
+        questionId
+      };
+      committed += 1;
+    }
+    const keys = Object.keys(this.state.surfacedDecisions);
+    if (keys.length > SURFACED_DECISIONS_MAX) {
+      for (const k of keys.slice(0, keys.length - SURFACED_DECISIONS_MAX)) {
+        delete this.state.surfacedDecisions[k];
+      }
+    }
+    if (committed > 0) this._save();
+    return committed;
+  }
+
+  // Which replacement session took over a failed one, for which failure. A
+  // later scan seeing the same failure on the old session must not fail it
+  // over again; a different failure (or a resumed session) may.
+  recordProviderFailover(oldKey, { newKey, failureSig } = {}) {
+    const key = String(oldKey ?? "").trim();
+    if (!key || !newKey) return null;
+    this.state.providerFailovers ??= {};
+    const entry = { newKey: String(newKey), failureSig: String(failureSig ?? ""), at: iso(this.now()) };
+    this.state.providerFailovers[key] = entry;
+    const keys = Object.keys(this.state.providerFailovers);
+    if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
+    this._save();
+    return { ...entry };
+  }
+
+  // When a session was last asked for decision context. An agent that
+  // restates its ask creates a new question id; this cap is per session.
+  recordThreadContextRequest(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.contextRequestLog ??= {};
+    this.state.contextRequestLog[key] = { at: iso(toMs(at, this.now())) };
+    const keys = Object.keys(this.state.contextRequestLog);
+    if (keys.length > 500) delete this.state.contextRequestLog[keys[0]];
+    this._save();
+    return { ...this.state.contextRequestLog[key] };
+  }
+
+  lastThreadContextRequest(threadKey) {
+    const entry = this.state.contextRequestLog?.[String(threadKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  providerFailoverFor(oldKey) {
+    const entry = this.state.providerFailovers?.[String(oldKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   _save() {

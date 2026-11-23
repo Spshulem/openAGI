@@ -501,6 +501,25 @@ struct SupervisorQueuedPayload: Equatable {
 
 typealias QueuedSupervisorTurn = QueuedTurn<SupervisorQueuedPayload>
 
+struct MacBudgetStatus: Decodable, Equatable, Sendable {
+  let today: String
+  let dailyUsdLimit: Double
+  let bonusUsdToday: Double?
+  let effectiveLimitUsd: Double?
+  let spentUsd: Double
+  let remainingUsd: Double
+  let exceeded: Bool?
+  let calls: Int
+
+  var effectiveLimit: Double {
+    effectiveLimitUsd ?? (dailyUsdLimit + (bonusUsdToday ?? 0))
+  }
+
+  var isExceeded: Bool {
+    exceeded ?? (spentUsd >= effectiveLimit)
+  }
+}
+
 /// Keeps Mac Supervisor Quick Ask, Supervisor Workspace Window, Paseo, iPhone,
 /// and Even G2 synced via `devices:supervisor:main` + `/tasks`.
 @MainActor
@@ -537,6 +556,8 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var chatgptSignedIn = false
   @Published private(set) var anthropicConfigured = false
   @Published private(set) var isSwitchingModel = false
+  @Published private(set) var budgetStatus: MacBudgetStatus? = nil
+  @Published private(set) var isUpdatingBudget = false
   @Published private(set) var lastError: String? = nil
 
   var activeModelLabel: String {
@@ -718,6 +739,53 @@ final class SharedSupervisorClient: ObservableObject {
       group.addTask { await self.refreshMessages() }
       group.addTask { await self.refreshTasks() }
       group.addTask { await self.refreshModelSettings() }
+      group.addTask { await self.refreshBudget() }
+    }
+  }
+
+  func refreshBudget() async {
+    var req = URLRequest(url: AppState.buildURL(
+      base: baseURL,
+      path: "/budget"))
+    authed(&req)
+    req.timeoutInterval = 8
+    do {
+      let (data, response) = try await session.data(for: req)
+      try AppState.ensureOK(response, data)
+      budgetStatus = try JSONDecoder().decode(MacBudgetStatus.self, from: data)
+    } catch {
+      // Non-fatal on older mains or while restarting.
+    }
+  }
+
+  @discardableResult
+  func updateBudget(dailyUsdLimit: Double? = nil, addUsdToday: Double? = nil, resetTodayBonus: Bool = false) async -> Bool {
+    guard !isUpdatingBudget else { return false }
+    isUpdatingBudget = true
+    defer { isUpdatingBudget = false }
+    var body: [String: Any] = [:]
+    if let dailyUsdLimit { body["dailyUsdLimit"] = dailyUsdLimit }
+    if let addUsdToday { body["addUsdToday"] = addUsdToday }
+    if resetTodayBonus { body["resetTodayBonus"] = true }
+    var req = URLRequest(url: AppState.buildURL(
+      base: baseURL,
+      path: "/budget"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    req.timeoutInterval = 15
+    authed(&req)
+    do {
+      let (data, response) = try await session.data(for: req)
+      try AppState.ensureOK(response, data)
+      budgetStatus = try JSONDecoder().decode(MacBudgetStatus.self, from: data)
+      if let err = lastError, err.localizedCaseInsensitiveContains("daily budget") {
+        lastError = nil
+      }
+      return true
+    } catch {
+      lastError = error.localizedDescription
+      return false
     }
   }
 
@@ -1254,5 +1322,6 @@ final class SharedSupervisorClient: ObservableObject {
     if let token = tokenOverride ?? AppState.shared.authToken(), !token.isEmpty {
       req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
+    req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
   }
 }

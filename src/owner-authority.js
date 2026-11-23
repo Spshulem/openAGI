@@ -160,6 +160,32 @@ export const INTENT_FAMILIES = Object.freeze({
   watch: {
     pattern: String.raw`(?:watch|monitor|keep an eye on|keep watching|stop watching)\s+(?:(?:a|an|the|my|that|this)\s+)*(?:codex|claude|cursor|coding agents?|agents?|coding sessions?)\b(?!'s)`,
     tools: ["watch_coding_agent"]
+  },
+  // Daily spend budget: "add $25 to my budget", "+$10 today", "set daily budget to $50".
+  budget: {
+    pattern: [
+      String.raw`(?:add|raise|increase|bump|set|change|update|adjust|top\s*up|extend|give\s+me|put)\b[^.!?\n]{0,80}?\b(?:daily\s+)?(?:budget|spend(?:\s+(?:limit|cap))?)\b`,
+      String.raw`(?:add|top\s*up|bump)\s+\+?\s*\$\s*\d+(?:\.\d{1,2})?(?:\s+(?:more|extra|for\s+today|today|to\s+(?:the\s+|my\s+)?(?:daily\s+)?(?:budget|limit)))?\b`,
+      String.raw`\+\s*\$\s*\d+(?:\.\d{1,2})?(?:\s+(?:more|extra|for\s+today|today|to\s+(?:the\s+|my\s+)?(?:daily\s+)?(?:budget|limit)))?(?=\s*(?:$|[.,;!?\n]))`,
+      String.raw`reset\s+(?:today['’]?s\s+)?(?:extra|bonus)\s+budget\b`
+    ].join("|"),
+    tools: ["update_budget"]
+  },
+  // Editable skills: "create a skill for AI SEO", "update the customer report skill", "save this workflow as a skill".
+  skills: {
+    pattern: [
+      String.raw`(?:create|make|build|write|save|author|update|edit|modify|revise|improve|install)\b[^.!?\n]{0,90}?\bskills?\b`,
+      String.raw`(?:turn|save)\s+(?:this|that|it)\s+into\s+a\s+skill\b`
+    ].join("|"),
+    tools: ["create_skill", "update_skill", "read_skill"]
+  },
+  // Persistent goals & provider failover: "track this goal", "switch that chat to Claude/Antigravity".
+  goals: {
+    pattern: [
+      String.raw`(?:track|set|add|create|update|manage|verify|continue)\b[^.!?\n]{0,90}?\b(?:goals?|outcomes?|active\s+work|definition\s+of\s+done|cadence)\b`,
+      String.raw`(?:switch|move|fail\s*over|rotate|change)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|model)\b`
+    ].join("|"),
+    tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider"]
   }
 });
 
@@ -364,4 +390,36 @@ export function matchConfirmations(text) {
     return { decision, codes: [], all: true, count: 2 };
   }
   return { decision, codes, all };
+}
+
+// Strict parser for standalone owner budget commands so the owner can top up
+// or adjust the daily budget in chat even when the current daily budget is
+// already exhausted (0 LLM tokens required).
+export function parseDirectBudgetCommand(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw || raw.length > 160 || /\?\s*$/.test(raw)) return null;
+  const cleaned = raw.replace(/^[.,;:!?\s]+|[.,;:!?\s]+$/g, "");
+
+  if (/^(?:please\s+)?reset\s+(?:my\s+|the\s+)?(?:today['’]?s\s+)?(?:extra|bonus)\s+budget$/i.test(cleaned)) {
+    return { resetTodayBonus: true };
+  }
+
+  const plusOnly = /^(?:please\s+)?(?:\+\s*\$?\s*(\d+(?:\.\d{1,2})?)|(?:add|top\s*up|bump)\s+\+?\s*\$\s*(\d+(?:\.\d{1,2})?))(?:\s+(?:more|extra|for\s+today|today|to\s+(?:my\s+|the\s+)?(?:daily\s+)?(?:budget|spend(?:\s+limit)?|limit)))?$/i.exec(cleaned)
+    ?? /^(?:please\s+)?(?:add|top\s*up|put|give\s+me)\s+\+?\s*\$?\s*(\d+(?:\.\d{1,2})?)\s+(?:more\s+|extra\s+)?(?:to|onto|into|for)\s+(?:my\s+|the\s+|today['’]?s\s+)?(?:daily\s+)?(?:budget|spend(?:\s+limit)?)$/i.exec(cleaned);
+  if (plusOnly) {
+    const amount = Number(plusOnly[1] ?? plusOnly[2]);
+    if (Number.isFinite(amount) && amount >= 0.01 && amount <= 10000) {
+      return { addUsdToday: amount };
+    }
+  }
+
+  const setLimit = /^(?:please\s+)?(?:set|change|update|raise|increase|bump)\s+(?:my\s+|the\s+)?(?:daily\s+)?(?:budget|spend\s+(?:limit|cap))(?:\s+limit)?\s+to\s+\$?\s*(\d+(?:\.\d{1,2})?)(?:\s*(?:\/\s*day|per\s+day|a\s+day|daily))?$/i.exec(cleaned);
+  if (setLimit) {
+    const limit = Number(setLimit[1]);
+    if (Number.isFinite(limit) && limit >= 0.5 && limit <= 10000) {
+      return { dailyUsdLimit: limit };
+    }
+  }
+
+  return null;
 }

@@ -18,7 +18,7 @@ struct ChatView: View {
     var onClose: (() -> Void)? = nil
 
     private enum ChatSheet: String, Identifiable {
-        case model, settings, fallback, conversations
+        case model, budget, settings, fallback, conversations
         var id: String { rawValue }
     }
 
@@ -41,6 +41,11 @@ struct ChatView: View {
             case .model:
                 NavigationStack {
                     ModelSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            case .budget:
+                NavigationStack {
+                    BudgetSettingsView()
                         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
                 }
             case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
@@ -133,6 +138,7 @@ struct ChatView: View {
                                     Text("Supervisor").tag(ConversationThread.supervisor)
                                 }
                             }
+                            Button("Budget", systemImage: "dollarsign.circle") { destination = .budget }
                             Button("Settings", systemImage: "gearshape") { destination = .settings }
                             if !model.isOnPhone {
                                 Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
@@ -183,6 +189,7 @@ struct ChatConversationView: View {
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
     @State private var reviewingApproval: PendingAction?
+    @State private var showingBudgetSheet = false
     // Cards put away in this chat. The approval stays in the Inbox.
     @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
@@ -235,6 +242,12 @@ struct ChatConversationView: View {
                     await model.refreshInbox(force: true)
                 }
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { reviewingApproval = nil } } }
+            }
+        }
+        .sheet(isPresented: $showingBudgetSheet) {
+            NavigationStack {
+                BudgetSettingsView()
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingBudgetSheet = false } } }
             }
         }
         .navigationTitle(showsTitle ? title : "")
@@ -363,11 +376,12 @@ struct ChatConversationView: View {
                                    offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
             } action: { previous, geometry in
                 hasContentBelow = !geometry.isAtBottom
-                // Keyboard dismissal and fold changes resize the viewport
-                // after Send has already moved to the reply. Resolve the
-                // message again at that size, rather than retaining a lazy
-                // stack's estimated bottom offset.
-                if previous.viewportHeight != geometry.viewportHeight && isPinnedToBottom && !userIsScrolling {
+                // Keyboard dismissal, fold changes and lazy multi-line row
+                // measurement resize the scroll geometry after an initial or
+                // post-send scroll. Settle again while pinned to the bottom.
+                if (previous.viewportHeight != geometry.viewportHeight
+                    || (previous.contentHeight != geometry.contentHeight && !geometry.isAtBottom))
+                    && isPinnedToBottom && !userIsScrolling {
                     scrollToLatest()
                 }
                 // Loading history, streaming and keyboard resizing must
@@ -391,8 +405,30 @@ struct ChatConversationView: View {
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
                     // Keep the message the reader was looking at in place
                     // when an earlier page is inserted above it.
+                    isPinnedToBottom = false
                     scrollPosition.scrollTo(id: first, anchor: .top)
-                } else if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+                } else if !new.isEmpty && (isPinnedToBottom || isBottomVisible) {
+                    isPinnedToBottom = true
+                    scrollToLatest()
+                    // Lazy message rows resolve their wrapped height after
+                    // materializing; settle onto the true end once laid out.
+                    // Only when history first loads: on an ordinary append
+                    // (a send and its reply) a short pane keeps the sent
+                    // message in view instead of snapping past it.
+                    guard old.isEmpty else { return }
+                    Task { @MainActor in
+                        await Task.yield()
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling {
+                            scrollToLatest()
+                        }
+                        try? await Task.sleep(for: .milliseconds(120))
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling && !isBottomVisible {
+                            withAnimation(nil) {
+                                scrollPosition.scrollTo(id: Self.endOfConversation, anchor: .bottom)
+                            }
+                        }
+                    }
+                }
             }
             .onAppear {
                 if let id = scrollToMessageID {
@@ -509,6 +545,14 @@ struct ChatConversationView: View {
             MessageBubbleRow(message: item.message, maxContainerWidth: width, showsActions: isLatestReply)
             if isLatestReply, !conversation.isReadOnly, let code = ApprovalCodePrompt.extractCode(from: item.message.text) {
                 ChatConfirmationCodeBar(code: code, conversation: conversation)
+            }
+            if item.message.id == messages.last?.id, !conversation.isReadOnly,
+               BudgetLimitPrompt.isBudgetExceeded(item.message) {
+                ChatBudgetExceededBar(
+                    message: item.message,
+                    conversation: conversation,
+                    onOpenBudgetSettings: { showingBudgetSheet = true }
+                )
             }
             // Offer a resend only when it cannot run a turn twice: main
             // rejected it before it ran, or main never confirmed it and the
@@ -1050,6 +1094,25 @@ enum ChatRetry {
         else { return nil }
         return (index, user.text, user.attachments)
     }
+
+    enum BudgetResend: Equatable {
+        case send(text: String, attachments: [ChatAttachment])
+        case attachmentsUnavailable
+        case nothingToResend
+    }
+
+    // "+$10 & retry" for a reply that is not retry-safe: re-send the user
+    // turn immediately before the blocked reply, attachments included. Never
+    // search further back -- that would re-send an older, different request.
+    static func budgetResend(failedID: UUID, in messages: [ChatMessage]) -> BudgetResend {
+        guard let index = messages.firstIndex(where: { $0.id == failedID }),
+              let user = messages[..<index].last(where: { $0.role == .user })
+        else { return .nothingToResend }
+        guard user.attachments.allSatisfy({ $0.data != nil }) else { return .attachmentsUnavailable }
+        guard !user.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !user.attachments.isEmpty
+        else { return .nothingToResend }
+        return .send(text: user.text, attachments: user.attachments)
+    }
 }
 
 // DESIGN.md's copy rules ("Never: ... an error that does not say what to do
@@ -1360,5 +1423,130 @@ struct ChatScrollGeometry: Equatable {
         // Bottom alignment and rubber-banding can produce negative offsets
         // even when the entire conversation fits in the visible viewport.
         return maximumOffset == 0 || offset >= maximumOffset - 60
+    }
+}
+
+enum BudgetLimitPrompt {
+    static func isBudgetExceeded(_ message: ChatMessage) -> Bool {
+        guard message.role == .assistant, !message.isStreaming else { return false }
+        let lower = message.text.lowercased()
+        return lower.contains("daily budget exceeded") || lower.contains("daily budget reached")
+    }
+}
+
+private struct ChatBudgetExceededBar: View {
+    @Environment(AppModel.self) private var model
+    let message: ChatMessage
+    let conversation: ChatConversation
+    let onOpenBudgetSettings: () -> Void
+    @State private var isWorking = false
+    @State private var showingCustomPrompt = false
+    @State private var customAmountText = "50"
+    @State private var note: (text: String, isError: Bool)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await addAndRetry(amount: 10, retryTurn: true) }
+                    } label: {
+                        Label("+$10 & retry", systemImage: "plus.circle.fill")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-10")
+
+                    Button {
+                        Task { await addAndRetry(amount: 25, retryTurn: true) }
+                    } label: {
+                        Text("+$25 & retry")
+                            .font(.footnote.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-25")
+
+                    Button {
+                        showingCustomPrompt = true
+                    } label: {
+                        Text("+$$$…")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-custom")
+
+                    Button("Settings", action: onOpenBudgetSettings)
+                        .font(.footnote.weight(.medium))
+                        .buttonStyle(.bordered)
+                        .disabled(isWorking)
+                        .accessibilityIdentifier("chat-budget-open")
+                }
+            }
+            if let note {
+                Text(note.text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(note.isError ? Theme.alert : Theme.live)
+            }
+        }
+        .padding(.top, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-budget-exceeded-bar")
+        .alert("Add extra budget for today", isPresented: $showingCustomPrompt) {
+            TextField("Amount in USD (e.g. 50)", text: $customAmountText)
+                .keyboardType(.decimalPad)
+            Button("Add & retry") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: true) }
+                }
+            }
+            Button("Add only") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: false) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Adds immediate headroom for today without permanently changing tomorrow's daily cap.")
+        }
+    }
+
+    private func parsedCustomAmount() -> Double? {
+        let cleaned = customAmountText
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: "+", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let amount = Double(cleaned), amount >= 0.5, amount <= 10000 else {
+            note = ("Enter an amount between $0.50 and $10,000.", true)
+            return nil
+        }
+        return amount
+    }
+
+    private func addAndRetry(amount: Double, retryTurn: Bool) async {
+        isWorking = true
+        note = nil
+        defer { isWorking = false }
+        do {
+            let updated = try await model.client.updateBudget(BudgetUpdate(addUsdToday: amount))
+            note = (String(format: "Added +$%.2f today ($%.2f remaining).", amount, max(0, updated.remainingUsd)), false)
+            guard retryTurn else { return }
+            if message.isFailed && message.retrySafe {
+                await conversation.retry(message)
+            } else {
+                switch ChatRetry.budgetResend(failedID: message.id, in: conversation.messages) {
+                case .send(let text, let attachments):
+                    await conversation.send(text, attachments: attachments)
+                case .attachmentsUnavailable:
+                    note = ("Budget added, but the images in that message can't be re-sent. Attach them again and send.", true)
+                case .nothingToResend:
+                    break
+                }
+            }
+        } catch {
+            note = (BudgetSettingsErrorCopy.saveMessage(for: error), true)
+        }
     }
 }
