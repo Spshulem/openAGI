@@ -294,10 +294,16 @@ export class ToolRegistry {
   }
 
   async runHandler(tool, args, context) {
+    // Checked again here, at the last moment: an owner check or approval
+    // step awaited since invoke() looked, and a stop may have landed then.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     try {
-      // An owner's interrupt never cuts short the action running now
-      // (message-turns.js toolSignal); other aborts still reach it.
-      const handlerContext = context?.signal ? { ...context, signal: toolSignal(context.signal) } : context;
+      // `signal` stays the turn's own signal, so a skill or subagent this
+      // tool runs stops its nested model calls and tools on an interrupt.
+      // `actionSignal` is for cancelling work already in progress (a
+      // computer action): an owner's interrupt never reaches it, so that
+      // action finishes; other aborts still do (message-turns.js toolSignal).
+      const handlerContext = context?.signal ? { ...context, actionSignal: toolSignal(context.signal) } : context;
       const result = await tool.handler(args, handlerContext);
       // Tool results are data: they can only ever taint the turn, never
       // write any other part of the server-built context.

@@ -156,8 +156,8 @@ final class ChatConversation {
     // what main confirmed. Repeated taps while that is settling do nothing.
     func sendQueuedNow(id: UUID) async {
         guard !isReadOnly, !forgotten else { return }
-        let running = runningReply
-        switch queue.beginSendNow(id, replyRunning: running != nil, runningRequestID: running?.requestID) {
+        let target = interruptTarget
+        switch queue.beginSendNow(id, replyRunning: target.running, runningRequestID: target.requestID) {
         case .ignored, .cannotInterrupt:
             return
         case .sendNext:
@@ -165,7 +165,20 @@ final class ChatConversation {
         case .interrupt(let requestID):
             let outcome = await client.interruptTurn(thread: thread, requestId: requestID, conversationId: conversationID)
             queue.applyInterrupt(id, outcome: outcome)
+            drainIfIdle()
         }
+    }
+
+    // The reply main is actually running. A reply whose stream was lost while
+    // main kept working (detached) runs ahead of anything sent after it, so
+    // it is the one to stop -- not a later message waiting behind it on main.
+    // Otherwise, the reply streaming now.
+    var interruptTarget: (running: Bool, requestID: String?) {
+        if let detached = messages.first(where: { $0.role == .assistant && $0.isDetached && $0.requestID != nil }) {
+            return (true, detached.requestID)
+        }
+        if let running = runningReply { return (true, running.requestID) }
+        return (false, nil)
     }
 
     // Starts sending the queue when nothing is running: after an edit

@@ -276,12 +276,14 @@ test("an owner interrupt never cancels the action running now; other aborts stil
   const { ownerInterruptReason } = await import("../src/message-turns.js");
   const registry = new ToolRegistry();
   const seen = [];
+  const turnSignalAborted = [];
   const release = gate();
   registry.register({
     name: "type_text", description: "types", parameters: { type: "object", properties: {} },
     async handler(_args, context) {
-      const aborted = new Promise((resolve) => context.signal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
+      const aborted = new Promise((resolve) => context.actionSignal?.addEventListener("abort", () => resolve("aborted"), { once: true }));
       seen.push(await Promise.race([aborted, release.opened.then(() => "finished")]));
+      turnSignalAborted.push(context.signal.aborted);
       return { ok: true };
     }
   });
@@ -291,6 +293,7 @@ test("an owner interrupt never cancels the action running now; other aborts stil
   setTimeout(release.open, 30);
   assert.equal((await ownerRun).ok, true);
   assert.deepEqual(seen, ["finished"], "the running action completed despite the owner's stop");
+  assert.deepEqual(turnSignalAborted, [true], "nested work the tool runs still sees the turn's stop");
   assert.equal((await registry.invoke("type_text", {}, { signal: owner.signal })).ok, false, "but no new action starts");
 
   const shutdown = new AbortController();
@@ -298,6 +301,48 @@ test("an owner interrupt never cancels the action running now; other aborts stil
   shutdown.abort(new Error("request cancelled"));
   await other;
   assert.equal(seen.at(-1), "aborted", "a cancelled request still reaches the tool");
+});
+
+test("a stop that lands while a tool waits on an owner check means it never starts", async () => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const { ownerInterruptReason } = await import("../src/message-turns.js");
+  const registry = new ToolRegistry();
+  let ran = false;
+  registry.register({ name: "send_it", description: "sends", parameters: { type: "object", properties: {} },
+    async handler() { ran = true; return { ok: true }; } });
+  const owner = new AbortController();
+  owner.abort(ownerInterruptReason());
+  // runHandler is what invoke() and ownerInvoke() call after their awaits.
+  const result = await registry.runHandler(registry.tools.get("send_it"), {}, { signal: owner.signal });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not run/);
+  assert.equal(ran, false);
+});
+
+test("a skill or subagent a tool runs stops its nested loop on the owner's interrupt", async (t) => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const { ownerInterruptReason } = await import("../src/message-turns.js");
+  const registry = new ToolRegistry();
+  const nested = [];
+  const firstNestedTool = gate();
+  registry.register({ name: "leaf", description: "leaf", parameters: { type: "object", properties: {} },
+    async handler() { nested.push("leaf ran"); return { ok: true }; } });
+  // A stand-in for run_skill: its own model/tool loop on the context it got.
+  registry.register({ name: "run_skill", description: "skill", parameters: { type: "object", properties: {} },
+    async handler(_args, context) {
+      nested.push((await registry.invoke("leaf", {}, context)).ok ? "first" : "first refused");
+      firstNestedTool.open();
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const second = await registry.invoke("leaf", {}, context);
+      nested.push(second.ok ? "second" : "second refused");
+      return { ok: true };
+    } });
+  const owner = new AbortController();
+  const run = registry.invoke("run_skill", {}, { signal: owner.signal });
+  await firstNestedTool.opened;
+  owner.abort(ownerInterruptReason());
+  await run;
+  assert.deepEqual(nested, ["leaf ran", "first", "second refused"], "the skill's next tool does not start after the stop");
 });
 
 test("a phone whose stream dropped can still interrupt its turn", async (t) => {

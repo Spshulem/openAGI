@@ -271,6 +271,26 @@ final class ChatQueueControlsTests: XCTestCase {
     }
 
     @MainActor
+    func testSendNowStopsTheReplyMainIsStillRunningAfterItsStreamDropped() async throws {
+        let chat = conversation()
+        HeldStreamProtocol.hold.insert("Queued behind it")
+        try await busy(chat, running: "Long job", queued: ["Queued behind it", "Correction"])
+        let longJob = try XCTUnwrap(HeldStreamProtocol.sentTurns[0].requestId)
+        // The stream drops after main accepted the turn: main keeps working.
+        HeldStreamProtocol.release("Long job", frames: "")
+        try await waitFor("the next queued message to reach main") { HeldStreamProtocol.isHeld("Queued behind it") }
+        XCTAssertTrue(chat.messages.contains { $0.isDetached && $0.requestID == longJob })
+        HeldStreamProtocol.answerInterrupt = { requestId in (200, "{\"status\":\"interrupted\",\"requestId\":\"\(requestId)\"}") }
+
+        await chat.sendQueuedNow(id: chat.queuedSubmissions[0].id)
+        XCTAssertEqual(HeldStreamProtocol.interruptIDs, [longJob], "stop the turn main is running, not the one waiting behind it")
+
+        HeldStreamProtocol.release("Queued behind it", frames: "event: final\ndata: {\"reply\":\"ok\"}\n\n")
+        try await waitFor("the queue to drain") { chat.queuedSubmissions.isEmpty && !chat.isSending }
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Long job", "Queued behind it", "Correction"])
+    }
+
+    @MainActor
     func testRemovingTheMessageBeingSentNowLeavesTheRestInOrder() async throws {
         let chat = conversation()
         try await busy(chat, running: "Running", queued: ["A", "B", "C"])
