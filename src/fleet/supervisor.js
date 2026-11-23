@@ -2833,7 +2833,7 @@ export class FleetSupervisor {
     const token = randomBytes(18).toString("base64url");
     const issuedAt = this.now();
     const expiresAt = issuedAt + ADMIN_MERGE_CONSENT_TTL_MS;
-    const consent = { action: plan.action, repo: plan.repo, number: plan.number, headSha: plan.headSha };
+    const consent = { action: plan.action, repo: plan.repo, number: plan.number, headSha: plan.headSha, baseRef: plan.baseRef };
     this.adminMergeConsents.set(token, { ...consent, questionId: target.question.id, prRef: plan.prRef, issuedAt, expiresAt });
     return {
       ok: true,
@@ -2859,10 +2859,11 @@ export class FleetSupervisor {
     }
     const headSha = String(consent.headSha ?? "").trim().toLowerCase();
     if (issued.questionId !== target.question.id || consent.action !== issued.action
-        || consent.repo !== issued.repo || consent.number !== issued.number || headSha !== issued.headSha) {
-      return { ok: false, kind: "admin_merge", status: "consent_mismatch", detail: `The confirmation does not match the Admin Merge you previewed (${issued.prRef} at ${issued.headSha.slice(0, 7)}). Nothing was merged.` };
+        || consent.repo !== issued.repo || consent.number !== issued.number || headSha !== issued.headSha
+        || consent.baseRef !== issued.baseRef) {
+      return { ok: false, kind: "admin_merge", status: "consent_mismatch", detail: `The confirmation does not match the Admin Merge you previewed (${issued.prRef} at ${issued.headSha.slice(0, 7)} into ${issued.baseRef}). Nothing was merged.` };
     }
-    const bound = { action: issued.action, repo: issued.repo, number: issued.number, headSha: issued.headSha };
+    const bound = { action: issued.action, repo: issued.repo, number: issued.number, headSha: issued.headSha, baseRef: issued.baseRef };
     const intent = this.store.recordAction({
       kind: "pr-admin-merge",
       playbook: "owner-admin-merge",
@@ -4791,6 +4792,7 @@ export class FleetSupervisor {
               ci: pr.ci,
               unresolvedThreads: pr.unresolvedThreads,
               mergeState: pr.mergeState,
+              reviewDecision: pr.reviewDecision ?? null,
               head: String(pr.headOid ?? "").slice(0, 10)
             }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),

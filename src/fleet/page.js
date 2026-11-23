@@ -536,7 +536,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   // separate, deliberate step. Preview (read-only) shows what would be
   // waived and the exact repo, PR, and head; only then can the owner confirm.
   function adminMergeOffer(q, pr, card) {
-    if (!q.prRef || !pr || String(q.prRef).toLowerCase() !== String(pr.repo + '#' + pr.number).toLowerCase()) return;
+    if (!q.prRef || !pr || String(q.prRef).toLowerCase() !== String(pr.ref || '').toLowerCase()) return;
     var up = function (v) { return String(v || '').toUpperCase(); };
     if (up(pr.state) !== 'OPEN' || pr.isDraft || up(pr.mergeState) !== 'BLOCKED' || up(pr.reviewDecision) !== 'REVIEW_REQUIRED') return;
     var box = el('div', 'admin', null, card);

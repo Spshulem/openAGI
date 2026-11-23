@@ -49,8 +49,18 @@ function fakeGh(over = {}) {
       return over.threads ?? { code: 0, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } } } }), stderr: "" };
     }
     if (a === "api" && b === "user") return { code: 0, stdout: "owner-login\n", stderr: "" };
+    const page = Number(/[?&]page=(\d+)/.exec(b ?? "")?.[1] ?? 0);
     if (a === "api" && /\/rules\/branches\//.test(b)) {
-      return { code: 0, stdout: JSON.stringify(over.rules ?? [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }, { type: "required_status_checks" }, { type: "deletion" }]), stderr: "" };
+      if (over.rulesPage) return { code: 0, stdout: JSON.stringify(over.rulesPage(page)), stderr: "" };
+      const rules = over.rules ?? [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "test", integration_id: 15368 }] } }, { type: "deletion" }];
+      return { code: 0, stdout: JSON.stringify(page === 1 ? rules : []), stderr: "" };
+    }
+    if (a === "api" && /\/commits\/[0-9a-f]+\/check-runs/.test(b)) {
+      const runs = over.checkRuns ?? [{ id: 1, name: "test", status: "completed", conclusion: "success", app: { id: 15368 } }];
+      return { code: 0, stdout: JSON.stringify({ total_count: runs.length, check_runs: page === 1 ? runs : [] }), stderr: "" };
+    }
+    if (a === "api" && /\/commits\/[0-9a-f]+\/status/.test(b)) {
+      return { code: 0, stdout: JSON.stringify({ state: "success", statuses: page === 1 ? (over.statuses ?? []) : [] }), stderr: "" };
     }
     if (a === "api" && /\/protection$/.test(b)) {
       if (over.protection) return { code: 0, stdout: JSON.stringify(over.protection), stderr: "" };
@@ -65,7 +75,7 @@ function fakeGh(over = {}) {
   return { run, calls, merges: () => calls.filter((c) => c[1] === "pr" && c[2] === "merge"), view };
 }
 
-const consentFor = (headSha = SHA, extra = {}) => ({ action: "admin_merge", repo: REPO, number: 42, headSha, ...extra });
+const consentFor = (headSha = SHA, extra = {}) => ({ action: "admin_merge", repo: REPO, number: 42, headSha, baseRef: "main", ...extra });
 
 // ─── resolver ────────────────────────────────────────────────────────────
 
@@ -101,7 +111,8 @@ test("Admin Merge without exact consent never calls GitHub", async () => {
     null,
     consentFor(SHA, { action: "merge" }),
     consentFor(SHA.slice(0, 7)),
-    { ...consentFor(), number: "42" }
+    { ...consentFor(), number: "42" },
+    { ...consentFor(), baseRef: undefined }
   ]) {
     const gh = fakeGh();
     const out = await executeAdminMerge({ prRef: PR, consent, run: gh.run });
@@ -129,6 +140,59 @@ test("Admin Merge halts on a stale head: consent for an older SHA, or a card pin
   const pre = await preflightAdminMerge({ prRef: PR, expectedHeadSha: SHA.slice(0, 7), run: pinned.run });
   assert.equal(pre.reason, "head_changed");
   assert.equal(pinned.merges().length, 0);
+});
+
+test("Admin Merge halts when the PR was retargeted to another base after the owner's consent", async () => {
+  const gh = fakeGh({ view: { baseRefName: "release" } });
+  const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: gh.run });
+  assert.equal(out.reason, "base_changed");
+  assert.match(out.detail, /now targets release.*into main/);
+  assert.equal(gh.merges().length, 0);
+});
+
+test("Admin Merge verifies every check the branch rules require, on the exact head, failing closed", async () => {
+  const securityRule = (extra = {}) => ({ rules: [{ type: "pull_request" }, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "mandatory-security", ...extra }] } }] });
+  const cases = [
+    // Never reported, even though gh pr checks --required says nothing is required.
+    [{ ...securityRule(), checks: { code: 1, stdout: "", stderr: "no required checks reported on the 'feature' branch" } }, /mandatory-security \(never reported\)/],
+    // Reported by a different app than the rule names.
+    [{ ...securityRule({ integration_id: 99 }), checkRuns: [{ id: 5, name: "mandatory-security", status: "completed", conclusion: "success", app: { id: 7 } }] }, /not reported by the required app/],
+    // A commit status cannot prove which app posted it.
+    [{ ...securityRule({ integration_id: 99 }), checkRuns: [], statuses: [{ context: "mandatory-security", state: "success" }] }, /not reported by the required app/],
+    // The newest run is what counts.
+    [{ ...securityRule(), checkRuns: [{ id: 5, name: "mandatory-security", status: "completed", conclusion: "success" }, { id: 9, name: "mandatory-security", status: "completed", conclusion: "failure" }] }, /mandatory-security \(failure\)/],
+    [{ ...securityRule(), checkRuns: [], statuses: [{ context: "mandatory-security", state: "pending" }] }, /mandatory-security \(pending\)/],
+    // Classic protection contexts count too.
+    [{ protection: { required_pull_request_reviews: {}, required_status_checks: { strict: true, contexts: ["ci/legacy"], checks: [] } } }, /ci\/legacy \(never reported\)/]
+  ];
+  for (const [over, detail] of cases) {
+    const gh = fakeGh(over);
+    const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: gh.run });
+    assert.equal(out.reason, "required_checks_not_passing", JSON.stringify(over));
+    assert.match(out.detail, detail);
+    assert.equal(gh.merges().length, 0);
+  }
+
+  // Passing on the head from the right source: allowed.
+  const ok = fakeGh({ ...securityRule({ integration_id: 99 }), checkRuns: [{ id: 5, name: "mandatory-security", status: "completed", conclusion: "success", app: { id: 99 } }] });
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: ok.run })).status, "merged");
+  const anySource = fakeGh({ ...securityRule(), checkRuns: [], statuses: [{ context: "mandatory-security", state: "success" }] });
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: anySource.run })).status, "merged");
+  assert.ok(ok.calls.some((c) => c[1] === "api" && c[2].startsWith(`repos/${REPO}/commits/${SHA}/check-runs`)), "checks are read on the consented head");
+});
+
+test("Admin Merge reads every page of branch rules before allowing a bypass", async () => {
+  const safePage = Array.from({ length: 100 }, () => ({ type: "deletion" }));
+  const gh = fakeGh({ rulesPage: (page) => (page === 1 ? safePage : page === 2 ? [{ type: "pull_request" }, { type: "merge_queue" }] : []) });
+  const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: gh.run });
+  assert.equal(out.reason, "other_rule");
+  assert.match(out.detail, /merge_queue/);
+  assert.equal(gh.merges().length, 0);
+
+  const endless = fakeGh({ rulesPage: () => safePage });
+  const capped = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: endless.run });
+  assert.equal(capped.reason, "rules_unreadable");
+  assert.equal(endless.merges().length, 0);
 });
 
 test("Admin Merge never bypasses failing, pending, or unposted required checks", async () => {
@@ -262,6 +326,7 @@ test("owner Admin Merge via the route: preview, confirm the exact consent, audit
     assert.equal(p.consent.repo, REPO);
     assert.equal(p.consent.number, 42);
     assert.equal(p.consent.headSha, SHA);
+    assert.equal(p.consent.baseRef, "main");
     assert.ok(p.consent.token.length >= 20);
     assert.equal(gh.merges().length, 0);
     assert.equal(adminAudit(t.supervisor).length, 0, "a preview is not an action");
@@ -311,6 +376,11 @@ test("denied Admin Merge: no preview, reused, tampered, or expired consent never
     assert.equal(r.status, "consent_mismatch");
     r = (await t.post(t.question.id, { consent: p.consent })).body.result;
     assert.equal(r.status, "consent_required", "a consent is single-use even when it did not match");
+
+    // Tampered base branch.
+    p = (await t.post(t.question.id, { preview: true })).body.result;
+    r = (await t.post(t.question.id, { consent: { ...p.consent, baseRef: "release" } })).body.result;
+    assert.equal(r.status, "consent_mismatch");
 
     // Consent for another card.
     const other = t.supervisor.store.upsertQuestion({ dedupeKey: "ready:acme/webapp#43", kind: "ready", prRef: `${REPO}#43`, title: "other", options: ["merged"] });

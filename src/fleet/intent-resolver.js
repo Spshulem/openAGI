@@ -307,6 +307,78 @@ async function ghApiJson(run, ghBin, endpoint) {
   return { ok: false, notProtected: /Branch not protected/i.test(text), message: githubMessage(res) };
 }
 
+// Every page of a GitHub list endpoint (pick(data) is that page's items).
+// Unreadable, malformed, or longer than MAX_PAGES: not ok, so callers halt.
+const PAGE_SIZE = 100;
+const MAX_PAGES = 10;
+async function ghApiAllPages(run, ghBin, endpoint, pick = (data) => data) {
+  const items = [];
+  const sep = endpoint.includes("?") ? "&" : "?";
+  for (let page = 1; page <= MAX_PAGES; page += 1) {
+    const res = await ghApiJson(run, ghBin, `${endpoint}${sep}per_page=${PAGE_SIZE}&page=${page}`);
+    if (!res.ok) return res;
+    const list = pick(res.data);
+    if (!Array.isArray(list)) return { ok: false, message: `Unexpected GitHub reply for ${endpoint}.` };
+    items.push(...list);
+    if (list.length < PAGE_SIZE) return { ok: true, data: items };
+  }
+  return { ok: false, message: `More than ${PAGE_SIZE * MAX_PAGES} entries on ${endpoint}; not all could be read.` };
+}
+
+// The status checks the base branch's own rules require: ruleset
+// required_status_checks and classic protection, each with the app that must
+// post it (null: any source).
+function requiredContexts(rules, protection) {
+  const found = [];
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    if (rule?.type !== "required_status_checks") continue;
+    for (const c of rule?.parameters?.required_status_checks ?? []) found.push({ context: c?.context, appId: c?.integration_id });
+  }
+  const classic = protection?.required_status_checks;
+  if (classic) {
+    const checks = Array.isArray(classic.checks) ? classic.checks : [];
+    for (const c of checks) found.push({ context: c?.context, appId: c?.app_id });
+    if (!checks.length) for (const context of classic.contexts ?? []) found.push({ context, appId: null });
+  }
+  const seen = new Map();
+  for (const { context, appId } of found) {
+    const name = String(context ?? "").trim();
+    if (!name) continue;
+    const app = Number.isInteger(appId) && appId > 0 ? appId : null;
+    seen.set(`${name}\u0000${app ?? "*"}`, { context: name, appId: app });
+  }
+  return [...seen.values()];
+}
+
+// Each required context must have passed on the exact head: its newest check
+// run from the required app, or (any-source contexts only) a successful
+// commit status. Missing, pending, failing, or unprovable: listed.
+async function unmetRequiredContexts(run, ghBin, repo, headSha, required) {
+  if (!required.length) return { ok: true, unmet: [] };
+  const runs = await ghApiAllPages(run, ghBin, `repos/${repo}/commits/${headSha}/check-runs`, (d) => d?.check_runs);
+  if (!runs.ok) return runs;
+  const statuses = await ghApiAllPages(run, ghBin, `repos/${repo}/commits/${headSha}/status`, (d) => d?.statuses);
+  if (!statuses.ok) return statuses;
+  const unmet = [];
+  for (const { context, appId } of required) {
+    const matching = runs.data.filter((r) => r?.name === context && (appId === null || r?.app?.id === appId));
+    if (matching.length) {
+      const latest = matching.reduce((a, b) => (Number(b?.id) > Number(a?.id) ? b : a));
+      const passed = String(latest?.status ?? "").toLowerCase() === "completed"
+        && GREEN_CONCLUSIONS.has(String(latest?.conclusion ?? "").toUpperCase());
+      if (!passed) unmet.push(`${context} (${String(latest?.conclusion || latest?.status || "not passing").toLowerCase()})`);
+      continue;
+    }
+    const status = appId === null ? statuses.data.find((st) => st?.context === context) : null;
+    if (status) {
+      if (String(status.state ?? "").toUpperCase() !== "SUCCESS") unmet.push(`${context} (${String(status.state || "not passing").toLowerCase()})`);
+      continue;
+    }
+    unmet.push(`${context} (${appId === null ? "never reported" : "not reported by the required app"})`);
+  }
+  return { ok: true, unmet };
+}
+
 // Classic branch protection settings --admin would otherwise skip.
 function classicProtectionBlockers(protection) {
   const blockers = [];
@@ -444,13 +516,12 @@ export async function preflightAdminMerge({
 
   const base = String(view.baseRefName ?? "").trim();
   if (!base) return halt("base_unknown", ref, `GitHub did not report the base branch of ${ref}.`);
-  const branchPath = `repos/${parsed.repo}/branches/${encodeURIComponent(base)}`;
 
-  const rules = await ghApiJson(run, ghBin, `repos/${parsed.repo}/rules/branches/${encodeURIComponent(base)}`);
+  const rules = await ghApiAllPages(run, ghBin, `repos/${parsed.repo}/rules/branches/${encodeURIComponent(base)}`);
   if (!rules.ok) return halt("rules_unreadable", ref, `Could not read the rules on ${base}, so Admin Merge cannot confirm only the required review would be waived. GitHub said: ${rules.message}`);
   const ruleset = rulesetBlockers(rules.data);
 
-  const protection = await ghApiJson(run, ghBin, `${branchPath}/protection`);
+  const protection = await ghApiJson(run, ghBin, `repos/${parsed.repo}/branches/${encodeURIComponent(base)}/protection`);
   if (!protection.ok && !protection.notProtected) {
     return halt("protection_unreadable", ref, `Could not read branch protection on ${base}, so Admin Merge cannot confirm only the required review would be waived. GitHub said: ${protection.message}`);
   }
@@ -458,6 +529,12 @@ export async function preflightAdminMerge({
   const blockers = [...ruleset.blockers, ...classicProtectionBlockers(classic)];
   if (blockers.length > 0) {
     return halt("other_rule", ref, `Admin Merge only waives the required review, but ${base} also has: ${blockers.join("; ")}. Supervisor will not bypass that or change any rule.`, { otherRules: blockers });
+  }
+  const requiredByRules = requiredContexts(rules.data, classic);
+  const contexts = await unmetRequiredContexts(run, ghBin, parsed.repo, liveSha, requiredByRules);
+  if (!contexts.ok) return halt("checks_unreadable", ref, `Could not read the checks on ${liveSha.slice(0, 7)}, so Admin Merge cannot confirm every required check passed. GitHub said: ${contexts.message}`);
+  if (contexts.unmet.length > 0) {
+    return halt("required_checks_not_passing", ref, `${base} requires check(s) that have not passed on ${liveSha.slice(0, 7)}: ${contexts.unmet.slice(0, 5).join(", ")}. Admin Merge never bypasses required checks.`);
   }
   if (ruleset.threadResolution || classic?.required_conversation_resolution?.enabled === true) {
     const threads = await unresolvedReviewThreads(run, ghBin, parsed);
@@ -470,7 +547,7 @@ export async function preflightAdminMerge({
   const who = await run(ghBin, ["api", "user", "--jq", ".login"], { timeoutMs: 15_000 });
   const githubLogin = who.code === 0 ? String(who.stdout ?? "").trim().slice(0, 100) || null : null;
 
-  const checks = Array.isArray(required.checks) ? required.checks : [];
+  const checks = [...new Set([...requiredByRules.map((c) => c.context), ...(Array.isArray(required.checks) ? required.checks : [])])];
   return {
     ok: true,
     status: "ready",
@@ -503,7 +580,7 @@ export async function preflightAdminMerge({
 }
 
 // Runs the owner's Admin Merge. consent must be the exact
-// { action: "admin_merge", repo, number, headSha } the owner confirmed; the
+// { action: "admin_merge", repo, number, headSha, baseRef } the owner confirmed; the
 // full preflight runs again live first. One `gh pr merge --admin` call, no
 // retry or fallback. GitHub's own answer is returned verbatim (redacted).
 export async function executeAdminMerge({
@@ -519,8 +596,9 @@ export async function executeAdminMerge({
   const ref = `${parsed.repo}#${parsed.number}`;
   const consentSha = String(consent?.headSha ?? "").trim().toLowerCase();
   if (!consent || consent.action !== ADMIN_MERGE_ACTION || typeof consent.repo !== "string"
-      || !Number.isInteger(consent.number) || !FULL_SHA.test(consentSha)) {
-    return halt("consent_missing", ref, "Admin Merge needs the owner's explicit consent naming the action, repo, PR number, and full head SHA.");
+      || !Number.isInteger(consent.number) || !FULL_SHA.test(consentSha)
+      || typeof consent.baseRef !== "string" || !consent.baseRef) {
+    return halt("consent_missing", ref, "Admin Merge needs the owner's explicit consent naming the action, repo, PR number, full head SHA, and base branch.");
   }
   if (consent.repo.toLowerCase() !== parsed.repo.toLowerCase() || consent.number !== parsed.number) {
     return halt("consent_mismatch", ref, `The Admin Merge consent was for ${consent.repo}#${consent.number}, not ${ref}. Nothing was merged.`);
@@ -529,6 +607,9 @@ export async function executeAdminMerge({
   const preflight = await preflightAdminMerge({ prRef: ref, expectedHeadSha, config, ghBin, run });
   if (!preflight.ok) return preflight;
   const { plan } = preflight;
+  if (plan.baseRef !== consent.baseRef) {
+    return halt("base_changed", ref, `${ref} now targets ${plan.baseRef}, but you confirmed Admin Merge into ${consent.baseRef}. Nothing was merged; preview again.`, { baseRef: plan.baseRef });
+  }
   if (plan.headSha !== consentSha) {
     return halt("head_changed", ref, `${ref} moved to ${plan.headSha.slice(0, 7)} after you confirmed Admin Merge for ${consentSha.slice(0, 7)}. Nothing was merged; review the new commit and confirm again.`, { headRefOid: plan.headSha });
   }

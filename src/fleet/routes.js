@@ -500,7 +500,8 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
           const consent = c && typeof c.token === "string" && c.token.length <= 64
             && typeof c.action === "string" && typeof c.repo === "string" && c.repo.length <= 200
             && Number.isInteger(c.number) && typeof c.headSha === "string" && c.headSha.length <= 64
-            ? { token: c.token, action: c.action, repo: c.repo, number: c.number, headSha: c.headSha }
+            && typeof c.baseRef === "string" && c.baseRef.length <= 255
+            ? { token: c.token, action: c.action, repo: c.repo, number: c.number, headSha: c.headSha, baseRef: c.baseRef }
             : null;
           if (!consent) return fail(400, "Send { preview: true } first, then { consent } exactly as the preview returned it.");
           outcome = await supervisor.adminMergeCard(cardId, { initiator: "owner", consent });

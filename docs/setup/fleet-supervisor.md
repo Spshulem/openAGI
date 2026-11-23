@@ -180,8 +180,8 @@ identity already allow it.
 1. **Preview** (`POST /fleet/api/cards/:id/admin-merge` `{ "preview": true }`)
    is read-only. It checks the PR live, then lists what would be waived, what
    stays enforced, the GitHub login, and the exact command. It returns a
-   single-use consent bound to the card, repo, PR number, full head SHA and the
-   `admin_merge` action. The consent is valid for 5 minutes.
+   single-use consent bound to the card, repo, PR number, full head SHA, base
+   branch and the `admin_merge` action. The consent is valid for 5 minutes.
 2. **Confirm** (`{ "consent": … }`, exactly as the preview returned it) runs
    every check again. It records the owner's intent, then makes one
    `gh pr merge <n> --admin --squash --match-head-commit <sha>` call, and
@@ -191,13 +191,16 @@ Before anything is merged, every one of these must hold. If any fails, the
 merge halts:
 
 - The PR is open and not a draft.
-- The head is unchanged since the preview, and since the reviewed commit if
-  the card pinned one.
+- The head and base branch are unchanged since the preview. The head is also
+  unchanged since the reviewed commit if the card pinned one.
 - There are no conflicts, the PR is not behind its base, and GitHub knows
   whether it can merge.
-- No check is failing or pending, and every required check passes.
+- No check is failing or pending.
+- Every check the branch's rulesets and protection require has passed on that
+  exact head. Where a rule names the app that must post a check, the check must
+  come from that app. A required check that never reported stops the merge.
 - No changes were requested.
-- The base branch has no rule beyond review, status checks, linear history,
+- The base branch has no rule (every page of its rulesets is read) beyond review, status checks, linear history,
   signatures, creation, deletion and non-fast-forward. Any other rule (merge
   queue, deployments, push restrictions, `enforce_admins`, a locked branch,
   a disallowed squash) stops it.
