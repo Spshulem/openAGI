@@ -429,6 +429,28 @@ async function unverifiedCommits(run, ghBin, parsed, headSha) {
   return { ok: true, unverified };
 }
 
+// Classic protection settings the REST protection response leaves out
+// (required deployments), read from the branch's own protection rule.
+async function classicGraphqlSettings(run, ghBin, parsed, base) {
+  const [owner, name] = parsed.repo.split("/");
+  const query = "query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){branchProtectionRule{requiresDeployments requiredDeploymentEnvironments}}}}";
+  const res = await run(
+    ghBin,
+    ["api", "graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-f", `ref=refs/heads/${base}`],
+    { timeoutMs: 20_000 }
+  );
+  if (res.code !== 0) return { ok: false, message: githubMessage(res) };
+  try {
+    const repo = JSON.parse(res.stdout || "{}")?.data?.repository;
+    if (!repo || !repo.ref) return { ok: false, message: `GitHub did not return the ${base} branch.` };
+    const rule = repo.ref.branchProtectionRule;
+    if (!rule) return { ok: false, message: `GitHub returned no protection rule for ${base}, though branch protection is on.` };
+    return { ok: true, requiresDeployments: rule.requiresDeployments === true, environments: Array.isArray(rule.requiredDeploymentEnvironments) ? rule.requiredDeploymentEnvironments : [] };
+  } catch {
+    return { ok: false, message: "Could not parse the branch protection rule." };
+  }
+}
+
 async function unresolvedReviewThreads(run, ghBin, parsed) {
   const [owner, name] = parsed.repo.split("/");
   const query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}";
@@ -545,6 +567,13 @@ export async function preflightAdminMerge({
   }
   const classic = protection.ok ? protection.data : null;
   const blockers = [...ruleset.blockers, ...classicProtectionBlockers(classic)];
+  if (classic) {
+    const extra = await classicGraphqlSettings(run, ghBin, parsed, base);
+    if (!extra.ok) return halt("protection_unreadable", ref, `Could not read every branch protection setting on ${base}, so Admin Merge cannot confirm only the required review would be waived. GitHub said: ${extra.message}`);
+    if (extra.requiresDeployments) {
+      blockers.push(`branch protection requires successful deployments${extra.environments.length ? ` (${extra.environments.slice(0, 3).join(", ")})` : ""} (requiresDeployments)`);
+    }
+  }
   if (blockers.length > 0) {
     return halt("other_rule", ref, `Admin Merge only waives the required review, but ${base} also has: ${blockers.join("; ")}. Supervisor will not bypass that or change any rule.`, { otherRules: blockers });
   }

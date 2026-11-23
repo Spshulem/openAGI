@@ -45,6 +45,10 @@ function fakeGh(over = {}) {
     if (a === "pr" && b === "checks") {
       return over.checks ?? { code: 0, stdout: JSON.stringify([{ name: "test", state: "SUCCESS", bucket: "pass" }]), stderr: "" };
     }
+    if (a === "api" && b === "graphql" && String(args[3] ?? "").includes("branchProtectionRule")) {
+      if (over.classicRule === "error") return { code: 1, stdout: "", stderr: "gh: Could not resolve to a Ref (HTTP 200)" };
+      return { code: 0, stdout: JSON.stringify({ data: { repository: { ref: { branchProtectionRule: over.classicRule ?? { requiresDeployments: false, requiredDeploymentEnvironments: [] } } } } }), stderr: "" };
+    }
     if (a === "api" && b === "graphql") {
       return over.threads ?? { code: 0, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { totalCount: 0, nodes: [] } } } } }), stderr: "" };
     }
@@ -207,6 +211,36 @@ test("Admin Merge never bypasses a signed-commit rule: every PR commit must be v
   const none = fakeGh();
   await executeAdminMerge({ prRef: PR, consent: consentFor(), run: none.run });
   assert.equal(none.calls.some((c) => /\/pulls\/\d+\/commits/.test(c[2] ?? "")), false);
+});
+
+test("Admin Merge never bypasses classic protection's required deployments, and fails closed when it cannot read them", async () => {
+  const protection = { required_pull_request_reviews: {}, enforce_admins: { enabled: false } };
+  const deploys = fakeGh({ protection, classicRule: { requiresDeployments: true, requiredDeploymentEnvironments: ["production"] } });
+  const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: deploys.run });
+  assert.equal(out.reason, "other_rule");
+  assert.match(out.detail, /requires successful deployments \(production\)/);
+  assert.equal(deploys.merges().length, 0);
+
+  const unreadable = fakeGh({ protection, classicRule: "error" });
+  const blocked = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: unreadable.run });
+  assert.equal(blocked.reason, "protection_unreadable");
+  assert.match(blocked.detail, /Could not resolve to a Ref/);
+  assert.equal(unreadable.merges().length, 0);
+
+  // Protection on, yet GitHub returns no rule for the branch: fail closed.
+  const missingRule = fakeGh({ protection });
+  const run = async (bin, args) => (args[1] === "graphql" && String(args[3] ?? "").includes("branchProtectionRule")
+    ? { code: 0, stdout: JSON.stringify({ data: { repository: { ref: { branchProtectionRule: null } } } }), stderr: "" }
+    : missingRule.run(bin, args));
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run })).reason, "protection_unreadable");
+  assert.equal(missingRule.merges().length, 0);
+
+  // Classic protection without deployments: allowed. No classic protection: the extra read is skipped.
+  const fine = fakeGh({ protection });
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: fine.run })).status, "merged");
+  const none = fakeGh();
+  await executeAdminMerge({ prRef: PR, consent: consentFor(), run: none.run });
+  assert.equal(none.calls.some((c) => String(c[4] ?? "").includes("branchProtectionRule")), false);
 });
 
 test("Admin Merge reads every page of branch rules before allowing a bypass", async () => {

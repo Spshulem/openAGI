@@ -202,9 +202,10 @@ merge halts:
 - No changes were requested.
 - The base branch has no rule beyond review, status checks, linear history,
   signatures, creation, deletion and non-fast-forward. Every page of its
-  rulesets is read. Any other rule (merge queue, deployments, push
-  restrictions, `enforce_admins`, a locked branch, a disallowed squash) stops
-  it.
+  rulesets is read. Any other rule (merge queue, deployments from a ruleset
+  or classic protection, push restrictions, `enforce_admins`, a locked
+  branch, a disallowed squash) stops it. If a classic protection setting
+  can't be read, the merge stops.
 - Required conversations are resolved.
 - If the branch requires signed commits, every commit on the PR has a
   signature GitHub verified. GitHub signing the squash commit does not count.
