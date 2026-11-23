@@ -195,7 +195,7 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
   const state = supervisor?.getState?.() ?? {};
   const org = supervisor?.store?.organization?.() ?? { projects: [], threadAssignments: {} };
   const threadAssignments = org.threadAssignments ?? {};
-  const openCards = Array.isArray(state.cards) ? state.cards : [];
+  const openCards = (Array.isArray(state.cards) ? state.cards : []).filter((c) => c?.needsYou !== false);
   const cardsByThread = new Map();
   const cardsByPr = new Map();
   for (const card of openCards) {

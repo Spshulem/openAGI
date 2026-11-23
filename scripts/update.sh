@@ -20,8 +20,18 @@ if [ -n "${OPENAGI_INSTALL_DIR:-}" ]; then
   PROJECT_DIR="${OPENAGI_INSTALL_DIR}"
 else
   SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
-  if [ -n "${SELF_DIR}" ] && [ -d "${SELF_DIR}/../.git" ]; then
+  if [ -n "${SELF_DIR}" ] && [ -f "${SELF_DIR}/../package.json" ]; then
     PROJECT_DIR=$(CDPATH= cd -- "${SELF_DIR}/.." && pwd)
+  elif command -v systemctl >/dev/null 2>&1 && systemctl --user is-active openagi >/dev/null 2>&1; then
+    UNIT_WD=$(systemctl --user show -p WorkingDirectory --value openagi 2>/dev/null || true)
+    PROJECT_DIR="${UNIT_WD:-/opt/openagi}"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl is-active openagi >/dev/null 2>&1; then
+    UNIT_WD=$(systemctl show -p WorkingDirectory --value openagi 2>/dev/null || true)
+    PROJECT_DIR="${UNIT_WD:-/opt/openagi}"
+  elif [ -f "$HOME/OpenAGI/package.json" ]; then
+    PROJECT_DIR="$HOME/OpenAGI"
+  elif [ -f "$HOME/openAGI/package.json" ]; then
+    PROJECT_DIR="$HOME/openAGI"
   else
     PROJECT_DIR="/opt/openagi"
   fi
@@ -94,14 +104,60 @@ CONTAINER_ENV
   color_green "✓ Container replaced. Env carried over; if you used custom ports or mounts, re-run with them manually."
 }
 
-update_systemd() {
-  color_green "▶ Updating via systemd ($1)"
-  if [ ! -d "${PROJECT_DIR}/.git" ]; then
-    color_red "${PROJECT_DIR} is not a git checkout — cannot update via git pull."
+update_portable_linux_tarball() {
+  ARCH_M="$(uname -m)"
+  case "${ARCH_M}" in
+    aarch64|arm64) ASSET="OpenAGI-Linux-arm64.tar.gz" ;;
+    x86_64|amd64) ASSET="OpenAGI-Linux-x64.tar.gz" ;;
+    *) color_red "Unsupported Linux architecture for portable tarball update: ${ARCH_M}"; exit 1 ;;
+  esac
+  color_green "▶ Updating portable Linux install in ${PROJECT_DIR} (${ASSET})"
+  TMP_STAGE="$(mktemp -d)"
+  trap 'rm -rf "${TMP_STAGE}"' EXIT
+  BASE_URL="https://github.com/Spshulem/openAGI/releases/latest/download"
+  curl -fL "${BASE_URL}/${ASSET}" -o "${TMP_STAGE}/${ASSET}"
+  curl -fL "${BASE_URL}/${ASSET}.sha256" -o "${TMP_STAGE}/${ASSET}.sha256"
+  (cd "${TMP_STAGE}" && sha256sum -c "${ASSET}.sha256")
+  mkdir -p "${TMP_STAGE}/extracted"
+  tar -xzf "${TMP_STAGE}/${ASSET}" -C "${TMP_STAGE}/extracted"
+  BUNDLE_DIR="${TMP_STAGE}/extracted/OpenAGI"
+  if [ ! -f "${BUNDLE_DIR}/package.json" ]; then
+    color_red "Extracted archive missing OpenAGI/package.json"
     exit 1
   fi
-  (cd "${PROJECT_DIR}" && need_sudo git fetch origin && need_sudo git pull --ff-only)
-  (cd "${PROJECT_DIR}" && need_sudo npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+  WRITE_CMD=""
+  if [ ! -w "${PROJECT_DIR}" ]; then WRITE_CMD="need_sudo"; fi
+  for entry in bin src examples scripts assets docs node_modules package.json package-lock.json runtime-manifest.json LICENSE README.md START_HERE.txt start-openagi.sh; do
+    if [ -e "${BUNDLE_DIR}/${entry}" ]; then
+      ${WRITE_CMD} rm -rf "${PROJECT_DIR}/${entry}.prev"
+      if [ -e "${PROJECT_DIR}/${entry}" ]; then
+        ${WRITE_CMD} mv "${PROJECT_DIR}/${entry}" "${PROJECT_DIR}/${entry}.prev"
+      fi
+      ${WRITE_CMD} cp -a "${BUNDLE_DIR}/${entry}" "${PROJECT_DIR}/${entry}"
+      ${WRITE_CMD} rm -rf "${PROJECT_DIR}/${entry}.prev"
+    fi
+  done
+  if [ -d "${PROJECT_DIR}/node" ] && [ -d "${BUNDLE_DIR}/node" ]; then
+    ${WRITE_CMD} rm -rf "${PROJECT_DIR}/node.prev"
+    ${WRITE_CMD} mv "${PROJECT_DIR}/node" "${PROJECT_DIR}/node.prev"
+    ${WRITE_CMD} cp -a "${BUNDLE_DIR}/node" "${PROJECT_DIR}/node"
+    ${WRITE_CMD} rm -rf "${PROJECT_DIR}/node.prev"
+  fi
+  rm -rf "${TMP_STAGE}"
+  trap - EXIT
+}
+
+update_systemd() {
+  color_green "▶ Updating via systemd ($1)"
+  if [ -d "${PROJECT_DIR}/.git" ]; then
+    (cd "${PROJECT_DIR}" && need_sudo git fetch origin && need_sudo git pull --ff-only)
+    (cd "${PROJECT_DIR}" && need_sudo npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+  elif [ -f "${PROJECT_DIR}/package.json" ] && [ "$(uname -s)" = "Linux" ]; then
+    update_portable_linux_tarball
+  else
+    color_red "${PROJECT_DIR} is not a git checkout or portable OpenAGI folder."
+    exit 1
+  fi
   if [ "$1" = "user" ]; then
     systemctl --user restart openagi
   else
@@ -153,11 +209,21 @@ if [ -f "${LAUNCHD_PLIST}" ]; then
   exit 0
 fi
 
-# Bare source fallback
+# Bare source / portable Linux tarball fallback
 if [ -d "${PROJECT_DIR}/.git" ]; then
   color_yellow "▶ No managed service detected. Doing a bare git pull. Restart the daemon manually."
   (cd "${PROJECT_DIR}" && git pull --ff-only)
   (cd "${PROJECT_DIR}" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+  exit 0
+fi
+
+if [ -f "${PROJECT_DIR}/package.json" ] && [ "$(uname -s)" = "Linux" ]; then
+  update_portable_linux_tarball
+  if curl -fsS -X POST http://127.0.0.1:43210/control/restart >/dev/null 2>&1; then
+    color_green "✓ Updated portable runtime and triggered daemon restart."
+  else
+    color_green "✓ Updated portable runtime in ${PROJECT_DIR}. Restart your OpenAGI process to load the new version."
+  fi
   exit 0
 fi
 

@@ -478,13 +478,30 @@ async function cmdUpdate(positional, flags) {
   if (!res.ok) { console.error(c(RED, `✗ ${res.error ?? "HTTP " + res.status}`)); return 1; }
   const r = res.json ?? {};
   if (checkOnly) {
-    if (r.updateAvailable) console.log(c(YELLOW, `↑ update available: ${r.current} → ${r.latest} (${r.behind} commit${r.behind === 1 ? "" : "s"} behind on ${r.branch})`));
-    else console.log(c(GREEN, `✓ up to date (${r.current} on ${r.branch ?? "?"})`) + (r.reason ? c(DIM, ` — ${r.reason}`) : ""));
+    if (r.ok === false) {
+      console.error(c(RED, `✗ ${r.reason ?? "update check failed"}`));
+      return 1;
+    }
+    if (r.updateAvailable) {
+      const detail = r.mode === "release-archive"
+        ? "release archive"
+        : `${r.behind} commit${r.behind === 1 ? "" : "s"} behind on ${r.branch}`;
+      console.log(c(YELLOW, `↑ update available: ${r.current} → ${r.latest} (${detail})`));
+    } else {
+      console.log(c(GREEN, `✓ up to date (${r.current} on ${r.branch ?? "?"})`) + (r.reason ? c(DIM, ` — ${r.reason}`) : ""));
+    }
     return 0;
   }
   if (r.updated) {
-    console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps reinstalled)") : ""));
-    console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps updated)") : ""));
+    if (r.restartRequired) {
+      console.log(c(YELLOW, `restart required: ${target.remote ? "main" : "the daemon"} is still running the old version; stop and start OpenAGI again to use it.`));
+    } else {
+      console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    }
+  } else if (r.ok === false) {
+    console.error(c(RED, `✗ ${r.reason ?? "update failed"}`));
+    return 1;
   } else {
     console.log(c(GREEN, `✓ ${r.reason ?? "nothing to do"}`));
   }
