@@ -279,6 +279,34 @@ function agentBlockerSentence(agentSummary, messages) {
   return hit ? prose(hit, 260) : null;
 }
 
+// The decision an agent names without asking a question, e.g. "Blocked on:
+// your decision on server port and iOS build" -> "Your decision on server
+// port and iOS build."
+const NAMED_DECISION_RE = /\byour (decision|call|approval|go-ahead|sign-off|choice) (on|for|to|about|between) ([^.;\n]{4,160})/i;
+
+function agentNamedDecision(agentSummary, messages) {
+  const m = NAMED_DECISION_RE.exec(String(latestAgentText(agentSummary, messages)).replace(/[*`]/g, ""));
+  return m ? prose(`Your ${m[1].toLowerCase()} ${m[2].toLowerCase()} ${m[3].trim()}.`, 220) : null;
+}
+
+// Choices the agent listed as a short bullet list ("- port 9803 first"),
+// used only when the question itself carries no options.
+function agentListedOptions(agentSummary, messages) {
+  const lines = String(latestAgentText(agentSummary, messages)).replace(/\r/g, "").split("\n");
+  const bullets = lines.map((l) => /^\s*(?:[-*•]|\d+[.)])\s+(.{2,80})$/.exec(l)?.[1]?.replace(/[*`]/g, "").trim()).filter(Boolean);
+  return bullets.length >= 2 && bullets.length <= 5 ? bullets : [];
+}
+
+// A single action only the owner can take ("Single owner action: On
+// BuildBot2, run sudo xcodebuild -license accept."). It is a decision with
+// two real outcomes: do it (the agent continues) or not now.
+const OWNER_ACTION_LINE_RE = /\b(?:single\s+)?owner\s+action\s*:?\s*(.{6,200}?)(?:\n|$)/i;
+
+function agentOwnerAction(agentSummary, messages) {
+  const m = OWNER_ACTION_LINE_RE.exec(String(latestAgentText(agentSummary, messages)).replace(/\*\*/g, ""));
+  return m ? prose(m[1].replace(/^[:\s]+/, ""), 200) : null;
+}
+
 // The agent's own question, e.g. "Rotate the key, or hold?".
 function agentQuestionSentence(agentSummary, messages) {
   const hit = splitSentences(latestAgentText(agentSummary, messages)).reverse().find((t) => /\?$/.test(t) && t.length >= 8 && !GENERIC_ASK_RE.test(t));
@@ -451,6 +479,8 @@ export function buildDecisionContext({
     || (question?.reviewedAt && reviewBrief?.decision ? prose(reviewBrief.decision, 280) : null)
     || (askedLine && !GENERIC_ASK_RE.test(askedLine) ? askedLine : null)
     || agentQuestionSentence(agentSummary, recentMessages)
+    || agentNamedDecision(agentSummary, recentMessages)
+    || (agentOwnerAction(agentSummary, recentMessages) ? `Do this yourself: ${agentOwnerAction(agentSummary, recentMessages)}` : null)
     || (titleLine && !GENERIC_ASK_RE.test(titleLine) ? titleLine : null)
     || null;
 
@@ -496,7 +526,8 @@ export function buildDecisionContext({
   } else if (followUp?.choices?.length) {
     options = followUp.choices.map((c) => ({ label: c.label, consequence: optionConsequence(c.label, consequenceCtx) }));
   } else {
-    const raw = activeItem?.options?.length ? activeItem.options : realDecisionOptions(question?.options);
+    const fromQuestion = activeItem?.options?.length ? activeItem.options : realDecisionOptions(question?.options);
+    const raw = fromQuestion.length ? fromQuestion : agentListedOptions(agentSummary, recentMessages);
     options = raw.map((opt) => {
       const text = String(opt).replace(/^\d+[.)]\s*/, "");
       const parts = /^(.{1,80}?)\s+(?:—|–|:|→)\s+(.+)$/.exec(text);
@@ -505,6 +536,12 @@ export function buildDecisionContext({
     });
   }
   options = options.filter((o) => o.label).slice(0, 5);
+  if (!options.length && decision && /^Do this yourself:/.test(decision)) {
+    options = [
+      { label: "Done", consequence: "The agent continues once you have done it." },
+      { label: "Not now", consequence: "It stays blocked; nothing changes." }
+    ];
+  }
   const rec = supplied?.recommendation
     || prose(recommendation, 240)
     || (question?.reviewedAt && reviewBrief?.recommendation ? prose(reviewBrief.recommendation, 240) : null)

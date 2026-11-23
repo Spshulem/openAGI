@@ -101,7 +101,8 @@ test("on a paired node, a hub failure keeps decisions pending and the hub is ret
     config: { enabled: true, mode: "auto", proactiveSupervisorChat: true },
     deps: { now: () => nowMs, supervisorChatFetch: async (url) => { hubCalls.push(url); return { ok: hubUp, status: hubUp ? 200 : 503 }; } }
   });
-  sup.store.upsertQuestion({ dedupeKey: "ask:hub", kind: "agent-ask", threadKey: "paseo:s.h", title: "Publish the release notes?", options: ["publish", "hold"] });
+  sup.store.upsertQuestion({ dedupeKey: "ask:hub", kind: "agent-ask", threadKey: "paseo:s.h", title: "Publish the release notes?", options: ["publish", "hold"],
+    contextSnapshot: { threadTitle: "Release notes", recentMessages: [{ role: "user", text: "Draft the v0.0.85 release notes for the blog" }, { role: "assistant", text: "Notes drafted and reviewed. Publishing needs your approval. Publish them, or hold?" }] } });
   const first = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
   assert.equal(first.deliveredRemote, false);
   assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: nowMs }).deltas.length, 1, "still pending after a local-only fallback");
@@ -120,4 +121,48 @@ test("a reworded merge ask at the same head is not a new decision; a new head is
   const newHead = actionableDecisionMaterialHash({ ...base, askedHead: "9f00d1e", title: "#10346: run Mac tests or merge?", body: "CI failing on main-health." });
   assert.equal(a, reworded);
   assert.notEqual(a, newHead);
+});
+
+// Spencer's acceptance (2026-11-23): a check-in surfaces only the top 3-4
+// verified decisions that need him; none if none qualify; no counts, backlog,
+// raw ids, FYIs, routine recovery or unchanged repeats; one line on why.
+test("check-in: at most four verified decisions, merges first, nothing else", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  let nowMs = NOW;
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => nowMs } });
+  const ctx = (i, text) => ({ threadTitle: `Workstream ${i}`, recentMessages: [{ role: "user", text: `Please finish workstream ${i} end to end` }, { role: "assistant", text }] });
+  for (let i = 0; i < 5; i += 1) {
+    sup.store.upsertQuestion({ dedupeKey: `ask:${i}`, kind: "agent-ask", threadKey: `paseo:s.${i}`, title: `Workstream ${i}: pick a path?`, options: ["go", "hold"],
+      contextSnapshot: ctx(i, `Built and tested step ${i}. Shipping needs your approval. Go, or hold?`) });
+  }
+  sup.store.upsertQuestion({ dedupeKey: "ask:merge", kind: "agent-ask", mergeAsk: true, prRef: "acme/app#77", askedHead: "abc1234", threadKey: "paseo:s.m", title: "acme #77: merge?", options: ["merge", "wait"],
+    contextSnapshot: { ...ctx("M", "CI is green and the review is resolved. Merging needs your approval. Merge, or wait?"), threadTitle: "Merge train" } });
+  // Not decisions, or not verified: never in a check-in.
+  sup.store.upsertQuestion({ dedupeKey: "done:x", kind: "completed", threadKey: "paseo:s.x", title: "Docs refresh: finished", options: ["Got it"] });
+  sup.store.upsertQuestion({ dedupeKey: "err:y", kind: "session-error", threadKey: "paseo:s.y", title: "Session hit an error", options: ["retry"] });
+  sup.store.upsertQuestion({ dedupeKey: "deliver:group", kind: "deliver", threadKey: null, threadKeys: ["paseo:s.a", "paseo:s.b"], title: "2 stopped. Nudges can't get through. Nudge them?", options: ["done", "skip"] });
+  sup.store.upsertQuestion({ dedupeKey: "ask:poor", kind: "agent-ask", threadKey: "paseo:s.p", title: "Proceed?", options: ["yes", "no"] });
+
+  await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(msgs.length, 1);
+  const text = msgs[0].text;
+  const shown = text.match(/\*\*(?:New|Changed): [^*]+\*\*/g) ?? [];
+  assert.equal(shown.length, 4, "never more than four");
+  assert.match(shown[0], /Merge train/, "the merge decision comes first");
+  assert.match(text, /^\*\*Supervisor check-in: 4 decisions need you\.\*\*\n_Picked because/);
+  assert.doesNotMatch(text, /\bfq_[0-9a-f]{6,}|Decisions waiting|Sessions running|tracked goals|more new|Docs refresh|hit an error|Nudges can't get through|Proceed\?/);
+
+  // The two not shown are announced next; nothing shown is repeated.
+  nowMs += 60_000;
+  await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(msgs.length, 2);
+  assert.equal((msgs[1].text.match(/\*\*(?:New|Changed): /g) ?? []).length, 2);
+  for (const name of shown) assert.ok(!msgs[1].text.includes(name), `no repeat of ${name}`);
+
+  // Nothing new that qualifies: no check-in at all.
+  nowMs += 60_000;
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(res.posted, false);
+  assert.equal(msgs.length, 2);
 });

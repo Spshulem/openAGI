@@ -283,12 +283,14 @@ test("a context-poor new card is held while its owning agent supplies context, t
   assert.equal(pushes.length, 1, "pushed exactly once, after context arrived");
   assert.match(pushes[0].body, /Re-send October's corrected CSV/);
   assert.equal(chat.length, 1, "one check-in for the new decision");
-  assert.match(chat[0], /one new decision needs you/i);
+  assert.match(chat[0], /one decision needs you/i);
   assert.match(chat[0], /1\. \*\*Goal:\*\* .*double-counting refunds/);
   assert.match(chat[0], /2\. \*\*You asked the agent to:\*\* Fix the refund double-count/);
   assert.match(chat[0], /3\. \*\*Where it stands:\*\* Export job dedupes refunds by charge id\. Shipping it rewrites last month's already-sent CSV, which only Spencer can approve\.\n/);
   assert.match(chat[0], /4\. \*\*Decision now:\*\* Re-send October's corrected CSV.*Recommendation: proceed/);
-  assert.match(chat[0], /Decisions waiting on you: 1 · Sessions running here: 0 · Unverified tracked goals: 0/);
+  // No status or backlog counts in a check-in; only the decisions and why.
+  assert.doesNotMatch(chat[0], /Decisions waiting on you|Sessions running|tracked goals|more new or changed/);
+  assert.match(chat[0], /Picked because each is new or changed since the last check-in/);
   assert.doesNotMatch(chat[0], INTERNAL_ID_RE, "check-ins use names, not ids");
 
   // Unchanged afterwards: nothing repeats.
