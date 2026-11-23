@@ -92,7 +92,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     failure(res, 401, "unauthorized", "A paired client credential is required.");
     return true;
   }
-  for (const key of ["accept", "if-none-match", "last-event-id"]) {
+  for (const key of ["accept", "if-none-match", "last-event-id", "x-openagi-timezone"]) {
     if (typeof req.headers[key] === "string") headers[key] = req.headers[key];
   }
   const query = new URLSearchParams(url.searchParams);
