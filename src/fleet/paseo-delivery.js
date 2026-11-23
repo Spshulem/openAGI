@@ -3,7 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { writeJsonAtomic } from "../file-utils.js";
-import { clampText, redactSecrets } from "./contracts.js";
+import { clampText, redactSecrets, shortHash } from "./contracts.js";
 import { withPaseo, hostApi, providerLimitNotice } from "./sources/paseo.js";
 
 const active = new Set();
@@ -557,6 +557,94 @@ async function waitForPaseoTurn(ref, receipt, signal, save, { ownerInitiated = f
   }
 }
 
+// Reconciling a receipt whose turn was never confirmed at send time. Hosts
+// that rebuild a timeline from provider history (Codex thread items,
+// Antigravity "<id>:history:<n>") drop the client message ID and turn IDs,
+// so the exact-ID check above can never settle those receipts. The exact
+// text we sent still identifies the message: its hash is journaled.
+const RECONCILE_PAGE_LIMIT = 200;
+const RECONCILE_MAX_PAGES = 30;
+const RECONCILE_BUDGET_MS = 12_000;
+// The one status check an unconfirmable delivery may get, never a replay.
+export const PASEO_STATUS_CHECK_TEXT = "[OpenAGI supervisor] Status check: where did you stop? Reply briefly; do not redo earlier steps.";
+// A receipt this young may still be waiting for its turn to start.
+const STATUS_CHECK_MIN_AGE_MS = 30 * 60_000;
+
+function entrySeq(entry) {
+  for (const value of [entry?.seqEnd, entry?.seqStart, entry?.seq]) if (Number.isInteger(value)) return value;
+  return null;
+}
+
+function failedTurnText(text) {
+  const plain = String(text ?? "").trim();
+  return /^\[System Error\]/i.test(plain) || providerLimitNotice(plain) ? clampText(redactSecrets(plain), 120) : null;
+}
+
+/**
+ * Settle a pending receipt against the chat's whole timeline (bounded).
+ * Evidence is the receipt's own message: an exact ID, or the exact text we
+ * sent (its journaled hash) after the pre-send cursor. Order and timestamps
+ * alone never count. Returns { outcome, evidence?, systemError? } with
+ * outcome one of:
+ *   delivered   the message is in the timeline and the agent answered it
+ *   running     the message is in the timeline and its turn is running now
+ *   unanswered  the message is in the timeline, no reply and nothing running
+ *   ambiguous   the message was not found in what the host still keeps
+ *   inconclusive  the time budget ran out before the scan finished
+ * Throws when the host cannot serve the timeline (a transport failure).
+ */
+export async function reconcilePaseoReceipt(ref, receipt, signal, { deadline = Infinity, maxPages = RECONCILE_MAX_PAGES } = {}) {
+  const ids = receiptIds(receipt);
+  const hash = nonEmpty(receipt?.messageHash);
+  let options = { direction: "tail", limit: RECONCILE_PAGE_LIMIT };
+  let newer = [];
+  let agent = null;
+  let scanned = 0;
+  for (let page = 0; page < maxPages; page++) {
+    signal?.throwIfAborted();
+    if (performance.now() >= deadline) return { outcome: "inconclusive", scanned };
+    const history = await ref.timeline.refetch(options);
+    if (history?.error) throw new Error("Paseo timeline unavailable");
+    agent ??= history.agent ?? null;
+    const entries = history.entries ?? [];
+    scanned += entries.length;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry.item?.type !== "user_message") continue;
+      const byId = entryIds(entry).some(id => ids.has(id));
+      const byHash = !byId && Boolean(hash) && shortHash(String(entry.item?.text ?? "")) === hash;
+      if (!byId && !byHash) continue;
+      // The same text sent before this receipt's cursor was another send.
+      const seq = entrySeq(entry);
+      if (byHash && receipt.cursor && history.epoch && history.epoch === receipt.cursor.epoch
+        && seq !== null && seq <= receipt.cursor.seq) continue;
+      const evidence = {
+        by: byId ? "message-id" : "message-hash",
+        entryId: entryIds(entry)[0] ?? null,
+        entryAt: entry.timestamp ?? null,
+      };
+      const later = entries.slice(i + 1).concat(newer);
+      const next = later.find(x => x.item?.type === "user_message" || x.item?.type === "assistant_message");
+      if (next?.item?.type === "assistant_message") {
+        const systemError = failedTurnText(next.item.text);
+        return { outcome: "delivered", evidence: { ...evidence, replied: true }, ...(systemError ? { systemError } : {}) };
+      }
+      // Nothing newer than our message: a turn running now is its turn.
+      if (!next && (agent?.status === "running" || agent?.activeTurn)) {
+        return { outcome: "running", evidence: { ...evidence, replied: false } };
+      }
+      return { outcome: "unanswered", evidence: { ...evidence, replied: false } };
+    }
+    newer = entries.concat(newer);
+    const first = entries[0];
+    if (!history.hasOlder || !first) return { outcome: "ambiguous", scanned, complete: true };
+    const cursor = history.startCursor ?? (entrySeq(first) !== null && history.epoch ? { epoch: history.epoch, seq: entrySeq(first) } : null);
+    if (!cursor) break;
+    options = { direction: "before", cursor, limit: RECONCILE_PAGE_LIMIT };
+  }
+  return { outcome: "ambiguous", scanned, complete: false };
+}
+
 const OWNER_PLAYBOOKS = new Set(["owner-message", "owner-answer"]);
 
 function cleanOwnerPermissionReply(raw, ownerChoice = null) {
@@ -699,6 +787,8 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       try { previous = JSON.parse(fs.readFileSync(file, "utf8")); }
       catch (e) { if (e.code !== "ENOENT") return blocked("Paseo delivery journal cannot be read"); }
       const save = receipt => writeJsonAtomic(file, receipt);
+      // Set when an unconfirmable earlier delivery gets its one status check.
+      let statusCheckFor = null;
       if (previous?.pending) {
         const priorCheck = await readPaseoConfirmation(ref, previous, signal, save, Infinity, { ownerInitiated });
         signal.throwIfAborted();
@@ -709,8 +799,37 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           // sees the failure (a quota waits for its reset).
           writeJsonAtomic(file, { ...previous, pending: false, executionError: priorCheck.systemError });
           if (!ownerInitiated) return blocked(`Previous nudge was delivered; its turn then failed (${priorCheck.systemError}); reassess before another send`);
+        } else if (!priorCheck.confirmed && !ownerInitiated) {
+          // Settle it from the whole timeline before refusing: a lost
+          // acknowledgment is a delivery, not a reason to stop nudging.
+          let rec;
+          try {
+            rec = await reconcilePaseoReceipt(ref, previous, signal, { deadline: performance.now() + RECONCILE_BUDGET_MS });
+          } catch (error) {
+            signal.throwIfAborted();
+            return blocked(`Previous delivery could not be checked: ${clampText(redactSecrets(String(error?.message ?? "Paseo timeline unavailable")), 100)}; no automatic resend`);
+          }
+          signal.throwIfAborted();
+          if (rec.outcome === "delivered" || rec.outcome === "running") {
+            writeJsonAtomic(file, {
+              ...previous,
+              pending: false,
+              reconciled: { outcome: rec.outcome, ...rec.evidence, ...(rec.systemError ? { executionError: rec.systemError } : {}), at: new Date().toISOString() },
+            });
+            return blocked(rec.systemError
+              ? `Previous nudge was delivered; its turn then failed (${rec.systemError}); reassess before another send`
+              : `Previous nudge was delivered (${rec.outcome === "running" ? "its turn is running" : "answered"}; matched by ${rec.evidence.by} in the Paseo timeline); reassess before another send`);
+          }
+          if (rec.outcome === "inconclusive") return blocked("Previous delivery has no confirmed turn yet; still checking the Paseo timeline, no automatic resend");
+          // Unanswered or not found. Age is never evidence of success, and
+          // the old message is never replayed. One status check per receipt.
+          if (previous.statusCheck) return blocked("Previous delivery and its one status check are both unconfirmed; held, no automatic resend");
+          const sentMs = Date.parse(previous.sentAt ?? previous.activityAt ?? "");
+          if (!Number.isFinite(sentMs) || Date.now() - sentMs < STATUS_CHECK_MIN_AGE_MS) {
+            return blocked("Previous delivery has no confirmed turn; no automatic resend");
+          }
+          statusCheckFor = { messageId: previous.messageId ?? null, outcome: rec.outcome };
         } else if (!priorCheck.confirmed) {
-          if (!ownerInitiated) return blocked("Previous delivery has no confirmed turn; no automatic resend");
           // Owner explicitly initiated a new send; clear stale unconfirmed marker so older background nudges never brick manual coordination.
           writeJsonAtomic(file, { ...previous, pending: false });
         } else {
@@ -719,7 +838,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           if (!ownerInitiated) return blocked("Previous Paseo turn confirmed; reassess the conversation before another send");
         }
       }
-      if (!ownerInitiated && previous?.messageHash === base?.messageHash && previous?.activityAt === thread.meta.updatedAt) {
+      if (!statusCheckFor && !ownerInitiated && previous?.messageHash === base?.messageHash && previous?.activityAt === thread.meta.updatedAt) {
         return blocked("This nudge was already delivered for this chat revision");
       }
       await ref.refresh();
@@ -783,23 +902,30 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
         }
       }
-      const preflight = ineligibleAgent(agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
-      if (preflight) return blocked(preflight);
+      // A status check goes only to a chat that is plainly idle: not running,
+      // not errored, no pending permission, unchanged since the scan.
+      const eligibility = statusCheckFor ? { ownerInitiated: false } : { ownerInitiated, silentStuckRecovery, errorRecovery };
+      const holdForCheck = reason => blocked(`Previous delivery has no confirmed turn; holding its one status check until the chat is idle (${reason}); no automatic resend`);
+      const preflight = ineligibleAgent(agent, thread, eligibility);
+      if (preflight) return statusCheckFor ? holdForCheck(preflight) : blocked(preflight);
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: ownerInitiated ? 8 : 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
       // refetch updates the SDK handle; check both snapshots so a newer event
       // or an unavailable baseline cannot be hidden by the other snapshot.
-      const changed = ineligibleAgent(baseline.agent, thread, { ownerInitiated, silentStuckRecovery, errorRecovery }) || ineligibleAgent(ref.current(), thread, { ownerInitiated, silentStuckRecovery, errorRecovery });
-      if (changed) return blocked(changed);
+      const changed = ineligibleAgent(baseline.agent, thread, eligibility) || ineligibleAgent(ref.current(), thread, eligibility);
+      if (changed) return statusCheckFor ? holdForCheck(changed) : blocked(changed);
+      if (statusCheckFor) text = PASEO_STATUS_CHECK_TEXT;
       const messageId = randomUUID();
       const cursor = timelineCursor(baseline);
       const intent = {
         messageId,
         clientMessageId: messageId,
-        messageHash: base.messageHash,
+        messageHash: statusCheckFor ? shortHash(PASEO_STATUS_CHECK_TEXT) : base.messageHash,
         activityAt: agent.updatedAt,
+        sentAt: new Date().toISOString(),
         ...(cursor ? { cursor } : {}),
+        ...(statusCheckFor ? { statusCheck: statusCheckFor } : {}),
         pending: true,
       };
       writeJsonAtomic(file, intent); // Disk failure prevents dispatch.
@@ -807,7 +933,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       const sendOptions = {
         messageId,
         activeTurnBehavior: "steer",
-        ...(normalizedImages.length ? { images: normalizedImages } : {})
+        ...(normalizedImages.length && !statusCheckFor ? { images: normalizedImages } : {})
       };
       let response;
       dispatched = true;
@@ -903,6 +1029,11 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
       }
       writeJsonAtomic(file, { ...correlated, pending: false });
+      if (statusCheckFor) {
+        // The proposed message was not sent: the reply decides what is next.
+        return { status: "blocked", route: "paseo-send", actionId, statusCheck: true, messageId: correlated.clientMessageId ?? messageId,
+          detail: "Sent one status check after an unconfirmable earlier delivery (no replay); the proposed nudge waits for the reply" };
+      }
       return {
         status: "sent",
         route: "paseo-send",
@@ -916,7 +1047,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       };
     }, factory);
   } catch (err) {
-    const errMsg = ownerInitiated && err?.message ? `: ${clampText(redactSecrets(String(err.message)), 120)}` : "";
+    // Before dispatch nothing can have been delivered, so the named error
+    // (host unavailable, timeout, auth) is safe to report for any send.
+    const errMsg = (ownerInitiated || !dispatched) && err?.message ? `: ${clampText(redactSecrets(String(err.message)), 120)}` : "";
     if (ownerInitiated && dispatched) {
       return {
         status: "blocked",

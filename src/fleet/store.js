@@ -53,9 +53,11 @@ const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
 // The owner being active is no failure. A presence probe that keeps failing
 // ("front app unknown", "presence check too slow") is: it builds the streak
 // so the owner hears why nothing lands.
-// A chat stopped on a provider limit, or a nudge delivered whose turn then
-// failed, is not a route failing either: the Supervisor owns that recovery.
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|Provider (?:usage|session)-limit until |Previous nudge was delivered; its turn then failed)/;
+// A chat stopped on a provider limit, a nudge found delivered (its turn
+// confirmed, answered, running, or failed), or one status check sent after
+// an unconfirmable delivery, is not a route failing either: the Supervisor
+// owns what comes next.
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|Provider (?:usage|session)-limit until |Previous nudge was delivered|Previous Paseo turn confirmed|Sent one status check)/;
 
 function emptyState() {
   return {
