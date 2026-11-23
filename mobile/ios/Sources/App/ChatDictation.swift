@@ -316,6 +316,9 @@ final class ChatDictation {
             task = nil
             request = nil
             requestBox.set(nil)
+            // Retire the failed request now, not when the retry starts: a
+            // callback it already queued must not reach the draft or retry.
+            recognitionID = UUID()
             guard decision.quickFailures > 0 else { return beginRecognition(generation: generation) }
             // Give a recognizer that just failed a moment before the next try.
             let delay = Self.retryDelay(afterQuickFailures: decision.quickFailures)
