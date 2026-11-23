@@ -563,6 +563,24 @@ final class NativeNavigationTests: XCTestCase {
         }
     }
 
+    // Idle voice is one composer button, so it costs the Supervisor chat no
+    // height on a small screen; the status row appears only while voice runs.
+    func testTalkWithSupervisorStartsFromTheComposerWithoutTakingChatSpace() {
+        let app = launch()
+        tab(app, "Chat")
+        tap(app, "chat-conversations")
+        tap(app, "conversation-supervisor")
+        XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 5))
+        let start = app.buttons["supervisor-voice-start"].firstMatch
+        XCTAssertTrue(start.waitForExistence(timeout: 5))
+        XCTAssertEqual(start.label, "Talk with Supervisor")
+        XCTAssertFalse(element(app, "supervisor-voice-state").exists, "No voice status row until voice starts")
+        XCTAssertFalse(element(app, "supervisor-voice-stop").exists)
+        tap(app, "chat-conversations")
+        tap(app, "conversation-agent")
+        XCTAssertFalse(app.buttons["supervisor-voice-start"].exists, "Voice is offered only in the Supervisor chat")
+    }
+
     func testImagesCanBeRemovedAndSentWithTheirPixelsInChatAndSupervisor() {
         let app = launch(["--ui-attachment-fixture"])
         tab(app, "Chat")
