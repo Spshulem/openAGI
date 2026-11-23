@@ -51,8 +51,31 @@ function cardItem(card) {
     primaryLabel: typeof card.primaryAction?.label === "string" ? clean(card.primaryAction.label, 80) : (typeof card.primaryLabel === "string" ? clean(card.primaryLabel, 80) : null),
     ciState: typeof card.ciState === "string" ? clean(card.ciState, 24) : null,
     pmBrief: typeof card.pmBrief === "string" ? clean(card.pmBrief, 500) : null,
-    options: supportedOptions(card.options)
+    options: supportedOptions(card.options),
+    // Decision-ready context for voice and glasses: what the owner is trying
+    // to do, the facts that bear on it, the choices and the recommendation.
+    goal: text(card.brief?.context, 300),
+    evidence: [text(card.brief?.currentState, 220), text(card.brief?.whatChanged, 360)].filter(Boolean).join(" ") || null,
+    decision: text(card.brief?.decision, 300),
+    recommendation: text(card.recommendation, 240),
+    choices: decisionChoices(card)
   };
+}
+
+function text(value, max) {
+  return typeof value === "string" && value.trim() ? clean(value, max) : null;
+}
+
+// The owner's real choices on a card, in the order the card offers them.
+function decisionChoices(card) {
+  const labels = [card.primaryAction?.label, card.secondaryAction?.label,
+    ...(Array.isArray(card.extraActions) ? card.extraActions.map(action => action?.label) : []),
+    ...supportedOptions(card.options)];
+  const seen = new Set();
+  return labels.filter(label => typeof label === "string" && label.trim())
+    .map(label => clean(label, 60))
+    .filter(label => !seen.has(label.toLowerCase()) && seen.add(label.toLowerCase()))
+    .slice(0, 5);
 }
 
 function questionItem(question, cards) {
