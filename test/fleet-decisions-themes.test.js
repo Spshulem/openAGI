@@ -46,7 +46,10 @@ test("decisions keep-alive gate suppresses completed chats, escalates owner bloc
   const decisionCalls = [];
   const decisionsFetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    decisionCalls.push({ url, body });
+    // The owner-precedent engine consults the same endpoint for owner asks;
+    // this test counts only keep-alive batches (they carry candidates).
+    if (body.input && Array.isArray(JSON.parse(body.input).candidates)) decisionCalls.push({ url, body });
+    else return { ok: true, status: 200, json: async () => ({ model: "gpt-6-luna-2026", answers: body.questions.map((q) => ({ type: "predicate", name: q.name, probability: 0.05 })), usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } }) };
     const answers = body.questions.map((q) => {
       const idxMatch = /^c(\d+)_(keep_alive|needs_owner)$/.exec(q.name);
       const idx = Number(idxMatch[1]);
@@ -783,6 +786,22 @@ test("deliverPaseo recovers disconnected ACP sessions in-place, unblocks stale n
   assert.match(createdSessions[0].prompt, /Why is paseo broken/);
   assert.equal(imageFollowUps.length, 1);
   assert.equal(imageFollowUps[0].options.images.length, 1);
+
+  // Active Work resumes are existing-session-only: a disconnected runtime
+  // must be reported as blocked instead of creating a replacement session.
+  const noRecovery = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: paseoThread(initialBroken, "srv_mac"),
+    text: "[OpenAGI supervisor] Follow up in the existing session.",
+    store: { dir },
+    actionId: "act-no-recovery",
+    base: { messageHash: "owner-no-recovery", playbook: "owner-message" },
+    factory: factoryA,
+    recoverDisconnected: false
+  });
+  assert.equal(noRecovery.status, "blocked");
+  assert.match(noRecovery.detail, /existing session only/);
+  assert.equal(createdSessions.length, 1);
 
   // Case B: Turnless ACP/Claude provider confirms owner message + clears stale unconfirmed background receipt!
   const turnlessAgent = {
