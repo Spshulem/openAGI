@@ -1,4 +1,5 @@
 import { THREAD_KIND_PATTERN } from "./fleet/contracts.js";
+import { isNodeReconnectMobileRoute } from "./node-reconnect.js";
 
 // The phone is a full client, so its credential is broader than the G2
 // wearable's. Breadth is only safe when it is explicit: this module is the
@@ -157,6 +158,10 @@ const PATTERNS = [
 export function isMobileRouteAllowed(method, pathname) {
   if (typeof method !== "string" || typeof pathname !== "string") return false;
   if (pathname.includes("..") || pathname.includes("//")) return false;
+  // A paired phone may approve a short-lived reconnect request, but it never
+  // receives a node credential. Keep the route shape in one place so the
+  // hosted auth gate and worker relay cannot accidentally broaden it.
+  if (isNodeReconnectMobileRoute(method, pathname)) return true;
   if (EXACT.has(`${method} ${pathname}`)) return true;
   // "GET /tasks/clarifications" is exact; the ID pattern must not swallow it.
   if (pathname === "/tasks/clarifications") return false;

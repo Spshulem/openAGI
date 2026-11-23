@@ -14,7 +14,7 @@ async function renderWorkspaceUnavailable(title, error, retry) {
   pane.append(heading, message, again); main.replaceChildren(pane);
   if (!reconnect) return;
   const help = document.createElement('p');
-  help.textContent = 'Open your connected agent below and sign in there, or use the server address shown in your phone’s connection settings. This desktop connection does not have workspace access yet.';
+  help.textContent = 'This Mac is still paired and its heartbeat can reach main, but desktop workspace authorization needs an owner decision. Run `openagi reconnect` on this Mac and approve the short-lived request from an already paired owner phone. No phone code or owner token is needed.';
   pane.append(help);
   try {
     const nodes = await fetchJson('/nodes');
