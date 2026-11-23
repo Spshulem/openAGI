@@ -33,6 +33,10 @@ test("NodeReconnectManager binds approval and delivery to the exact node", () =>
     assert.equal(approved.ok, true);
     assert.equal(approved.request.ownerProxyToken, undefined, "phone response never contains a credential");
     assert.equal(manager.listForMobile().length, 0);
+    const resumed = manager.create("mac-node");
+    assert.equal(resumed.created, false, "an approved but unacknowledged request is resumable");
+    assert.equal(resumed.request.requestId, id);
+    assert.equal(resumed.request.status, "approved");
 
     const delivered = manager.statusForNode(id, "mac-node");
     assert.equal(delivered.ok, true);

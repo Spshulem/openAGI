@@ -9,7 +9,7 @@ struct MainConnectionError: LocalizedError {
   var errorDescription: String? {
     switch code {
     case "main-pairing-required":
-      return "Main workspace authorization is needed. On this Mac, run `openagi reconnect`, then approve the one-time request from an already paired owner phone. The node heartbeat, phone pairing, and saved work are kept."
+      return "Main workspace authorization is needed. Reconnect this Mac safely by running `openagi reconnect`, then approve the one-time request from an already paired owner phone. The node heartbeat, phone pairing, and saved work are kept."
     case "main-routing-loop":
       return "This Mac's main address points to another worker. Correct its main server address, then refresh."
     default:

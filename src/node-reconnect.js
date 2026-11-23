@@ -64,7 +64,11 @@ export class NodeReconnectManager {
     this.sweep(now);
     const enrollment = this.nodeRegistry.enrollment(targetNodeId);
     if (!enrollment) return { ok: false, code: "unknown_node", message: "This node is no longer enrolled on the main." };
-    const existing = [...this.requests.values()].find((request) => request.targetNodeId === targetNodeId && request.status === "pending");
+    // An approved request remains resumable until the target acknowledges
+    // delivery. A CLI retry after a lost response must not create a second
+    // approval request or require the owner to approve the same repair again.
+    const existing = [...this.requests.values()].find((request) => request.targetNodeId === targetNodeId
+      && (request.status === "pending" || request.status === "approved"));
     if (existing && !expired(existing, now)) {
       return { ok: true, created: false, request: publicRequest(existing) };
     }
