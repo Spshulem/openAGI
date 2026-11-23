@@ -523,6 +523,7 @@ function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
 
 const CONTEXT_REQUEST_RETRY_MS = 30 * 60_000;
 const CONTEXT_REQUEST_MAX_ATTEMPTS = 3;
+const CONTEXT_REQUEST_THREAD_COOLDOWN_MS = 6 * 60 * 60_000;
 
 function formatCount(value) {
   return value === null || value === undefined ? "unknown" : String(value);
@@ -1010,11 +1011,17 @@ export class FleetSupervisor {
         && ["paseo-send", "antigravity-send", "peer-relay"].includes(route)
         && budgetLeft > 0
         && !this.store.mutedUntil(thread.key);
-      let reason = reachable ? null : "owning agent not reachable by message";
-      if (reachable) {
+      // At most one context request per session per cooldown, whatever new
+      // question ids its restated asks create (live 2026-11-23: 7 requests
+      // to one agent in 65 minutes).
+      const lastAsked = thread ? Date.parse(this.store.lastThreadContextRequest(thread.key)?.at ?? "") : NaN;
+      const recentlyAsked = Number.isFinite(lastAsked) && started - lastAsked < CONTEXT_REQUEST_THREAD_COOLDOWN_MS;
+      let reason = !reachable ? "owning agent not reachable by message" : (recentlyAsked ? "this session was asked for context recently" : null);
+      if (reachable && !recentlyAsked) {
         try {
           const delivery = await this.executor.deliver({ thread, message: buildContextRequestMessage(ctx), route, playbook: "context-request" });
           sent = delivery?.status === "sent";
+          if (sent) this.store.recordThreadContextRequest(thread.key, started);
           if (!sent) reason = clampText(delivery?.detail ?? delivery?.status ?? "not delivered", 120);
           this.store.recordNudge(thread.key, { playbook: "context-request", route: delivery?.route ?? route, status: sent ? "context-request" : (delivery?.status ?? "failed") });
         } catch (error) {

@@ -142,20 +142,17 @@ export function parseAgentSuppliedContext(text) {
 // Only the agent's latest message counts: a block from earlier in the chat
 // may describe an older ask, and must never label a newer, different one.
 // The block also has to name the same decision when the ask has options.
-function latestAgentContext(messages, agentSummary, question = null) {
+function latestAgentContext(messages, agentSummary) {
   const latest = [...(messages ?? [])].reverse().find((m) => m?.role !== "user")?.text ?? null;
   // Message windows keep only a message's tail; the fuller agent summary is
   // used when it is the same latest message.
   const tail = String(latest ?? "").trim().slice(-80);
   const sameFuller = agentSummary && (!latest || (tail && String(agentSummary).trim().endsWith(tail))) ? agentSummary : null;
-  const parsed = parseAgentSuppliedContext(latest) ?? parseAgentSuppliedContext(sameFuller);
-  if (!parsed) return null;
-  const asked = realDecisionOptions(question?.options).map((o) => o.toLowerCase());
-  if (asked.length && parsed.options.length) {
-    const offered = parsed.options.map((o) => String(o.label).toLowerCase());
-    if (!asked.some((label) => offered.some((o) => o === label || o.startsWith(label) || label.startsWith(o)))) return null;
-  }
-  return parsed;
+  // Only the latest message counts, so an older block can't describe a newer
+  // ask. Option labels are not required to match the question's: agents
+  // word them differently, and rejecting on that discarded every real reply
+  // (live 2026-11-23), which kept re-requesting the same context.
+  return parseAgentSuppliedContext(latest) ?? parseAgentSuppliedContext(sameFuller);
 }
 
 function sourceRequest(messages) {
@@ -365,7 +362,7 @@ export function buildDecisionContext({
   now = Date.now()
 } = {}) {
   const askType = followUp ? "decision" : classifyAsk(question);
-  const supplied = latestAgentContext(recentMessages, agentSummary, question);
+  const supplied = latestAgentContext(recentMessages, agentSummary);
   const req = sourceRequest(recentMessages);
   const prRef = prMeta?.ref ?? question?.prRef ?? followUp?.prRef ?? null;
   const prName = prLabel(prRef);

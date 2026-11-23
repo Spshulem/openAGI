@@ -88,7 +88,8 @@ function emptyState() {
     followThroughWatches: [],
     supervisorChatNotices: {},
     surfacedDecisions: {},
-    providerFailovers: {}
+    providerFailovers: {},
+    contextRequestLog: {}
   };
 }
 
@@ -1503,7 +1504,8 @@ export class FleetStore {
       surfacedDecisions: isObject(raw.surfacedDecisions)
         ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
         : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
-      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {}
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {},
+      contextRequestLog: isObject(raw.contextRequestLog) ? raw.contextRequestLog : {}
     };
   }
 
@@ -1813,6 +1815,24 @@ export class FleetStore {
     if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
     this._save();
     return { ...entry };
+  }
+
+  // When a session was last asked for decision context. An agent that
+  // restates its ask creates a new question id; this cap is per session.
+  recordThreadContextRequest(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.contextRequestLog ??= {};
+    this.state.contextRequestLog[key] = { at: iso(toMs(at, this.now())) };
+    const keys = Object.keys(this.state.contextRequestLog);
+    if (keys.length > 500) delete this.state.contextRequestLog[keys[0]];
+    this._save();
+    return { ...this.state.contextRequestLog[key] };
+  }
+
+  lastThreadContextRequest(threadKey) {
+    const entry = this.state.contextRequestLog?.[String(threadKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   providerFailoverFor(oldKey) {

@@ -406,12 +406,15 @@ test("review fixes: stale agent context, permission approvals, reviewed recommen
   });
   assert.equal(stale.agentSupplied, false);
   assert.doesNotMatch(stale.decision, /Merge the PR/);
-  // Even as the latest message, a block naming other options is ignored.
-  const mismatched = buildDecisionContext({
-    question: { kind: "agent-ask", title: "Delete the staging database?", options: ["delete", "keep"] },
-    recentMessages: [{ role: "assistant", text: oldBlock }]
+  // The latest message's block is the agent's direct reply: it counts even
+  // when its option labels are worded differently (requiring a label match
+  // discarded every real reply and looped context requests, live 2026-11-23).
+  const reworded = buildDecisionContext({
+    question: { kind: "agent-ask", title: "Choose the Amplemarket connection?", options: ["workspace connection", "personal connection"] },
+    recentMessages: [{ role: "assistant", text: "DECISION CONTEXT\nGoal: G\nAssigned: A\nVerified: V\nBlocked: B\nDecision: Which connection?\nOptions:\n- Use the shared workspace connection — everyone shares it\n- Use my personal connection — only Spencer's\nRecommendation: workspace" }]
   });
-  assert.equal(mismatched.agentSupplied, false);
+  assert.equal(reworded.agentSupplied, true);
+  assert.equal(reworded.assignment, "A");
 
   // "Approve" on a tool permission is not a merge.
   const perm = buildDecisionContext({ question: { kind: "prompt", title: "Run npm test?", options: ["Approve", "Deny"] }, permission: { command: "npm test" } });
@@ -631,4 +634,29 @@ test("a grouped delivery card names the group, borrows no member's context, and 
   assert.doesNotMatch(card.decisionContext.goal ?? "", /Bob goal|habit-forming for every customer/i, "no member's goal or chat stands in for the group");
   const deck = buildSupervisorDeck({ questions: [group], preferences: null }, { threadsByKey, now: NOW });
   assert.ok(!deck.cards.some((c) => c.questionId === group.id && c.needsYou !== false), "not in Needs You");
+});
+
+test("context requests: at most one per session per cooldown, whatever new question ids appear", async (t) => {
+  const dir = tempDir(t);
+  let nowMs = NOW;
+  const sent = [];
+  const sup = new FleetSupervisor({
+    dataDir: dir, runtime: { events: { emit() {} } },
+    config: { enabled: true, mode: "auto", paseo: { enabled: true, only: true }, review: { enabled: false } },
+    deps: { now: () => nowMs, executor: { deliver: async (a) => { sent.push(a.playbook); return { status: "sent", route: a.route, detail: "ok" }; }, inFlight: () => [], whenIdle: async () => {} } }
+  });
+  const thread = { key: "paseo:srv.sess_loop", kind: "paseo", id: "sess_loop", title: "Loop case", agentStatus: "idle", archived: false, meta: { serverId: "srv" } };
+  sup.knownThreads.set(thread.key, thread);
+  const byKey = new Map([[thread.key, thread]]);
+  // The agent restates its ask each time, so each is a new question id.
+  for (let i = 0; i < 4; i += 1) {
+    const q = sup.store.upsertQuestion({ dedupeKey: `ask:loop:${i}`, kind: "agent-ask", threadKey: thread.key, title: `Go ahead? (${i})`, options: ["go", "hold"] });
+    await sup.gateDecisionContext(sup.store.question(q.id), { byKey, budgetLeft: 5, started: nowMs });
+    nowMs += 10 * 60_000;
+  }
+  assert.equal(sent.filter((p) => p === "context-request").length, 1, "one request inside the cooldown");
+  nowMs += 6 * 60 * 60_000;
+  const later = sup.store.upsertQuestion({ dedupeKey: "ask:loop:later", kind: "agent-ask", threadKey: thread.key, title: "Go ahead? (later)", options: ["go", "hold"] });
+  await sup.gateDecisionContext(sup.store.question(later.id), { byKey, budgetLeft: 5, started: nowMs });
+  assert.equal(sent.filter((p) => p === "context-request").length, 2, "allowed again after the cooldown");
 });
