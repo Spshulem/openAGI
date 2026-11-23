@@ -78,10 +78,14 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/walkthrough",
   "GET /fleet/api/diagnose",
   "GET /fleet/api/search",
   "GET /fleet/api/workspaces",
   "GET /fleet/api/hierarchy",
+  "GET /fleet/api/active-work",
+  "POST /fleet/api/active-work",
+  "POST /fleet/api/active-work/scan",
   "GET /fleet/api/projects",
   "POST /fleet/api/projects",
   "GET /fleet/api/repo-status",
@@ -90,6 +94,7 @@ const EXACT = new Set([
   "POST /fleet/api/scan",
   "POST /fleet/api/reconcile",
   "POST /fleet/api/mode",
+  "POST /fleet/api/walkthrough",
   "POST /fleet/api/preferences",
   "POST /fleet/api/route",
   "POST /fleet/api/dispatch",
@@ -108,6 +113,8 @@ const EXACT = new Set([
   "POST /conversations",
   "GET /lifelog/moments",
   // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+  "GET /budget",
+  "POST /budget",
   "GET /settings/models",
   "POST /settings/models",
   "POST /settings/models/test",
@@ -144,6 +151,7 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
   { method: "POST", re: /^\/fleet\/api\/cards\/[A-Za-z0-9:%_-]{1,160}\/act$/ },
+  { method: "POST", re: new RegExp(`^/fleet/api/active-work/${ID}/act$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
   // One fleet thread's detail/transcript, and the owner's Push now, Mute, Unmute, and OpenAGI Project/Theme organization.

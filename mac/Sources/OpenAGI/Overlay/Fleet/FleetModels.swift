@@ -141,6 +141,64 @@ struct FleetHierarchyResponse: Decodable, Equatable {
   }
 }
 
+struct FleetDecisionSource: Decodable, Equatable {
+  let questionId: String?
+  let threadKey: String?
+  let threadKeys: [String]
+  let app: String?
+  let cardId: String?
+  let itemId: String?
+
+  enum CodingKeys: String, CodingKey { case questionId, threadKey, threadKeys, app, cardId, itemId }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    questionId = try? c.decodeIfPresent(String.self, forKey: .questionId)
+    threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+    threadKeys = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .threadKeys)) ?? []).compactMap { $0.value }
+    app = try? c.decodeIfPresent(String.self, forKey: .app)
+    cardId = try? c.decodeIfPresent(String.self, forKey: .cardId)
+    itemId = try? c.decodeIfPresent(String.self, forKey: .itemId)
+  }
+}
+
+struct FleetCardAction: Decodable, Equatable {
+  let op: String?
+  let label: String?
+  let value: String?
+
+  enum CodingKeys: String, CodingKey { case op, label, value }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    op = try? c.decodeIfPresent(String.self, forKey: .op)
+    label = try? c.decodeIfPresent(String.self, forKey: .label)
+    value = try? c.decodeIfPresent(String.self, forKey: .value)
+  }
+}
+
+struct FleetDecisionItem: Decodable, Equatable, Identifiable {
+  let itemId: String?
+  let source: FleetDecisionSource?
+  let headline: String
+  let options: [String]
+  let multiSelect: Bool
+  let freeText: Bool
+  let active: Bool
+  var id: String { itemId ?? headline }
+
+  enum CodingKeys: String, CodingKey { case itemId, source, headline, options, multiSelect, freeText, active }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    itemId = try? c.decodeIfPresent(String.self, forKey: .itemId)
+    source = try? c.decodeIfPresent(FleetDecisionSource.self, forKey: .source)
+    headline = (try? c.decodeIfPresent(String.self, forKey: .headline)) ?? "Owner decision"
+    options = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .options)) ?? []).compactMap { $0.value }
+    multiSelect = (try? c.decodeIfPresent(Bool.self, forKey: .multiSelect)) ?? false
+    freeText = (try? c.decodeIfPresent(Bool.self, forKey: .freeText)) ?? false
+    active = (try? c.decodeIfPresent(Bool.self, forKey: .active)) ?? false
+  }
+}
+
 struct FleetQuestion: Decodable, Equatable, Identifiable {
   let id: String
   let kind: String?
@@ -156,6 +214,13 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let reviewCategory: String?
   let pinned: Bool
   let createdAt: String?
+  let needsYou: Bool
+  let decisionHeadline: String?
+  let decisionFact: String?
+  let decisionSource: FleetDecisionSource?
+  let decisionAction: FleetCardAction?
+  let remainingItemIds: [String]
+  let decisionItems: [FleetDecisionItem]
   /// When the agent asked, else when the supervisor first asked the owner.
   let askedAt: String?
   /// The chat it is about: "remote-dev · Remote dev setup (Conductor)".
@@ -183,7 +248,7 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let labels: [String]
 
   enum CodingKeys: String, CodingKey {
-    case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
+    case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt, needsYou, decisionHeadline, decisionFact, decisionSource, decisionAction, remainingItemIds, decisionItems
     case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project, meta
     case blockingCount, blockingSummary, actorLabel, subchannel, labels
   }
@@ -264,6 +329,13 @@ extension FleetQuestion {
     reviewCategory = try? c.decodeIfPresent(String.self, forKey: .reviewCategory)
     pinned = (try? c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
     createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    needsYou = (try? c.decodeIfPresent(Bool.self, forKey: .needsYou)) ?? true
+    decisionHeadline = try? c.decodeIfPresent(String.self, forKey: .decisionHeadline)
+    decisionFact = try? c.decodeIfPresent(String.self, forKey: .decisionFact)
+    decisionSource = try? c.decodeIfPresent(FleetDecisionSource.self, forKey: .decisionSource)
+    decisionAction = try? c.decodeIfPresent(FleetCardAction.self, forKey: .decisionAction)
+    remainingItemIds = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .remainingItemIds)) ?? []).compactMap { $0.value }
+    decisionItems = ((try? c.decodeIfPresent([Lossy<FleetDecisionItem>].self, forKey: .decisionItems)) ?? []).compactMap { $0.value }
     askedAt = try? c.decodeIfPresent(String.self, forKey: .askedAt)
     chatLabel = try? c.decodeIfPresent(String.self, forKey: .chatLabel)
     answerIn = try? c.decodeIfPresent(String.self, forKey: .answerIn)

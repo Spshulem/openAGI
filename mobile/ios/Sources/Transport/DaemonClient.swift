@@ -533,6 +533,27 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetState.self, from: data)
     }
 
+    // The Needs You walkthrough is main-owned and shared with G2. Navigation
+    // changes only the cursor; card/question actions still use their normal
+    // approval-gated routes and must be resolved by identity on the main.
+    public func fleetWalkthrough(operation: String = "view", expectedId: String? = nil) async throws -> SupervisorWalkthrough {
+        let allowed = Set(["view", "start", "next", "back", "skip", "pause", "resume"])
+        guard allowed.contains(operation) else { throw DaemonError.malformedResponse }
+        let request: URLRequest
+        if operation == "view" {
+            request = try authorizedRequest(path: "/fleet/api/walkthrough", method: "GET")
+        } else {
+            var mutable = try authorizedRequest(path: "/fleet/api/walkthrough", method: "POST")
+            var body: [String: Any] = ["operation": operation]
+            if let expectedId, !expectedId.isEmpty { body["expectedId"] = expectedId }
+            mutable.httpBody = try JSONSerialization.data(withJSONObject: body)
+            mutable.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request = mutable
+        }
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(SupervisorWalkthrough.self, from: data)
+    }
+
     // A scan can take up to ~100s. No body: the route reads none.
     public func fleetScan() async throws -> FleetState {
         var request = try authorizedRequest(path: "/fleet/api/scan", method: "POST")
@@ -554,6 +575,19 @@ public actor DaemonClient {
     public func fleetAnswer(questionID: String, answer: String) async throws -> FleetMutationResult {
         var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["answer": answer])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
+    // Free text to a question that takes it (its alert's canReply): the
+    // daemon types it into the question's own thread, or sends it as the
+    // clarification of a suggestion's "Answer question". The same long wait
+    // as an answer. Android's fleetReply posts the same body.
+    public func fleetReply(questionID: String, reply: String) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["reply": reply])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 200
         let (data, _) = try await perform(request)
@@ -774,11 +808,14 @@ public actor DaemonClient {
     // phone has no push-to-start token; `alerts: false` that notifications
     // are not allowed. `renew` in the answer means the relay refused this
     // pass (expired, revoked, unknown) and the phone should mint a new one.
+    // `approvals: true` says this build shows Approve/Deny approval alerts;
+    // an older daemon ignores it.
     // Keys sorted so a test can assert the body byte for byte.
     public func registerPush(pass: String, key: String, env: String, activities: Bool,
                              alerts: Bool) async throws -> PushRegistrationResult {
         var request = try authorizedRequest(path: "/mobile/push", method: "POST")
-        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities, "alerts": alerts]
+        let body: [String: Any] = ["pass": pass, "key": key, "env": env, "activities": activities, "alerts": alerts,
+                                   "approvals": true]
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let (data, _) = try await perform(request)
@@ -892,6 +929,7 @@ public actor DaemonClient {
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(nodeID, forHTTPHeaderField: "X-OpenAGI-Node-ID")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
         request.timeoutInterval = 12
         return request
     }
@@ -1053,6 +1091,34 @@ extension DaemonClient {
 
     public func testModel() async throws -> ModelTestResult {
         try await json(ModelTestResult.self, path: "/settings/models/test", method: "POST", body: Data("{}".utf8), timeout: 45)
+    }
+
+    public func budget() async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "GET")
+    }
+
+    public func updateBudget(_ update: BudgetUpdate) async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "POST", body: try ProtocolDecoder.jsonEncoder.encode(update), timeout: 20)
+    }
+
+    private func performBudgetRequest<T: Decodable>(_ type: T.Type, path: String, method: String, body: Data? = nil, timeout: TimeInterval? = nil) async throws -> T {
+        do {
+            return try await json(type, path: path, method: method, body: body, timeout: timeout)
+        } catch DaemonError.unauthorized {
+            // A main server running OpenAGI v0.0.83 or earlier rejects `/budget`
+            // at the mobile scope gate (401/403) even when this phone's pairing
+            // is healthy. Prove pairing health via heartbeat and report `.notFound`
+            // so the UI asks to update main instead of blaming connectivity.
+            try await heartbeat()
+            throw DaemonError.notFound
+        } catch DaemonError.mainConnection(.authorizationRequired) {
+            // Same case when routed through a worker (`routeMainData` maps an
+            // older main's 401/403 on `/budget` to 502 `main-pairing-required`).
+            if (try? await heartbeat()) != nil {
+                throw DaemonError.notFound
+            }
+            throw DaemonError.mainConnection(.authorizationRequired)
+        }
     }
 
     public func persona() async throws -> PersonaDocument {

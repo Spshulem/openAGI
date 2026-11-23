@@ -172,6 +172,11 @@ test("the owner may write to a self-listed session; the supervisor never nudges 
   const host = await executor.deliver({ thread: claudeThread(cwd, { ...live, id: "host-1", claudeSessionId: "host-1", key: "claude:host-1" }), message: "hi", route: "peer-relay", playbook: "owner-message", dryRun: true });
   assert.equal(host.status, "blocked");
   assert.match(host.detail, /loop back/);
+  // A host known only as the Paseo agent this process runs in is refused too.
+  const paseoHost = createExecutor({ config: { ...config, selfSessionIds: [], hostSessionIds: ["host-agent"] }, run: async () => { calls.push(1); return { code: 0 }; }, store });
+  const paseo = await paseoHost.deliver({ thread: claudeThread(cwd, { ...live, id: "host-agent", claudeSessionId: "host-agent", key: "claude:host-agent" }), message: "hi", route: "peer-relay", playbook: "owner-message", dryRun: true });
+  assert.equal(paseo.status, "blocked");
+  assert.match(paseo.detail, /loop back/);
   assert.equal(calls.length, 0);
 });
 

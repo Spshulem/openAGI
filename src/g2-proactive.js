@@ -4,6 +4,7 @@ import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
 import { isSuppressedByQuietCadence } from "./fleet/preferences.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./fleet/walkthrough.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -18,10 +19,11 @@ function reject(message, status = 400) { throw Object.assign(new Error(message),
 // Main-owned, bounded snapshots. No raw audio, model invocation, or execution
 // authority. Only explicit task acceptance crosses into the user task queue.
 export class G2Proactive {
-  constructor({ dir, runtime, now = Date.now } = {}) {
+  constructor({ dir, dataDir, runtime, now = Date.now } = {}) {
     this.file = path.join(dir ?? path.join(resolveDataDir(), "g2-proactive"), "state.json");
     this.runtime = runtime;
     this.now = now;
+    this.walkthrough = new SupervisorWalkthrough({ dataDir: dataDir ?? path.resolve(this.file, "..", ".."), now });
     this.reviewing = false; this.closed = false; this.reviewController = null;
     this.nodes = readJsonFile(this.file, { nodes: {} }).nodes;
     this.prune();
@@ -54,6 +56,14 @@ export class G2Proactive {
     if (!body || typeof body !== "object" || Array.isArray(body)) reject("Expected an object");
     this.prune();
     const n = this.node(nodeId);
+    if (body.op === "walkthrough") {
+      try {
+        return { walkthrough: this.walkthrough.mutate(body.command ?? body.operation ?? "view", body.expectedId, this.runtime?.fleetSupervisor?.getState?.()) };
+      } catch (error) {
+        if (error instanceof WalkthroughError) reject(error.message, error.status);
+        throw error;
+      }
+    }
     if (body.op === "lifelog-task") {
       const s = n.segments.find(s => s.id === body.segmentId);
       if (!s || body.confirm !== true || typeof body.title !== "string" || !body.title.trim() || body.title.length > 180) reject("Confirm a task with current transcript evidence");
@@ -250,15 +260,29 @@ export class G2Proactive {
     this.prune();
     const n = this.node(nodeId);
     const item = this.feed(n).find(i => i.id === body.id && i.supervisor);
-    if (!item) reject("Supervisor question not available", 404);
-    if (!item.options.includes(body.answer)) reject("Pick one of the question's choices");
-    const source = this.runtime?.outreach?.get?.(body.id);
+    // Walkthrough cards are main-owned and can remain actionable after their
+    // mirrored G2 alert is snoozed. Resolve that identity from the durable
+    // cursor, then use the same Supervisor answer gate as the inbox route.
+    const walkthroughItem = item ? null : this.walkthroughTarget(body.id);
+    if (!item && !walkthroughItem) reject("Supervisor question not available", 404);
+    const options = item?.options ?? walkthroughItem?.options ?? [];
+    if (!options.includes(body.answer)) reject("Pick one of the question's choices");
+    const questionId = item?.questionId
+      ?? walkthroughItem?.questionId
+      ?? (walkthroughItem?.kind === "question" ? walkthroughItem.id : null);
+    if (!questionId) reject("Supervisor question not available", 404);
+    const mirrored = this.runtime?.outreach?.list?.() ?? [];
+    const source = this.runtime?.outreach?.get?.(body.id)
+      ?? mirrored.find(i => i.sourceRef?.kind === "fleet" && i.sourceRef.id === questionId);
+    if (source && source.sourceRef?.kind !== "fleet") reject("Supervisor question not available", 404);
     const supervisor = this.runtime?.fleetSupervisor;
-    if (!source || source.sourceRef?.kind !== "fleet" || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
-    const result = await supervisor.answerQuestion(source.sourceRef.id, body.answer);
+    if ((!source && !walkthroughItem) || (source && source.sourceRef?.kind !== "fleet") || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
+    const result = await supervisor.answerQuestion(questionId, body.answer);
     if (!result) reject("Question already closed", 409);
     if (result.question?.status === "open") return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
-    try { this.runtime?.outreach?.resolve?.(body.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
+    if (source) {
+      try { this.runtime?.outreach?.resolve?.(source.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
+    }
     n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
     this.save();
     return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
@@ -271,10 +295,14 @@ export class G2Proactive {
     this.prune();
     const n = this.node(nodeId);
     const item = this.feed(n).find(i => i.id === body.id && i.supervisor && i.cardId);
-    if (!item) reject("Supervisor card not available", 404);
+    const walkthroughItem = item ? null : this.walkthroughTarget(body.id);
+    const cardId = item?.cardId
+      ?? walkthroughItem?.cardId
+      ?? (walkthroughItem?.kind === "card" ? walkthroughItem.id : null);
+    if (!cardId) reject("Supervisor card not available", 404);
     const supervisor = this.runtime?.fleetSupervisor;
     if (!supervisor?.actCard) reject("Supervisor unavailable", 503);
-    const result = await supervisor.actCard(item.cardId, { op: cardOp, ...(typeof body.value === "string" && body.value.trim() ? { value: clean(body.value, 120) } : {}) });
+    const result = await supervisor.actCard(cardId, { op: cardOp, ...(typeof body.value === "string" && body.value.trim() ? { value: clean(body.value, 120) } : {}) });
     if (!result) reject("Supervisor card already closed", 409);
     if (result.ok === false) {
       return { ok: false, status: clean(result.status ?? "blocked", 40), detail: clean(result.detail ?? "Action halted; check PR or session state", 220) };
@@ -285,6 +313,15 @@ export class G2Proactive {
     n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
     this.save();
     return { ok: true, status: clean(result.status ?? "done", 40), detail: clean(result.detail ?? result.summary ?? "Done", 220) };
+  }
+  walkthroughTarget(id) {
+    if (typeof id !== "string" || !id) return null;
+    const supervisorState = this.runtime?.fleetSupervisor?.getState?.();
+    const view = this.walkthrough.read(supervisorState);
+    const candidates = new Set([id]);
+    if (id.startsWith("card:")) candidates.add(id.slice(5));
+    if (id.startsWith("question:")) candidates.add(id.slice(9));
+    return view.items.find(item => candidates.has(item.id) || candidates.has(item.cardId) || candidates.has(item.questionId)) ?? null;
   }
   // Dismissing a supervisor question on the glasses closes it on the fleet
   // computer too, as the phone's dismiss does. Fire and forget: the glasses

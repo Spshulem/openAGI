@@ -162,7 +162,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
-  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
+  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor, dataDir });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
     ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM, MOBILE_PLATFORM] });
@@ -261,7 +261,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
-  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;
@@ -395,14 +395,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   if (runtime.bindOutreachEvents) runtime.bindOutreachEvents(runtime.events);
 
   // Paired iPhones' push registrations (POST /mobile/push), and the sender
-  // that turns fleet changes into sealed Live Activity updates and alerts.
+  // that turns fleet changes into sealed Live Activity updates and alerts,
+  // and pending approvals into Approve/Deny alerts.
   // Registrations are stored even with sending off, so turning it on later
   // needs no re-pairing.
   const mobilePushStore = new MobilePushStore({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
-  const mobilePush = runtime.fleetSupervisor && process.env.OPENAGI_PUSH !== "0"
+  const mobilePush = (runtime.fleetSupervisor || runtime.pendingActions) && process.env.OPENAGI_PUSH !== "0"
     ? new MobilePush({
         store: mobilePushStore,
-        supervisor: runtime.fleetSupervisor,
+        supervisor: runtime.fleetSupervisor ?? null,
+        pendingActions: runtime.pendingActions ?? null,
         events: runtime.events,
         relayUrl: process.env.OPENAGI_PUSH_RELAY || undefined,
         ...(options.pushFetch ? { fetch: options.pushFetch } : {})
@@ -1155,6 +1157,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
         try {
+          if (body.OPENAGI_DAILY_USD_LIMIT !== undefined && runtime.budget?.setDailyLimit) {
+            const parsedLimit = Number.parseFloat(String(body.OPENAGI_DAILY_USD_LIMIT));
+            if (Number.isFinite(parsedLimit) && parsedLimit >= 0.5 && parsedLimit <= 10000) {
+              runtime.budget.setDailyLimit(parsedLimit);
+            }
+          }
           const { createModelProvider } = await import("./model-provider.js");
           if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|CLAUDE_CLI_|CODEX_CLI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
@@ -1333,7 +1341,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/sessions") return sendJson(res, 200, runtime.agentHost?.store.listSessions() ?? []);
       if (method === "GET" && pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(pathname.slice("/sessions/".length));
-        return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
+        const session = runtime.agentHost?.store.getSession(id);
+        return sendJson(res, 200, session ? withLiveApprovalStatus(session, runtime.pendingActions) : { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
       if (method === "POST" && /^\/nodes\/[^/]+\/revoke$/.test(pathname)) {
@@ -2227,6 +2236,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
         let clientTurnId = null;
         try {
@@ -2423,7 +2435,91 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 202, { accepted: true });
       }
 
-      if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget") {
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      }
+      if (method === "POST" && pathname === "/budget") {
+        if (!runtime.budget) return sendJson(res, 503, { error: "no-budget" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_body", message: "Expected a JSON budget update." });
+        }
+        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus", "timeZone"]);
+        if (Object.keys(body).some((k) => !allowedKeys.has(k))) {
+          return sendJson(res, 400, { error: "unsupported_fields", message: "Unsupported budget fields." });
+        }
+        const hasLimit = body.dailyUsdLimit !== undefined && body.dailyUsdLimit !== null;
+        const hasBonus = body.addUsdToday !== undefined && body.addUsdToday !== null;
+        const hasReset = body.resetTodayBonus === true;
+        const hasTimeZone = typeof body.timeZone === "string" && body.timeZone.trim().length > 0;
+        if (!hasLimit && !hasBonus && !hasReset && !hasTimeZone) {
+          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit, addUsdToday, or timeZone." });
+        }
+        try {
+          if (hasLimit) {
+            const parsed = Number(body.dailyUsdLimit);
+            if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Daily budget limit must be between $0.50 and $10,000." });
+            }
+          }
+          if (hasBonus) {
+            const parsedBonus = Number(body.addUsdToday);
+            if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
+            }
+          }
+          // The live update stands even if `.env` can't be written, but the
+          // caller must learn it will not survive a restart (a lowered cap
+          // would otherwise silently revert to the old, higher one).
+          const notPersisted = [];
+          let persistenceError = null;
+          const persistEnv = async (key, value) => {
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { [key]: value } });
+            } catch (error) {
+              notPersisted.push(key);
+              persistenceError ??= String(error?.message ?? error);
+            }
+          };
+          if (hasTimeZone && typeof runtime.budget.setTimeZone === "function") {
+            runtime.budget.setTimeZone(body.timeZone.trim());
+            process.env.OPENAGI_TIMEZONE = runtime.budget.timeZone;
+            await persistEnv("OPENAGI_TIMEZONE", runtime.budget.timeZone);
+          }
+          if (hasLimit) {
+            runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));
+            process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+            await persistEnv("OPENAGI_DAILY_USD_LIMIT", String(runtime.budget.dailyUsdLimit));
+          }
+          if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+            runtime.budget.clearBonusToday();
+          }
+          if (hasBonus) {
+            runtime.budget.addBonusToday(Number(body.addUsdToday));
+          }
+          const updated = runtime.budget.status();
+          runtime.events?.emit?.("budget-updated", updated);
+          if (notPersisted.length > 0) {
+            return sendJson(res, 200, {
+              ...updated,
+              persisted: false,
+              notPersisted,
+              persistenceError,
+              warning: "Applied for now, but not saved: the previous setting returns when OpenAGI restarts."
+            });
+          }
+          return sendJson(res, 200, (hasLimit || hasTimeZone) ? { ...updated, persisted: true } : updated);
+        } catch (error) {
+          return sendJson(res, 400, { error: "invalid_budget", message: String(error?.message ?? "Invalid budget update.") });
+        }
+      }
       if (method === "GET" && pathname === "/budget/ledger") {
         const ledger = runtime.budget?.ledger;
         if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
@@ -3026,6 +3122,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Pass extraCookies so /fleet?token= signs in like the dashboard does.
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
       }
+      if (pathname === "/goals" && (method === "GET" || method === "POST")) {
+        res.setHeader("Cache-Control", "no-store");
+        if (method === "GET") {
+          const activeWork = typeof runtime.fleetSupervisor?.getActiveWork === "function"
+            ? await Promise.resolve(runtime.fleetSupervisor.getActiveWork({ includeSnoozed: true, includeDone: url.searchParams.get("includeDone") === "true" })).catch(() => null)
+            : null;
+          const taskGoals = typeof runtime.tasks?.listGoals === "function"
+            ? runtime.tasks.listGoals({}).map((g) => ({ ...g, progress: runtime.tasks.goalProgress?.(g.id) ?? null }))
+            : [];
+          return sendJson(res, 200, {
+            activeWork,
+            taskGoals
+          });
+        }
+        const body = await readJsonLimited(req, 32 * 1024).catch(() => null);
+        if (!body || typeof body.goal !== "string" || !body.goal.trim()) {
+          return sendJson(res, 400, { error: "invalid_goal", message: "Provide { goal, doneCriteria, project?, cadence? }." });
+        }
+        const doneCriteria = typeof body.doneCriteria === "string" && body.doneCriteria.trim()
+          ? body.doneCriteria.trim()
+          : `Verify ${body.goal.trim().slice(0, 120)}`;
+        const tracked = typeof runtime.fleetSupervisor?.trackWork === "function"
+          ? await runtime.fleetSupervisor.trackWork({
+              project: body.project ?? "General",
+              theme: body.theme ?? null,
+              customer: body.customer ?? null,
+              goal: body.goal.trim(),
+              doneCriteria,
+              cadence: body.cadence ?? "daily",
+              permittedNudges: body.permittedNudges ?? "resume_owner",
+              threadKey: body.threadKey ?? null,
+              prRef: body.prRef ?? null,
+              linkedSkill: body.linkedSkill ?? null,
+              cursor: body.cursor ?? null
+            })
+          : null;
+        return sendJson(res, 200, { ok: true, tracked });
+      }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
         const acceptsImages = method === "POST" && (
@@ -3267,10 +3401,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // with a reason when already current or not fast-forwardable.
         const { applyUpdate } = await import("./self-update.js");
         const result = await applyUpdate();
-        sendJson(res, result.updated ? 202 : 200, result);
+        const willRestart = result.updated && !result.restartRequired;
+        sendJson(res, willRestart ? 202 : 200, result);
         if (result.updated) {
-          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to });
-          setTimeout(() => process.exit(0), 300); // respawn with new code
+          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to, restartRequired: Boolean(result.restartRequired) });
+          // Unsupervised portable installs have nothing to respawn them: keep
+          // serving and report that a manual restart is required.
+          if (willRestart) setTimeout(() => process.exit(0), 300); // respawn with new code
         }
         return;
       }
@@ -4925,6 +5062,38 @@ function readForm(req) {
   });
 }
 
+// A reply's metadata.pendingApprovals is the record of the code cards that
+// turn raised. Stamp each with the card's current state on the way out (a
+// copy; the stored session is untouched) so the chat shows Approve / Deny
+// only while the card can still be decided. A card the store no longer has
+// reads "unknown" and gets no buttons.
+export function withLiveApprovalStatus(session, store) {
+  if (!Array.isArray(session?.messages) || !session.messages.some((m) => Array.isArray(m?.metadata?.pendingApprovals))) return session;
+  return {
+    ...session,
+    messages: session.messages.map((message) => {
+      const cards = message?.metadata?.pendingApprovals;
+      if (!Array.isArray(cards)) return message;
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          pendingApprovals: cards.map((card) => {
+            const action = typeof card?.id === "string" ? store?.get?.(card.id) ?? null : null;
+            // A card the owner's later instruction ran is closed as denied
+            // "superseded": it did run, so it must not read "Nothing was run."
+            const status = !action ? "unknown"
+              : action.status === "approved" && action.error != null ? "failed"
+              : action.status === "denied" && /^superseded\b/.test(String(action.error ?? "")) ? "superseded"
+              : action.status;
+            return { ...card, status, ...(action?.expiresAt ? { expiresAt: action.expiresAt } : {}) };
+          })
+        }
+      };
+    })
+  };
+}
+
 function renderApp() {
   return `<!doctype html>
 <html lang="en">
@@ -5824,7 +5993,7 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     input.style.height = Math.min(180, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -5885,6 +6054,13 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
       sendBtn.disabled = false;
     }
   });
+}
+
+// Only an unmodified Return submits a chat draft. Shift+Return is left to the
+// textarea so it inserts a newline; composition events must also reach the IME.
+function shouldSubmitComposerKey(e) {
+  return e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+    && !e.isComposing && e.keyCode !== 229;
 }
 
 function showToast(msg, ok = true) {
@@ -6566,7 +6742,7 @@ function renderChat() {
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       $("composer").requestSubmit();
     }
@@ -6852,9 +7028,76 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const pendingNote = pending
     ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
     : "";
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${pendingNote}\`;
+  const approvals = renderChatApprovals(msg);
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${approvals}\${pendingNote}\`;
+  if (approvals) wireChatApprovals(div);
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+// Code cards the reply raised (metadata.pendingApprovals, stamped with live
+// status by GET /sessions/:id). Buttons only while a card is pending; after
+// that the card shows its state. Typing "yes NN" keeps working alongside.
+function chatApprovalStateLabel(status) {
+  return ({
+    pending: "Waiting for your answer.",
+    executing: "Running…",
+    approved: "Approved.",
+    failed: "Approved, but it failed.",
+    denied: "Denied. Nothing was run.",
+    superseded: "Already run from your later message.",
+    expired: "Expired. Ask again to retry.",
+    interrupted: "Interrupted. Ask again to retry."
+  })[status] ?? "No longer available.";
+}
+
+function renderChatApprovals(msg) {
+  const cards = msg?.role === "assistant" && Array.isArray(msg.metadata?.pendingApprovals) ? msg.metadata.pendingApprovals : [];
+  return cards.filter((card) => card && typeof card.id === "string").map((card) => {
+    const live = card.status === "pending";
+    const hint = live && card.code ? " · or reply yes " + card.code : "";
+    return '<div class="card chat-approval" data-approval-id="' + escapeHtml(card.id) + '" data-approval-status="' + escapeHtml(card.status ?? "unknown") + '" style="padding:10px 12px; margin-top:8px;">'
+      + '<div style="font-weight:600;">' + escapeHtml(card.summary || card.toolName || "Agent action") + '</div>'
+      + '<div class="muted" style="font-size:12px;">' + escapeHtml((card.toolName ?? "") + hint) + '</div>'
+      + (live
+        ? '<div class="row" style="gap:8px; margin-top:8px;"><button type="button" data-approval-decision="approve">Approve</button><button type="button" class="secondary" data-approval-decision="deny">Deny</button></div>'
+        : "")
+      + '<div class="muted chat-approval-outcome" style="font-size:12px; margin-top:6px;"' + (live ? " hidden" : "") + '>' + escapeHtml(chatApprovalStateLabel(card.status)) + '</div>'
+      + '</div>';
+  }).join("");
+}
+
+// The same owner-authenticated routes the Approvals tab uses. A refusal
+// (already decided, expired, the tool failed) is final; only a transport
+// failure leaves the buttons usable for another try.
+async function decideChatApproval(id, decision) {
+  try {
+    const res = await postJson("/pending-actions/" + encodeURIComponent(id) + "/" + decision, {});
+    if (decision === "deny") return { ok: true, final: true, text: "Denied. Nothing was run." };
+    return { ok: true, final: true, text: res?.continuation?.status === "queued" ? "Approved. The agent is continuing in this chat." : "Approved." };
+  } catch (err) {
+    return { ok: false, final: err.status != null, text: (decision === "approve" ? "Approve" : "Deny") + " failed: " + err.message };
+  }
+}
+
+function wireChatApprovals(root) {
+  root.querySelectorAll(".chat-approval").forEach((card) => {
+    const buttons = Array.from(card.querySelectorAll("[data-approval-decision]"));
+    const outcome = card.querySelector(".chat-approval-outcome");
+    for (const button of buttons) {
+      button.addEventListener("click", async () => {
+        buttons.forEach((b) => { b.disabled = true; });
+        const result = await decideChatApproval(card.dataset.approvalId, button.dataset.approvalDecision);
+        if (outcome) {
+          outcome.textContent = result.text;
+          outcome.hidden = false;
+          outcome.className = "chat-approval-outcome " + (result.ok ? "muted" : "err");
+        }
+        if (!result.final) buttons.forEach((b) => { b.disabled = false; });
+        refreshApprovalBadge().catch(() => {});
+      });
+    }
+  });
 }
 
 // Keep transient model text outside state.messages: only the exact provider
@@ -8073,11 +8316,13 @@ async function renderChannels() {
 
 async function renderBudget() {
   const b = await fetchJson("/budget");
-  const pct = Math.min(100, (b.spentUsd / Math.max(b.dailyUsdLimit, 0.0001)) * 100);
+  const effectiveLimit = Number(b.effectiveLimitUsd ?? b.dailyUsdLimit ?? 10);
+  const bonusUsdToday = Number(b.bonusUsdToday ?? 0);
+  const pct = Math.min(100, (b.spentUsd / Math.max(effectiveLimit, 0.0001)) * 100);
   const stateClass = pct > 90 ? "err" : pct > 70 ? "warn" : "ok";
   main.innerHTML = \`
     <div class="pane">
-      <h2>Credits</h2>
+      <h2>Credits &amp; Daily Budget</h2>
       <div class="card">
         <div class="row between" style="align-items:center;">
           <span class="name">Today · \${escapeHtml(b.today)}</span>
@@ -8088,11 +8333,34 @@ async function renderBudget() {
         </div>
       </div>
 
+      <div class="card" style="margin-top:12px;">
+        <div class="row between" style="align-items:center;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div class="name">Adjust budget</div>
+            <div class="desc">Add extra room just for today or change your daily limit immediately.</div>
+          </div>
+          <div class="row" style="gap:8px;flex-wrap:wrap;">
+            <button class="btn" id="budgetAdd10Btn" type="button">+$10 today</button>
+            <button class="btn" id="budgetAdd25Btn" type="button">+$25 today</button>
+            \${bonusUsdToday > 0 ? '<button class="btn ghost" id="budgetResetBonusBtn" type="button">Reset today extra</button>' : ""}
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label class="desc" for="budgetDailyInput">Daily limit ($/day)</label>
+          <input id="budgetDailyInput" type="number" min="0.5" max="10000" step="0.5" value="\${Number(b.dailyUsdLimit ?? 10).toFixed(2)}" style="width:120px;" />
+          <button class="btn primary" id="budgetSaveLimitBtn" type="button">Save daily limit</button>
+          <button class="btn ghost" data-budget-preset="25" type="button">$25/day</button>
+          <button class="btn ghost" data-budget-preset="50" type="button">$50/day</button>
+          <button class="btn ghost" data-budget-preset="100" type="button">$100/day</button>
+          <span id="budgetSaveMsg" class="desc"></span>
+        </div>
+      </div>
+
       <h3>Today</h3>
       <div class="grid stats">
         <div class="card"><span class="desc">Spent</span><div class="stat-value">$\${b.spentUsd.toFixed(4)}</div></div>
         <div class="card"><span class="desc">Remaining</span><div class="stat-value">$\${b.remainingUsd.toFixed(4)}</div></div>
-        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}</div></div>
+        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}\${bonusUsdToday > 0 ? \` (+\$\${bonusUsdToday.toFixed(2)} today)\` : ""}</div></div>
         <div class="card"><span class="desc">Calls</span><div class="stat-value">\${b.calls}</div></div>
         <div class="card"><span class="desc">Input tokens</span><div class="stat-value">\${b.tokens.input.toLocaleString()}</div></div>
         <div class="card"><span class="desc">Output tokens</span><div class="stat-value">\${b.tokens.output.toLocaleString()}</div></div>
@@ -8102,7 +8370,7 @@ async function renderBudget() {
 
       <h3>Last 14 days</h3>
       <div id="budgetHistory" class="grid"></div>
-      <p class="desc" style="margin-top:12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+      <p class="desc" style="margin-top:12px;">Saved daily limits persist to <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code> and take effect immediately.</p>
       <h3>Spend over time (30 days)</h3>
       <div id="creditChart" class="card"></div>
       <h3>By activity (30 days)</h3>
@@ -8114,6 +8382,26 @@ async function renderBudget() {
     </div>
   \`;
   const hist = $("budgetHistory");
+  const applyBudgetPatch = async (patch) => {
+    const msg = $("budgetSaveMsg");
+    if (msg) msg.textContent = "Saving…";
+    try {
+      await postJson("/budget", patch);
+      await renderBudget();
+    } catch (err) {
+      if (msg) msg.textContent = err?.message || "Failed to update budget.";
+    }
+  };
+  $("budgetAdd10Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 10 }));
+  $("budgetAdd25Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 25 }));
+  $("budgetResetBonusBtn")?.addEventListener("click", () => applyBudgetPatch({ resetTodayBonus: true }));
+  $("budgetSaveLimitBtn")?.addEventListener("click", () => {
+    const val = Number.parseFloat($("budgetDailyInput")?.value ?? "");
+    applyBudgetPatch({ dailyUsdLimit: val });
+  });
+  for (const btn of main.querySelectorAll("[data-budget-preset]")) {
+    btn.addEventListener("click", () => applyBudgetPatch({ dailyUsdLimit: Number(btn.getAttribute("data-budget-preset")) }));
+  }
   for (const d of (b.history ?? [])) {
     const c = document.createElement("div");
     c.className = "card";

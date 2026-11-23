@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import { threadHealth } from "./classify.js";
 import { normalizeBatchCardsInput, selectBatchTargetCards } from "./coordinator.js";
+import { ACTIVE_WORK_TOOL_NAMES, registerActiveWorkTools } from "./active-work.js";
 import { registerVoiceTools } from "./voice-tools.js";
 
 const SOURCE = "integration:fleet-supervisor";
@@ -17,7 +18,9 @@ const TOOL_NAMES = [
   "fleet_answer_question", "fleet_screen", "fleet_click", "fleet_app",
   "fleet_search", "fleet_act_card", "fleet_route_issue", "fleet_preferences",
   "fleet_workspaces", "fleet_read_chat", "fleet_repo_status", "fleet_start_session",
-  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project"
+  "fleet_batch_cards", "fleet_hierarchy", "fleet_dispatch_goal", "fleet_sync_themes", "fleet_organize_project",
+  "fleet_switch_provider", "fleet_precedents",
+  ...ACTIVE_WORK_TOOL_NAMES
 ];
 const APPS = { conductor: "Conductor", codex: "Codex" };
 const LABEL_MAX = 80;
@@ -104,32 +107,46 @@ function statusFrom(state, now, { midScan = false } = {}) {
     freshness: "Scans run every few minutes. stillAsked: true means the latest scan found the question still standing; false means that scan could not recheck it (its source failed, see failedSources), so treat it as unverified. reviewedMinutesAgo and review are the supervisor's own last re-check of it. fleet_scan runs a new scan now.",
     counts: snapshot?.counts ?? null,
     byHealth,
-    questions: (state.questions ?? []).map((q) => ({
-      id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
-      firstAskedMinutesAgo: minutesSince(q.createdAt, now),
-      askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
-      // Mid-scan, question records may already be updated past the snapshot.
-      stillAsked: midScan ? null : stillAsked(q, snapshot),
-      reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
-      review: q.reviewReason ? clip(q.reviewReason, 200) : null
-    })),
+    questions: (state.questions ?? [])
+      .filter((q) => q?.needsYou !== false && q?.kind !== "completed")
+      .map((q) => ({
+        id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
+        firstAskedMinutesAgo: minutesSince(q.createdAt, now),
+        askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
+        // Mid-scan, question records may already be updated past the snapshot.
+        stillAsked: midScan ? null : stillAsked(q, snapshot),
+        reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
+        review: q.reviewReason ? clip(q.reviewReason, 200) : null
+      })),
     ...(Array.isArray(state.cards) ? {
-      cards: state.cards.map((c) => ({
-        id: c.id,
-        kind: c.kind,
-        headline: clip(c.headline, 120),
-        recommendation: c.recommendation ? clip(c.recommendation, 160) : null,
-        primaryAction: c.primaryAction ?? null,
-        secondaryAction: c.secondaryAction ?? null,
-        threadKey: c.threadKey ?? null,
-        prRef: c.prRef ?? null,
-        ciState: c.ciState ?? null
-      }))
+      cards: state.cards
+        .filter((c) => c?.needsYou !== false)
+        .map((c) => ({
+          id: c.id,
+          kind: c.kind,
+          headline: clip(c.headline, 120),
+          recommendation: c.recommendation ? clip(c.recommendation, 200) : null,
+          brief: c.brief ? {
+            whatChanged: c.brief.whatChanged ? clip(c.brief.whatChanged, 280) : null,
+            decision: c.brief.decision ? clip(c.brief.decision, 500) : null,
+            context: c.brief.context ? clip(c.brief.context, 280) : null
+          } : null,
+          primaryAction: c.primaryAction ?? null,
+          secondaryAction: c.secondaryAction ?? null,
+          threadKey: c.threadKey ?? null,
+          prRef: c.prRef ?? null,
+          ciState: c.ciState ?? null
+        })),
+      completedNoticesCount: state.cards.filter((c) => c?.needsYou === false).length
     } : {}),
+    ...(state.precedentsSummary ? { precedentsSummary: state.precedentsSummary } : {}),
     ...(state.preferences ? {
       preferences: {
         mergePolicy: state.preferences.mergePolicy ?? "manual_confirm",
         cadence: state.preferences.cadence ?? "balanced",
+        defaultProvider: state.preferences.defaultProvider ?? "claude",
+        defaultPermissionMode: state.preferences.defaultPermissionMode ?? "bypass",
+        defaultModels: state.preferences.defaultModels ?? { claude: "claude-opus-5-5", codex: "gpt-6.2-sol", antigravity: "gemini-4-carbon-high" },
         autoSlices: state.preferences.autoSlices ?? {}
       }
     } : {}),
@@ -211,7 +228,10 @@ export function registerFleetTools(registry, supervisor) {
     description: "Send the owner's own message to one coding thread the supervisor watches (key from fleet_status or fleet_search). For Paseo sessions (`paseo:<serverId>.<agentId>`), images attached to this Supervisor turn are automatically forwarded alongside the message (unless `forwardImages: false`), and setting `attachRecentImages: true` attaches images from an earlier message in this Supervisor conversation (use when the owner asks to 'attach it' or send an earlier screenshot). Never claim you cannot attach images to Paseo sessions. Runs immediately on the owner's instruction when Auto-Approve is on. A blocked or failed delivery is NOT success; report the detail. Never work around a blocked send by starting another session, or by asking the owner to paste the message: that duplicates the chat or the message.",
     parameters: { type: "object", properties: { key: { type: "string", maxLength: KEY_MAX }, message: { type: "string", minLength: 1, maxLength: MESSAGE_MAX }, queue: { type: "boolean", description: "Conductor only: true queues it behind the chat's running background tasks (its Send button); default sends it now (⌘↩)." }, forwardImages: { type: "boolean", description: "Paseo only: forward images attached to this Supervisor turn (default true)." }, attachRecentImages: { type: "boolean", description: "Paseo only: attach image(s) from the owner's recent message in this conversation when none are attached on this exact turn (e.g. 'can you attach it?')." } }, required: ["key", "message"], additionalProperties: false },
     prepareApprovalArgs: (args) => fleetTarget(supervisor, args),
-    approvalTtlMs: 10 * 60_000,
+    // Valid while its chat is and the owner has not written to it since;
+    // a day at most. The send itself checks the chat again as it goes out.
+    approvalTtlMs: 24 * 60 * 60_000,
+    approvalStillValid: (args, action) => fleetSendStillValid(supervisor, args, action),
     // One card per chat, thread and text: a repeated ask reuses it.
     approvalDedupeKey: (args, context) => `fleet-send:${digest([context?.sessionId ?? null, args.key, args.message, args.queue === true, args.attachRecentImages === true])}`,
     summarize: (args) => `Send to ${args.name} (${args.key})${args.queue === true ? ", queued behind its background tasks" : ""}:\n${args.message}`,
@@ -314,12 +334,15 @@ export function registerFleetTools(registry, supervisor) {
       return outcome;
     } });
   if (typeof supervisor.updatePreferences === "function") registry.register({ name: "fleet_preferences", source: SOURCE, needsConfirmation: true, supervisorAutoApprove: true,
-    description: "Update the owner's progressive Supervisor preferences (autoApprove mode, notification cadence, routine slice autonomy, or vetoing an autonomous slice back to manual confirmation) when the owner asks to toggle auto-approve, ping less/more often, make a routine slice automatic, keep current defaults, or says 'don't do that'.",
+    description: "Update the owner's Supervisor & Paseo session preferences: default model (e.g. 'claude-opus-5-5', 'gpt-6.2-sol'), default provider ('claude', 'codex', 'antigravity'), default Paseo permission mode ('bypass' = bypassPermissions/full-access, 'auto', 'ask'), autoApprove mode, notification cadence, or routine slice autonomy.",
     parameters: {
       type: "object",
       properties: {
         autoApprove: { type: "boolean" },
         cadence: { type: "string", enum: ["quiet_until_ready", "balanced", "detailed"] },
+        defaultProvider: { type: "string", enum: ["claude", "codex", "antigravity", "auto"] },
+        defaultPermissionMode: { type: "string", enum: ["bypass", "auto", "ask"], description: "Default permission mode for newly started Paseo sessions ('bypass' = bypassPermissions / full-access)" },
+        defaultModel: { type: "string", maxLength: 120, description: "Default model id (e.g. 'claude-opus-5-5', 'gpt-6.2-sol')" },
         choice: { type: "string", maxLength: 120 },
         vetoSlice: { type: "string", maxLength: 80 },
         vetoActionId: { type: "string", maxLength: 120 }
@@ -392,9 +415,10 @@ export function registerFleetTools(registry, supervisor) {
         cwd: { type: "string", maxLength: 400 },
         serverId: { type: "string", maxLength: 120 },
         title: { type: "string", maxLength: 120 },
-        provider: { type: "string", maxLength: 80, description: "Optional provider ('codex', 'claude', or 'provider/model')" },
-        model: { type: "string", maxLength: 120, description: "Optional model name or alias (e.g. 'gpt-6.2-sol', 'sol 6-2', 'claude-sonnet-4-6')" },
+        provider: { type: "string", maxLength: 80, description: "Optional provider ('claude', 'codex', 'antigravity', or 'provider/model'; defaults to owner preference 'claude')" },
+        model: { type: "string", maxLength: 120, description: "Optional model name or alias (defaults to 'claude-opus-5-5' for Claude, 'gpt-6.2-sol' for Codex)" },
         effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max"], description: "Optional reasoning/thinking effort level" },
+        modeId: { type: "string", maxLength: 60, description: "Optional Paseo permission mode override (defaults to 'bypassPermissions' on Claude / 'full-access' on Codex unless specified)" },
         prompt: { type: "string", minLength: 1, maxLength: 4000 },
         attachRecentImages: { type: "boolean", description: "Attach image(s) from an earlier turn in this conversation when none were attached on this turn." }
       },
@@ -417,6 +441,7 @@ export function registerFleetTools(registry, supervisor) {
         provider: args.provider ?? null,
         model: args.model ?? null,
         effort: args.effort ?? null,
+        modeId: args.modeId ?? null,
         prompt: args.prompt,
         ...(images ? { images } : {})
       });
@@ -618,6 +643,83 @@ export function registerFleetTools(registry, supervisor) {
       return supervisor.upsertProject({ name: args.project, theme: args.theme ?? null, alias: args.alias ?? null });
     }
   });
+  if (typeof supervisor.switchPaseoProvider === "function") {
+    registry.register({
+      name: "fleet_switch_provider",
+      source: SOURCE,
+      needsConfirmation: true,
+      supervisorAutoApprove: true,
+      description:
+        "Fail over a Paseo coding session (`paseo:<serverId>.<agentId>`) that hit a provider usage/quota/auth limit onto a ready alternate provider (such as Claude or Antigravity) in the exact same workspace directory, transferring Active Work goal ownership and bounded conversation context.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", minLength: 1, maxLength: KEY_MAX, description: "Paseo session key (`paseo:<serverId>.<agentId>`)" },
+          preferredProviders: {
+            type: "array",
+            items: { type: "string", enum: ["claude", "antigravity", "codex"] },
+            maxItems: 3,
+            description: "Ordered fallback provider preference (defaults to ['claude', 'antigravity'])"
+          },
+          reason: { type: "string", maxLength: 240, description: "Reason for provider switch (e.g. 'Codex usage limit reached')" }
+        },
+        required: ["key"],
+        additionalProperties: false
+      },
+      prepareApprovalArgs: (args = {}) => {
+        const key = typeof args.key === "string" ? args.key.trim() : "";
+        if (!key.startsWith("paseo:")) throw new Error("Pass a Paseo session key (`paseo:<serverId>.<agentId>`).");
+        return {
+          key,
+          preferredProviders: Array.isArray(args.preferredProviders) && args.preferredProviders.length
+            ? args.preferredProviders
+            : ["claude", "antigravity"],
+          ...(args.reason ? { reason: clip(args.reason, 240) } : {})
+        };
+      },
+      approvalTtlMs: 10 * 60_000,
+      approvalDedupeKey: (args, context) => `fleet-switch-provider:${digest([context?.sessionId ?? null, args.key, args.preferredProviders])}`,
+      summarize: (args) => `Switch Paseo session ${args.key} onto ${args.preferredProviders.join(" / ")}`,
+      handler: async (args, context) => {
+        if (context?.__confirmed !== true) throw new Error("Explicit approval is required.");
+        const res = await supervisor.switchPaseoProvider(args.key, {
+          preferredProviders: args.preferredProviders,
+          reason: args.reason ?? null
+        });
+        if (!res?.ok) {
+          throw new Error(`Provider switch halted (${res?.status ?? "blocked"}): ${clip(res?.detail ?? "unavailable", 220)}`);
+        }
+        return res;
+      }
+    });
+  }
+  if (supervisor.precedentMemory || typeof supervisor.listPrecedents === "function") {
+    registry.register({
+      name: "fleet_precedents",
+      source: SOURCE,
+      sideEffects: false,
+      description:
+        "Inspect learned and built-in owner decision precedents (plus recent autonomous precedent applications) that allow OpenAGI to resolve routine non-red-line blockers from Spencer's historical decisions.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", minimum: 1, maximum: 100 }
+        },
+        additionalProperties: false
+      },
+      handler: (args = {}) => {
+        const limit = Number.isInteger(args.limit) ? args.limit : 40;
+        if (supervisor.precedentMemory) {
+          return {
+            precedents: supervisor.precedentMemory.list({ limit }),
+            recentApplications: supervisor.precedentMemory.applications(20)
+          };
+        }
+        return readState(supervisor).precedentsSummary ?? { precedents: [], recentApplications: [] };
+      }
+    });
+  }
+  registerActiveWorkTools(registry, supervisor, { source: SOURCE });
 }
 
 async function fleetDispatchGoalTarget(supervisor, args = {}) {
@@ -630,6 +732,7 @@ async function fleetDispatchGoalTarget(supervisor, args = {}) {
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
   const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
   const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
+  const modeId = typeof args?.modeId === "string" && args.modeId.trim() ? clip(args.modeId.trim(), 60) : null;
 
   if (explicitKey && !forceNew) {
     const validated = await Promise.resolve(fleetTarget(supervisor, { key: explicitKey, message: goal }));
@@ -709,6 +812,7 @@ async function fleetStartSessionTarget(supervisor, args = {}) {
   const provider = typeof args?.provider === "string" && args.provider.trim() ? clip(args.provider.trim(), 80) : null;
   const model = typeof args?.model === "string" && args.model.trim() ? clip(args.model.trim(), 120) : null;
   const effort = typeof args?.effort === "string" && args.effort.trim() ? clip(args.effort.trim(), 40) : null;
+  const modeId = typeof args?.modeId === "string" && args.modeId.trim() ? clip(args.modeId.trim(), 60) : null;
 
   if (fromThreadKey && (!cwd || !serverId)) {
     const refThread = supervisor?.lastThreads?.get?.(fromThreadKey)
@@ -821,6 +925,21 @@ function fleetTarget(supervisor, args = {}) {
   throw new Error(`No fleet thread with key "${clip(key, KEY_MAX)}". Call fleet_status for the current keys.`);
 }
 
+async function fleetSendStillValid(supervisor, args, action) {
+  await fleetTarget(supervisor, args);
+  // Anything written to the chat since the card was (last) raised: the
+  // owner's own words, or a supervisor message. Either can change what a
+  // waiting "yes" or "go ahead" would answer.
+  const thread = supervisor.lastThreads?.get?.(args?.key) ?? null;
+  const row = (readState(supervisor).snapshot?.threads ?? []).find((item) => item?.key === args?.key);
+  const wroteAt = Math.max(Date.parse(thread?.lastUserAt ?? "") || 0, Date.parse(row?.lastOwnerAt ?? "") || 0);
+  const askedAt = Date.parse(action?.raisedAt ?? action?.createdAt ?? "");
+  if (wroteAt && Number.isFinite(askedAt) && wroteAt > askedAt) {
+    return `${clip(args?.name || args?.key, 80)} has new messages since this was asked, so it was not sent. Ask again if you still want it.`;
+  }
+  return null;
+}
+
 function fleetCardTarget(supervisor, args = {}) {
   const cardId = typeof args?.cardId === "string" ? args.cardId.trim() : "";
   if (!cardId) throw new Error("Pass a cardId from fleet_status cards.");
@@ -895,6 +1014,18 @@ function fleetPreferenceTarget(args = {}) {
   if (typeof args?.cadence === "string") {
     patch.cadence = args.cadence;
     labels.push(`cadence=${args.cadence}`);
+  }
+  if (typeof args?.defaultProvider === "string" && args.defaultProvider.trim()) {
+    patch.defaultProvider = args.defaultProvider.trim();
+    labels.push(`defaultProvider=${patch.defaultProvider}`);
+  }
+  if (typeof args?.defaultPermissionMode === "string" && args.defaultPermissionMode.trim()) {
+    patch.defaultPermissionMode = args.defaultPermissionMode.trim();
+    labels.push(`defaultPermissionMode=${patch.defaultPermissionMode}`);
+  }
+  if (typeof args?.defaultModel === "string" && args.defaultModel.trim()) {
+    patch.defaultModel = args.defaultModel.trim();
+    labels.push(`defaultModel=${patch.defaultModel}`);
   }
   if (typeof args?.choice === "string" && args.choice.trim()) {
     patch.choice = args.choice.trim();
@@ -1028,5 +1159,13 @@ function deliveryReceipt(result) {
   return { status, route: delivery?.route ?? null, detail: clip(delivery?.detail ?? "", 200),
     ...(Number.isInteger(delivery?.attachedImages) && delivery.attachedImages > 0 ? { attachedImages: delivery.attachedImages } : {}),
     ...(delivery?.actionId ? { actionId: delivery.actionId } : {}),
-    ...(delivery?.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}) };
+    ...(delivery?.messageId ? { messageId: delivery.messageId } : {}),
+    ...(delivery?.providerMessageId ? { providerMessageId: delivery.providerMessageId } : {}),
+    ...(delivery?.turnId ? { turnId: delivery.turnId } : {}),
+    ...(delivery?.verifiedAt ? { verifiedAt: delivery.verifiedAt } : {}),
+    ...(delivery?.reconciledReceipt ? { reconciledReceipt: true } : {}),
+    ...(delivery?.followThroughWatchId ? { followThroughWatchId: delivery.followThroughWatchId } : {}),
+    ...(delivery?.recoveredSession ? { recoveredSession: delivery.recoveredSession } : {}),
+    outcomeVerified: false,
+    verificationNote: "Message delivery and turn start confirmed; target goal/submission is NOT complete until post-turn outcome is verified." };
 }

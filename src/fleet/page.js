@@ -90,6 +90,10 @@ a.btn.primary{color:var(--ink)}
 .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .item .acts .btn{margin:0;width:auto;flex:1 1 auto}
 .ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
+.settings{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--raise)}
+.settings h4{margin:0 0 8px;font-size:15px}.settings label{display:block;margin-top:9px;font-size:13px;color:var(--muted)}
+.settings select{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+.settings .note{margin:8px 0 0}.settings .acts{margin-top:10px}
 .ask .t{display:block}
 .chat{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .chat .log{max-height:420px;overflow:auto}
@@ -432,6 +436,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   // ─── needs you ───────────────────────────────────────────────────────────
 
   function renderNeeds(questions, byKey) {
+    questions = (questions || []).filter(function (q) { return q && q.needsYou !== false; });
     var box = $('needsList');
     box.replaceChildren();
     cards.clear();
@@ -441,7 +446,8 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       var card = el('article', 'card', null, box);
       card.dataset.id = q.id;
       cards.set(q.id, card);
-      el('h3', null, q.title || 'Question', card);
+      el('h3', null, q.decisionHeadline || q.title || 'Question', card);
+      if (q.decisionFact) el('p', 'note', q.decisionFact, card);
       var ctx = el('div', 'ctx', null, card);
       var t = q.threadKey ? byKey.get(q.threadKey) : null;
       // In which chat (workspace and app), else the thread's workspace.
@@ -633,6 +639,77 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     var reply = asks.filter(function (q) { return q.canReply === true; })[0];
     if (reply) return reply;
     return asks.filter(function (q) { return q.kind === 'agent-card' || q.kind === 'prompt'; })[0] || null;
+  }
+
+  var settingsLoading = new Set();
+  var settingsOpen = new Set();
+
+  function currentSettingsOption(select, settings, name) {
+    var current = settings && settings.current ? settings.current[name] : null;
+    if (!current) return;
+    var option = document.createElement('option');
+    option.value = current;
+    option.textContent = current;
+    option.selected = true;
+    option.disabled = true;
+    select.append(option);
+  }
+
+  function renderPaseoSettings(parent, t) {
+    var box = el('div', 'settings', null, parent);
+    el('h4', null, 'Paseo session settings', box);
+    var status = el('p', 'note', 'Loading authoritative settings…', box);
+    if (settingsLoading.has(t.key)) return box;
+    settingsLoading.add(t.key);
+    api(threadPath(t.key) + '/settings').then(function (result) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      var settings = result && result.settings ? result.settings : null;
+      if (!settings) { el('p', 'note', 'Settings are unavailable until this Paseo host can be read safely.', box); return; }
+      var stateText = settings.status === 'pending'
+        ? 'A pending permission card is open. Answer that card; settings cannot approve or clear it.'
+        : settings.status === 'busy'
+          ? 'This session has an active turn. Settings take effect after it finishes; no restart is performed.'
+          : 'Changes are sent to this exact session and confirmed by a fresh readback.';
+      el('p', 'note', stateText, box);
+      var names = [['model', 'Model'], ['reasoningEffort', 'Reasoning effort'], ['permissions', 'Permissions']];
+      var changed = false;
+      names.forEach(function (pair) {
+        var name = pair[0], label = pair[1];
+        var options = Array.isArray(settings.supported && settings.supported[name]) ? settings.supported[name] : [];
+        var select = document.createElement('select');
+        var lab = el('label', null, label, box); lab.append(select);
+        var unavailable = settings.unavailable && settings.unavailable[name];
+        if (unavailable) { currentSettingsOption(select, settings, name); select.disabled = true; el('p', 'note', unavailable, box); return; }
+        if (!options.length) { select.disabled = true; el('p', 'note', 'Unavailable on this host/provider.', box); return; }
+        options.forEach(function (item) {
+          var option = document.createElement('option'); option.value = item.id; option.textContent = item.label;
+          option.disabled = item.selectable === false; option.selected = settings.current && settings.current[name] === item.id; select.append(option);
+        });
+        select.disabled = settings.status !== 'ready';
+        select.addEventListener('change', function () {
+          if (changed || select.disabled) return;
+          changed = true; select.disabled = true;
+          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function () {
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say('Paseo ' + label.toLowerCase() + ' change confirmed by readback.');
+          }).catch(function (error) {
+            // Never leave the rejected value displayed as current; reread the session.
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say(error.message || 'The setting was not changed.', true);
+          });
+        });
+      });
+    }).catch(function (error) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      el('p', 'note', error.message || 'Settings could not be read; nothing was changed.', box);
+    });
+    return box;
   }
 
   // Where the reply box sends: the question's own reply when it takes one,
@@ -1033,6 +1110,15 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     } else {
       var mu = button('Mute ' + MUTE_HOURS + 'h', 'btn', acts, function () { return mute(t, true, mu); });
     }
+    if (t.kind === 'paseo') {
+      var settings = button('Session settings', 'btn', acts, function () {
+        settingsOpen.add(t.key);
+        settings.disabled = true;
+        renderPaseoSettings(parent, t);
+      });
+      settings.disabled = settingsOpen.has(t.key);
+      if (settingsOpen.has(t.key)) renderPaseoSettings(parent, t);
+    }
   }
 
   function renderThread(t, parent) {
@@ -1068,7 +1154,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     // A row the owner just opened wants fresh detail; one a re-render keeps
     // open (its toggle fires too) refetches only once the detail is stale.
     d.addEventListener('toggle', function () {
-      if (!d.open) { openThreads.delete(t.key); return; }
+      if (!d.open) { openThreads.delete(t.key); settingsOpen.delete(t.key); return; }
       var fresh = !openThreads.has(t.key);
       openThreads.add(t.key);
       wantDetail(t.key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);

@@ -17,6 +17,13 @@ export async function executeApprovedAction(runtime, id, { decidedBy = "user", c
     return { status: 200, body: { ok: true, alreadyApproved: true, ...(resumed ? { continuation: resumed } : {}) }, action };
   }
   if (action.status !== "pending") return { status: 409, body: { error: `action already ${action.status}` }, action };
+  // The context it was asked in must still hold: the same chat, still there,
+  // and nothing the owner said since that makes it stale.
+  const stale = await runtime.tools?.approvalStillValid?.(action);
+  if (stale) {
+    runtime.pendingActions.expire?.(id, stale);
+    return { status: 410, body: { error: stale }, action: runtime.pendingActions.get(id) ?? action };
+  }
   const claim = runtime.pendingActions.claimForExecution?.(id, { claimedBy });
   if (!claim) {
     action = runtime.pendingActions.get(id);

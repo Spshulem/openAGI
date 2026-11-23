@@ -31,6 +31,10 @@ export class PendingActionStore {
     // journaled): a confirmed card's follow-up steps are judged on them.
     this.ownerIntents = new Map();
     this.events = null;
+    // Called with each new card that waits on the owner, announced or not
+    // (a chat card stays off the SSE bus but still reaches the phone's
+    // notification). A re-raised card is the same card, so it never calls.
+    this.raiseListeners = new Set();
     // Recovery and expiry happen while the durable runtime is constructed,
     // before createHostedInterface owns/binds the live event bus. Hold those
     // resolutions until bindEvents() so the durable outreach copy is not left
@@ -51,6 +55,14 @@ export class PendingActionStore {
     for (const payload of deferred) {
       this.events?.emit?.("pending-action-resolved", payload);
     }
+  }
+
+  /// Returns the unsubscribe. Listeners must not throw; one that does is
+  /// ignored, never the enqueue.
+  watch(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.raiseListeners.add(listener);
+    return () => this.raiseListeners.delete(listener);
   }
 
   list({ status } = {}) {
@@ -142,6 +154,11 @@ export class PendingActionStore {
       code: action.confirmCode,
       createdAt: action.createdAt
     });
+    if (cardMode !== "owner") {
+      for (const listener of this.raiseListeners) {
+        try { listener(action); } catch { /* a notifier must never fail the enqueue */ }
+      }
+    }
     return action;
   }
 
@@ -386,6 +403,21 @@ export class PendingActionStore {
 
   _appendJournal(event) {
     appendJsonLine(this._journalPath(), event);
+  }
+
+  // Retires one pending card whose context no longer holds, with the reason.
+  expire(id, reason) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "pending") return null;
+    const decidedAt = new Date(this.now()).toISOString();
+    action.status = "expired";
+    this.ownerIntents.delete(action.id);
+    action.decidedAt = decidedAt;
+    action.decidedBy = "system";
+    action.error = String(reason ?? "Approval expired before it was used.").slice(0, 300);
+    this._appendJournal({ op: "decide", id: action.id, status: action.status, decidedAt, decidedBy: action.decidedBy, error: action.error });
+    this._emitResolution(action);
+    return action;
   }
 
   _expirePending() {

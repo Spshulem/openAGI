@@ -482,6 +482,25 @@ struct QueuedSupervisorMessage: Identifiable, Equatable {
   var attachments: [WorkspaceImageAttachment]
 }
 
+struct MacBudgetStatus: Decodable, Equatable, Sendable {
+  let today: String
+  let dailyUsdLimit: Double
+  let bonusUsdToday: Double?
+  let effectiveLimitUsd: Double?
+  let spentUsd: Double
+  let remainingUsd: Double
+  let exceeded: Bool?
+  let calls: Int
+
+  var effectiveLimit: Double {
+    effectiveLimitUsd ?? (dailyUsdLimit + (bonusUsdToday ?? 0))
+  }
+
+  var isExceeded: Bool {
+    exceeded ?? (spentUsd >= effectiveLimit)
+  }
+}
+
 /// Keeps Mac Supervisor Quick Ask, Supervisor Workspace Window, Paseo, iPhone,
 /// and Even G2 synced via `devices:supervisor:main` + `/tasks`.
 @MainActor
@@ -494,6 +513,12 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var isSending = false
   @Published private(set) var queuedMessages: [QueuedSupervisorMessage] = []
   @Published private(set) var streamingReplyText: String? = nil
+  /// The assistant messages already shown when the current reply started,
+  /// and the question it answers. A new assistant message right after that
+  /// question is this reply, saved by the server and pulled in by a
+  /// transcript sync before the stream ended.
+  @Published private(set) var replyBaselineIds: Set<String> = []
+  @Published private(set) var replyPromptText: String? = nil
   @Published private(set) var progressStage: String? = nil
   @Published private(set) var activeModelId: String? = nil
   @Published private(set) var activeProvider: String? = nil
@@ -503,6 +528,8 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var chatgptSignedIn = false
   @Published private(set) var anthropicConfigured = false
   @Published private(set) var isSwitchingModel = false
+  @Published private(set) var budgetStatus: MacBudgetStatus? = nil
+  @Published private(set) var isUpdatingBudget = false
   @Published private(set) var lastError: String? = nil
 
   var activeModelLabel: String {
@@ -570,6 +597,53 @@ final class SharedSupervisorClient: ObservableObject {
       group.addTask { await self.refreshMessages() }
       group.addTask { await self.refreshTasks() }
       group.addTask { await self.refreshModelSettings() }
+      group.addTask { await self.refreshBudget() }
+    }
+  }
+
+  func refreshBudget() async {
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/budget"))
+    authed(&req)
+    req.timeoutInterval = 8
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      budgetStatus = try JSONDecoder().decode(MacBudgetStatus.self, from: data)
+    } catch {
+      // Non-fatal on older mains or while restarting.
+    }
+  }
+
+  @discardableResult
+  func updateBudget(dailyUsdLimit: Double? = nil, addUsdToday: Double? = nil, resetTodayBonus: Bool = false) async -> Bool {
+    guard !isUpdatingBudget else { return false }
+    isUpdatingBudget = true
+    defer { isUpdatingBudget = false }
+    var body: [String: Any] = [:]
+    if let dailyUsdLimit { body["dailyUsdLimit"] = dailyUsdLimit }
+    if let addUsdToday { body["addUsdToday"] = addUsdToday }
+    if resetTodayBonus { body["resetTodayBonus"] = true }
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/budget"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    req.timeoutInterval = 15
+    authed(&req)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      budgetStatus = try JSONDecoder().decode(MacBudgetStatus.self, from: data)
+      if let err = lastError, err.localizedCaseInsensitiveContains("daily budget") {
+        lastError = nil
+      }
+      return true
+    } catch {
+      lastError = error.localizedDescription
+      return false
     }
   }
 
@@ -650,6 +724,33 @@ final class SharedSupervisorClient: ObservableObject {
     }
   }
 
+  /// The reply's newest streamed text to draw, or nil once the transcript
+  /// already holds this reply (one bubble, never two).
+  var liveReplyText: String? {
+    Self.liveReplyText(streaming: streamingReplyText, messages: messages, baseline: replyBaselineIds, prompt: replyPromptText)
+  }
+
+  nonisolated static func liveReplyText(streaming: String?, messages: [SyncedSupervisorMessage], baseline: Set<String>, prompt: String?) -> String? {
+    guard let text = streaming, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    if replyAlreadyShown(messages: messages, baseline: baseline, prompt: prompt) { return nil }
+    return text
+  }
+
+  /// True only for a new assistant message that directly follows this turn's
+  /// own question. A Quick Ask mirrored in meanwhile, or older history a
+  /// sync brings back, answers something else and leaves the stream showing.
+  nonisolated static func replyAlreadyShown(messages: [SyncedSupervisorMessage], baseline: Set<String>, prompt: String?) -> Bool {
+    let asked = prompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !asked.isEmpty,
+          let question = messages.lastIndex(where: { $0.role == "user" && $0.text.trimmingCharacters(in: .whitespacesAndNewlines) == asked })
+    else { return false }
+    for message in messages[(question + 1)...] {
+      if message.role == "user" { return false }
+      if message.role == "assistant" && !baseline.contains(message.id) { return true }
+    }
+    return false
+  }
+
   func refreshMessages() async {
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
@@ -727,11 +828,13 @@ final class SharedSupervisorClient: ObservableObject {
   private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
+    replyBaselineIds = previousAssistantIds
     lastError = nil
     streamingReplyText = nil
     progressStage = "queued"
 
     let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+    replyPromptText = displayText
     let localId = "local_\(UUID().uuidString)"
     let optimistic = SyncedSupervisorMessage(
       id: localId,
@@ -777,7 +880,9 @@ final class SharedSupervisorClient: ObservableObject {
           continue
         }
       }
-      if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty {
+      // A sync during the stream may already have brought the saved reply.
+      if let reply = replyText?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty,
+         !Self.replyAlreadyShown(messages: messages, baseline: previousAssistantIds, prompt: displayText) {
         messages.append(SyncedSupervisorMessage(
           id: "local_reply_\(UUID().uuidString)",
           role: "assistant",
@@ -1052,5 +1157,6 @@ final class SharedSupervisorClient: ObservableObject {
     if let token = AppState.shared.authToken(), !token.isEmpty {
       req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     }
+    req.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
   }
 }

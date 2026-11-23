@@ -28,6 +28,7 @@ struct SupervisorView: View {
     @Environment(AppModel.self) private var model
 
     @State private var state: FleetState?
+    @State private var walkthrough: SupervisorWalkthrough?
     @State private var modelSettings: ModelSettings?
     @State private var isSwitchingModel = false
     @State private var loadError: DaemonError?
@@ -89,12 +90,16 @@ struct SupervisorView: View {
     }
 
     private enum SupervisorSheet: String, Identifiable {
-        case board, sessions, preferences, conversations
+        case board, sessions, preferences, budget, conversations
         var id: String { rawValue }
     }
 
     @State private var openThread: ThreadPresentation?
     @State private var activeSheet: SupervisorSheet?
+    @State private var budgetStatus: BudgetStatus?
+    @State private var budgetBusy = false
+    @State private var showingCustomBudgetPrompt = false
+    @State private var customBudgetAmountText = "50"
     @State private var issued = 0
     @State private var applied = 0
 
@@ -117,7 +122,7 @@ struct SupervisorView: View {
                     workspace: card.workspace
                 ),
                 subchannel: card.subchannel,
-                headline: card.headline,
+                headline: card.decisionHeadline ?? card.headline,
                 kindLabel: card.kindLabel ?? "Needs you",
                 risky: card.risky
             )
@@ -471,6 +476,11 @@ struct SupervisorView: View {
                                                 vetoSlice: vetoSlice, vetoActionID: vetoActionID)
                     }
                 )
+            case .budget:
+                NavigationStack {
+                    BudgetSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { activeSheet = nil } } }
+                }
             case .conversations:
                 NavigationStack {
                     ConversationBrowser(thread: $browserThread) { message in
@@ -489,6 +499,24 @@ struct SupervisorView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("In Auto the supervisor sends preset nudges to your agents by itself, a few per scan, without asking first. Observe and Propose never send on their own.")
+        }
+        .alert("Add extra budget for today", isPresented: $showingCustomBudgetPrompt) {
+            TextField("Amount in USD (e.g. 50)", text: $customBudgetAmountText)
+                .keyboardType(.decimalPad)
+            Button("Add today") {
+                let cleaned = customBudgetAmountText
+                    .replacingOccurrences(of: "$", with: "")
+                    .replacingOccurrences(of: "+", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let amount = Double(cleaned), amount >= 0.5, amount <= 10000 {
+                    Task { await quickTopUpBudget(amount: amount) }
+                } else {
+                    showToast("Enter an amount between $0.50 and $10,000.", isError: true)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Adds immediate headroom for today without permanently changing tomorrow's daily cap.")
         }
         .confirmationDialog(
             "Archive coding chat in Paseo?",
@@ -801,6 +829,11 @@ struct SupervisorView: View {
             }
             .accessibilityIdentifier("supervisor-preferences-button")
 
+            Button("Budget", systemImage: "dollarsign.circle") {
+                activeSheet = .budget
+            }
+            .accessibilityIdentifier("supervisor-budget-button")
+
             if let state {
                 Menu {
                     ForEach(FleetMode.allCases, id: \.self) { mode in
@@ -848,6 +881,74 @@ struct SupervisorView: View {
     @ViewBuilder
     private var topBannerStack: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let budget = budgetStatus, budget.isExceeded {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "dollarsign.circle.fill")
+                            .foregroundStyle(Theme.alert)
+                            .font(.footnote.weight(.semibold))
+                        Text(String(format: "Daily budget reached ($%.2f / $%.2f)", budget.spentUsd, budget.effectiveLimit))
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Theme.ink)
+                        Spacer(minLength: 4)
+                    }
+                    HStack(spacing: 8) {
+                        Button("+$10") { Task { await quickTopUpBudget(amount: 10) } }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-10")
+                        Button("+$25") { Task { await quickTopUpBudget(amount: 25) } }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-25")
+                        Button("+$$$…") { showingCustomBudgetPrompt = true }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-add-custom")
+                        Button("Settings") { activeSheet = .budget }
+                            .font(.caption.weight(.medium))
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(budgetBusy)
+                            .accessibilityIdentifier("supervisor-budget-open")
+                    }
+                }
+                .padding(.horizontal, Theme.gutter)
+                .padding(.vertical, 8)
+                .background(Theme.alert.opacity(0.08))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("supervisor-budget-exceeded-banner")
+            }
+            if let walkthrough, walkthrough.active, let current = walkthrough.current {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: walkthrough.paused ? "pause.circle" : "rectangle.stack")
+                        .foregroundStyle(Theme.live)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Needs You · \(max(1, (walkthrough.items.firstIndex(where: { $0.id == current.id }) ?? 0) + 1))/\(max(1, walkthrough.total))")
+                            .font(.footnote.weight(.semibold)).foregroundStyle(Theme.ink)
+                        Text(current.title).font(.caption.weight(.medium)).foregroundStyle(Theme.ink).lineLimit(1)
+                        Text(walkthrough.paused ? "Paused · the same card is ready on G2." : current.summary)
+                            .font(.caption2).foregroundStyle(Theme.muted).lineLimit(2)
+                    }
+                    Spacer(minLength: 4)
+                    HStack(spacing: 8) {
+                        Button("Back") { Task { await moveWalkthrough("back") } }
+                        Button(walkthrough.paused ? "Resume" : "Pause") { Task { await moveWalkthrough(walkthrough.paused ? "resume" : "pause") } }
+                        Button("Next") { Task { await moveWalkthrough("next") } }
+                    }
+                    .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, Theme.gutter)
+                .padding(.vertical, 8)
+                .background(Theme.surface)
+                .accessibilityIdentifier("supervisor-walkthrough-bar")
+            }
             if let loadError, state == nil || SupervisorFormat.isUnavailable(loadError) {
                 let copy = SupervisorFormat.errorCopy(loadError)
                 HStack(alignment: .top, spacing: 10) {
@@ -1289,10 +1390,25 @@ struct SupervisorView: View {
                 .font(Theme.Typography.caption.weight(.bold))
                 .foregroundStyle(Theme.ink)
                 .fixedSize()
-            Text(card.headline)
-                .font(Theme.Typography.caption)
-                .foregroundStyle(Theme.muted)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(card.decisionHeadline ?? card.headline)
+                    .font(Theme.Typography.caption.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(1)
+                if let fact = card.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+                    Text(fact)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .lineLimit(1)
+                }
+                if !card.remainingItemIds.isEmpty {
+                    Text("More owner questions remain")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.live)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Spacer(minLength: 4)
             Button {
                 withAnimation(.spring(duration: 0.22)) {
@@ -1532,6 +1648,8 @@ struct SupervisorView: View {
         let sequence = nextSequence()
         async let freshModelSettings = try? model.client.modelSettings()
         async let freshHierarchy = try? model.client.fleetHierarchy(limit: 60)
+        async let freshBudget = try? model.client.budget()
+        async let freshWalkthrough = try? model.client.fleetWalkthrough()
         do {
             let fresh = try await model.client.fleetState()
             accept(sequence, fresh)
@@ -1545,6 +1663,35 @@ struct SupervisorView: View {
         }
         if let updatedHierarchy = await freshHierarchy {
             model.latestFleetHierarchy = updatedHierarchy
+        }
+        if let updatedBudget = await freshBudget {
+            budgetStatus = updatedBudget
+        }
+        if let updatedWalkthrough = await freshWalkthrough {
+            walkthrough = updatedWalkthrough
+        }
+    }
+
+    private func quickTopUpBudget(amount: Double) async {
+        guard !budgetBusy else { return }
+        budgetBusy = true
+        defer { budgetBusy = false }
+        do {
+            let updated = try await model.client.updateBudget(BudgetUpdate(addUsdToday: amount))
+            budgetStatus = updated
+            showToast(String(format: "Added +$%.2f today ($%.2f remaining) ✓", amount, max(0, updated.remainingUsd)))
+        } catch {
+            showToast(BudgetSettingsErrorCopy.saveMessage(for: error), isError: true)
+        }
+    }
+
+    private func moveWalkthrough(_ operation: String) async {
+        guard let current = walkthrough?.currentId else { return }
+        do {
+            walkthrough = try await model.client.fleetWalkthrough(operation: operation, expectedId: current)
+        } catch {
+            statusNote = .init(text: "Needs You changed. Refreshing the shared walkthrough.", isAlert: true)
+            walkthrough = try? await model.client.fleetWalkthrough()
         }
     }
 
@@ -1868,6 +2015,7 @@ private struct SupervisorCardDeckView: View {
     let onAct: (SupervisorCard, SupervisorCardAction) -> Void
 
     @State private var revealedPlanCardIDs: Set<String> = []
+    @State private var detailsContentHeight: CGFloat = 0
 
     private var card: SupervisorCard { cards[index] }
     private var isBusy: Bool { busyCardID == card.id }
@@ -2023,8 +2171,12 @@ private struct SupervisorCardDeckView: View {
                     .accessibilityIdentifier(contextID)
             }
 
-            // Fixed-height scrollable body so stepper controls never jump vertically
-            // and tapping anywhere on the summary opens full context.
+            // Scrollable body: tapping anywhere on the summary opens full
+            // context. It keeps the compact 145 pt floor so stepper controls
+            // stay put for short cards, and grows to 235 pt only when the
+            // card's content needs it. A fixed 235 pt, together with the
+            // voice bar and composer below, left a folded phone's chat
+            // history about one line tall.
             ScrollView(.vertical, showsIndicators: true) {
                 cardDetailsContent
                     .padding(.trailing, 2)
@@ -2034,7 +2186,12 @@ private struct SupervisorCardDeckView: View {
                         }
                     }
             }
-            .frame(height: 145)
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentSize.height
+            } action: { _, height in
+                detailsContentHeight = height
+            }
+            .frame(height: min(max(detailsContentHeight, 145), 235))
 
             if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2087,17 +2244,26 @@ private struct SupervisorCardDeckView: View {
     }
 
     private func headlineRow(showsChevron: Bool) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(card.headline)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Theme.ink)
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
-            Spacer(minLength: 4)
-            if showsChevron {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(card.decisionHeadline ?? card.headline)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 4)
+                if showsChevron {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+            if let fact = card.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+                Text(fact)
+                    .font(.caption)
                     .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2146,24 +2312,46 @@ private struct SupervisorCardDeckView: View {
                 }
             }
             if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
-                Text(ctx)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("GOAL")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    Text(ctx)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.ink.opacity(0.9))
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+            }
+            if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("WHERE IT IS")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    Text(stateNow)
+                        .font(Theme.Typography.caption.weight(.medium))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
             }
             let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
             if let summary = mainSummary {
-                if summary.contains("\n") || summary.contains("|") {
-                    MarkdownContent(blocks: MarkdownParser.parse(summary))
-                        .lineLimit(nil)
-                } else {
-                    Text(MarkdownParser.inline(summary))
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.ink.opacity(0.92))
-                        .lineLimit(5)
-                        .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("WHAT TO KNOW")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.muted)
+                    if summary.contains("\n") || summary.contains("|") {
+                        MarkdownContent(blocks: MarkdownParser.parse(summary))
+                            .lineLimit(nil)
+                    } else {
+                        Text(MarkdownParser.inline(summary))
+                            .font(Theme.Typography.secondary)
+                            .foregroundStyle(Theme.ink.opacity(0.92))
+                            .lineLimit(6)
+                            .multilineTextAlignment(.leading)
+                    }
                 }
             }
             if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2172,7 +2360,7 @@ private struct SupervisorCardDeckView: View {
                 Text("Decision: \(decision)")
                     .font(Theme.Typography.caption.weight(.medium))
                     .foregroundStyle(Theme.ink)
-                    .lineLimit(2)
+                    .lineLimit(4)
                     .multilineTextAlignment(.leading)
             } else if let nextAction = card.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !nextAction.isEmpty {
@@ -2203,10 +2391,20 @@ private struct SupervisorCardDeckView: View {
                 .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
             if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
-                Text(rec)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.muted)
-                    .lineLimit(2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("RECOMMENDATION")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Theme.live)
+                    Text(rec)
+                        .font(Theme.Typography.caption.weight(.semibold))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.35), lineWidth: 1))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2545,11 +2743,32 @@ private struct BoardNeedsYouStage: View {
                             .font(Theme.Typography.caption)
                             .foregroundStyle(Theme.muted)
                     }
+                    if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
+                        Text("Goal: \(ctx)")
+                            .font(Theme.Typography.caption)
+                            .foregroundStyle(Theme.muted)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
+                    if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
+                        Text(stateNow)
+                            .font(Theme.Typography.caption.weight(.medium))
+                            .foregroundStyle(Theme.ink)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
                     if let summary = mainSummary {
                         Text(MarkdownParser.inline(summary))
                             .font(Theme.Typography.secondary)
                             .foregroundStyle(Theme.ink.opacity(0.9))
                             .lineLimit(4)
+                            .multilineTextAlignment(.leading)
+                    }
+                    if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
+                        Text(rec)
+                            .font(Theme.Typography.caption.weight(.semibold))
+                            .foregroundStyle(Theme.live)
+                            .lineLimit(2)
                             .multilineTextAlignment(.leading)
                     }
                 }
@@ -3448,7 +3667,9 @@ private struct BoardThreadInspectorPane: View {
                             if let actor = thread.actorLabel, !actor.isEmpty {
                                 BoardActorPill(actor: actor)
                             }
-                            if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
+                            if let wd = thread.watchdog, let wdText = wd.badgeText {
+                                Chip(text: wdText, color: wd.isAlert ? Theme.alert : Theme.muted)
+                            } else if let check = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) {
                                 BoardQuietCheckPill(label: check)
                             }
                             if let prChip = SupervisorFormat.prChip(thread.pr) {
@@ -3710,7 +3931,8 @@ private struct ThreadRow: View {
                         .lineLimit(1)
                 }
                 let chip = SupervisorFormat.prChip(thread.pr)
-                let checkBadge = SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt)
+                let watchdogChip = thread.watchdog?.badgeText
+                let checkBadge = watchdogChip == nil ? SupervisorQuietCheckFormatter.badge(nextCheckDate: thread.nextCheckAt) : nil
                 let threadLabels = Array(SupervisorBoardLabel.extract(from: thread.labels).prefix(3))
                 let subSlug = thread.subchannel.flatMap { raw -> String? in
                     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3718,7 +3940,7 @@ private struct ThreadRow: View {
                     let clean = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
                     return clean.split(separator: "/").last.map(String.init) ?? clean
                 }
-                if chip != nil || hasProposal || thread.actorLabel != nil || checkBadge != nil || subSlug != nil {
+                if chip != nil || hasProposal || thread.actorLabel != nil || watchdogChip != nil || checkBadge != nil || subSlug != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: Theme.Spacing.x2) {
                             if let actor = thread.actorLabel, !actor.isEmpty {
@@ -3730,7 +3952,9 @@ private struct ThreadRow: View {
                             if let chip {
                                 Chip(text: chip, color: SupervisorFormat.ciFailing(thread.pr?.ci) ? Theme.alert : Theme.ink)
                             }
-                            if let checkBadge {
+                            if let watchdogChip {
+                                Chip(text: watchdogChip, color: thread.watchdog?.isAlert == true ? Theme.alert : Theme.muted)
+                            } else if let checkBadge {
                                 BoardQuietCheckPill(label: checkBadge)
                             }
                             if hasProposal { Chip(text: "Nudge ready to send", color: Theme.live) }
@@ -3947,7 +4171,10 @@ private struct ThreadDetailSheet: View {
                         let decisionTitle = trimmedNonEmpty(card?.headline) ?? trimmedNonEmpty(question?.title) ?? "Decision"
                         Text(decisionTitle).font(.headline)
                         if let ctx = trimmedNonEmpty(card?.brief?.context) {
-                            Text(ctx).font(.footnote).foregroundStyle(.secondary)
+                            Text("Goal: \(ctx)").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                        }
+                        if let stateNow = trimmedNonEmpty(card?.brief?.currentState) {
+                            Text("Where it is: \(stateNow)").font(.footnote.weight(.medium)).foregroundStyle(Theme.ink)
                         }
                         let preferredSummary: String? = {
                             if let briefBody = trimmedNonEmpty(card?.brief?.whatChanged) { return briefBody }
@@ -3966,7 +4193,9 @@ private struct ThreadDetailSheet: View {
                                 .foregroundStyle(Theme.ink)
                         }
                         if let rec = trimmedNonEmpty(card?.recommendation) {
-                            Text(rec).font(.footnote).foregroundStyle(.secondary)
+                            Text(rec)
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Theme.live)
                         }
 
                         if let card, card.canReply, !card.suggestedReplies.isEmpty, questionIsOpen {

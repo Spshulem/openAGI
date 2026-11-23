@@ -67,7 +67,7 @@ acceptance above. It restores model preference and removes its synthetic task.
 - External OAuth registrations and redirect URIs before claiming native
   Google/integration sign-up. No OAuth client secret may ship in the app.
 
-Version is 1.0, candidate build 2111. Keep app and extensions aligned.
+Version is 1.1, candidate build 2142 (1.0 is live; 1.1 build 2141 was submitted 2026-11-21 and replaced by 2142). Keep app and extensions aligned.
 Prepare a Release archive on a remote Xcode runner; run distribution
 validation before submission. This document does not authorize uploading or
 submitting a release, and passing fixtures alone is not submission readiness.

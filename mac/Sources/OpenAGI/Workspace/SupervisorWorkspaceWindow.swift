@@ -170,7 +170,7 @@ struct SupervisorWorkspaceView: View {
 
   private var decisionItems: [SupervisorDecisionItem] {
     let byKey = Dictionary(fleet.threads.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-    return fleet.questions.map { q in
+    return fleet.questions.filter(\.needsYou).map { q in
       let linked = q.threadKey.flatMap { byKey[$0] }
       let proj = SupervisorChannelGrouping.normalizeProject(
         explicit: q.project,
@@ -182,7 +182,8 @@ struct SupervisorWorkspaceView: View {
         id: q.id,
         project: proj,
         subchannel: q.subchannel ?? linked?.subchannel,
-        headline: q.title,
+        headline: q.decisionHeadline ?? q.title,
+        fact: q.decisionFact,
         kindLabel: q.kind ?? "Needs you",
         risky: q.risky,
         noticedAtISO: q.askedTime
@@ -881,6 +882,37 @@ struct SupervisorWorkspaceView: View {
             }
           }
         }
+        Menu {
+          if let b = supervisor.budgetStatus {
+            Text(String(format: "Today: $%.2f / $%.2f", b.spentUsd, b.effectiveLimit))
+            Divider()
+          }
+          Button("Add $10 for Today") {
+            Task { _ = await supervisor.updateBudget(addUsdToday: 10) }
+          }
+          Button("Add $25 for Today") {
+            Task { _ = await supervisor.updateBudget(addUsdToday: 25) }
+          }
+          if let bonus = supervisor.budgetStatus?.bonusUsdToday, bonus > 0 {
+            Button("Reset Today's Extra") {
+              Task { _ = await supervisor.updateBudget(resetTodayBonus: true) }
+            }
+          }
+          Divider()
+          ForEach([10.0, 25.0, 50.0, 100.0], id: \.self) { limit in
+            Button {
+              Task { _ = await supervisor.updateBudget(dailyUsdLimit: limit) }
+            } label: {
+              if let b = supervisor.budgetStatus, abs(b.dailyUsdLimit - limit) < 0.01 {
+                Label(String(format: "Daily Limit: $%.0f/day", limit), systemImage: "checkmark")
+              } else {
+                Text(String(format: "Daily Limit: $%.0f/day", limit))
+              }
+            }
+          }
+        } label: {
+          Label("Daily Budget", systemImage: "dollarsign.circle")
+        }
         Button("Refresh Everything") {
           Task {
             await supervisor.refreshAll()
@@ -918,6 +950,52 @@ struct SupervisorWorkspaceView: View {
 
   @ViewBuilder
   private var generalStage: some View {
+    let latestHitBudget = (supervisor.messages.last?.role == "assistant"
+      && ((supervisor.messages.last?.text.localizedCaseInsensitiveContains("daily budget exceeded") ?? false)
+          || (supervisor.messages.last?.text.localizedCaseInsensitiveContains("daily budget reached") ?? false)))
+      || (supervisor.lastError?.localizedCaseInsensitiveContains("daily budget") ?? false)
+    if supervisor.budgetStatus?.isExceeded == true || latestHitBudget {
+      HStack(spacing: WorkspaceTheme.Spacing.x3) {
+        Image(systemName: "dollarsign.circle.fill")
+          .foregroundStyle(WorkspaceTheme.alert)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Daily budget limit reached")
+            .font(WorkspaceTheme.Typography.secondary.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.ink)
+          if let b = supervisor.budgetStatus {
+            Text(String(format: "Spent $%.2f of $%.2f today. Add room for today or raise your daily limit.", b.spentUsd, b.effectiveLimit))
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          } else {
+            Text("Add budget for today or raise your daily limit to continue.")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+        Spacer()
+        WorkspaceActionButton(prominent: true, small: true) {
+          Task { _ = await supervisor.updateBudget(addUsdToday: 10) }
+        } label: {
+          Text("+$10 Today")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+        WorkspaceActionButton(prominent: false, small: true) {
+          Task { _ = await supervisor.updateBudget(addUsdToday: 25) }
+        } label: {
+          Text("+$25 Today")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+        WorkspaceActionButton(prominent: false, small: true) {
+          Task { _ = await supervisor.updateBudget(dailyUsdLimit: 50) }
+        } label: {
+          Text("Set $50/day")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+      }
+      .padding(WorkspaceTheme.Spacing.x3)
+      .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
+    }
+
     if waitingTotal > 0 {
       HStack(spacing: WorkspaceTheme.Spacing.x3) {
         Image(systemName: "bell.badge.fill")
@@ -1752,12 +1830,26 @@ struct SupervisorWorkspaceView: View {
           Button {
             openInspector(.question(q.id))
           } label: {
-            Text(q.title)
+            Text(q.decisionHeadline ?? q.title)
               .font(WorkspaceTheme.Typography.body.weight(.semibold))
               .foregroundStyle(WorkspaceTheme.ink)
               .multilineTextAlignment(.leading)
           }
           .buttonStyle(.plain)
+
+          if let fact = q.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
+            Text(fact)
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+              .lineLimit(2)
+              .multilineTextAlignment(.leading)
+          }
+          if !q.remainingItemIds.isEmpty {
+            Text("More owner questions remain; answer this one before the next is presented.")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.live)
+              .lineLimit(2)
+          }
 
           HStack(spacing: 6) {
             if let actor = q.actorLabel, !actor.isEmpty {
@@ -1810,7 +1902,8 @@ struct SupervisorWorkspaceView: View {
         }
       }
 
-      if !q.body.isEmpty {
+      if isExpanded {
+        if !q.body.isEmpty {
         Button {
           if let tk = q.threadKey, !tk.isEmpty {
             openInspector(.session(tk))
@@ -1831,7 +1924,7 @@ struct SupervisorWorkspaceView: View {
         .help("Click to inspect full thread context and conversation")
       }
 
-      if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
+        if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
         VStack(alignment: .leading, spacing: 4) {
           Text(q.isClarificationQuestion ? "Question to unblock" : "Next step")
             .font(WorkspaceTheme.Typography.caption.weight(.semibold))
@@ -1850,6 +1943,7 @@ struct SupervisorWorkspaceView: View {
         .padding(WorkspaceTheme.Spacing.x3)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(WorkspaceTheme.live.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
       }
 
       if revealedPlanQuestionIDs.contains(q.id), let plan = q.plan {
@@ -2410,10 +2504,11 @@ struct SupervisorWorkspaceView: View {
       }
 
       if supervisor.isSending {
-        let liveText = supervisor.streamingReplyText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The transcript may already hold this reply (a sync mid-stream):
+        // then only the progress line shows, never a second copy.
         VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
-          if !liveText.isEmpty {
-            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(supervisor.streamingReplyText ?? liveText))
+          if let liveText = supervisor.liveReplyText {
+            WorkspaceMarkdownContent(blocks: WorkspaceMarkdownParser.parse(liveText))
           }
           HStack(spacing: 8) {
             ProgressView()

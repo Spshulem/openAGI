@@ -3,19 +3,21 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
-import { MODES, resolveFleetConfig } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, resolveFleetConfig, shortHash } from "./contracts.js";
+import { flattenMessage } from "./ui-delivery.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
+import { classifyAsk, decisionContextFromQuestion, decisionSummary, shouldHoldForContext } from './decision-context.js';
 import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
 import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +51,13 @@ export function createFleetCapability(supervisor) {
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
+      if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (typeof payload.body?.theme === 'string') url.searchParams.set('theme', payload.body.theme);
+        if (payload.body?.includeSnoozed !== undefined) url.searchParams.set('includeSnoozed', String(Boolean(payload.body.includeSnoozed)));
+        if (payload.body?.includeDone !== undefined) url.searchParams.set('includeDone', String(Boolean(payload.body.includeDone)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
       if (payload.path === '/fleet/api/repo-status') {
         if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
         if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
@@ -59,7 +68,11 @@ export function createFleetCapability(supervisor) {
       }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
-      return { response, state: supervisor.getState() };
+      return {
+        response,
+        state: supervisor.getState(),
+        activeWork: typeof supervisor.getActiveWork === 'function' ? supervisor.getActiveWork() : null
+      };
     }
   };
 }
@@ -75,7 +88,26 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive))$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive|failover))$/;
+
+const FEEDBACK_OUTBOX_MAX = 200;
+
+// Hashes the fleet computer journals for an owner send of this message:
+// the route's text (an image-only send gets its default line), prefixed as
+// the executor types it, raw or flattened for computer-use.
+function ownerMessageHashes(message, images) {
+  const raw = String(message ?? '').trim();
+  const text = raw || (Array.isArray(images) && images.length ? 'Please inspect the attached image(s).' : '');
+  const prefixed = text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`;
+  return new Set([shortHash(prefixed), shortHash(flattenMessage(prefixed))]);
+}
+
+function queuedFeedback(entry) {
+  const input = entry.input ?? {};
+  return { id: entry.localId, status: 'queued', queued: true, createdAt: entry.at,
+    utterance: typeof input.utterance === 'string' ? input.utterance : null, intent: input.intent ?? null, target: input.target ?? null,
+    detail: 'Saved on this server; it goes to the fleet computer once that is reachable.' };
+}
 
 export class RemoteFleetSupervisor {
   constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
@@ -94,7 +126,12 @@ export class RemoteFleetSupervisor {
     this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
+    // Feedback said while the computer was out of reach, kept here and sent
+    // on the next refresh that reaches it.
+    this.feedbackOutboxFile = dataDir ? path.join(dataDir, "fleet-feedback-outbox.json") : null;
+    this.feedbackOutbox = this.loadFeedbackOutbox();
     this.lastEmitted = null;
+    this.activeWorkSignature = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
   }
@@ -162,7 +199,8 @@ export class RemoteFleetSupervisor {
     let reached = false;
     let status = null;
     try {
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
+      const isDelivering = method === 'POST' && (DELIVERING.test(path) || /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path));
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: isDelivering ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       if (sequence >= this.appliedSequence) {
@@ -171,6 +209,7 @@ export class RemoteFleetSupervisor {
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
         this.mirrorQuestions();
+        this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();
       }
       status = result.response?.status ?? null;
@@ -182,10 +221,18 @@ export class RemoteFleetSupervisor {
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
       const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
-      const nonOutageError = missingThread || closedCard || unsupportedRoute;
-      if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
-      // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
+      const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
+      const hasSpecificNodeError = reached && Boolean(rawMsg) && rawMsg !== 'Fleet request failed';
+      const nonOutageError = hasSpecificNodeError || missingThread || closedCard || missingActiveWork || unsupportedRoute;
+      if (!nonOutageError && sequence >= this.appliedSequence) {
+        this.state.lastError = !reached && /timed out|timeout|aborted/i.test(rawMsg)
+          ? `Fleet request timed out waiting for ${this.nodeId} (${rawMsg}). Reconcile recent deliveries before resending.`
+          : 'Fleet computer unavailable or request failed. Retry when it is online.';
+      }
+      // Preserve the last snapshot/questions through connection outages, and never
+      // misreport an HTTP error from an online fleet computer as an offline outage.
+      const timedOut = !reached && /timed out|timeout|aborted/i.test(rawMsg);
+      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute, timedOut });
     }
   }
   refresh() {
@@ -193,6 +240,7 @@ export class RemoteFleetSupervisor {
       this.refreshing = this.request('GET', '/fleet/api/state')
         .then(async (body) => { await this.selfFixHub?.sync().catch(() => {}); return body; })
         .then(async (body) => { await this.replayDismissals(); return body; })
+        .then(async (body) => { await this.flushFeedback(); return body; })
         .then((body) => { this.emitIfChanged(); return body; })
         .finally(() => { this.refreshing = null; });
     }
@@ -208,6 +256,7 @@ export class RemoteFleetSupervisor {
         state.snapshot?.at ?? null,
         state.questions.map(q => q.id).sort(),
         (state.cards ?? []).map(c => c.id).sort(),
+        this.activeWorkSignature,
         state.preferences?.mergePolicy ?? null,
         state.preferences?.cadence ?? null,
         state.preferences?.autoSlices ?? null
@@ -253,7 +302,50 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(Array.isArray(images) && images.length ? { images } : {}) }); }
+  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) {
+    const startedAtMs = Date.now();
+    try {
+      return await this.request('POST', '/fleet/api/send', {
+        threadKey,
+        message,
+        ...(queue === true ? { queue: true } : {}),
+        ...(Array.isArray(images) && images.length ? { images } : {})
+      });
+    } catch (error) {
+      // Only an uncertain send (it timed out in flight) may have landed; a
+      // send that never reached the computer did not.
+      if (!error?.reached && error?.timedOut) {
+        try {
+          await this.request('GET', '/fleet/api/state');
+          // The executor journals shortHash of the prefixed text it sent
+          // (flattened for computer-use); only that exact message counts.
+          const hashes = ownerMessageHashes(message, images);
+          const matched = (this.state.actions ?? []).find((act) => (
+            act?.threadKey === threadKey
+            && act?.playbook === 'owner-message'
+            && act?.status === 'sent'
+            && hashes.has(act?.messageHash)
+            && Number.isFinite(Date.parse(act?.at ?? ''))
+            && Date.parse(act.at) >= startedAtMs - 2000
+          ));
+          if (matched) {
+            return {
+              reconciledAfterTimeout: true,
+              delivery: {
+                status: 'sent',
+                route: matched.route ?? 'paseo-send',
+                actionId: matched.id ?? null,
+                reconciledReceipt: true,
+                verifiedAt: matched.at,
+                detail: matched.detail || 'Verified in fleet action log after remote response timeout; message was delivered.'
+              }
+            };
+          }
+        } catch { /* preserve original error if state reconciliation also fails */ }
+      }
+      throw error;
+    }
+  }
   async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
@@ -264,8 +356,50 @@ export class RemoteFleetSupervisor {
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
   }
   // Feedback and self-fix requests live with the fleet, on the computer.
-  async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
-  async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async recordFeedback(input) {
+    try {
+      return (await this.request('POST', '/fleet/api/feedback', input)).feedback;
+    } catch (error) {
+      // The computer answered and refused it: that is the answer. Out of
+      // reach: keep it here instead of losing the owner's words.
+      if (error.reached || !this.feedbackOutboxFile) throw error;
+      const entry = { localId: `fb_local_${randomUUID().replace(/-/g, '').slice(0, 16)}`, input, at: new Date().toISOString() };
+      this.feedbackOutbox = [...this.feedbackOutbox, entry].slice(-FEEDBACK_OUTBOX_MAX);
+      this.saveFeedbackOutbox();
+      return queuedFeedback(entry);
+    }
+  }
+  async feedback() {
+    const sent = (await this.request('GET', '/fleet/api/feedback')).feedback ?? [];
+    return [...this.feedbackOutbox.map(queuedFeedback).reverse(), ...sent];
+  }
+  loadFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return [];
+    try {
+      const saved = readJsonFile(this.feedbackOutboxFile, null);
+      return Array.isArray(saved?.entries) ? saved.entries.filter(e => e?.localId && e.input && typeof e.input === 'object') : [];
+    } catch {
+      return [];
+    }
+  }
+  saveFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return;
+    try { writeJsonAtomic(this.feedbackOutboxFile, { entries: this.feedbackOutbox }); } catch { /* kept in memory; the next save writes it */ }
+  }
+  // Oldest first; stops at the first one the computer cannot be reached for.
+  async flushFeedback() {
+    for (const entry of [...this.feedbackOutbox]) {
+      try {
+        await this.request('POST', '/fleet/api/feedback', entry.input);
+      } catch (error) {
+        // Kept for later unless the computer refused it as invalid (4xx):
+        // out of reach, or a 5xx, may work next time.
+        if (!error.reached || !(error.status >= 400 && error.status < 500)) break;
+      }
+      this.feedbackOutbox = this.feedbackOutbox.filter(e => e.localId !== entry.localId);
+      this.saveFeedbackOutbox();
+    }
+  }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
   async searchThreads(options = {}) {
     const limit = Number.isInteger(options?.limit) ? options.limit : 20;
@@ -364,11 +498,78 @@ export class RemoteFleetSupervisor {
   async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
   async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
   async organizeThread(threadKey, input = {}) { return this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/organize`, input); }
+  async paseoSessionSettings(threadKey) {
+    const body = await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
+  async updatePaseoSessionSettings(threadKey, input = {}) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`, input);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
+  async switchPaseoProvider(threadKey, input = {}) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/failover`, input);
+    return body?.result ?? { ok: false, detail: 'Provider failover returned no result.' };
+  }
+  // Same input ({ id, evidenceSummary, cursor, ownerConfirmedDone }) and
+  // result ({ accomplished, continueRequired, item, ... }) as the local
+  // ActiveWorkManager.verifyGoalProgress, run on the owning Fleet computer.
+  async verifyGoalProgress({ id, evidenceSummary = '', cursor = null, ownerConfirmedDone = false } = {}) {
+    const cleanId = String(id ?? '').trim();
+    if (!cleanId) throw new Error('Pass the tracked goal id.');
+    const body = {
+      evidenceSummary: String(evidenceSummary ?? ''),
+      ...(cursor && typeof cursor === 'object' ? { cursor } : {}),
+      ownerConfirmedDone: ownerConfirmedDone === true
+    };
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(cleanId)}/verify`, body)).result ?? null;
+    } catch (error) {
+      if (!error.unsupportedRoute) throw error;
+    }
+    // An older Fleet computer without the verify route: record owner-confirmed
+    // completion through confirm_done; otherwise report the cursor verdict.
+    if (ownerConfirmedDone === true) {
+      const acted = await this.actActiveWork(cleanId, { op: 'confirm_done', note: body.evidenceSummary || 'Verified via verify_goal_progress' });
+      if (!acted) throw new Error(`No tracked goal with id "${cleanId}".`);
+      const accomplished = Boolean(acted.ok);
+      return { ok: accomplished, id: cleanId, accomplished, continueRequired: !accomplished, confidence: accomplished ? 1 : 0, item: acted.item ?? null };
+    }
+    const active = await this.getActiveWork({ limit: 100, includeDone: true });
+    const item = (active?.items ?? []).find((it) => it.id === cleanId) ?? null;
+    if (!item) throw new Error(`No tracked goal with id "${cleanId}".`);
+    const remaining = Number.isInteger(cursor?.remaining) ? cursor.remaining : null;
+    const accomplished = remaining === 0 || item.outcomeVerified === true;
+    return {
+      ok: true,
+      id: cleanId,
+      accomplished,
+      continueRequired: !accomplished,
+      confidence: accomplished ? 1 : 0,
+      note: accomplished
+        ? 'All tracked batches satisfied; ready for owner verification (`confirm_done`).'
+        : 'Definition of Done is not yet satisfied; continue next batch.',
+      item
+    };
+  }
   async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
   async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
   async claimTask(input = {}) { return await this.request('POST', '/fleet/api/tasks/claim', input); }
+  async getActiveWork(input = {}) { return this.request('GET', '/fleet/api/active-work', input); }
+  async trackWork(input = {}) {
+    const { state: _state, activeWork: _aw, ...rest } = await this.request('POST', '/fleet/api/active-work', input);
+    return rest;
+  }
+  async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async actActiveWork(id, input = {}) {
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      throw error;
+    }
+  }
   async batchActCards(input = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new Error('Pass a JSON object body.');
@@ -700,20 +901,72 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
+    const nowMs = Date.now();
     for (const q of liveQuestions) {
+      const ctx = q.kind === 'storage' ? null : decisionContextFromQuestion(q);
+      // Held on the coding node while its agent supplies context: the hub
+      // waits too, instead of posting the context-poor ask early.
+      if (ctx && shouldHoldForContext(q, ctx, nowMs)) continue;
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'
         ? { title: q.title, summary: 'Storage cleanup can permanently delete files. Review the full warning and choose in the main app.', actions: ['dismiss'] }
-        : { title: q.title, summary: q.card || q.body, actions: outreachActions(q.options) };
+        : { title: q.title, summary: decisionSummary(ctx, q.card || q.body, { maxChars: 1400 }), actions: outreachActions(q.options) };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
       const item = (last && outreach.reopen?.(last.id))
         || outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
-          ...shown, needsDecision: true, dedupeOpen: true });
+          ...shown, needsDecision: classifyAsk(q) === 'decision', dedupeOpen: true });
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
+    }
+  }
+
+  mirrorActiveWork(activeWork) {
+    const outreach = this.runtime?.outreach;
+    if (!activeWork || !Array.isArray(activeWork.prompts)) return;
+    const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
+    this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
+    if (!outreach) return;
+    const openIds = new Set(prompts.map((prompt) => String(prompt.id)));
+    for (const item of outreach.list()) {
+      if (item.sourceRef?.kind === 'active-work'
+          && item.sourceRef.nodeId === this.nodeId
+          && ['unseen', 'seen'].includes(item.status)
+          && !openIds.has(String(item.sourceRef.id))) {
+        outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
+      }
+    }
+    const existing = outreach.list();
+    for (const prompt of prompts) {
+      const sourceRef = { kind: 'active-work', id: prompt.id, nodeId: this.nodeId, mark: prompt.mark };
+      const shown = {
+        title: prompt.title,
+        summary: prompt.summary,
+        actions: Array.isArray(prompt.actions) && prompt.actions.length ? prompt.actions : ['dismiss']
+      };
+      const current = existing.find((item) => item.sourceRef?.kind === 'active-work'
+        && item.sourceRef.nodeId === this.nodeId
+        && String(item.sourceRef.id) === String(prompt.id));
+      const markChanged = Boolean(current && current.sourceRef?.mark !== prompt.mark);
+      const sourceReopened = Boolean(current
+        && current.status === 'dismissed'
+        && current.decision === 'resolved');
+      let item = (markChanged || sourceReopened) ? (outreach.reopen?.(current.id) ?? null) : current;
+      if (!item && current && ['unseen', 'seen'].includes(current.status)) item = current;
+      if (!item) {
+        item = outreach.append({
+          type: 'fleet-active-work',
+          sourceRef,
+          ...shown,
+          needsDecision: false,
+          // A dismissed record cannot be reopened for a changed mark. Do not
+          // let an open-record dedupe rule suppress the replacement notice.
+          dedupeOpen: !markChanged
+        });
+      }
+      if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
     }
   }
 }
