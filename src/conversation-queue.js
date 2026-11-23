@@ -82,13 +82,17 @@ export class ConversationQueue {
       state.revision = Number(saved.revision) || 0;
       state.tombstones = Array.isArray(saved.tombstones) ? saved.tombstones : [];
       for (const item of saved.items) {
-        if (item.state === "running") continue;
+        // Already inside AgentHost when the hub stopped: its own records (or
+        // their absence) say how it ended, so it is not run again. One that
+        // was dispatched but still waiting behind another turn never began,
+        // so it waits again.
+        if (item.state === "running" && item.started) continue;
         const principal = this.mintPrincipal(item.principal);
         if (!principal && item.principal) {
           this.tombstone(state, item.requestId, "not_run", "The device that sent this is no longer paired.");
           continue;
         }
-        state.items.push({ ...item, state: "queued" });
+        state.items.push({ ...item, state: "queued", started: false });
       }
       state.revision += 1;
       this.persist(saved.sessionId);
@@ -157,7 +161,17 @@ export class ConversationQueue {
     const turn = this.liveTurns.run(sessionId, entry.requestId, async (hooks) => {
       await this.slot(sessionId, entry.requestId, hooks.signal);
       const current = this.find(sessionId, entry.requestId) ?? entry;
-      return this.startTurn(current, hooks);
+      // AgentHost reports progress first thing when the turn really begins
+      // (it may still wait behind a turn sent without a requestId). Only
+      // from then on is the item recorded as started.
+      const onProgress = (data) => {
+        if (!current.started && this.find(sessionId, entry.requestId) === current) {
+          current.started = true;
+          this.persist(sessionId);
+        }
+        hooks.onProgress?.(data);
+      };
+      return this.startTurn(current, { ...hooks, onProgress });
     });
     turn.promise.then(() => this.settled(sessionId, entry.requestId, "complete"),
       (error) => this.settled(sessionId, entry.requestId, error?.code === "OWNER_INTERRUPTED" ? "stopped" : error?.code === "QUEUE_REMOVED" ? "removed" : "failed"));

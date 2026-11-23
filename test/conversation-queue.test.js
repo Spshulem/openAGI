@@ -399,3 +399,27 @@ test("an owner proxy revoked across a restart does not get its waiting messages 
   assert.deepEqual(second.calls, ["owner command"], "only the owner's own message ran");
   assert.equal(second.stored().some(([, text]) => text === "proxy command"), false);
 });
+
+test("a message dispatched while a turn without a requestId still runs is not lost to a restart", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-legacy-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const first = await hub(t, { dataDir, keep: true });
+  // An older client (or a G2 turn) sends without a requestId: it runs
+  // outside the queue, and the next named message waits behind it.
+  const cut = new AbortController();
+  const legacy = fetch(`${first.base}/message`, {
+    method: "POST", signal: cut.signal,
+    headers: { authorization: "Bearer owner", "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ thread: "supervisor", text: "[slow] legacy turn" })
+  }).then((r) => r.text()).catch(() => null);
+  await until(() => first.calls.length === 1);
+  await first.enqueue("phone", { text: "waiting behind it", requestId: "ios-behind-0001" });
+  assert.equal((await first.queue("mac")).body.items[0].state, "running", "dispatched, but still waiting in AgentHost");
+  cut.abort();
+  await legacy;
+  await first.close({ release: false });
+
+  const second = await hub(t, { dataDir, keep: true });
+  await until(() => second.calls.length === 1);
+  assert.deepEqual(second.calls, ["waiting behind it"], "it never began, so it runs after the restart");
+});

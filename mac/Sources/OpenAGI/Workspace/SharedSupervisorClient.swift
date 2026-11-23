@@ -716,6 +716,8 @@ final class SharedSupervisorClient: ObservableObject {
         applyHubQueue(data.flatMap { try? JSONDecoder().decode(QueueEnvelope.self, from: $0) }?.queue)
       }
     }
+    // A message not yet on the hub waited for its editor; deliver it now.
+    if hubQueueAvailable { uploadPending() }
     drainIfIdle()
   }
 
@@ -728,6 +730,8 @@ final class SharedSupervisorClient: ObservableObject {
 
   private func mirrorHub(_ snapshot: HubQueueSnapshot?) {
     guard let snapshot else { return }
+    // Older than what is shown (a slow refresh crossed a newer change).
+    if let shown = queue.hubRevision, snapshot.revision < shown { return }
     if !hubQueueAvailable {
       for item in queue.items where item.origin == nil {
         queue.setOrigin(item.id) { $0.pendingUpload = true; $0.mine = true }
@@ -752,7 +756,7 @@ final class SharedSupervisorClient: ObservableObject {
     guard hubQueueAvailable, uploadTask == nil else { return }
     uploadTask = Task { [weak self] in
       await self?.removeAfterUploads()
-      while let self, let next = self.queue.items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) {
+      while let self, let next = self.queue.nextUpload {
         var body: [String: Any] = ["text": next.text, "requestId": next.requestID, "from": "mac-supervisor"]
         if let card = next.payload.focusedCardId, card.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil {
           body["focusedCardId"] = card

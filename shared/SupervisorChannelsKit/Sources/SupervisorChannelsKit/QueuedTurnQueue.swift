@@ -159,6 +159,17 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     /// The item whose editor is open. The queue never sends it, or anything
     /// after it, until the edit is saved or cancelled.
     public private(set) var editingID: UUID?
+    /// The next message to deliver to the hub: the first one it has not
+    /// accepted, unless that one's editor is open (then nothing: later ones
+    /// never pass it, and the old text is never sent mid-edit).
+    public var nextUpload: QueuedTurn<Payload>? {
+        guard let next = items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) else { return nil }
+        return next.id == editingID ? nil : next
+    }
+
+    /// The newest hub revision mirrored. An older snapshot (a slow refresh
+    /// that crossed a newer change) is ignored rather than undoing it.
+    public private(set) var hubRevision: Int?
 
     public init() {}
 
@@ -197,6 +208,8 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     /// status, and messages the hub has not accepted yet (kept last, in
     /// order). `skip` names turn ids already shown as sent in this chat.
     public mutating func mirror(_ snapshot: HubQueueSnapshot, payload: (HubQueueItem) -> Payload, skip: Set<String> = []) {
+        if let hubRevision, snapshot.revision < hubRevision { return }
+        hubRevision = snapshot.revision
         let previous = Dictionary(items.map { ($0.requestID, $0) }, uniquingKeysWith: { first, _ in first })
         let hubIDs = Set(snapshot.items.map(\.requestId))
         var next: [QueuedTurn<Payload>] = []
@@ -315,6 +328,7 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     public mutating func removeAll() {
         items = []
         editingID = nil
+        hubRevision = nil
     }
 }
 

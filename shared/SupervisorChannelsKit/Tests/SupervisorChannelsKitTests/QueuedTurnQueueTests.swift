@@ -191,4 +191,24 @@ final class HubQueueMirrorTests: XCTestCase {
         XCTAssertTrue(HubQueueRefusal.message(code: "conflict", fallback: nil).contains("changed on another device"))
         XCTAssertEqual(HubQueueRefusal.message(code: "held", fallback: "Mac is editing that message."), "Mac is editing that message.")
     }
+
+    func testAnOlderSnapshotNeverUndoesANewerOne() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("a", "accepted", "queued", true)], revision: 7), payload: { _ in 0 })
+        q.mirror(hub([], revision: 5), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.requestID), ["a"], "a slow refresh from before the enqueue is ignored")
+        q.mirror(hub([], revision: 8), payload: { _ in 0 })
+        XCTAssertTrue(q.items.isEmpty)
+    }
+
+    func testUploadsStopAtAMessageWhoseEditorIsOpenAndNothingPassesIt() {
+        var q = QueuedTurnQueue<Int>()
+        let first = q.enqueue(text: "first", payload: 0, requestID: "p1", origin: QueuedOrigin(pendingUpload: true))
+        q.enqueue(text: "second", payload: 0, requestID: "p2", origin: QueuedOrigin(pendingUpload: true))
+        XCTAssertEqual(q.nextUpload?.requestID, "p1")
+        _ = q.beginEditing(first)
+        XCTAssertNil(q.nextUpload, "not the old text mid-edit, and not the one behind it")
+        XCTAssertTrue(q.saveEdit(first, text: "first, fixed"))
+        XCTAssertEqual(q.nextUpload?.text, "first, fixed")
+    }
 }

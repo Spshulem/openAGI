@@ -247,6 +247,8 @@ final class ChatConversation {
         if isOnHub(item), let item {
             Task { applyHubQueue(try? await client.updateQueued(thread: thread, requestId: item.requestID, hold: false, conversationId: conversationID)) }
         }
+        // A message not yet on the hub waited for its editor; deliver it now.
+        if hubQueueAvailable { uploadPending() }
         drainIfIdle()
     }
 
@@ -313,6 +315,8 @@ final class ChatConversation {
 
     private func mirrorHub(_ snapshot: HubQueueSnapshot?) {
         guard let snapshot, !forgotten else { return }
+        // Older than what is shown (a slow refresh crossed a newer change).
+        if let shown = queue.hubRevision, snapshot.revision < shown { return }
         if !hubQueueAvailable {
             // Anything queued here before the hub was known goes to the hub.
             for item in queue.items where item.origin == nil {
@@ -340,7 +344,7 @@ final class ChatConversation {
         uploadTask = Task { [weak self] in
             await self?.removeAfterUploads()
             while let self, !self.forgotten,
-                  let next = self.queue.items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) {
+                  let next = self.queue.nextUpload {
                 self.uploadingRequestID = next.requestID
                 var offline = false
                 do {

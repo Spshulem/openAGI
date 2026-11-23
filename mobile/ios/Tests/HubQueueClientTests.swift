@@ -285,4 +285,23 @@ final class HubQueueClientTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertTrue(chat.queuedSubmissions.isEmpty, "the upload's answer did not bring it back")
     }
+
+    @MainActor
+    func testAMessageNotYetOnTheHubIsNeverUploadedWithItsOldTextWhileItsEditorIsOpen() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-8", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.failNextEnqueue = true
+        chat.draft = "old text"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the failed upload") { FakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 1 }
+        let id = try XCTUnwrap(chat.queuedSubmissions.first?.id)
+        XCTAssertTrue(chat.beginEditingQueued(id: id))
+        await chat.refresh()   // the connection is back; a retry would run now
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(FakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count, 1, "held while editing")
+        chat.queuedEditDraft = "new text"
+        XCTAssertTrue(chat.saveQueuedEdit())
+        try await waitFor("the upload of the edited text") { FakeHubProtocol.snapshot().contains { $0.text == "new text" } }
+        XCTAssertFalse(FakeHubProtocol.snapshot().contains { $0.text == "old text" })
+    }
 }
