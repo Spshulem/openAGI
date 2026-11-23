@@ -183,3 +183,18 @@ test("a card denied elsewhere during the validity check is not raised again", as
   assert.equal(h.pendingActions.list({ status: "pending" }).length, 0);
   assert.equal(h.sent.length, 0);
 });
+
+// Review fix (#350): a chat card raised again keeps the owner's instruction,
+// so approving the fresh code still carries the rest of the request.
+test("a re-raised chat card keeps the owner's instruction", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const card = h.pendingActions.enqueue({ toolName: "fleet_send_message", args: { key: "paseo:s.a", name: "amman", message: "Send plan A" }, context: { sessionId: "s1" },
+    summary: "Send plan A", mode: "chat", ownerIntent: "Send the plan to amman, then to the iOS chat" });
+  h.rows[0].lastOwnerAt = new Date(now.value + 60_000).toISOString();
+  h.rows[0].lastOwnerText = "also mention the deadline";
+  now.value += 5 * 60_000;
+  const moved = await executeApprovedAction(h.runtime, card.id);
+  assert.equal(moved.status, 410);
+  assert.equal(h.pendingActions.ownerIntentFor(moved.body.reraised.actionId), "Send the plan to amman, then to the iOS chat");
+});

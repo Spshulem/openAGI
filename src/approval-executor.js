@@ -26,8 +26,11 @@ export async function executeApprovedAction(runtime, id, { decidedBy = "user", c
   if (stale) {
     // Re-raised only if this call retired it: a card denied or run on
     // another surface meanwhile stays as it is.
+    // The owner's own words behind a chat card go with it to the fresh one,
+    // so approving it still carries the rest of a multi-step request.
+    const ownerIntent = runtime.pendingActions.ownerIntentFor?.(id) ?? null;
     const expired = runtime.pendingActions.expire?.(id, stale) ?? null;
-    const reraised = verdict.reraise && expired ? reraiseStaleApproval(runtime, action, stale) : null;
+    const reraised = verdict.reraise && expired ? reraiseStaleApproval(runtime, action, stale, ownerIntent) : null;
     // Nothing ran: say so in words a model cannot read as "on its way".
     const error = reraised
       ? `${stale} Nothing was sent or started. A fresh approval is waiting${reraised.confirmCode ? ` (code ${reraised.confirmCode})` : ""}; approve it to send.`
@@ -120,7 +123,7 @@ function staleVerdict(reason) {
 // check asked for a re-raise), raised again with the very same arguments, in
 // the same chat and mode, so the request waits for a fresh "yes" instead of
 // vanishing. Null when the store cannot raise one.
-function reraiseStaleApproval(runtime, action, reason) {
+function reraiseStaleApproval(runtime, action, reason, ownerIntent = null) {
   if (typeof runtime.pendingActions?.enqueue !== "function") return null;
   const tool = runtime.tools?.get?.(action?.toolName);
   try {
@@ -133,7 +136,8 @@ function reraiseStaleApproval(runtime, action, reason) {
       dedupeKey: action.dedupeKey,
       ttlMs: tool?.approvalTtlMs ?? null,
       mode: action.mode ?? "queue",
-      announce: action.mode !== "chat"
+      announce: action.mode !== "chat",
+      ...(ownerIntent ? { ownerIntent } : {})
     });
   } catch {
     return null;

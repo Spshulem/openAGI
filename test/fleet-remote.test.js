@@ -851,3 +851,21 @@ test('an acknowledged failure that is not a timeout is reconciled, not retried',
   assert.equal(result.delivery.unconfirmed, true);
   assert.equal(sends(), 1, 'never sent a second time');
 });
+
+// Review fix (#350): the same short text sent twice on purpose. A receipt
+// that existed before this request is the earlier send's, never this one's.
+test('a repeated short message is not reported sent from the previous send\'s receipt', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  state.actions.push({ id: 'fa_earlier', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'paseo-send',
+    messageHash: shortHash('[OpenAGI supervisor] continue'), status: 'sent', detail: 'Paseo message and turn confirmed', at: new Date(Date.now() - 2000).toISOString() });
+  await remote.refresh();
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  let failures = 3;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send' && failures-- > 0) throw new Error('selected node is not connected (no poll in 90 s)');
+    return deliver(...args);
+  };
+  await assert.rejects(remote.sendOwnerMessage('paseo:s.agent', 'continue'), /unavailable/);
+  assert.equal(sends(), 0, 'it never reached the computer, and is not called sent');
+});
