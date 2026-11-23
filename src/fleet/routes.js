@@ -23,7 +23,7 @@ const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
-const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive", "failover"]);
 const BATCH_OPS = new Set([
   "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
 ]);
@@ -42,6 +42,13 @@ const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra }
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeActiveWorkError(err, fallback) {
+  if (err?.code || err?.syscall || err?.path) {
+    return fail(503, "Active Work storage error. Check available disk space and daemon log.");
+  }
+  return fail(400, String(err?.message ?? fallback).slice(0, 220));
 }
 
 async function readObject(readBody) {
@@ -209,6 +216,103 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
           return fail(400, "Pass project up to 160 characters and limit of 1-60.");
         }
         return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
+      }
+      if (parts[0] === "active-work" && (parts.length === 1 || (parts.length === 2 && parts[1] === "scan") || (parts.length === 3 && (parts[2] === "act" || parts[2] === "verify")))) {
+        if (parts.length === 1 && method === "GET") {
+          if (typeof supervisor.getActiveWork !== "function") {
+            return fail(503, "Active Work tracking is not available.");
+          }
+          const project = url?.searchParams?.get("project") ?? "";
+          const theme = url?.searchParams?.get("theme") ?? "";
+          const includeSnoozed = ["true", "1"].includes(url?.searchParams?.get("includeSnoozed") ?? "");
+          const includeDone = ["true", "1"].includes(url?.searchParams?.get("includeDone") ?? "");
+          const limit = Number(url?.searchParams?.get("limit") ?? 50);
+          if (project.length > 160 || theme.length > 120 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return fail(400, "Pass project up to 160 chars, theme up to 120 chars, and limit of 1-100.");
+          }
+          return ok(await supervisor.getActiveWork({
+            project: project.trim() || null,
+            theme: theme.trim() || null,
+            includeSnoozed,
+            includeDone,
+            limit
+          }));
+        }
+        if (parts.length === 1 && method === "POST") {
+          if (typeof supervisor.trackWork !== "function") {
+            return fail(503, "Active Work tracking is not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body) return fail(400, "Send a JSON object describing the outcome, project, or customer to track.");
+          try {
+            const tracked = await supervisor.trackWork(body);
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ ...tracked, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not track Active Work.");
+          }
+        }
+        if (parts.length === 2 && parts[1] === "scan") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (typeof supervisor.scanActiveWork !== "function") {
+            return fail(503, "Active Work inventory scan is not available.");
+          }
+          const body = (await readObject(readBody)) ?? {};
+          try {
+            const pass = await supervisor.scanActiveWork({
+              ...(body.pageSize !== undefined ? { pageSize: Number(body.pageSize) } : {}),
+              ...(body.maxRepoChecks !== undefined ? { maxRepoChecks: Number(body.maxRepoChecks) } : {}),
+              ...(body.maxDecisionItems !== undefined ? { maxDecisionItems: Number(body.maxDecisionItems) } : {}),
+              ...(body.maxPromptsPerPass !== undefined ? { maxPromptsPerPass: Number(body.maxPromptsPerPass) } : {}),
+              resetCursor: body.resetCursor === true
+            });
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ pass, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Active Work inventory scan failed.");
+          }
+        }
+        if (parts.length === 3 && parts[2] === "verify") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad Active Work id.");
+          if (typeof supervisor.verifyGoalProgress !== "function") {
+            return fail(503, "Goal verification is not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body) return fail(400, "Send a JSON object with { evidenceSummary, cursor }.");
+          try {
+            const result = await supervisor.verifyGoalProgress({
+              id: parts[1],
+              evidenceSummary: typeof body.evidenceSummary === "string" ? body.evidenceSummary : "",
+              cursor: body.cursor && typeof body.cursor === "object" && !Array.isArray(body.cursor) ? body.cursor : null,
+              ownerConfirmedDone: body.ownerConfirmedDone === true
+            });
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ result, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not verify goal progress.");
+          }
+        }
+        if (parts.length === 3 && parts[2] === "act") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad Active Work id.");
+          if (typeof supervisor.actActiveWork !== "function") {
+            return fail(503, "Active Work actions are not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body || typeof body.op !== "string" || !body.op.trim()) {
+            return fail(400, "Send a JSON object with { op }.");
+          }
+          try {
+            const result = await supervisor.actActiveWork(parts[1], body, sendOptions);
+            if (!result) return fail(404, "No Active Work item or proposal with that id.");
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ result, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not execute Active Work action.");
+          }
+        }
+        return fail(405, "Method not allowed.");
       }
       if (parts[0] === "projects" && (parts.length === 1 || parts.length === 2)) {
         if (parts.length === 1 && method === "GET") {
@@ -740,6 +844,19 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
           if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
           const result = await supervisor.pushNow(threadKey, sendOptions);
           return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (parts[2] === "failover") {
+          if (typeof supervisor.switchPaseoProvider !== "function") return fail(503, "Provider failover is not available.");
+          const body = (await readObject(readBody)) ?? {};
+          const preferredProviders = Array.isArray(body.preferredProviders)
+            ? body.preferredProviders.filter((p) => typeof p === "string").slice(0, 3)
+            : undefined;
+          const reason = typeof body.reason === "string" ? body.reason.slice(0, 240) : null;
+          const result = await supervisor.switchPaseoProvider(threadKey, { preferredProviders, reason });
+          if (!result?.ok) {
+            return fail(400, result?.detail ?? "Could not switch Paseo provider.", { status: result?.status ?? "blocked", state: state() });
+          }
+          return ok({ result, state: state() });
         }
         if (parts[2] === "archive") {
           if (typeof supervisor.archiveThread !== "function") return fail(503, "Session archiving is not available.");
