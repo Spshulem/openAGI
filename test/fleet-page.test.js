@@ -1019,6 +1019,12 @@ test("Admin Merge: offered only on a review-held PR from the real snapshot field
   for (const part of ["Waives only:", "Required approving review", "Still enforced:", SHA, "owner-login", "into main"]) assert.ok(text.includes(part), part);
   assert.equal(page.requests.filter((r) => r.method === "POST").length, 1, "preview alone merges nothing");
 
+  // An automatic poll while the owner reads keeps the preview and its confirm.
+  const poll = () => page.timers.filter((t) => t.ms === 30_000).at(-1).fn();
+  await poll();
+  await settle();
+  assert.ok(page.el("needsList").textContent.includes("Waives only:"), "preview survives polling");
+
   // GitHub refuses: its message is shown verbatim.
   const denial = "GitHub rejected the Admin Merge of o/r#12: You're not authorized to bypass the required review on this branch.";
   page.responses.push({ status: 200, body: { result: { ok: false, status: "halted", reason: "github_rejected", detail: denial }, state: reviewHeld() } });
@@ -1031,4 +1037,21 @@ test("Admin Merge: offered only on a review-held PR from the real snapshot field
   assert.deepEqual(sent.body, { consent });
   assert.equal(page.el("status").textContent, denial);
   assert.ok(page.el("status").className.includes("err"));
+  // The consent is spent: the next render offers a fresh preview, not the old one.
+  await poll();
+  await settle();
+  assert.equal(page.el("needsList").textContent.includes("Waives only:"), false);
+  const again = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Admin Merge…")[0];
+  assert.ok(again);
+
+  // Cancel drops the preview for good.
+  page.responses.push({ status: 200, body: { result: { ok: true, status: "preview", consent, plan: { repo: "o/r", number: 12, baseRef: "main", headSha: SHA, waives: [], stillEnforced: [] } } } });
+  await again.click();
+  await settle();
+  const cancel = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Cancel")[0];
+  await cancel.click();
+  await settle();
+  await poll();
+  await settle();
+  assert.equal(page.el("needsList").textContent.includes("Waives only:"), false);
 });

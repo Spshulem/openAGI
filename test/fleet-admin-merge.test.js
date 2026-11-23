@@ -59,6 +59,10 @@ function fakeGh(over = {}) {
       const runs = over.checkRuns ?? [{ id: 1, name: "test", status: "completed", conclusion: "success", app: { id: 15368 } }];
       return { code: 0, stdout: JSON.stringify({ total_count: runs.length, check_runs: page === 1 ? runs : [] }), stderr: "" };
     }
+    if (a === "api" && /\/pulls\/\d+\/commits/.test(b)) {
+      const commits = over.prCommits ?? [{ sha: SHA, commit: { verification: { verified: true, reason: "valid" } } }];
+      return { code: 0, stdout: JSON.stringify(page === 1 ? commits : []), stderr: "" };
+    }
     if (a === "api" && /\/commits\/[0-9a-f]+\/status/.test(b)) {
       return { code: 0, stdout: JSON.stringify({ state: "success", statuses: page === 1 ? (over.statuses ?? []) : [] }), stderr: "" };
     }
@@ -179,6 +183,30 @@ test("Admin Merge verifies every check the branch rules require, on the exact he
   const anySource = fakeGh({ ...securityRule(), checkRuns: [], statuses: [{ context: "mandatory-security", state: "success" }] });
   assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: anySource.run })).status, "merged");
   assert.ok(ok.calls.some((c) => c[1] === "api" && c[2].startsWith(`repos/${REPO}/commits/${SHA}/check-runs`)), "checks are read on the consented head");
+});
+
+test("Admin Merge never bypasses a signed-commit rule: every PR commit must be verified", async () => {
+  const OLD = "1111111111111111111111111111111111111111";
+  const unsigned = [{ sha: OLD, commit: { verification: { verified: false, reason: "unsigned" } } }, { sha: SHA, commit: { verification: { verified: true, reason: "valid" } } }];
+  const cases = [
+    [{ rules: [{ type: "pull_request" }, { type: "required_signatures" }], prCommits: unsigned }, "unsigned_commits", /1111111 \(unsigned\)/],
+    [{ protection: { required_pull_request_reviews: {}, required_signatures: { enabled: true } }, prCommits: unsigned }, "unsigned_commits", /lack a verified signature/],
+    [{ rules: [{ type: "required_signatures" }], prCommits: [{ sha: OLD, commit: { verification: { verified: true } } }] }, "signatures_unreadable", /does not end at the head/],
+    [{ rules: [{ type: "required_signatures" }], prCommits: Array.from({ length: 250 }, (_, i) => ({ sha: i === 249 ? SHA : OLD, commit: { verification: { verified: true } } })) }, "signatures_unreadable", /at most 250 commits/]
+  ];
+  for (const [over, reason, detail] of cases) {
+    const gh = fakeGh(over);
+    const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: gh.run });
+    assert.equal(out.reason, reason);
+    assert.match(out.detail, detail);
+    assert.equal(gh.merges().length, 0);
+  }
+  // All verified: allowed. No signature rule: commits are not even read.
+  const signed = fakeGh({ rules: [{ type: "pull_request" }, { type: "required_signatures" }] });
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: signed.run })).status, "merged");
+  const none = fakeGh();
+  await executeAdminMerge({ prRef: PR, consent: consentFor(), run: none.run });
+  assert.equal(none.calls.some((c) => /\/pulls\/\d+\/commits/.test(c[2] ?? "")), false);
 });
 
 test("Admin Merge reads every page of branch rules before allowing a bypass", async () => {

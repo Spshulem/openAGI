@@ -200,11 +200,14 @@ merge halts:
   exact head. Where a rule names the app that must post a check, the check must
   come from that app. A required check that never reported stops the merge.
 - No changes were requested.
-- The base branch has no rule (every page of its rulesets is read) beyond review, status checks, linear history,
-  signatures, creation, deletion and non-fast-forward. Any other rule (merge
-  queue, deployments, push restrictions, `enforce_admins`, a locked branch,
-  a disallowed squash) stops it.
+- The base branch has no rule beyond review, status checks, linear history,
+  signatures, creation, deletion and non-fast-forward. Every page of its
+  rulesets is read. Any other rule (merge queue, deployments, push
+  restrictions, `enforce_admins`, a locked branch, a disallowed squash) stops
+  it.
 - Required conversations are resolved.
+- If the branch requires signed commits, every commit on the PR has a
+  signature GitHub verified. GitHub signing the squash commit does not count.
 
 If GitHub refuses the bypass, the card shows GitHub's exact message and stays
 open. There is no retry, force push, auto-merge or fallback. Supervisor never

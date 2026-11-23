@@ -275,15 +275,17 @@ const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const GITHUB_DETAIL_MAX = 600;
 
 // Ruleset rules that a GitHub squash merge cannot break (creation, deletion,
-// non_fast_forward, linear history, signatures: GitHub signs the squash
-// commit) or that Admin Merge verifies itself (status checks; the
-// pull_request rule's review count is the one waiver, its thread-resolution
-// and merge-method parts are checked below). Any other active rule is
-// something --admin could skip, so Admin Merge refuses instead.
+// non_fast_forward, linear history) or that Admin Merge verifies itself
+// (status checks; signatures, on every PR commit; the pull_request rule's
+// review count is the one waiver, its thread-resolution and merge-method parts
+// are checked below). Any other active rule is something --admin could skip,
+// so Admin Merge refuses instead.
 const RULESET_RULES_SAFE = new Set([
   "creation", "deletion", "non_fast_forward", "required_linear_history",
   "required_signatures", "required_status_checks", "pull_request"
 ]);
+// GitHub's PR commits endpoint lists at most this many commits.
+const PR_COMMITS_LISTED_MAX = 250;
 
 function githubMessage(res) {
   const raw = String(res?.stderr || res?.stdout || res?.error || "").trim();
@@ -393,12 +395,14 @@ function classicProtectionBlockers(protection) {
 function rulesetBlockers(rules) {
   const blockers = [];
   let threadResolution = false;
+  let signatures = false;
   for (const rule of Array.isArray(rules) ? rules : []) {
     const type = String(rule?.type ?? "");
     if (!RULESET_RULES_SAFE.has(type)) {
       blockers.push(`ruleset rule "${type || "unknown"}"`);
       continue;
     }
+    if (type === "required_signatures") signatures = true;
     if (type === "pull_request") {
       const params = rule?.parameters ?? {};
       if (params.required_review_thread_resolution === true) threadResolution = true;
@@ -408,7 +412,21 @@ function rulesetBlockers(rules) {
       }
     }
   }
-  return { blockers, threadResolution };
+  return { blockers, threadResolution, signatures };
+}
+
+// Signed-commit rules: every commit on the PR must carry a signature GitHub
+// verified (GitHub signing the squash commit does not satisfy the rule).
+// Unreadable, more than GitHub lists, or not ending at the head: not ok.
+async function unverifiedCommits(run, ghBin, parsed, headSha) {
+  const commits = await ghApiAllPages(run, ghBin, `repos/${parsed.repo}/pulls/${parsed.number}/commits`);
+  if (!commits.ok) return commits;
+  if (commits.data.length >= PR_COMMITS_LISTED_MAX) return { ok: false, message: `GitHub lists at most ${PR_COMMITS_LISTED_MAX} commits per PR, so not every signature could be read.` };
+  if (String(commits.data.at(-1)?.sha ?? "").toLowerCase() !== headSha) return { ok: false, message: "The PR's commit list does not end at the head being merged." };
+  const unverified = commits.data
+    .filter((c) => c?.commit?.verification?.verified !== true)
+    .map((c) => `${String(c?.sha ?? "").slice(0, 7)} (${c?.commit?.verification?.reason ?? "unsigned"})`);
+  return { ok: true, unverified };
 }
 
 async function unresolvedReviewThreads(run, ghBin, parsed) {
@@ -535,6 +553,13 @@ export async function preflightAdminMerge({
   if (!contexts.ok) return halt("checks_unreadable", ref, `Could not read the checks on ${liveSha.slice(0, 7)}, so Admin Merge cannot confirm every required check passed. GitHub said: ${contexts.message}`);
   if (contexts.unmet.length > 0) {
     return halt("required_checks_not_passing", ref, `${base} requires check(s) that have not passed on ${liveSha.slice(0, 7)}: ${contexts.unmet.slice(0, 5).join(", ")}. Admin Merge never bypasses required checks.`);
+  }
+  if (ruleset.signatures || classic?.required_signatures?.enabled === true) {
+    const signed = await unverifiedCommits(run, ghBin, parsed, liveSha);
+    if (!signed.ok) return halt("signatures_unreadable", ref, `${base} requires signed commits and Admin Merge could not confirm every commit on ${ref} is. ${signed.message}`);
+    if (signed.unverified.length > 0) {
+      return halt("unsigned_commits", ref, `${base} requires signed commits, and ${signed.unverified.length} commit(s) on ${ref} lack a verified signature: ${signed.unverified.slice(0, 5).join(", ")}. Admin Merge never bypasses that.`);
+    }
   }
   if (ruleset.threadResolution || classic?.required_conversation_resolution?.enabled === true) {
     const threads = await unresolvedReviewThreads(run, ghBin, parsed);

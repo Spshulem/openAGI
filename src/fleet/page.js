@@ -233,6 +233,10 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   var openThreads = new Set();
   var groupOpen = new Map();
   var cards = new Map();
+  // question id -> { plan, consent }: an Admin Merge preview the owner is
+  // reading. Polling re-renders keep showing it until Cancel, confirm, or
+  // the consent expires.
+  var adminPreviews = new Map();
   // Expanded rows: thread key -> { at, thread, error } from the detail route,
   // and the function that repaints that row once its detail arrives.
   var details = new Map();
@@ -540,6 +544,9 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     var up = function (v) { return String(v || '').toUpperCase(); };
     if (up(pr.state) !== 'OPEN' || pr.isDraft || up(pr.mergeState) !== 'BLOCKED' || up(pr.reviewDecision) !== 'REVIEW_REQUIRED') return;
     var box = el('div', 'admin', null, card);
+    var open = adminPreviews.get(q.id);
+    if (open && Date.parse(open.consent.expiresAt) > Date.now()) { adminPlan(q, box, open.plan, open.consent); return; }
+    adminPreviews.delete(q.id);
     el('p', 'note', 'GitHub holds this PR for a required review. Merge will not bypass that.', box);
     var b = button('Admin Merge…', 'btn ghost', box, function () { return adminPreview(q, box, b); });
   }
@@ -556,6 +563,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
         say('Admin Merge not available: ' + ((res && res.detail) || 'no preview returned.'), true);
         return;
       }
+      adminPreviews.set(q.id, { plan: res.plan, consent: res.consent });
       adminPlan(q, box, res.plan, res.consent);
     } catch (e) {
       b.disabled = false;
@@ -580,11 +588,13 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     buttons.push(button('Admin Merge ' + plan.repo + '#' + plan.number + ' at ' + plan.headSha.slice(0, 7), 'btn hot', acts, function () {
       return adminConfirm(q, consent, buttons);
     }));
-    buttons.push(button('Cancel', 'btn ghost', acts, function () { return load(); }));
+    buttons.push(button('Cancel', 'btn ghost', acts, function () { adminPreviews.delete(q.id); return load(); }));
   }
 
   async function adminConfirm(q, consent, buttons) {
     buttons.forEach(function (b) { b.disabled = true; });
+    // The consent is single-use: whatever the answer, a new preview is needed.
+    adminPreviews.delete(q.id);
     try {
       var r = await api(adminPath(q), { consent: consent });
       var res = r && r.result;
