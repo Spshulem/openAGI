@@ -173,7 +173,9 @@ final class ChatConversation {
     // no device runs or changes it meanwhile.
     @discardableResult
     func beginEditingQueued(id: UUID) -> Bool {
-        guard !isReadOnly, let item = queue.item(id), item.origin?.heldBy == nil, let text = queue.beginEditing(id) else { return false }
+        // Not while its upload is on the wire: the hub may already run it.
+        guard !isReadOnly, let item = queue.item(id), item.origin?.heldBy == nil, item.requestID != uploadingRequestID,
+              let text = queue.beginEditing(id) else { return false }
         queue.setOrigin(id) { $0.error = nil }
         queuedEditDraft = text
         editBaseRevision = item.origin?.revision
@@ -329,10 +331,41 @@ final class ChatConversation {
             hubQueueAvailable = true
         }
         hubRunning = snapshot.running
-        // A message this phone sent on a stream is already in the chat.
-        let shown = Set(messages.compactMap(\.requestID)).union(removeAfterUpload)
-        queue.mirror(snapshot, payload: { _ in ChatQueuedPayload(attachments: [], focusedCardID: nil) }, skip: shown)
+        // Every waiting message keeps its controls here, including one this
+        // phone sent on a stream that the hub queued behind another turn.
+        queue.mirror(snapshot, payload: { _ in ChatQueuedPayload(attachments: [], focusedCardID: nil) }, skip: removeAfterUpload)
+        settleEnded(snapshot.ended ?? [])
     }
+
+    // A reply whose stream was lost while its message waited on the hub, and
+    // the message then left the queue without running (removed on another
+    // device, stopped first): say so instead of "still working".
+    private func settleEnded(_ ended: [HubQueueEnded]) {
+        var changed = false
+        for entry in ended {
+            guard let index = messages.firstIndex(where: { $0.role == .assistant && $0.isDetached && $0.requestID == entry.requestId }) else { continue }
+            messages[index].isDetached = false
+            messages[index].isStreaming = false
+            messages[index].activity = nil
+            messages[index].text = entry.outcome == "stopped" ? Self.stoppedText
+                : entry.outcome == "removed" ? Self.removedText
+                : (entry.message ?? "This message was not run.")
+            changed = true
+        }
+        if changed { persist() }
+    }
+
+    static let removedText = "Removed from the queue before it ran. Nothing was sent to the agent."
+
+    #if DEBUG
+    // Tests: a reply whose stream was lost after main accepted it.
+    func markDetachedForTesting(requestID: String) {
+        guard let index = messages.firstIndex(where: { $0.role == .assistant && $0.requestID == requestID }) else { return }
+        messages[index].isDetached = true
+        messages[index].isStreaming = true
+        messages[index].activity = ChatHistoryCodec.stillWorking
+    }
+    #endif
 
     private func noteQueueError(_ requestID: String, _ error: Error, fallback: String) {
         guard let item = queue.item(requestID: requestID) else { return }
@@ -363,6 +396,10 @@ final class ChatConversation {
                     }
                     self.uploadingRequestID = nil
                     self.mirrorHub(snapshot)
+                } catch let refused as HubQueueRefused where refused.code == "queue_full" {
+                    // Full for now, not refused: it stays next to deliver and
+                    // is tried again on the next refresh (nothing passes it).
+                    offline = true
                 } catch let refused as HubQueueRefused {
                     self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
                 } catch {
@@ -599,6 +636,11 @@ final class ChatConversation {
                     if frame.code == "stopped" {
                         // Send Now stopped it: not a fault, nothing to retry.
                         stopped(replyID)
+                    } else if frame.code == "removed" {
+                        // Taken out of the hub's queue (here or on another device).
+                        messages[index].text = Self.removedText
+                        messages[index].isStreaming = false
+                        messages[index].activity = nil
                     } else {
                         fail(replyID, text: (frame.error ?? "OpenAGI couldn't finish.") + " Check the conversation before sending again.")
                     }

@@ -9,17 +9,19 @@ import SupervisorChannelsKit
 // the hub's refusals shown.
 final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     struct Item { var requestId: String; var text: String; var source: String; var mine: Bool; var state: String; var heldBy: String?; var revision: Int }
-    private static let lock = NSLock()
+    static let lock = NSLock()
     nonisolated(unsafe) static var items: [Item] = []
     nonisolated(unsafe) static var log: [String] = []
     nonisolated(unsafe) static var failNextEnqueue = false
+    nonisolated(unsafe) static var fullNextEnqueue = false
+    nonisolated(unsafe) static var ended: [[String: Any]] = []
     nonisolated(unsafe) static var sendNowStatus = "interrupted"
     // Accept the next queued message but hold the answer until released.
     nonisolated(unsafe) static var holdNextEnqueue = false
     private struct Held: @unchecked Sendable { let proto: FakeHubProtocol; let runLoop: CFRunLoop }
     nonisolated(unsafe) private static var heldEnqueue: Held?
 
-    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil } }
+    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; ended = []; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil } }
     static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
     static func releaseEnqueue() {
         guard let held = lock.withLock({ () -> Held? in defer { heldEnqueue = nil }; return heldEnqueue }) else { return }
@@ -33,7 +35,7 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
 
     private static func queueJSON() -> [String: Any] {
-        ["revision": 1, "items": items.enumerated().map { index, item -> [String: Any] in
+        ["revision": 1, "ended": ended, "items": items.enumerated().map { index, item -> [String: Any] in
             var json: [String: Any] = ["requestId": item.requestId, "text": item.text, "source": ["device": item.mine ? "phone" : "owner", "name": item.source],
                                        "mine": item.mine, "state": item.state, "position": index, "revision": item.revision]
             if let heldBy = item.heldBy { json["heldBy"] = heldBy; json["heldByMe"] = heldBy == "iPhone" }
@@ -75,6 +77,10 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
                 Self.failNextEnqueue = false
                 client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
                 return
+            }
+            if Self.fullNextEnqueue {
+                // Stays full until the test makes room.
+                return respond(429, ["error": "queue_full", "message": "The queue is full."])
             }
             let id = body["requestId"] as? String ?? ""
             var sendNow: [String: Any]? = nil
@@ -378,5 +384,68 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(chat.submitDraft(override: .sendNow))
         try await waitFor("the normal send") { FakeHubProtocol.calls().contains { $0.hasPrefix("POST /message") } }
         XCTAssertFalse(FakeHubProtocol.calls().contains { $0.hasPrefix("POST /conversations/supervisor/queue") })
+    }
+
+    @MainActor
+    func testTheEditorDoesNotOpenWhileThatMessagesUploadIsOnTheWire() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-11", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.holdNextEnqueue = true
+        chat.draft = "uploading now"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the upload on the wire") { FakeHubProtocol.isHoldingEnqueue }
+        XCTAssertFalse(chat.beginEditingQueued(id: try XCTUnwrap(chat.queuedSubmissions.first?.id)), "the hub may already run it")
+        FakeHubProtocol.releaseEnqueue()
+        try await waitFor("accepted") { chat.queuedSubmissions.first?.origin?.pendingUpload == false }
+        XCTAssertTrue(chat.beginEditingQueued(id: try XCTUnwrap(chat.queuedSubmissions.first?.id)), "and opens once it is on the hub (with a hold)")
+    }
+
+    @MainActor
+    func testAFullQueueIsTriedAgainAndNothingPassesTheWaitingMessage() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-12", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.fullNextEnqueue = true }
+        chat.draft = "first, while full"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the refusal") { FakeHubProtocol.calls().filter { $0.contains("first, while full") }.count == 1 }
+        chat.draft = "second"
+        XCTAssertTrue(chat.submitDraft())
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertFalse(FakeHubProtocol.snapshot().contains { $0.text == "second" }, "nothing passes the waiting one")
+        XCTAssertFalse(FakeHubProtocol.calls().contains { $0.contains("POST /conversations/supervisor/queue second") })
+        XCTAssertNil(chat.queuedSubmissions.first?.origin?.error, "not a permanent refusal")
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.fullNextEnqueue = false }
+        await chat.refresh()
+        try await waitFor("both delivered, in order") { FakeHubProtocol.snapshot().count == 3 }
+        XCTAssertEqual(FakeHubProtocol.snapshot().map(\.text), ["busy", "first, while full", "second"])
+    }
+
+    @MainActor
+    func testAWaitingMessageRemovedOnAnotherDeviceSettlesAReplyWhoseStreamWasLost() async throws {
+        let chat = await chat()
+        // This phone's own message, accepted, whose stream it lost.
+        chat.draft = "will be removed elsewhere"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the reply") { chat.messages.contains { $0.role == .assistant && !$0.isStreaming } }
+        let requestID = try XCTUnwrap(chat.messages.first { $0.role == .user }?.requestID)
+        chat.markDetachedForTesting(requestID: requestID)
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.ended = [["requestId": requestID, "outcome": "removed", "message": "Removed from the queue by Mac."]] }
+        await chat.refresh()
+        let reply = try XCTUnwrap(chat.messages.first { $0.role == .assistant && $0.requestID == requestID })
+        XCTAssertFalse(reply.isDetached, "not 'still working' any more")
+        XCTAssertEqual(reply.text, ChatConversation.removedText)
+    }
+
+    @MainActor
+    func testAStreamedMessageThatWaitsOnTheHubKeepsItsControlsOnThisPhone() async throws {
+        let chat = await chat()
+        chat.draft = "sent before this phone knew the Mac was busy"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("sent") { FakeHubProtocol.calls().contains { $0.hasPrefix("POST /message") } }
+        let requestID = try XCTUnwrap(chat.messages.first { $0.role == .user }?.requestID)
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-13", text: "Mac's turn", source: "Mac", mine: false, state: "running", revision: 1),
+                                    .init(requestId: requestID, text: "sent before this phone knew the Mac was busy", source: "iPhone", mine: true, state: "queued", revision: 1)] }
+        await chat.refresh()
+        XCTAssertEqual(chat.queuedSubmissions.map(\.requestID), [requestID], "Edit, Remove and Send Now are available here too")
     }
 }

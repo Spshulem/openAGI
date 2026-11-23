@@ -665,7 +665,9 @@ final class SharedSupervisorClient: ObservableObject {
   /// queue the item is held for this Mac meanwhile, for every device.
   @discardableResult
   func beginEditingQueued(id: UUID) -> Bool {
-    guard let item = queue.item(id), item.origin?.heldBy == nil, let text = queue.beginEditing(id) else { return false }
+    // Not while its upload is on the wire: the hub may already run it.
+    guard let item = queue.item(id), item.origin?.heldBy == nil, item.requestID != uploadingRequestID,
+          let text = queue.beginEditing(id) else { return false }
     queue.setOrigin(id) { $0.error = nil }
     queuedEditDraft = text
     editBaseRevision = item.origin?.revision
@@ -767,9 +769,9 @@ final class SharedSupervisorClient: ObservableObject {
       hubQueueAvailable = true
     }
     hubRunning = snapshot.running
-    // This Mac's own streamed send is already in the chat.
-    let shown = Set(runningRequestId.map { [$0] } ?? []).union(removeAfterUpload)
-    queue.mirror(snapshot, payload: { _ in SupervisorQueuedPayload(focusedCardId: nil, attachments: []) }, skip: shown)
+    // Every waiting message keeps its controls here, including this Mac's
+    // own streamed send that the hub queued behind another turn.
+    queue.mirror(snapshot, payload: { _ in SupervisorQueuedPayload(focusedCardId: nil, attachments: []) }, skip: removeAfterUpload)
   }
 
   private func noteQueueError(_ requestID: String, _ error: Error, fallback: String) {
@@ -805,6 +807,9 @@ final class SharedSupervisorClient: ObservableObject {
           self.uploadingRequestID = nil
           self.mirrorHub(envelope?.queue)
           self.uploadRetryDelay = 2
+        } catch let refused as HubQueueRefused where refused.code == "queue_full" {
+          // Full for now, not refused: it stays next and is tried again.
+          offline = true
         } catch let refused as HubQueueRefused {
           self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
         } catch {
@@ -1437,7 +1442,9 @@ final class SharedSupervisorClient: ObservableObject {
         return decoded?.reply ?? streamingReplyText
       case "failure":
         let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
-        if failure?.code == "stopped" { throw SupervisorReplyInterrupted() }
+        // Stopped by Send Now, or taken out of the hub's queue: main stored
+        // or showed the outcome; not an error.
+        if failure?.code == "stopped" || failure?.code == "removed" { throw SupervisorReplyInterrupted() }
         let message = failure?.error ?? "Supervisor could not complete that request."
         throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
       default:

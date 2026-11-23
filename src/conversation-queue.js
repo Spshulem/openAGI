@@ -227,9 +227,12 @@ export class ConversationQueue {
     const state = this.session(sessionId);
     const index = state.items.findIndex((item) => item.requestId === requestId);
     if (index >= 0) {
-      const wasRunning = state.items[index].state === "running";
+      // Stopped before AgentHost began it (still waiting, even if already
+      // dispatched behind a turn sent without a requestId): it has no records,
+      // so the stop is remembered here, durably, for resends and recovery.
+      const began = state.items[index].started === true;
       state.items.splice(index, 1);
-      if (!wasRunning && outcome === "stopped") this.tombstone(state, requestId, "stopped", STOPPED_TEXT);
+      if (!began && outcome === "stopped") this.tombstone(state, requestId, "stopped", STOPPED_TEXT);
     }
     if (state.running === requestId) state.running = null;
     this.changed(sessionId);
@@ -357,10 +360,16 @@ export class ConversationQueue {
   }
 
   // What every device shows. Running item first, then the waiting ones.
+  // `ended`: recent messages that left the queue without running (removed,
+  // stopped before they began, or not run), so a device that lost its stream
+  // can settle its "still working" line; they have no history records.
   snapshot(sessionId, actorKey = null) {
     const state = this.sessions.get(sessionId);
-    if (!state) return { revision: 0, items: [] };
-    return { revision: state.revision, items: state.items.map((item) => this.project(sessionId, item, actorKey)) };
+    if (!state) return { revision: 0, items: [], ended: [] };
+    const cutoff = this.now() - TOMBSTONE_TTL_MS;
+    const ended = state.tombstones.filter((entry) => entry.at >= cutoff).slice(-20)
+      .map(({ requestId, outcome, message }) => ({ requestId, outcome, message }));
+    return { revision: state.revision, items: state.items.map((item) => this.project(sessionId, item, actorKey)), ended };
   }
 
   close() {

@@ -382,12 +382,28 @@ public struct HubQueueItem: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// A message that left the hub's queue without running (removed, stopped
+/// before it began, or not run): it has no history record, so this is how a
+/// device that lost its stream learns its fate.
+public struct HubQueueEnded: Codable, Equatable, Sendable {
+    public let requestId: String
+    public let outcome: String
+    public let message: String?
+    public init(requestId: String, outcome: String, message: String? = nil) {
+        self.requestId = requestId
+        self.outcome = outcome
+        self.message = message
+    }
+}
+
 public struct HubQueueSnapshot: Codable, Equatable, Sendable {
     public let revision: Int
     public let items: [HubQueueItem]
-    public init(revision: Int, items: [HubQueueItem]) {
+    public let ended: [HubQueueEnded]?
+    public init(revision: Int, items: [HubQueueItem], ended: [HubQueueEnded]? = nil) {
         self.revision = revision
         self.items = items
+        self.ended = ended
     }
     /// The message the hub is running now, if it came through the queue.
     public var running: HubQueueItem? { items.first { $0.state == "running" } }

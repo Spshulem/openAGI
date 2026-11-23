@@ -11,8 +11,9 @@ final class MacFakeHubProtocol: URLProtocol {
   static var items: [Item] = []
   static var log: [String] = []
   static var failNextEnqueue = false
+  static var fullNextEnqueue = false
 
-  static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false } }
+  static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false } }
   static func snapshot() -> [Item] { lock.withLock { items } }
   static func calls() -> [String] { lock.withLock { log } }
   static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
@@ -60,6 +61,10 @@ final class MacFakeHubProtocol: URLProtocol {
         Self.failNextEnqueue = false
         client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
         return
+      }
+      if Self.fullNextEnqueue {
+        Self.fullNextEnqueue = false
+        return respond(429, ["error": "queue_full", "message": "The queue is full."])
       }
       let id = body["requestId"] as? String ?? ""
       var sendNow: [String: Any]? = nil
@@ -211,5 +216,19 @@ final class MacHubQueueTests: XCTestCase {
     try await waitFor("both delivered") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
     XCTAssertEqual(MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") },
                    ["POST /conversations/supervisor/queue queue instead", "POST /conversations/supervisor/queue immediately NEXT"])
+  }
+
+  func testAFullQueueIsRetriedOnTheBackoffAndKeepsItsPlace() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-6", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.fullNextEnqueue = true }
+    _ = await supervisor.sendMessage("while full")
+    try await waitFor("the refusal") { MacFakeHubProtocol.calls().filter { $0.contains("while full") }.count == 1 }
+    XCTAssertNil(supervisor.queuedMessages.first?.origin?.error)
+    let deadline = Date().addingTimeInterval(6)
+    while !MacFakeHubProtocol.snapshot().contains(where: { $0.text == "while full" }), Date() < deadline {
+      try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    XCTAssertTrue(MacFakeHubProtocol.snapshot().contains { $0.text == "while full" })
   }
 }

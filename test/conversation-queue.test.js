@@ -524,3 +524,46 @@ test("a queued message's images survive a hub restart and reach the model", asyn
   assert.equal(second.calls[0], "what is in this picture");
   assert.deepEqual(second.images[0], [PNG], "the picture itself, not a preview");
 });
+
+test("a message stopped while dispatched behind a turn without a requestId stays stopped across a restart", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-unstarted-stop-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const first = await hub(t, { dataDir, keep: true });
+  const cut = new AbortController();
+  const legacy = fetch(`${first.base}/message`, {
+    method: "POST", signal: cut.signal,
+    headers: { authorization: "Bearer owner", "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ thread: "supervisor", text: "[slow] legacy turn" })
+  }).then((r) => r.text()).catch(() => null);
+  await until(() => first.calls.length === 1);
+  await first.enqueue("phone", { text: "stop me before I start", requestId: "ios-stopwait-001" });
+  assert.equal((await first.queue("mac")).body.items[0].state, "running", "dispatched, still waiting in AgentHost");
+  const stop = await fetch(`${first.base}/conversations/supervisor/interrupt`, {
+    method: "POST", headers: { authorization: "Bearer owner", "content-type": "application/json" },
+    body: JSON.stringify({ requestId: "ios-stopwait-001" })
+  });
+  assert.equal((await stop.json()).status, "interrupted");
+  assert.deepEqual((await first.queue("mac")).body.ended.map((e) => [e.requestId, e.outcome]), [["ios-stopwait-001", "stopped"]]);
+  cut.abort();
+  await legacy;
+  await first.close({ release: false });
+
+  const second = await hub(t, { dataDir, keep: true });
+  const resend = await frames(await second.message("phone", { text: "stop me before I start", requestId: "ios-stopwait-001" }));
+  assert.equal(resend.find((f) => f.event === "failure").data.code, "stopped");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(second.calls, [], "the stopped message never ran");
+});
+
+test("a removal on one device is visible to a device that lost its stream, through the queue's ended list", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00015" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("phone", { text: "will be removed", requestId: "ios-gone-000002" });
+  await h.remove("mac", "ios-gone-000002");
+  const history = (await h.history("phone")).body;
+  assert.deepEqual(history.queue.ended.map((e) => [e.requestId, e.outcome]), [["ios-gone-000002", "removed"]]);
+  assert.match(history.queue.ended[0].message, /Removed from the queue by Mac/);
+  h.slow.open();
+  await running;
+});
