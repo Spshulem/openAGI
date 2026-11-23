@@ -816,7 +816,8 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     const restarted = new FleetSupervisor({
       dataDir: ctx.dataDir,
       config: { enabled: false, paseo: { enabled: false } },
-      runtime: { outreach: ctx.outreach, events: { emit() {} } }
+      runtime: { outreach: ctx.outreach, events: { emit() {} } },
+      deps: { now: () => BASE_NOW }
     });
     assert.equal(restarted.getActiveWork({ project: "PersistedPR" }).items[0].followThroughState, "blocked_pr");
 
@@ -846,7 +847,8 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     const movedRestart = new FleetSupervisor({
       dataDir: ctx.dataDir,
       config: { enabled: false, paseo: { enabled: false } },
-      runtime: { outreach: ctx.outreach, events: { emit() {} } }
+      runtime: { outreach: ctx.outreach, events: { emit() {} } },
+      deps: { now: () => BASE_NOW }
     });
     assert.equal(movedRestart.getActiveWork({ project: "MovedPR" }).items[0].followThroughState, "active");
 

@@ -788,7 +788,7 @@ export class ActiveWorkManager {
     if (existing) {
       const acceptanceChanged = input.acceptanceCriteria !== undefined
         ? cleanText(input.acceptanceCriteria, 500) !== (existing.acceptanceCriteria ?? existing.doneCriteria ?? "")
-        : (!existing.acceptanceCriteriaExplicit && existing.acceptanceCriteria !== doneCriteria);
+        : false;
       const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria || acceptanceChanged;
       const ownerUpdated = input.owner !== undefined || input.threadKey !== undefined;
       const ownerChanged = ownerUpdated && (
