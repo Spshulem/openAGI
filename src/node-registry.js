@@ -273,6 +273,13 @@ export class NodeRegistry {
     return actual.length === hash.length && crypto.timingSafeEqual(actual, hash);
   }
 
+  // Whether this node still holds an owner-proxy grant (it was not revoked
+  // or re-enrolled without one), without needing its credential.
+  hasOwnerProxyGrant(nodeId) {
+    if (typeof nodeId !== "string") return false;
+    return typeof this._read().credentials[nodeId]?.ownerProxyTokenHash === "string";
+  }
+
   enrollmentForToken(token) {
     if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) return null;
     const actualHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");

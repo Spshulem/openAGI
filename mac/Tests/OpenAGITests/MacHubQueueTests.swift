@@ -7,11 +7,12 @@ import XCTest
 /// and Edit/Remove/Send Now are hub requests whose refusals are shown.
 final class MacFakeHubProtocol: URLProtocol {
   struct Item { var requestId: String; var text: String; var source: String; var mine: Bool; var state: String; var heldBy: String?; var revision: Int }
-  private static let lock = NSLock()
+  static let lock = NSLock()
   static var items: [Item] = []
   static var log: [String] = []
+  static var failNextEnqueue = false
 
-  static func reset() { lock.withLock { items = []; log = [] } }
+  static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false } }
   static func snapshot() -> [Item] { lock.withLock { items } }
   static func calls() -> [String] { lock.withLock { log } }
   static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
@@ -55,6 +56,11 @@ final class MacFakeHubProtocol: URLProtocol {
     Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? ""))
     if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
     if path == "/conversations/supervisor/queue", method == "POST" {
+      if Self.failNextEnqueue {
+        Self.failNextEnqueue = false
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+        return
+      }
       let id = body["requestId"] as? String ?? ""
       if !Self.items.contains(where: { $0.requestId == id }) {
         Self.items.append(Item(requestId: id, text: body["text"] as? String ?? "", source: "Mac", mine: true, state: "queued", heldBy: nil, revision: 1))
@@ -154,5 +160,21 @@ final class MacHubQueueTests: XCTestCase {
     XCTAssertTrue(MacFakeHubProtocol.calls().contains("POST /conversations/supervisor/queue/ios-plain-001/send-now"))
     XCTAssertEqual(supervisor.queuedMessages.first?.requestID, "ios-plain-001")
     XCTAssertEqual(supervisor.queuedMessages.first?.sendNow, .answered(.stopping(tool: "fleet_status")))
+  }
+
+  func testAnUploadThatFailedOfflineIsRetriedWithoutAnotherSendOrRefresh() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-3", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.failNextEnqueue = true }
+    _ = await supervisor.sendMessage("sent during an outage")
+    try await waitFor("the failed try") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 1 }
+    XCTAssertEqual(supervisor.queuedMessages.first?.origin?.pendingUpload, true)
+    // No send, no refresh: the backoff retry delivers it.
+    let deadline = Date().addingTimeInterval(6)
+    while !MacFakeHubProtocol.snapshot().contains(where: { $0.text == "sent during an outage" }), Date() < deadline {
+      try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    XCTAssertTrue(MacFakeHubProtocol.snapshot().contains { $0.text == "sent during an outage" })
+    try await waitFor("the mirror") { supervisor.queuedMessages.first?.origin?.pendingUpload == false }
   }
 }

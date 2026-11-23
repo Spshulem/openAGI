@@ -543,6 +543,17 @@ final class SharedSupervisorClient: ObservableObject {
   @Published private(set) var hubRunning: HubQueueItem? = nil
   private var uploadTask: Task<Void, Never>?
   private var holdRenewal: Task<Void, Never>?
+  /// The hub revision the open editor started from: Save sends this, so a
+  /// stale draft is refused (conflict) instead of replacing another edit.
+  private var editBaseRevision: Int?
+  /// The upload on the wire now, and messages removed here meanwhile (the
+  /// hub may have them, so they are removed there once it settles).
+  private var uploadingRequestID: String?
+  private var removeAfterUpload: Set<String> = []
+  /// Uploads that failed offline are tried again on a bounded backoff, so a
+  /// message never stays "not on main yet" after the connection returns.
+  private var uploadRetry: Task<Void, Never>?
+  private var uploadRetryDelay: UInt64 = 2
   var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
   @Published private(set) var streamingReplyText: String? = nil
   /// The assistant messages already shown when the current reply started,
@@ -594,6 +605,12 @@ final class SharedSupervisorClient: ObservableObject {
 
   func removeQueued(id: UUID) {
     guard let item = queue.item(id) else { return }
+    if hubQueueAvailable, item.requestID == uploadingRequestID {
+      removeAfterUpload.insert(item.requestID)
+      queue.remove(id)
+      if queue.editingID == nil { queuedEditDraft = "" }
+      return
+    }
     if isOnHub(item) {
       let revision = item.origin?.revision
       queue.remove(id)
@@ -623,6 +640,7 @@ final class SharedSupervisorClient: ObservableObject {
     guard let item = queue.item(id), item.origin?.heldBy == nil, let text = queue.beginEditing(id) else { return false }
     queue.setOrigin(id) { $0.error = nil }
     queuedEditDraft = text
+    editBaseRevision = item.origin?.revision
     if isOnHub(item) { holdWhileEditing(item) }
     return true
   }
@@ -659,9 +677,10 @@ final class SharedSupervisorClient: ObservableObject {
       text = "Please inspect the attached screenshot(s)."
     }
     let onHub = isOnHub(item)
-    let revision = item.origin?.revision
+    let revision = editBaseRevision ?? item.origin?.revision
     guard queue.saveEdit(id, text: text) else { return false }
     queuedEditDraft = ""
+    editBaseRevision = nil
     holdRenewal?.cancel()
     if onHub {
       let saved = queue.item(id)?.text ?? text
@@ -689,6 +708,7 @@ final class SharedSupervisorClient: ObservableObject {
     let item = queue.editingID.flatMap { queue.item($0) }
     queue.cancelEdit()
     queuedEditDraft = ""
+    editBaseRevision = nil
     holdRenewal?.cancel()
     if isOnHub(item), let item {
       Task {
@@ -716,7 +736,7 @@ final class SharedSupervisorClient: ObservableObject {
     }
     hubRunning = snapshot.running
     // This Mac's own streamed send is already in the chat.
-    let shown: Set<String> = runningRequestId.map { [$0] } ?? []
+    let shown = Set(runningRequestId.map { [$0] } ?? []).union(removeAfterUpload)
     queue.mirror(snapshot, payload: { _ in SupervisorQueuedPayload(focusedCardId: nil, attachments: []) }, skip: shown)
   }
 
@@ -731,23 +751,63 @@ final class SharedSupervisorClient: ObservableObject {
   private func uploadPending() {
     guard hubQueueAvailable, uploadTask == nil else { return }
     uploadTask = Task { [weak self] in
+      await self?.removeAfterUploads()
       while let self, let next = self.queue.items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) {
         var body: [String: Any] = ["text": next.text, "requestId": next.requestID, "from": "mac-supervisor"]
         if let card = next.payload.focusedCardId, card.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil {
           body["focusedCardId"] = card
         }
         if !next.payload.attachments.isEmpty { body["attachments"] = next.payload.attachments.map(\.agentHostPayload) }
+        self.uploadingRequestID = next.requestID
+        var offline = false
         do {
           let data = try await self.queueCall("/conversations/supervisor/queue", method: "POST", body: body)
           self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
+          self.uploadingRequestID = nil
           self.mirrorHub((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+          self.uploadRetryDelay = 2
         } catch let refused as HubQueueRefused {
           self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
         } catch {
+          offline = true
+        }
+        self.uploadingRequestID = nil
+        await self.removeAfterUploads()
+        if offline {
+          self.scheduleUploadRetry()
           break
         }
       }
       self?.uploadTask = nil
+    }
+  }
+
+  private func scheduleUploadRetry() {
+    guard uploadRetry == nil else { return }
+    let delay = uploadRetryDelay
+    uploadRetryDelay = min(uploadRetryDelay * 2, 60)
+    uploadRetry = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+      guard let self else { return }
+      self.uploadRetry = nil
+      self.uploadPending()
+    }
+  }
+
+  /// Removals made while their upload was on the wire: remove them on the
+  /// hub too. Offline, they wait for the next try (scheduleUploadRetry).
+  private func removeAfterUploads() async {
+    for requestID in removeAfterUpload {
+      do {
+        let data = try await queueCall("/conversations/supervisor/queue/\(requestID)", method: "DELETE")
+        removeAfterUpload.remove(requestID)
+        mirrorHub((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+      } catch is HubQueueRefused {
+        removeAfterUpload.remove(requestID)
+      } catch {
+        scheduleUploadRetry()
+        return
+      }
     }
   }
 

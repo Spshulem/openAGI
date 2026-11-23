@@ -14,8 +14,20 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var log: [String] = []
     nonisolated(unsafe) static var failNextEnqueue = false
     nonisolated(unsafe) static var sendNowStatus = "interrupted"
+    // Accept the next queued message but hold the answer until released.
+    nonisolated(unsafe) static var holdNextEnqueue = false
+    private struct Held: @unchecked Sendable { let proto: FakeHubProtocol; let runLoop: CFRunLoop }
+    nonisolated(unsafe) private static var heldEnqueue: Held?
 
-    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; sendNowStatus = "interrupted" } }
+    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil } }
+    static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
+    static func releaseEnqueue() {
+        guard let held = lock.withLock({ () -> Held? in defer { heldEnqueue = nil }; return heldEnqueue }) else { return }
+        let proto = held.proto
+        let json = lock.withLock { queueJSON() }
+        CFRunLoopPerformBlock(held.runLoop, CFRunLoopMode.commonModes.rawValue) { proto.respond(202, ["queue": json]) }
+        CFRunLoopWakeUp(held.runLoop)
+    }
     static func snapshot() -> [Item] { lock.withLock { items } }
     static func calls() -> [String] { lock.withLock { log } }
     static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
@@ -33,7 +45,7 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
 
-    private func respond(_ status: Int, _ object: Any, type: String = "application/json") {
+    fileprivate func respond(_ status: Int, _ object: Any, type: String = "application/json") {
         let data = (object as? String).map { Data($0.utf8) } ?? (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": type])!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
@@ -66,6 +78,11 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
             let id = body["requestId"] as? String ?? ""
             if !Self.items.contains(where: { $0.requestId == id }) {
                 Self.items.append(Item(requestId: id, text: body["text"] as? String ?? "", source: "iPhone", mine: true, state: "queued", heldBy: nil, revision: 1))
+            }
+            if Self.holdNextEnqueue {
+                Self.holdNextEnqueue = false
+                Self.heldEnqueue = Held(proto: self, runLoop: CFRunLoopGetCurrent())
+                return
             }
             return respond(202, ["requestId": id, "queue": Self.queueJSON()])
         }
@@ -230,5 +247,42 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(FakeHubProtocol.calls().contains("POST /conversations/supervisor/queue/mac-first-001/send-now"))
         XCTAssertEqual(chat.queuedSubmissions.first?.sendNow, .answered(.interrupted))
         XCTAssertFalse(FakeHubProtocol.calls().contains { $0.hasPrefix("POST /conversations/supervisor/interrupt") }, "the hub chooses what to stop")
+    }
+
+    @MainActor
+    func testASaveNamesTheRevisionTheEditorOpenedAtEvenIfANewerOneArrivesWhileEditing() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-6", text: "busy", source: "Mac", mine: false, state: "running", revision: 1),
+                                    .init(requestId: "ios-stale-0001", text: "Tuesday", source: "iPhone", mine: true, state: "queued", revision: 2)] }
+        let chat = await chat()
+        let id = try XCTUnwrap(chat.queuedSubmissions.first?.id)
+        XCTAssertTrue(chat.beginEditingQueued(id: id))
+        // Another device edits it before this phone's hold lands: the hold's
+        // own answer brings revision 5 into this phone's queue.
+        FakeHubProtocol.set { $0[1].text = "Thursday (Mac)"; $0[1].revision = 5 }
+        try await waitFor("the hold answer") { chat.queuedSubmissions.first?.origin?.revision == 5 }
+        chat.queuedEditDraft = "Wednesday"
+        XCTAssertTrue(chat.saveQueuedEdit())
+        try await waitFor("the refusal") { chat.queuedSubmissions.first?.origin?.error != nil }
+        XCTAssertEqual(FakeHubProtocol.snapshot()[1].text, "Thursday (Mac)", "the other device's edit was not overwritten")
+        XCTAssertEqual(chat.queuedSubmissions.first?.text, "Thursday (Mac)")
+    }
+
+    @MainActor
+    func testRemovingAMessageWhileItsUploadIsOnTheWireRemovesItOnTheHubToo() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-7", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.holdNextEnqueue = true
+        chat.draft = "changed my mind"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the hub to take it, answer pending") { FakeHubProtocol.isHoldingEnqueue }
+        let id = try XCTUnwrap(chat.queuedSubmissions.first?.id)
+        let requestID = try XCTUnwrap(chat.queuedSubmissions.first?.requestID)
+        chat.removeQueuedSubmission(id: id)
+        XCTAssertTrue(chat.queuedSubmissions.isEmpty)
+        FakeHubProtocol.releaseEnqueue()
+        try await waitFor("the hub removal") { !FakeHubProtocol.snapshot().contains { $0.requestId == requestID } }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(requestID)") })
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(chat.queuedSubmissions.isEmpty, "the upload's answer did not bring it back")
     }
 }

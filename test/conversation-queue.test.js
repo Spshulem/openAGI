@@ -16,6 +16,8 @@ import { NodeRegistry } from "../src/node-registry.js";
 const SESSION = "devices:supervisor:main";
 const phone = { id: "mobile:queue-phone", token: "q".repeat(43) };
 const glasses = { id: "g2:queue-glasses", token: "h".repeat(43) };
+// A node acting for the owner's Mac (a worker forwarding to this main).
+const proxy = { id: "mac:queue-proxy", token: "m".repeat(43), proxyToken: "x".repeat(43) };
 
 function gate() {
   let open;
@@ -51,6 +53,9 @@ async function hub(t, { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi
   const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
   if (!nodeRegistry.enrollment(phone.id)) nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
   if (!nodeRegistry.enrollment(glasses.id)) nodeRegistry.enroll(glasses.id, glasses.token, { platform: "even-g2", name: "G2" });
+  if (!nodeRegistry.enrollment(proxy.id) && !fs.existsSync(path.join(dataDir, "proxy-revoked"))) {
+    nodeRegistry.enroll(proxy.id, proxy.token, { platform: "macos", name: "Work Mac", ownerProxyToken: proxy.proxyToken });
+  }
   const runtime = createDurableRuntime({ dataDir });
   const calls = [];
   const slow = gate();
@@ -70,10 +75,11 @@ async function hub(t, { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi
   t.after(async () => { await close().catch(() => {}); if (!keep) fs.rmSync(dataDir, { recursive: true, force: true }); });
   const auth = (who) => who === "mac" ? { authorization: "Bearer owner" }
     : who === "g2" ? { authorization: `Bearer ${glasses.token}`, "x-openagi-node-id": glasses.id }
+    : who === "proxy" ? { authorization: `Bearer ${proxy.proxyToken}`, "x-openagi-node-id": proxy.id }
       : { authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id };
   const json = async (response) => ({ status: response.status, body: await response.json().catch(() => null) });
   const api = {
-    base, runtime, calls, slow, dataDir, close,
+    base, runtime, calls, slow, dataDir, close, nodeRegistry,
     // A streamed send, as each app sends when it believes nothing is running.
     message: (who, body, { stream = true } = {}) => fetch(`${base}/message`, {
       method: "POST", headers: { ...auth(who), "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json" },
@@ -334,4 +340,62 @@ test("every queue change tells connected devices to reload", async (t) => {
   await reading;
   h.slow.open();
   await running;
+});
+
+test("a long queued message comes back whole, so editing it never cuts it short", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00010" }));
+  await until(() => h.calls.length === 1);
+  const long = "x".repeat(20_000) + " the end";
+  await h.enqueue("phone", { text: long, requestId: "ios-long-text-01" });
+  const item = (await h.queue("mac")).body.items[1];
+  assert.equal(item.text.length, long.length, "the full text, not a 16,000-character preview");
+  assert.equal((await h.edit("mac", "ios-long-text-01", { text: item.text + "!", baseRevision: item.revision })).status, 200);
+  h.slow.open();
+  await running;
+  await until(() => h.calls.length === 2);
+  assert.equal(h.calls[1], long + "!");
+});
+
+test("a phone unpaired while its message waits never runs it", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00011" }));
+  await until(() => h.calls.length === 1);
+  const waiting = frames(await h.message("phone", { text: "from a phone about to be unpaired", requestId: "ios-unpair-0001" }));
+  await until(async () => (await h.queue("mac")).body.items.length === 2);
+  h.nodeRegistry.revoke(phone.id);
+  h.slow.open();
+  await running;
+  const ended = (await waiting).find((f) => f.event === "failure");
+  assert.equal(ended.data.code, "sender-unpaired");
+  assert.deepEqual(h.calls, ["[slow] busy"], "it never reached the model");
+  // Re-pair for later tests in this file that share the phone id.
+  h.nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
+});
+
+test("an owner proxy revoked across a restart does not get its waiting messages run with owner authority", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-proxy-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const first = await hub(t, { dataDir, keep: true });
+  const cut = new AbortController();
+  const running = fetch(`${first.base}/message`, {
+    method: "POST", signal: cut.signal,
+    headers: { authorization: "Bearer owner", "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ thread: "supervisor", from: "mac-supervisor", text: "[slow] busy", requestId: "mac-busy-00012" })
+  }).then((r) => r.text()).catch(() => null);
+  await until(() => first.calls.length === 1);
+  const queued = await first.enqueue("proxy", { text: "proxy command", requestId: "mac-proxy-00001" });
+  assert.equal(queued.status, 202);
+  await first.enqueue("mac", { text: "owner command", requestId: "mac-owner-00001" });
+  first.nodeRegistry.revoke(proxy.id);
+  fs.writeFileSync(path.join(dataDir, "proxy-revoked"), "1");
+  cut.abort();
+  await running;
+  await first.close({ release: false });
+
+  const second = await hub(t, { dataDir, keep: true });
+  await until(() => second.calls.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(second.calls, ["owner command"], "only the owner's own message ran");
+  assert.equal(second.stored().some(([, text]) => text === "proxy command"), false);
 });

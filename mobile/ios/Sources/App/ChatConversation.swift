@@ -62,6 +62,15 @@ final class ChatConversation {
     var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
     private var uploadTask: Task<Void, Never>?
     private var holdRenewal: Task<Void, Never>?
+    // The hub revision the open editor started from. Save sends this, never a
+    // newer one a refresh brought meanwhile, so a stale draft is refused
+    // (conflict) instead of silently replacing another device's edit.
+    private var editBaseRevision: Int?
+    // The message whose upload is on the wire now, and messages removed here
+    // while that was so: the hub may have taken them, so they are removed on
+    // the hub too once the upload settles (and never shown again meanwhile).
+    private var uploadingRequestID: String?
+    private var removeAfterUpload: Set<String> = []
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
@@ -128,6 +137,12 @@ final class ChatConversation {
 
     func removeQueuedSubmission(id: UUID) {
         guard let item = queue.item(id) else { return }
+        if hubQueueAvailable, item.requestID == uploadingRequestID {
+            removeAfterUpload.insert(item.requestID)
+            queue.remove(id)
+            if queue.editingID == nil { queuedEditDraft = "" }
+            return
+        }
         if isOnHub(item) {
             // Removed here at once; the hub's answer (or a refresh) is final.
             let revision = item.origin?.revision
@@ -157,6 +172,7 @@ final class ChatConversation {
         guard !isReadOnly, let item = queue.item(id), item.origin?.heldBy == nil, let text = queue.beginEditing(id) else { return false }
         queue.setOrigin(id) { $0.error = nil }
         queuedEditDraft = text
+        editBaseRevision = item.origin?.revision
         if isOnHub(item) { holdWhileEditing(item) }
         return true
     }
@@ -196,9 +212,10 @@ final class ChatConversation {
             text = "Please describe the attached images."
         }
         let onHub = isOnHub(item)
-        let revision = item.origin?.revision
+        let revision = editBaseRevision ?? item.origin?.revision
         guard queue.saveEdit(id, text: text) else { return false }
         queuedEditDraft = ""
+        editBaseRevision = nil
         holdRenewal?.cancel()
         if onHub {
             let saved = queue.item(id)?.text ?? text
@@ -225,6 +242,7 @@ final class ChatConversation {
         let item = queue.editingID.flatMap { queue.item($0) }
         queue.cancelEdit()
         queuedEditDraft = ""
+        editBaseRevision = nil
         holdRenewal?.cancel()
         if isOnHub(item), let item {
             Task { applyHubQueue(try? await client.updateQueued(thread: thread, requestId: item.requestID, hold: false, conversationId: conversationID)) }
@@ -304,7 +322,7 @@ final class ChatConversation {
         }
         hubRunning = snapshot.running
         // A message this phone sent on a stream is already in the chat.
-        let shown = Set(messages.compactMap(\.requestID))
+        let shown = Set(messages.compactMap(\.requestID)).union(removeAfterUpload)
         queue.mirror(snapshot, payload: { _ in ChatQueuedPayload(attachments: [], focusedCardID: nil) }, skip: shown)
     }
 
@@ -320,21 +338,44 @@ final class ChatConversation {
     private func uploadPending() {
         guard hubQueueAvailable, uploadTask == nil, !forgotten else { return }
         uploadTask = Task { [weak self] in
+            await self?.removeAfterUploads()
             while let self, !self.forgotten,
                   let next = self.queue.items.first(where: { $0.origin?.pendingUpload == true && $0.origin?.error == nil }) {
+                self.uploadingRequestID = next.requestID
+                var offline = false
                 do {
                     let snapshot = try await self.client.enqueueMessage(thread: self.thread, text: next.text, attachments: next.attachments,
                                                                         focusedCardId: next.payload.focusedCardID, requestId: next.requestID,
                                                                         conversationId: self.conversationID)
                     self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
+                    self.uploadingRequestID = nil
                     self.mirrorHub(snapshot)
                 } catch let refused as HubQueueRefused {
                     self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
                 } catch {
-                    break
+                    offline = true
                 }
+                self.uploadingRequestID = nil
+                await self.removeAfterUploads()
+                if offline { break }
             }
             self?.uploadTask = nil
+        }
+    }
+
+    // Removals made while their upload was on the wire: the hub may have the
+    // message, so remove it there too. Offline, they wait for the next try.
+    private func removeAfterUploads() async {
+        for requestID in removeAfterUpload {
+            do {
+                mirrorHub(try await client.removeQueued(thread: thread, requestId: requestID, baseRevision: nil, conversationId: conversationID))
+                removeAfterUpload.remove(requestID)
+            } catch is HubQueueRefused {
+                // Never reached the hub, or already ran: nothing left to remove.
+                removeAfterUpload.remove(requestID)
+            } catch {
+                return
+            }
         }
     }
 
@@ -619,7 +660,7 @@ final class ChatConversation {
     // Detached replies to find again, or hub-queued work still waiting or
     // running (in case /events is down): keep checking while active.
     private var needsPolling: Bool {
-        messages.contains(where: \.isDetached) || (hubQueueAvailable && (!queue.isEmpty || hubRunning != nil))
+        messages.contains(where: \.isDetached) || (hubQueueAvailable && (!queue.isEmpty || hubRunning != nil || !removeAfterUpload.isEmpty))
     }
 
     private func startRecoveryIfNeeded() {

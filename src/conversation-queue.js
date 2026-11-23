@@ -53,9 +53,10 @@ export function submissionDigest({ text, attachments = [], focusedCardId = null 
 }
 
 export class ConversationQueue {
-  // startTurn(item, hooks) runs one item's turn (AgentHost via channels) and
-  // returns its promise. mintPrincipal(spec) rebuilds the sender's authority
-  // after a restart, or returns null when that sender is no longer allowed.
+  // startTurn(item, hooks) runs one item's turn (AgentHost via channels) with
+  // the sender's authority and returns its promise. mintPrincipal(spec)
+  // rebuilds that authority, or returns null when the sender is no longer
+  // allowed (checked again at restore, and by startTurn when it runs).
   constructor({ dir, liveTurns, startTurn, mintPrincipal = () => null, onChange = () => {}, now = () => Date.now(), holdMs = HOLD_MS }) {
     this.holdMs = holdMs;
     this.dir = dir;
@@ -87,7 +88,7 @@ export class ConversationQueue {
           this.tombstone(state, item.requestId, "not_run", "The device that sent this is no longer paired.");
           continue;
         }
-        state.items.push({ ...item, state: "queued", principalObject: principal });
+        state.items.push({ ...item, state: "queued" });
       }
       state.revision += 1;
       this.persist(saved.sessionId);
@@ -140,7 +141,7 @@ export class ConversationQueue {
     const entry = {
       requestId, sessionId, thread: item.thread, conversationId: item.conversationId ?? "main",
       text: String(item.text), body: item.body, digest: item.digest, source: item.source,
-      principal: item.principalSpec ?? null, principalObject: item.principal ?? null,
+      principal: item.principalSpec ?? null,
       state: "queued", hold: null, revision: 1, createdAt: at, updatedAt: at
     };
     state.items.push(entry);
@@ -301,15 +302,16 @@ export class ConversationQueue {
   persist(sessionId) {
     if (!this.dir) return;
     const state = this.session(sessionId);
-    const items = state.items.map(({ principalObject: _principal, ...item }) => item);
-    writeJsonAtomic(path.join(this.dir, fileName(sessionId)), { sessionId, revision: state.revision, items, tombstones: state.tombstones });
+    writeJsonAtomic(path.join(this.dir, fileName(sessionId)), { sessionId, revision: state.revision, items: state.items, tombstones: state.tombstones });
   }
 
   project(sessionId, item, actorKey = null) {
     const state = this.session(sessionId);
     return {
       requestId: item.requestId,
-      text: item.text.slice(0, 16_000),
+      // The whole text (at most 64 KiB): clients edit what they are given,
+      // so a shortened copy would be saved back shortened.
+      text: item.text,
       attachmentCount: item.body?.attachments?.length ?? 0,
       source: { device: item.source?.device ?? null, name: item.source?.name ?? null, nodeId: item.source?.nodeId ?? null },
       ...(actorKey ? { mine: item.source?.key === actorKey } : {}),

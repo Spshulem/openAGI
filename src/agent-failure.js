@@ -27,7 +27,8 @@ const PUBLIC_FAILURES = Object.freeze({
   // An action that was already running may have finished; none is undone.
   stopped: STOPPED_TEXT,
   // Taken out of the hub's conversation queue (by any device) before it ran.
-  removed: "Removed from the queue before it ran. Nothing was sent to the agent."
+  removed: "Removed from the queue before it ran. Nothing was sent to the agent.",
+  "sender-unpaired": "Not run: the device that sent this was unpaired before its turn came."
 });
 
 const loggedFailures = new WeakSet();
@@ -36,6 +37,7 @@ const loggedFailures = new WeakSet();
 // public taxonomy before they reach chat history, HTTP responses, or browser
 // events; the detailed diagnostic belongs only in the daemon's local log.
 export function classifyAgentFailure(error) {
+  if (error?.code === "SENDER_UNPAIRED") return { code: "sender-unpaired", message: PUBLIC_FAILURES["sender-unpaired"] };
   if (error?.code === "QUEUE_REMOVED") return { code: "removed", message: PUBLIC_FAILURES.removed };
   if (error?.code === "OWNER_INTERRUPTED") return { code: "stopped", message: PUBLIC_FAILURES.stopped };
   if (error?.code === "IMAGE_INPUT_UNSUPPORTED") return { code: "image-input-unsupported", message: PUBLIC_FAILURES["image-input-unsupported"] };

@@ -318,6 +318,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // How long an interrupt waits for the turn to stop before answering
   // "stopping" (it is waiting on a running tool). Tests shorten it.
   const interruptSettleMs = Number.isFinite(options.interruptSettleMs) ? options.interruptSettleMs : 4_000;
+  // The authority a queued message runs with: the transport's, re-minted
+  // only while its sender may still speak for the owner. A phone must still
+  // be an enrolled phone; an owner proxy (a node acting for the owner's Mac)
+  // must still be enrolled and hold its proxy grant; the owner's own local
+  // clients (no node) always may.
+  const mintQueuedPrincipal = (spec) => {
+    if (!spec || typeof spec.via !== "string") return null;
+    if (spec.via === "phone") {
+      return nodeRegistry.enrollment?.(spec.nodeId)?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", spec.nodeId) : null;
+    }
+    if (spec.nodeId && !(nodeRegistry.enrollment?.(spec.nodeId) && nodeRegistry.hasOwnerProxyGrant?.(spec.nodeId))) return null;
+    try { return ownerPrincipal(spec.via, spec.nodeId ?? null); } catch { return null; }
+  };
   // The hub's queue for each shared device conversation (conversation-queue.js).
   // Every named turn a phone or the owner's Mac sends to a shared thread runs
   // through it, in order, with the sender's authority.
@@ -325,19 +338,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     dir: path.join(dataDir, "conversation-queues"),
     liveTurns,
     ...(Number.isFinite(options.queueHoldMs) ? { holdMs: options.queueHoldMs } : {}),
+    // The sender's authority is checked again when the message runs, not
+    // only when it was queued: a device unpaired (or an owner proxy revoked)
+    // while its message waited, or across a restart, never runs it.
     startTurn: (item, hooks) => {
       if (!channels) return Promise.reject(Object.assign(new Error("agent host disabled"), { code: "agent-host-disabled" }));
-      return channels.handleLocalMessage(item.body, { ...hooks, principal: item.principalObject ?? null });
-    },
-    // After a restart: the same authority, only while that sender may still
-    // speak for the owner (a phone that was unpaired may not).
-    mintPrincipal: (spec) => {
-      if (!spec || typeof spec.via !== "string") return null;
-      if (spec.via === "phone") {
-        return nodeRegistry.enrollment?.(spec.nodeId)?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", spec.nodeId) : null;
+      const principal = item.principal ? mintQueuedPrincipal(item.principal) : null;
+      if (item.principal && !principal) {
+        return Promise.reject(Object.assign(new Error("The device that sent this message is no longer paired."), { code: "SENDER_UNPAIRED" }));
       }
-      try { return ownerPrincipal(spec.via, spec.nodeId ?? null); } catch { return null; }
+      return channels.handleLocalMessage(item.body, { ...hooks, principal });
     },
+    mintPrincipal: (spec) => mintQueuedPrincipal(spec),
     onChange: ({ sessionId, revision }) => {
       const thread = sharedThreadForSession(sessionId);
       if (thread) events.emit("conversation.updated", { thread, conversationId: sharedConversationForSession(sessionId) ?? "main", queueRevision: revision });
@@ -2526,7 +2538,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 source: requestNodeId
                   ? { device: ownerProxyRoute ? "owner" : "phone", key: actorKey, nodeId: requestNodeId, name: String(body.metadata?.sourceName ?? (ownerProxyRoute ? "Mac" : "Phone")).slice(0, 80) }
                   : { device: "owner", key: actorKey, nodeId: null, name: rawFrom === "mac-supervisor" ? "Mac" : "Owner" },
-                principal,
                 principalSpec: principal ? { via: principal.via, nodeId: principal.nodeId ?? null } : null
               });
             } catch (error) {
