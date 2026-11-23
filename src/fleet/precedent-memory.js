@@ -124,6 +124,10 @@ function hasUnquotedShellHazard(input) {
       if (quote === "\"" && (ch === "`" || (ch === "$" && input[i + 1] === "("))) return true;
       continue;
     }
+    // An unquoted backslash makes the next character literal in bash
+    // (\' is a quote character, not an opening quote). The parsers here do
+    // not model that, so such commands are never approved by rule.
+    if (ch === "\\") return true;
     if (ch === "'" || ch === "\"") {
       quote = ch;
       continue;

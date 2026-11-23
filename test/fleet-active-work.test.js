@@ -844,11 +844,14 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
       goal: "Move the commitment to the current PR",
       doneCriteria: "Current PR outcome verified"
     });
+    // The restart shares the fixture clock: with the wall clock it would see
+    // the fixtures as days old (stale) once the real date moves past them.
+    const fixtureNow = ctx.supervisor.now();
     const movedRestart = new FleetSupervisor({
       dataDir: ctx.dataDir,
       config: { enabled: false, paseo: { enabled: false } },
       runtime: { outreach: ctx.outreach, events: { emit() {} } },
-      deps: { now: () => BASE_NOW }
+      deps: { now: () => fixtureNow }
     });
     assert.equal(movedRestart.getActiveWork({ project: "MovedPR" }).items[0].followThroughState, "active");
 
