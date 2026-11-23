@@ -105,16 +105,25 @@ test("update rewords only an open item in place, with a new seq and an outreach-
 
   const firstSeq = a.seq;
   const cursor = s.nextSeq - 1;
-  const updated = s.update(a.id, { title: " 5 stuck ", actions: ["retry", "wait", "dismiss"] });
+  const updated = s.update(a.id, {
+    title: " 5 stuck ",
+    actions: ["retry", "wait", "dismiss"],
+    sourceRef: { kind: "fleet", id: "fq_1", mark: "evidence-b" }
+  });
   assert.equal(updated.id, a.id);
   assert.deepEqual([updated.title, updated.summary, updated.actions], ["5 stuck", "Four threads", ["retry", "wait", "dismiss"]]);
+  assert.equal(updated.sourceRef.mark, "evidence-b");
   assert.deepEqual([updated.status, updated.createdAt], ["seen", a.createdAt]);
   assert.ok(updated.seq > firstSeq);
   assert.deepEqual(s.since(cursor).map((i) => i.id), [a.id]);
   assert.deepEqual(events, ["outreach-updated"]);
   // Same text again: no new seq and no event, only a refresh time.
   const seq = updated.seq;
-  const same = s.update(a.id, { title: "5 stuck", actions: ["retry", "wait", "dismiss"] });
+  const same = s.update(a.id, {
+    title: "5 stuck",
+    actions: ["retry", "wait", "dismiss"],
+    sourceRef: { kind: "fleet", id: "fq_1", mark: "evidence-b" }
+  });
   assert.deepEqual([same.seq, events.length], [seq, 1]);
   assert.ok(Date.parse(same.refreshedAt) >= Date.parse(a.createdAt));
 
