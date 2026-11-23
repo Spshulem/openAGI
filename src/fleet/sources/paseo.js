@@ -311,6 +311,17 @@ export async function hostApi(client, serverId, directory = null) {
   return client.hosts.client(serverId);
 }
 
+// A provider's account-limit notice posted as the whole assistant reply,
+// with or without Paseo's "[System Error]" prefix: Codex's "You've hit your
+// usage limit ... try again at Nov 23rd, 2026 5:58 PM." An agent quoting
+// such a notice inside a longer report is not one: the notice must open the
+// message and the message must be short.
+const PROVIDER_LIMIT_NOTICE = /^You['\u2019]ve (?:hit|reached) your (?:usage|session|weekly|daily) limit\b/i;
+export function providerLimitNotice(text) {
+  const plain = String(text ?? "").trim();
+  return plain.length <= 600 && PROVIDER_LIMIT_NOTICE.test(plain);
+}
+
 // A provider failure is a separate timeline item, not an assistant reply.
 // Keep it out of conversation/PR extraction, but pass it to the existing
 // infrastructure policy. Quoted errors and failed tools are not turn failures.
@@ -322,7 +333,7 @@ function currentError(agent, entries) {
       failure = null;
     } else if (entry.item?.type === "assistant_message") {
       const rawText = String(entry.item?.text ?? "").trim();
-      if (/^\[System Error\]/i.test(rawText)) {
+      if (/^\[System Error\]/i.test(rawText) || providerLimitNotice(rawText)) {
         failure = {
           timestamp: entry.timestamp,
           isSystemErrorMsg: true,
@@ -350,8 +361,13 @@ function currentError(agent, entries) {
   const snapshotError = agent.status === "error" ? redactSecrets(agent.lastError ?? "").slice(0, 8000).trim() : "";
   if (!snapshotError && !failure && agent.status !== "error") return null;
   const eventError = redactSecrets(failure?.item.message ?? "").slice(0, 8000).trim();
-  const message = snapshotError || eventError || "Paseo agent reported an error.";
-  const at = failure && (!snapshotError || snapshotError === eventError) ? failure.timestamp : agent.updatedAt;
+  // The snapshot's lastError wins, unless only the timeline event names a
+  // known failure (a generic "turn failed" beside Codex's quota notice).
+  const eventAt = Number.isFinite(Date.parse(failure?.timestamp)) ? new Date(Date.parse(failure.timestamp)) : new Date();
+  const useEvent = Boolean(eventError) && (!snapshotError || snapshotError === eventError
+    || (!classifyErrorText(snapshotError, eventAt) && Boolean(classifyErrorText(eventError, eventAt))));
+  const message = (useEvent ? eventError : snapshotError) || "Paseo agent reported an error.";
+  const at = failure && (useEvent || !snapshotError) ? failure.timestamp : agent.updatedAt;
   const now = new Date(Number.isFinite(Date.parse(at)) ? Date.parse(at) : Date.now());
   return { ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }), text: clampText(message, 1000) };
 }
