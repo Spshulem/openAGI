@@ -74,7 +74,7 @@ export function createNotifier({
         type: "fleet-question",
         sourceRef: { kind: "fleet", id: question.id },
         ...shown(question),
-        needsDecision: true,
+        needsDecision: question.kind !== "completed",
         dedupeOpen: true
       });
       return item?.id ?? null;
@@ -93,7 +93,8 @@ export function createNotifier({
 
   const push = async (question, at) => {
     if (config?.push !== "buzzkit") return skip("push-off");
-    if (question.pushedAt) return skip("already-pushed");
+    if (question.kind === "completed") return skip("passive-completion");
+    if (question.pushedAt || store?.hasPriorUnansweredPush?.(question, at.getTime())) return skip("already-pushed");
     if (isQuietHours(at)) return skip("quiet-hours");
     if ((store?.pushesSince?.(HOUR_MS, at.getTime()) ?? 0) >= limits.pushPerHour) return skip("hourly-cap");
     const endpoint = readEndpoint();

@@ -717,6 +717,8 @@ export class FleetSupervisor {
     this.runtime = runtime;
     this.deps = deps ?? {};
     this.skip = { bb3: false, github: false, ...skip };
+    this.proactiveSupervisorChat = config?.proactiveSupervisorChat === true;
+    this.proactiveRespectQuietHours = config?.proactiveRespectQuietHours === true;
     this.config = config?.paths && config?.limits ? config : resolveFleetConfig(process.env, config ?? {});
     this._store = null;
     this._executor = null;
@@ -940,7 +942,9 @@ export class FleetSupervisor {
 
   get notifier() {
     if (this.deps.notifier) return this.deps.notifier;
-    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl });
+    // The notifier shares the supervisor's clock, so quiet hours and push
+    // caps are judged at the same time the scan runs (and are testable).
+    this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl, now: () => new Date(this.now()) });
     return this._notifier;
   }
 
@@ -2436,7 +2440,7 @@ export class FleetSupervisor {
     return watch;
   }
 
-  async postSupervisorChatUpdate(content, { dedupeKey = null, minGapMs = 30 * MIN, metadata = {} } = {}) {
+  async postSupervisorChatUpdate(content, { dedupeKey = null, messageId = null, minGapMs = 30 * MIN, metadata = {} } = {}) {
     const cleanContent = clampTailLines(redactSecrets(String(content ?? "").trim()), 1600);
     if (!cleanContent) return { posted: false, reason: "empty" };
     const nowMs = this.now();
@@ -2448,17 +2452,17 @@ export class FleetSupervisor {
       }
     }
     const nowIso = new Date(nowMs).toISOString();
-    const messageEntry = {
+    // Without an explicit id, the id names one occurrence: retries inside the
+    // cooldown window dedupe, a later occurrence of the same report is new.
+    const windowIndex = minGapMs > 0 ? Math.floor(nowMs / minGapMs) : nowMs;
+    const stableMsgId = typeof messageId === "string" && /^[\w-]{1,200}$/.test(messageId)
+      ? messageId
+      : (dedupeKey ? `msg_sup_${shortHash(`${dedupeKey}:${windowIndex}`)}` : null);
+    const sharedMsgPayload = {
+      ...(stableMsgId ? { id: stableMsgId } : {}),
       role: "assistant",
       text: cleanContent,
-      content: cleanContent,
-      at: nowIso,
-      createdAt: nowIso,
-      metadata: {
-        proactiveSupervisor: true,
-        ...(dedupeKey ? { dedupeKey } : {}),
-        ...metadata
-      }
+      at: nowIso
     };
 
     let deliveredRemote = false;
@@ -2483,7 +2487,7 @@ export class FleetSupervisor {
               },
               body: JSON.stringify({
                 conversationId: "main",
-                messages: [{ role: "assistant", text: cleanContent, at: nowIso }]
+                messages: [sharedMsgPayload]
               }),
               signal: controller.signal
             });
@@ -2498,22 +2502,28 @@ export class FleetSupervisor {
     const sessionStore = this.runtime?.agentHost?.store;
     if (sessionStore && typeof sessionStore.getSession === "function" && typeof sessionStore.appendMessage === "function") {
       try {
-        appendSharedThreadMessages(sessionStore, "supervisor", {
+        const appendedRes = appendSharedThreadMessages(sessionStore, "supervisor", {
           conversationId: "main",
-          messages: [{ role: "assistant", text: cleanContent, at: nowIso }]
+          messages: [sharedMsgPayload]
         });
-        this.runtime?.events?.emit?.("conversation.updated", {
-          sessionId: "devices:supervisor:main",
-          proactive: true,
-          at: nowIso
-        });
+        if ((appendedRes?.appended?.length ?? 0) > 0) {
+          this.runtime?.events?.emit?.("conversation.updated", {
+            sessionId: "devices:supervisor:main",
+            proactive: true,
+            at: nowIso,
+            ...(Object.keys(metadata).length ? { metadata } : {})
+          });
+        }
         deliveredLocal = true;
       } catch { /* best-effort */ }
     }
 
+    // On a node paired to a hub the owner reads the hub's copy: a local-only
+    // fallback is not delivery, so the caller keeps it pending for a retry.
+    const remoteRequired = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     if (deliveredRemote || deliveredLocal) {
-      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
-      return { posted: true, deliveredRemote, deliveredLocal };
+      if (dedupeKey && (!remoteRequired || deliveredRemote)) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
+      return { posted: true, deliveredRemote, deliveredLocal, remoteRequired, messageId: stableMsgId };
     }
     return { posted: false, reason: "no-channel" };
   }
@@ -2596,8 +2606,8 @@ export class FleetSupervisor {
     return outcomes;
   }
 
-  async maybePostProactiveSupervisorDigest({ snapshot, started, autoResolvedSummaries = [] }) {
-    const enabled = Boolean(this.timer) || this.config?.proactiveSupervisorChat === true;
+  async maybePostProactiveSupervisorDigest({ started }) {
+    const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
     const quiet = this.config?.notify?.quietHours ?? null;
     if (quiet && Number.isInteger(quiet.start) && Number.isInteger(quiet.end)) {
@@ -2606,53 +2616,71 @@ export class FleetSupervisor {
         ? (hour >= quiet.start && hour < quiet.end)
         : (hour >= quiet.start || hour < quiet.end);
       if (inQuiet) return null;
+    } else if ((this.proactiveRespectQuietHours || this.config?.proactiveRespectQuietHours === true) && this.notifier?.isQuietHours?.(new Date(started))) {
+      return null;
     }
 
-    const runningCount = Number(
-      snapshot?.counts?.byState?.running
-      ?? snapshot?.counts?.byWatch?.working
-      ?? snapshot?.counts?.running
-      ?? 0
-    );
-    const waitingCiCount = Number(snapshot?.counts?.byState?.["waiting-ci"] ?? 0);
-    const awItems = (this.activeWork.getActiveWork({ limit: 40 })?.items ?? [])
-      .filter((it) => !it.outcomeVerified && it.state !== "done" && it.state !== "snoozed");
-    const openActionable = this.store.openQuestions()
-      .filter((q) => q.status === "open" && !["completed"].includes(q.kind) && !this.awaitingReview.has(q.id));
-
-    // Surface proactively when 0 agents are running (and none waiting on CI) despite
-    // tracked unfinished goals, or when autonomous precedents cleared a batch alongside owner walls.
-    const zeroRunningStall = runningCount === 0 && waitingCiCount === 0 && awItems.length > 0;
-    const batchClearedWithWalls = autoResolvedSummaries.length >= 3 && openActionable.length > 0 && awItems.length > 0;
-    if (!zeroRunningStall && !batchClearedWithWalls) return null;
-
-    const topBlockers = openActionable.slice(0, 5);
-    const sig = shortHash(JSON.stringify([
-      runningCount === 0 ? "zero-running" : "active",
-      topBlockers.map((q) => [q.id, q.kind]).slice(0, 5),
-      awItems.filter((it) => it.state === "blocked").map((it) => it.id)
-    ]));
-
-    const lines = [
-      runningCount === 0
-        ? `**Supervisor check-in:** **0 coding sessions are currently running** across **${awItems.length}** unfinished goal${awItems.length === 1 ? "" : "s"} (**${openActionable.length}** item${openActionable.length === 1 ? "" : "s"} waiting on you).`
-        : `**Supervisor check-in:** **${runningCount}** session${runningCount === 1 ? "" : "s"} running · **${openActionable.length}** item${openActionable.length === 1 ? "" : "s"} waiting on your decision.`
-    ];
-    if (autoResolvedSummaries.length > 0) {
-      lines.push(`- **Auto-handled via precedent (${autoResolvedSummaries.length}):** ${autoResolvedSummaries.slice(0, 4).join("; ")}`);
-    }
-    if (topBlockers.length > 0) {
-      lines.push("- **Needs your call (Hard Red Lines / external blockers):**");
-      for (const q of topBlockers) {
-        const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
-        lines.push(`  - \`${q.id}\` — **${clampText(q.title, 110)}**${opts ? ` *(${opts})*` : ""}`);
-      }
-    }
-    return this.postSupervisorChatUpdate(lines.join("\n"), {
-      dedupeKey: `digest:${sig}`,
-      minGapMs: 2 * 60 * MIN,
-      metadata: { kind: "proactive_supervisor_digest", runningCount, openCount: openActionable.length, unfinishedGoals: awItems.length }
+    const notifyPrefs = this.store.preferences();
+    const openActionable = this.store.openQuestions().filter((q) => {
+      if (!q || q.status !== "open" || q.kind === "completed") return false;
+      if (this.awaitingReview.has(q.id)) return false;
+      if (isSuppressedByQuietCadence(q, notifyPrefs)) return false;
+      const keys = q.threadKeys ?? (q.threadKey ? [q.threadKey] : []);
+      if (keys.length && keys.every((key) => this.store.mutedUntil(key))) return false;
+      return true;
     });
+
+    // Delta-only outreach: already-surfaced unanswered items stay visible in Needs You
+    // without ever being re-pushed due to elapsed scans, aggregate count changes,
+    // reordering, or question ID churn. Only genuinely new or materially changed
+    // actionable decisions emit a delta message.
+    const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
+    if (!deltas.length) return { posted: false, reason: "no-delta" };
+
+    // Render only what fits the chat message: a decision cut off by the
+    // length cap would otherwise be marked surfaced without being seen.
+    const DIGEST_MAX = 1600;
+    const header = (n, change) => (n === 1
+      ? (change === "updated" ? "**Updated decision needing you:**" : "**New decision needing you:**")
+      : `**${n} new/updated decisions needing you:**`);
+    const renderDelta = ({ question: q, change }, many) => {
+      const badge = change === "updated" ? "[Updated] " : (many ? "[New] " : "");
+      const opts = (q.options ?? []).filter((o) => o !== "dismiss").slice(0, 3).join(" / ");
+      const contextLine = clampText(redactSecrets(q.reviewBrief?.decision || q.body || ""), 180);
+      return `- ${badge}\`${q.id}\` — **${clampText(q.title, 120)}**${opts ? ` *(${opts})*` : ""}${contextLine ? `\n  ${contextLine}` : ""}`;
+    };
+    let shownDeltas = deltas.slice(0, 5);
+    let lines;
+    for (;;) {
+      const overflow = deltas.length - shownDeltas.length;
+      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.map((d) => renderDelta(d, shownDeltas.length > 1))];
+      if (overflow > 0) lines.push(`- *(+${overflow} more new in Needs You)*`);
+      if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
+      shownDeltas = shownDeltas.slice(0, -1);
+    }
+
+    const canonicalPairs = shownDeltas
+      .map((d) => [d.decisionKey, d.materialHash])
+      .sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+    const deltaSig = shortHash(JSON.stringify(canonicalPairs));
+    const messageId = `msg_sup_delta_${deltaSig}`;
+
+    const res = await this.postSupervisorChatUpdate(lines.join("\n"), {
+      dedupeKey: `delta:${deltaSig}`,
+      messageId,
+      minGapMs: 24 * 60 * MIN,
+      metadata: {
+        kind: "proactive_supervisor_delta",
+        deltaCount: shownDeltas.length,
+        decisionKeys: shownDeltas.map((d) => d.decisionKey)
+      }
+    });
+    // Only what was shown, and only once it reached the owner's copy (the
+    // hub, on a paired node); the rest stays pending for the next check-in.
+    if (res?.posted && (!res.remoteRequired || res.deliveredRemote)) {
+      this.store.commitSurfacedDecisions(shownDeltas, { now: started });
+    }
+    return res;
   }
 
   // One thread, expanded for the owner: the agent's last message and when,

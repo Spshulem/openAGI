@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { REMEDIES, suggestionPlan } from "./remedies.js";
-import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets } from "./contracts.js";
+import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets, shortHash } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
 import { defaultPreferences, normalizePreferences } from "./preferences.js";
@@ -87,8 +87,122 @@ function emptyState() {
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
     supervisorChatNotices: {},
+    surfacedDecisions: {},
     providerFailovers: {}
   };
+}
+
+const SURFACED_DECISIONS_MAX = 500;
+
+function normalizeDecisionText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\b\d+\s+(threads?|sessions?|chats?|items?|stuck|stopped)\b/g, "# $1")
+    .replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent)\s+)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function actionableDecisionKey(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  if (kind === "ready" && prRef) return `ready:${prRef}`;
+  if (question.mergeAsk === true && prRef) return `merge:${prRef}`;
+  const rawDedupe = String(question.dedupeKey ?? "").trim();
+  const groupBase = rawDedupe.replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(groupBase)) {
+    return `group:${groupBase}`;
+  }
+  if (question.threadKey) {
+    if (kind === "prompt") return `prompt:${question.threadKey}`;
+    if (kind === "agent-card" && rawDedupe) return `card:${question.threadKey}:${rawDedupe}`;
+    return `thread:${question.threadKey}:${kind}:${prRef}`;
+  }
+  if (groupBase) return `dedupe:${groupBase}`;
+  const rawTitle = normalizeDecisionText(question.askedAs?.title ?? question.title);
+  return `other:${kind}:${shortHash(rawTitle)}`;
+}
+
+export function actionableDecisionMaterialHash(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  const rawTitle = question.askedAs?.title ?? question.title ?? "";
+  const rawOptions = Array.isArray(question.askedAs?.options) && question.askedAs.options.length > 0
+    ? question.askedAs.options
+    : (Array.isArray(question.options) ? question.options : []);
+  const normOpts = rawOptions
+    .filter((opt) => typeof opt === "string" && opt.toLowerCase() !== "dismiss")
+    .map(normalizeDecisionText)
+    .filter(Boolean)
+    .sort();
+  if (kind === "ready" && prRef) {
+    return shortHash(JSON.stringify(["ready", prRef]));
+  }
+  // A merge decision is the PR at a head with its choices: an agent or the
+  // review rewording the ask is not a new decision; a new head is.
+  if (question.mergeAsk === true && prRef) {
+    return shortHash(JSON.stringify(["merge", prRef, String(question.askedHead ?? ""), normOpts]));
+  }
+  const rawDedupe = String(question.dedupeKey ?? "").trim().replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(rawDedupe)) {
+    // Which sessions are affected is material (a different session's
+    // blocker is a different decision); how many scans saw it is not.
+    const members = (Array.isArray(question.threadKeys) ? question.threadKeys : []).map(String).sort();
+    return shortHash(JSON.stringify(["group", rawDedupe, normOpts, members]));
+  }
+  return shortHash(JSON.stringify([
+    kind,
+    prRef,
+    Boolean(question.mergeAsk),
+    normalizeDecisionText(rawTitle),
+    normalizeDecisionText(question.body ?? ""),
+    normOpts
+  ]));
+}
+
+function normalizeSurfacedDecisions(raw, nowMs = Date.now()) {
+  if (!isObject(raw)) return {};
+  const out = {};
+  const entries = Object.entries(raw)
+    .filter(([key, val]) => Boolean(key) && isObject(val) && typeof val.materialHash === "string")
+    .filter(([, val]) => {
+      const seenMs = toMs(val.lastSeenAt ?? val.surfacedAt, 0);
+      return seenMs === 0 || nowMs - seenMs < QUESTION_TTL_MS;
+    })
+    .slice(-SURFACED_DECISIONS_MAX);
+  for (const [key, val] of entries) {
+    out[key] = {
+      materialHash: String(val.materialHash),
+      surfacedAt: typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs),
+      lastSeenAt: typeof val.lastSeenAt === "string" ? val.lastSeenAt : (typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs)),
+      questionId: typeof val.questionId === "string" ? val.questionId : null
+    };
+  }
+  return out;
+}
+
+function seedSurfacedDecisionsFromExisting(questions, notices, nowMs = Date.now()) {
+  const out = {};
+  for (const q of Array.isArray(questions) ? questions : []) {
+    if (!isObject(q) || q.status !== "open" || q.kind === "completed") continue;
+    // Only evidence that this question itself reached the owner counts; an
+    // unrelated chat notice does not prove it appeared in a check-in.
+    const alreadySurfaced = Boolean(q.outreachId || q.pushedAt);
+    if (!alreadySurfaced) continue;
+    const dKey = actionableDecisionKey(q);
+    const mHash = actionableDecisionMaterialHash(q);
+    if (!dKey || !mHash) continue;
+    const stamp = typeof q.updatedAt === "string" ? q.updatedAt : (typeof q.createdAt === "string" ? q.createdAt : iso(nowMs));
+    out[dKey] = {
+      materialHash: mHash,
+      surfacedAt: stamp,
+      lastSeenAt: stamp,
+      questionId: typeof q.id === "string" ? q.id : null
+    };
+  }
+  return out;
 }
 
 const ORG_PROJECTS_MAX = 60;
@@ -1269,6 +1383,22 @@ export class FleetStore {
     return latest;
   }
 
+  hasPriorUnansweredPush(question, now = this.now()) {
+    const nowMs = toMs(now, this.now());
+    const dKey = actionableDecisionKey(question);
+    const mHash = actionableDecisionMaterialHash(question);
+    if (!dKey || !mHash) return false;
+    for (const q of this.state.questions) {
+      if (!q || q.id === question.id) continue;
+      if (OWNER_CLOSED.has(q.status) || isReviewClosed(q)) continue;
+      if (!q.pushedAt) continue;
+      const pushedMs = toMs(q.pushedAt, 0);
+      if (!pushedMs || nowMs - pushedMs >= QUESTION_TTL_MS) continue;
+      if (actionableDecisionKey(q) === dKey && actionableDecisionMaterialHash(q) === mHash) return true;
+    }
+    return false;
+  }
+
   _closeQuestion(id, status, answer, extra = {}) {
     const now = this.now();
     this._expireQuestions(now);
@@ -1279,6 +1409,13 @@ export class FleetStore {
     question.answeredAt = iso(now);
     question.updatedAt = iso(now);
     Object.assign(question, extra);
+    // If the owner explicitly answered or dismissed the decision, clear its surfaced
+    // ledger slot so a genuinely new future ask after the owner hold ends can surface;
+    // automatic supervisor resolves retain the slot across transient close/reissue churn.
+    if (OWNER_CLOSED.has(status) && isObject(this.state.surfacedDecisions)) {
+      const dKey = actionableDecisionKey(question);
+      if (dKey) delete this.state.surfacedDecisions[dKey];
+    }
     this._save();
     return { ...question };
   }
@@ -1347,6 +1484,9 @@ export class FleetStore {
       organization: normalizeOrganization(raw.organization),
       followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
+      surfacedDecisions: isObject(raw.surfacedDecisions)
+        ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
+        : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
       providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {}
     };
   }
@@ -1563,6 +1703,85 @@ export class FleetStore {
     }
     this._save();
     return { ...entry };
+  }
+
+  surfacedDecisions() {
+    const nowMs = this.now();
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    return structuredClone(this.state.surfacedDecisions);
+  }
+
+  // Computes only genuinely new or materially changed actionable decisions relative to
+  // the persistent surfacedDecisions ledger, refreshing lastSeenAt on unchanged open
+  // items while keeping all open items untouched in Needs You.
+  diffSurfacedDecisions(openQuestions = [], { now = this.now() } = {}) {
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    const ledger = this.state.surfacedDecisions;
+
+    const deltas = [];
+    const seenKeys = new Set();
+    let unchangedCount = 0;
+    let touchedSeen = false;
+
+    for (const q of Array.isArray(openQuestions) ? openQuestions : []) {
+      if (!q || q.status !== "open" || q.kind === "completed") continue;
+      const decisionKey = actionableDecisionKey(q);
+      const materialHash = actionableDecisionMaterialHash(q);
+      if (!decisionKey || !materialHash || seenKeys.has(decisionKey)) continue;
+      seenKeys.add(decisionKey);
+
+      const existing = ledger[decisionKey] ?? null;
+      if (existing && existing.materialHash === materialHash) {
+        unchangedCount += 1;
+        if (existing.lastSeenAt !== nowIso || existing.questionId !== q.id) {
+          existing.lastSeenAt = nowIso;
+          existing.questionId = q.id;
+          touchedSeen = true;
+        }
+        continue;
+      }
+      deltas.push({
+        question: q,
+        decisionKey,
+        materialHash,
+        change: existing ? "updated" : "new",
+        previousHash: existing?.materialHash ?? null
+      });
+    }
+
+    if (touchedSeen) this._save();
+    return { deltas, unchangedCount };
+  }
+
+  commitSurfacedDecisions(deltas = [], { now = this.now() } = {}) {
+    if (!Array.isArray(deltas) || deltas.length === 0) return 0;
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    let committed = 0;
+    for (const entry of deltas) {
+      const decisionKey = entry?.decisionKey ?? actionableDecisionKey(entry?.question ?? entry);
+      const materialHash = entry?.materialHash ?? actionableDecisionMaterialHash(entry?.question ?? entry);
+      const questionId = entry?.question?.id ?? entry?.questionId ?? null;
+      if (!decisionKey || !materialHash) continue;
+      this.state.surfacedDecisions[decisionKey] = {
+        materialHash,
+        surfacedAt: nowIso,
+        lastSeenAt: nowIso,
+        questionId
+      };
+      committed += 1;
+    }
+    const keys = Object.keys(this.state.surfacedDecisions);
+    if (keys.length > SURFACED_DECISIONS_MAX) {
+      for (const k of keys.slice(0, keys.length - SURFACED_DECISIONS_MAX)) {
+        delete this.state.surfacedDecisions[k];
+      }
+    }
+    if (committed > 0) this._save();
+    return committed;
   }
 
   // Which replacement session took over a failed one, for which failure. A
