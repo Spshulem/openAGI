@@ -983,6 +983,23 @@ export async function dispatchManagerGoal(
       dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal, dispatchId)
     });
   };
+  const recordDeliveryFailure = (persisted, sent) => {
+    const item = persisted?.item;
+    if (!item || typeof supervisor?.trackWork !== "function") return;
+    const detail = clampText(sent?.delivery?.detail || "Owner delivery was blocked.", 240);
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      state: "blocked",
+      blocker: `Dispatch delivery blocked: ${detail}`,
+      currentStep: "Dispatch recorded, but the owner did not receive it",
+      nextAction: "Retry delivery to the existing owner",
+      workflowStage: item.workflowStage || "implementing",
+      permittedNudges: "none"
+    });
+  };
 
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
@@ -996,6 +1013,7 @@ export async function dispatchManagerGoal(
     const persisted = persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
     const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const ok = sent?.delivery?.status === "sent";
+    if (!ok) recordDeliveryFailure(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
@@ -1201,6 +1219,7 @@ export async function dispatchManagerGoal(
     });
     const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const delivered = sent?.delivery?.status === "sent";
+    if (!delivered) recordDeliveryFailure(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",

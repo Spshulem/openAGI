@@ -1687,7 +1687,9 @@ export class ActiveWorkManager {
       if (item.actionable) current.actionable += 1;
       current.stages[item.workflowStage] = (current.stages[item.workflowStage] ?? 0) + 1;
       current.health[item.executionHealth] = (current.health[item.executionHealth] ?? 0) + 1;
-      if (item.nextCheckAt && (!current.nextCheckAt || item.nextCheckAt < current.nextCheckAt)) current.nextCheckAt = item.nextCheckAt;
+      if (!item.outcomeVerified && item.nextCheckAt && (!current.nextCheckAt || item.nextCheckAt < current.nextCheckAt)) {
+        current.nextCheckAt = item.nextCheckAt;
+      }
       if (item.nextMilestone) current.nextMilestones.push(item.nextMilestone);
       if (item.blocker) current.blockers.push({ blocker: item.blocker, owner: item.nextActionOwner, id: item.id });
       return groups.set(item.project, current);
