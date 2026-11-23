@@ -869,3 +869,52 @@ test('a repeated short message is not reported sent from the previous send\'s re
   await assert.rejects(remote.sendOwnerMessage('paseo:s.agent', 'continue'), /unavailable/);
   assert.equal(sends(), 0, 'it never reached the computer, and is not called sent');
 });
+
+// Incident tw_d9544149a037e8c1: an owner send with a screenshot to the BB
+// Recorder release chat came back "Fleet computer unavailable or request
+// failed" while the main's link to the fleet computer was down (heartbeat
+// 502 windows). A request that never reached the computer is retried with
+// exactly the same text and attachments, reaches it once, and is reported
+// sent only from that send's own result.
+test('an image send that never reached the computer is retried with the same attachments, once', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  const bodies = [];
+  route({ 'POST /fleet/api/send': (payload) => { bodies.push(payload.body); return { status: 200, body: { delivery: { status: 'sent', route: 'paseo-send', detail: 'Paseo message, 1 image(s), and turn confirmed', attachedImages: 1 } } }; } });
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  const attempts = [];
+  let offline = 1;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') {
+      attempts.push(structuredClone(args[3].body));
+      if (offline-- > 0) throw new Error('selected node is not connected (no poll in 90 s)');
+    }
+    return deliver(...args);
+  };
+  const images = [{ mimeType: 'image/png', data: Buffer.from('release-screenshot').toString('base64') }];
+  const key = 'paseo:srv_6csfaHcKvC-A.375e1a66-c3c1-4a32-82a8-f29b4ade001b';
+  const result = await remote.sendOwnerMessage(key, 'Submit 0.4.1 for App Review; screenshot attached.', { images });
+  assert.equal(result.delivery.status, 'sent');
+  assert.deepEqual(result.delivery.attempts.map((a) => a.kind), ['unreachable', 'ok']);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[0], attempts[1], 'the retry carries the same text and attachments');
+  assert.deepEqual(attempts[1].images, images);
+  assert.equal(sends(), 1, 'the computer received it once');
+  assert.equal(bodies.length, 1);
+  // Nothing in the attempt log carries the text or the image data.
+  assert.doesNotMatch(JSON.stringify(remote.recentAttempts()), /Submit 0\.4\.1|cmVsZWFzZS1zY3JlZW5zaG90/);
+});
+
+test('an image send the computer took but did not answer is reconciled, never resent', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') { await deliver(...args); throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true }); }
+    return deliver(...args);
+  };
+  const images = [{ mimeType: 'image/png', data: Buffer.from('release-screenshot').toString('base64') }];
+  const result = await remote.sendOwnerMessage('paseo:srv_6csfaHcKvC-A.375e1a66-c3c1-4a32-82a8-f29b4ade001b', 'Screenshot attached.', { images });
+  assert.equal(result.delivery.status, 'unknown');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(sends(), 1);
+});
