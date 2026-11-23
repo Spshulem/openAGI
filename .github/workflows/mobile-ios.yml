@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "mobile/**"
+      - "shared/SupervisorChannelsKit/**"
       - "src/**"
       - "bin/mobile-entry.mjs"
       - "examples/skills/**"

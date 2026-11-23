@@ -13,6 +13,10 @@ final class NeedsYouReviewTests: XCTestCase {
         return app
     }
 
+    private func element(_ app: XCUIApplication, _ id: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: id).firstMatch
+    }
+
     private func button(_ app: XCUIApplication, _ id: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
@@ -59,5 +63,69 @@ final class NeedsYouReviewTests: XCTestCase {
             capture("needs-you-list-scrolled-\(suffix)", app: app)
             app.terminate()
         }
+    }
+
+    /// Scan, select, read, return: one row opens one decision screen, and
+    /// Back lands on the same list with nothing reset.
+    func testRowOpensOneDecisionScreenAndBackReturnsToTheList() {
+        let app = launch(["--ui-dark"])
+        openNeedsYou(app)
+        let row = element(app, "needs-you-row-ny-deploy")
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        // The row is one control: title and why-line read together, and it
+        // is at least a 44 pt touch target.
+        XCTAssertTrue(row.label.contains("checkout redesign"), row.label)
+        XCTAssertTrue(row.label.contains("Only you can approve"), row.label)
+        XCTAssertGreaterThanOrEqual(row.frame.height, 44)
+        // FYIs are not rows of their own until asked for.
+        XCTAssertFalse(element(app, "needs-you-row-fyi-docs").exists)
+
+        row.tap()
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        XCTAssertTrue(app.navigationBars["Decision"].waitForExistence(timeout: 5))
+        // Context first, in this order, then the decision.
+        let headings = ["Goal", "Where it stands", "Why it needs you"].map { labelled(app, $0) }
+        XCTAssertTrue(headings.allSatisfy(\.exists), "Goal, state, and why come first")
+        XCTAssertLessThan(headings[0].frame.minY, headings[1].frame.minY)
+        XCTAssertLessThan(headings[1].frame.minY, headings[2].frame.minY)
+        // No message bar of its own: replies go through the Supervisor composer.
+        XCTAssertFalse(app.textFields["chat-composer"].exists)
+        capture("needs-you-detail-dark", app: app)
+        var sawReply = element(app, "needs-you-reply").exists
+        for _ in 0..<5 where !element(app, "needs-you-conversation").isHittable {
+            app.swipeUp()
+            sawReply = sawReply || element(app, "needs-you-reply").exists
+        }
+        XCTAssertTrue(sawReply, "Reply in Supervisor chat is offered")
+        XCTAssertTrue(element(app, "needs-you-conversation").isHittable, "Conversation and sources come last")
+        capture("needs-you-detail-scrolled-dark", app: app)
+
+        let back = app.navigationBars["Decision"].buttons.element(boundBy: 0)
+        XCTAssertTrue(back.waitForExistence(timeout: 5))
+        back.tap()
+        XCTAssertTrue(element(app, "needs-you-row-ny-deploy").waitForExistence(timeout: 5), "Back returns to the list")
+        XCTAssertFalse(element(app, "needs-you-detail").exists)
+
+        // Updates sit apart, collapsed, and open on request.
+        let updates = element(app, "needs-you-updates")
+        for _ in 0..<6 where !updates.isHittable { app.swipeUp() }
+        XCTAssertTrue(updates.exists)
+        updates.tap()
+        XCTAssertTrue(element(app, "needs-you-row-fyi-docs").waitForExistence(timeout: 5))
+        capture("needs-you-updates-expanded-dark", app: app)
+    }
+
+    /// The largest accessibility text size: rows wrap instead of clipping,
+    /// and the decision screen stays usable.
+    func testAccessibilityTextSizeKeepsRowsAndDecisionReadable() {
+        let app = launch(["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
+        openNeedsYou(app)
+        let row = element(app, "needs-you-row-ny-deploy")
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        XCTAssertTrue(row.isHittable)
+        capture("needs-you-list-ax-xxxl", app: app)
+        row.tap()
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        capture("needs-you-detail-ax-xxxl", app: app)
     }
 }
