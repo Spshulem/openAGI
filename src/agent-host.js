@@ -319,13 +319,13 @@ export class AgentHost {
         const spoken = matchConfirmation(text);
         if (spoken) {
           const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
-          confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+          confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal, signal: options.signal });
         }
       } else {
         const spokenBatch = matchConfirmations(text);
         if (spokenBatch) {
           const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
-          confirmation = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+          confirmation = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal, signal: options.signal });
         }
       }
       if (confirmation?.untrusted) turnState.untrusted = true;
@@ -642,7 +642,7 @@ export class AgentHost {
   // Runs or denies the pending card the owner's spoken confirm names and
   // returns the receipt the model reports. Null when nothing matched (the
   // model then reads "yes" in context, as before).
-  async confirmSpoken(spoken, { sessionId, sinceIso, principal }) {
+  async confirmSpoken(spoken, { sessionId, sinceIso, principal, signal = null }) {
     const store = this.runtime.pendingActions;
     if (!store?.findByCode || !store?.chatCandidates) return null;
     let action = null;
@@ -665,6 +665,10 @@ export class AgentHost {
     // raised in another chat resumes that chat (a computer-use lease is bound
     // to it), as a dashboard approval does.
     const sameChat = action.context?.sessionId === sessionId;
+    // The owner stopped this turn (Send Now) before this approval started:
+    // run nothing and leave the card pending, so it can still be approved.
+    // An approval already running is not passed the signal; it finishes.
+    if (signal?.aborted) return { ...receipt, status: "not run: you stopped this reply first; the action is still waiting for approval" };
     const queueContinuation = typeof this.runtime.queueApprovalContinuation === "function" ? this.runtime.queueApprovalContinuation : null;
     let executed;
     try {
@@ -687,13 +691,13 @@ export class AgentHost {
     };
   }
 
-  async confirmSpokenBatch(spokenBatch, { sessionId, sinceIso, principal }) {
+  async confirmSpokenBatch(spokenBatch, { sessionId, sinceIso, principal, signal = null }) {
     const store = this.runtime.pendingActions;
     if (!store?.findByCode || !store?.chatCandidates) return null;
     if (!spokenBatch.all && spokenBatch.codes.length <= 1) {
       return this.confirmSpoken(
         { decision: spokenBatch.decision, code: spokenBatch.codes[0] ?? null },
-        { sessionId, sinceIso, principal }
+        { sessionId, sinceIso, principal, signal }
       );
     }
     let codes = spokenBatch.codes;
@@ -709,14 +713,16 @@ export class AgentHost {
       codes = candidates.map((c) => c.confirmCode).filter(Boolean);
       if (codes.length === 0) return null;
       if (codes.length === 1) {
-        return this.confirmSpoken({ decision: spokenBatch.decision, code: codes[0] }, { sessionId, sinceIso, principal });
+        return this.confirmSpoken({ decision: spokenBatch.decision, code: codes[0] }, { sessionId, sinceIso, principal, signal });
       }
     }
     const actions = [];
     let untrusted = false;
     let instruction = null;
     for (const code of codes) {
-      const one = await this.confirmSpoken({ decision: spokenBatch.decision, code }, { sessionId, sinceIso, principal });
+      // Checked before each one: an interrupt lets the approval running now
+      // finish and starts none of the rest.
+      const one = await this.confirmSpoken({ decision: spokenBatch.decision, code }, { sessionId, sinceIso, principal, signal });
       if (!one) continue;
       if (one.untrusted) untrusted = true;
       if (!instruction && one.instruction) instruction = one.instruction;

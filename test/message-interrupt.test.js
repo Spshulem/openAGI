@@ -405,3 +405,32 @@ test("interruptTurn answers without a live registry entry from the stored record
   assert.deepEqual(await ask("turn-stored-cc"), { status: "finished", outcome: "interrupted", requestId: "turn-stored-cc" },
     "a turn lost to a restart was not interrupted by this request");
 });
+
+test("an interrupt during a chat approval batch finishes the running approval and starts none of the rest", async () => {
+  const { AgentHost } = await import("../src/agent-host.js");
+  const { ownerInterruptReason } = await import("../src/message-turns.js");
+  const first = gate();
+  const cards = {
+    "11": { id: "pa-11", confirmCode: "11", toolName: "send_email", summary: "Email A", context: { sessionId: "s" } },
+    "12": { id: "pa-12", confirmCode: "12", toolName: "send_email", summary: "Email B", context: { sessionId: "s" } }
+  };
+  const executed = [];
+  const owner = new AbortController();
+  const runtime = {
+    pendingActions: { findByCode: (code) => cards[code] ?? null, chatCandidates: () => Object.values(cards) },
+    async executeApprovedAction(id) {
+      executed.push(`${id} started`);
+      if (id === "pa-11") { owner.abort(ownerInterruptReason()); await first.opened; }
+      executed.push(`${id} finished`);
+      return { invokeResult: { ok: true, result: "sent" } };
+    }
+  };
+  const host = new AgentHost({ runtime, modelProvider: { isConfigured: () => true, generate: async () => ({ text: "x" }) } });
+  setTimeout(first.open, 30);
+  const result = await host.confirmSpokenBatch({ decision: "approve", codes: ["11", "12"] },
+    { sessionId: "s", sinceIso: null, principal: { via: "phone" }, signal: owner.signal });
+  assert.deepEqual(executed, ["pa-11 started", "pa-11 finished"], "the approval underway finished; the next never started");
+  assert.equal(result.actions[0].status, "done");
+  assert.match(result.actions[1].status, /^not run: you stopped this reply first/);
+  assert.equal(result.status, "partial");
+});
