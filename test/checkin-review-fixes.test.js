@@ -216,3 +216,48 @@ test("check-in replay: grouped sub-decisions, no duplicate generic ask, no sessi
   assert.match(text, /Where it stands:\*\* Once I have both answers, I'll update the video field/);
   assert.doesNotMatch(text, /…eady|Decisions I need from you|needs your call|session hit an error|Got it|waiting on you|\bfq_/);
 });
+
+// #366 review P2 (2nd round): "No owner action required" is not a decision.
+test("a negated or completed owner action never becomes a 'Do this yourself' decision", async (t) => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  for (const text of [
+    "The rollout is complete. No owner action required; monitoring continues automatically.",
+    "Owner action: none required, the migration was already completed."
+  ]) {
+    const ctx = buildDecisionContext({ question: { kind: "agent-ask", threadKey: "paseo:s.o", title: "Rollout: needs your call. Answer?", options: [] }, recentMessages: [{ role: "assistant", text }] });
+    assert.doesNotMatch(ctx.decision ?? "", /Do this yourself/, text);
+    assert.equal(ctx.options.length, 0);
+  }
+  // Through the check-in path: nothing is announced.
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  sup.store.upsertQuestion({ dedupeKey: "ask:noaction", kind: "agent-ask", threadKey: "paseo:s.o", title: "Rollout: needs your call. Answer?", options: [],
+    contextSnapshot: { threadTitle: "Rollout", recentMessages: [{ role: "user", text: "Roll out the new cache layer" }, { role: "assistant", text: "The rollout is complete. No owner action required; monitoring continues automatically." }] } });
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  assert.equal(res.posted, false);
+  assert.equal(msgs.length, 0);
+});
+
+// #366 review P2 (2nd round): bulleted status evidence stays in "Where it
+// stands"; only choice lists are left out.
+test("bulleted results stay in where-it-stands; only choice lists are dropped", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.rel", title: "Release v2: approve?", options: ["approve", "hold"] },
+    recentMessages: [{ role: "user", text: "Cut the v2 release" }, { role: "assistant", text: "- Staging smoke test failed with HTTP 500.\nWaiting for your release approval." }]
+  });
+  assert.match(ctx.status, /Staging smoke test failed with HTTP 500\./);
+  const choices = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.rel", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "assistant", text: "- Unit tests passed.\n\nWhich region should production use?\n- us-east\n- eu-west" }]
+  });
+  assert.match(choices.status, /Unit tests passed\./);
+  assert.doesNotMatch(choices.status, /us-east|eu-west/);
+});
+
+test("tradeoffs are said to be missing when the source states none", async () => {
+  const { buildDecisionContext, renderDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({ question: { kind: "agent-ask", threadKey: "paseo:s.t", title: "Pick a vendor?", options: ["vendor a", "vendor b"] }, recentMessages: [{ role: "user", text: "Choose a vendor for the pilot" }, { role: "assistant", text: "Both vendors pass the security review. Pick a vendor?" }] });
+  assert.match(renderDecisionContext(ctx), /Options: Vendor a; Vendor b\. Tradeoffs: not stated by the agent\./);
+});

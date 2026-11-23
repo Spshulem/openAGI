@@ -175,7 +175,6 @@ const GENERIC_STATE_RE = /^(?:Paused at a decision checkpoint|Blocked at an exte
 
 // ---- "Where it stands": one plain status sentence (two at most) ----------
 
-const OWNER_ACTION_RE = /\b(?:sign in|log in|reply|approve|allow|drag|grant|confirm|choose|pick|you need to|please)\b/i;
 const STATUS_NOISE_RE = /^(?:-{2,}|\*{2,}|!\[|\[image\]|supervisor review:|not recoverable|agent's latest update:)/i;
 const LAST_KNOWN_MS = 24 * 60 * 60 * 1000;
 
@@ -196,10 +195,30 @@ function similar(a, b) {
   return shared / Math.max(ta.size, tb.size) >= 0.6;
 }
 
+function withoutChoiceLists(text) {
+  const lines = String(text ?? "").replace(/\r/g, "").split("\n");
+  const isItem = (l) => /^\s*(?:[-*•]|\d+[.)])\s+/.test(l);
+  const out = [];
+  let inChoices = false;
+  for (const line of lines) {
+    if (isItem(line)) {
+      if (inChoices) continue;
+      if (/^\s*\d+[.)]\s+/.test(line) && /\?/.test(line)) continue;
+      out.push(line);
+      continue;
+    }
+    inChoices = Boolean(line.trim()) && CHOICE_HEADER_RE.test(line) && !RESULT_HEADER_RE.test(line);
+    if (!line.trim()) inChoices = false;
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 function statusSentences(text) {
-  // Numbered or bulleted lines are the decision's own content (its choices),
-  // not where the work stands.
-  const prose_ = String(text ?? "").split("\n").filter((l) => !/^\s*(?:[-*•]|\d+[.)])\s+/.test(l)).join("\n");
+  // Only the decision's own choice lists are left out of "where it stands":
+  // bullets right after a line asking for a choice, and numbered items that
+  // ask something. Other bullets (test results, failures) are status.
+  const prose_ = withoutChoiceLists(text);
   return splitSentences(prose_.replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
     .map((t) => t.replace(/^[-*•]\s+/, "").trim())
     // A clipped excerpt starts mid-sentence ("…eady say"); a lead-in ends in
@@ -357,11 +376,17 @@ function groupedDecisions(agentSummary, messages, options) {
 // A single action only the owner can take ("Single owner action: On
 // BuildBot2, run sudo xcodebuild -license accept."). It is a decision with
 // two real outcomes: do it (the agent continues) or not now.
-const OWNER_ACTION_LINE_RE = /\b(?:single\s+)?owner\s+action\s*:?\s*(.{6,200}?)(?:\n|$)/i;
+// Affirmative only: a line that starts "Owner action:" (optionally
+// "Single owner action:"). "No owner action required" or an action already
+// done is not a decision.
+const OWNER_ACTION_LINE_RE = /^\s*(?:[-*•]\s*)?(?:single\s+)?owner\s+action\s*:\s*(.{6,200})$/im;
+const NOT_NEEDED_RE = /\b(?:no|not|none)\b[^.]{0,30}\b(?:required|needed|necessary)\b|\b(?:already|was)\s+(?:done|completed|handled|applied)\b/i;
 
 function agentOwnerAction(agentSummary, messages) {
-  const m = OWNER_ACTION_LINE_RE.exec(String(latestAgentText(agentSummary, messages)).replace(/\*\*/g, ""));
-  return m ? prose(m[1].replace(/^[:\s]+/, ""), 200) : null;
+  const text = String(latestAgentText(agentSummary, messages)).replace(/\*\*/g, "");
+  const m = OWNER_ACTION_LINE_RE.exec(text);
+  if (!m || NOT_NEEDED_RE.test(m[1])) return null;
+  return prose(m[1], 200);
 }
 
 // The agent's own question, e.g. "Rotate the key, or hold?".
@@ -692,7 +717,10 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
     ? ctx.groups.map((g, i) => `(${i + 1}) ${g.label}: ${g.options.map(optText).join(" or ")}`).join(" ")
     : ctx.options.map(optText).join("; ");
   const rec = ctx.recommendation ? (/^recommend/i.test(ctx.recommendation) ? ctx.recommendation : `Recommendation: ${ctx.recommendation}`) : null;
-  const four = [ctx.decision, opts ? `Options: ${opts.replace(/\.$/, "")}.` : null, rec].filter(Boolean).join(" ");
+  // Tradeoffs are shown when the source states them, and said to be missing
+  // otherwise, never invented.
+  const noTradeoffs = ctx.options.length > 0 && !ctx.options.some((o) => o.consequence);
+  const four = [ctx.decision, opts ? `Options: ${opts.replace(/\.$/, "")}.` : null, noTradeoffs ? "Tradeoffs: not stated by the agent." : null, rec].filter(Boolean).join(" ");
   if (four) lines.push(`4. ${b("Decision now:")} ${four}`);
   if (ctx.sources.length) {
     lines.push(markdown
