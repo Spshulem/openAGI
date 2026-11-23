@@ -15,7 +15,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/(?:act|admin-merge)|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -194,7 +194,7 @@ export class RemoteFleetSupervisor {
       const unsupportedRoute = (reached && status === 404 && /unknown fleet route/i.test(rawMsg))
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
+      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/(?:act|admin-merge)$/.test(path);
       const nonOutageError = missingThread || closedCard || unsupportedRoute;
       if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
@@ -572,6 +572,25 @@ export class RemoteFleetSupervisor {
   async routeIssue(input = {}) {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
     return rest;
+  }
+  // The owner's Admin Merge runs on the fleet computer, where its consent
+  // lives. Only the main's owner route calls these.
+  async previewAdminMerge(cardId, { initiator = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { preview: true });
+  }
+  async adminMergeCard(cardId, { initiator = null, consent = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { consent });
+  }
+  async adminMergeRequest(cardId, body) {
+    try {
+      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/admin-merge`, body)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      if (error.unsupportedRoute) return { ok: false, kind: 'admin_merge', status: 'unsupported', detail: 'The fleet computer runs an older OpenAGI without Admin Merge. Update it first.' };
+      throw error;
+    }
   }
   async actCard(cardId, input = {}) {
     if (this.selfFixHub && typeof cardId === 'string') {

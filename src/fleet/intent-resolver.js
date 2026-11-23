@@ -1,12 +1,14 @@
-// Safe PR merge preflight + execution and natural-utterance card matching.
-// Enforces the progressive non-auto-merge contract:
+// Safe PR merge preflight + execution, the owner's separate Admin Merge, and
+// natural-utterance card matching. Ordinary merge never bypasses anything
+// (no --admin): a PR held by its required review halts and offers Admin
+// Merge. Enforces the progressive non-auto-merge contract:
 //   1. Default mergePolicy is "manual_confirm" (never passes `gh pr merge --auto`
 //      unless the owner explicitly switched mergePolicy to "queue_when_green").
 //   2. Verifies PR state, draft flag, expected head SHA, merge conflicts, and
 //      CI rollup live right before merging.
 //   3. Halts immediately on drift, conflict, or red CI so nothing broken merges.
 
-import { clampText, parsePrRef, redactSecrets, runCommand } from "./contracts.js";
+import { clampText, clampTextLines, parsePrRef, redactSecrets, runCommand } from "./contracts.js";
 import { requiredChecksFor } from "./sources/github.js";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -52,15 +54,15 @@ async function verifyRequiredBranchChecks(run, ghBin, parsed) {
   try {
     checks = JSON.parse(res.stdout || "[]");
   } catch {
-    return { ok: false, detail: "Could not parse required branch checks before admin merge override." };
+    return { ok: false, detail: "Could not parse the required branch checks." };
   }
   if (!Array.isArray(checks)) return { ok: false, detail: "Unexpected required checks payload from GitHub." };
   const incomplete = checks.filter((c) => !["pass", "skipping"].includes(String(c?.bucket ?? "").toLowerCase()));
   if (incomplete.length > 0) {
     const names = incomplete.map((c) => c?.name || "required check").slice(0, 3).join(", ");
-    return { ok: false, detail: `Required check(s) not yet passing (${names}). Merge halted safely.` };
+    return { ok: false, detail: `Required check(s) not yet passing (${names}).` };
   }
-  return { ok: true };
+  return { ok: true, checks: checks.map((c) => String(c?.name ?? "")).filter(Boolean) };
 }
 
 function summarizeRollup(rollup) {
@@ -86,7 +88,6 @@ export async function executeSafePrMerge({
   prRef,
   expectedHeadSha = null,
   mergePolicy = "manual_confirm",
-  ownerConfirmed = false,
   config = null,
   ghBin = "gh",
   run = runCommand
@@ -212,17 +213,20 @@ export async function executeSafePrMerge({
     };
   }
 
+  // Ordinary Merge never bypasses anything. A PR held only by its required
+  // review halts here and names the separate, owner-only Admin Merge path.
   const reviewDecision = String(view.reviewDecision ?? "").toUpperCase();
-  const hasNonEmptyGreenRollup = Array.isArray(view.statusCheckRollup) && view.statusCheckRollup.length > 0;
-  const configuredGatesGreen = rollupPassesConfiguredGates(view.statusCheckRollup, parsed.repo, config);
-  const ownerOverrideEligible = ownerConfirmed === true
-    && mergeState === "BLOCKED"
-    && mergeable === "MERGEABLE"
-    && reviewDecision === "REVIEW_REQUIRED"
-    && hasNonEmptyGreenRollup
-    && configuredGatesGreen;
-
-  if ((mergeState === "BLOCKED" && !ownerOverrideEligible) || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
+  if (mergeState === "BLOCKED" && mergeable === "MERGEABLE" && reviewDecision === "REVIEW_REQUIRED") {
+    return {
+      status: "halted",
+      reason: "review_required",
+      prRef,
+      headRefOid: liveSha || null,
+      adminMergeOffered: true,
+      detail: `${prRef} still needs the approving review its branch rules require. Merge never bypasses that; use Admin Merge if you deliberately want to waive the required review.`
+    };
+  }
+  if (mergeState === "BLOCKED" || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
     return {
       status: "halted",
       reason: "blocked",
@@ -246,45 +250,315 @@ export async function executeSafePrMerge({
     };
   }
 
-  if (ownerOverrideEligible || (ownerConfirmed === true && mergeable === "MERGEABLE" && hasNonEmptyGreenRollup && configuredGatesGreen && reviewDecision === "REVIEW_REQUIRED")) {
-    const reqVerification = await verifyRequiredBranchChecks(run, ghBin, parsed);
-    if (!reqVerification.ok) {
-      return {
-        status: "halted",
-        reason: "blocked",
-        prRef,
-        detail: reqVerification.detail
-      };
-    }
-    const adminRes = await run(
-      ghBin,
-      ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--admin", "--squash", ...headArgs],
-      { timeoutMs: 30_000 }
-    );
-    if (adminRes.code === 0) {
-      return {
-        status: "merged",
-        prRef,
-        headRefOid: liveSha || null,
-        url: view.url ?? null,
-        adminOverride: true,
-        detail: `Merged ${prRef} via squash (owner-confirmed branch protection override).`
-      };
-    }
-    return {
-      status: "halted",
-      reason: "gh_merge_failed",
-      prRef,
-      detail: clampText(redactSecrets(adminRes.stderr || adminRes.stdout || mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection or admin permissions)."), 220)
-    };
-  }
-
   return {
     status: "halted",
     reason: "gh_merge_failed",
     prRef,
     detail: clampText(redactSecrets(mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection reviews)."), 220)
   };
+}
+
+// ─── Admin Merge ─────────────────────────────────────────────────────────
+// The owner's deliberate, separate path (never reached by ordinary Merge,
+// batch actions, or any agent tool). It waives exactly one thing, the
+// required approving review, through GitHub's own `gh pr merge --admin`
+// bypass, and only where GitHub already lets the authenticated identity do
+// that. It never bypasses failing or pending checks, conflicts, drafts, a
+// moved head, or any other branch rule. It never edits rules, settings, or
+// credentials, never force-pushes, never falls back to anything else, and
+// runs only when the owner's consent names the exact repo, PR number, head
+// SHA, and action.
+
+export const ADMIN_MERGE_ACTION = "admin_merge";
+export const ADMIN_MERGE_WAIVER = "required_review";
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const GITHUB_DETAIL_MAX = 600;
+
+// Ruleset rules that a GitHub squash merge cannot break (creation, deletion,
+// non_fast_forward, linear history, signatures: GitHub signs the squash
+// commit) or that Admin Merge verifies itself (status checks; the
+// pull_request rule's review count is the one waiver, its thread-resolution
+// and merge-method parts are checked below). Any other active rule is
+// something --admin could skip, so Admin Merge refuses instead.
+const RULESET_RULES_SAFE = new Set([
+  "creation", "deletion", "non_fast_forward", "required_linear_history",
+  "required_signatures", "required_status_checks", "pull_request"
+]);
+
+function githubMessage(res) {
+  const raw = String(res?.stderr || res?.stdout || res?.error || "").trim();
+  return clampText(redactSecrets(raw || "GitHub returned no message."), GITHUB_DETAIL_MAX);
+}
+
+function halt(reason, prRef, detail, extra = {}) {
+  return { ok: false, status: "halted", reason, prRef, detail, ...extra };
+}
+
+async function ghApiJson(run, ghBin, endpoint) {
+  const res = await run(ghBin, ["api", endpoint], { timeoutMs: 20_000 });
+  if (res.code === 0) {
+    try {
+      return { ok: true, data: JSON.parse(res.stdout || "null") };
+    } catch {
+      return { ok: false, message: `Could not parse GitHub's reply for ${endpoint}.` };
+    }
+  }
+  const text = `${res.stderr ?? ""}\n${res.stdout ?? ""}`;
+  return { ok: false, notProtected: /Branch not protected/i.test(text), message: githubMessage(res) };
+}
+
+// Classic branch protection settings --admin would otherwise skip.
+function classicProtectionBlockers(protection) {
+  const blockers = [];
+  if (protection?.enforce_admins?.enabled === true) {
+    blockers.push("branch protection applies to administrators too (enforce_admins), so GitHub does not allow an admin bypass here");
+  }
+  if (protection?.lock_branch?.enabled === true) blockers.push("the base branch is locked (lock_branch)");
+  if (protection?.restrictions) blockers.push("pushes to the base branch are restricted to specific people, teams, or apps (restrictions)");
+  return blockers;
+}
+
+function rulesetBlockers(rules) {
+  const blockers = [];
+  let threadResolution = false;
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    const type = String(rule?.type ?? "");
+    if (!RULESET_RULES_SAFE.has(type)) {
+      blockers.push(`ruleset rule "${type || "unknown"}"`);
+      continue;
+    }
+    if (type === "pull_request") {
+      const params = rule?.parameters ?? {};
+      if (params.required_review_thread_resolution === true) threadResolution = true;
+      const methods = Array.isArray(params.allowed_merge_methods) ? params.allowed_merge_methods : null;
+      if (methods && !methods.map((m) => String(m).toLowerCase()).includes("squash")) {
+        blockers.push("ruleset allows only " + methods.join("/") + " merges, not squash");
+      }
+    }
+  }
+  return { blockers, threadResolution };
+}
+
+async function unresolvedReviewThreads(run, ghBin, parsed) {
+  const [owner, name] = parsed.repo.split("/");
+  const query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}";
+  const res = await run(
+    ghBin,
+    ["api", "graphql", "-f", `query=${query}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${parsed.number}`],
+    { timeoutMs: 20_000 }
+  );
+  if (res.code !== 0) return { ok: false, message: githubMessage(res) };
+  try {
+    const threads = JSON.parse(res.stdout || "{}")?.data?.repository?.pullRequest?.reviewThreads;
+    const nodes = Array.isArray(threads?.nodes) ? threads.nodes : null;
+    if (!nodes || !(threads.totalCount <= nodes.length)) return { ok: false, message: "Could not read every review thread." };
+    return { ok: true, unresolved: nodes.filter((n) => n?.isResolved !== true).length };
+  } catch {
+    return { ok: false, message: "Could not parse review threads." };
+  }
+}
+
+// Live, read-only check of everything Admin Merge requires. Returns
+// { ok: true, plan } naming exactly what would be waived, or a halt.
+export async function preflightAdminMerge({
+  prRef,
+  expectedHeadSha = null,
+  config = null,
+  ghBin = "gh",
+  run = runCommand
+} = {}) {
+  const parsed = parsePrRef(prRef);
+  if (!parsed || !REPO_PATTERN.test(parsed.repo) || !(parsed.number > 0)) {
+    return halt("invalid_pr_ref", prRef ?? null, "Invalid pull request reference.");
+  }
+  const ref = `${parsed.repo}#${parsed.number}`;
+
+  const viewRes = await run(
+    ghBin,
+    [
+      "pr", "view", String(parsed.number),
+      "--repo", parsed.repo,
+      "--json", "state,isDraft,mergeStateStatus,mergeable,reviewDecision,headRefOid,baseRefName,statusCheckRollup,url,title"
+    ],
+    { timeoutMs: 25_000 }
+  );
+  if (viewRes.code !== 0 || !viewRes.stdout) {
+    return halt("github_unreachable", ref, `Could not read ${ref} on GitHub: ${githubMessage(viewRes)}`);
+  }
+  let view;
+  try {
+    view = JSON.parse(viewRes.stdout);
+  } catch {
+    return halt("github_parse_error", ref, "Could not parse GitHub PR status.");
+  }
+
+  const state = String(view.state ?? "").toUpperCase();
+  if (state === "MERGED") return { ok: false, status: "already_merged", reason: "already_merged", prRef: ref, url: view.url ?? null, detail: `${ref} is already merged.` };
+  if (state !== "OPEN") return halt("pr_closed", ref, `${ref} is ${state.toLowerCase() || "closed"}; nothing was merged.`);
+  if (view.isDraft === true) return halt("draft_pr", ref, `${ref} is still a draft PR.`);
+
+  const liveSha = String(view.headRefOid ?? "").trim().toLowerCase();
+  if (!FULL_SHA.test(liveSha)) return halt("head_unknown", ref, `GitHub did not report a head commit for ${ref}.`);
+  const pinned = String(expectedHeadSha ?? "").trim().toLowerCase();
+  if (pinned && (pinned.length < 7 || !liveSha.startsWith(pinned))) {
+    return halt("head_changed", ref, `New commit (${liveSha.slice(0, 7)}) landed on ${ref} after review. Inspect the updated diff first.`, { headRefOid: liveSha });
+  }
+
+  const mergeState = String(view.mergeStateStatus ?? "").toUpperCase();
+  const mergeable = String(view.mergeable ?? "").toUpperCase();
+  if (mergeState === "DIRTY" || mergeable === "CONFLICTING") {
+    return halt("merge_conflict", ref, `${ref} has merge conflicts with its base. Admin Merge never bypasses conflicts.`, { canFixCi: true });
+  }
+  if (mergeable !== "MERGEABLE") {
+    return halt("mergeability_unknown", ref, `GitHub has not finished checking whether ${ref} can merge (${mergeable || "unknown"}). Try again in a moment.`);
+  }
+  if (mergeState === "BEHIND") {
+    return halt("behind_base", ref, `${ref} is behind its base branch and must be updated first. Admin Merge never bypasses that.`, { canFixCi: true });
+  }
+
+  const { failing, pending } = summarizeRollup(view.statusCheckRollup);
+  if (failing.length > 0) {
+    return halt("ci_failed", ref, `Checks are failing on ${ref} (${failing.slice(0, 3).join(", ")}). Admin Merge never bypasses failing checks.`, { canFixCi: true, failingChecks: failing.slice(0, 5) });
+  }
+  if (pending.length > 0) {
+    return halt("ci_pending", ref, `Checks are still running on ${ref} (${pending.slice(0, 3).join(", ")}). Admin Merge never bypasses pending checks.`, { pendingChecks: pending.slice(0, 5) });
+  }
+  if (!rollupPassesConfiguredGates(view.statusCheckRollup, parsed.repo, config)) {
+    return halt("checks_not_green", ref, `A check Supervisor requires for ${parsed.repo} has not passed on ${ref}.`);
+  }
+
+  const reviewDecision = String(view.reviewDecision ?? "").toUpperCase();
+  if (mergeState !== "BLOCKED") {
+    const plainMergeable = mergeState === "CLEAN" || mergeState === "HAS_HOOKS";
+    return halt("nothing_to_waive", ref, `${ref} is not held by a required review (GitHub merge state: ${mergeState || "unknown"}).${plainMergeable ? " Use ordinary Merge." : " Admin Merge waives nothing else."}`);
+  }
+  if (reviewDecision === "CHANGES_REQUESTED") {
+    return halt("changes_requested", ref, `A reviewer requested changes on ${ref}. Admin Merge only waives a missing required review, not requested changes.`);
+  }
+  if (reviewDecision !== "REVIEW_REQUIRED") {
+    return halt("blocked_other", ref, `${ref} is blocked by something other than a required review (review decision: ${reviewDecision || "none"}). Admin Merge only waives a required review.`);
+  }
+
+  const required = await verifyRequiredBranchChecks(run, ghBin, parsed);
+  if (!required.ok) return halt("required_checks_not_passing", ref, `${required.detail} Admin Merge never bypasses required checks.`);
+
+  const base = String(view.baseRefName ?? "").trim();
+  if (!base) return halt("base_unknown", ref, `GitHub did not report the base branch of ${ref}.`);
+  const branchPath = `repos/${parsed.repo}/branches/${encodeURIComponent(base)}`;
+
+  const rules = await ghApiJson(run, ghBin, `repos/${parsed.repo}/rules/branches/${encodeURIComponent(base)}`);
+  if (!rules.ok) return halt("rules_unreadable", ref, `Could not read the rules on ${base}, so Admin Merge cannot confirm only the required review would be waived. GitHub said: ${rules.message}`);
+  const ruleset = rulesetBlockers(rules.data);
+
+  const protection = await ghApiJson(run, ghBin, `${branchPath}/protection`);
+  if (!protection.ok && !protection.notProtected) {
+    return halt("protection_unreadable", ref, `Could not read branch protection on ${base}, so Admin Merge cannot confirm only the required review would be waived. GitHub said: ${protection.message}`);
+  }
+  const classic = protection.ok ? protection.data : null;
+  const blockers = [...ruleset.blockers, ...classicProtectionBlockers(classic)];
+  if (blockers.length > 0) {
+    return halt("other_rule", ref, `Admin Merge only waives the required review, but ${base} also has: ${blockers.join("; ")}. Supervisor will not bypass that or change any rule.`, { otherRules: blockers });
+  }
+  if (ruleset.threadResolution || classic?.required_conversation_resolution?.enabled === true) {
+    const threads = await unresolvedReviewThreads(run, ghBin, parsed);
+    if (!threads.ok) return halt("threads_unreadable", ref, `${base} requires resolved conversations and Admin Merge could not confirm they are. GitHub said: ${threads.message}`);
+    if (threads.unresolved > 0) {
+      return halt("unresolved_conversations", ref, `${ref} has ${threads.unresolved} unresolved review conversation(s) and ${base} requires them resolved. Admin Merge never bypasses that.`);
+    }
+  }
+
+  const who = await run(ghBin, ["api", "user", "--jq", ".login"], { timeoutMs: 15_000 });
+  const githubLogin = who.code === 0 ? String(who.stdout ?? "").trim().slice(0, 100) || null : null;
+
+  const checks = Array.isArray(required.checks) ? required.checks : [];
+  return {
+    ok: true,
+    status: "ready",
+    prRef: ref,
+    plan: {
+      action: ADMIN_MERGE_ACTION,
+      repo: parsed.repo,
+      number: parsed.number,
+      prRef: ref,
+      title: typeof view.title === "string" ? clampText(view.title, 200) : null,
+      url: view.url ?? null,
+      headSha: liveSha,
+      baseRef: base,
+      method: "squash",
+      githubLogin,
+      waives: [{
+        rule: ADMIN_MERGE_WAIVER,
+        label: "Required approving review",
+        detail: `GitHub reports ${ref} as REVIEW_REQUIRED: ${base} requires an approving review this PR does not have.`
+      }],
+      stillEnforced: [
+        checks.length ? `Required checks passing on ${liveSha.slice(0, 7)} (${checks.slice(0, 5).join(", ")})` : `No required checks on ${base}; every reported check is passing`,
+        "No merge conflicts; not behind base",
+        `Merges only if the head is still ${liveSha.slice(0, 7)}`,
+        "Every other branch rule"
+      ],
+      command: `gh pr merge ${parsed.number} --repo ${parsed.repo} --admin --squash --match-head-commit ${liveSha}`
+    }
+  };
+}
+
+// Runs the owner's Admin Merge. consent must be the exact
+// { action: "admin_merge", repo, number, headSha } the owner confirmed; the
+// full preflight runs again live first. One `gh pr merge --admin` call, no
+// retry or fallback. GitHub's own answer is returned verbatim (redacted).
+export async function executeAdminMerge({
+  prRef,
+  consent = null,
+  expectedHeadSha = null,
+  config = null,
+  ghBin = "gh",
+  run = runCommand
+} = {}) {
+  const parsed = parsePrRef(prRef);
+  if (!parsed) return halt("invalid_pr_ref", prRef ?? null, "Invalid pull request reference.");
+  const ref = `${parsed.repo}#${parsed.number}`;
+  const consentSha = String(consent?.headSha ?? "").trim().toLowerCase();
+  if (!consent || consent.action !== ADMIN_MERGE_ACTION || typeof consent.repo !== "string"
+      || !Number.isInteger(consent.number) || !FULL_SHA.test(consentSha)) {
+    return halt("consent_missing", ref, "Admin Merge needs the owner's explicit consent naming the action, repo, PR number, and full head SHA.");
+  }
+  if (consent.repo.toLowerCase() !== parsed.repo.toLowerCase() || consent.number !== parsed.number) {
+    return halt("consent_mismatch", ref, `The Admin Merge consent was for ${consent.repo}#${consent.number}, not ${ref}. Nothing was merged.`);
+  }
+
+  const preflight = await preflightAdminMerge({ prRef: ref, expectedHeadSha, config, ghBin, run });
+  if (!preflight.ok) return preflight;
+  const { plan } = preflight;
+  if (plan.headSha !== consentSha) {
+    return halt("head_changed", ref, `${ref} moved to ${plan.headSha.slice(0, 7)} after you confirmed Admin Merge for ${consentSha.slice(0, 7)}. Nothing was merged; review the new commit and confirm again.`, { headRefOid: plan.headSha });
+  }
+
+  const res = await run(
+    ghBin,
+    ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--admin", "--squash", "--match-head-commit", consentSha],
+    { timeoutMs: 30_000 }
+  );
+  const github = {
+    exitCode: typeof res.code === "number" ? res.code : null,
+    stdout: clampTextLines(redactSecrets(String(res.stdout ?? "")), GITHUB_DETAIL_MAX),
+    stderr: clampTextLines(redactSecrets(String(res.stderr ?? res.error ?? "")), GITHUB_DETAIL_MAX)
+  };
+  if (res.code === 0) {
+    return {
+      ok: true,
+      status: "merged",
+      prRef: ref,
+      headRefOid: consentSha,
+      url: plan.url,
+      adminOverride: true,
+      waived: [ADMIN_MERGE_WAIVER],
+      githubLogin: plan.githubLogin,
+      plan,
+      github,
+      detail: `Admin merged ${ref} at ${consentSha.slice(0, 7)} via squash, waiving only the required review.`
+    };
+  }
+  return halt("github_rejected", ref, `GitHub rejected the Admin Merge of ${ref}: ${githubMessage(res)}`, { plan, github, githubLogin: plan.githubLogin });
 }
 
 // Resolves which SupervisorCard a natural-language reply targets:

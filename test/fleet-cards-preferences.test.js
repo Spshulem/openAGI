@@ -795,8 +795,8 @@ test("fleet_act_card pins the concrete resolved operation in queued approval arg
   }
 });
 
-test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge_and_deploy, and inline Paseo choice cards", async () => {
-  // 1. REVIEW_REQUIRED + green checks: halts without ownerConfirmed, succeeds via --admin fallback when ownerConfirmed
+test("ordinary merge never bypasses REVIEW_REQUIRED; merge_and_deploy and inline Paseo choice cards", async () => {
+  // 1. REVIEW_REQUIRED + green checks: ordinary merge halts and offers Admin Merge; it never runs gh pr merge or --admin
   const calls = [];
   const runReviewProtected = async (cmd, args) => {
     calls.push([cmd, ...args]);
@@ -832,29 +832,31 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     return { code: 1, stdout: "", stderr: "unexpected" };
   };
 
-  const haltedUnconfirmed = await executeSafePrMerge({
+  const halted = await executeSafePrMerge({
     prRef: "acme/webapp#9599",
     expectedHeadSha: "abc9599",
-    ownerConfirmed: false,
     run: runReviewProtected
   });
-  assert.equal(haltedUnconfirmed.status, "halted");
-  assert.equal(calls.length, 1);
+  assert.equal(halted.status, "halted");
+  assert.equal(halted.reason, "review_required");
+  assert.equal(halted.adminMergeOffered, true);
+  assert.match(halted.detail, /Admin Merge/);
+  assert.equal(calls.length, 1, "only the live read; no merge attempt");
 
-  const mergedOwner = await executeSafePrMerge({
+  // A legacy ownerConfirmed flag changes nothing: still no merge, no --admin.
+  const legacyFlag = await executeSafePrMerge({
     prRef: "acme/webapp#9599",
     expectedHeadSha: "abc9599",
     ownerConfirmed: true,
     run: runReviewProtected
   });
-  assert.equal(mergedOwner.status, "merged");
-  assert.equal(mergedOwner.adminOverride, true);
-  assert.ok(calls.at(-1).includes("--admin") && calls.at(-1).includes("--match-head-commit") && calls.at(-1).includes("abc9599def"));
+  assert.equal(legacyFlag.reason, "review_required");
+  assert.equal(calls.filter((c) => c.includes("merge")).length, 0);
+  assert.equal(calls.some((c) => c.includes("--admin")), false);
 
-  // CHANGES_REQUESTED must still halt even with ownerConfirmed: true!
+  // CHANGES_REQUESTED halts too.
   const changesRequested = await executeSafePrMerge({
     prRef: "acme/webapp#9599",
-    ownerConfirmed: true,
     run: async () => ({
       code: 0,
       stdout: JSON.stringify({
@@ -871,11 +873,10 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
   });
   assert.equal(changesRequested.status, "halted");
 
-  // Missing/expected required check must halt BEFORE --admin even when rollup has an optional green check!
+  // Missing/expected required check: ordinary merge still never tries --admin.
   let adminAttempted = false;
   const unpostedRequired = await executeSafePrMerge({
     prRef: "acme/webapp#9599",
-    ownerConfirmed: true,
     run: async (_cmd, args) => {
       if (args[0] === "pr" && args[1] === "view") {
         return {
@@ -911,8 +912,28 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
 
   // 2. merge_and_deploy + Paseo inline choice card delivery on risky production choice
   const delivered = [];
+  const runClean = async (_cmd, args) => {
+    if (args[0] === "pr" && args[1] === "view") {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          state: "OPEN",
+          isDraft: false,
+          mergeStateStatus: "CLEAN",
+          mergeable: "MERGEABLE",
+          reviewDecision: "APPROVED",
+          headRefOid: "abc9599def",
+          statusCheckRollup: [{ name: "test", status: "COMPLETED", conclusion: "SUCCESS" }],
+          url: "https://github.com/acme/webapp/pull/9599"
+        }),
+        stderr: ""
+      };
+    }
+    if (args[0] === "pr" && args[1] === "merge" && !args.includes("--admin")) return { code: 0, stdout: "Merged", stderr: "" };
+    return { code: 1, stdout: "", stderr: "unexpected" };
+  };
   const { supervisor, cleanup } = tempSupervisor({
-    ghRun: runReviewProtected
+    ghRun: runClean
   });
   try {
     await supervisor.setMode("auto");
@@ -981,7 +1002,7 @@ test("ownerConfirmed safe merge handles REVIEW_REQUIRED branch protection, merge
     assert.equal(delivered.length, 1);
     assert.match(delivered[0].message, /Staging, then production/);
 
-    // Merge & Deploy card action merges via ownerConfirmed override AND pings coding session!
+    // Merge & Deploy card action merges (ordinary, no bypass) AND pings coding session!
     const readyCard = supervisor.getState().cards.find((c) => c.id === prQ.id);
     assert.ok(readyCard.extraActions.some((a) => a.op === "merge_and_deploy"));
     const shipped = await supervisor.actCard(prQ.id, { op: "merge_and_deploy" });

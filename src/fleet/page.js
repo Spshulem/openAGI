@@ -85,6 +85,7 @@ details.thread>summary{padding:0}
 a.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text)}
 a.btn.primary{color:var(--ink)}
 .risk{margin:10px 0 0;font-size:14px;font-weight:650;color:var(--hot)}
+.admin{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.admin p{margin:6px 0 0;font-size:14px}.admin code{word-break:break-all}.btn.hot{border-color:var(--hot);color:var(--hot)}
 .chats{display:grid;gap:6px;margin-top:10px;font-size:14px;color:var(--soft)}
 .chats div{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
 .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
@@ -466,6 +467,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       // Answered only in the agent's app: the way there comes first.
       if (inApp) openChatLink(q.openChat, 'btn primary', opts);
       answerButtons(q, opts, !inApp);
+      adminMergeOffer(q, t && t.pr, card);
       if (inApp) {
         el('p', 'note', appNote(q), card);
       } else if (q.kind === 'agent-ask') {
@@ -527,6 +529,73 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     });
     buttons.push(button('Dismiss', 'btn ghost', parent, function () { return decide(q, { dismiss: true }, buttons); }));
     return buttons;
+  }
+
+  // Admin Merge: offered only on an open PR GitHub reports as held by its
+  // required review. Ordinary answers never bypass anything; this is a
+  // separate, deliberate step. Preview (read-only) shows what would be
+  // waived and the exact repo, PR, and head; only then can the owner confirm.
+  function adminMergeOffer(q, pr, card) {
+    if (!q.prRef || !pr || String(q.prRef).toLowerCase() !== String(pr.repo + '#' + pr.number).toLowerCase()) return;
+    var up = function (v) { return String(v || '').toUpperCase(); };
+    if (up(pr.state) !== 'OPEN' || pr.isDraft || up(pr.mergeState) !== 'BLOCKED' || up(pr.reviewDecision) !== 'REVIEW_REQUIRED') return;
+    var box = el('div', 'admin', null, card);
+    el('p', 'note', 'GitHub holds this PR for a required review. Merge will not bypass that.', box);
+    var b = button('Admin Merge…', 'btn ghost', box, function () { return adminPreview(q, box, b); });
+  }
+
+  function adminPath(q) { return '/fleet/api/cards/' + encodeURIComponent(q.id) + '/admin-merge'; }
+
+  async function adminPreview(q, box, b) {
+    b.disabled = true;
+    try {
+      var r = await api(adminPath(q), { preview: true });
+      var res = r && r.result;
+      if (!res || !res.ok || !res.plan || !res.consent) {
+        b.disabled = false;
+        say('Admin Merge not available: ' + ((res && res.detail) || 'no preview returned.'), true);
+        return;
+      }
+      adminPlan(q, box, res.plan, res.consent);
+    } catch (e) {
+      b.disabled = false;
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
+  }
+
+  function adminPlan(q, box, plan, consent) {
+    box.replaceChildren();
+    el('p', 'risk', 'Admin Merge uses your GitHub admin bypass. Read all of it before you confirm.', box);
+    var what = el('p', null, 'Squash-merge ' + plan.repo + '#' + plan.number + ' into ' + plan.baseRef + ' at head ', box);
+    el('code', null, plan.headSha, what);
+    if (plan.githubLogin) el('p', 'note', 'As GitHub user ' + plan.githubLogin + '.', box);
+    el('p', 'k', 'Waives only:', box);
+    (plan.waives || []).forEach(function (w) { el('p', null, '• ' + w.label + ': ' + w.detail, box); });
+    el('p', 'k', 'Still enforced:', box);
+    (plan.stillEnforced || []).forEach(function (line) { el('p', null, '• ' + line, box); });
+    el('p', 'note', 'GitHub decides whether your identity may bypass the review. If it refuses, you will see its exact answer. Nothing is deployed. Confirm before ' + when(consent.expiresAt) + '.', box);
+    var acts = el('div', 'opts', null, box);
+    var buttons = [];
+    buttons.push(button('Admin Merge ' + plan.repo + '#' + plan.number + ' at ' + plan.headSha.slice(0, 7), 'btn hot', acts, function () {
+      return adminConfirm(q, consent, buttons);
+    }));
+    buttons.push(button('Cancel', 'btn ghost', acts, function () { return load(); }));
+  }
+
+  async function adminConfirm(q, consent, buttons) {
+    buttons.forEach(function (b) { b.disabled = true; });
+    try {
+      var r = await api(adminPath(q), { consent: consent });
+      var res = r && r.result;
+      if (r && r.state) render(r.state); else await load();
+      if (res && res.ok) say(res.detail || 'Admin merged.');
+      else say((res && res.detail) || 'Admin Merge halted. Nothing was merged.', true);
+    } catch (e) {
+      buttons.forEach(function (b) { b.disabled = false; });
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
   }
 
   // Why the supervisor's review kept an open question (live), or the close
