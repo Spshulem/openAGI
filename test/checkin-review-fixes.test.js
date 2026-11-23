@@ -166,3 +166,53 @@ test("check-in: at most four verified decisions, merges first, nothing else", as
   assert.equal(res.posted, false);
   assert.equal(msgs.length, 2);
 });
+
+// #366 review P2: options come only from a choices list tied to the
+// decision, never from verification bullets.
+test("verification bullets are never recovered as decision options", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.r", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "user", text: "Roll the API out to production" }, { role: "assistant", text: "Verified:\n- Unit tests passed\n- Staging smoke test passed\nBlocked on your decision on the production region." }]
+  });
+  assert.equal(ctx.options.length, 0, "test results are not choices");
+  assert.ok(ctx.missing.includes("decision"), "so the ask is not a verified decision");
+  const listed = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.r", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "assistant", text: "Verified:\n- Unit tests passed\n\nWhich region should production use?\n- us-east\n- eu-west" }]
+  });
+  assert.deepEqual(listed.options.map((o) => o.label), ["Us-east", "Eu-west"]);
+});
+
+// #366 review P2: a resolved decision mentioned in passing must not replace
+// the real current ask.
+test("a past decision named in an update does not override the current question", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.d", title: "Approve the production deployment?", options: ["approve", "hold"] },
+    recentMessages: [{ role: "assistant", text: "I applied your decision on the EU region. The build passed staging verification. Production deployment still needs your approval." }]
+  });
+  assert.equal(ctx.decision, "Approve the production deployment?");
+});
+
+// Live repro 2026-11-23 ~21:30Z (synthetic text, same structure): a rich
+// multi-part ask and a generic yes/no duplicate from the same session, plus a
+// session error. The check-in groups the real sub-decisions with the
+// recommendation, drops the duplicate and the error, and has no counts.
+test("check-in replay: grouped sub-decisions, no duplicate generic ask, no session error, no counts", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  const agent = "…eady say the email is only used to match accounts.\n\n**Decisions I need from you:**\n1. **The video:** will you record the narrated walkthrough and give me a public link? Or should I put screenshots in a public folder? If so, tell me where.\n2. **App Home:** should I add the welcome message so reviewers see it? Or leave the warning?\n\nOnce I have both answers, I'll update the video field and get the submission ready.";
+  const snap = { threadTitle: "Marketplace submission", recentMessages: [{ role: "user", text: "Fix the marketplace submission and get it ready to resubmit" }, { role: "assistant", text: agent }], agentSummary: agent };
+  sup.store.upsertQuestion({ dedupeKey: "ask:rich", kind: "agent-ask", threadKey: "paseo:s.mkt", title: "Marketplace: choose video and App Home", body: agent, options: ["record narrated video", "use public screenshots", "add welcome message", "leave warning"], contextSnapshot: snap });
+  sup.store.upsertQuestion({ dedupeKey: "ask:generic", kind: "agent-ask", threadKey: "paseo:s.mkt2", title: "Marketplace submission: needs your call. Answer?", options: ["yes", "no"], contextSnapshot: { threadTitle: "Marketplace submission" } });
+  sup.store.upsertQuestion({ dedupeKey: "err:zs", kind: "session-error", threadKey: "paseo:s.zs", title: "Iteration review: session hit an error", options: ["Got it"] });
+  await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  assert.equal(msgs.length, 1);
+  const text = msgs[0].text;
+  assert.equal((text.match(/\*\*New: /g) ?? []).length, 1, "only the real decision");
+  assert.match(text, /\(1\) The video: Record narrated video or Use public screenshots \(2\) App Home: Add welcome message or Leave warning/);
+  assert.match(text, /Where it stands:\*\* Once I have both answers, I'll update the video field/);
+  assert.doesNotMatch(text, /…eady|Decisions I need from you|needs your call|session hit an error|Got it|waiting on you|\bfq_/);
+});
