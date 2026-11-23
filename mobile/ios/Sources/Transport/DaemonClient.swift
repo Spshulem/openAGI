@@ -497,7 +497,11 @@ public actor DaemonClient {
 
     // MARK: - The hub's conversation queue (mobile/PROTOCOL.md §3.1)
 
-    private struct QueueEnvelope: Decodable { let queue: HubQueueSnapshot? }
+    private struct QueueEnvelope: Decodable {
+        struct SendNow: Decodable { let status: String?; let tool: String? }
+        let queue: HubQueueSnapshot?
+        let sendNow: SendNow?
+    }
     private struct QueueRefusalBody: Decodable { let error: String?; let message: String? }
     private struct SendNowAnswer: Decodable { let status: String?; let tool: String?; let queue: HubQueueSnapshot? }
 
@@ -535,9 +539,13 @@ public actor DaemonClient {
 
     // Adds a message to the hub's queue without holding a stream open. Safe
     // to repeat with the same requestId: the hub keeps one.
+    // `next`: "Send anyway" -- the hub puts it next and stops what runs now
+    // in the same request; the outcome is only what the hub confirmed.
     public func enqueueMessage(thread: ConversationThread, text: String, attachments: [ChatAttachment] = [],
-                               focusedCardId: String? = nil, requestId: String, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+                               focusedCardId: String? = nil, requestId: String, conversationId: String = "main",
+                               next: Bool = false) async throws -> (HubQueueSnapshot?, TurnInterruptOutcome?) {
         var body: [String: Any] = ["text": text, "requestId": requestId]
+        if next { body["next"] = true }
         if !attachments.isEmpty {
             try await requireImageSupport()
             body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
@@ -545,7 +553,8 @@ public actor DaemonClient {
         if let focusedCardId, !focusedCardId.isEmpty { body["focusedCardId"] = focusedCardId }
         if conversationId != "main" { body["conversationId"] = conversationId }
         let data = try await queueCall("/conversations/\(thread.rawValue)/queue", method: "POST", body: body)
-        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+        let envelope = try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data)
+        return (envelope?.queue, envelope?.sendNow.map { TurnInterruptOutcome.fromServer(status: $0.status, tool: $0.tool) })
     }
 
     // Edit (hold the item while its editor is open; save text against the

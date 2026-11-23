@@ -71,6 +71,9 @@ final class ChatConversation {
     // the hub too once the upload settles (and never shown again meanwhile).
     private var uploadingRequestID: String?
     private var removeAfterUpload: Set<String> = []
+    // Where the "while a reply is running" preference (Settings) is kept.
+    private let preferences: UserDefaults
+    var busySendBehavior: BusySendBehavior { BusySendBehavior.stored(in: preferences) }
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     var draftAttachments: [ChatAttachment] = []
@@ -108,7 +111,8 @@ final class ChatConversation {
     private var isAway = false
 
     init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String,
-         conversationID: String = "main", isReadOnly: Bool = false) {
+         conversationID: String = "main", isReadOnly: Bool = false, preferences: UserDefaults = .standard) {
+        self.preferences = preferences
         self.thread = thread
         self.conversationID = conversationID
         self.isReadOnly = isReadOnly
@@ -348,16 +352,23 @@ final class ChatConversation {
                 self.uploadingRequestID = next.requestID
                 var offline = false
                 do {
-                    let snapshot = try await self.client.enqueueMessage(thread: self.thread, text: next.text, attachments: next.attachments,
-                                                                        focusedCardId: next.payload.focusedCardID, requestId: next.requestID,
-                                                                        conversationId: self.conversationID)
+                    let (snapshot, interrupt) = try await self.client.enqueueMessage(
+                        thread: self.thread, text: next.text, attachments: next.attachments,
+                        focusedCardId: next.payload.focusedCardID, requestId: next.requestID,
+                        conversationId: self.conversationID, next: next.origin?.sendNext == true)
                     self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
+                    if next.origin?.sendNext == true {
+                        // What the hub confirmed; it ran at once when nothing was running.
+                        self.queue.setSendNowOutcome(next.id, interrupt ?? .nothingRunning)
+                    }
                     self.uploadingRequestID = nil
                     self.mirrorHub(snapshot)
                 } catch let refused as HubQueueRefused {
                     self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
                 } catch {
                     offline = true
+                    // Not stopped: main was not reached. It is tried again.
+                    if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
                 }
                 self.uploadingRequestID = nil
                 await self.removeAfterUploads()
@@ -404,14 +415,41 @@ final class ChatConversation {
 
     // Reserve the turn and reset the native editor in the same main-actor
     // transaction. Return-key and Send cannot race two unstructured tasks.
+    //
+    // Idle, it sends. While a reply runs (here or on the hub, or messages
+    // still wait), the Settings preference decides -- Queue message (default)
+    // or Send immediately -- and `override` is the composer's one-message
+    // choice the other way ("Send anyway" / "Queue instead").
     @discardableResult
-    func submitDraft() -> Bool {
+    func submitDraft(override: BusySendBehavior? = nil) -> Bool {
         guard canSubmitDraft else { return false }
         let text = draft
         let attachments = draftAttachments
+        let decision = SendDecision.resolve(busy: isBusy, preference: busySendBehavior, override: override)
+        if decision == .sendNext {
+            guard !forgotten else { return false }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+            draft = ""
+            draftAttachments = []
+            composerRevision += 1
+            let id = queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
+                                   requestID: Self.newRequestID(),
+                                   origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true, sendNext: true) : nil)
+            if hubQueueAvailable {
+                // Shown first at once, asking; the hub's answer says what happened.
+                queue.beginHubSendNow(id)
+                uploadPending()
+            } else {
+                // Main keeps no queue: this phone's queue, front, then stop
+                // the running reply (or say plainly that it can't be).
+                Task { await sendQueuedNow(id: id) }
+            }
+            return true
+        }
         // Busy, or messages are still waiting (one is being edited), here or
         // on the hub: this one goes after them, never ahead.
-        if isBusy {
+        if decision == .queue {
             guard !forgotten else { return false }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed

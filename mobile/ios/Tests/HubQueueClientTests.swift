@@ -67,7 +67,8 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
         let body = body()
         Self.lock.lock()
         defer { Self.lock.unlock() }
-        Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + (body["requestId"].map { " #\($0)" } ?? ""))
+        Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + (body["requestId"].map { " #\($0)" } ?? "")
+                        + ((body["next"] as? Bool) == true ? " NEXT" : ""))
         if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
         if path == "/conversations/supervisor/queue", method == "POST" {
             if Self.failNextEnqueue {
@@ -76,15 +77,29 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
                 return
             }
             let id = body["requestId"] as? String ?? ""
+            var sendNow: [String: Any]? = nil
             if !Self.items.contains(where: { $0.requestId == id }) {
-                Self.items.append(Item(requestId: id, text: body["text"] as? String ?? "", source: "iPhone", mine: true, state: "queued", heldBy: nil, revision: 1))
+                let item = Item(requestId: id, text: body["text"] as? String ?? "", source: "iPhone", mine: true, state: "queued", heldBy: nil, revision: 1)
+                if (body["next"] as? Bool) == true, let runningIndex = Self.items.firstIndex(where: { $0.state == "running" }) {
+                    // Send anyway: the running reply stops, this goes next.
+                    Self.items.remove(at: runningIndex)
+                    Self.items.insert(item, at: 0)
+                    sendNow = ["status": "interrupted"]
+                } else if (body["next"] as? Bool) == true {
+                    Self.items.insert(item, at: 0)
+                    sendNow = ["status": "next"]
+                } else {
+                    Self.items.append(item)
+                }
             }
             if Self.holdNextEnqueue {
                 Self.holdNextEnqueue = false
                 Self.heldEnqueue = Held(proto: self, runLoop: CFRunLoopGetCurrent())
                 return
             }
-            return respond(202, ["requestId": id, "queue": Self.queueJSON()])
+            var answer: [String: Any] = ["requestId": id, "queue": Self.queueJSON()]
+            if let sendNow { answer["sendNow"] = sendNow }
+            return respond(202, answer)
         }
         let parts = path.split(separator: "/").map(String.init)
         if parts.count >= 4, parts[2] == "queue", let index = Self.items.firstIndex(where: { $0.requestId == parts[3] }) {
@@ -303,5 +318,65 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(chat.saveQueuedEdit())
         try await waitFor("the upload of the edited text") { FakeHubProtocol.snapshot().contains { $0.text == "new text" } }
         XCTAssertFalse(FakeHubProtocol.snapshot().contains { $0.text == "old text" })
+    }
+
+    @MainActor
+    private func chat(preference: BusySendBehavior) async throws -> ChatConversation {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "busy-\(UUID().uuidString)"))
+        preference.store(in: defaults)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [FakeHubProtocol.self]
+        let client = DaemonClient(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:test", token: "synthetic-token",
+                                  session: URLSession(configuration: config))
+        let conversation = ChatConversation(thread: .supervisor, client: client,
+                                            store: ChatHistoryStore(thread: "busy-\(UUID().uuidString)", directory: directory),
+                                            nodeID: "mobile:test", preferences: defaults)
+        await conversation.refresh()
+        return conversation
+    }
+
+    @MainActor
+    func testWhileBusyTheDefaultQueuesAndSendAnywayStopsTheReplyAndGoesNextAheadOfTheQueue() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-9", text: "Mac's long reply", source: "Mac", mine: false, state: "running", revision: 1),
+                                    .init(requestId: "mac-queued-9", text: "Mac queued earlier", source: "Mac", mine: false, state: "queued", revision: 1)] }
+        let chat = try await chat(preference: .queue)
+        XCTAssertEqual(chat.busySendBehavior, .queue, "the default")
+        chat.draft = "queued by default"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the queued message") { FakeHubProtocol.snapshot().contains { $0.text == "queued by default" } }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.contains("queued by default") && !$0.hasSuffix("NEXT") })
+
+        chat.draft = "send anyway"
+        XCTAssertTrue(chat.submitDraft(override: .sendNow))
+        XCTAssertEqual(chat.queuedSubmissions.first?.text, "send anyway", "shown first at once")
+        XCTAssertEqual(chat.queuedSubmissions.first?.sendNow, .requesting)
+        try await waitFor("the hub's answer") { chat.queuedSubmissions.first?.sendNow == .answered(.interrupted) }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.contains("send anyway") && $0.hasSuffix("NEXT") }, "one request: queue, next, stop")
+        XCTAssertEqual(FakeHubProtocol.snapshot().map(\.text), ["send anyway", "Mac queued earlier", "queued by default"],
+                       "it goes next; the others keep their order")
+        XCTAssertFalse(FakeHubProtocol.calls().contains { $0.hasPrefix("POST /message") })
+    }
+
+    @MainActor
+    func testTheSendImmediatelyPreferenceAndAQueueInsteadOverride() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-10", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = try await chat(preference: .sendNow)
+        chat.draft = "queue this one instead"
+        XCTAssertTrue(chat.submitDraft(override: .queue))
+        try await waitFor("the queued one") { FakeHubProtocol.snapshot().contains { $0.text == "queue this one instead" } }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.contains("queue this one instead") && !$0.hasSuffix("NEXT") })
+        chat.draft = "send immediately"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the immediate one") { FakeHubProtocol.calls().contains { $0.contains("send immediately") && $0.hasSuffix("NEXT") } }
+    }
+
+    @MainActor
+    func testWhenNothingIsRunningSendJustSendsWhateverThePreference() async throws {
+        let chat = try await chat(preference: .sendNow)
+        XCTAssertFalse(chat.isBusy)
+        chat.draft = "plain send"
+        XCTAssertTrue(chat.submitDraft(override: .sendNow))
+        try await waitFor("the normal send") { FakeHubProtocol.calls().contains { $0.hasPrefix("POST /message") } }
+        XCTAssertFalse(FakeHubProtocol.calls().contains { $0.hasPrefix("POST /conversations/supervisor/queue") })
     }
 }

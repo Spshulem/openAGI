@@ -195,6 +195,8 @@ struct ChatConversationView: View {
     @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
     @FocusState private var queuedEditFocused: Bool
+    // Observed so the composer's busy line follows Settings at once.
+    @AppStorage(BusySendBehavior.defaultsKey) private var busySendPreference = BusySendBehavior.default.rawValue
     @Environment(\.layoutDirection) private var layoutDirection
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -630,6 +632,7 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chat-attachment-error")
             }
             if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
+            if conversation.isBusy && canSend { busySendChoice }
             composerBar
             }
         }
@@ -1018,8 +1021,31 @@ struct ChatConversationView: View {
             .accessibilityIdentifier("chat-composer")
     }
 
+    // While a reply runs: what Send will do (the Settings preference) and the
+    // other choice for this one message.
+    private var busySendChoice: some View {
+        let preference = BusySendBehavior(rawValue: busySendPreference) ?? .default
+        return HStack(spacing: 8) {
+            Text(preference == .queue ? "A reply is running. Send queues this." : "A reply is running. Send stops it and sends this next.")
+                .font(.caption2)
+                .foregroundStyle(Theme.muted)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(preference.other == .sendNow ? "Send anyway" : "Queue instead") {
+                sendDraft(override: preference.other)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .tint(preference.other == .sendNow ? Theme.alert : Theme.live)
+            .accessibilityHint(preference.other == .sendNow
+                ? "Stops the current reply and sends this next. An action already running finishes; nothing is undone."
+                : "Waits until the current reply and earlier queued messages finish.")
+            .accessibilityIdentifier("chat-send-other")
+        }
+        .padding(.horizontal, 16)
+    }
+
     private var sendButton: some View {
-        Button(action: sendDraft) {
+        Button { sendDraft() } label: {
             Image(systemName: "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(canSend ? Color(uiColor: .systemBackground) : Theme.muted)
@@ -1028,8 +1054,14 @@ struct ChatConversationView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(.circle)
         }
-            .accessibilityLabel("Send")
+            .accessibilityLabel(conversation.isBusy ? conversation.busySendBehavior.busyLabel : "Send")
             .disabled(!canSend)
+            .contextMenu {
+                if conversation.isBusy && canSend {
+                    Button("Queue message", systemImage: "clock") { sendDraft(override: .queue) }
+                    Button("Send anyway", systemImage: "arrow.up.to.line") { sendDraft(override: .sendNow) }
+                }
+            }
             .accessibilityIdentifier("chat-send")
     }
 
@@ -1042,10 +1074,10 @@ struct ChatConversationView: View {
             .contentShape(.rect)
     }
 
-    private func sendDraft() {
+    private func sendDraft(override: BusySendBehavior? = nil) {
         guard canSend else { return }
         dictation.stop()
-        if conversation.submitDraft() { isPinnedToBottom = true }
+        if conversation.submitDraft(override: override) { isPinnedToBottom = true }
     }
 
     private var canSend: Bool {

@@ -107,14 +107,19 @@ public struct QueuedOrigin: Equatable, Sendable {
     public var pendingUpload: Bool
     /// The last hub refusal for this item, shown on its row.
     public var error: String?
+    /// Sent with "Send anyway": when the hub takes it, it goes next and the
+    /// running reply is stopped (one request, so a retry does it once).
+    public var sendNext: Bool
 
-    public init(sourceName: String? = nil, mine: Bool = true, heldBy: String? = nil, revision: Int = 0, pendingUpload: Bool = false, error: String? = nil) {
+    public init(sourceName: String? = nil, mine: Bool = true, heldBy: String? = nil, revision: Int = 0, pendingUpload: Bool = false,
+                error: String? = nil, sendNext: Bool = false) {
         self.sourceName = sourceName
         self.mine = mine
         self.heldBy = heldBy
         self.revision = revision
         self.pendingUpload = pendingUpload
         self.error = error
+        self.sendNext = sendNext
     }
 }
 
@@ -300,6 +305,13 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
         item.sendNow = .requesting
         items.insert(item, at: 0)
         return true
+    }
+
+    /// What the hub said about a "Send anyway" message once it took it
+    /// (after any earlier "couldn't reach main" for the same message).
+    public mutating func setSendNowOutcome(_ id: UUID, _ outcome: TurnInterruptOutcome) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].sendNow = .answered(outcome)
     }
 
     /// The hub refused Send Now (held elsewhere, already sent): no status.

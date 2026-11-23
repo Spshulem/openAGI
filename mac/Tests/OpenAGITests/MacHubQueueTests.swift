@@ -53,7 +53,7 @@ final class MacFakeHubProtocol: URLProtocol {
     let body = body()
     Self.lock.lock()
     defer { Self.lock.unlock() }
-    Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? ""))
+    Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + ((body["next"] as? Bool) == true ? " NEXT" : ""))
     if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
     if path == "/conversations/supervisor/queue", method == "POST" {
       if Self.failNextEnqueue {
@@ -62,10 +62,20 @@ final class MacFakeHubProtocol: URLProtocol {
         return
       }
       let id = body["requestId"] as? String ?? ""
+      var sendNow: [String: Any]? = nil
       if !Self.items.contains(where: { $0.requestId == id }) {
-        Self.items.append(Item(requestId: id, text: body["text"] as? String ?? "", source: "Mac", mine: true, state: "queued", heldBy: nil, revision: 1))
+        let item = Item(requestId: id, text: body["text"] as? String ?? "", source: "Mac", mine: true, state: "queued", heldBy: nil, revision: 1)
+        if (body["next"] as? Bool) == true, let runningIndex = Self.items.firstIndex(where: { $0.state == "running" }) {
+          Self.items.remove(at: runningIndex)
+          Self.items.insert(item, at: 0)
+          sendNow = ["status": "interrupted"]
+        } else {
+          Self.items.append(item)
+        }
       }
-      return respond(202, ["requestId": id, "queue": Self.queueJSON()])
+      var answer: [String: Any] = ["requestId": id, "queue": Self.queueJSON()]
+      if let sendNow { answer["sendNow"] = sendNow }
+      return respond(202, answer)
     }
     let parts = path.split(separator: "/").map(String.init)
     if parts.count >= 4, parts[2] == "queue", let index = Self.items.firstIndex(where: { $0.requestId == parts[3] }) {
@@ -103,10 +113,13 @@ final class MacHubQueueTests: XCTestCase {
   override func setUp() { MacFakeHubProtocol.reset() }
   override func tearDown() { MacFakeHubProtocol.reset() }
 
-  private func client() async -> SharedSupervisorClient {
+  private func client(preference: BusySendBehavior = .queue) async -> SharedSupervisorClient {
     let config = URLSessionConfiguration.ephemeral
     config.protocolClasses = [MacFakeHubProtocol.self]
-    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: config), baseURL: URL(string: "http://daemon.test:43210")!, token: "synthetic")
+    let defaults = UserDefaults(suiteName: "mac-busy-\(UUID().uuidString)")!
+    preference.store(in: defaults)
+    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: config), baseURL: URL(string: "http://daemon.test:43210")!,
+                                            token: "synthetic", preferences: defaults)
     await supervisor.refreshMessages()
     return supervisor
   }
@@ -176,5 +189,27 @@ final class MacHubQueueTests: XCTestCase {
     }
     XCTAssertTrue(MacFakeHubProtocol.snapshot().contains { $0.text == "sent during an outage" })
     try await waitFor("the mirror") { supervisor.queuedMessages.first?.origin?.pendingUpload == false }
+  }
+
+  func testSendAnywayAndThePreferenceWithAQueueInsteadOverride() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-4", text: "iPhone's reply", source: "iPhone", mine: false, state: "running", revision: 1),
+                                   .init(requestId: "ios-queued-04", text: "iPhone queued earlier", source: "iPhone", mine: false, state: "queued", revision: 1)] }
+    let supervisor = await client(preference: .queue)
+    _ = await supervisor.sendMessage("queued by default")
+    _ = await supervisor.sendMessage("send anyway", override: .sendNow)
+    try await waitFor("Send anyway's answer") { supervisor.queuedMessages.first?.sendNow == .answered(.interrupted) }
+    XCTAssertTrue(MacFakeHubProtocol.calls().contains("POST /conversations/supervisor/queue send anyway NEXT"))
+    XCTAssertTrue(MacFakeHubProtocol.calls().contains("POST /conversations/supervisor/queue queued by default"))
+    XCTAssertEqual(MacFakeHubProtocol.snapshot().map(\.text), ["send anyway", "iPhone queued earlier", "queued by default"])
+
+    MacFakeHubProtocol.reset()
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-5", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let immediate = await client(preference: .sendNow)
+    _ = await immediate.sendMessage("queue instead", override: .queue)
+    try await waitFor("the queued one") { MacFakeHubProtocol.calls().contains { $0.hasPrefix("POST /conversations/supervisor/queue") } }
+    _ = await immediate.sendMessage("immediately")
+    try await waitFor("both delivered") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
+    XCTAssertEqual(MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") },
+                   ["POST /conversations/supervisor/queue queue instead", "POST /conversations/supervisor/queue immediately NEXT"])
   }
 }

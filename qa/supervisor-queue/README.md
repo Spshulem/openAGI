@@ -22,6 +22,11 @@ while the iPhone tries to (refused, held), the iPhone removes another Mac
 message, and the Mac sends an iPhone message now, which stops the iPhone's
 running turn.
 
+Phase 3: the iPhone starts a slow turn, queues a message and closes its app;
+the Mac queues one and uses Send anyway, which stops the iPhone's reply
+midstream and goes next; the iPhone app is opened again (a new client) and
+shows what the hub ran while it was closed.
+
 This is the simulator and the Mac test runner on one machine, not two
 physical devices: it exercises the real client code and transport, not iOS
 backgrounding, push, or a physical network.

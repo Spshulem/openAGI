@@ -148,8 +148,18 @@ export class ConversationQueue {
       principal: item.principalSpec ?? null,
       state: "queued", hold: null, revision: 1, createdAt: at, updatedAt: at
     };
+    // Acknowledged only once it is on disk: if it can't be saved, it is not
+    // queued at all (no copy left in memory to run unannounced).
     state.items.push(entry);
-    this.changed(sessionId);
+    state.revision += 1;
+    try {
+      this.persist(sessionId);
+    } catch {
+      state.items.splice(state.items.indexOf(entry), 1);
+      state.revision -= 1;
+      throw fail("queue_unavailable", 503, "The hub couldn't save this message, so it was not queued. Try again.");
+    }
+    this.notify(sessionId);
     const turn = this.track(sessionId, entry);
     this.dispatch(sessionId);
     return { turn, item: entry, duplicate: false };
@@ -310,6 +320,11 @@ export class ConversationQueue {
     const state = this.session(sessionId);
     state.revision += 1;
     this.persist(sessionId);
+    this.notify(sessionId);
+  }
+
+  notify(sessionId) {
+    const state = this.session(sessionId);
     try { this.onChange({ sessionId, revision: state.revision }); } catch { /* notification is best-effort */ }
   }
 

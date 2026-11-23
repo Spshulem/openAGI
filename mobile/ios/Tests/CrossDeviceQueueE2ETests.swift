@@ -119,5 +119,39 @@ final class CrossDeviceQueueE2ETests: XCTestCase {
             try await Task.sleep(for: .milliseconds(500)); await chat.refresh()
         }
         record(chat, "p2-final", to: file)
+        // The app is closed: nothing of this phone runs any more.
+        chat.suspend()
+
+        // Phase 3: queue, close the app, let the Mac Send anyway midstream,
+        // then reopen and see what the hub ran meanwhile.
+        let t2 = env.t0.addingTimeInterval(140)
+        let preferences = UserDefaults(suiteName: "e2e-\(UUID().uuidString)")!
+        func openApp(_ label: String) async -> ChatConversation {
+            let reopened = ChatConversation(thread: .supervisor, client: DaemonClient(server: env.hub, nodeID: env.nodeID, token: env.token,
+                                                                                     session: URLSession(configuration: .ephemeral)),
+                                            store: ChatHistoryStore(thread: "e2e-\(label)", directory: directory), nodeID: env.nodeID,
+                                            preferences: preferences)
+            await reopened.resume()
+            return reopened
+        }
+        try await until(t2)
+        let session3 = await openApp("p3")
+        session3.draft = "[slow] third running turn from the iPhone"
+        XCTAssertTrue(session3.submitDraft())
+        try await until(t2.addingTimeInterval(3)); await session3.refresh()
+        session3.draft = "[ios-7] iPhone queued this, then closed the app"
+        XCTAssertTrue(session3.submitDraft())
+        try await Task.sleep(for: .seconds(1))
+        record(session3, "p3-queued-then-closing", to: file)
+        session3.enterBackground()
+        session3.suspend()
+        try await until(t2.addingTimeInterval(25))
+        let session4 = await openApp("p3-reopened")
+        record(session4, "p3-reopened", to: file)
+        let deadline3 = Date().addingTimeInterval(40)
+        while (!session4.queuedSubmissions.isEmpty || session4.hubRunning != nil), Date() < deadline3 {
+            try await Task.sleep(for: .milliseconds(500)); await session4.refresh()
+        }
+        record(session4, "p3-final", to: file)
     }
 }

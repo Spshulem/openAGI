@@ -331,6 +331,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     if (spec.nodeId && !(nodeRegistry.enrollment?.(spec.nodeId) && nodeRegistry.hasOwnerProxyGrant?.(spec.nodeId))) return null;
     try { return ownerPrincipal(spec.via, spec.nodeId ?? null); } catch { return null; }
   };
+  // Send Now / Send anyway: move one waiting message first and stop whatever
+  // runs now, whichever device sent that. The outcome is what interruptTurn
+  // confirmed ("next" when nothing was running).
+  const sendQueuedNext = async (sessionId, requestId, actor) => {
+    const moved = conversationQueue.moveToFront(sessionId, requestId, actor);
+    const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+    const outcome = moved.running && moved.running !== requestId
+      ? { ...await interruptTurn({ liveTurns, store, sessionId, requestId: moved.running, settleMs: interruptSettleMs }), interrupted: moved.running }
+      : { status: "next", interrupted: null };
+    conversationQueue.dispatch(sessionId);
+    return { outcome, item: moved.item };
+  };
   // The hub's queue for each shared device conversation (conversation-queue.js).
   // Every named turn a phone or the owner's Mac sends to a shared thread runs
   // through it, in order, with the sender's authority.
@@ -2138,13 +2150,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           if (method === "POST" && queueRoute.sendNow) {
             const sessionId = sharedSessionId(queueRoute.thread, conversationId);
-            const moved = conversationQueue.moveToFront(sessionId, queueRoute.requestId, actor);
-            // Whichever device's message is running now is the one to stop.
-            const outcome = moved.running
-              ? await interruptTurn({ liveTurns, store, sessionId, requestId: moved.running, settleMs: interruptSettleMs })
-              : { status: "next" };
-            conversationQueue.dispatch(sessionId);
-            return sendJson(res, 200, { ...outcome, interrupted: moved.running ?? null, item: moved.item, queue: conversationQueue.snapshot(sessionId, actorKey) });
+            const { outcome, item } = await sendQueuedNext(sessionId, queueRoute.requestId, actor);
+            return sendJson(res, 200, { ...outcome, item, queue: conversationQueue.snapshot(sessionId, actorKey) });
           }
           return sendJson(res, 405, { error: "method_not_allowed" });
         } catch (error) {
@@ -2369,6 +2376,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const enqueueRoute = method === "POST" && sharedQueueRoute(pathname)?.requestId === null ? sharedQueueRoute(pathname) : null;
       if (method === "POST" && (pathname === "/message" || enqueueRoute)) {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        let sendNext = false;
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
         if (enqueueRoute) {
           if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(res, 400, { error: "message must be an object" });
@@ -2376,6 +2384,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { error: "invalid_request_id", message: "A queued message needs its requestId (8-128 letters, digits, _ or -)." });
           }
           if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+          if (body.next !== undefined && typeof body.next !== "boolean") return sendJson(res, 400, { error: "invalid_queue_message", message: "next must be true or false." });
+          // "Send anyway": queue it, put it next and stop what runs now, in
+          // one request (a retry with the same id does the same, once).
+          sendNext = body.next === true;
+          delete body.next;
           body.thread = enqueueRoute.thread;
         }
         const rawFrom = typeof body?.from === "string" ? body.from.slice(0, 120) : null;
@@ -2523,9 +2536,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             ?? liveTurns.stoppedTurn(turnStore, sessionId, clientTurnId)
             ?? (gone ? { status: "failed", sessionId, messageCount: 0, code: gone.outcome, message: { content: gone.message } } : null));
           const actorKey = requestNodeId ? `node:${requestNodeId}` : "owner";
+          const queueActor = { key: actorKey, name: requestNodeId ? boundedMobileNodeName(requestEnrollment?.name) : "Mac" };
           if (enqueueRoute) {
             if (live || stored) {
-              return sendJson(res, 202, { requestId: clientTurnId, duplicate: true, ...(stored ? { outcome: stored.status === "complete" ? "complete" : stored.code ?? stored.status } : {}), queue: conversationQueue.snapshot(sessionId, actorKey) });
+              const again = sendNext && queued?.state === "queued"
+                ? await sendQueuedNext(sessionId, clientTurnId, queueActor).catch(() => null) : null;
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: true, ...(stored ? { outcome: stored.status === "complete" ? "complete" : stored.code ?? stored.status } : {}),
+                ...(again ? { sendNow: again.outcome } : {}), queue: conversationQueue.snapshot(sessionId, actorKey) });
             }
           }
           if (shared && !live && !stored) {
@@ -2545,7 +2562,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               throw error;
             }
             if (enqueueRoute) {
-              return sendJson(res, 202, { requestId: clientTurnId, duplicate: false, queue: conversationQueue.snapshot(sessionId, actorKey) });
+              const next = sendNext ? await sendQueuedNext(sessionId, clientTurnId, queueActor).catch(() => null) : null;
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: false, ...(next ? { sendNow: next.outcome } : {}),
+                queue: conversationQueue.snapshot(sessionId, actorKey) });
             }
             const turn = submitted.turn;
             runTurn = (hooks) => {

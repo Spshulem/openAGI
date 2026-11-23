@@ -212,3 +212,27 @@ final class HubQueueMirrorTests: XCTestCase {
         XCTAssertEqual(q.nextUpload?.text, "first, fixed")
     }
 }
+
+final class BusySendTests: XCTestCase {
+    func testIdleAlwaysSendsAndBusyFollowsThePreferenceUnlessOverridden() {
+        for preference in BusySendBehavior.allCases {
+            XCTAssertEqual(SendDecision.resolve(busy: false, preference: preference), .send)
+            XCTAssertEqual(SendDecision.resolve(busy: false, preference: preference, override: .sendNow), .send, "nothing to interrupt")
+        }
+        XCTAssertEqual(SendDecision.resolve(busy: true, preference: .queue), .queue, "the default queues")
+        XCTAssertEqual(SendDecision.resolve(busy: true, preference: .queue, override: .sendNow), .sendNext, "Send anyway")
+        XCTAssertEqual(SendDecision.resolve(busy: true, preference: .sendNow), .sendNext)
+        XCTAssertEqual(SendDecision.resolve(busy: true, preference: .sendNow, override: .queue), .queue, "Queue instead")
+    }
+
+    func testThePreferenceIsPersistedAndDefaultsToQueue() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "busy-send-\(UUID().uuidString)"))
+        XCTAssertEqual(BusySendBehavior.stored(in: defaults), .queue)
+        BusySendBehavior.sendNow.store(in: defaults)
+        XCTAssertEqual(BusySendBehavior.stored(in: defaults), .sendNow)
+        defaults.set("nonsense", forKey: BusySendBehavior.defaultsKey)
+        XCTAssertEqual(BusySendBehavior.stored(in: defaults), .queue)
+        XCTAssertEqual(BusySendBehavior.queue.busyLabel, "Queue message")
+        XCTAssertEqual(BusySendBehavior.queue.other.busyLabel, "Send anyway")
+    }
+}

@@ -454,8 +454,13 @@ it. The queue is durable: messages not yet started survive a hub restart and
 run afterwards; one that was running when the hub stopped is not run again.
 
 - `POST /conversations/:thread/queue` `{text, requestId, attachments?,
-  focusedCardId?, conversationId?, from?}` -> `202 {requestId, duplicate,
-  queue}`. Same validation as `/message`. Repeating a `requestId` keeps one
+  focusedCardId?, conversationId?, from?, next?}` -> `202 {requestId,
+  duplicate, queue, sendNow?}`. Same validation as `/message`. The `202`
+  comes only after the message is saved to disk; if it can't be saved the
+  answer is `503 queue_unavailable` and nothing is queued. `next: true` is
+  "Send anyway": in the same request the message goes next (ahead of the other
+  waiting messages, which keep their order) and whatever runs now is stopped;
+  `sendNow` is what the hub confirmed, as for send-now below. Repeating a `requestId` keeps one
   message (`duplicate: true`; after it ran, `outcome` says how it ended); the
   same id with different text or images is `409 request_conflict`. More than
   50 waiting is `429 queue_full`. A `/message` stream for a message that waits
@@ -480,6 +485,11 @@ run afterwards; one that was running when the hub stopped is not run again.
 - `POST .../queue/:requestId/send-now` moves it first and stops whatever runs
   now, whichever device sent that: `{status, interrupted, item, queue}` with
   `status` as for interrupt above, or `next` when nothing was running.
+
+Clients: while nothing runs, Send sends. While a reply runs, Send follows
+the device's Settings preference, "Queue message" (default) or "Send
+immediately" (`next: true`), and the composer offers the other choice for
+one message ("Send anyway" / "Queue instead").
 
 A hub without the queue answers these routes 404 (owner) or 401 (a phone;
 its heartbeat still succeeds) and its history has no `queue`: clients then

@@ -484,7 +484,11 @@ private struct SyncedHistoryResponse: Decodable {
   let queue: HubQueueSnapshot?
 }
 
-private struct QueueEnvelope: Decodable { let queue: HubQueueSnapshot? }
+private struct QueueEnvelope: Decodable {
+  struct SendNow: Decodable { let status: String?; let tool: String? }
+  let queue: HubQueueSnapshot?
+  let sendNow: SendNow?
+}
 private struct QueueRefusalBody: Decodable { let error: String?; let message: String? }
 private struct QueueSendNowAnswer: Decodable { let status: String?; let tool: String?; let queue: HubQueueSnapshot? }
 
@@ -554,6 +558,9 @@ final class SharedSupervisorClient: ObservableObject {
   /// message never stays "not on main yet" after the connection returns.
   private var uploadRetry: Task<Void, Never>?
   private var uploadRetryDelay: UInt64 = 2
+  /// Where the "while a reply is running" preference is kept (tray menu).
+  private let preferences: UserDefaults
+  var busySendBehavior: BusySendBehavior { BusySendBehavior.stored(in: preferences) }
   var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
   @Published private(set) var streamingReplyText: String? = nil
   /// The assistant messages already shown when the current reply started,
@@ -762,18 +769,27 @@ final class SharedSupervisorClient: ObservableObject {
           body["focusedCardId"] = card
         }
         if !next.payload.attachments.isEmpty { body["attachments"] = next.payload.attachments.map(\.agentHostPayload) }
+        if next.origin?.sendNext == true { body["next"] = true }
         self.uploadingRequestID = next.requestID
         var offline = false
         do {
           let data = try await self.queueCall("/conversations/supervisor/queue", method: "POST", body: body)
+          let envelope = try? JSONDecoder().decode(QueueEnvelope.self, from: data)
           self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
+          if next.origin?.sendNext == true {
+            // What the hub confirmed; it ran at once when nothing was running.
+            let outcome = envelope?.sendNow.map { TurnInterruptOutcome.fromServer(status: $0.status, tool: $0.tool) } ?? .nothingRunning
+            self.queue.setSendNowOutcome(next.id, outcome)
+          }
           self.uploadingRequestID = nil
-          self.mirrorHub((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+          self.mirrorHub(envelope?.queue)
           self.uploadRetryDelay = 2
         } catch let refused as HubQueueRefused {
           self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
         } catch {
           offline = true
+          // Not stopped: main was not reached. It is tried again.
+          if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
         }
         self.uploadingRequestID = nil
         await self.removeAfterUploads()
@@ -932,13 +948,16 @@ final class SharedSupervisorClient: ObservableObject {
     session = .shared
     baseURLOverride = nil
     tokenOverride = nil
+    preferences = .standard
   }
 
-  /// A separate client for tests: its own session, daemon URL and token.
-  init(testSession: URLSession, baseURL: URL, token: String) {
+  /// A separate client for tests: its own session, daemon URL, token and
+  /// preferences.
+  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard) {
     session = testSession
     baseURLOverride = baseURL
     tokenOverride = token
+    self.preferences = preferences
   }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
@@ -1131,12 +1150,32 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   @discardableResult
-  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
+  /// Idle, it sends. While a reply runs (here or on the hub, or messages
+  /// still wait), the preference decides -- Queue message (default) or Send
+  /// immediately -- and `override` is the composer's one-message choice the
+  /// other way ("Send anyway" / "Queue instead").
+  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],
+                   override: BusySendBehavior? = nil) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+    let decision = SendDecision.resolve(busy: isBusy, preference: busySendBehavior, override: override)
+    if decision == .sendNext {
+      let id = queue.enqueue(text: text, payload: SupervisorQueuedPayload(focusedCardId: focusedCardId, attachments: attachments),
+                             requestID: Self.newRequestId(),
+                             origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true, sendNext: true) : nil)
+      if hubQueueAvailable {
+        queue.beginHubSendNow(id)
+        uploadPending()
+      } else {
+        // Main keeps no queue: this Mac's queue, front, then stop the
+        // running reply (or say plainly that it can't be).
+        await sendQueuedNow(id: id)
+      }
+      return true
+    }
     // Busy, or messages still wait (one is being edited): this one goes
     // after them, never ahead.
-    if isBusy {
+    if decision == .queue {
       queue.enqueue(text: text, payload: SupervisorQueuedPayload(focusedCardId: focusedCardId, attachments: attachments),
                     requestID: Self.newRequestId(),
                     origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)

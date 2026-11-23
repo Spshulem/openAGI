@@ -58,11 +58,13 @@ async function hub(t, { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi
   }
   const runtime = createDurableRuntime({ dataDir });
   const calls = [];
+  const images = [];
   const slow = gate();
   runtime.agentHost.modelProvider = {
     name: "queue-test", model: "test", isConfigured: () => true,
     async generate(request) {
       calls.push(request.input);
+      images.push((request.attachments ?? []).map((image) => image.data));
       if (String(request.input).includes("[slow]")) await untilAborted(request.context.signal, slow.opened);
       return { id: `r${calls.length}`, text: `Ack: ${request.input}`, provider: "test", model: "test", toolCalls: [] };
     }
@@ -79,7 +81,7 @@ async function hub(t, { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi
       : { authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id };
   const json = async (response) => ({ status: response.status, body: await response.json().catch(() => null) });
   const api = {
-    base, runtime, calls, slow, dataDir, close, nodeRegistry,
+    base, runtime, calls, images, slow, dataDir, close, nodeRegistry,
     // A streamed send, as each app sends when it believes nothing is running.
     message: (who, body, { stream = true } = {}) => fetch(`${base}/message`, {
       method: "POST", headers: { ...auth(who), "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json" },
@@ -422,4 +424,103 @@ test("a message dispatched while a turn without a requestId still runs is not lo
   const second = await hub(t, { dataDir, keep: true });
   await until(() => second.calls.length === 1);
   assert.deepEqual(second.calls, ["waiting behind it"], "it never began, so it runs after the restart");
+});
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
+
+test("Send anyway from the Mac stops the iPhone's reply midstream and goes next; pending messages keep their order", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("phone", { text: "[slow] phone's long reply", requestId: "ios-midstream-01" }));
+  await until(() => h.calls.length === 1);
+  await h.enqueue("phone", { text: "pending one", requestId: "ios-pending-0001" });
+  await h.enqueue("mac", { text: "pending two", requestId: "mac-pending-0001" });
+  const anyway = await h.enqueue("mac", { text: "Send anyway: stop and do this", requestId: "mac-anyway-0001", next: true });
+  assert.equal(anyway.status, 202);
+  assert.equal(anyway.body.sendNow.status, "interrupted", "the running reply really stopped");
+  assert.equal(anyway.body.sendNow.interrupted, "ios-midstream-01");
+  assert.deepEqual(anyway.body.queue.items.map((i) => i.text).slice(0, 3), ["Send anyway: stop and do this", "pending one", "pending two"]);
+  assert.equal((await running).find((f) => f.event === "failure").data.code, "stopped");
+  await until(() => h.calls.length === 4);
+  assert.deepEqual(h.calls, ["[slow] phone's long reply", "Send anyway: stop and do this", "pending one", "pending two"]);
+  // A retry of the same Send anyway (a lost answer) queues and runs nothing twice.
+  const again = await h.enqueue("mac", { text: "Send anyway: stop and do this", requestId: "mac-anyway-0001", next: true });
+  assert.equal(again.body.duplicate, true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(h.calls.length, 4);
+  assert.equal((await h.enqueue("mac", { text: "x", requestId: "mac-badnext-001", next: "yes" })).status, 400);
+});
+
+test("Send anyway when nothing is running just sends; the stopped reply's late output never reaches the next message", async (t) => {
+  const h = await hub(t);
+  const idle = await h.enqueue("phone", { text: "nothing was running", requestId: "ios-idle-000001", next: true });
+  assert.equal(idle.status, 202);
+  await until(() => h.calls.length === 1);
+
+  // A provider that still emits text after it was told to stop.
+  h.runtime.agentHost.modelProvider = {
+    name: "late", model: "late", isConfigured: () => true,
+    async generate(request) {
+      h.calls.push(request.input);
+      if (String(request.input).includes("[slow]")) {
+        try { await untilAborted(request.context.signal, new Promise(() => {})); }
+        catch (error) { request.onTextDelta?.({ text: "LATE TEXT FROM THE STOPPED REPLY" }); throw error; }
+      }
+      request.onTextDelta?.({ text: `streamed ${request.input}` });
+      return { id: "x", text: `Ack: ${request.input}`, provider: "t", model: "t", toolCalls: [] };
+    }
+  };
+  const old = frames(await h.message("mac", { text: "[slow] to be stopped", requestId: "mac-stale-00001" }));
+  await until(() => h.calls.length === 2);
+  const nextStream = frames(await h.message("phone", { text: "the correction", requestId: "ios-fence-00001" }));
+  assert.equal((await h.sendNow("phone", "ios-fence-00001")).body.status, "interrupted");
+  const next = await nextStream;
+  assert.equal(next.find((f) => f.event === "final").data.reply, "Ack: the correction");
+  assert.ok(!JSON.stringify(next).includes("LATE TEXT"), "no stale text in the next message's stream");
+  await old;
+  assert.ok(!h.stored().some(([, text]) => text.includes("LATE TEXT")), "nor in history");
+});
+
+test("a message is acknowledged only once it is saved: if the hub can't save it, it is not queued", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00013" }));
+  await until(() => h.calls.length === 1);
+  const dir = path.join(h.dataDir, "conversation-queues");
+  fs.chmodSync(dir, 0o500);
+  t.after(() => { try { fs.chmodSync(dir, 0o700); } catch { /* already removed */ } });
+  const refused = await h.enqueue("phone", { text: "cannot be saved", requestId: "ios-nosave-0001" });
+  fs.chmodSync(dir, 0o700);
+  assert.equal(refused.status, 503);
+  assert.equal(refused.body.error, "queue_unavailable");
+  assert.deepEqual((await h.queue("mac")).body.items.map((i) => i.text), ["[slow] busy"], "no copy kept to run unannounced");
+  const retried = await h.enqueue("phone", { text: "cannot be saved", requestId: "ios-nosave-0001" });
+  assert.equal(retried.status, 202, "the same message can be sent again once saving works");
+  h.slow.open();
+  await running;
+  await until(() => h.calls.length === 2);
+  assert.deepEqual(h.calls, ["[slow] busy", "cannot be saved"]);
+});
+
+test("a queued message's images survive a hub restart and reach the model", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-images-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const first = await hub(t, { dataDir, keep: true });
+  const cut = new AbortController();
+  const running = fetch(`${first.base}/message`, {
+    method: "POST", signal: cut.signal,
+    headers: { authorization: "Bearer owner", "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ thread: "supervisor", from: "mac-supervisor", text: "[slow] busy", requestId: "mac-busy-00014" })
+  }).then((r) => r.text()).catch(() => null);
+  await until(() => first.calls.length === 1);
+  const queued = await first.enqueue("phone", { text: "what is in this picture", requestId: "ios-image-00001",
+    attachments: [{ name: "Synthetic.png", mimeType: "image/png", data: PNG }] });
+  assert.equal(queued.status, 202);
+  assert.equal(queued.body.queue.items[1].attachmentCount, 1);
+  cut.abort();
+  await running;
+  await first.close({ release: false });
+
+  const second = await hub(t, { dataDir, keep: true });
+  await until(() => second.calls.length === 1);
+  assert.equal(second.calls[0], "what is in this picture");
+  assert.deepEqual(second.images[0], [PNG], "the picture itself, not a preview");
 });

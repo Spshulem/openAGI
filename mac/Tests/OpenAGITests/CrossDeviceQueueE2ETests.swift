@@ -43,7 +43,8 @@ final class CrossDeviceQueueE2ETests: XCTestCase {
     }
     let t0 = Date(timeIntervalSince1970: t0ms / 1000)
     let file = URL(fileURLWithPath: out).appendingPathComponent("mac.jsonl")
-    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: .ephemeral), baseURL: hub, token: token)
+    let preferences = UserDefaults(suiteName: "e2e-\(UUID().uuidString)")!
+    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: .ephemeral), baseURL: hub, token: token, preferences: preferences)
     await supervisor.refreshMessages()
     record(supervisor, "before", to: file)
 
@@ -91,5 +92,21 @@ final class CrossDeviceQueueE2ETests: XCTestCase {
       try await Task.sleep(nanoseconds: 500_000_000); await supervisor.refreshMessages()
     }
     record(supervisor, "p2-final", to: file)
+
+    // Phase 3: while the iPhone's reply runs and its app is closed, queue one
+    // message, then Send anyway: it stops that reply and goes next; the
+    // pending ones keep their order and run without the iPhone.
+    let t2 = t0.addingTimeInterval(140)
+    try await until(t2.addingTimeInterval(6)); await supervisor.refreshMessages()
+    _ = await supervisor.sendMessage("[mac-5] Mac queued this while the iPhone's app was closed")
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+    _ = await supervisor.sendMessage("[mac-6] Mac sends anyway", override: .sendNow)
+    try await Task.sleep(nanoseconds: 2_000_000_000)
+    record(supervisor, "p3-sent-anyway", to: file)
+    let deadline3 = Date().addingTimeInterval(40)
+    while (supervisor.isSending || !supervisor.queuedMessages.isEmpty || supervisor.hubRunning != nil), Date() < deadline3 {
+      try await Task.sleep(nanoseconds: 500_000_000); await supervisor.refreshMessages()
+    }
+    record(supervisor, "p3-final", to: file)
   }
 }
