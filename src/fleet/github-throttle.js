@@ -77,13 +77,18 @@ export class GithubThrottle {
     this.configure({ file });
   }
 
-  // Where the cooldown survives a restart. A saved one already over is dropped.
+  // Where the cooldown survives a restart. A saved one already over is
+  // dropped, unless the hold queued to follow it is still running: that one
+  // takes over, exactly as it would have without the restart.
   configure({ file = null } = {}) {
     this.file = file;
     if (!file) return this;
     const saved = readJsonFile(file, null);
-    const until = Date.parse(saved?.until ?? "");
-    if (saved && Number.isFinite(until) && until > this.now()) this.cooldown = { ...saved };
+    const live = (hold) => Date.parse(hold?.until ?? "") > this.now();
+    if (saved && (live(saved) || live(saved.then))) {
+      this.cooldown = { ...saved };
+      this.current();
+    }
     return this;
   }
 

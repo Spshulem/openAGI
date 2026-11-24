@@ -319,3 +319,24 @@ test("extending a hold keeps the weaker hold queued to follow it", () => {
   assert.notEqual(throttle.blocking({ background: true }), null);
   assert.equal(throttle.blocking({ background: false }), null);
 });
+
+// Review fix (#351): a restart after the active hold ended but while its
+// queued hold still ran used to drop both, so background polling resumed in
+// a known low-budget window.
+test("a restart keeps a queued hold that is still running", (t) => {
+  const dir = tmp(t);
+  const file = path.join(dir, "github-throttle.json");
+  const c = clock();
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  const before = new GithubThrottle({ now: c.fn, file });
+  before.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  before.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  c.now.value = T0 + 121_000;
+  const after = new GithubThrottle({ now: c.fn, file });
+  assert.equal(after.current()?.kind, "low-budget", "the queued hold took over across the restart");
+  assert.notEqual(after.blocking({ background: true }), null);
+  assert.equal(after.blocking({ background: false }), null);
+  // After the queued hold ends too, a restart starts clean.
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(new GithubThrottle({ now: c.fn, file }).current(), null);
+});
