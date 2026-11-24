@@ -14,7 +14,7 @@ import { resolveDataDir } from "../data-dir.js";
 import { readNodeConfig } from "../cli-client.js";
 import { readOrCreateIdentity } from "../node-registry.js";
 import { appendSharedThreadMessages } from "../shared-conversations.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, isWatchOnlyThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
@@ -2004,7 +2004,9 @@ export class FleetSupervisor {
     if (typeof driver?.attention !== "function" || typeof driver?.clickLabel !== "function") return;
     // Only while Auto holds and the thread is not muted, checked again before
     // each read and click: the owner can switch mode or mute mid-pass.
-    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key);
+    // Never a watch-only session's cards: those stay the owner's to answer
+    // (owner-directed clicks go through clickThread, not here).
+    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key) && !thread.watchOnly;
     const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived && allowed(thread));
     if (!codex.length) return;
     let rows = [];
@@ -2432,15 +2434,22 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true } = {}) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = false, images = null, recoverDisconnected = true, ownerChoice = null } = {}) {
     const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const onThread = (q) => q.threadKey === threadKey || (q.threadKeys ?? []).includes(threadKey);
     const matchingOpen = this.store.openQuestions().find(onThread) ?? null;
-    const thread = this.lastThreads.get(threadKey)
+    let thread = this.lastThreads.get(threadKey)
       ?? this.knownThreads.get(threadKey)
       ?? this.syntheticPaseoThread(threadKey, matchingOpen);
+    let refreshedPermissionState = false;
+    if (thread?.meta?.blockedOnOwner === true && ["codex", "conductor"].includes(thread.kind) && typeof this.refreshThread === "function") {
+      try {
+        const fresh = await this.refreshThread(thread);
+        if (fresh) { thread = { ...thread, ...fresh, meta: { ...(thread.meta ?? {}), ...(fresh.meta ?? {}) } }; refreshedPermissionState = true; }
+      } catch { /* retain the cached permission state and fail closed */ }
+    }
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     // A thread with an open risky ask hears the owner only typed into its
     // app, as an answer to that ask would be.
@@ -2448,6 +2457,30 @@ export class FleetSupervisor {
     // but the agent has not heard it yet.
     const risky = this.store.openQuestions().some((q) => onThread(q) && riskyQuestion(q))
       || this.store.queuedAnswers().some((q) => onThread(q) && q.pendingDelivery?.typedOnly === true);
+    // A Paseo question card is also represented as a pending permission, but
+    // its free-text answer must reach deliverPaseo so that it can submit the
+    // answer through the question handler. Keep the early guard for actual
+    // permission prompts (and for cards that explicitly disallow free text).
+    const paseoFreeTextQuestion = Boolean(
+      thread?.kind === "paseo"
+      && thread?.meta?.pendingCard?.items?.some((item) => item?.freeText === true)
+      && !thread?.meta?.blockedOnOwner
+      && !thread?.meta?.pendingPermission
+    );
+    const permissionPending = Boolean(
+      thread?.meta?.blockedOnOwner === true
+      || thread?.meta?.pendingPermission
+      || (thread?.meta?.pendingCard?.requestId && !paseoFreeTextQuestion)
+      || (!refreshedPermissionState && (matchingOpen?.meta?.paseoPermissionId || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")))
+    );
+    // A free-form handoff is not a permission answer. If a permission prompt
+    // is pending, refuse with a durable action receipt so prose cannot be
+    // interpreted as Allow/Deny and the caller can retry after fleet_click.
+    if (permissionPending && ownerChoice == null) {
+      const detail = "permission prompt pending; message was not sent. Answer the prompt first, then retry the handoff";
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
+      return { delivery: { status: "blocked", route: null, detail, actionId: action.id, permissionRequired: true } };
+    }
     const chosen = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     if (!thread || !route) {
@@ -2467,7 +2500,7 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}) });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: queue === true, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}), ...(ownerChoice != null ? { ownerChoice } : {}) });
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     let followThroughWatch = null;
@@ -3168,6 +3201,16 @@ export class FleetSupervisor {
     const result = this.activeWork.trackWork(input);
     this.emitFleet("active-work-updated");
     return result;
+  }
+
+  scheduleActiveWorkRecheck(id, input = {}) {
+    const result = this.activeWork.scheduleRecheck(id, input);
+    if (result?.ok) this.emitFleet("active-work-recheck-scheduled");
+    return result;
+  }
+
+  listActiveWorkRechecks(options = {}) {
+    return this.activeWork.listRechecks(options);
   }
 
   async verifyGoalProgress(input = {}) {
@@ -4072,6 +4115,8 @@ export class FleetSupervisor {
       if (isSelfThread(thread, config) || thread.branch?.startsWith("selffix/")
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
+      // Watched like any chat, never messaged by the supervisor (policy).
+      else if (isWatchOnlyThread(thread, config)) thread.watchOnly = true;
     }
     // Auto-link unassigned explicit ActiveWork goals to matching live coding sessions
     // so `resume_owner` goals do not sit stranded with `owner.threadKey: null`.
@@ -4266,6 +4311,15 @@ export class FleetSupervisor {
       store.saveDiagnosis({ error: clampText(redactSecrets(error?.message), 200) });
     }
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
+    // Due one-shot rechecks run from the background loop; a failed pass
+    // leaves them pending for the next tick and never breaks this one.
+    if (this.activeWork?.hasDueRechecks?.(this.now())) {
+      try {
+        await this.scanActiveWork({ pageSize: 12, maxRepoChecks: 2, maxDecisionItems: 4, maxPromptsPerPass: 1 });
+      } catch (error) {
+        store.saveDiagnosis({ error: clampText(redactSecrets(`active-work recheck: ${error?.message}`), 200) });
+      }
+    }
     return snapshot;
   }
 
@@ -4855,6 +4909,8 @@ export class FleetSupervisor {
       for (const { thread, classified } of items) {
         if (failoversThisTick >= 2) break;
         if (!thread?.key || thread.kind !== "paseo" || thread.excluded || thread.archived) continue;
+        // A watch-only session is never resumed or replaced on its own.
+        if (thread.watchOnly) continue;
         if (store.mutedUntil(thread.key)) continue;
         if (classified?.state !== "infra-blocked") continue;
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
@@ -5092,7 +5148,10 @@ export class FleetSupervisor {
         const slice = classifyQuestionSlice(fields);
         const prefs = store.preferences();
         const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
-        const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
+        // Never an automatic answer to a watch-only session: its asks stay
+        // the owner's (the owner's own answers still go through).
+        const candidate = autoChoice ? byKey.get(fields.threadKey) : null;
+        const targetThread = candidate?.watchOnly ? null : candidate;
         const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
         const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
         if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
@@ -5153,6 +5212,8 @@ export class FleetSupervisor {
         && fields.threadKey
         && !fields.mergeAsk
         && !store.mutedUntil(fields.threadKey)
+        // Precedents never answer a watch-only session on the owner's behalf.
+        && !(byKey.get(fields.threadKey)?.watchOnly || askThread?.watchOnly)
         && sends < config.limits.maxSendsPerTick
       ) {
         const askActiveGoal = this.activeWork.findActiveGoalForThread(fields.threadKey, askPrRef);
