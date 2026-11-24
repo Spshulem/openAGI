@@ -230,3 +230,41 @@ test("a delayed same-window response never lifts a newer cooldown; a later windo
   throttle.observe(answer(4900, "2026-11-22T22:00:37Z"));
   assert.equal(throttle.current(), null, "a new window lifts it");
 });
+
+// Review fix (#351): the fleet query reads PR bodies and comments. A PR that
+// discusses rate limits is repository content, not GitHub refusing a call.
+test("a successful answer that mentions a rate limit in PR text starts no cooldown", () => {
+  const throttle = new GithubThrottle({ now: () => T0 });
+  const body = JSON.stringify({ data: {
+    rateLimit: { remaining: 4200, resetAt: RESET },
+    r0: { p1: { title: "Handle the secondary rate limit", body: "GraphQL: API rate limit already exceeded; abuse detection; retry-after: 120" } }
+  } });
+  assert.equal(throttle.observe({ code: 0, stdout: body, stderr: "" }), null);
+  assert.equal(throttle.current(), null);
+  // The same words as GitHub's own structured error do start one.
+  assert.equal(throttle.observe({ code: 1, stdout: JSON.stringify({ errors: [{ type: "RATE_LIMIT", message: "API rate limit already exceeded" }] }), stderr: "" })?.kind, "primary");
+  // A timeout is a failure: its stderr may name the throttle.
+  const timedOut = new GithubThrottle({ now: () => T0 });
+  assert.equal(timedOut.observe({ code: null, timedOut: true, stdout: "", stderr: "You have exceeded a secondary rate limit" })?.kind, "secondary");
+});
+
+// Review fix (#351): 90 points left, then 0 with the same reset, used to
+// stay a background-only low-budget hold, so owner merges kept calling.
+test("a used-up budget upgrades a low-budget hold so owner actions stop too", () => {
+  const throttle = new GithubThrottle({ now: () => T0 });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: RESET } } }) });
+  assert.equal(throttle.current()?.kind, "low-budget");
+  assert.equal(throttle.blocking({ background: false }), null, "low budget leaves owner actions alone");
+  throttle.observe({ code: 1, stdout: PRIMARY_JSON, stderr: PRIMARY_TEXT });
+  assert.equal(throttle.current()?.kind, "primary");
+  assert.notEqual(throttle.blocking({ background: false }), null, "a used-up budget stops owner actions");
+  assert.equal(Date.parse(throttle.current().until) >= Date.parse(RESET), true, "the later deadline is kept");
+  assert.equal(throttle.needsProbe(), false, "the reset is already known: no probe spent");
+  // A primary error with no reset of its own also upgrades, keeping the window.
+  const vague = new GithubThrottle({ now: () => T0 });
+  vague.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: RESET } } }) });
+  vague.observe({ code: 1, stdout: "", stderr: PRIMARY_TEXT });
+  assert.equal(vague.current()?.kind, "primary");
+  assert.equal(vague.current().windowResetAt, new Date(Date.parse(RESET)).toISOString());
+  assert.notEqual(vague.blocking({ background: false }), null);
+});

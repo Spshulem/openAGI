@@ -29,6 +29,8 @@ const SECONDARY_MAX_MS = 15 * 60_000;
 // A reset GitHub reports further out than its one-hour window is not trusted.
 const MAX_COOLDOWN_MS = 65 * 60_000;
 const PROBE_QUERY = "query={ rateLimit { remaining resetAt } }";
+// How much a hold stops: low budget pauses background polling only.
+const STRENGTH = { "low-budget": 1, primary: 2, secondary: 2 };
 const PROBE_TIMEOUT_MS = 15_000;
 
 // A gh failure's text -> { kind: "primary" | "secondary", retryAfterSec } or null.
@@ -38,6 +40,16 @@ export function classifyGithubThrottle(text) {
   if (SECONDARY.test(s)) return { kind: "secondary", retryAfterSec };
   if (PRIMARY.test(s)) return { kind: "primary", retryAfterSec };
   return null;
+}
+
+// The text of a GraphQL answer's own errors ("type", "code", "message"),
+// never its data: a PR body or comment that mentions a rate limit is
+// repository content, not GitHub refusing the request.
+export function graphqlErrorText(stdout) {
+  let body;
+  try { body = JSON.parse(String(stdout ?? "")); } catch { return ""; }
+  const errors = Array.isArray(body?.errors) ? body.errors : [];
+  return errors.map((e) => [e?.type, e?.code, e?.message].filter((v) => typeof v === "string").join(" ")).join("\n");
 }
 
 // The rateLimit block a GraphQL answer carries, or null.
@@ -105,7 +117,12 @@ export class GithubThrottle {
   // Reads one gh result: a throttle error starts or extends the cooldown, a
   // rateLimit block sets the budget. Returns the throttle seen, or null.
   observe(result) {
-    const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}\n${result?.error ?? ""}`;
+    // Only a failed call's own output, or GraphQL's structured errors, can
+    // say GitHub refused it. A successful answer's data is never searched.
+    // Success is an exit code of 0 with no error; a timeout (code null) or
+    // any other result is a failure whose output may name a throttle.
+    const failed = Boolean(result?.error) || result?.code !== 0;
+    const text = `${failed ? `${result?.stderr ?? ""}\n${result?.error ?? ""}\n` : ""}${graphqlErrorText(result?.stdout)}`;
     const throttled = classifyGithubThrottle(text);
     const rate = readRateLimit(result?.stdout);
     if (throttled) {
@@ -163,14 +180,23 @@ export class GithubThrottle {
       }
     }
     const previous = this.current();
-    // Never shorten a stronger hold with a weaker or vaguer one.
-    if (previous && Date.parse(previous.until) >= until && !(resetKnown && !previous.resetKnown && kind === previous.kind)) return previous;
+    // Never shorten a stronger hold with a weaker or vaguer one. A stronger
+    // observation (the budget is now used up, or GitHub asked to slow down)
+    // upgrades a weaker hold (low budget: background only) and keeps the
+    // later of the two deadlines, so owner actions stop reaching GitHub too.
+    const stronger = previous && STRENGTH[kind] > STRENGTH[previous.kind];
+    if (previous && Date.parse(previous.until) >= until && !stronger && !(resetKnown && !previous.resetKnown && kind === previous.kind)) return previous;
+    if (stronger && Date.parse(previous.until) > until) {
+      until = Date.parse(previous.until);
+      resetKnown = resetKnown || previous.resetKnown === true;
+    }
     this.cooldown = {
       kind,
       until: new Date(until).toISOString(),
       since: previous?.since ?? new Date(now).toISOString(),
       resetKnown,
-      ...(kind !== "secondary" && Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() } : {}),
+      ...(kind !== "secondary" && Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() }
+        : stronger && previous.windowResetAt ? { windowResetAt: previous.windowResetAt } : {}),
       probed: previous?.probed === true && !resetKnown,
       ...(Number.isFinite(remaining) ? { remaining } : {})
     };
