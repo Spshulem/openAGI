@@ -466,3 +466,28 @@ test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, g
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
 });
+
+// Review fix (#373): Paseo can post "[System Error] Selected model is at
+// capacity…" and leave the session "running" with no active turn. Capacity
+// is now overloaded, not a hard kind, so the stuck status must still read as
+// failed for the backoff to run; a real active turn still reads as running.
+test("a stuck running session with a transient system error reads as failed", () => {
+  const stuck = paseoThread(agent("a", { status: "running" }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: `[System Error] ${capacityError}` } }
+  ]);
+  assert.equal(stuck.error?.kind, "overloaded");
+  assert.equal(stuck.agentStatus, "error");
+  const classified = classifyThread(stuck);
+  assert.equal(classified.state, "infra-blocked");
+  assert.equal(classified.infraKind, "overloaded");
+  const network = paseoThread(agent("b", { status: "running" }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: "[System Error] stream disconnected before completion" } }
+  ]);
+  assert.equal(network.error?.kind, "network");
+  assert.equal(network.agentStatus, "error");
+  const working = paseoThread(agent("c", { status: "running", activeTurn: { startedAt: laterAt } }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: `[System Error] ${capacityError}` } }
+  ]);
+  assert.equal(working.error, null);
+  assert.equal(working.agentStatus, "running");
+});
