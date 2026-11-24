@@ -82,15 +82,17 @@ export function parseAgentSuppliedContext(text) {
   const at = raw.toUpperCase().lastIndexOf(AGENT_CONTEXT_MARKER);
   if (at === -1) return null;
   const block = raw.slice(at + AGENT_CONTEXT_MARKER.length).replace(/^[\s:*#-]+/, "");
+  // Whole-label matches only: "Option one all regions — because…" is an
+  // option line, not an "Options:" header.
   const labels = {
-    goal: /^(?:original\s+)?goal|^what\s+this\s+is|^project/i,
-    assignment: /^assign(?:ed|ment)|^you\s+asked|^task/i,
-    verified: /^verified|^tried|^tested/i,
-    changed: /^changed|^what\s+changed/i,
-    blocked: /^blocked|^why\s+(?:i|the agent)\s+can(?:no|')t|^can(?:no|')t\s+proceed/i,
-    decision: /^decision|^question/i,
-    options: /^options?/i,
-    recommendation: /^recommend/i
+    goal: /^(?:original\s+)?goal$|^what\s+this\s+is$|^project$/i,
+    assignment: /^assign(?:ed|ment)$|^you\s+asked(?:\s+me)?(?:\s+to)?$|^task$/i,
+    verified: /^verified$|^tried$|^tested$/i,
+    changed: /^changed$|^what\s+changed$/i,
+    blocked: /^blocked(?:\s+on|\s+because)?$|^why\s+(?:i|the agent)\s+can(?:no|')t(?:\s+proceed)?(?:\s+alone)?$|^can(?:no|')t\s+proceed(?:\s+alone)?$/i,
+    decision: /^decision$|^question$/i,
+    options: /^options?$/i,
+    recommendation: /^recommend(?:ation|ed)?$/i
   };
   const out = {};
   let current = null;
@@ -685,7 +687,7 @@ const PART_LABELS = {
 
 // Plain-English rendering. `markdown` adds bold labels and links; the plain
 // form is for outreach summaries and phone pushes.
-export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null } = {}) {
+export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null, preserveDecision = false } = {}) {
   if (!ctx) return "";
   if (Number.isFinite(maxChars) && maxChars > 0) {
     // Budget the earlier parts so the decision, options and recommendation
@@ -702,7 +704,10 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
     const head = lines.slice(0, four).join("\n");
     const tail = lines.slice(four).join("\n");
     const room = Math.max(0, maxChars - tail.length - 1);
-    return room > 40 ? `${clampText(head, room)}\n${tail}` : clampText(tail, maxChars);
+    if (room > 40) return `${clampText(head, room)}\n${tail}`;
+    // The decision and its options must never be cut: a caller that needs
+    // them whole gets null and shows the decision in full or defers it.
+    return preserveDecision ? null : clampText(tail, maxChars);
   }
   const b = (s) => (markdown ? `**${s}**` : s);
   // Only what is known is shown: an empty part is left out rather than
