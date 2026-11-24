@@ -4865,6 +4865,8 @@ export class FleetSupervisor {
       for (const { thread, classified } of items) {
         if (failoversThisTick >= 2) break;
         if (!thread?.key || thread.kind !== "paseo" || thread.excluded || thread.archived) continue;
+        // A watch-only session is never resumed or replaced on its own.
+        if (thread.watchOnly) continue;
         if (store.mutedUntil(thread.key)) continue;
         if (classified?.state !== "infra-blocked") continue;
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
@@ -5102,7 +5104,10 @@ export class FleetSupervisor {
         const slice = classifyQuestionSlice(fields);
         const prefs = store.preferences();
         const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
-        const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
+        // Never an automatic answer to a watch-only session: its asks stay
+        // the owner's (the owner's own answers still go through).
+        const candidate = autoChoice ? byKey.get(fields.threadKey) : null;
+        const targetThread = candidate?.watchOnly ? null : candidate;
         const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
         const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
         if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
@@ -5163,6 +5168,8 @@ export class FleetSupervisor {
         && fields.threadKey
         && !fields.mergeAsk
         && !store.mutedUntil(fields.threadKey)
+        // Precedents never answer a watch-only session on the owner's behalf.
+        && !(byKey.get(fields.threadKey)?.watchOnly || askThread?.watchOnly)
         && sends < config.limits.maxSendsPerTick
       ) {
         const askActiveGoal = this.activeWork.findActiveGoalForThread(fields.threadKey, askPrRef);
