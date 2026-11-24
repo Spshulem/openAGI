@@ -105,3 +105,66 @@ test("outstanding voice holds reduce the shared budget for text and embedding ca
   guard.setVoiceReservation("audio", 0);
   assert.doesNotThrow(() => guard.check(0.5));
 });
+
+test("daily budget resets on local midnight and rebuckets legacy UTC late-night spend from ledger", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "budget-local-day-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const storePath = path.join(dir, "usage.json");
+  const ledger = new CreditLedger({ storePath: path.join(dir, "ledger.jsonl") });
+
+  // Simulate legacy v0.0.83 UTC Linux server (`distiller`) on Friday Nov 20 at 11:33 PM PST
+  // (`2026-11-21T07:33:56Z`), which previously bucketed Friday night's $10.05 spend into `"2026-11-21"`.
+  const fridayNightUtc = new Date("2026-11-21T07:33:56.000Z");
+  const legacyUtcGuard = new BudgetGuard({
+    storePath,
+    ledger,
+    dailyUsdLimit: 10,
+    timeZone: "UTC",
+    now: () => fridayNightUtc
+  });
+  legacyUtcGuard.recordUsd(10.05, "gpt-6.2-sol", { channel: "chat", now: fridayNightUtc });
+  assert.equal(legacyUtcGuard.status().today, "2026-11-21");
+  assert.equal(legacyUtcGuard.status().exceeded, true);
+
+  // Simulate legacy usage.json having no `daysTimeZone` field yet
+  const rawLegacy = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  delete rawLegacy.daysTimeZone;
+  delete rawLegacy.timeZone;
+  fs.writeFileSync(storePath, JSON.stringify(rawLegacy));
+
+  // Next morning: Saturday Nov 21 at 8:08 AM PST (`2026-11-21T16:08:53Z`).
+  const saturdayMorningUtc = new Date("2026-11-21T16:08:53.000Z");
+  const serverGuard = new BudgetGuard({
+    storePath,
+    ledger,
+    dailyUsdLimit: 10,
+    now: () => saturdayMorningUtc
+  });
+  // Override explicit/OS timezone to simulate a UTC Linux host before client sync
+  serverGuard._explicitTimeZone = null;
+  serverGuard.timeZone = "UTC";
+  serverGuard.state.daysTimeZone = "UTC";
+  assert.equal(serverGuard.status().exceeded, true, "before adopting owner's timezone, UTC day is still 2026-11-21");
+
+  // Paired iPhone/Mac sends `X-OpenAGI-Timezone: America/Los_Angeles`
+  const adopted = serverGuard.adoptClientTimeZone("America/Los_Angeles");
+  assert.equal(adopted, true);
+
+  const status = serverGuard.status();
+  assert.equal(status.timeZone, "America/Los_Angeles");
+  assert.equal(status.today, "2026-11-21");
+  assert.equal(status.spentUsd, 0, "Friday 11:33 PM PST spend rebuckets to 2026-11-20, leaving Saturday at $0");
+  assert.equal(status.remainingUsd, 10);
+  assert.equal(status.exceeded, false);
+  assert.doesNotThrow(() => serverGuard.check());
+  assert.equal(
+    status.history.find((h) => h.date === "2026-11-20")?.usd,
+    10.05,
+    "Friday local day retains the $10.05 spend in history"
+  );
+
+  // Headless UTC node hint must never clobber an already-adopted local timezone
+  assert.equal(serverGuard.adoptClientTimeZone("UTC"), false);
+  assert.equal(serverGuard.adoptClientTimeZone("Etc/UTC"), false);
+  assert.equal(serverGuard.status().timeZone, "America/Los_Angeles");
+});

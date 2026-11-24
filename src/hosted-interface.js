@@ -15,7 +15,7 @@ import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
-import { g2ConnectPage } from "./g2-connect-page.js";
+import { renderG2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
@@ -89,7 +89,7 @@ import {
   EVEN_G2_PLATFORM,
   G2ChannelError
 } from "./integrations/g2-channel.js";
-import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { DELEGATED_ENROLLMENT_CODE_TTL_MS, NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
@@ -1021,6 +1021,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         && isMobileRouteAllowed(method, pathname);
       const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
         && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
+      // A paired computer may ask main for a G2 code only with the owner-proxy
+      // grant main recorded at owner-authenticated pairing. Its operational
+      // token, a phone, or a pair of glasses never qualifies.
+      const g2CodeRequest = method === "POST" && pathname === "/nodes/g2/enrollment-code";
+      const g2CodeIssuer = g2CodeRequest && Boolean(requestNodeId)
+        && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -1086,6 +1093,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : g2CodeRequest && requestNodeId
+            ? { ok: g2CodeIssuer, reason: "this computer is not authorized by the main owner to request glasses codes" }
           : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
@@ -1157,6 +1166,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
         try {
+          if (body.OPENAGI_DAILY_USD_LIMIT !== undefined && runtime.budget?.setDailyLimit) {
+            const parsedLimit = Number.parseFloat(String(body.OPENAGI_DAILY_USD_LIMIT));
+            if (Number.isFinite(parsedLimit) && parsedLimit >= 0.5 && parsedLimit <= 10000) {
+              runtime.budget.setDailyLimit(parsedLimit);
+            }
+          }
           const { createModelProvider } = await import("./model-provider.js");
           if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|CLAUDE_CLI_|CODEX_CLI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
@@ -1389,13 +1404,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
         const issued = nodeEnrollment.issue(platform);
-        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code issued (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
           ...(platform === EVEN_G2_PLATFORM
             ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
             : {})
+        });
+      }
+      if (g2CodeRequest) {
+        res.setHeader("cache-control", "no-store");
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "not_main", message: "This computer is not the main. Request the code from the main OpenAGI." });
+        }
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+          return sendJson(res, 400, { error: "invalid_request", message: "This request takes no options." });
+        }
+        let origin;
+        try {
+          const configured = new URL(getPublicUrl());
+          if (configured.protocol !== "https:" || configured.username || configured.password
+              || configured.pathname !== "/" || configured.search || configured.hash) throw new Error("invalid");
+          origin = configured.origin;
+        } catch {
+          return sendJson(res, 409, {
+            error: "main_public_url_required",
+            message: "Your main has no exact HTTPS public address, so glasses could not reach it. Set OPENAGI_PUBLIC_URL on the main, then try again."
+          });
+        }
+        const issuedVia = requestNodeId ?? null;
+        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM, { ttlMs: DELEGATED_ENROLLMENT_CODE_TTL_MS, issuedVia });
+        const via = issuedVia ? nodeRegistry.enrollment(issuedVia)?.name ?? issuedVia : "the owner";
+        console.log(`[openagi] Even G2 enrollment code issued for ${via} (valid 10 min, single use)`);
+        return sendJson(res, 200, {
+          code: issued.code,
+          platform: EVEN_G2_PLATFORM,
+          expiresAt: issued.expiresAt,
+          publicUrl: origin,
+          main: { name: localIdentity.name ?? null },
+          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1516,7 +1565,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         nodeRegistry.enroll(nodeId, nodeToken, {
           platform,
           name,
-          capabilities: capabilitiesForPlatform(platform)
+          capabilities: capabilitiesForPlatform(platform),
+          enrolledVia: consumed.issuedVia
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
@@ -2086,7 +2136,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/g2/connect") {
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
-        return sendHtml(res, 200, g2ConnectPage);
+        const pairedRemote = mobileProfile ? null : readNodeConfig(dataDir)?.remote;
+        let mainOrigin = null;
+        if (pairedRemote) {
+          try { mainOrigin = pinnedRemoteOrigin(pairedRemote, { allowInsecureRemote: allowInsecureNodeRelay }); }
+          catch { mainOrigin = String(pairedRemote); }
+        }
+        return sendHtml(res, 200, renderG2ConnectPage({ mainOrigin }));
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -2230,6 +2286,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
         let clientTurnId = null;
         try {
@@ -2426,7 +2485,91 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 202, { accepted: true });
       }
 
-      if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget") {
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      }
+      if (method === "POST" && pathname === "/budget") {
+        if (!runtime.budget) return sendJson(res, 503, { error: "no-budget" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_body", message: "Expected a JSON budget update." });
+        }
+        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus", "timeZone"]);
+        if (Object.keys(body).some((k) => !allowedKeys.has(k))) {
+          return sendJson(res, 400, { error: "unsupported_fields", message: "Unsupported budget fields." });
+        }
+        const hasLimit = body.dailyUsdLimit !== undefined && body.dailyUsdLimit !== null;
+        const hasBonus = body.addUsdToday !== undefined && body.addUsdToday !== null;
+        const hasReset = body.resetTodayBonus === true;
+        const hasTimeZone = typeof body.timeZone === "string" && body.timeZone.trim().length > 0;
+        if (!hasLimit && !hasBonus && !hasReset && !hasTimeZone) {
+          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit, addUsdToday, or timeZone." });
+        }
+        try {
+          if (hasLimit) {
+            const parsed = Number(body.dailyUsdLimit);
+            if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Daily budget limit must be between $0.50 and $10,000." });
+            }
+          }
+          if (hasBonus) {
+            const parsedBonus = Number(body.addUsdToday);
+            if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
+            }
+          }
+          // The live update stands even if `.env` can't be written, but the
+          // caller must learn it will not survive a restart (a lowered cap
+          // would otherwise silently revert to the old, higher one).
+          const notPersisted = [];
+          let persistenceError = null;
+          const persistEnv = async (key, value) => {
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { [key]: value } });
+            } catch (error) {
+              notPersisted.push(key);
+              persistenceError ??= String(error?.message ?? error);
+            }
+          };
+          if (hasTimeZone && typeof runtime.budget.setTimeZone === "function") {
+            runtime.budget.setTimeZone(body.timeZone.trim());
+            process.env.OPENAGI_TIMEZONE = runtime.budget.timeZone;
+            await persistEnv("OPENAGI_TIMEZONE", runtime.budget.timeZone);
+          }
+          if (hasLimit) {
+            runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));
+            process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+            await persistEnv("OPENAGI_DAILY_USD_LIMIT", String(runtime.budget.dailyUsdLimit));
+          }
+          if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+            runtime.budget.clearBonusToday();
+          }
+          if (hasBonus) {
+            runtime.budget.addBonusToday(Number(body.addUsdToday));
+          }
+          const updated = runtime.budget.status();
+          runtime.events?.emit?.("budget-updated", updated);
+          if (notPersisted.length > 0) {
+            return sendJson(res, 200, {
+              ...updated,
+              persisted: false,
+              notPersisted,
+              persistenceError,
+              warning: "Applied for now, but not saved: the previous setting returns when OpenAGI restarts."
+            });
+          }
+          return sendJson(res, 200, (hasLimit || hasTimeZone) ? { ...updated, persisted: true } : updated);
+        } catch (error) {
+          return sendJson(res, 400, { error: "invalid_budget", message: String(error?.message ?? "Invalid budget update.") });
+        }
+      }
       if (method === "GET" && pathname === "/budget/ledger") {
         const ledger = runtime.budget?.ledger;
         if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
@@ -3029,6 +3172,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Pass extraCookies so /fleet?token= signs in like the dashboard does.
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
       }
+      if (pathname === "/goals" && (method === "GET" || method === "POST")) {
+        res.setHeader("Cache-Control", "no-store");
+        if (method === "GET") {
+          const activeWork = typeof runtime.fleetSupervisor?.getActiveWork === "function"
+            ? await Promise.resolve(runtime.fleetSupervisor.getActiveWork({ includeSnoozed: true, includeDone: url.searchParams.get("includeDone") === "true" })).catch(() => null)
+            : null;
+          const taskGoals = typeof runtime.tasks?.listGoals === "function"
+            ? runtime.tasks.listGoals({}).map((g) => ({ ...g, progress: runtime.tasks.goalProgress?.(g.id) ?? null }))
+            : [];
+          return sendJson(res, 200, {
+            activeWork,
+            taskGoals
+          });
+        }
+        const body = await readJsonLimited(req, 32 * 1024).catch(() => null);
+        if (!body || typeof body.goal !== "string" || !body.goal.trim()) {
+          return sendJson(res, 400, { error: "invalid_goal", message: "Provide { goal, doneCriteria, project?, cadence? }." });
+        }
+        const doneCriteria = typeof body.doneCriteria === "string" && body.doneCriteria.trim()
+          ? body.doneCriteria.trim()
+          : `Verify ${body.goal.trim().slice(0, 120)}`;
+        const tracked = typeof runtime.fleetSupervisor?.trackWork === "function"
+          ? await runtime.fleetSupervisor.trackWork({
+              project: body.project ?? "General",
+              theme: body.theme ?? null,
+              customer: body.customer ?? null,
+              goal: body.goal.trim(),
+              doneCriteria,
+              cadence: body.cadence ?? "daily",
+              permittedNudges: body.permittedNudges ?? "resume_owner",
+              threadKey: body.threadKey ?? null,
+              prRef: body.prRef ?? null,
+              linkedSkill: body.linkedSkill ?? null,
+              cursor: body.cursor ?? null
+            })
+          : null;
+        return sendJson(res, 200, { ok: true, tracked });
+      }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
         const acceptsImages = method === "POST" && (
@@ -3270,10 +3451,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // with a reason when already current or not fast-forwardable.
         const { applyUpdate } = await import("./self-update.js");
         const result = await applyUpdate();
-        sendJson(res, result.updated ? 202 : 200, result);
+        const willRestart = result.updated && !result.restartRequired;
+        sendJson(res, willRestart ? 202 : 200, result);
         if (result.updated) {
-          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to });
-          setTimeout(() => process.exit(0), 300); // respawn with new code
+          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to, restartRequired: Boolean(result.restartRequired) });
+          // Unsupervised portable installs have nothing to respawn them: keep
+          // serving and report that a manual restart is required.
+          if (willRestart) setTimeout(() => process.exit(0), 300); // respawn with new code
         }
         return;
       }
@@ -8182,11 +8366,13 @@ async function renderChannels() {
 
 async function renderBudget() {
   const b = await fetchJson("/budget");
-  const pct = Math.min(100, (b.spentUsd / Math.max(b.dailyUsdLimit, 0.0001)) * 100);
+  const effectiveLimit = Number(b.effectiveLimitUsd ?? b.dailyUsdLimit ?? 10);
+  const bonusUsdToday = Number(b.bonusUsdToday ?? 0);
+  const pct = Math.min(100, (b.spentUsd / Math.max(effectiveLimit, 0.0001)) * 100);
   const stateClass = pct > 90 ? "err" : pct > 70 ? "warn" : "ok";
   main.innerHTML = \`
     <div class="pane">
-      <h2>Credits</h2>
+      <h2>Credits &amp; Daily Budget</h2>
       <div class="card">
         <div class="row between" style="align-items:center;">
           <span class="name">Today · \${escapeHtml(b.today)}</span>
@@ -8197,11 +8383,34 @@ async function renderBudget() {
         </div>
       </div>
 
+      <div class="card" style="margin-top:12px;">
+        <div class="row between" style="align-items:center;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div class="name">Adjust budget</div>
+            <div class="desc">Add extra room just for today or change your daily limit immediately.</div>
+          </div>
+          <div class="row" style="gap:8px;flex-wrap:wrap;">
+            <button class="btn" id="budgetAdd10Btn" type="button">+$10 today</button>
+            <button class="btn" id="budgetAdd25Btn" type="button">+$25 today</button>
+            \${bonusUsdToday > 0 ? '<button class="btn ghost" id="budgetResetBonusBtn" type="button">Reset today extra</button>' : ""}
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label class="desc" for="budgetDailyInput">Daily limit ($/day)</label>
+          <input id="budgetDailyInput" type="number" min="0.5" max="10000" step="0.5" value="\${Number(b.dailyUsdLimit ?? 10).toFixed(2)}" style="width:120px;" />
+          <button class="btn primary" id="budgetSaveLimitBtn" type="button">Save daily limit</button>
+          <button class="btn ghost" data-budget-preset="25" type="button">$25/day</button>
+          <button class="btn ghost" data-budget-preset="50" type="button">$50/day</button>
+          <button class="btn ghost" data-budget-preset="100" type="button">$100/day</button>
+          <span id="budgetSaveMsg" class="desc"></span>
+        </div>
+      </div>
+
       <h3>Today</h3>
       <div class="grid stats">
         <div class="card"><span class="desc">Spent</span><div class="stat-value">$\${b.spentUsd.toFixed(4)}</div></div>
         <div class="card"><span class="desc">Remaining</span><div class="stat-value">$\${b.remainingUsd.toFixed(4)}</div></div>
-        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}</div></div>
+        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}\${bonusUsdToday > 0 ? \` (+\$\${bonusUsdToday.toFixed(2)} today)\` : ""}</div></div>
         <div class="card"><span class="desc">Calls</span><div class="stat-value">\${b.calls}</div></div>
         <div class="card"><span class="desc">Input tokens</span><div class="stat-value">\${b.tokens.input.toLocaleString()}</div></div>
         <div class="card"><span class="desc">Output tokens</span><div class="stat-value">\${b.tokens.output.toLocaleString()}</div></div>
@@ -8211,7 +8420,7 @@ async function renderBudget() {
 
       <h3>Last 14 days</h3>
       <div id="budgetHistory" class="grid"></div>
-      <p class="desc" style="margin-top:12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+      <p class="desc" style="margin-top:12px;">Saved daily limits persist to <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code> and take effect immediately.</p>
       <h3>Spend over time (30 days)</h3>
       <div id="creditChart" class="card"></div>
       <h3>By activity (30 days)</h3>
@@ -8223,6 +8432,26 @@ async function renderBudget() {
     </div>
   \`;
   const hist = $("budgetHistory");
+  const applyBudgetPatch = async (patch) => {
+    const msg = $("budgetSaveMsg");
+    if (msg) msg.textContent = "Saving…";
+    try {
+      await postJson("/budget", patch);
+      await renderBudget();
+    } catch (err) {
+      if (msg) msg.textContent = err?.message || "Failed to update budget.";
+    }
+  };
+  $("budgetAdd10Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 10 }));
+  $("budgetAdd25Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 25 }));
+  $("budgetResetBonusBtn")?.addEventListener("click", () => applyBudgetPatch({ resetTodayBonus: true }));
+  $("budgetSaveLimitBtn")?.addEventListener("click", () => {
+    const val = Number.parseFloat($("budgetDailyInput")?.value ?? "");
+    applyBudgetPatch({ dailyUsdLimit: val });
+  });
+  for (const btn of main.querySelectorAll("[data-budget-preset]")) {
+    btn.addEventListener("click", () => applyBudgetPatch({ dailyUsdLimit: Number(btn.getAttribute("data-budget-preset")) }));
+  }
   for (const d of (b.history ?? [])) {
     const c = document.createElement("div");
     c.className = "card";

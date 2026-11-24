@@ -297,6 +297,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     public var live: Bool
     public var decision: FleetDecision?
     public var nextCheckAt: Date?
+    public var watchdog: FleetWatchdog?
     public var actorLabel: String?
     public var subchannel: String?
     public var labels: [String]
@@ -307,8 +308,8 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
                 branch: String? = nil, agentStatus: String? = nil, state: String? = nil, health: String? = nil,
                 reason: String? = nil, blockers: [String] = [], pr: FleetPR? = nil, lastActivityAt: Date? = nil,
                 lastAgentText: String? = nil, error: FleetThreadError? = nil, live: Bool = false,
-                decision: FleetDecision? = nil, nextCheckAt: Date? = nil, actorLabel: String? = nil,
-                subchannel: String? = nil, labels: [String] = []) {
+                decision: FleetDecision? = nil, nextCheckAt: Date? = nil, watchdog: FleetWatchdog? = nil,
+                actorLabel: String? = nil, subchannel: String? = nil, labels: [String] = []) {
         self.key = key
         self.kind = kind
         self.title = title
@@ -328,6 +329,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         self.live = live
         self.decision = decision
         self.nextCheckAt = nextCheckAt
+        self.watchdog = watchdog
         self.actorLabel = actorLabel
         self.subchannel = subchannel
         self.labels = labels
@@ -336,7 +338,7 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case key, kind, title, project, workspace, repo, branch, agentStatus, state, health, reason, blockers, pr
         case lastActivityAt, lastAgentText, error, live, decision
-        case nextCheckAt, actorLabel, subchannel, labels
+        case nextCheckAt, watchdog, actorLabel, subchannel, labels
     }
 
     public init(from decoder: Decoder) throws {
@@ -360,14 +362,115 @@ public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
         live = c.lenient(Bool.self, .live) ?? false
         decision = c.lenient(FleetDecision.self, .decision)
         nextCheckAt = c.lenient(Date.self, .nextCheckAt)
+        watchdog = c.lenient(FleetWatchdog.self, .watchdog)
         actorLabel = c.lenient(String.self, .actorLabel)
         subchannel = c.lenient(String.self, .subchannel)
         labels = c.lenientList(String.self, .labels)
     }
 }
 
-// A thread whose PR the supervisor could not read still carries its ref, with
-// url/state null -- the same partial shape buildSnapshot emits.
+public struct FleetWatchdogDiagnosis: Decodable, Sendable, Equatable {
+    public var kind: String?
+    public var label: String?
+    public var resolution: String?
+
+    public init(kind: String? = nil, label: String? = nil, resolution: String? = nil) {
+        self.kind = kind
+        self.label = label
+        self.resolution = resolution
+    }
+
+    private enum CodingKeys: String, CodingKey { case kind, label, resolution }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = c.lenient(String.self, .kind)
+        label = c.lenient(String.self, .label)
+        resolution = c.lenient(String.self, .resolution)
+    }
+}
+
+public struct FleetWatchdog: Decodable, Sendable, Equatable {
+    public var phase: String?
+    public var expectedMinutes: Int?
+    public var silentMinutes: Int?
+    public var checkInDueAt: Date?
+    public var overdue: Bool
+    public var overdueMinutes: Int
+    public var severelyStuck: Bool
+    public var status: String?
+    public var diagnosis: FleetWatchdogDiagnosis?
+
+    public var badgeText: String? {
+        if severelyStuck {
+            let dur = Self.compactDuration(silentMinutes ?? overdueMinutes)
+            if let diag = diagnosis?.label, !diag.isEmpty {
+                return "Stuck \(dur) · \(diag)"
+            }
+            return "Stuck \(dur)"
+        }
+        if overdue {
+            if let diag = diagnosis?.label, !diag.isEmpty {
+                return "Check-in overdue · \(diag)"
+            }
+            let mins = max(1, overdueMinutes)
+            return "Check-in overdue +\(Self.compactDuration(mins))"
+        }
+        if let exp = expectedMinutes, exp > 0 {
+            if let due = checkInDueAt {
+                let remMin = max(1, Int(ceil(due.timeIntervalSinceNow / 60)))
+                if due.timeIntervalSinceNow > 0 {
+                    return "Check-in in \(Self.compactDuration(remMin)) (est. \(exp)m)"
+                }
+            }
+            return "Est. check-in \(exp)m"
+        }
+        return nil
+    }
+
+    public var isAlert: Bool {
+        severelyStuck || overdue
+    }
+
+    private static func compactDuration(_ minutes: Int) -> String {
+        let m = max(1, minutes)
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        let rem = m % 60
+        return (rem > 0 && h < 10) ? "\(h)h \(rem)m" : "\(h)h"
+    }
+
+    public init(phase: String? = nil, expectedMinutes: Int? = nil, silentMinutes: Int? = nil,
+                checkInDueAt: Date? = nil, overdue: Bool = false, overdueMinutes: Int = 0,
+                severelyStuck: Bool = false, status: String? = nil, diagnosis: FleetWatchdogDiagnosis? = nil) {
+        self.phase = phase
+        self.expectedMinutes = expectedMinutes
+        self.silentMinutes = silentMinutes
+        self.checkInDueAt = checkInDueAt
+        self.overdue = overdue
+        self.overdueMinutes = overdueMinutes
+        self.severelyStuck = severelyStuck
+        self.status = status
+        self.diagnosis = diagnosis
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case phase, expectedMinutes, silentMinutes, checkInDueAt, overdue, overdueMinutes, severelyStuck, status, diagnosis
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        phase = c.lenient(String.self, .phase)
+        expectedMinutes = c.lenient(Int.self, .expectedMinutes)
+        silentMinutes = c.lenient(Int.self, .silentMinutes)
+        checkInDueAt = c.lenient(Date.self, .checkInDueAt)
+        overdue = c.lenient(Bool.self, .overdue) ?? false
+        overdueMinutes = c.lenient(Int.self, .overdueMinutes) ?? 0
+        severelyStuck = c.lenient(Bool.self, .severelyStuck) ?? false
+        status = c.lenient(String.self, .status)
+        diagnosis = c.lenient(FleetWatchdogDiagnosis.self, .diagnosis)
+    }
+}
 public struct FleetPR: Decodable, Sendable, Equatable {
     public var ref: String?
     public var url: String?
@@ -938,20 +1041,23 @@ public struct SupervisorRecentMessage: Decodable, Sendable, Equatable, Identifia
 
 public struct SupervisorCardBrief: Decodable, Sendable, Equatable {
     public var context: String?
+    public var currentState: String?
     public var whatChanged: String?
     public var decision: String?
 
-    public init(context: String? = nil, whatChanged: String? = nil, decision: String? = nil) {
+    public init(context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil) {
         self.context = context
+        self.currentState = currentState
         self.whatChanged = whatChanged
         self.decision = decision
     }
 
-    private enum CodingKeys: String, CodingKey { case context, whatChanged, decision }
+    private enum CodingKeys: String, CodingKey { case context, currentState, whatChanged, decision }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         context = c.lenient(String.self, .context)
+        currentState = c.lenient(String.self, .currentState)
         whatChanged = c.lenient(String.self, .whatChanged)
         decision = c.lenient(String.self, .decision)
     }
