@@ -14,7 +14,8 @@ import { AnthropicProvider, OpenAIResponsesProvider } from "../src/model-provide
 import { ChatGPTPlanProvider } from "../src/chatgpt-provider.js";
 import { CodexCliProvider } from "../src/cli-subscription-providers.js";
 import { OfflineFallbackProvider } from "../src/offline-fallback-provider.js";
-import { normalizeReasoningEffort, providerReasoningEffortSupport } from "../src/session-reasoning-effort.js";
+import { normalizeReasoningEffort, providerReasoningEffortSupport, applySessionReasoningEffort, effectiveSessionReasoningEffort, describeSessionReasoningEffort } from "../src/session-reasoning-effort.js";
+import { reasoningEffortsForModel } from "../src/model-router.js";
 
 function makeRuntime(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-chat-effort-"));
@@ -178,4 +179,52 @@ test("ChatGPT plan, phone offline wrapper, and Codex CLI expose and honor the pe
   assert.equal(runs[1].includes("-c"), false, "no override keeps the CLI default");
   await codex.generate({ input: "hi", reasoningEffort: "none" });
   assert.equal(runs[2].includes("-c"), false, "values Codex does not accept are not sent");
+});
+
+test("supported efforts come from the resolved model, so an override it would reject is refused or suppressed", async () => {
+  assert.deepEqual(reasoningEffortsForModel("gpt-5"), ["minimal", "low", "medium", "high"]);
+  assert.deepEqual(reasoningEffortsForModel("gpt-5-mini"), ["minimal", "low", "medium", "high"]);
+  assert.deepEqual(reasoningEffortsForModel("gpt-5.1"), ["none", "low", "medium", "high"]);
+  assert.ok(reasoningEffortsForModel("gpt-5.1-codex-max").includes("xhigh"));
+  assert.ok(reasoningEffortsForModel("gpt-5.4").includes("xhigh"));
+  assert.ok(reasoningEffortsForModel("gpt-6-luna").includes("xhigh"));
+  assert.deepEqual(reasoningEffortsForModel("o3"), ["low", "medium", "high"]);
+  assert.deepEqual(reasoningEffortsForModel("gpt-4.1"), []);
+  assert.deepEqual(reasoningEffortsForModel("gpt-5-chat-latest"), []);
+  assert.deepEqual(reasoningEffortsForModel("some-new-model"), ["low", "medium", "high"]);
+
+  // Default gpt-5: "extra high" is refused up front instead of being saved and 400ing every turn.
+  const sessions = new Map([["peri-chat", { id: "peri-chat", metadata: {} }]]);
+  const store = { getSession: (id) => structuredClone(sessions.get(id)), saveSession: (s) => sessions.set(s.id, structuredClone(s)) };
+  const gpt5 = new OpenAIResponsesProvider({ apiKey: "sk-test-0000000000000000", model: "gpt-5", reasoningEffort: null });
+  const support = providerReasoningEffortSupport(gpt5);
+  assert.equal(support.supported, true);
+  assert.equal(support.options.includes("xhigh"), false);
+  assert.throws(() => applySessionReasoningEffort({ store, provider: gpt5, sessionId: "peri-chat", effort: "extra high" }), /not "xhigh"/);
+  assert.equal(sessions.get("peri-chat").metadata.reasoningEffort, undefined, "nothing persisted");
+
+  // Saved on a model that takes xhigh, then the chat model changes to gpt-5:
+  // the override is suppressed (not sent), reported, and still clearable.
+  const luna = new OpenAIResponsesProvider({ apiKey: "sk-test-0000000000000000", model: "gpt-6-luna", reasoningEffort: null });
+  applySessionReasoningEffort({ store, provider: luna, sessionId: "peri-chat", effort: "xhigh" });
+  assert.equal(effectiveSessionReasoningEffort(store.getSession("peri-chat"), luna), "xhigh");
+  assert.equal(effectiveSessionReasoningEffort(store.getSession("peri-chat"), gpt5), null);
+  assert.match(describeSessionReasoningEffort({ store, provider: gpt5, sessionId: "peri-chat" }).note, /not supported/);
+  const bodies = [];
+  gpt5.postResponses = async (body) => { bodies.push(structuredClone(body)); return { id: "r", output_text: "ok", output: [] }; };
+  gpt5.postResponsesStream = (body, context) => gpt5.postResponses(body, context);
+  gpt5.fetchImpl = async () => { throw new Error("network disabled in test"); };
+  await gpt5.generate({ input: "hi", task: "chat", reasoningEffort: "xhigh" });
+  assert.notEqual(bodies[0].reasoning?.effort, "xhigh", "the request never carries an effort gpt-5 rejects");
+  const cleared = applySessionReasoningEffort({ store, provider: gpt5, sessionId: "peri-chat", effort: null });
+  assert.equal(cleared.sessionOverride, null);
+
+  // Non-reasoning model: reported unsupported, with a reason.
+  const gpt41 = providerReasoningEffortSupport(new OpenAIResponsesProvider({ apiKey: "sk-test-0000000000000000", model: "gpt-4.1" }));
+  assert.equal(gpt41.supported, false);
+  assert.match(gpt41.reason, /gpt-4.1/);
+
+  // Codex CLI follows its configured model too.
+  const codex5 = new CodexCliProvider({ bin: "/usr/bin/codex", env: {}, model: "gpt-5" });
+  assert.equal(providerReasoningEffortSupport(codex5).options.includes("xhigh"), false);
 });

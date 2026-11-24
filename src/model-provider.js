@@ -1,6 +1,6 @@
 import { imageContent, imageHistory, unsupportedImageInput } from "./message-attachments.js";
 import { redactFailureDiagnostic } from "./agent-failure.js";
-import { ModelRouter, REASONING_EFFORTS } from "./model-router.js";
+import { ModelRouter, reasoningEffortsForModel } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
@@ -114,13 +114,18 @@ export class OpenAIResponsesProvider {
 
   // Reasoning effort is sent per request, so a single chat can ask for a
   // different depth (session-reasoning-effort.js) without touching env.
+  // Options come from the model the chat turn resolves to, so an override the
+  // model would reject is neither accepted nor sent.
   reasoningEffortSupport({ task = "chat" } = {}) {
+    const model = this.resolveModel({ task });
+    const options = reasoningEffortsForModel(model);
     return {
-      supported: true,
+      supported: options.length > 0,
       provider: this.name ?? "openai",
-      model: this.resolveModel({ task }),
-      options: [...REASONING_EFFORTS],
-      configuredDefault: this.router?.reasoningEffort?.(task) || this.reasoningEffort || null
+      model,
+      options,
+      configuredDefault: this.router?.reasoningEffort?.(task) || this.reasoningEffort || null,
+      ...(options.length > 0 ? {} : { reason: `${model} does not take a reasoning-effort setting.` })
     };
   }
 
@@ -153,7 +158,7 @@ export class OpenAIResponsesProvider {
     const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
     const toolList = tools.length > 0 ? tools : toolRegistry?.toOpenAITools?.() ?? [];
     const fixedChars = baseInstructions.length + JSON.stringify(toolList).length;
-    const reasoningEffort = (REASONING_EFFORTS.includes(reasoningEffortOverride) ? reasoningEffortOverride : null)
+    const reasoningEffort = (reasoningEffortsForModel(model).includes(reasoningEffortOverride) ? reasoningEffortOverride : null)
       || this.router?.reasoningEffort?.(task) || this.reasoningEffort;
     const toolCalls = [];
     const { turnSpend, toolContext } = shareTurnSpend(context);
