@@ -836,3 +836,65 @@ test("upsert_goal cursor-only update keeps the saved owner, cadence and nudge po
     assert.equal(fresh.activeWorkItem.permittedNudges, "resume_owner");
   });
 });
+
+test("owner send recovered into a replacement session watches the replacement, not the disconnected original", async () => {
+  await withTempDir(async (dir) => {
+    const original = {
+      key: "paseo:srv_mac.old_owner",
+      kind: "paseo",
+      id: "old_owner",
+      title: "Unified Work view",
+      workspace: "openagi",
+      repo: "acme/openagi",
+      agentStatus: "idle",
+      archived: false,
+      excluded: null,
+      lastActivityAt: "2026-11-22T17:00:00Z",
+      lastAgentAt: "2026-11-22T17:00:00Z",
+      lastAgentText: "Earlier unrelated work finished.",
+      lastAgentFull: "Earlier unrelated work finished.",
+      prRefs: [],
+      meta: { serverId: "srv_mac", provider: "codex", historyKnown: true, conversation: [] }
+    };
+    const sup = new FleetSupervisor({
+      dataDir: dir,
+      env: {
+        OPENAGI_FLEET_ENABLED: "1",
+        OPENAGI_FLEET_MODE: "auto",
+        OPENAGI_PASEO_ONLY: "1",
+        OPENAGI_FLEET_REVIEW: "0"
+      },
+      deps: {
+        now: () => Date.parse("2026-11-22T17:12:00Z"),
+        listPaseoThreads: async () => [original],
+        fetchPrs: async () => new Map(),
+        executor: {
+          async deliver() {
+            return {
+              status: "sent",
+              route: "paseo-send",
+              actionId: "act_recovered",
+              recoveredSession: { key: "paseo:srv_mac.new_owner", title: "Unified Work view (resumed)", workspace: "openagi", cwd: "/tmp/openagi" },
+              detail: "Session runtime disconnected; started fresh Paseo session and delivered message"
+            };
+          }
+        }
+      }
+    });
+    const tracked = sup.activeWork.trackWork({
+      project: "openagi",
+      goal: "Ship the unified Work view",
+      threadKey: original.key,
+      permittedNudges: "resume_owner"
+    });
+    await sup._tick("test");
+
+    const sent = await sup.sendOwnerMessage(original.key, "Ship the unified Work view");
+    assert.equal(sent.delivery.status, "sent");
+    assert.equal(sent.delivery.recoveredSession.key, "paseo:srv_mac.new_owner");
+    const watches = sup.store.openFollowThroughWatches();
+    assert.equal(watches.length, 1);
+    assert.equal(watches[0].threadKey, "paseo:srv_mac.new_owner", "verification follows the session that received the directive");
+    assert.equal(watches[0].goalId, tracked.item.id, "the watch stays bound to the goal tracked on the original owner");
+  });
+});

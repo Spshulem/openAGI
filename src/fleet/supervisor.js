@@ -2485,7 +2485,22 @@ export class FleetSupervisor {
           this.resolveOutreach(q, "reply", "acted");
         }
       }
-      followThroughWatch = this.registerFollowThroughWatch(thread, text, { source: "owner-message", question: matchingOpen, goalId });
+      // A send that recovered into a replacement session is verified on the
+      // session that actually received it, not the disconnected original.
+      const recovered = delivery.recoveredSession?.key ? delivery.recoveredSession : null;
+      const watchThread = recovered
+        ? (this.lastThreads.get(recovered.key) ?? this.knownThreads.get(recovered.key) ?? {
+            key: recovered.key,
+            title: recovered.title || recovered.workspace || recovered.key,
+            workspace: recovered.workspace ?? thread.workspace ?? null,
+            prRefs: thread.prRefs ?? [],
+            lastAgentAt: null,
+            lastActivityAt: null
+          })
+        : thread;
+      const watchGoalId = goalId
+        ?? (recovered ? this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? matchingOpen?.prRef ?? null)?.id ?? null : null);
+      followThroughWatch = this.registerFollowThroughWatch(watchThread, text, { source: "owner-message", question: matchingOpen, goalId: watchGoalId });
     }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
