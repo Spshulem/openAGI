@@ -1,6 +1,6 @@
 import { imageContent, imageHistory, unsupportedImageInput } from "./message-attachments.js";
 import { redactFailureDiagnostic } from "./agent-failure.js";
-import { ModelRouter } from "./model-router.js";
+import { DEFAULT_OPENAI_MODEL, ModelRouter } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
@@ -83,7 +83,7 @@ export class DeterministicModelProvider {
 export class OpenAIResponsesProvider {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
-    this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-5";
+    this.model = options.model ?? process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL;
     // Reasoning depth for models that support it. Left null unless configured,
     // because sending `reasoning` to a non-reasoning model is a 400 — an opt-in
     // key must never become a floor that breaks every other model in the table.

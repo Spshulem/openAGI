@@ -52,6 +52,7 @@ import { ChannelManager } from "./channels.js";
 import { createCompanionRoutes, connectionsPage } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, renderAdvancedWizard, saveEnv } from "./setup-wizard.js";
+import { readModelUpgradeCache } from "./model-upgrades.js";
 import {
   NodeRegistry,
   readOrCreateIdentity,
@@ -158,7 +159,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })(),
         claudeCli: claudeCliStatus(),
         codexCli: codexCliStatus()
-      }
+      },
+      // Last daily model check (model-upgrades.js): newer models the keys can
+      // use, or configured models that are gone. Suggestions only.
+      upgrades: (() => { try { const c = readModelUpgradeCache(dataDir); return c ? { checkedAt: c.checkedAt, suggestions: c.suggestions ?? [], errors: c.errors ?? {} } : null; } catch { return null; } })()
     };
   };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
@@ -2805,6 +2809,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           await rebuildModelProvider();
         }
         return sendJson(res, 200, modelSettings());
+      }
+      // Re-run the newer-model check now (same as the daily job).
+      if (method === "POST" && pathname === "/settings/models/upgrades/check") {
+        const { checkModelUpgrades } = await import("./model-upgrades.js");
+        const result = await checkModelUpgrades({ dataDir, outreach: runtime.outreach });
+        return sendJson(res, 200, { checkedAt: result.checkedAt, checked: result.checked, errors: result.errors, suggestions: result.suggestions });
       }
       // A one-line round trip through the active model, so the settings
       // screen can say "works" or show why not.

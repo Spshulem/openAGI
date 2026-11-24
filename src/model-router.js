@@ -8,8 +8,8 @@
 // pinned to an exact model.
 //
 // Two knobs:
-//   • Tiers   — name a cheaper model once, reuse it.  e.g. OPENAI_MODEL_NANO=gpt-5-nano
-//   • Tasks   — pin one job to an exact model.        e.g. OPENAI_MODEL_TASK_OBSERVER=gpt-5-mini
+//   • Tiers   — name a cheaper model once, reuse it.  e.g. OPENAI_MODEL_NANO=gpt-6-luna
+//   • Tasks   — pin one job to an exact model.        e.g. OPENAI_MODEL_TASK_OBSERVER=gpt-6-luna
 //
 // Resolution for a task:  task pin  >  task's recommended tier  >  base model.
 //
@@ -19,6 +19,12 @@
 // The value is trimmed and lowercased; anything outside REASONING_EFFORTS is
 // ignored with a warning (the task falls back to the global effort) so a typo
 // cannot 400 every call for that task.
+
+// Out-of-the-box OpenAI models when the owner has not picked one. The daily
+// model check (model-upgrades.js) suggests newer ones as they ship, so these
+// only matter for fresh installs and unset keys.
+export const DEFAULT_OPENAI_MODEL = "gpt-6.2-sol";
+export const DEFAULT_OPENAI_SMALL_MODEL = "gpt-6-luna";
 
 export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -201,10 +207,10 @@ export function renderModelPlan(router, { provider } = {}) {
     lines.push("");
     lines.push("Recommended savings — set these to use cheaper models for small jobs:");
     if (router.describe().some((r) => r.tier === "nano" && r.onBase)) {
-      lines.push(`  ${prefix}_MODEL_NANO=${prefix === "OPENAI" ? "gpt-5-nano" : "claude-haiku-4-5"}   # observer, scrutiny judges`);
+      lines.push(`  ${prefix}_MODEL_NANO=${prefix === "OPENAI" ? DEFAULT_OPENAI_SMALL_MODEL : "claude-haiku-4-5"}   # observer, scrutiny judges`);
     }
     if (router.describe().some((r) => r.tier === "mini" && r.onBase)) {
-      lines.push(`  ${prefix}_MODEL_MINI=${prefix === "OPENAI" ? "gpt-5-mini" : "claude-haiku-4-5"}   # condensing, mining, daily recap`);
+      lines.push(`  ${prefix}_MODEL_MINI=${prefix === "OPENAI" ? DEFAULT_OPENAI_SMALL_MODEL : "claude-haiku-4-5"}   # condensing, mining, daily recap`);
     }
   }
   return lines.join("\n");

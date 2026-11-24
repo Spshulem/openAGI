@@ -21,14 +21,14 @@
 // import-cycle TDZ error.
 
 import { OpenAIResponsesProvider } from "./model-provider.js";
-import { ModelRouter } from "./model-router.js";
+import { DEFAULT_OPENAI_MODEL, ModelRouter } from "./model-router.js";
 import { resolveDataDir } from "./data-dir.js";
 import { ChatGPTAuthError, getAccessToken, isPlanUsable } from "./chatgpt-auth.js";
 
 /// Public Responses API; never ChatGPT's backend-api (models-and-inference#2).
 export const CHATGPT_API_BASE_URL = "https://api.openai.com/v1";
 /// The docs' own example model. Real choices come from listModels().
-export const CHATGPT_DEFAULT_MODEL = "gpt-6.1-sol";
+export const CHATGPT_DEFAULT_MODEL = DEFAULT_OPENAI_MODEL;
 /// Preview limitations: "Group function/custom tools in namespaces or supply
 /// them through additional_tools input items." Namespace shape is from
 /// https://developers.openai.com/api/docs/guides/tools-tool-search.

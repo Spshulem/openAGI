@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { clipToolOutput } from "./context-trim.js";
+import { DEFAULT_OPENAI_MODEL } from "./model-router.js";
 
 const MAX_CLI_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CLI_TIMEOUT_MS = 120_000;
@@ -94,7 +95,7 @@ export function codexCliStatus({ env = process.env, homeDir = os.homedir() } = {
     || hasFile(path.join(homeDir, ".ccodex"));
   return {
     available: Boolean(bin && hasAuth),
-    model: String(env?.CODEX_CLI_MODEL ?? "").trim() || "gpt-5.4"
+    model: String(env?.CODEX_CLI_MODEL ?? "").trim() || DEFAULT_OPENAI_MODEL
   };
 }
 
@@ -493,7 +494,7 @@ export class CodexCliProvider {
     this.name = "codex-cli";
     this.env = options.env ?? process.env;
     this.homeDir = options.homeDir ?? os.homedir();
-    this.model = options.model ?? (String(this.env?.CODEX_CLI_MODEL ?? "").trim() || "gpt-5.4");
+    this.model = options.model ?? (String(this.env?.CODEX_CLI_MODEL ?? "").trim() || DEFAULT_OPENAI_MODEL);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS;
     this.maxToolHops = options.maxToolHops ?? (Number(this.env?.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.run = options.run ?? defaultRunCli;
