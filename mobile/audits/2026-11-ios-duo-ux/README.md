@@ -36,7 +36,7 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 
 ### P1-1. The Supervisor composer silently replies to whichever decision is on top
 - **Before** (`img/duo-cover-supervisor-annotated.jpg` #2, `img/iphone-supervisor-annotated.jpg` #1): `syncFocusedCard()` (SupervisorView.swift:718) sets `focusedCardID` to the current card unless you cleared it. Every message then goes out with that card attached as `focusedCardId` (ChatConversation.swift:219 → agent-host.js:75). The placeholder says "Reply to decision **or** ask Supervisor…" and is cut off on both devices. The "Replying to: …" chip only appears once the field has focus. A general question can therefore be read as an answer to a decision.
-- **Safety today:** the daemon only uses the card id as context. Anything actually sent to an agent still goes through `fleet_send_message`, which asks for confirmation. Nothing unsafe gets sent, but you can't tell what the message is about.
+- **Safety today:** the daemon uses the card id only as context. Sending to an agent goes through `fleet_send_message`, but for the authenticated owner that is **not always confirmed**: `ToolRegistry.ownerInvoke` (src/tool-registry.js) can approve and run it immediately. This happens when the owner's message reads as agreeing to, or choosing from, the previous assistant turn (`conversationalCover`), and for some voice requests. A separate confirmation only shows in the other cases. So an implicitly targeted message *can* reach an agent without another prompt, which makes this the most important fix.
 - **After:** keep two explicit modes on the one composer.
   - **Ask Supervisor** is the default. Nothing is attached and nothing is selected automatically.
   - **Reply to "<decision>"** turns on only when you tap *Reply in chat* or pick the decision from a chip above the field. The chip stays visible, focused or not, and has a Clear button with a 44pt target.
@@ -90,7 +90,7 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
   - Voice: a full-width "Talk with Supervisor" bar plus the composer's mic (`img/duo-cover-supervisor-annotated.jpg` #5).
   - Agent replies: the thread sheet's "Reply to <workspace>…" field (`img/duo-cover-thread-reply-annotated.jpg`), the card's *Reply in chat*, and quick-reply pills.
 - **After:**
-  - Voice: one control, the composer mic, plus long-press for hands-free.
+  - Voice: one place to start it, the composer mic. Tap dictates into the draft (review before Send); long-press starts **live voice**, which sends spoken turns directly. Live voice must look and be labeled as a different mode, because it has no review step.
   - Agent replies: keep **Reply to agent** (sent straight to the agent) visibly different from **Ask Supervisor**:
     - The thread sheet's field gets the same pill style as Chat.
     - It gets an "To agent" label and a 44pt send control.
@@ -138,7 +138,7 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 | Answer a decision with its listed option (yes/no…) | Card pills, thread sheet | Option buttons send the exact option; `act`/`decide` | ✓ | ✓ | Same, in the detail pane |
 | Free-text reply to the agent | Thread sheet "Reply to <workspace>" | Direct to the agent, explicit field | ✓ | ✓ | Same field, labeled "To agent" |
 | Reply in chat (Supervisor composer focused on a card) | Card "Reply in chat" | **Today: implicit auto-focus (P1-1)**. Proposed: explicit chip | ✓ | ✓ | Same chip |
-| Ask Supervisor | Supervisor composer | Supervisor acts only through confirmed tools | ✓ | ✓ | Same |
+| Ask Supervisor | Supervisor composer | Tool confirmation is conditional for the owner: `ownerInvoke` can run `fleet_send_message` / `reply_to_coding_agent` without a prompt when the message reads as assent | ✓ | ✓ | Same, but the composer mode must be explicit (P1-1) |
 | Later (defer) | Grey "Dismiss" text (mislabeled) | None needed; reversible | ✓ | ✓ | Labeled "Later", in More |
 | Dismiss | Card X (no confirmation) | **Today: none (P1-2)**. Proposed: confirmation | ✓ | ✓ | In More, with confirmation |
 | Archive session | Card action | `pendingArchiveConfirmation` dialog | ✓ | ✓ | Unchanged |
@@ -146,7 +146,8 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 | Merge green PRs (batch) | #needs-you stage | Existing `batchAct` gating | ✓ | ✓ | Unchanged |
 | Approve a pending action | Inbox, Chat card → Review → ApprovalDetailView | Approve/Deny only in the detail view, with result handling and computer-unavailable copy | ✓ | ✓ | Unchanged; card stays Review-only |
 | Hide an approval card in Chat | Chat card "Hide" | Local; the approval stays in the Inbox | ✓ | ✓ | Unchanged |
-| Voice | Talk bar, composer mic | Dictation fills the draft for review before sending | ✓ | ✓ | Composer mic only |
+| Dictation | Composer mic | Fills the editable draft; nothing is sent until Send | ✓ | ✓ | Same |
+| Live voice conversation | "Talk with Supervisor" bar | **Different behavior:** `startVoice()` starts `VoiceSession.handsFree(true)`; spoken turns are sent and saved without an editable draft or Send | ✓ | ✓ | Keep as its own clearly labeled mode (e.g. long-press on the mic). Do not merge it into dictation in a way that implies review before sending |
 | Open the thread or conversation | Card ›, thread sheet | Read-only | ✓ | ✓ | Detail pane instead of a sheet |
 | Board and channels | Board button, chips | Read-only | ✓ | ✓ (chips clipped) | Sidebar |
 | Settings, model | Today gear, More menus | Revoke has its own confirmation | ✓ | ✓ | Same |
