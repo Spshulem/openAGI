@@ -12,6 +12,7 @@ import { executeApprovedAction } from "./approval-executor.js";
 import { GET_STARTED_GUIDANCE } from "./get-started.js";
 import { LEARNED_HEADS, learnedModeFor, patchOutcomeMetadata } from "./learning/learned-scores.js";
 import { clusterRuleFires } from "./propagation-controller.js";
+import { effectiveSessionReasoningEffort } from "./session-reasoning-effort.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
 // and the task queue it drains. Everything else comes from the specialist's
@@ -19,6 +20,8 @@ import { clusterRuleFires } from "./propagation-controller.js";
 const SPECIALIST_CORE_TOOLS = [
   "recall", "remember",
   "get_budget", "update_budget",
+  // The owner can tune how hard this chat thinks, whoever answers the turn.
+  "chat_reasoning_effort",
   // A routed owner turn must still be able to set up or change a schedule.
   "schedule_message", "list_cron_jobs", "update_cron_job", "cancel_cron_job",
   "list_tasks", "agent_pick_next", "complete_task", "move_task", "save_draft"
@@ -435,13 +438,18 @@ export class AgentHost {
       ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
       : supervisorCoordinatorHops);
     const computerUseToolHops = computerUseHopsNow();
+    const turnTask = agentTurnTask(input);
+    // The owner can ask this chat to think harder or lighter
+    // (chat_reasoning_effort); it applies to this session's foreground turns.
+    const sessionEffort = effectiveSessionReasoningEffort(sessionBefore, this.modelProvider, { task: turnTask });
     const modelResult = await this.modelProvider.generate({
       input: text,
       attachments,
       agent,
       // Delivery channel is not provenance: scheduled work can deliver to
       // local/iMessage/G2 without becoming foreground chat on the main model.
-      task: agentTurnTask(input),
+      task: turnTask,
+      ...(sessionEffort ? { reasoningEffort: sessionEffort } : {}),
       maxToolHops: computerUseToolHops,
       extendToolHops: computerUseHopsNow,
       scrutiny: output.scrutiny,

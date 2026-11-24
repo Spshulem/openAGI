@@ -10,6 +10,7 @@ import {
 } from "./owner-authority.js";
 import { evaluateOwnerIntentClarityWithDecisions } from "./fleet/decisions-gate.js";
 import { argsDigest } from "./pending-actions.js";
+import { applySessionReasoningEffort, describeSessionReasoningEffort, normalizeReasoningEffort } from "./session-reasoning-effort.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
 // caller's array (and the registry's own values) are never reordered underneath
@@ -469,6 +470,54 @@ export function registerCoreTools(registry, runtime) {
     handler: async () => {
       if (!runtime?.budget?.status) return { configured: false, error: "Budget guard is not configured on this runtime." };
       return { configured: true, ...runtime.budget.status() };
+    }
+  });
+
+  // This chat's own reasoning effort ("set your reasoning effort to extra
+  // high"). Session-scoped: other chats, background work, env defaults and
+  // Paseo coding sessions are untouched. Reads are free; a change is owner-only.
+  registry.register({
+    name: "chat_reasoning_effort",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    trustedOutput: true,
+    description: "Read or change YOUR OWN reasoning effort for THIS chat session (how hard you think on the owner's next messages here). action=get reads the current setting and the provider's supported values; action=set with effort (none|minimal|low|medium|high|xhigh; 'extra high' = xhigh) changes it; action=clear returns to the configured default. Takes effect from the next message. Use this when the owner asks you (not a Paseo/coding session) to think harder or lighter; for a coding session use the Supervisor session settings instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "clear"] },
+        effort: { type: "string", maxLength: 24, description: "Required for set: none, minimal, low, medium, high, or xhigh (extra high)." }
+      },
+      required: ["action"],
+      additionalProperties: false
+    },
+    confirmationRequired: (args = {}) => args.action !== "get",
+    scrutinyConfirmationRequired: (args = {}) => args.action !== "get",
+    prepareApprovalArgs: (args = {}) => {
+      const action = ["get", "set", "clear"].includes(args.action) ? args.action : null;
+      if (!action) throw new Error("action must be get, set, or clear.");
+      if (action !== "set") return { action };
+      const effort = normalizeReasoningEffort(args.effort);
+      if (!effort) throw new Error(`"${String(args.effort ?? "").slice(0, 24)}" is not a reasoning effort (none, minimal, low, medium, high, xhigh).`);
+      return { action, effort };
+    },
+    summarize: (args = {}) => (args.action === "clear"
+      ? "Reset this chat's reasoning effort to the default"
+      : `Set this chat's reasoning effort to ${args.effort}`),
+    approvalDedupeKey: (args = {}, context = {}) => `chat-effort:${context?.sessionId ?? "none"}:${args.action}:${args.effort ?? ""}`,
+    handler: async (args = {}, context = {}) => {
+      const host = runtime?.agentHost;
+      if (!host?.store || !host?.modelProvider) throw new Error("Chat sessions are not available on this runtime.");
+      const sessionId = typeof context?.sessionId === "string" && context.sessionId ? context.sessionId : null;
+      if (!sessionId) throw new Error("No current chat session to read or change.");
+      const target = { store: host.store, provider: host.modelProvider, sessionId };
+      if (args.action === "get") return describeSessionReasoningEffort(target);
+      if (!isOwnerPrincipal(context?.__owner) && context?.__confirmed !== true) {
+        throw new Error("Only the owner can change this chat's reasoning effort.");
+      }
+      const effort = args.action === "clear" ? null : args.effort;
+      if (args.action === "set" && !effort) throw new Error("Provide effort for action=set.");
+      return applySessionReasoningEffort({ ...target, effort, setBy: context?.__owner?.via ? `owner:${context.__owner.via}` : "owner:approved" });
     }
   });
 
