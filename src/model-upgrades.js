@@ -13,7 +13,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic, readJsonFile } from "./file-utils.js";
-import { DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_SMALL_MODEL } from "./model-router.js";
+import { DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_SMALL_MODEL, deniedModel } from "./model-router.js";
+import { validateOpenAIKey } from "./provider-credentials.js";
 
 const CACHE_FILE = "model-upgrades.json";
 
@@ -53,7 +54,7 @@ function variantsFor(variant) {
 // and strictly newer. Undated aliases win over dated snapshots of the same
 // version. Returns the catalog's own id, so the suggestion is a value that
 // endpoint actually serves.
-export function newestSuccessor(current, availableIds = []) {
+export function newestSuccessor(current, availableIds = [], { isDenied = () => false } = {}) {
   const cur = parseModelId(current);
   if (!cur) return null;
   const variants = variantsFor(cur.variant);
@@ -61,6 +62,7 @@ export function newestSuccessor(current, availableIds = []) {
   for (const raw of availableIds) {
     const cand = parseModelId(raw);
     if (!cand || cand.line !== cur.line || !variants.includes(cand.variant)) continue;
+    if (isDenied(cand.raw)) continue; // OPENAGI_MODEL_DENY: never suggest it
     if (!newer(cand.version, cur.version)) continue;
     if (!best || newer(cand.version, best.version)
       || (cand.version.join(".") === best.version.join(".") && best.snapshot && !cand.snapshot)) best = cand;
@@ -91,20 +93,21 @@ export function configuredModels(env = process.env) {
   return out;
 }
 
-export function suggestModelUpgrades({ configured = [], available = {} } = {}) {
+export function suggestModelUpgrades({ configured = [], available = {}, env = process.env } = {}) {
+  const isDenied = (model) => deniedModel(model, env);
   const suggestions = [];
   for (const entry of configured) {
     const ids = available[entry.provider];
     if (!Array.isArray(ids) || ids.length === 0) continue; // catalog not read: say nothing
     const lower = new Set(ids.map((i) => String(i).toLowerCase()));
-    const successor = newestSuccessor(entry.model, ids);
+    const successor = newestSuccessor(entry.model, ids, { isDenied });
     if (successor) {
       suggestions.push({ kind: "upgrade", ...entry, suggested: successor });
     } else if (!lower.has(entry.model.toLowerCase())) {
       const fallback = entry.provider === "openai"
         ? (/(mini|nano|luna)/.test(entry.key + entry.model) ? DEFAULT_OPENAI_SMALL_MODEL : DEFAULT_OPENAI_MODEL)
         : null;
-      const served = fallback ? ids.find((i) => parseModelId(i)?.id === fallback) ?? null : null;
+      const served = fallback ? ids.find((i) => parseModelId(i)?.id === fallback && !isDenied(i)) ?? null : null;
       suggestions.push({ kind: "unavailable", ...entry, suggested: served });
     }
   }
@@ -122,6 +125,11 @@ export async function fetchAvailableModels(provider, { env = process.env, fetchI
   const spec = CATALOGS[provider];
   const key = env[spec.keyEnv];
   if (!key) return { ok: false, error: "not configured" };
+  // Same guard as inference: an OpenRouter key aimed at api.openai.com fails
+  // here, before the credential leaves the machine.
+  if (provider === "openai") {
+    try { validateOpenAIKey(key, env.OPENAI_BASE_URL); } catch (error) { return { ok: false, error: error.message }; }
+  }
   try {
     const response = await fetchImpl(spec.url(env), { method: "GET", headers: { accept: "application/json", ...spec.headers(key) }, signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
@@ -162,7 +170,7 @@ export async function checkModelUpgrades({ env = process.env, dataDir, fetchImpl
     if (result.ok) available[provider] = result.ids;
     else errors[provider] = result.error;
   }
-  const suggestions = suggestModelUpgrades({ configured, available });
+  const suggestions = suggestModelUpgrades({ configured, available, env });
   const previous = dataDir ? readModelUpgradeCache(dataDir) : null;
   const notified = new Set(previous?.notified ?? []);
   const announced = [];

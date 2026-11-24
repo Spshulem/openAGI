@@ -154,3 +154,19 @@ test("the daily job passes no outreach store when outreach is disabled", async (
     globalThis.fetch = prev.f;
   }
 });
+
+test("review fixes: OpenRouter key never sent to api.openai.com; denied models never suggested", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => { calls.push(url); return new Response(JSON.stringify({ data: [{ id: "gpt-6.2-sol" }] })); };
+  const r = await checkModelUpgrades({ env: { OPENAI_API_KEY: "sk-or-v1-abc", OPENAI_MODEL: "gpt-6.1-sol" }, fetchImpl });
+  assert.deepEqual(calls, [], "no request carries the OpenRouter key to OpenAI");
+  assert.match(r.errors.openai, /OpenRouter key/);
+  await checkModelUpgrades({ env: { OPENAI_API_KEY: "sk-or-v1-abc", OPENAI_BASE_URL: "https://openrouter.ai/api/v1", OPENAI_MODEL: "gpt-6.1-sol" }, fetchImpl });
+  assert.deepEqual(calls, ["https://openrouter.ai/api/v1/models"], "a matching base URL is allowed");
+
+  const env = { OPENAI_API_KEY: "sk", OPENAI_MODEL: "gpt-6.1-sol", OPENAI_MODEL_NANO: "gpt-6.2-luna", OPENAGI_MODEL_DENY: "gpt-6.2-sol,gpt-6-luna" };
+  const s = suggestModelUpgrades({ configured: configuredModels(env), available: { openai: ["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6-luna"] }, env });
+  assert.deepEqual(s.map((x) => [x.kind, x.key, x.suggested]), [["unavailable", "OPENAI_MODEL_NANO", null]],
+    "no upgrade to the denied gpt-6.2-sol, no denied replacement");
+  assert.equal(newestSuccessor("gpt-6-sol", ["gpt-6.1-sol", "gpt-6.2-sol"], { isDenied: (m) => m === "gpt-6.2-sol" }), "gpt-6.1-sol");
+});
