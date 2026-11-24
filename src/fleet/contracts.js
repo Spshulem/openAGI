@@ -518,6 +518,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
         password: env.OPENAGI_PASEO_PASSWORD ?? localPaseo.password,
         serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
         autoHosts: overrides.paseo?.autoHosts ?? !envOff(env.OPENAGI_PASEO_AUTO_HOSTS),
+        manageRemoteHosts: overrides.paseo?.manageRemoteHosts ?? envFlag(env.OPENAGI_PASEO_MANAGE_REMOTE),
         ...overrides.paseo
       };
     })(),
