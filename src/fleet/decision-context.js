@@ -82,15 +82,17 @@ export function parseAgentSuppliedContext(text) {
   const at = raw.toUpperCase().lastIndexOf(AGENT_CONTEXT_MARKER);
   if (at === -1) return null;
   const block = raw.slice(at + AGENT_CONTEXT_MARKER.length).replace(/^[\s:*#-]+/, "");
+  // Whole-label matches only: "Option one all regions — because…" is an
+  // option line, not an "Options:" header.
   const labels = {
-    goal: /^(?:original\s+)?goal|^what\s+this\s+is|^project/i,
-    assignment: /^assign(?:ed|ment)|^you\s+asked|^task/i,
-    verified: /^verified|^tried|^tested/i,
-    changed: /^changed|^what\s+changed/i,
-    blocked: /^blocked|^why\s+(?:i|the agent)\s+can(?:no|')t|^can(?:no|')t\s+proceed/i,
-    decision: /^decision|^question/i,
-    options: /^options?/i,
-    recommendation: /^recommend/i
+    goal: /^(?:original\s+)?goal$|^what\s+this\s+is$|^project$/i,
+    assignment: /^assign(?:ed|ment)$|^you\s+asked(?:\s+me)?(?:\s+to)?$|^task$/i,
+    verified: /^verified$|^tried$|^tested$/i,
+    changed: /^changed$|^what\s+changed$/i,
+    blocked: /^blocked(?:\s+on|\s+because)?$|^why\s+(?:i|the agent)\s+can(?:no|')t(?:\s+proceed)?(?:\s+alone)?$|^can(?:no|')t\s+proceed(?:\s+alone)?$/i,
+    decision: /^decision$|^question$/i,
+    options: /^options?$/i,
+    recommendation: /^recommend(?:ation|ed)?$/i
   };
   const out = {};
   let current = null;
@@ -175,7 +177,6 @@ const GENERIC_STATE_RE = /^(?:Paused at a decision checkpoint|Blocked at an exte
 
 // ---- "Where it stands": one plain status sentence (two at most) ----------
 
-const OWNER_ACTION_RE = /\b(?:sign in|log in|reply|approve|allow|drag|grant|confirm|choose|pick|you need to|please)\b/i;
 const STATUS_NOISE_RE = /^(?:-{2,}|\*{2,}|!\[|\[image\]|supervisor review:|not recoverable|agent's latest update:)/i;
 const LAST_KNOWN_MS = 24 * 60 * 60 * 1000;
 
@@ -196,10 +197,36 @@ function similar(a, b) {
   return shared / Math.max(ta.size, tb.size) >= 0.6;
 }
 
+function withoutChoiceLists(text) {
+  const lines = String(text ?? "").replace(/\r/g, "").split("\n");
+  const isItem = (l) => /^\s*(?:[-*•]|\d+[.)])\s+/.test(l);
+  const out = [];
+  let inChoices = false;
+  for (const line of lines) {
+    if (isItem(line)) {
+      if (inChoices) continue;
+      if (/^\s*\d+[.)]\s+/.test(line) && /\?/.test(line)) continue;
+      out.push(line);
+      continue;
+    }
+    inChoices = Boolean(line.trim()) && CHOICE_HEADER_RE.test(line) && !RESULT_HEADER_RE.test(line);
+    if (!line.trim()) inChoices = false;
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 function statusSentences(text) {
-  return splitSentences(String(text ?? "").replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
+  // Only the decision's own choice lists are left out of "where it stands":
+  // bullets right after a line asking for a choice, and numbered items that
+  // ask something. Other bullets (test results, failures) are status.
+  const prose_ = withoutChoiceLists(text);
+  return splitSentences(prose_.replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
     .map((t) => t.replace(/^[-*•]\s+/, "").trim())
-    .filter((t) => t.length >= 6 && !STATUS_NOISE_RE.test(t) && !/^\[?openagi supervisor\]?/i.test(t));
+    // A clipped excerpt starts mid-sentence ("…eady say"); a lead-in ends in
+    // ":" ("Decisions I need from you:"). Neither is a status.
+    .filter((t) => t.length >= 6 && !/^…/.test(t) && !/:$/.test(t) && !/^\d+[.)]\s/.test(t))
+    .filter((t) => !STATUS_NOISE_RE.test(t) && !/^\[?openagi supervisor\]?/i.test(t));
 }
 
 function messageMs(message) {
@@ -277,6 +304,91 @@ function latestAgentText(agentSummary, messages) {
 function agentBlockerSentence(agentSummary, messages) {
   const hit = splitSentences(latestAgentText(agentSummary, messages)).reverse().find((t) => BLOCKER_SENTENCE_RE.test(t) && t.length >= 12);
   return hit ? prose(hit, 260) : null;
+}
+
+// The decision an agent names without asking a question, e.g. "Blocked on:
+// your decision on server port and iOS build" -> "Your decision on server
+// port and iOS build."
+const NAMED_DECISION_RE = /\byour (decision|call|approval|go-ahead|sign-off|choice) (on|for|to|about|between) ([^.;\n]{4,160})/i;
+
+// Only a decision still pending counts ("Blocked on: your decision on X",
+// "still needs your approval for Y"); "I applied your decision on X" is
+// past work and must not replace the current ask.
+const PENDING_RE = /\b(?:blocked|need(?:s|ed)?|waiting|wait on|still|pending|before|requires?|until)\b/i;
+const PAST_RE = /\b(?:applied|used|made|took|followed|got|per|thanks for|as you (?:asked|decided)|implemented|did)\b[^.]{0,20}\byour (?:decision|call|choice|approval|go-ahead|sign-off)\b/i;
+
+function agentNamedDecision(agentSummary, messages) {
+  const sentences = splitSentences(String(latestAgentText(agentSummary, messages)).replace(/[*`]/g, "")).reverse();
+  for (const sentence of sentences) {
+    const m = NAMED_DECISION_RE.exec(sentence);
+    if (!m || PAST_RE.test(sentence) || !PENDING_RE.test(sentence)) continue;
+    return prose(`Your ${m[1].toLowerCase()} ${m[2].toLowerCase()} ${m[3].trim()}.`, 220);
+  }
+  return null;
+}
+
+// Choices the agent listed as a short bullet list ("- port 9803 first"),
+// used only when the question itself carries no options. Only a list that
+// directly follows a line asking for a choice counts: bullets after
+// "Verified:" or other results are never decision options.
+const CHOICE_HEADER_RE = /\?\s*\**\s*$|\b(?:options?|choices?|pick(?: one)?|choose|either|which (?:one|way))\b|\byour (?:decision|call|choice|approval|go-ahead|sign-off)\b/i;
+const RESULT_HEADER_RE = /^\s*\**\s*(?:verified|tested|checked|done|completed|changed|passed|results?|what (?:changed|i did))\b/i;
+
+function agentListedOptions(agentSummary, messages) {
+  const lines = String(latestAgentText(agentSummary, messages)).replace(/\r/g, "").split("\n");
+  const bullet = (l) => /^\s*(?:[-*•]|\d+[.)])\s+(.{2,80})$/.exec(l)?.[1]?.replace(/[*`]/g, "").trim() ?? null;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.trim() || bullet(line)) continue;
+    if (RESULT_HEADER_RE.test(line) || !CHOICE_HEADER_RE.test(line)) continue;
+    const found = [];
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (!lines[j].trim()) { if (found.length) break; continue; }
+      const b = bullet(lines[j]);
+      if (!b) break;
+      found.push(b);
+    }
+    if (found.length >= 2 && found.length <= 5) return found;
+  }
+  return [];
+}
+
+// Related sub-decisions the agent numbered ("1. The video: … 2. App Home:
+// …"), with each option placed under the one it belongs to. Only when every
+// sub-decision gets at least one option and every option fits one.
+function groupedDecisions(agentSummary, messages, options) {
+  const items = [];
+  for (const line of String(latestAgentText(agentSummary, messages)).replace(/\r/g, "").split("\n")) {
+    const m = /^\s*(\d+)[.)]\s+\**([^:*\n]{2,40}?)\**\s*:\**\s*(.+)$/.exec(line.replace(/`/g, ""));
+    if (m) items.push({ label: m[2].trim(), text: `${m[2]} ${m[3]}` });
+  }
+  if (items.length < 2 || options.length < 2) return null;
+  const placed = items.map(() => []);
+  for (const opt of options) {
+    const words = [...tokens(opt.label)];
+    const scores = items.map((it) => { const t = tokens(it.text); return words.filter((w) => t.has(w)).length; });
+    const best = Math.max(...scores);
+    if (best === 0 || scores.filter((x) => x === best).length > 1) return null;
+    placed[scores.indexOf(best)].push(opt);
+  }
+  if (placed.some((p) => !p.length)) return null;
+  return items.map((it, i) => ({ label: it.label, options: placed[i] }));
+}
+
+// A single action only the owner can take ("Single owner action: On
+// BuildBot2, run sudo xcodebuild -license accept."). It is a decision with
+// two real outcomes: do it (the agent continues) or not now.
+// Affirmative only: a line that starts "Owner action:" (optionally
+// "Single owner action:"). "No owner action required" or an action already
+// done is not a decision.
+const OWNER_ACTION_LINE_RE = /^\s*(?:[-*•]\s*)?(?:single\s+)?owner\s+action\s*:\s*(.{6,200})$/im;
+const NOT_NEEDED_RE = /\b(?:no|not|none)\b[^.]{0,30}\b(?:required|needed|necessary)\b|\b(?:already|was)\s+(?:done|completed|handled|applied)\b/i;
+
+function agentOwnerAction(agentSummary, messages) {
+  const text = String(latestAgentText(agentSummary, messages)).replace(/\*\*/g, "");
+  const m = OWNER_ACTION_LINE_RE.exec(text);
+  if (!m || NOT_NEEDED_RE.test(m[1])) return null;
+  return prose(m[1], 200);
 }
 
 // The agent's own question, e.g. "Rotate the key, or hold?".
@@ -451,6 +563,10 @@ export function buildDecisionContext({
     || (question?.reviewedAt && reviewBrief?.decision ? prose(reviewBrief.decision, 280) : null)
     || (askedLine && !GENERIC_ASK_RE.test(askedLine) ? askedLine : null)
     || agentQuestionSentence(agentSummary, recentMessages)
+    // A clear, non-generic question title outranks a recovered phrase.
+    || (titleLine && !GENERIC_ASK_RE.test(titleLine) && /\?\s*$/.test(titleLine) ? titleLine : null)
+    || agentNamedDecision(agentSummary, recentMessages)
+    || (agentOwnerAction(agentSummary, recentMessages) ? `Do this yourself: ${agentOwnerAction(agentSummary, recentMessages)}` : null)
     || (titleLine && !GENERIC_ASK_RE.test(titleLine) ? titleLine : null)
     || null;
 
@@ -496,7 +612,8 @@ export function buildDecisionContext({
   } else if (followUp?.choices?.length) {
     options = followUp.choices.map((c) => ({ label: c.label, consequence: optionConsequence(c.label, consequenceCtx) }));
   } else {
-    const raw = activeItem?.options?.length ? activeItem.options : realDecisionOptions(question?.options);
+    const fromQuestion = activeItem?.options?.length ? activeItem.options : realDecisionOptions(question?.options);
+    const raw = fromQuestion.length ? fromQuestion : agentListedOptions(agentSummary, recentMessages);
     options = raw.map((opt) => {
       const text = String(opt).replace(/^\d+[.)]\s*/, "");
       const parts = /^(.{1,80}?)\s+(?:—|–|:|→)\s+(.+)$/.exec(text);
@@ -505,6 +622,13 @@ export function buildDecisionContext({
     });
   }
   options = options.filter((o) => o.label).slice(0, 5);
+  const groups = options.length ? groupedDecisions(agentSummary, recentMessages, options) : null;
+  if (!options.length && decision && /^Do this yourself:/.test(decision)) {
+    options = [
+      { label: "Done", consequence: "The agent continues once you have done it." },
+      { label: "Not now", consequence: "It stays blocked; nothing changes." }
+    ];
+  }
   const rec = supplied?.recommendation
     || prose(recommendation, 240)
     || (question?.reviewedAt && reviewBrief?.recommendation ? prose(reviewBrief.recommendation, 240) : null)
@@ -540,6 +664,7 @@ export function buildDecisionContext({
     changed,
     blocked,
     status,
+    groups,
     details: [verified.length ? `Verified: ${verified.join(" ")}` : null, changed ? `Changed: ${changed}` : null, blocked ? `Blocked: ${blocked}` : null].filter(Boolean).join("\n") || null,
     decision,
     options,
@@ -562,7 +687,7 @@ const PART_LABELS = {
 
 // Plain-English rendering. `markdown` adds bold labels and links; the plain
 // form is for outreach summaries and phone pushes.
-export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null } = {}) {
+export function renderDecisionContext(ctx, { markdown = false, compact = false, maxChars = null, preserveDecision = false } = {}) {
   if (!ctx) return "";
   if (Number.isFinite(maxChars) && maxChars > 0) {
     // Budget the earlier parts so the decision, options and recommendation
@@ -579,7 +704,10 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
     const head = lines.slice(0, four).join("\n");
     const tail = lines.slice(four).join("\n");
     const room = Math.max(0, maxChars - tail.length - 1);
-    return room > 40 ? `${clampText(head, room)}\n${tail}` : clampText(tail, maxChars);
+    if (room > 40) return `${clampText(head, room)}\n${tail}`;
+    // The decision and its options must never be cut: a caller that needs
+    // them whole gets null and shows the decision in full or defers it.
+    return preserveDecision ? null : clampText(tail, maxChars);
   }
   const b = (s) => (markdown ? `**${s}**` : s);
   // Only what is known is shown: an empty part is left out rather than
@@ -589,9 +717,15 @@ export function renderDecisionContext(ctx, { markdown = false, compact = false, 
   if (ctx.goal || ctx.itemName) lines.push(`1. ${b("Goal:")} ${what}${ctx.goal ?? ""}`.trimEnd());
   if (ctx.assignment && !similar(ctx.assignment, ctx.goal ?? "")) lines.push(`2. ${b("You asked the agent to:")} ${ctx.assignment}`);
   if (ctx.status) lines.push(`3. ${b("Where it stands:")} ${compact ? clampText(ctx.status, 220) : ctx.status}`);
-  const opts = ctx.options.map((o) => `${o.label}${o.consequence ? ` (${o.consequence.replace(/\.$/, "")})` : ""}`).join("; ");
+  const optText = (o) => `${o.label}${o.consequence ? ` (${o.consequence.replace(/\.$/, "")})` : ""}`;
+  const opts = ctx.groups?.length
+    ? ctx.groups.map((g, i) => `(${i + 1}) ${g.label}: ${g.options.map(optText).join(" or ")}`).join(" ")
+    : ctx.options.map(optText).join("; ");
   const rec = ctx.recommendation ? (/^recommend/i.test(ctx.recommendation) ? ctx.recommendation : `Recommendation: ${ctx.recommendation}`) : null;
-  const four = [ctx.decision, opts ? `Options: ${opts.replace(/\.$/, "")}.` : null, rec].filter(Boolean).join(" ");
+  // Tradeoffs are shown when the source states them, and said to be missing
+  // otherwise, never invented.
+  const noTradeoffs = ctx.options.length > 0 && !ctx.options.some((o) => o.consequence);
+  const four = [ctx.decision, opts ? `Options: ${opts.replace(/\.$/, "")}.` : null, noTradeoffs ? "Tradeoffs: not stated by the agent." : null, rec].filter(Boolean).join(" ");
   if (four) lines.push(`4. ${b("Decision now:")} ${four}`);
   if (ctx.sources.length) {
     lines.push(markdown
