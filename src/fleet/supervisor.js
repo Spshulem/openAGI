@@ -14,7 +14,7 @@ import { resolveDataDir } from "../data-dir.js";
 import { readNodeConfig } from "../cli-client.js";
 import { readOrCreateIdentity } from "../node-registry.js";
 import { appendSharedThreadMessages } from "../shared-conversations.js";
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, isWatchOnlyThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
@@ -2008,7 +2008,9 @@ export class FleetSupervisor {
     if (typeof driver?.attention !== "function" || typeof driver?.clickLabel !== "function") return;
     // Only while Auto holds and the thread is not muted, checked again before
     // each read and click: the owner can switch mode or mute mid-pass.
-    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key);
+    // Never a watch-only session's cards: those stay the owner's to answer
+    // (owner-directed clicks go through clickThread, not here).
+    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key) && !thread.watchOnly;
     const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived && allowed(thread));
     if (!codex.length) return;
     let rows = [];
@@ -4119,6 +4121,8 @@ export class FleetSupervisor {
       if (isSelfThread(thread, config) || thread.branch?.startsWith("selffix/")
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
+      // Watched like any chat, never messaged by the supervisor (policy).
+      else if (isWatchOnlyThread(thread, config)) thread.watchOnly = true;
     }
     // Auto-link unassigned explicit ActiveWork goals to matching live coding sessions
     // so `resume_owner` goals do not sit stranded with `owner.threadKey: null`.
@@ -4911,6 +4915,8 @@ export class FleetSupervisor {
       for (const { thread, classified } of items) {
         if (failoversThisTick >= 2) break;
         if (!thread?.key || thread.kind !== "paseo" || thread.excluded || thread.archived) continue;
+        // A watch-only session is never resumed or replaced on its own.
+        if (thread.watchOnly) continue;
         if (store.mutedUntil(thread.key)) continue;
         if (classified?.state !== "infra-blocked") continue;
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
@@ -5148,7 +5154,10 @@ export class FleetSupervisor {
         const slice = classifyQuestionSlice(fields);
         const prefs = store.preferences();
         const autoChoice = slice && prefs.autoSlices?.[slice] === "auto" ? pickAffirmativeOption(fields.options) : null;
-        const targetThread = autoChoice ? byKey.get(fields.threadKey) : null;
+        // Never an automatic answer to a watch-only session: its asks stay
+        // the owner's (the owner's own answers still go through).
+        const candidate = autoChoice ? byKey.get(fields.threadKey) : null;
+        const targetThread = candidate?.watchOnly ? null : candidate;
         const route = targetThread ? chooseRoute(targetThread, "auto", this.lastDelivery) : null;
         const uiKey = route === "computer-use" && targetThread ? uiTargetFor(targetThread)?.targetKey ?? null : null;
         if (autoChoice && targetThread && route && sends < config.limits.maxSendsPerTick && !(deferUi && route === "computer-use") && !(uiKey && typedInto.has(uiKey))) {
@@ -5209,6 +5218,8 @@ export class FleetSupervisor {
         && fields.threadKey
         && !fields.mergeAsk
         && !store.mutedUntil(fields.threadKey)
+        // Precedents never answer a watch-only session on the owner's behalf.
+        && !(byKey.get(fields.threadKey)?.watchOnly || askThread?.watchOnly)
         && sends < config.limits.maxSendsPerTick
       ) {
         const askActiveGoal = this.activeWork.findActiveGoalForThread(fields.threadKey, askPrRef);
