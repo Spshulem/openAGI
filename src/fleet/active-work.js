@@ -1574,8 +1574,12 @@ export class ActiveWorkManager {
 
     // Recheck notices this computer posted, for a hosted hub to mirror once
     // each (keyed by recheck id). The item may be done, so prompts omit it.
+    // The newest by completion: rechecks finish out of scheduling order, and
+    // a late one must not fall outside the window for good.
+    const completedMs = (recheck) => Date.parse(recheck.completedAt ?? "") || 0;
     const recheckNotifications = this.state.rechecks
       .filter((recheck) => recheck.status === "notified" && recheck.result?.title)
+      .sort((a, b) => completedMs(a) - completedMs(b))
       .slice(-MAX_RECHECK_NOTIFICATIONS)
       .map((recheck) => ({
         id: recheck.id,

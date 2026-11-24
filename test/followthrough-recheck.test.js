@@ -273,6 +273,23 @@ test("a blocker recheck folded into an open prompt is one hub entry, not two", a
   assert.equal(forItem[0].sourceRef.kind, "active-work");
 });
 
+// Review fix (#369): a recheck that finishes after 50 later-scheduled ones
+// is still among the notices a hub can pick up.
+test("recheck notices are the newest by completion, not by scheduling order", () => {
+  const { supervisor } = fixture();
+  const rechecks = [];
+  const at = (minutes) => new Date(Date.parse("2026-11-22T12:00:00.000Z") + minutes * 60_000).toISOString();
+  rechecks.push({ id: "late", itemId: "i0", status: "notified", completedAt: at(60), result: { type: "verified_outcome", title: "Late", summary: "" } });
+  for (let i = 1; i <= 50; i += 1) {
+    rechecks.push({ id: `early-${i}`, itemId: `i${i}`, status: "notified", completedAt: at(i), result: { type: "verified_outcome", title: `Early ${i}`, summary: "" } });
+  }
+  supervisor.activeWork.state.rechecks = rechecks;
+  const ids = supervisor.getActiveWork({ includeDone: true }).recheckNotifications.map((notice) => notice.id);
+  assert.equal(ids.length, 50);
+  assert.ok(ids.includes("late"), "the last to finish is kept");
+  assert.equal(ids.includes("early-1"), false, "the oldest completion drops out instead");
+});
+
 test("the background tick runs a due recheck without a manual inventory scan", async () => {
   const { supervisor, advance } = fixture();
   const tracked = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Verify release", doneCriteria: "Release feed verified" });
