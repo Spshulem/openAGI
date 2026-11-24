@@ -364,12 +364,19 @@ function backoffIntent(ctx, errorAt, kind) {
   const steps = ctx.limits.overloadBackoffMs;
   const attempts = attemptsWithoutProgress(ctx.ledger, ctx.progressMark);
   const delay = steps[Math.min(attempts, steps.length - 1)];
-  const resumeAt = addMs(errorAt, delay);
+  const backoffAt = addMs(errorAt, delay);
+  // The provider's own "retry after" (errors.js retryHintAt, capped at an
+  // hour) wins when it is later than the backoff step: retrying sooner
+  // would only be refused again.
+  const hintAt = TRANSIENT_HINT_KINDS.has(kind) ? ctx.thread?.error?.resetAt : null;
+  const hinted = Number.isFinite(Date.parse(hintAt ?? "")) && (!backoffAt || Date.parse(hintAt) > Date.parse(backoffAt));
+  const resumeAt = hinted ? hintAt : backoffAt;
   if (resumeAt && Date.parse(resumeAt) > ctx.now) {
-    return { type: "wait", notBefore: resumeAt, reason: `${kind}; backing off ${minutes(delay)}m` };
+    return { type: "wait", notBefore: resumeAt, reason: hinted ? `${kind}; the provider asked to retry at ${clock(resumeAt)}` : `${kind}; backing off ${minutes(delay)}m` };
   }
   return nudge("resume", `${kind}; retry ${attempts + 1}`, { immediate: true });
 }
+const TRANSIENT_HINT_KINDS = new Set(["overloaded", "network"]);
 
 // The repo's merge gate is the BuildBot3 full run itself: a required check
 // named for it, or one produced by bb-verify --full. Another required check
