@@ -828,11 +828,18 @@ export class OwnerPrecedentStore {
       .join("\n");
 
     // 2. Deterministic High-Confidence Rule: AppFolio Lifecycles report -> buildbetter-staging MCP.
+    // Only fire when the latest agent reply actually reports a production-MCP / missing-workspace
+    // block, and never re-nudge once the agent already generated or verified via buildbetter-staging.
+    const latestAgentReply = String(thread?.lastAgentFull || thread?.lastAgentText || "");
+    const appfolioBlockedOnProdMcp = /\b(?:blocked|no\s+result|not\s+found|missing|cannot\s+find|can['’]t\s+find|doesn['’]t\s+exist|unavailable|prod(?:uction)?\s+(?:buildbetter\s+)?mcp|wrong\s+(?:workspace|mcp))\b/i.test(latestAgentReply);
+    const appfolioAlreadyUsedStaging = /\bbuildbetter-staging\b/i.test(latestAgentReply)
+      && /\b(?:verified|generated|updated|created|revision|app-staging\.buildbetter\.app|definition\s+of\s+done\s+(?:is|has\s+been)\s+(?:met|satisfied|complete)|(?:the\s+)?goal\s+(?:is|has\s+been)\s+(?:met|complete|achieved)|ready\s+for\s+(?:your|owner)\s+(?:review|sign-off))\b/i.test(latestAgentReply);
     if (
       !question
       && /\bappfolio\b/i.test(hay)
       && /\b(?:mcp|workspace|create_report|no result|lifecycles)\b/i.test(hay)
-      && !/\bbuildbetter-staging\b[^.\n]{0,60}\bverified\b/i.test(String(thread?.lastAgentText ?? ""))
+      && appfolioBlockedOnProdMcp
+      && !appfolioAlreadyUsedStaging
     ) {
       const prec = this.state.precedents.find((p) => p.id === "prec_appfolio_staging_mcp");
       if (prec && (prec.vetoCount ?? 0) === 0) {

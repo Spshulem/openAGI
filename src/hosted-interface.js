@@ -15,7 +15,7 @@ import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
-import { g2ConnectPage } from "./g2-connect-page.js";
+import { renderG2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
@@ -89,7 +89,7 @@ import {
   EVEN_G2_PLATFORM,
   G2ChannelError
 } from "./integrations/g2-channel.js";
-import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { DELEGATED_ENROLLMENT_CODE_TTL_MS, NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
@@ -1025,6 +1025,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         && isMobileRouteAllowed(method, pathname);
       const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
         && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
+      // A paired computer may ask main for a G2 code only with the owner-proxy
+      // grant main recorded at owner-authenticated pairing. Its operational
+      // token, a phone, or a pair of glasses never qualifies.
+      const g2CodeRequest = method === "POST" && pathname === "/nodes/g2/enrollment-code";
+      const g2CodeIssuer = g2CodeRequest && Boolean(requestNodeId)
+        && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -1090,6 +1097,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : g2CodeRequest && requestNodeId
+            ? { ok: g2CodeIssuer, reason: "this computer is not authorized by the main owner to request glasses codes" }
           : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
@@ -1399,13 +1408,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
         const issued = nodeEnrollment.issue(platform);
-        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code issued (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
           ...(platform === EVEN_G2_PLATFORM
             ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
             : {})
+        });
+      }
+      if (g2CodeRequest) {
+        res.setHeader("cache-control", "no-store");
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "not_main", message: "This computer is not the main. Request the code from the main OpenAGI." });
+        }
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+          return sendJson(res, 400, { error: "invalid_request", message: "This request takes no options." });
+        }
+        let origin;
+        try {
+          const configured = new URL(getPublicUrl());
+          if (configured.protocol !== "https:" || configured.username || configured.password
+              || configured.pathname !== "/" || configured.search || configured.hash) throw new Error("invalid");
+          origin = configured.origin;
+        } catch {
+          return sendJson(res, 409, {
+            error: "main_public_url_required",
+            message: "Your main has no exact HTTPS public address, so glasses could not reach it. Set OPENAGI_PUBLIC_URL on the main, then try again."
+          });
+        }
+        const issuedVia = requestNodeId ?? null;
+        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM, { ttlMs: DELEGATED_ENROLLMENT_CODE_TTL_MS, issuedVia });
+        const via = issuedVia ? nodeRegistry.enrollment(issuedVia)?.name ?? issuedVia : "the owner";
+        console.log(`[openagi] Even G2 enrollment code issued for ${via} (valid 10 min, single use)`);
+        return sendJson(res, 200, {
+          code: issued.code,
+          platform: EVEN_G2_PLATFORM,
+          expiresAt: issued.expiresAt,
+          publicUrl: origin,
+          main: { name: localIdentity.name ?? null },
+          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1526,7 +1569,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         nodeRegistry.enroll(nodeId, nodeToken, {
           platform,
           name,
-          capabilities: capabilitiesForPlatform(platform)
+          capabilities: capabilitiesForPlatform(platform),
+          enrolledVia: consumed.issuedVia
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
@@ -2121,7 +2165,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/g2/connect") {
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
-        return sendHtml(res, 200, g2ConnectPage);
+        const pairedRemote = mobileProfile ? null : readNodeConfig(dataDir)?.remote;
+        let mainOrigin = null;
+        if (pairedRemote) {
+          try { mainOrigin = pinnedRemoteOrigin(pairedRemote, { allowInsecureRemote: allowInsecureNodeRelay }); }
+          catch { mainOrigin = String(pairedRemote); }
+        }
+        return sendHtml(res, 200, renderG2ConnectPage({ mainOrigin }));
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
