@@ -175,6 +175,9 @@ function pickMessageMetadata(metadata) {
     const v = metadata[key];
     if (typeof v === "string" && v.length <= LIMITS.shortString) out[key] = v;
   }
+  // A capture restriction (e.g. a Pebble ring recording) must survive the
+  // mirror so the phone's own session mining honors it too.
+  if (metadata.noCapture === true) out.noCapture = true;
   return out;
 }
 

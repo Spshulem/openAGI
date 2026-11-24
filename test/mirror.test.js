@@ -305,3 +305,20 @@ test("snapshot replacement and later rotation do not resend acknowledged or base
   assert.deepEqual(new Set(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent.map(m => m.id)), new Set(fresh));
   await settle(mac.runtime, phone.runtime);
 });
+
+test("the no-capture restriction survives a mirror round trip, so phone skill mining skips ring input", async () => {
+  const mac = makeRuntime("mac-nocapture");
+  const phone = makeRuntime("phone-nocapture", { OPENAGI_PROFILE: "mobile" });
+  const ring = "devices:agent:0f8fad5b-d9cb-469f-a165-70867728950e";
+  const store = mac.runtime.agentHost.store;
+  store.saveSession({ id: ring, createdAt: new Date().toISOString(), messages: [], metadata: { thread: "agent" } });
+  for (let i = 0; i < 3; i++) store.appendMessage(ring, { role: "user", content: "send me the weekly fixture revenue report", channel: "pebble", metadata: { thread: "agent", noCapture: true } });
+  store.appendMessage(ring, { role: "user", content: "an ordinary owner fixture message", metadata: { thread: "agent", noCapture: "yes" } });
+  importMirrorSnapshot(phone.runtime, buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir }), { dataDir: phone.dir });
+  const mirrored = phone.runtime.agentHost.store.getSession(ring).messages;
+  assert.deepEqual(mirrored.map(m => m.metadata.noCapture), [true, true, true, undefined], "only a boolean true is carried");
+  const { SessionMiner } = await import("../src/session-miner.js");
+  const result = await new SessionMiner({ runtime: phone.runtime, dataDir: phone.dir, minOccurrences: 3 }).mine();
+  assert.equal(result.skipped, true, "no skill candidate from mirrored ring input");
+  await settle(mac.runtime, phone.runtime);
+});
