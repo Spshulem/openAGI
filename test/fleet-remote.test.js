@@ -852,6 +852,55 @@ test('an acknowledged failure that is not a timeout is reconciled, not retried',
   assert.equal(sends(), 1, 'never sent a second time');
 });
 
+// Review fix (#350): the executor journals a computer-use send that may
+// have landed as failed + unconfirmed. Rebuilt from that receipt after a
+// lost reply, it stays unconfirmed: not "Not delivered", not resent.
+test('a reconciled receipt that is failed but unconfirmed stays unconfirmed', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') {
+      await deliver(...args);
+      state.actions.push({ id: 'fa_maybe', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'computer-use',
+        messageHash: shortHash('[OpenAGI supervisor] Investigate the missing integration'), status: 'failed', unconfirmed: true,
+        detail: 'typed, but the chat could not be read back', at: new Date().toISOString() });
+      throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true });
+    }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'failed');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(result.delivery.reconciled, true);
+  assert.equal(result.delivery.verifiedAt, null);
+  assert.equal(result.reconciledAfterTimeout, undefined);
+  assert.equal(sends(), 1, 'never sent a second time');
+});
+
+test('before a retry, a receipt that may have landed stops the resend and stays unconfirmed', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  let first = true;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send' && first) {
+      first = false;
+      await deliver(...args);
+      state.actions.push({ id: 'fa_maybe', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'computer-use',
+        messageHash: shortHash('[OpenAGI supervisor] Investigate the missing integration'), status: 'sent', unconfirmed: true,
+        detail: 'typed, but the chat could not be read back', at: new Date().toISOString() });
+      // The link dropped before the request was acknowledged.
+      throw new Error('selected node is not connected (no poll in 90 s)');
+    }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(result.reconciledAfterTimeout, undefined, 'not reported as a confirmed send');
+  assert.equal(sends(), 1, 'never sent a second time');
+});
+
 // Review fix (#350): the same short text sent twice on purpose. A receipt
 // that existed before this request is the earlier send's, never this one's.
 test('a repeated short message is not reported sent from the previous send\'s receipt', async t => {

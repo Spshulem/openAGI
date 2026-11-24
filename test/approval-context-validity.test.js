@@ -155,7 +155,57 @@ test("on a remote row, the reader's own supervisor stamp still identifies the su
   const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
   const nudgeAt = now.value + 10 * 60_000;
   h.rows[0].lastOwnerAt = new Date(nudgeAt).toISOString();
+  // Its reader had no owner text for that turn.
+  h.rows[0].lastOwnerBy = "unattributed";
   h.rows[0].lastSupervisorAt = new Date(nudgeAt + 600).toISOString();
+  now.value += 30 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 200);
+  assert.equal(h.sent.length, 1);
+});
+
+// Review fix (#350): approval raised at 18:00, a supervisor nudge at
+// 18:01:00, the owner's correction at 18:01:02. The stamp is two seconds
+// from the owner's turn, but the reader saw the owner write it.
+test("on a remote row, an owner turn just after a supervisor nudge still needs a fresh yes", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
+  h.rows[0].lastSupervisorAt = new Date(now.value + 60_000).toISOString();
+  h.rows[0].lastOwnerAt = new Date(now.value + 62_000).toISOString();
+  h.rows[0].lastOwnerBy = "owner";
+  now.value += 5 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 410);
+  assert.equal(ran.body.notRun, true);
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.pendingActions.get(ran.body.reraised.actionId)?.status, "pending");
+});
+
+test("a remote row with no attribution (an older computer) is presumed the owner's, even beside a stamp", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
+  const at = now.value + 10 * 60_000;
+  h.rows[0].lastOwnerAt = new Date(at).toISOString();
+  h.rows[0].lastSupervisorAt = new Date(at + 600).toISOString();
+  now.value += 30 * 60_000;
+  const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
+  assert.equal(ran.status, 410, "fails closed: asked again, never sent past it");
+  assert.equal(h.sent.length, 0);
+});
+
+// Review fix (#350): the local reader saw an empty-text turn that a journal
+// receipt shows is the supervisor's; the snapshot row repeats that turn's
+// time without text. The row is the same turn, so it does not re-raise.
+test("the snapshot row for the reader's own turn does not overrule the reader's receipt attribution", async (t) => {
+  const now = { value: Date.parse("2026-11-22T18:00:00.000Z") };
+  const h = setup(t, { now });
+  const queued = await h.runtime.tools.invoke("fleet_send_message", { key: "paseo:s.a", message: "Investigate the missing integration" }, { sessionId: "s1" });
+  const landedAt = new Date(now.value + 11 * 60_000).toISOString();
+  h.lastThreads.set("paseo:s.a", { key: "paseo:s.a", lastUserAt: landedAt, lastUserText: "", meta: {} });
+  h.rows[0].lastOwnerAt = landedAt;
+  h.actions.push({ threadKey: "paseo:s.a", playbook: "goal-continuation", status: "sent", route: "paseo-send", finishedAt: new Date(Date.parse(landedAt) + 3_000).toISOString() });
   now.value += 30 * 60_000;
   const ran = await executeApprovedAction(h.runtime, queued.result.actionId);
   assert.equal(ran.status, 200);

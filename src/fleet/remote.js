@@ -109,6 +109,19 @@ function imageBytes(images) {
   return images.reduce((sum, image) => sum + (typeof image?.data === 'string' ? image.data.length : 0), 0);
 }
 
+// The result a fleet computer's own receipt stands for. One that says the
+// send may or may not have landed (the executor journals it failed or sent,
+// unconfirmed) stays unconfirmed: never a plain failure, which could invite
+// a resend, and never a confirmed send.
+function fromReceipt(receipt, attempts, detail) {
+  const unconfirmed = receipt.unconfirmed === true;
+  const confirmed = receipt.status === 'sent' && !unconfirmed;
+  return { ...(confirmed ? { reconciledAfterTimeout: true } : {}),
+    delivery: { status: receipt.status, ...(unconfirmed ? { unconfirmed: true } : {}), route: receipt.route ?? null, detail,
+      actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true,
+      verifiedAt: unconfirmed ? null : (receipt.finishedAt ?? receipt.at ?? null), attempts } };
+}
+
 function attemptSummary(attempt, error) {
   return error
     ? { attempt, kind: error.kind ?? 'failed', retryable: error.retryable === true, uncertain: error.uncertain === true, detail: clampText(redactSecrets(String(error.message ?? '')), 200) }
@@ -427,12 +440,7 @@ export class RemoteFleetSupervisor {
         attempts.push(attemptSummary(attempt, error));
         if (error.uncertain) {
           const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-          if (receipt) {
-            return { ...(receipt.status === 'sent' ? { reconciledAfterTimeout: true } : {}),
-              delivery: { status: receipt.status, route: receipt.route ?? null,
-                detail: `${clampText(receipt.detail ?? '', 160)} (the fleet computer's receipt; its reply to this request was lost)`,
-                actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true, verifiedAt: receipt.finishedAt ?? receipt.at ?? null, attempts } };
-          }
+          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 160)} (the fleet computer's receipt; its reply to this request was lost)`);
           return { delivery: { status: 'unknown', unconfirmed: true, route: null,
             detail: 'the fleet computer took the message but did not answer in time and has no receipt for it yet; not sent again so it cannot arrive twice. Check fleet_thread receipts before resending.',
             attempts } };
@@ -450,8 +458,9 @@ export class RemoteFleetSupervisor {
         // earlier reply was lost, its receipt says so before sending again.
         await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
         const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-        if (receipt?.status === 'sent') {
-          return { reconciledAfterTimeout: true, delivery: { status: 'sent', route: receipt.route ?? null, detail: clampText(receipt.detail ?? '', 200), actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true, verifiedAt: receipt.finishedAt ?? receipt.at ?? null, attempts } };
+        // A send that may have landed is not sent again either.
+        if (receipt && (receipt.status === 'sent' || receipt.unconfirmed === true)) {
+          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 200));
         }
       }
     }

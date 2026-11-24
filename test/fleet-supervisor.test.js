@@ -85,6 +85,17 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
   return { supervisor, delivered, notified, dataDir };
 }
 
+// Review fix (#350): a remote approval check needs to know who wrote the
+// row's last user turn; the row says so without carrying the words.
+test("snapshot rows say whether the reader saw the owner write the last turn", async (t) => {
+  const { supervisor } = fixture(t, { threads: [makeThread(), makeThread({ key: "codex:t2", id: "t2", lastUserText: "" })] });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  const byKey = Object.fromEntries(snapshot.threads.map((row) => [row.key, row]));
+  assert.equal(byKey["codex:t1"].lastOwnerBy, "owner");
+  assert.equal(byKey["codex:t1"].lastOwnerText, undefined, "no owner words travel");
+  assert.equal(byKey["codex:t2"].lastOwnerBy, "unattributed");
+});
+
 test("observe records planned actions and never delivers", async (t) => {
   const { supervisor, delivered } = fixture(t);
   const snapshot = await supervisor.tick({ reason: "test" });

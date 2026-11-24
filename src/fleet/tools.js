@@ -944,11 +944,16 @@ async function fleetSendStillValid(supervisor, args, action) {
   const thread = supervisor.lastThreads?.get?.(args?.key) ?? null;
   const row = (state.snapshot?.threads ?? []).find((item) => item?.key === args?.key);
   const marks = supervisorWriteMarks(state, args?.key, thread, row);
-  const ownerWrote = [[thread?.lastUserAt, thread?.lastUserText], [row?.lastOwnerAt, row?.lastOwnerText]]
-    .some(([at, text]) => {
-      const ms = Date.parse(at ?? "") || 0;
-      return ms > askedAt && !supervisorWrote(ms, text, marks);
-    });
+  const turns = [{ at: thread?.lastUserAt, text: thread?.lastUserText }];
+  // The snapshot row's turn is this computer's reader's turn again when the
+  // times match: the reader's own attribution (its text, its receipts)
+  // already decided it, so the row cannot overrule it.
+  const sameTurn = Boolean(thread) && Date.parse(row?.lastOwnerAt ?? "") === Date.parse(thread.lastUserAt ?? "");
+  if (row && !sameTurn) turns.push(rowTurn(row));
+  const ownerWrote = turns.some(({ at, text, owner }) => {
+    const ms = Date.parse(at ?? "") || 0;
+    return ms > askedAt && (owner === true || !supervisorWrote(ms, text, marks));
+  });
   // The chat is still there, so the handoff still stands: it is raised
   // again for a fresh yes instead of being dropped.
   if (ownerWrote) {
@@ -979,10 +984,22 @@ function supervisorWriteMarks(state, key, thread, row) {
   return { stamps, receipts };
 }
 
+// A snapshot row's owner turn. No words travel in it; lastOwnerBy says what
+// its reader knew: "owner" (it had the owner's own text) is the owner's turn
+// whatever supervisor stamp sits a few seconds away; "unattributed" (it had
+// no owner text) is judged like a local turn without text. A row with
+// neither, from an older computer, is presumed the owner's: the approval is
+// asked again rather than run past what may be the owner's newer words.
+function rowTurn(row) {
+  if (typeof row.lastOwnerText === "string") return { at: row.lastOwnerAt, text: row.lastOwnerText };
+  if (row.lastOwnerBy === "unattributed") return { at: row.lastOwnerAt, text: "" };
+  return { at: row.lastOwnerAt, owner: true };
+}
+
 // text: the chat's own text for that turn when the reader had it ("" when
-// its window held no owner turn), undefined when it did not travel (a
-// remote snapshot row). Without it, only the reader's exact stamp counts:
-// a receipt window could otherwise hide a real owner turn.
+// its window held no owner turn), undefined when it did not travel. Without
+// it, only the reader's exact stamp counts: a receipt window could otherwise
+// hide a real owner turn.
 function supervisorWrote(ms, text, { stamps, receipts }) {
   if (String(text ?? "").startsWith(SUPERVISOR_PREFIX)) return true;
   // A chat's own text for the owner's turn is never the supervisor's.
