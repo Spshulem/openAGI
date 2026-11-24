@@ -396,16 +396,21 @@ final class NativeNavigationTests: XCTestCase {
     func testQueuedMessagesEditInPlaceAndSendNowSaysWhatMainConfirmed() {
         let app = launch(["--ui-chat-working"])
         tab(app, "Chat")
-        let composer = element(app, "chat-composer")
-        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        // The running reply keeps its working indicator animating, so the app
+        // is never idle and every UI query waits on it. Keep queries few and
+        // narrow: one direct tap on Send per message (no separate existence
+        // and hit-test queries), and let the first queued row (which only
+        // exists while a reply runs) stand for "a reply is running".
+        let composer = app.textFields["chat-composer"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        let send = app.buttons["chat-send"]
         for text in ["Check my agents", "Draft the update for Tuesday", "Also invite Sam"] {
             composer.tap()
             composer.typeText(text)
-            tap(app, "chat-send")
+            send.tap()
         }
-        XCTAssertTrue(element(app, "chat-working").waitForExistence(timeout: 10))
         let firstQueued = app.staticTexts.matching(identifier: "chat-queued-text").firstMatch
-        XCTAssertTrue(firstQueued.waitForExistence(timeout: 10))
+        XCTAssertTrue(firstQueued.waitForExistence(timeout: 15))
         XCTAssertTrue(firstQueued.label.contains("Draft the update for Tuesday"), firstQueued.label)
         capture("queue-tray", app: app)
 
