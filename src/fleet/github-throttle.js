@@ -90,9 +90,11 @@ export class GithubThrottle {
   current() {
     if (!this.cooldown) return null;
     if (Date.parse(this.cooldown.until) <= this.now()) {
-      this.cooldown = null;
+      // A weaker hold that lasts longer takes over when this one ends.
+      const then = this.cooldown.then;
+      this.cooldown = then && Date.parse(then.until) > this.now() ? { ...then, since: new Date(this.now()).toISOString() } : null;
       this.save();
-      return null;
+      return this.cooldown;
     }
     return this.cooldown;
   }
@@ -185,6 +187,20 @@ export class GithubThrottle {
     // upgrades a weaker hold (low budget: background only) and keeps the
     // later of the two deadlines, so owner actions stop reaching GitHub too.
     const stronger = previous && STRENGTH[kind] > STRENGTH[previous.kind];
+    // A weaker observation never replaces a stronger hold while it lasts
+    // (owner actions stay stopped through GitHub's own Retry-After). If it
+    // lasts longer, it follows once the stronger hold ends.
+    if (previous && STRENGTH[kind] < STRENGTH[previous.kind]) {
+      if (until > Date.parse(previous.until) && !(Date.parse(previous.then?.until ?? "") >= until)) {
+        previous.then = {
+          kind, until: new Date(until).toISOString(), resetKnown, probed: false,
+          ...(Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() } : {}),
+          ...(Number.isFinite(remaining) ? { remaining } : {})
+        };
+        this.save();
+      }
+      return previous;
+    }
     if (previous && Date.parse(previous.until) >= until && !stronger && !(resetKnown && !previous.resetKnown && kind === previous.kind)) return previous;
     if (stronger && Date.parse(previous.until) > until) {
       until = Date.parse(previous.until);

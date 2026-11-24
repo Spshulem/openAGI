@@ -268,3 +268,33 @@ test("a used-up budget upgrades a low-budget hold so owner actions stop too", ()
   assert.equal(vague.current().windowResetAt, new Date(Date.parse(RESET)).toISOString());
   assert.notEqual(vague.blocking({ background: false }), null);
 });
+
+// Review fix (#351): a secondary limit (retry-after 120) and then a low-budget
+// answer (90 points, reset 30 minutes away) from a concurrent read used to
+// turn the hold into low-budget, letting owner merges call GitHub during its
+// explicit Retry-After. The stronger hold stays; the weaker one follows it.
+test("a weaker, longer observation never replaces a stronger hold; it follows it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  assert.equal(throttle.current().kind, "secondary");
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  assert.equal(throttle.current().kind, "secondary", "the stronger hold stays");
+  assert.notEqual(throttle.blocking({ background: false }), null, "owner actions stay stopped through Retry-After");
+  // After GitHub's retry-after, the low budget still holds background polling.
+  c.now.value = T0 + 121_000;
+  assert.equal(throttle.current()?.kind, "low-budget");
+  assert.equal(throttle.blocking({ background: false }), null, "owner actions may run again");
+  assert.notEqual(throttle.blocking({ background: true }), null, "background polling still waits");
+  // After the window resets, nothing holds.
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(throttle.current(), null);
+  // A weaker observation that ends sooner than the stronger hold is dropped.
+  const short = new GithubThrottle({ now: () => T0 });
+  short.observe({ code: 1, stderr: PRIMARY_TEXT, stdout: JSON.stringify({ errors: [{ type: "RATE_LIMIT", message: "API rate limit already exceeded" }], data: { rateLimit: { remaining: 0, resetAt: RESET } } }) });
+  const held = short.current();
+  short.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: new Date(T0 + 60_000).toISOString() } } }) });
+  assert.equal(short.current().kind, held.kind);
+  assert.equal(short.current().then, undefined);
+});
