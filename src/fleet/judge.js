@@ -20,7 +20,7 @@ export const JUDGE_ACTIONS = Object.freeze(["send", "wait", "ask-owner"]);
 // verify locally" went out to an agent that had said nothing ran there).
 // Owner answers, owner messages, manager escalations and questions never
 // come here.
-export const JUDGED_PLAYBOOKS = new Set(["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume", "no-local-verify", "infra-recovered", "in-scope-yes"]);
+export const JUDGED_PLAYBOOKS = new Set(["merge-ready", "ci-finished", "status-check", "idle-report", "bb3-slow-agent", "resume", "no-local-verify", "infra-recovered", "in-scope-yes", "unblock-snag"]);
 export const DEFAULT_JUDGE_TIMEOUT_MS = 40_000;
 const MESSAGE_MAX = 600;
 const REASON_MAX = 200;
@@ -85,7 +85,7 @@ export const JUDGE_INSTRUCTIONS = [
   "- Never repeat what the agent already reported or already did.",
   "- The agent answered the last nudge and nothing it can act on changed: wait.",
   "- Current evidence says it waits on something passive (a queued or pending run, a reviewer, CI running, a rate or session limit): wait.",
-  "- A skipped or neutral check is not a failure, and neither is a run a newer one replaced (a cancelled duplicate of a run that went on). A cancelled or timed-out check nothing replaced never reached a verdict: it is red and needs a rerun. A red main-health check is main's own health, shared by every PR: not this agent's failure to fix.",
+  "- A skipped or neutral check is not a failure, and neither is a run a newer one replaced (a cancelled duplicate of a run that went on). A cancelled or timed-out check nothing replaced never reached a verdict: it is red and needs a rerun. When `main-health` is red: if `origin/main` has moved or been repaired since the agent last checked, send a concise nudge to merge `origin/main` and re-verify; if no separate `fix-main` repair is running yet, nudge the agent to verify whether `main` still fails on head rather than leaving the work permanently stalled.",
   "- It needs a human decision, approval or credential from the owner: ask-owner, with a concrete question. Use the agent's own options when it listed them: at most 4, each under 40 characters, never \"later\".",
   "- Otherwise: send ONE short message (under 600 characters) that names exactly what is still missing or what changed. No generic checklist, no greeting.",
   "",
