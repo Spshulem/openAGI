@@ -214,7 +214,10 @@ export class GithubThrottle {
       ...(kind !== "secondary" && Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() }
         : stronger && previous.windowResetAt ? { windowResetAt: previous.windowResetAt } : {}),
       probed: previous?.probed === true && !resetKnown,
-      ...(Number.isFinite(remaining) ? { remaining } : {})
+      ...(Number.isFinite(remaining) ? { remaining } : {}),
+      // A hold queued to follow the previous one still follows this one,
+      // when it lasts longer: a later observation never drops it.
+      ...(previous?.then && Date.parse(previous.then.until) > until ? { then: previous.then } : {})
     };
     this.save();
     return this.cooldown;

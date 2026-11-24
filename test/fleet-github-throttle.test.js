@@ -298,3 +298,24 @@ test("a weaker, longer observation never replaces a stronger hold; it follows it
   assert.equal(short.current().kind, held.kind);
   assert.equal(short.current().then, undefined);
 });
+
+// Review fix (#351): secondary (120 s), then low budget with a later reset,
+// then another secondary extending the hold to 240 s used to drop the queued
+// low-budget hold, so background polling resumed after four minutes despite
+// the known low budget.
+test("extending a hold keeps the weaker hold queued to follow it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  assert.equal(throttle.current().then?.kind, "low-budget");
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  assert.equal(throttle.current().kind, "secondary");
+  assert.equal(Date.parse(throttle.current().until) > T0 + 120_000, true, "the second secondary extends the hold");
+  assert.equal(throttle.current().then?.kind, "low-budget", "the queued hold survives the extension");
+  c.now.value = Date.parse(throttle.current().until) + 1000;
+  assert.equal(throttle.current()?.kind, "low-budget", "background polling still waits for the reset");
+  assert.notEqual(throttle.blocking({ background: true }), null);
+  assert.equal(throttle.blocking({ background: false }), null);
+});
