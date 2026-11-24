@@ -1246,3 +1246,75 @@ test("Codex round-3 fixes: confirm_done stays gated, follow-through notices bypa
   const remoteDigest = await sup4.maybePostProactiveSupervisorDigest({ started: Date.now() });
   assert.equal(remoteDigest.posted, true, "manageRemoteHosts=true must allow publishing remote Paseo decisions");
 });
+
+test("Codex round-4 fixes: post-merge deploy stays actionable, queued attachments dedupe by image identity, model switch updates chat pin and clears incompatible effort", async (t) => {
+  // 1. "PR is already merged into main. May I deploy it to production?" stays actionable!
+  const deployQ = { kind: "agent-ask", title: "May I deploy it to production?", body: "Deploy to prod now?" };
+  const mergedThread = { lastAgentText: "The PR is already merged into main. May I deploy it to production?" };
+  assert.equal(isClosedOrContradictoryDecision(deployQ, mergedThread, { decision: "May I deploy it to production?" }), false);
+  // Whereas a stale merge ask on an already-merged PR is still filtered.
+  const staleMergeQ = { kind: "agent-ask", title: "Should I merge PR #12?", body: "Ready to merge." };
+  assert.equal(isClosedOrContradictoryDecision(staleMergeQ, mergedThread, { decision: "Merge PR #12?" }), true);
+
+  // 2. Queued messages with same caption but different images do NOT collapse into one entry.
+  const dir = makeTmpDir(t, "img-dedupe-");
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    config: { mode: "propose", paseo: { enabled: true, only: true } }
+  });
+  const q1 = sup.store.enqueueOwnerMessage({
+    threadKey: "paseo:host1.a1",
+    message: "Look at this bug",
+    images: [{ mimeType: "image/png", data: "AAAA" }]
+  });
+  const q2 = sup.store.enqueueOwnerMessage({
+    threadKey: "paseo:host1.a1",
+    message: "Look at this bug",
+    images: [{ mimeType: "image/png", data: "BBBB" }]
+  });
+  assert.notEqual(q1.id, q2.id);
+  assert.equal(q2.deduped, false);
+  assert.equal(sup.store.queuedOwnerMessages("paseo:host1.a1").length, 2);
+
+  // 3. Model switch updates OPENAI_MODEL_TASK_CHAT pin and clears incompatible xhigh effort on gpt-5.
+  const dir3 = makeTmpDir(t, "pin-effort-");
+  const prevEnv = {
+    OPENAGI_DATA_DIR: process.env.OPENAGI_DATA_DIR,
+    OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_MODEL_TASK_CHAT: process.env.OPENAI_MODEL_TASK_CHAT,
+    OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT
+  };
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    _resetDataDirCache();
+  });
+  process.env.OPENAGI_DATA_DIR = dir3;
+  _resetDataDirCache();
+  process.env.OPENAGI_PROVIDER = "openai";
+  process.env.OPENAI_API_KEY = "sk-test-fake-key-1234567890";
+  process.env.OPENAI_MODEL = "gpt-5.4";
+  process.env.OPENAI_MODEL_TASK_CHAT = "gpt-5.4";
+  process.env.OPENAI_REASONING_EFFORT_TASK_CHAT = "xhigh";
+
+  const store3 = new InMemoryAgentStore({ storePath: path.join(dir3, "sessions.json") });
+  store3.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const runtime3 = {
+    agentHost: { store: store3, modelProvider: { constructor: { name: "OpenAIResponsesProvider" }, model: "gpt-5.4" } },
+    budget: null
+  };
+  const reg3 = new ToolRegistry();
+  registerCoreTools(reg3, runtime3);
+
+  const switched = await reg3.invoke("set_provider", { model: "gpt-5" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(switched.ok, true);
+  assert.equal(switched.result.ok, true);
+  assert.equal(switched.result.model, "gpt-5", "chat task pin must update so resolved model becomes gpt-5");
+  assert.equal(process.env.OPENAI_MODEL_TASK_CHAT, "gpt-5");
+  assert.equal(switched.result.clearedIncompatibleEffort, "xhigh");
+  assert.equal(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT, undefined);
+});

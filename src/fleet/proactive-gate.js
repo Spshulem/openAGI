@@ -9,7 +9,10 @@ import { clampText, redactSecrets, shortHash } from "./contracts.js";
 import { effectiveCheckinCooldownMs } from "./preferences.js";
 
 const LEGACY_PROACTIVE_PREFIX_RE = /^\s*\*\*(?:Supervisor check-in|Post-send verification)\b/i;
-const CLOSED_OR_NO_ACTION_RE = /\b(?:the\s+goal\s+is\s+already\s+closed|goal\s+is\s+(?:already\s+)?closed|did\s+no\s+new\s+work\s+this\s+turn|no\s+new\s+work\s+this\s+turn|no\s+owner\s+action\s+(?:is\s+)?required|already\s+merged\s+into\s+(?:main|master)|nothing\s+left\s+to\s+do|already\s+shipped\s+and\s+verified)\b/i;
+const CLOSED_OR_NO_ACTION_RE = /\b(?:the\s+goal\s+is\s+already\s+closed|goal\s+is\s+(?:already\s+)?closed|did\s+no\s+new\s+work\s+this\s+turn|no\s+new\s+work\s+this\s+turn|no\s+owner\s+action\s+(?:is\s+)?required|nothing\s+left\s+to\s+do|already\s+shipped\s+and\s+verified)\b/i;
+const ALREADY_MERGED_RE = /\balready\s+merged\s+into\s+(?:main|master)\b/i;
+const MERGE_DECISION_RE = /\b(?:merge|land)\b/i;
+const POST_MERGE_ACTION_RE = /\b(?:deploy|release|roll\s*out|publish|ship\s+to\s+prod|production|staging|restart|upgrade|verify\s+live|submit\s+for\s+review)\b/i;
 const HUB_DEDUPE_TTL_MS = 4 * 60 * 60_000;
 const MAX_TRACKED_KEYS = 400;
 
@@ -34,7 +37,8 @@ function normalizeIdentityText(raw) {
 
 // Filters out contradictory zombie asks where the owning session's latest
 // message explicitly states the goal is already closed/done/merged while an
-// old question still asks for a decision.
+// old question still asks for a decision. Preserves legitimate post-merge
+// follow-up decisions (e.g. "PR is already merged into main. May I deploy to prod?").
 export function isClosedOrContradictoryDecision(question, thread = null, ctx = null) {
   if (!question || question.kind === "ready" || question.mergeAsk) return false;
   const recentAssistant = Array.isArray(thread?.meta?.conversation)
@@ -45,7 +49,15 @@ export function isClosedOrContradictoryDecision(question, thread = null, ctx = n
     recentAssistant,
     ctx?.status
   ].filter(Boolean).join("\n");
-  return Boolean(probe && CLOSED_OR_NO_ACTION_RE.test(probe));
+  if (!probe) return false;
+  if (CLOSED_OR_NO_ACTION_RE.test(probe)) return true;
+  if (ALREADY_MERGED_RE.test(probe)) {
+    const decisionText = [question.title, question.body, ctx?.decision].filter(Boolean).join(" ");
+    if (MERGE_DECISION_RE.test(decisionText) && !POST_MERGE_ACTION_RE.test(decisionText)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Collapses duplicate open decisions within a single digest (e.g. two failed-over

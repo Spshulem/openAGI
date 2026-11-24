@@ -1737,8 +1737,11 @@ export class FleetStore {
         const createdMs = toMs(item?.createdAt, 0);
         return createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
       });
+    const normalizedImages = Array.isArray(images) && images.length > 0 ? images.slice(0, 4) : null;
+    const imageSig = (imgs) => (Array.isArray(imgs) && imgs.length > 0 ? JSON.stringify(imgs) : "");
+    const nextImgSig = imageSig(normalizedImages);
     const existing = this.state.queuedOwnerMessages.find(
-      (item) => item.threadKey === cleanKey && item.message === cleanMsg
+      (item) => item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig
     );
     if (existing) {
       return { ...existing, deduped: true };
@@ -1747,7 +1750,7 @@ export class FleetStore {
       id: makeId("qmsg"),
       threadKey: cleanKey,
       message: cleanMsg,
-      ...(Array.isArray(images) && images.length > 0 ? { images: images.slice(0, 4) } : {}),
+      ...(normalizedImages ? { images: normalizedImages } : {}),
       ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
       source: clampText(String(source || "owner-message"), 40),

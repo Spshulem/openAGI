@@ -1507,12 +1507,20 @@ export function registerCoreTools(registry, runtime) {
           })()
         : null;
 
+      // If a task-level chat model pin exists for the chosen provider, update
+      // it too so `ModelRouter.resolve("chat")` actually switches to the
+      // requested model instead of staying stuck on the older pin.
+      const taskChatPinKey = modelEnvKey === "OPENAI_MODEL" || modelEnvKey === "CHATGPT_MODEL"
+        ? (process.env.OPENAI_MODEL_TASK_CHAT ? "OPENAI_MODEL_TASK_CHAT" : null)
+        : (modelEnvKey === "ANTHROPIC_MODEL" && process.env.ANTHROPIC_MODEL_TASK_CHAT ? "ANTHROPIC_MODEL_TASK_CHAT" : null);
+
       // Snapshot affected env keys so validation failures roll back cleanly
       // without leaking unsupported settings into process.env or .env.
       const prevEnvSnapshot = {
         OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
         OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT,
-        ...(modelEnvKey ? { [modelEnvKey]: process.env[modelEnvKey] } : {})
+        ...(modelEnvKey ? { [modelEnvKey]: process.env[modelEnvKey] } : {}),
+        ...(taskChatPinKey ? { [taskChatPinKey]: process.env[taskChatPinKey] } : {})
       };
       const restoreEnvSnapshot = () => {
         for (const [k, v] of Object.entries(prevEnvSnapshot)) {
@@ -1528,6 +1536,10 @@ export function registerCoreTools(registry, runtime) {
       if (requestedModel && modelEnvKey) {
         process.env[modelEnvKey] = requestedModel;
         envUpdates[modelEnvKey] = requestedModel;
+        if (taskChatPinKey) {
+          process.env[taskChatPinKey] = requestedModel;
+          envUpdates[taskChatPinKey] = requestedModel;
+        }
       }
 
       const { createModelProvider } = await import("./model-provider.js");
@@ -1536,21 +1548,23 @@ export function registerCoreTools(registry, runtime) {
 
       // Validate reasoningEffort against the selected provider & model BEFORE
       // persisting to process.env / .env so unsupported efforts (e.g. xhigh on
-      // gpt-5) never break subsequent chat turns.
+      // gpt-5) never break subsequent chat turns. On model-only changes, also
+      // revalidate and clear any previously saved incompatible task effort.
+      let clearedIncompatibleEffort = null;
+      const support = typeof candidateProvider?.reasoningEffortSupport === "function"
+        ? candidateProvider.reasoningEffortSupport({ task: "chat" })
+        : { supported: false, options: [], reason: "Active provider does not support reasoning effort." };
+      const allowedEfforts = Array.isArray(support?.options) ? support.options : [];
       if (normalizedEffort) {
-        const support = typeof candidateProvider?.reasoningEffortSupport === "function"
-          ? candidateProvider.reasoningEffortSupport({ task: "chat" })
-          : { supported: false, options: [], reason: "Active provider does not support reasoning effort." };
-        const allowed = Array.isArray(support?.options) ? support.options : [];
-        if (!support?.supported || !allowed.includes(normalizedEffort)) {
+        if (!support?.supported || !allowedEfforts.includes(normalizedEffort)) {
           restoreEnvSnapshot();
           return {
             ok: false,
-            error: allowed.length > 0
-              ? `Reasoning effort "${normalizedEffort}" is not supported by ${candidateModel || candidateProvider?.constructor?.name || "the active model"}. Supported efforts: ${allowed.join(", ")}.`
+            error: allowedEfforts.length > 0
+              ? `Reasoning effort "${normalizedEffort}" is not supported by ${candidateModel || candidateProvider?.constructor?.name || "the active model"}. Supported efforts: ${allowedEfforts.join(", ")}.`
               : (support?.reason || `The active model (${candidateModel || candidateProvider?.constructor?.name || "unknown"}) does not support a reasoning effort setting.`),
             model: candidateModel,
-            supportedEfforts: allowed,
+            supportedEfforts: allowedEfforts,
             configuredProviders
           };
         }
@@ -1559,6 +1573,14 @@ export function registerCoreTools(registry, runtime) {
       } else if (clearedEffort) {
         delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
         envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+      } else {
+        const existingTaskEffort = String(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? "").trim().toLowerCase();
+        if (existingTaskEffort && (!support?.supported || !allowedEfforts.includes(existingTaskEffort))) {
+          clearedIncompatibleEffort = existingTaskEffort;
+          clearedEffort = true;
+          delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+        }
       }
 
       // Rebuild provider with the validated effort env var in place.
@@ -1598,6 +1620,7 @@ export function registerCoreTools(registry, runtime) {
         current: activeProvider?.constructor?.name ?? null,
         model: activeProvider?.resolveModel?.({ task: "chat" }) ?? activeProvider?.model ?? null,
         reasoningEffort: effortReadback?.effective ?? process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? process.env.OPENAI_REASONING_EFFORT ?? null,
+        ...(clearedIncompatibleEffort ? { clearedIncompatibleEffort } : {}),
         supportedEfforts: effortReadback?.options ?? [],
         configuredProviders,
         takesEffect: "next_turn"
