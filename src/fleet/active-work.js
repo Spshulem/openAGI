@@ -81,6 +81,28 @@ export const PERSISTENT_WORK_STATES = Object.freeze([
   "done"
 ]);
 
+// Workflow stage describes where the requested outcome is in its lifecycle.
+// Execution health is deliberately separate: a validating item can be idle,
+// and an implementing item can be blocked.  Keeping these axes independent is
+// what lets the Work view answer both “what stage is it in?” and “is anyone
+// making fresh progress?” without treating a running chat as proof of progress.
+export const WORKFLOW_STAGES = Object.freeze([
+  "queued",
+  "implementing",
+  "validating",
+  "ready_for_review",
+  "deploying",
+  "verified_done"
+]);
+
+export const EXECUTION_HEALTH = Object.freeze([
+  "active",
+  "idle",
+  "stalled",
+  "blocked",
+  "unknown"
+]);
+
 const FOLLOW_THROUGH_PRIORITY = Object.freeze({
   blocked: 100,
   blocked_pr: 96,
@@ -141,6 +163,22 @@ function utcDay(ms) {
 function parseIsoMs(iso) {
   const ts = Date.parse(String(iso ?? ""));
   return Number.isFinite(ts) ? ts : null;
+}
+
+function normalizeWorkflowStage(value, fallback = "queued") {
+  const stage = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return WORKFLOW_STAGES.includes(stage) ? stage : fallback;
+}
+
+function normalizeExecutionHealth(value, fallback = "unknown") {
+  const health = String(value ?? "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return EXECUTION_HEALTH.includes(health) ? health : fallback;
+}
+
+function defaultNextCheckAt(nowMs, cadence) {
+  const hours = Number(cadence?.staleAfterHours);
+  const delay = Number.isFinite(hours) ? Math.max(1, hours) : CADENCE_MODES.daily;
+  return new Date(nowMs + delay * HOUR_MS).toISOString();
 }
 
 function emptyPersistentState() {
@@ -633,7 +671,10 @@ export class ActiveWorkManager {
     const { byKey: sessionsByKey } = this._knownSessionsByKey();
     const prsByRef = this._livePrMap();
 
-    const rawGoal = cleanText(input.goal ?? "", 600);
+    // Manager dispatch accepts up to 4,000 characters. Preserve the complete
+    // delegated ask so late accessibility/release requirements survive in the
+    // durable Work record and verification context.
+    const rawGoal = cleanText(input.goal ?? "", 4000);
     if (!rawGoal) throw new Error("Provide a goal describing the outcome or commitment to track.");
 
     const rawThreadKey = typeof input.threadKey === "string" && input.threadKey.trim()
@@ -754,10 +795,70 @@ export class ActiveWorkManager {
     // request to replace its explicit completion contract with the default.
     const doneCriteria = requestedDoneCriteria ?? existing?.doneCriteria ?? defaultDoneCriteria;
 
+    // These fields form the durable contract shared by the portfolio view,
+    // project-scoped Ask Supervisor, and every follow-through check. Keep the
+    // original ask separate from the mutable goal so later edits never erase
+    // what was actually delegated.
+    const originalAsk = cleanText(input.originalAsk ?? existing?.originalAsk ?? rawGoal, 4000);
+    const acceptanceCriteriaExplicit = input.acceptanceCriteria !== undefined
+      ? Boolean(cleanText(input.acceptanceCriteria, 500))
+      : Boolean(existing?.acceptanceCriteriaExplicit);
+    const acceptanceCriteria = cleanText(
+      input.acceptanceCriteria !== undefined
+        ? input.acceptanceCriteria
+        : (acceptanceCriteriaExplicit ? existing?.acceptanceCriteria : doneCriteria),
+      500
+    );
+    const currentStepExplicit = input.currentStep !== undefined
+      ? Boolean(cleanText(input.currentStep, 300))
+      : Boolean(existing?.currentStepExplicit);
+    const currentStep = cleanText(
+      input.currentStep !== undefined
+        ? input.currentStep
+        : (currentStepExplicit ? existing?.currentStep : input.progressSummary ?? existing?.lastMeaningfulProgress?.summary ?? "Queued for owner work"),
+      300
+    );
+    const nextMilestoneExplicit = input.nextMilestone !== undefined
+      ? Boolean(cleanText(input.nextMilestone, 300))
+      : Boolean(existing?.nextMilestoneExplicit);
+    const nextMilestone = cleanText(
+      input.nextMilestone !== undefined
+        ? input.nextMilestone
+        : (nextMilestoneExplicit ? existing?.nextMilestone : nextAction ?? "Fresh owner evidence"),
+      300
+    );
+    const blocker = cleanText(input.blocker ?? existing?.blocker ?? "", 300) || null;
+    const nextActionOwnerExplicit = input.nextActionOwner !== undefined
+      ? Boolean(cleanText(input.nextActionOwner, 120))
+      : Boolean(existing?.nextActionOwnerExplicit);
+    const nextActionOwner = cleanText(
+      input.nextActionOwner !== undefined
+        ? input.nextActionOwner
+        : (nextActionOwnerExplicit ? existing?.nextActionOwner : owner.label),
+      120
+    ) || null;
+    const eta = cleanText(input.eta ?? existing?.eta ?? "", 120) || null;
+    const nextCheckInputMs = parseIsoMs(input.nextCheckAt);
+    const nextCheckExplicit = input.nextCheckAt !== undefined
+      ? nextCheckInputMs !== null
+      : Boolean(existing?.nextCheckExplicit);
+    const cadenceChanged = Boolean(existing && input.cadence !== undefined
+      && cadence.staleAfterHours !== existing.cadence?.staleAfterHours);
+    const nextCheckMs = parseIsoMs(input.nextCheckAt ?? existing?.nextCheckAt);
+    const nextCheckAt = nextCheckMs !== null && !(cadenceChanged && !nextCheckExplicit)
+      ? new Date(nextCheckMs).toISOString()
+      : defaultNextCheckAt(nowMs, cadence);
+    const requestedWorkflowStage = input.workflowStage !== undefined
+      ? normalizeWorkflowStage(input.workflowStage)
+      : (existing?.workflowStage ?? "queued");
+
     let item;
     let created = false;
     if (existing) {
-      const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria;
+      const acceptanceChanged = input.acceptanceCriteria !== undefined
+        ? cleanText(input.acceptanceCriteria, 500) !== (existing.acceptanceCriteria ?? existing.doneCriteria ?? "")
+        : false;
+      const goalChanged = existing.goal !== rawGoal || existing.doneCriteria !== doneCriteria || acceptanceChanged;
       const ownerUpdated = input.owner !== undefined || input.threadKey !== undefined;
       const ownerChanged = ownerUpdated && (
         existing.owner?.threadKey !== owner.threadKey
@@ -775,6 +876,12 @@ export class ActiveWorkManager {
 
       let nextState = requestedState ?? existing.state ?? "active";
       let outcomeVerified = Boolean(existing.outcomeVerified);
+      if (input.resetVerification === true || input.dispatching === true) {
+        // A new execution of an already-verified directive is a fresh open
+        // outcome; never let the prior completion hide the rerun.
+        nextState = requestedState && requestedState !== "done" ? requestedState : "active";
+        outcomeVerified = false;
+      }
       if (goalChanged && input.confirmDone !== true) {
         if (existing.state === "done") nextState = "active";
         outcomeVerified = false;
@@ -794,9 +901,23 @@ export class ActiveWorkManager {
         customer: customer ?? existing.customer ?? null,
         repo: repo ?? existing.repo ?? null,
         goal: rawGoal,
+        originalAsk,
         doneCriteria,
+        acceptanceCriteria,
+        acceptanceCriteriaExplicit,
         goalUpdatedAt: goalChanged ? nowIso : (existing.goalUpdatedAt ?? existing.createdAt ?? nowIso),
         nextAction: nextAction !== null ? nextAction : existing.nextAction,
+        currentStep,
+        nextMilestone,
+        currentStepExplicit,
+        nextMilestoneExplicit,
+        blocker,
+        nextActionOwner,
+        eta,
+        nextCheckAt,
+        nextCheckExplicit,
+        workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
+        nextActionOwnerExplicit,
         cadence: input.cadence !== undefined ? cadence : existing.cadence,
         permittedNudges: input.permittedNudges !== undefined ? permittedNudges : existing.permittedNudges,
         owner: (input.owner !== undefined || input.threadKey !== undefined) ? owner : existing.owner,
@@ -861,9 +982,23 @@ export class ActiveWorkManager {
         customer,
         repo,
         goal: rawGoal,
+        originalAsk,
         doneCriteria,
+        acceptanceCriteria,
+        acceptanceCriteriaExplicit,
         goalUpdatedAt: nowIso,
         nextAction,
+        currentStep,
+        nextMilestone,
+        currentStepExplicit,
+        nextMilestoneExplicit,
+        blocker,
+        nextActionOwner,
+        eta,
+        nextCheckAt,
+        nextCheckExplicit,
+        workflowStage: (requestedWorkflowStage === "verified_done" && !outcomeVerified) ? "queued" : requestedWorkflowStage,
+        nextActionOwnerExplicit,
         cadence,
         permittedNudges,
         owner,
@@ -1164,6 +1299,7 @@ export class ActiveWorkManager {
         input: {
           goal: item.goal,
           done_criteria: item.doneCriteria,
+          acceptance_criteria: item.acceptanceCriteria ?? item.doneCriteria,
           cursor: item.cursor ?? null,
           latest_evidence: cleanText(evidenceSummary, 500)
         },
@@ -1172,8 +1308,8 @@ export class ActiveWorkManager {
             type: "predicate",
             name: "goal_accomplished",
             instructions:
-              "Based on `done_criteria`, `cursor`, and `latest_evidence`, is the entire `goal` genuinely accomplished " +
-              "with zero remaining batches or unverified acceptance steps (as opposed to only finishing one partial batch or audit)?"
+              "Based on `done_criteria`, `acceptance_criteria`, `cursor`, and `latest_evidence`, is the entire `goal` genuinely accomplished " +
+              "with zero remaining batches and every acceptance requirement verified (as opposed to only finishing one partial batch or audit)?"
           }
         ],
         apiKey,
@@ -1320,6 +1456,7 @@ export class ActiveWorkManager {
       whySurfaced = "Workstream is paused while outcome remains unverified.";
     } else if (
       effectivePersistentState === "blocked"
+      || Boolean(item.blocker)
       || (effectiveRemainingCount !== null && effectiveRemainingCount > 0 && sessionStatus !== "running")
       || untrusted?.claimsBlocked
       || item.decisionsVerdict?.classification === "blocked"
@@ -1327,7 +1464,7 @@ export class ActiveWorkManager {
       followThroughState = "blocked";
       whySurfaced = effectiveRemainingCount !== null && effectiveRemainingCount > 0
         ? `${effectiveRemainingCount} remaining/blocked items reported${sessionStatus === "idle" ? " after coding chat finished" : ""}; outcome not yet complete.`
-        : "Blocked on unresolved issue or external dependency.";
+        : (item.blocker ? `Blocked on: ${item.blocker}` : "Blocked on unresolved issue or external dependency.");
       verificationQuestion = `Resolve or verify blocker for ${item.project}${item.theme ? ` / ${item.theme}` : ""}: ${item.doneCriteria}`;
     } else if (prState === "OPEN" && (prCiState === "FAILURE" || prMergeState === "DIRTY")) {
       followThroughState = "blocked_pr";
@@ -1371,6 +1508,26 @@ export class ActiveWorkManager {
       verificationQuestion = `${item.project}${item.theme ? ` / ${item.theme}` : ""} has been idle ${idleHours}h. Resume owner, snooze, or confirm done?`;
     }
 
+    const explicitWorkflowStage = normalizeWorkflowStage(item.workflowStage);
+    const workflowStage = item.outcomeVerified === true
+      ? "verified_done"
+      : (prState === "MERGED"
+          ? "deploying"
+          : (prState === "OPEN" && !prIsDraft && prCiState === "SUCCESS"
+              ? "ready_for_review"
+              : (prState === "OPEN" && prCiState && prCiState !== "SUCCESS"
+                  ? "validating"
+                  : (explicitWorkflowStage !== "queued" && explicitWorkflowStage !== "implementing"
+                      ? explicitWorkflowStage
+                      : (sessionStatus === "running" ? "implementing" : explicitWorkflowStage)))));
+    const executionHealth = followThroughState === "blocked" || followThroughState === "blocked_pr"
+      ? "blocked"
+      : (isPastCadence && sessionStatus !== "running"
+          ? "stalled"
+          : (sessionStatus === "running" && evidenceFreshness.allFresh
+              ? "active"
+              : (sessionStatus === "idle" ? "idle" : "unknown")));
+
     const choices = this._buildChoices(item, {
       followThroughState,
       hasActiveSessionOwner,
@@ -1390,8 +1547,16 @@ export class ActiveWorkManager {
       customer: item.customer ?? null,
       repo: item.repo ?? null,
       goal: item.goal,
+      originalAsk: item.originalAsk ?? item.goal,
       doneCriteria: item.doneCriteria,
+      acceptanceCriteria: item.acceptanceCriteria ?? item.doneCriteria,
       nextAction: item.nextAction ?? null,
+      currentStep: item.currentStep ?? item.lastMeaningfulProgress?.summary ?? null,
+      nextMilestone: item.nextMilestone ?? item.nextAction ?? null,
+      blocker: item.blocker ?? null,
+      nextActionOwner: item.nextActionOwner ?? item.owner?.label ?? null,
+      eta: item.eta ?? null,
+      nextCheckAt: item.nextCheckAt ?? null,
       cadence: item.cadence,
       permittedNudges: item.permittedNudges,
       owner: {
@@ -1407,10 +1572,13 @@ export class ActiveWorkManager {
       linkedSkill: item.linkedSkill ?? null,
       evidenceLinks: evaluatedLinks,
       evidenceFreshness,
+      lastMeaningfulEvidenceAt: evidenceFreshness.newestEvidenceAt,
       lastMeaningfulProgress: item.lastMeaningfulProgress,
       lastMeaningfulProgressAt: item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? null,
       idleHours,
       state: effectivePersistentState,
+      workflowStage,
+      executionHealth,
       followThroughState,
       actionable,
       priorityRank,
@@ -1567,6 +1735,35 @@ export class ActiveWorkManager {
       proposedProjects: openProposals.length
     };
 
+    const projectSummaries = [...scoped.reduce((groups, item) => {
+      const current = groups.get(item.project) ?? {
+        project: item.project,
+        total: 0,
+        actionable: 0,
+        stages: {},
+        health: {},
+        nextCheckAt: null,
+        nextMilestones: [],
+        blockers: []
+      };
+      current.total += 1;
+      if (item.actionable) current.actionable += 1;
+      current.stages[item.workflowStage] = (current.stages[item.workflowStage] ?? 0) + 1;
+      current.health[item.executionHealth] = (current.health[item.executionHealth] ?? 0) + 1;
+      if (!item.outcomeVerified && item.nextCheckAt && (!current.nextCheckAt || item.nextCheckAt < current.nextCheckAt)) {
+        current.nextCheckAt = item.nextCheckAt;
+      }
+      // Verified outcomes still count toward historical stage/health totals,
+      // but their stored milestone and blocker are no longer current.
+      if (!item.outcomeVerified && item.nextMilestone) current.nextMilestones.push(item.nextMilestone);
+      if (!item.outcomeVerified && item.blocker) current.blockers.push({ blocker: item.blocker, owner: item.nextActionOwner, id: item.id });
+      return groups.set(item.project, current);
+    }, new Map()).values()].map((summary) => ({
+      ...summary,
+      nextMilestones: [...new Set(summary.nextMilestones)].slice(0, 5),
+      blockers: summary.blockers.slice(0, 5)
+    }));
+
     return {
       at: nowIso,
       distinctFrom: {
@@ -1574,6 +1771,7 @@ export class ActiveWorkManager {
         needsYouApprovals: true
       },
       counts,
+      projectSummaries,
       digest,
       items: visibleItems,
       prompts,
@@ -1774,6 +1972,7 @@ export class ActiveWorkManager {
         theme: item.theme ?? null,
         goal: cleanText(item.goal, 240),
         done_criteria: cleanText(item.doneCriteria, 240),
+        acceptance_criteria: cleanText(item.acceptanceCriteria ?? item.doneCriteria, 240),
         session_status: session?.agentStatus ?? "idle",
         untrusted_agent_excerpt: untrusted?.excerpt ?? ""
       }))
@@ -2249,7 +2448,11 @@ export class ActiveWorkManager {
         livePr?.headOid ?? livePr?.headSha ?? null,
         livePr?.updatedAt ?? null,
         livePr?.mergedAt ?? null,
-        completionReviewedAt ?? ""
+        completionReviewedAt ?? "",
+        // A recorded blocker changes the projection (blocked / actionable)
+        // without a state change. Append only when present so existing
+        // unblocked items keep their mark and are not re-evaluated en masse.
+        ...(item.blocker ? [`blocker:${item.blocker}`] : [])
       ]));
 
       // Verdicts are only valid for the evidence mark they evaluated. Clear a
@@ -2418,6 +2621,13 @@ export class ActiveWorkManager {
       item.wasStaleAtLastEval = (nowMs - currentProgressMs) >= ((item.cadence?.staleAfterHours ?? 24) * HOUR_MS);
       item.lastEvaluatedMark = deltaMark;
       item.lastEvaluatedAt = nowIso;
+      // An omitted deadline is a moving cadence window. Once this pass has
+      // evaluated the item, advance that inferred check so Work and Ask
+      // Supervisor do not keep showing the deadline that just elapsed. An
+      // owner-supplied deadline remains fixed until explicitly changed.
+      if (item.nextCheckExplicit !== true) {
+        item.nextCheckAt = defaultNextCheckAt(nowMs, item.cadence);
+      }
 
       const projected = this._projectItem(item, { nowMs, sessionsByKey, prsByRef });
       item.lastEvaluatedActionable = projected.actionable;
@@ -2707,11 +2917,22 @@ export class ActiveWorkManager {
           detail: "The linked coding session is archived."
         };
       }
-      const defaultMessage = cleanText(
-        input.message
-          || `Follow up on "${item.goal}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
-        1200
-      );
+      // The default follow-up carries the complete current goal (up to
+      // 4,000 chars) so a retried dispatch never drops late or revised
+      // requirements. originalAsk stays historical context only.
+      const fullAsk = cleanText(item.goal || item.originalAsk, 4000);
+      // Verification checks the separate acceptance contract, so the owner
+      // must receive it too or the follow-up can never satisfy it.
+      const acceptance = cleanText(item.acceptanceCriteria ?? "", 500);
+      const acceptanceLine = acceptance && acceptance !== cleanText(item.doneCriteria ?? "", 500)
+        ? `. Acceptance requires: ${acceptance}`
+        : "";
+      const defaultMessage = input.message
+        ? cleanText(input.message, 1200)
+        : cleanText(
+            `Follow up on "${fullAsk}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${acceptanceLine}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
+            6000
+          );
       if (input.confirmed !== true) {
         return {
           ok: true,
@@ -2736,6 +2957,18 @@ export class ActiveWorkManager {
       const delivery = sent?.delivery ?? { status: "blocked", detail: "Delivery unavailable" };
       if (delivery.status === "sent") {
         if (item.state === "paused") item.state = "active";
+        // A dispatch is only recovered once the complete ask reached the owner;
+        // a shorter custom note is delivered but leaves the blocker visible.
+        if (
+          typeof item.blocker === "string"
+          && item.blocker.startsWith("Dispatch delivery blocked:")
+          && defaultMessage.includes(fullAsk)
+        ) {
+          item.blocker = null;
+          if (item.state === "blocked") item.state = "active";
+          item.nextAction = "Owner evidence received and verified";
+          item.currentStep = "Owner resumed; awaiting fresh evidence";
+        }
         item.updatedAt = nowIso;
         this._resolveItemOutreach(item, "resume_owner", "acted");
       }
@@ -2855,7 +3088,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
           project: { type: "string", maxLength: 80, description: "Project name (e.g. 'SEO', 'BuildBetter', 'bb-recorder')" },
           theme: { type: "string", maxLength: 80, description: "Optional theme/workstream (e.g. 'Ads', 'Content', 'Videos', 'Launch', 'QA', 'Release')" },
           customer: { type: "string", maxLength: 80, description: "Optional customer name for follow-through (e.g. 'AppFolio', 'Brex', 'Intruder', 'Kudos')" },
-          goal: { type: "string", minLength: 1, maxLength: 600, description: "Outcome or commitment to track" },
+          goal: { type: "string", minLength: 1, maxLength: 4000, description: "Outcome or commitment to track" },
           doneCriteria: { type: "string", maxLength: 500, description: "What 'done' means before this outcome can be marked verified" },
           nextAction: { type: "string", maxLength: 300, description: "Next expected step" },
           cadence: { type: "string", enum: ["hourly", "twice_daily", "daily", "weekly", "quiet"], description: "Follow-through check cadence (default 'daily')" },
@@ -2868,7 +3101,7 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         additionalProperties: false
       },
       prepareApprovalArgs: (args = {}) => {
-        const goal = cleanText(args.goal ?? "", 600);
+        const goal = cleanText(args.goal ?? "", 4000);
         if (!goal) throw new Error("Provide a goal to track.");
         const project = cleanText(args.project || args.customer || "General", 80);
         const theme = args.theme ? cleanText(args.theme, 80) : null;

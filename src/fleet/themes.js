@@ -2,7 +2,7 @@
 // Scoped Project Supervisor hierarchy, and Manager-Level Goal Dispatch
 // ("Go work on <feature> in <project>").
 
-import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets } from "./contracts.js";
+import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets, shortHash } from "./contracts.js";
 import { listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, matchGoalWithDecisions } from "./decisions-gate.js";
 import { hostApi, isLocalPaseoUrl, withPaseo } from "./sources/paseo.js";
@@ -20,6 +20,18 @@ export const PASEO_LABEL_COLORS = Object.freeze([
   "blue",
   "red"
 ]);
+
+// trackWork clamps dedupe keys to 160 characters. Bound each readable slug so
+// the digest (which carries the full project/theme/goal/dispatch identity)
+// always survives: 9 + 60 + 1 + 60 + 1 + 16 = 147.
+const DISPATCH_KEY_SLUG_MAX = 60;
+
+export function dispatchDedupeKey(project, theme, goal, dispatchId = "") {
+  const slug = (value) => (String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general")
+    .slice(0, DISPATCH_KEY_SLUG_MAX).replace(/-+$/g, "") || "general";
+  const digest = shortHash(JSON.stringify([String(project ?? ""), String(theme ?? ""), String(goal ?? ""), String(dispatchId ?? "")]));
+  return `dispatch:${slug(project)}:${slug(theme)}:${digest}`;
+}
 
 const THEME_RULES = [
   {
@@ -939,6 +951,78 @@ export async function dispatchManagerGoal(
   const normalizedMode = ["preview", "auto", "execute", "force_new"].includes(String(mode ?? "auto").toLowerCase())
     ? String(mode ?? "auto").toLowerCase()
     : "auto";
+  // Each manager dispatch is a distinct execution, even when it repeats the
+  // same wording. The returned Work id is reused only for the post-start
+  // owner attachment, so no completed execution can hide a rerun.
+  const dispatchId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${shortHash(`${cleanGoal}:${project ?? ""}:${theme ?? ""}`)}`;
+
+  // A dispatch is never allowed to outrun its durable outcome contract.  This
+  // record is written before any message is sent or new Paseo session starts,
+  // so failed delivery, idle owners, and restarts still leave one truthful
+  // item for Work and project-scoped Ask Supervisor to reconcile.
+  const persistDispatchOutcome = ({ projectName = null, themeName = theme, threadKey = null, ownerLabel = null, workflowStage = "queued", nextAction = null } = {}) => {
+    if (normalizedMode === "preview") return null;
+    if (typeof supervisor?.trackWork !== "function") throw new Error("Cannot dispatch without durable Active Work tracking.");
+    const resolvedProject = projectName || project || "General";
+    return supervisor.trackWork({
+      project: resolvedProject,
+      theme: themeName || null,
+      goal: cleanGoal,
+      originalAsk: cleanGoal,
+      doneCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      acceptanceCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      // A label-only pre-start record is intentionally unassigned. If Paseo
+      // returns a session key later, the follow-up update binds that same
+      // durable record to the actual owner; a timeout can still be auto-bound.
+      owner: threadKey
+        ? { threadKey, label: ownerLabel || threadKey }
+        : { kind: "unassigned", label: ownerLabel || "Assigned owner" },
+      currentStep: "Dispatch recorded; awaiting owner evidence",
+      nextMilestone: nextAction || "Owner evidence received and verified",
+      nextAction: nextAction || "Owner evidence received and verified",
+      nextActionOwner: ownerLabel || "Assigned owner",
+      workflowStage,
+      executionHealth: "unknown",
+      cadence: "hourly",
+      permittedNudges: "none",
+      dispatching: true,
+      resetVerification: true,
+      dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal, dispatchId)
+    });
+  };
+  const recordDeliveryFailure = (persisted, sent) => {
+    const item = persisted?.item;
+    if (!item || typeof supervisor?.trackWork !== "function") return;
+    const detail = clampText(sent?.delivery?.detail || "Owner delivery was blocked.", 240);
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      state: "blocked",
+      blocker: `Dispatch delivery blocked: ${detail}`,
+      currentStep: "Dispatch recorded, but the owner did not receive it",
+      nextAction: "Retry delivery to the existing owner",
+      workflowStage: item.workflowStage || "implementing",
+      permittedNudges: "none"
+    });
+  };
+  const recordRecoveredOwner = (persisted, sent) => {
+    const item = persisted?.item;
+    const recovered = sent?.delivery?.recoveredSession;
+    if (!item || !recovered?.key || typeof supervisor?.trackWork !== "function") return;
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      threadKey: recovered.key,
+      owner: { threadKey: recovered.key, label: recovered.title || recovered.workspace || recovered.key },
+      currentStep: "Replacement owner session received the dispatch; awaiting fresh evidence",
+      nextAction: "Replacement owner evidence received and verified",
+      workflowStage: item.workflowStage || "implementing"
+    });
+  };
 
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
@@ -949,8 +1033,11 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
-    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
+    const persisted = persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
+    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const ok = sent?.delivery?.status === "sent";
+    if (!ok) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
@@ -1146,8 +1233,18 @@ export async function dispatchManagerGoal(
     }
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
-    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images });
+    const persisted = persistDispatchOutcome({
+      projectName: targetProject.name,
+      themeName: theme || inferredTheme.name,
+      threadKey: best.session.key,
+      ownerLabel: best.session.title || best.session.workspace,
+      workflowStage: "implementing",
+      nextAction: "Existing owner acknowledges the request"
+    });
+    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images, goalId: persisted?.item?.id ?? null });
     const delivered = sent?.delivery?.status === "sent";
+    if (!delivered) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
@@ -1183,6 +1280,13 @@ export async function dispatchManagerGoal(
     };
   }
 
+  const persisted = persistDispatchOutcome({
+    projectName: targetProject.name,
+    themeName: theme || inferredTheme.name,
+    ownerLabel: suggestedTitle,
+    workflowStage: "queued",
+    nextAction: "New owner session starts and acknowledges the request"
+  });
   const created = await (typeof supervisor?.startPaseoSession === "function"
     ? supervisor.startPaseoSession({
         workspace: targetProject.name,
@@ -1208,8 +1312,27 @@ export async function dispatchManagerGoal(
         effort,
         modeId,
         images,
-        factory
-      }));
+      factory
+    }));
+
+  if (created?.key && typeof supervisor?.trackWork === "function") {
+    supervisor.trackWork({
+      id: persisted?.item?.id,
+      project: targetProject.name,
+      theme: theme || inferredTheme.name,
+      goal: cleanGoal,
+      dedupeKey: persisted?.item?.dedupeKey ?? dispatchDedupeKey(targetProject.name, theme || inferredTheme.name, cleanGoal, dispatchId),
+      owner: { threadKey: created.key, label: created.title || suggestedTitle },
+      currentStep: "Owner session started; awaiting first meaningful evidence",
+      workflowStage: "implementing",
+      nextMilestone: "Owner evidence received and verified",
+      nextAction: "Owner evidence received and verified",
+      nextActionOwner: created.title || suggestedTitle,
+      permittedNudges: "none",
+      dispatching: true,
+      resetVerification: true
+    });
+  }
 
   supervisor?.store?.recordAction?.({
     kind: "dispatch-goal",

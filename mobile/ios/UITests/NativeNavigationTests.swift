@@ -21,7 +21,7 @@ final class NativeNavigationTests: XCTestCase {
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
         // Walking every accessibility type can stall while resolving system
         // toolbar snapshots, even for a fully visible native navigation row.
-        let isNativeButton = id == "approval-approve" || id == "open-settings" || id == "chat-jump-latest" || id == "chat-send" || id.hasPrefix("inbox-approval-")
+        let isNativeButton = id == "approval-approve" || id == "open-settings" || id == "chat-jump-latest" || id == "chat-send" || id == "today-open-inbox" || id.hasPrefix("inbox-approval-")
         let target = isNativeButton ? app.buttons[id] : element(app, id)
         if let listID {
             let list = element(app, listID)

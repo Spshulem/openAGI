@@ -17,7 +17,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +49,10 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/hierarchy') {
         if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/ask-supervisor') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
       if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
@@ -494,6 +498,7 @@ export class RemoteFleetSupervisor {
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async getSupervisorWork(input = {}) { return this.request('GET', '/fleet/api/ask-supervisor', input); }
   async getOrganization() { return (await this.request('GET', '/fleet/api/projects')).organization; }
   async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
   async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
