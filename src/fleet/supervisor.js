@@ -2593,6 +2593,24 @@ export class FleetSupervisor {
         ownerChoice,
         source: "owner-message"
       });
+      if (!queued) {
+        const detail = "Message exceeds the 24,000-character queue limit and was not sent while the Paseo session is mid-turn.";
+        const action = this.store.recordAction({
+          threadKey: effectiveKey,
+          playbook: "owner-message",
+          status: "blocked",
+          route: "paseo-queue",
+          detail
+        });
+        return {
+          delivery: {
+            status: "blocked",
+            route: "paseo-queue",
+            actionId: action?.id ?? null,
+            detail
+          }
+        };
+      }
       const detail = "Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).";
       const action = this.store.recordAction({
         threadKey: effectiveKey,
@@ -2713,10 +2731,36 @@ export class FleetSupervisor {
         results.push({ id: entry.id, threadKey: entry.threadKey, status: "dropped-archived" });
         continue;
       }
+      // Preserve sendOwnerMessage's permission guard: never drain ordinary
+      // queued prose into a session waiting on a permission prompt (where
+      // deliverPaseo could interpret unrelated prose as Allow/Deny).
+      const matchingOpen = this.store.openQuestions().find(
+        (q) => q.threadKey === entry.threadKey || (q.threadKeys ?? []).includes(entry.threadKey)
+      ) ?? null;
+      const paseoFreeTextQuestion = Boolean(
+        thread?.kind === "paseo"
+        && thread?.meta?.pendingCard?.items?.some((item) => item?.freeText === true)
+        && !thread?.meta?.blockedOnOwner
+        && !thread?.meta?.pendingPermission
+      );
+      const permissionPending = Boolean(
+        thread?.meta?.blockedOnOwner === true
+        || thread?.meta?.pendingPermission
+        || (thread?.meta?.pendingCard?.requestId && !paseoFreeTextQuestion)
+        || (matchingOpen?.meta?.paseoPermissionId && !paseoFreeTextQuestion)
+        || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")
+        || String(thread?.attentionReason ?? thread?.meta?.attentionReason ?? "").toLowerCase() === "permission"
+      );
+      if (permissionPending && entry.ownerChoice == null) {
+        continue;
+      }
       const pausedForHuman = Boolean(
-        thread.state === "needs-human"
-        || thread.requiresAttention === true
-        || ["async_question", "permission", "input"].includes(String(thread.attentionReason ?? thread.meta?.attentionReason ?? "").toLowerCase())
+        !permissionPending
+        && (
+          thread.state === "needs-human"
+          || thread.requiresAttention === true
+          || ["async_question", "input"].includes(String(thread.attentionReason ?? thread.meta?.attentionReason ?? "").toLowerCase())
+        )
       );
       if (!pausedForHuman && ["running", "initializing"].includes(String(thread.agentStatus ?? "").toLowerCase())) {
         continue;
@@ -2727,6 +2771,7 @@ export class FleetSupervisor {
         route: "paseo-send",
         playbook: "owner-message",
         queue: true,
+        holdOnPermission: entry.ownerChoice == null,
         images: entry.images ?? null,
         recoverDisconnected: false,
         ...(entry.ownerChoice != null ? { ownerChoice: entry.ownerChoice } : {})
@@ -2830,6 +2875,7 @@ export class FleetSupervisor {
       ? {
           kind: typeof metadata?.kind === "string" ? metadata.kind : "proactive_supervisor",
           ...(Array.isArray(metadata?.decisionKeys) ? { decisionKeys: metadata.decisionKeys } : {}),
+          ...(Array.isArray(metadata?.decisionTokens) ? { decisionTokens: metadata.decisionTokens } : {}),
           ...(agentReviewed ? { agentReviewed: true } : {})
         }
       : null;
@@ -2843,6 +2889,8 @@ export class FleetSupervisor {
 
     let deliveredRemote = false;
     let suppressedRemote = false;
+    let deferredRemote = false;
+    let remoteReason = null;
     let deliveredLocal = false;
     if (remoteRequired) {
       try {
@@ -2871,7 +2919,11 @@ export class FleetSupervisor {
             if (deliveredRemote && typeof res?.json === "function") {
               try {
                 const body = await res.json();
-                if (body?.suppressed === true) suppressedRemote = true;
+                if (body?.suppressed === true) {
+                  suppressedRemote = true;
+                  deferredRemote = Boolean(body?.deferred === true || body?.reason === "hub_cooldown");
+                  remoteReason = typeof body?.reason === "string" ? body.reason : null;
+                }
               } catch { /* non-JSON ok response */ }
             }
           } finally {
@@ -2902,8 +2954,17 @@ export class FleetSupervisor {
     // On a node paired to a hub the owner reads the hub's copy: a local-only
     // fallback is not delivery, so the caller keeps it pending for a retry.
     if (suppressedRemote) {
-      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, "suppressed by hub proactive gate");
-      return { posted: false, suppressed: true, deliveredRemote: true, deliveredLocal: false, remoteRequired, messageId: stableMsgId };
+      if (dedupeKey && !deferredRemote) this.store.recordSupervisorChatNotice(dedupeKey, "suppressed by hub proactive gate");
+      return {
+        posted: false,
+        suppressed: true,
+        deferred: deferredRemote,
+        ...(remoteReason ? { reason: remoteReason } : {}),
+        deliveredRemote: true,
+        deliveredLocal: false,
+        remoteRequired,
+        messageId: stableMsgId
+      };
     }
     if (deliveredRemote || deliveredLocal) {
       if (dedupeKey && (!remoteRequired || deliveredRemote)) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
@@ -3166,13 +3227,14 @@ export class FleetSupervisor {
       metadata: {
         kind: "proactive_supervisor_delta",
         deltaCount: shownDeltas.length,
-        decisionKeys: shownDeltas.map((d) => d.decisionKey)
+        decisionKeys: shownDeltas.map((d) => d.decisionKey),
+        decisionTokens: shownDeltas.map((d) => `${d.decisionKey}:${d.materialHash || ""}`)
       }
     });
     // Only what was shown, and only once it reached the owner's copy (or was
-    // explicitly suppressed by the context-aware agent gate); the rest stays
-    // pending for the next check-in.
-    if ((res?.posted || res?.suppressed) && (!res.remoteRequired || res.deliveredRemote)) {
+    // deliberately suppressed — NOT temporarily deferred by hub cooldown); the
+    // rest stays pending for the next check-in.
+    if ((res?.posted || (res?.suppressed && !res?.deferred)) && (!res.remoteRequired || res.deliveredRemote)) {
       this.store.commitSurfacedDecisions(shownDeltas, { now: started });
     }
     return res;

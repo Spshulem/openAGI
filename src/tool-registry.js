@@ -1457,13 +1457,29 @@ export function registerCoreTools(registry, runtime) {
 
       if (requestedModel) {
         const isClaude = /^claude/i.test(requestedModel) || inferredPref === "anthropic" || inferredPref === "claude-cli";
-        if (isClaude) {
-          process.env.ANTHROPIC_MODEL = requestedModel;
-          envUpdates.ANTHROPIC_MODEL = requestedModel;
-        } else {
-          process.env.OPENAI_MODEL = requestedModel;
-          envUpdates.OPENAI_MODEL = requestedModel;
-        }
+        const effectivePref = String(inferredPref || process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
+        const currentClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
+        const resolveModelEnvKey = () => {
+          if (effectivePref === "anthropic") return "ANTHROPIC_MODEL";
+          if (effectivePref === "claude-cli") return "CLAUDE_CLI_MODEL";
+          if (effectivePref === "openai") return "OPENAI_MODEL";
+          if (effectivePref === "chatgpt") return "CHATGPT_MODEL";
+          if (effectivePref === "codex-cli") return "CODEX_CLI_MODEL";
+          if (isClaude) {
+            if (currentClass === "ClaudeCliProvider") return "CLAUDE_CLI_MODEL";
+            return configuredProviders.anthropic ? "ANTHROPIC_MODEL" : "CLAUDE_CLI_MODEL";
+          }
+          if (currentClass === "ChatGPTPlanProvider") return "CHATGPT_MODEL";
+          if (currentClass === "CodexCliProvider") return "CODEX_CLI_MODEL";
+          if (currentClass === "OpenAIResponsesProvider") return "OPENAI_MODEL";
+          if (configuredProviders.openai) return "OPENAI_MODEL";
+          if (configuredProviders.chatgpt) return "CHATGPT_MODEL";
+          if (configuredProviders.codexCli) return "CODEX_CLI_MODEL";
+          return "OPENAI_MODEL";
+        };
+        const modelEnvKey = resolveModelEnvKey();
+        process.env[modelEnvKey] = requestedModel;
+        envUpdates[modelEnvKey] = requestedModel;
       }
 
       let normalizedEffort = null;

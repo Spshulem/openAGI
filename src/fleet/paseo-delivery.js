@@ -832,7 +832,7 @@ export function isPermanentlyDisconnectedRuntimeError(raw) {
   return PERMANENT_DISCONNECT_ERROR_RE.test(text);
 }
 
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, queue = false } = {}) {
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, queue = false, holdOnPermission = false } = {}) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const silentStuckRecovery = !ownerInitiated
@@ -936,6 +936,16 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         return blocked("Paseo permission changed; scan again before sending");
       }
       if (ownerInitiated && agent && !agent.archivedAt && agent.status !== "closed" && livePerms.length > 0) {
+        if (holdOnPermission === true && ownerChoice == null) {
+          return {
+            status: "busy",
+            busy: true,
+            permissionRequired: true,
+            route: "paseo-send",
+            actionId,
+            detail: "Paseo session paused at a permission prompt; holding queued message until resolved."
+          };
+        }
         if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) {
           return blocked("Paseo chat changed; scan again before sending");
         }

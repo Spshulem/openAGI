@@ -1580,10 +1580,16 @@ export async function startPaseoSession(supervisor, {
           ...(t.prRefs ?? []).map((r) => String(r).split("#")[1]).filter(Boolean)
         ]);
         const sharedPr = [...reqPrNums].some((num) => tPrNums.has(num));
-        const titleMatch = Boolean(cleanTitle && t.title && titlesMatchForFailover(cleanTitle, t.title));
+        const exactNorm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        const exactTitleMatch = Boolean(cleanTitle && t.title && exactNorm(cleanTitle) === exactNorm(t.title));
+        // Only apply fuzzy failover title matching when the request is a
+        // continuation/recovery ("Continue ...", "Resume ...", "Failover ...");
+        // distinct new-work titles (e.g. "Fix Android production checkout" vs
+        // "Fix Android production login") must stay separate sessions.
+        const fuzzyTitleMatch = Boolean(continueLike && cleanTitle && t.title && titlesMatchForFailover(cleanTitle, t.title));
         const promptTitleMatch = Boolean(continueLike && t.title && titlesMatchForFailover(cleanTitle || cleanPrompt.slice(0, 90), t.title));
         const sameSourceLive = Boolean(continueLike && cleanFromKey && t.key === cleanFromKey);
-        return titleMatch || promptTitleMatch || sameSourceLive || (continueLike && sharedPr);
+        return exactTitleMatch || fuzzyTitleMatch || promptTitleMatch || sameSourceLive || (continueLike && sharedPr);
       })
       .sort((a, b) => {
         const rank = (s) => (s.agentStatus === "running" ? 0 : s.agentStatus === "idle" ? 1 : 2);

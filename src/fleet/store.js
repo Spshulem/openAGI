@@ -1725,8 +1725,11 @@ export class FleetStore {
 
   enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message" } = {}) {
     const cleanKey = String(threadKey ?? "").trim();
-    const cleanMsg = String(message ?? "").trim().slice(0, 4000);
-    if (!cleanKey || !cleanMsg) return null;
+    const cleanMsg = String(message ?? "").trim();
+    // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
+    // chars with acceptance criteria appended at the end) rather than silently
+    // truncating trailing requirements. Reject genuinely oversized payloads.
+    if (!cleanKey || !cleanMsg || cleanMsg.length > 24_000) return null;
     const nowMs = this.now();
     const nowIso = iso(nowMs);
     this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])

@@ -737,7 +737,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
 
   // typedOnly: a risky ask's owner answer, which only ever goes typed into
   // the app; a block there returns as is, never by a background route.
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true } = {}) {
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, holdOnPermission = false } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -766,7 +766,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
       try {
-        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue });
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue, holdOnPermission });
         const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
         return { ...result, actionId: id };
       }

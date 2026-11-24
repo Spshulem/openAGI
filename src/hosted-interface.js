@@ -2098,6 +2098,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const rawMessages = Array.isArray(body.messages) ? body.messages : body.messages;
           let filteredMessages = rawMessages;
           let suppressedCount = 0;
+          let deferredCount = 0;
           let lastSuppressReason = null;
           if (conversationId === "main" && Array.isArray(rawMessages)) {
             filteredMessages = [];
@@ -2112,10 +2113,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 text,
                 kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
                 decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
+                decisionTokens: Array.isArray(item?.proactiveMeta?.decisionTokens) ? item.proactiveMeta.decisionTokens : [],
                 alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true
               });
               if (!verdict.send) {
                 suppressedCount += 1;
+                if (verdict.deferred === true) deferredCount += 1;
                 lastSuppressReason = verdict.reason ?? "suppressed";
                 continue;
               }
@@ -2136,6 +2139,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 conversationId,
                 appended: [],
                 suppressed: true,
+                deferred: deferredCount > 0 && deferredCount === suppressedCount,
                 reason: lastSuppressReason
               });
             }

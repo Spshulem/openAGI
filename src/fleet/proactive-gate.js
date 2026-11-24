@@ -250,82 +250,98 @@ export function createHubProactiveGuard({
   now = () => Date.now()
 } = {}) {
   let lastPostedAtMs = 0;
+  let evalChain = Promise.resolve();
   const recentFingerprints = new Map();
-  const recentDecisionKeys = new Map();
+  const recentDecisionTokens = new Map();
 
   const prune = (nowMs) => {
     for (const [k, at] of recentFingerprints) {
       if (nowMs - at >= HUB_DEDUPE_TTL_MS) recentFingerprints.delete(k);
     }
-    for (const [k, at] of recentDecisionKeys) {
-      if (nowMs - at >= HUB_DEDUPE_TTL_MS) recentDecisionKeys.delete(k);
+    for (const [k, at] of recentDecisionTokens) {
+      if (nowMs - at >= HUB_DEDUPE_TTL_MS) recentDecisionTokens.delete(k);
     }
     while (recentFingerprints.size > MAX_TRACKED_KEYS) {
       recentFingerprints.delete(recentFingerprints.keys().next().value);
     }
-    while (recentDecisionKeys.size > MAX_TRACKED_KEYS) {
-      recentDecisionKeys.delete(recentDecisionKeys.keys().next().value);
+    while (recentDecisionTokens.size > MAX_TRACKED_KEYS) {
+      recentDecisionTokens.delete(recentDecisionTokens.keys().next().value);
     }
   };
 
+  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false } = {}) => {
+    const cleanText = String(text ?? "").trim();
+    if (!cleanText) return { send: false, reason: "empty" };
+    const nowMs = now();
+    prune(nowMs);
+    const prefs = getPreferences?.() ?? {};
+    if (prefs?.cadence === "off") {
+      return { send: false, reason: "cadence_off" };
+    }
+
+    const fp = contentFingerprint(cleanText);
+    if (recentFingerprints.has(fp)) {
+      return { send: false, reason: "hub_deduped" };
+    }
+    const cleanKeys = Array.isArray(decisionKeys)
+      ? decisionKeys.map((k) => String(k ?? "").trim()).filter(Boolean)
+      : [];
+    // Deduplicate by decision key + material hash when available so materially
+    // changed decisions (e.g., a new PR head SHA or new choices) remain
+    // announceable after cooldown instead of being blocked for 4 hours.
+    const cleanTokens = Array.isArray(decisionTokens) && decisionTokens.length > 0
+      ? decisionTokens.map((t) => String(t ?? "").trim()).filter(Boolean)
+      : cleanKeys;
+    if (cleanTokens.length > 0 && cleanTokens.every((t) => recentDecisionTokens.has(t))) {
+      return { send: false, reason: "hub_decisions_deduped" };
+    }
+
+    const cooldownMs = effectiveCheckinCooldownMs(prefs);
+    if (!skipCooldown && cooldownMs > 0 && lastPostedAtMs > 0 && nowMs - lastPostedAtMs < cooldownMs) {
+      return { send: false, deferred: true, reason: "hub_cooldown" };
+    }
+
+    let finalText = cleanText;
+    let agentReviewed = Boolean(alreadyAgentReviewed);
+    if (!alreadyAgentReviewed) {
+      const verdict = await reviewProactiveUpdateWithAgent({
+        candidateText: cleanText,
+        kind,
+        decisionKeys: cleanKeys,
+        recentMessages: getRecentMessages?.() ?? [],
+        preferences: prefs,
+        modelProvider: getModelProvider?.() ?? null,
+        judgeFn: judgeProactiveUpdate
+      });
+      agentReviewed = verdict.agentReviewed;
+      if (!verdict.send) {
+        recentFingerprints.set(fp, nowMs);
+        for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);
+        return { send: false, reason: verdict.reason, agentReviewed };
+      }
+      finalText = verdict.text || cleanText;
+    }
+
+    lastPostedAtMs = nowMs;
+    recentFingerprints.set(fp, nowMs);
+    recentFingerprints.set(contentFingerprint(finalText), nowMs);
+    for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);
+    return { send: true, text: finalText, agentReviewed };
+  };
+
   return {
-    async evaluate({ text, kind = "proactive_supervisor_delta", decisionKeys = [], alreadyAgentReviewed = false, skipCooldown = false } = {}) {
-      const cleanText = String(text ?? "").trim();
-      if (!cleanText) return { send: false, reason: "empty" };
-      const nowMs = now();
-      prune(nowMs);
-      const prefs = getPreferences?.() ?? {};
-      if (prefs?.cadence === "off") {
-        return { send: false, reason: "cadence_off" };
-      }
-
-      const fp = contentFingerprint(cleanText);
-      if (recentFingerprints.has(fp)) {
-        return { send: false, reason: "hub_deduped" };
-      }
-      const cleanKeys = Array.isArray(decisionKeys)
-        ? decisionKeys.map((k) => String(k ?? "").trim()).filter(Boolean)
-        : [];
-      if (cleanKeys.length > 0 && cleanKeys.every((k) => recentDecisionKeys.has(k))) {
-        return { send: false, reason: "hub_decisions_deduped" };
-      }
-
-      const cooldownMs = effectiveCheckinCooldownMs(prefs);
-      if (!skipCooldown && cooldownMs > 0 && lastPostedAtMs > 0 && nowMs - lastPostedAtMs < cooldownMs) {
-        return { send: false, reason: "hub_cooldown" };
-      }
-
-      let finalText = cleanText;
-      let agentReviewed = Boolean(alreadyAgentReviewed);
-      if (!alreadyAgentReviewed) {
-        const verdict = await reviewProactiveUpdateWithAgent({
-          candidateText: cleanText,
-          kind,
-          decisionKeys: cleanKeys,
-          recentMessages: getRecentMessages?.() ?? [],
-          preferences: prefs,
-          modelProvider: getModelProvider?.() ?? null,
-          judgeFn: judgeProactiveUpdate
-        });
-        agentReviewed = verdict.agentReviewed;
-        if (!verdict.send) {
-          recentFingerprints.set(fp, nowMs);
-          for (const k of cleanKeys) recentDecisionKeys.set(k, nowMs);
-          return { send: false, reason: verdict.reason, agentReviewed };
-        }
-        finalText = verdict.text || cleanText;
-      }
-
-      lastPostedAtMs = nowMs;
-      recentFingerprints.set(fp, nowMs);
-      recentFingerprints.set(contentFingerprint(finalText), nowMs);
-      for (const k of cleanKeys) recentDecisionKeys.set(k, nowMs);
-      return { send: true, text: finalText, agentReviewed };
+    evaluate(args = {}) {
+      const next = evalChain.then(
+        () => evaluateSerialized(args),
+        () => evaluateSerialized(args)
+      );
+      evalChain = next.catch(() => {});
+      return next;
     },
     reset() {
       lastPostedAtMs = 0;
       recentFingerprints.clear();
-      recentDecisionKeys.clear();
+      recentDecisionTokens.clear();
     }
   };
 }

@@ -630,3 +630,291 @@ test("set_provider live self-configuration: inspects, updates model + reasoningE
   assert.equal(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT, "xhigh");
   assert.equal(runtime.agentHost.modelProvider.model, "gpt-6.2-sol");
 });
+
+test("Codex review fixes: hub cooldown stays pending, material changes pass dedupe, concurrent hub evaluations serialize", async (t) => {
+  // 1. Concurrent evaluations with identical payload serialize so only the first posts.
+  let nowMs = Date.parse("2026-11-24T19:00:00.000Z");
+  let judgeCalls = 0;
+  const hubGuard = createHubProactiveGuard({
+    getPreferences: () => ({ cadence: "balanced", checkinCooldownMinutes: 30 }),
+    getRecentMessages: () => [],
+    now: () => nowMs,
+    judgeProactiveUpdate: async ({ candidateText }) => {
+      judgeCalls += 1;
+      await new Promise((r) => setTimeout(r, 20));
+      return { send: true, text: candidateText, reason: "approved" };
+    }
+  });
+  const [r1, r2] = await Promise.all([
+    hubGuard.evaluate({
+      text: "**Supervisor check-in: one decision needs you.**\nMerge PR #401?",
+      decisionKeys: ["ready:acme/app#401"],
+      decisionTokens: ["ready:acme/app#401:head_aaa"]
+    }),
+    hubGuard.evaluate({
+      text: "**Supervisor check-in: one decision needs you.**\nMerge PR #401?",
+      decisionKeys: ["ready:acme/app#401"],
+      decisionTokens: ["ready:acme/app#401:head_aaa"]
+    })
+  ]);
+  assert.equal(r1.send, true);
+  assert.equal(r2.send, false);
+  assert.equal(r2.reason, "hub_deduped");
+  assert.equal(judgeCalls, 1, "second concurrent request must wait and be deduped before calling judge");
+
+  // 2. Different decision inside cooldown returns deferred: true (temporary), NOT permanent suppression.
+  nowMs += 5 * 60_000;
+  const duringCooldown = await hubGuard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nMerge PR #402?",
+    decisionKeys: ["ready:acme/app#402"],
+    decisionTokens: ["ready:acme/app#402:head_bbb"]
+  });
+  assert.equal(duringCooldown.send, false);
+  assert.equal(duringCooldown.deferred, true);
+  assert.equal(duringCooldown.reason, "hub_cooldown");
+
+  // 3. After cooldown expires, BOTH the deferred PR #402 AND a materially changed PR #401 (new head) pass!
+  nowMs += 31 * 60_000;
+  const afterCooldown = await hubGuard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nMerge PR #402?",
+    decisionKeys: ["ready:acme/app#402"],
+    decisionTokens: ["ready:acme/app#402:head_bbb"]
+  });
+  assert.equal(afterCooldown.send, true);
+
+  nowMs += 31 * 60_000;
+  const updatedHead = await hubGuard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nPR #401 updated with new head commit — merge?",
+    decisionKeys: ["ready:acme/app#401"],
+    decisionTokens: ["ready:acme/app#401:head_ccc"]
+  });
+  assert.equal(updatedHead.send, true, "materially changed decision token must remain announceable within 4h");
+
+  // 4. Supervisor.maybePostProactiveSupervisorDigest does NOT commit surfacedDecisions when hub defers on cooldown.
+  const dir = makeTmpDir(t, "hub-defer-");
+  fs.writeFileSync(path.join(dir, "node.json"), JSON.stringify({
+    remote: "http://hub.local:43210",
+    ownerProxyToken: "test-token"
+  }));
+  const sessionStore = new InMemoryAgentStore({ storePath: path.join(dir, "sessions.json") });
+  sessionStore.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  let remoteMode = "defer";
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    runtime: { agentHost: { store: sessionStore } },
+    config: { mode: "propose", proactiveSupervisorChat: true, paseo: { enabled: true, only: true } },
+    deps: {
+      supervisorChatFetch: async () => ({
+        ok: true,
+        json: async () => (remoteMode === "defer"
+          ? { ok: true, suppressed: true, deferred: true, reason: "hub_cooldown" }
+          : { ok: true, appended: [{ id: "m1" }] })
+      })
+    }
+  });
+  const row = {
+    key: "paseo:local.defer-1",
+    kind: "paseo",
+    id: "defer-1",
+    title: "Checkout fix",
+    workspace: "app",
+    agentStatus: "idle",
+    prRefs: ["acme/app#700"],
+    meta: { serverId: "local", isLocalHost: true, paseoCwd: "/work/app" }
+  };
+  sup.lastThreads.set(row.key, row);
+  sup.store.upsertQuestion({
+    dedupeKey: "ready:acme/app#700",
+    kind: "ready",
+    threadKey: row.key,
+    prRef: "acme/app#700",
+    title: "Checkout fix PR #700 ready to merge",
+    body: "All checks green.",
+    options: ["merged", "later"],
+    contextSnapshot: {
+      threadTitle: "Checkout fix",
+      workspace: "app",
+      pr: { ref: "acme/app#700", state: "OPEN", ciState: "SUCCESS", head: "sha700" }
+    }
+  });
+
+  const firstAttempt = await sup.maybePostProactiveSupervisorDigest({ started: Date.now() });
+  assert.equal(firstAttempt.suppressed, true);
+  assert.equal(firstAttempt.deferred, true);
+
+  // When hub later accepts (cooldown expired), the decision is STILL pending and posts!
+  remoteMode = "post";
+  const secondAttempt = await sup.maybePostProactiveSupervisorDigest({ started: Date.now() + 60_000 });
+  assert.equal(secondAttempt.posted, true, "cooldown-deferred decision must remain pending until posted");
+});
+
+test("Codex review fixes: queued drain holds on permission prompt, preserves >4000-char directives, and new-work sessions stay distinct", async (t) => {
+  const dir = makeTmpDir(t, "queue-perm-");
+  const deliveries = [];
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    config: { mode: "propose", paseo: { enabled: true, only: true } },
+    deps: {
+      executor: {
+        async deliver({ message, holdOnPermission }) {
+          deliveries.push({ text: message, holdOnPermission });
+          return { status: "sent", route: "paseo-send", detail: "delivered" };
+        }
+      }
+    }
+  });
+  const longDirective = `ActiveWork goal: ${"A".repeat(4500)}\nACCEPTANCE_CRITERIA_TAIL_MARKER`;
+  const runningThread = {
+    key: "paseo:host1.agent-long",
+    kind: "paseo",
+    id: "agent-long",
+    title: "Fix Android production login",
+    workspace: "app",
+    cwd: "/work/app",
+    agentStatus: "running",
+    meta: { serverId: "host1", paseoCwd: "/work/app", workspaceId: "wks_1", updatedAt: "2026-11-24T19:00:00.000Z" }
+  };
+  sup.lastThreads.set(runningThread.key, runningThread);
+
+  // 1. Enqueue preserves full 4,500+ char directive without truncating trailing acceptance criteria.
+  const queuedRes = await sup.sendOwnerMessage(runningThread.key, longDirective);
+  assert.equal(queuedRes.delivery.status, "queued");
+  const stored = sup.store.queuedOwnerMessages(runningThread.key);
+  assert.equal(stored.length, 1);
+  assert.ok(stored[0].message.includes("ACCEPTANCE_CRITERIA_TAIL_MARKER"));
+
+  // 2. If the session pauses at a permission prompt, drain MUST keep the message queued instead of answering Allow/Deny!
+  sup.lastThreads.set(runningThread.key, {
+    ...runningThread,
+    agentStatus: "idle",
+    state: "needs-human",
+    requiresAttention: true,
+    attentionReason: "permission",
+    meta: { ...runningThread.meta, blockedOnOwner: true, pendingPermission: { id: "perm-9", kind: "tool" } }
+  });
+  const heldDrain = await sup.drainQueuedOwnerMessages();
+  assert.equal(heldDrain.length, 0);
+  assert.equal(deliveries.length, 0);
+  assert.equal(sup.store.queuedOwnerMessages(runningThread.key).length, 1);
+
+  // 3. Even if live deliverPaseo encounters a fresh permission prompt right at send time, holdOnPermission=true holds it!
+  let respondCalled = false;
+  const permAgent = {
+    id: "agent-long",
+    status: "idle",
+    cwd: "/work/app",
+    workspaceId: "wks_1",
+    updatedAt: "2026-11-24T19:00:00.000Z",
+    pendingPermissions: [{ id: "perm-live", kind: "tool", actions: [{ id: "allow", behavior: "allow", label: "Allow" }] }]
+  };
+  const fakeFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "host1" }, hosts: [] }) },
+    agents: {
+      ref: () => ({
+        refresh: async () => {},
+        current: () => permAgent,
+        respondPermission: async () => { respondCalled = true; },
+        timeline: { refetch: async () => ({ agent: permAgent, entries: [] }) }
+      })
+    }
+  });
+  const liveHeld = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: { ...runningThread, agentStatus: "idle" },
+    text: "Also update the tests",
+    store: { dir },
+    actionId: "act-perm-hold",
+    base: { playbook: "owner-message", messageHash: "h1" },
+    factory: fakeFactory,
+    queue: true,
+    holdOnPermission: true
+  });
+  assert.equal(liveHeld.status, "busy");
+  assert.equal(liveHeld.permissionRequired, true);
+  assert.equal(respondCalled, false, "queued prose must never answer a permission prompt");
+
+  // 4. Once permission clears and session is idle, drain delivers the full untruncated directive.
+  sup.lastThreads.set(runningThread.key, {
+    ...runningThread,
+    agentStatus: "idle",
+    state: "idle",
+    requiresAttention: false,
+    attentionReason: null,
+    meta: { ...runningThread.meta, blockedOnOwner: false, pendingPermission: null }
+  });
+  const sentDrain = await sup.drainQueuedOwnerMessages();
+  assert.equal(sentDrain.length, 1);
+  assert.equal(sentDrain[0].status, "sent");
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0].holdOnPermission, true);
+  assert.ok(deliveries[0].text.includes("ACCEPTANCE_CRITERIA_TAIL_MARKER"));
+
+  // 5. Distinct new-work title ("Fix Android production checkout" vs "Fix Android production login") creates a new session!
+  let createdNew = false;
+  const fakeCreateFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "host1" }, hosts: [] }) },
+    agents: {
+      list: async () => ({ agents: [] }),
+      providers: async () => ({ providers: [{ provider: "claude", available: true, models: [{ id: "claude-opus-4-6" }], modes: [{ id: "bypassPermissions" }] }] }),
+      create: async (opts) => {
+        createdNew = true;
+        return { id: "agent-new-checkout", title: opts.title, cwd: opts.cwd, provider: opts.provider, model: opts.model, status: "running" };
+      }
+    }
+  });
+  const created = await startPaseoSession(sup, {
+    title: "Fix Android production checkout",
+    prompt: "Investigate checkout failure on Android",
+    cwd: "/work/app",
+    serverId: "host1",
+    factory: fakeCreateFactory
+  });
+  assert.equal(createdNew, true, "distinct new-work title must not fuzzy-merge into existing login session");
+  assert.notEqual(created.reused, true);
+});
+
+test("Codex review fixes: set_provider writes CHATGPT_MODEL / CODEX_CLI_MODEL / CLAUDE_CLI_MODEL for subscription providers", async (t) => {
+  const dir = makeTmpDir(t, "sub-model-");
+  const prevEnv = {
+    OPENAGI_DATA_DIR: process.env.OPENAGI_DATA_DIR,
+    OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    CHATGPT_MODEL: process.env.CHATGPT_MODEL,
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY
+  };
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    _resetDataDirCache();
+  });
+
+  process.env.OPENAGI_DATA_DIR = dir;
+  _resetDataDirCache();
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  process.env.OPENAGI_PROVIDER = "auto";
+  delete process.env.CHATGPT_MODEL;
+  delete process.env.OPENAI_MODEL;
+
+  const store = new InMemoryAgentStore({ storePath: path.join(dir, "sessions.json") });
+  store.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const runtime = {
+    agentHost: { store, modelProvider: { constructor: { name: "ChatGPTPlanProvider" }, model: "gpt-6.1-sol" } },
+    budget: null
+  };
+  const registry = new ToolRegistry();
+  registerCoreTools(registry, runtime);
+
+  const res = await registry.invoke("set_provider", { model: "gpt-6.2-sol" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(res.ok, true);
+  assert.equal(res.result.ok, true);
+  assert.equal(process.env.CHATGPT_MODEL, "gpt-6.2-sol");
+  assert.equal(process.env.OPENAI_MODEL, undefined);
+});
