@@ -43,6 +43,8 @@ import { buildDecisionContext, renderDecisionContext } from "./decision-context.
 const HOUR_MS = 60 * 60_000;
 const ACTIVE_WORK_FILE = "active-work.json";
 const MAX_ITEMS = 400;
+// Recent recheck notices a hosted hub can still pick up after an outage.
+const MAX_RECHECK_NOTIFICATIONS = 50;
 // Passes a due recheck may wait for its repo's PR evidence before using cached evidence.
 const MAX_RECHECK_REPO_DEFERRALS = 3;
 const MAX_PROPOSALS = 150;
@@ -272,18 +274,37 @@ function finiteClampInt(value, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.round(n)));
 }
 
-function capTrackedItems(items) {
+// protectedIds: items a pending recheck still has to evaluate. They are
+// kept as long as anything else can go instead; the cap still holds. The
+// newest item (the one just added) is kept the same way.
+function capTrackedItems(items, protectedIds = new Set()) {
   if (!Array.isArray(items)) return [];
   if (items.length <= MAX_ITEMS) return items;
   // Evict verified-done / archived items first before dropping oldest active items.
   const settled = [];
   const open = [];
   for (const it of items) {
-    if (it?.outcomeVerified && (it?.state === "done" || it?.archivedAt)) settled.push(it);
+    if (it?.outcomeVerified && (it?.state === "done" || it?.archivedAt) && !protectedIds.has(it?.id)) settled.push(it);
     else open.push(it);
   }
-  if (open.length >= MAX_ITEMS) return open.slice(-MAX_ITEMS);
+  if (open.length >= MAX_ITEMS) {
+    let excess = open.length - MAX_ITEMS;
+    const dropped = new Set();
+    const kept = (it, i) => protectedIds.has(it?.id) || i === open.length - 1;
+    for (const pass of [false, true]) {
+      open.forEach((it, i) => {
+        if (excess > 0 && kept(it, i) === pass) { dropped.add(it); excess -= 1; }
+      });
+    }
+    return open.filter((it) => !dropped.has(it));
+  }
   return [...settled.slice(-(MAX_ITEMS - open.length)), ...open];
+}
+
+function pendingRecheckItemIds(rechecks) {
+  return new Set((Array.isArray(rechecks) ? rechecks : [])
+    .filter((recheck) => recheck?.status === "pending" && recheck.itemId)
+    .map((recheck) => recheck.itemId));
 }
 
 // Collapses Paseo + local Claude/Codex/Conductor/Antigravity alias rows so
@@ -541,7 +562,7 @@ export class ActiveWorkManager {
     if (!raw || typeof raw !== "object") return base;
     return {
       version: 1,
-      items: capTrackedItems(Array.isArray(raw.items) ? raw.items : []),
+      items: capTrackedItems(Array.isArray(raw.items) ? raw.items : [], pendingRecheckItemIds(raw.rechecks)),
       proposedProjects: Array.isArray(raw.proposedProjects) ? raw.proposedProjects.slice(-MAX_PROPOSALS) : [],
       inventoryCursor: {
         ...base.inventoryCursor,
@@ -1048,7 +1069,7 @@ export class ActiveWorkManager {
         createdAt: nowIso,
         updatedAt: nowIso
       };
-      this.state.items = capTrackedItems([...this.state.items, item]);
+      this.state.items = capTrackedItems([...this.state.items, item], pendingRecheckItemIds(this.state.rechecks));
     }
 
     // Mark any matching proposed project as enrolled.
@@ -1719,6 +1740,25 @@ export class ActiveWorkManager {
       .filter((p) => p.status === "proposed" && (!filterProjectSlug || slugKey(p.project) === filterProjectSlug))
       .slice(0, 30);
 
+    // Recheck notices this computer posted, for a hosted hub to mirror once
+    // each (keyed by recheck id). The item may be done, so prompts omit it.
+    // The newest by completion: rechecks finish out of scheduling order, and
+    // a late one must not fall outside the window for good.
+    const completedMs = (recheck) => Date.parse(recheck.completedAt ?? "") || 0;
+    const recheckNotifications = this.state.rechecks
+      .filter((recheck) => recheck.status === "notified" && recheck.result?.title)
+      .sort((a, b) => completedMs(a) - completedMs(b))
+      .slice(-MAX_RECHECK_NOTIFICATIONS)
+      .map((recheck) => ({
+        id: recheck.id,
+        itemId: recheck.itemId,
+        type: recheck.result.type,
+        title: recheck.result.title,
+        summary: recheck.result.summary ?? "",
+        reusedPrompt: recheck.result.reusedPrompt === true,
+        at: recheck.completedAt ?? null
+      }));
+
     const counts = {
       totalTracked: scoped.length,
       digestCount: digest.length,
@@ -1775,6 +1815,7 @@ export class ActiveWorkManager {
       digest,
       items: visibleItems,
       prompts,
+      recheckNotifications,
       proposedProjects: openProposals,
       inventory: structuredClone(this.state.inventoryCursor),
       spend: structuredClone(this.state.spend),
@@ -2328,7 +2369,7 @@ export class ActiveWorkManager {
                   archivedAt: null,
                   createdAt: nowIso,
                   updatedAt: nowIso
-                }]);
+                }], pendingRecheckItemIds(this.state.rechecks));
               }
             }
           }
@@ -2689,15 +2730,22 @@ export class ActiveWorkManager {
       if (verified || blocked) {
         if (!recheckNotification) {
           const outreach = this.runtime?.outreach;
+          const title = verified ? `Follow-through verified · ${projected.project}` : `Follow-through blocker · ${projected.project}`;
+          const summary = verified ? `Recheck verified: ${projected.doneCriteria}` : `${projected.whySurfaced || "Actionable blocker found"} Choose resume, assign, confirm, or snooze.`;
+          let item = null;
+          let reusedPrompt = false;
           if (typeof outreach?.append === "function") {
-            const title = verified ? `Follow-through verified · ${projected.project}` : `Follow-through blocker · ${projected.project}`;
-            const summary = verified ? `Recheck verified: ${projected.doneCriteria}` : `${projected.whySurfaced || "Actionable blocker found"} Choose resume, assign, confirm, or snooze.`;
             const existing = rawRecheckItem?.outreachId ? outreach.get?.(rawRecheckItem.outreachId) : null;
             const openExisting = existing && ["unseen", "seen"].includes(existing.status) ? existing : null;
-            const item = openExisting ?? outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
+            reusedPrompt = Boolean(openExisting);
+            item = openExisting ?? outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
             if (item?.id && typeof outreach.update === "function") outreach.update(item.id, { title, summary, actions: ["dismiss"] });
-            recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId };
           }
+          // The copy is kept on the recheck so a hosted hub, which never sees
+          // this computer's outreach, can post the same notice (getActiveWork).
+          // reusedPrompt: the notice went into the item's open follow-through
+          // prompt rather than a new entry; a hub mirrors that prompt already.
+          recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId, title, summary, ...(reusedPrompt ? { reusedPrompt: true } : {}) };
           recheck.status = "notified"; recheck.result = recheckNotification;
         } else {
           recheck.status = "checked"; recheck.result = { type: "notification_cap", itemId: recheck.itemId };

@@ -151,7 +151,17 @@ export function appendSharedThreadMessages(
     const at = typeof item.at === "string" && item.at.trim() ? item.at.trim().slice(0, 64) : null;
     const itemSourceName = typeof item.sourceName === "string" ? item.sourceName : sourceName;
     const itemSourceNodeId = typeof item.sourceNodeId === "string" ? item.sourceNodeId : sourceNodeId;
-    normalized.push({ id, role, text, at, sourceName: itemSourceName, sourceNodeId: itemSourceNodeId });
+    const proactive = role === "assistant" && item.proactive === true;
+    const proactiveMeta = proactive && item.proactiveMeta && typeof item.proactiveMeta === "object" && !Array.isArray(item.proactiveMeta)
+      ? {
+          ...(typeof item.proactiveMeta.kind === "string" ? { kind: item.proactiveMeta.kind.slice(0, 80) } : {}),
+          ...(Array.isArray(item.proactiveMeta.decisionKeys)
+            ? { decisionKeys: item.proactiveMeta.decisionKeys.filter((k) => typeof k === "string").slice(0, 12).map((k) => k.slice(0, 160)) }
+            : {}),
+          ...(item.proactiveMeta.agentReviewed === true ? { agentReviewed: true } : {})
+        }
+      : null;
+    normalized.push({ id, role, text, at, sourceName: itemSourceName, sourceNodeId: itemSourceNodeId, proactive, proactiveMeta });
   }
   const existingSession = store.getSession(sessionId);
   const existingIds = new Set((existingSession?.messages ?? []).map((m) => m?.id).filter(Boolean));
@@ -170,6 +180,7 @@ export function appendSharedThreadMessages(
       ...(entry.at ? { createdAt: entry.at } : {}),
       metadata: {
         thread,
+        ...(entry.proactive ? { proactive: true, ...(entry.proactiveMeta ? { proactiveMeta: entry.proactiveMeta } : {}) } : {}),
         ...(entry.role === "user" && typeof entry.sourceName === "string" && entry.sourceName.trim()
           ? { sourceName: entry.sourceName.trim().slice(0, 80) }
           : {}),
