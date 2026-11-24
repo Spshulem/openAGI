@@ -287,6 +287,31 @@ function selectExecutionModeId(providerEntry, sourceAgent = null, permissionMode
   return resolveDefaultPaseoModeId(providerEntry, { permissionMode: normalizePermissionMode(permissionMode), sourceAgent });
 }
 
+function normalizeFailoverTitle(raw) {
+  return String(raw ?? "")
+    .toLowerCase()
+    // Strip leading emojis/symbols and Paseo's auto-summarized "Continue " prefix.
+    .replace(/^[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D\s\-–—:]+/gu, "")
+    .replace(/^(?:continu(?:e|ing)|resume|resuming)\s+/i, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+export function titlesMatchForFailover(sourceTitle, candidateTitle) {
+  const src = normalizeFailoverTitle(sourceTitle);
+  const cand = normalizeFailoverTitle(candidateTitle);
+  if (!src || !cand) return false;
+  if (src === cand) return true;
+  if (src.length >= 12 && cand.length >= 12 && (src.startsWith(cand) || cand.startsWith(src))) return true;
+  const srcTokens = src.split(" ").filter((t) => t.length >= 3);
+  const candTokens = new Set(cand.split(" ").filter((t) => t.length >= 3));
+  if (srcTokens.length >= 3 && candTokens.size >= 3) {
+    const overlap = srcTokens.filter((t) => candTokens.has(t)).length;
+    return overlap >= Math.ceil(Math.min(srcTokens.length, candTokens.size) * 0.75);
+  }
+  return false;
+}
+
 // Automatically switches a quota-exhausted or auth-blocked Paseo coding session
 // onto another healthy provider (e.g. Codex -> Claude or Antigravity) in the
 // exact same host & working directory, preserving bounded transcript + goal context.
@@ -375,6 +400,55 @@ export async function failoverPaseoSessionProvider({
     ).join("\n");
 
     const baseTitle = clampText(redactSecrets(String(agent?.title ?? thread?.title ?? path.basename(cwd))), 72) || path.basename(cwd);
+
+    // Cross-host / restart guard: if Paseo already has an active unarchived
+    // alternate-provider continuation in the same cwd with a matching title
+    // created around or after this failure, adopt it instead of cloning again.
+    if (typeof api?.agents?.list === "function") {
+      try {
+        const listed = await api.agents.list({
+          filter: { includeArchived: false, includeBackground: true },
+          sort: [{ key: "updated_at", direction: "desc" }],
+          page: { limit: 100 }
+        });
+        signal.throwIfAborted();
+        const existingEntries = Array.isArray(listed?.entries)
+          ? listed.entries.map((entry) => entry?.agent ?? entry).filter(Boolean)
+          : (Array.isArray(listed) ? listed : []);
+        const errorAtMs = Date.parse(thread?.error?.at ?? thread?.lastAgentAt ?? "") || 0;
+        const sourceCreatedMs = Date.parse(agent?.createdAt ?? "") || 0;
+        const minCreatedMs = errorAtMs > 0 ? errorAtMs - 5 * 60_000 : sourceCreatedMs;
+        const existing = existingEntries.find((cand) => {
+          if (!cand?.id || cand.id === agentId || cand.archivedAt) return false;
+          if (String(cand.status ?? "").toLowerCase() === "error") return false;
+          if (String(cand.cwd ?? "").trim() !== cwd) return false;
+          const candProv = String(cand.provider ?? "").trim().toLowerCase().split("/")[0];
+          if (!candProv || candProv === exhaustedProvider) return false;
+          if (!titlesMatchForFailover(baseTitle, cand.title)) return false;
+          const candCreatedMs = Date.parse(cand.createdAt ?? cand.updatedAt ?? "") || 0;
+          if (minCreatedMs > 0 && candCreatedMs > 0 && candCreatedMs < minCreatedMs) return false;
+          return true;
+        });
+        if (existing) {
+          const existingProvider = existing.model && !String(existing.provider ?? "").includes("/")
+            ? `${existing.provider}/${existing.model}`
+            : String(existing.provider || `${chosen.provider}/${chosenModel.id}`);
+          return {
+            ok: true,
+            reused: true,
+            oldKey: thread.key,
+            newKey: `paseo:${serverId}.${existing.id}`,
+            serverId,
+            agentId: existing.id,
+            exhaustedProvider,
+            provider: existingProvider,
+            cwd,
+            title: clampText(redactSecrets(String(existing.title ?? baseTitle)), 72) || baseTitle
+          };
+        }
+      } catch { /* list check is best-effort; proceed with create if unavailable */ }
+    }
+
     const prLine = thread?.prRefs?.length ? `Linked PR(s): ${thread.prRefs.slice(0, 3).join(", ")}\n` : "";
     const goalLine = goalContext?.goal
       ? `Tracked Goal: ${clampText(redactSecrets(goalContext.goal), 260)}\nDefinition of Done: ${clampText(redactSecrets(goalContext.doneCriteria || "Verify all in-scope work is complete."), 260)}\n`

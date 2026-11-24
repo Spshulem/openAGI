@@ -369,7 +369,11 @@ function currentError(agent, entries) {
   const message = (useEvent ? eventError : snapshotError) || "Paseo agent reported an error.";
   const at = failure && (useEvent || !snapshotError) ? failure.timestamp : agent.updatedAt;
   const now = new Date(Number.isFinite(Date.parse(at)) ? Date.parse(at) : Date.now());
-  return { ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }), text: clampText(message, 1000) };
+  return {
+    ...(classifyErrorText(message, now) ?? { kind: "other", resetAt: null }),
+    text: clampText(message, 1000),
+    ...(failure?.timestamp ? { at: failure.timestamp } : {})
+  };
 }
 
 export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null, sleepingActive = false, silentStuck = false } = {}) {
@@ -445,7 +449,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
         busy: Boolean(agent.activeTurn) || ["running", "initializing"].includes(agent.status),
         authoritative: false
       },
-      aliases, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
+      aliases, createdAt: agent.createdAt ?? null, updatedAt: agent.updatedAt, blockedOnOwner: hasBlockingPermission,
       ...(!agent.archivedAt && agent.status === "closed" ? { paseoClosed: true } : {}),
       ...(silentStuck ? { silentStuck: true } : {}),
       requiresAttention: Boolean(agent.requiresAttention), attentionReason: agent.attentionReason ?? null,
