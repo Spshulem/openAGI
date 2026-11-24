@@ -2792,14 +2792,20 @@ export class FleetSupervisor {
       const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
       const badge = change === "updated" ? "Changed" : "New";
       const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
-      const body = renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION });
+      // Context may be shortened to the per-decision share; the decision and
+      // every option never are (shown whole, or deferred by the size check).
+      const body = renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION, preserveDecision: true })
+        ?? renderDecisionContext(ctx, { markdown: true, compact: true });
       return ["", `**${badge}: ${clampText(name, 140)}**`, body];
     };
     let shownDeltas = deltas.slice(0, MAX_DECISIONS);
     let lines;
     for (;;) {
       lines = [header(shownDeltas.length), WHY, ...shownDeltas.flatMap(renderDelta)];
-      if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
+      if (lines.join("\n").length <= DIGEST_MAX) break;
+      // A single decision too long to send whole is deferred, never cut and
+      // marked delivered.
+      if (shownDeltas.length <= 1) return { posted: false, reason: "decision-too-long" };
       shownDeltas = shownDeltas.slice(0, -1);
     }
 
