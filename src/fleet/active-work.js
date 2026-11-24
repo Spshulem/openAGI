@@ -2810,9 +2810,10 @@ export class ActiveWorkManager {
           detail: "The linked coding session is archived."
         };
       }
-      // The default follow-up carries the complete supported ask (up to
-      // 4,000 chars) so a retried dispatch never drops late requirements.
-      const fullAsk = cleanText(item.originalAsk || item.goal, 4000);
+      // The default follow-up carries the complete current goal (up to
+      // 4,000 chars) so a retried dispatch never drops late or revised
+      // requirements. originalAsk stays historical context only.
+      const fullAsk = cleanText(item.goal || item.originalAsk, 4000);
       const defaultMessage = input.message
         ? cleanText(input.message, 1200)
         : cleanText(

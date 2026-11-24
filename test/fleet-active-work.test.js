@@ -1415,6 +1415,29 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
   }
 });
 
+test("resume_owner retries the current goal, not the historical original ask", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: "Implement the desktop flow",
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads"
+    });
+    const id = tracked.item.id;
+    const updated = ctx.supervisor.trackWork({ id, project: "OpenAGI", goal: "Implement the desktop AND mobile flows" });
+    assert.equal(updated.item.goal, "Implement the desktop AND mobile flows");
+    assert.equal(updated.item.originalAsk, "Implement the desktop flow");
+
+    const retry = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes("Implement the desktop AND mobile flows"), "the retry carries the revised goal");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
 test("resume_owner retries a long blocked dispatch with the complete ask before clearing the blocker", async () => {
   const ctx = seedRepresentativeFixtures();
   try {
