@@ -1318,3 +1318,82 @@ test("Codex round-4 fixes: post-merge deploy stays actionable, queued attachment
   assert.equal(switched.result.clearedIncompatibleEffort, "xhigh");
   assert.equal(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT, undefined);
 });
+
+test("Codex round-5 fixes: queued drain redirects to failover replacement and claimTask throws on blocked reuse", async (t) => {
+  const dir = makeTmpDir(t, "failover-drain-");
+  const deliveredKeys = [];
+  const tasks = new Map();
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    runtime: {
+      tasks: {
+        get: (id) => tasks.get(id) ?? null,
+        add: (obj) => {
+          const item = { id: "tsk_1", status: "open", queue: "agent", ...obj };
+          tasks.set(item.id, item);
+          return item;
+        },
+        update: (id, patch) => {
+          const cur = tasks.get(id);
+          const next = { ...cur, ...patch };
+          tasks.set(id, next);
+          return next;
+        }
+      }
+    },
+    config: { mode: "propose", paseo: { enabled: true, only: true } },
+    deps: {
+      executor: {
+        async deliver({ thread }) {
+          deliveredKeys.push(thread.key);
+          return { status: "sent", route: "paseo-send", detail: "delivered" };
+        }
+      }
+    }
+  });
+  const oldRow = {
+    key: "paseo:host1.old-1",
+    kind: "paseo",
+    id: "old-1",
+    title: "Checkout fix",
+    cwd: "/work/app",
+    agentStatus: "running",
+    meta: { serverId: "host1", paseoCwd: "/work/app" }
+  };
+  const newRow = {
+    key: "paseo:host1.new-2",
+    kind: "paseo",
+    id: "new-2",
+    title: "Continue Checkout fix",
+    cwd: "/work/app",
+    agentStatus: "idle",
+    meta: { serverId: "host1", paseoCwd: "/work/app" }
+  };
+  sup.lastThreads.set(oldRow.key, oldRow);
+  await sup.sendOwnerMessage(oldRow.key, "Finish the unit tests");
+  assert.equal(sup.store.queuedOwnerMessages(oldRow.key).length, 1);
+
+  // Original session errors and fails over to newRow while message is queued!
+  sup.lastThreads.set(oldRow.key, { ...oldRow, agentStatus: "error" });
+  sup.lastThreads.set(newRow.key, newRow);
+  sup.store.recordProviderFailover(oldRow.key, { newKey: newRow.key, fromProvider: "claude", toProvider: "codex" });
+  const drained = await sup.drainQueuedOwnerMessages();
+  assert.equal(drained.length, 1);
+  assert.equal(drained[0].status, "sent");
+  assert.equal(drained[0].threadKey, newRow.key);
+  assert.equal(drained[0].redirectedFrom, oldRow.key);
+  assert.deepEqual(deliveredKeys, [newRow.key]);
+
+  // claimTask throws instead of marking task in_progress when startPaseoSession returns blocked reuse.
+  sup.startPaseoSession = async () => ({
+    status: "blocked",
+    reused: true,
+    key: newRow.key,
+    delivery: { status: "blocked", detail: "permission prompt pending" }
+  });
+  await assert.rejects(
+    () => sup.claimTask({ title: "Checkout fix", prompt: "Fix checkout" }),
+    /permission prompt pending/i
+  );
+  assert.equal(tasks.get("tsk_1").status, "open", "blocked reuse must not mark task in_progress");
+});

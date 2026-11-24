@@ -1323,6 +1323,26 @@ export async function dispatchManagerGoal(
       factory
     }));
 
+  if (created?.status === "blocked") {
+    supervisor?.store?.recordAction?.({
+      kind: "dispatch-goal",
+      playbook: "manager-dispatch-new",
+      threadKey: created.key ?? null,
+      status: "blocked",
+      by: "owner",
+      reason: clampText(created?.delivery?.detail || `existing ${targetProject.name} session blocked delivery`, 240)
+    });
+    return {
+      ok: false,
+      status: "blocked",
+      project: projectSummary,
+      inferredTheme: inferredTheme.name,
+      candidatesChecked: allSessions.length,
+      createdSession: created,
+      delivery: created.delivery ?? null
+    };
+  }
+
   if (created?.key && typeof supervisor?.trackWork === "function") {
     supervisor.trackWork({
       id: persisted?.item?.id,

@@ -391,7 +391,12 @@ export class AgentHost {
       (m) => m?.role === "assistant" && typeof m?.content === "string" && !isProactiveSupervisorMessage(m)
     );
     const tailMsg = priorHistory.at(-1);
-    const lastAssistantMsg = (isProactiveSupervisorMessage(tailMsg) && !lastNonProactiveAssistant)
+    const tailText = typeof tailMsg?.content === "string" ? tailMsg.content : "";
+    const tailProactiveAsksQuestion = Boolean(
+      isProactiveSupervisorMessage(tailMsg)
+      && (/\?/.test(tailText) || /\b(?:decision\s+now|options:|option\s*1|should\s+i|may\s+i|do\s+you\s+want|approve|merge)\b/i.test(tailText))
+    );
+    const lastAssistantMsg = tailProactiveAsksQuestion
       ? tailMsg
       : (lastNonProactiveAssistant ?? tailMsg ?? null);
     const supervisorAutoApprove = Boolean(

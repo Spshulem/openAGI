@@ -2715,31 +2715,47 @@ export class FleetSupervisor {
     const seenThreads = new Set();
     const results = [];
     for (const entry of queued) {
-      // Strictly FIFO per thread: never leapfrog an earlier queued message.
-      if (seenThreads.has(entry.threadKey)) continue;
+      // Redirect queued messages to a recorded live failover continuation when
+      // the original session failed over while messages were waiting to drain.
+      let effectiveKey = entry.threadKey;
+      const failover = this.store.providerFailoverFor?.(effectiveKey) ?? null;
+      if (failover?.newKey && failover.newKey !== effectiveKey) {
+        const origThread = byKey?.get(effectiveKey) ?? this.lastThreads.get(effectiveKey) ?? this.knownThreads.get(effectiveKey) ?? null;
+        const origDead = Boolean(!origThread || origThread.archived || origThread.excluded === "closed" || ["error", "closed"].includes(String(origThread.agentStatus ?? "").toLowerCase()));
+        if (origDead) {
+          const replacement = byKey?.get(failover.newKey) ?? this.lastThreads.get(failover.newKey) ?? this.knownThreads.get(failover.newKey) ?? null;
+          if (!replacement || (!replacement.archived && !["error", "closed"].includes(String(replacement.agentStatus ?? "").toLowerCase()))) {
+            effectiveKey = failover.newKey;
+          }
+        }
+      }
+      // Strictly FIFO per effective target thread: never leapfrog an earlier
+      // queued message (even across original -> failover replacement keys).
+      if (seenThreads.has(entry.threadKey) || seenThreads.has(effectiveKey)) continue;
       seenThreads.add(entry.threadKey);
-      const thread = byKey?.get(entry.threadKey)
-        ?? this.lastThreads.get(entry.threadKey)
-        ?? this.knownThreads.get(entry.threadKey)
-        ?? this.syntheticPaseoThread(entry.threadKey, null);
+      seenThreads.add(effectiveKey);
+      const thread = byKey?.get(effectiveKey)
+        ?? this.lastThreads.get(effectiveKey)
+        ?? this.knownThreads.get(effectiveKey)
+        ?? this.syntheticPaseoThread(effectiveKey, null);
       if (!thread) continue;
       if (thread.archived) {
         this.store.removeQueuedOwnerMessage(entry.id);
         this.store.recordAction({
-          threadKey: entry.threadKey,
+          threadKey: effectiveKey,
           playbook: "owner-message",
           status: "blocked",
           route: "paseo-queue",
           detail: "Queued message dropped: target Paseo session was archived."
         });
-        results.push({ id: entry.id, threadKey: entry.threadKey, status: "dropped-archived" });
+        results.push({ id: entry.id, threadKey: effectiveKey, status: "dropped-archived" });
         continue;
       }
       // Preserve sendOwnerMessage's permission guard: never drain ordinary
       // queued prose into a session waiting on a permission prompt (where
       // deliverPaseo could interpret unrelated prose as Allow/Deny).
       const matchingOpen = this.store.openQuestions().find(
-        (q) => q.threadKey === entry.threadKey || (q.threadKeys ?? []).includes(entry.threadKey)
+        (q) => q.threadKey === effectiveKey || (q.threadKeys ?? []).includes(effectiveKey)
       ) ?? null;
       const paseoFreeTextQuestion = Boolean(
         thread?.kind === "paseo"
@@ -2787,7 +2803,7 @@ export class FleetSupervisor {
         this.store.removeQueuedOwnerMessage(entry.id);
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
-        results.push({ id: entry.id, threadKey: entry.threadKey, status: "sent", delivery });
+        results.push({ id: entry.id, threadKey: effectiveKey, ...(effectiveKey !== entry.threadKey ? { redirectedFrom: entry.threadKey } : {}), status: "sent", delivery });
       } else if (
         delivery?.unconfirmed === true
         || /previous delivery has no confirmed turn|no automatic resend|turn confirmation timed out/i.test(String(delivery?.detail ?? ""))
@@ -2797,7 +2813,7 @@ export class FleetSupervisor {
         // reconciliation without risking duplicate execution.
         this.store.removeQueuedOwnerMessage(entry.id);
         this.store.recordAction({
-          threadKey: entry.threadKey,
+          threadKey: effectiveKey,
           playbook: "owner-message",
           status: "blocked",
           route: "paseo-queue",
@@ -2806,10 +2822,10 @@ export class FleetSupervisor {
             240
           )
         });
-        results.push({ id: entry.id, threadKey: entry.threadKey, status: "unconfirmed", delivery });
+        results.push({ id: entry.id, threadKey: effectiveKey, status: "unconfirmed", delivery });
       } else {
         this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
-        results.push({ id: entry.id, threadKey: entry.threadKey, status: delivery?.status ?? "blocked", delivery });
+        results.push({ id: entry.id, threadKey: effectiveKey, status: delivery?.status ?? "blocked", delivery });
       }
     }
     if (this.store.queuedOwnerMessages().length > 0) {
@@ -3460,6 +3476,9 @@ export class FleetSupervisor {
       ...(images ? { images } : {}),
       prompt: sessionPrompt.slice(0, 4000)
     });
+    if (session?.status === "blocked") {
+      throw new Error(session?.delivery?.detail || "Existing Paseo session blocked delivery; task not claimed.");
+    }
 
     const nowMs = this.now();
     const leaseMs = Number(taskStore.leaseMs) > 0 ? Number(taskStore.leaseMs) : 30 * MIN;
