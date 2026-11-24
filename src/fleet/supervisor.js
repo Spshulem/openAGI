@@ -2471,11 +2471,14 @@ export class FleetSupervisor {
       && !thread?.meta?.blockedOnOwner
       && !thread?.meta?.pendingPermission
     );
+    // An open question card keeps its card's requestId as paseoPermissionId
+    // (cardIntent), so that id alone does not mean a permission prompt on a
+    // free-text question. A "permission-" card id always does.
     const permissionPending = Boolean(
       thread?.meta?.blockedOnOwner === true
       || thread?.meta?.pendingPermission
       || (thread?.meta?.pendingCard?.requestId && !paseoFreeTextQuestion)
-      || (!refreshedPermissionState && (matchingOpen?.meta?.paseoPermissionId || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")))
+      || (!refreshedPermissionState && ((matchingOpen?.meta?.paseoPermissionId && !paseoFreeTextQuestion) || String(matchingOpen?.meta?.cardId ?? "").startsWith("permission-")))
     );
     // A free-form handoff is not a permission answer. If a permission prompt
     // is pending, refuse with a durable action receipt so prose cannot be

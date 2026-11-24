@@ -4,6 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
+import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
+import { OutreachStore } from "../src/outreach-store.js";
 
 function fixture() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-followthrough-"));
@@ -112,6 +114,44 @@ test("a free-text Paseo question accepts the owner's prose answer", async () => 
   assert.equal(delivered[0].message, "Use /work/project for the release handoff.");
 });
 
+// A surfaced Paseo card keeps its requestId as meta.paseoPermissionId (cardIntent).
+function freeTextQuestionThread(supervisor, threadKey, { cardId }) {
+  supervisor.knownThreads.set(threadKey, {
+    key: threadKey, kind: "paseo", id: threadKey.split(":").at(-1), title: "Question chat", agentStatus: "idle",
+    meta: { serverId: "bb", pendingCard: { app: "paseo", cardId, requestId: cardId, items: [{ itemId: `${cardId}:0`, freeText: true, question: "Which directory?", options: [] }] } },
+    prRefs: []
+  });
+  supervisor.store.upsertQuestion({
+    kind: "agent-card", dedupeKey: `card:${threadKey}:${cardId}:0`, title: "Question chat: Which directory?", options: ["open thread"], threadKey,
+    meta: { app: "paseo", cardId, itemId: `${cardId}:0`, itemIds: [`${cardId}:0`], freeText: "1", multiSelect: "0", labels: [], paseoPermissionId: cardId }
+  });
+}
+
+test("a surfaced free-text Paseo question card still accepts the owner's prose answer", async () => {
+  const { supervisor } = fixture();
+  const threadKey = "paseo:bb:surfaced";
+  freeTextQuestionThread(supervisor, threadKey, { cardId: "question-2" });
+  const delivered = [];
+  supervisor.executor.deliver = async (input) => { delivered.push(input); return { status: "sent", route: "paseo-send" }; };
+  const result = await supervisor.sendOwnerMessage(threadKey, "Use /work/project.");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(result.delivery.permissionRequired, undefined);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "Use /work/project.");
+});
+
+test("a surfaced Paseo permission card still blocks prose", async () => {
+  const { supervisor } = fixture();
+  const threadKey = "paseo:bb:permcard";
+  freeTextQuestionThread(supervisor, threadKey, { cardId: "permission-9" });
+  const delivered = [];
+  supervisor.executor.deliver = async (input) => { delivered.push(input); return { status: "sent", route: "paseo-send" }; };
+  const result = await supervisor.sendOwnerMessage(threadKey, "Go ahead.");
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(result.delivery.permissionRequired, true);
+  assert.equal(delivered.length, 0);
+});
+
 test("pruning keeps accepted pending rechecks and rejects scheduling when pending capacity is full", () => {
   const { supervisor } = fixture();
   const longRunning = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Long follow-through", doneCriteria: "Verified next year" });
@@ -132,6 +172,55 @@ test("pruning keeps accepted pending rechecks and rejects scheduling when pendin
   }
   assert.throws(() => supervisor.scheduleActiveWorkRecheck(churn.item.id, { delaySeconds: 30, evidenceMark: "one-too-many" }), /capacity is full/);
   assert.equal(supervisor.listActiveWorkRechecks({ status: "pending" }).length, 400);
+});
+
+test("a pending recheck's verified item survives tracked-work churn past the cap", async () => {
+  const { supervisor, outreach, advance } = fixture();
+  const verified = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Verify release", doneCriteria: "Release feed verified" });
+  supervisor.scheduleActiveWorkRecheck(verified.item.id, { delaySeconds: 30 });
+  await supervisor.actActiveWork(verified.item.id, { op: "confirm_done" });
+  for (let i = 0; i < 405; i += 1) supervisor.trackWork({ project: "Churn", theme: "Load", goal: `Churn goal ${i}`, doneCriteria: `Churn ${i} done` });
+  assert.ok(supervisor.activeWork.state.items.length <= 400, "the tracked-work cap still holds");
+  assert.ok(supervisor.activeWork.state.items.some((item) => item.id === verified.item.id), "the recheck's item was not evicted");
+  advance(31);
+  const pass = await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 0, maxPromptsPerPass: 0, resetCursor: true });
+  assert.equal(pass.recheckNotification?.type, "verified_outcome");
+  assert.equal(pass.recheckNotification?.itemId, verified.item.id);
+  assert.equal(outreach.filter((entry) => entry.type === "fleet-active-work-recheck").length, 1);
+  assert.equal(supervisor.listActiveWorkRechecks({ status: "notified" }).length, 1);
+});
+
+test("a recheck notice on a coding node reaches the hosted hub's outreach exactly once", async () => {
+  const { supervisor, outreach, advance } = fixture();
+  const verified = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Verify release", doneCriteria: "Release feed verified" });
+  const scheduled = supervisor.scheduleActiveWorkRecheck(verified.item.id, { delaySeconds: 30 });
+  await supervisor.actActiveWork(verified.item.id, { op: "confirm_done" });
+  advance(31);
+  const pass = await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 0, maxPromptsPerPass: 0, resetCursor: true });
+  assert.equal(pass.recheckNotification?.type, "verified_outcome");
+  assert.equal(outreach.filter((entry) => entry.type === "fleet-active-work-recheck").length, 1, "the node's own feed has it");
+
+  const capability = createFleetCapability(supervisor);
+  const hubOutreach = new OutreachStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "bb-hub-outreach-")) });
+  const hub = new RemoteFleetSupervisor({
+    nodeId: "coding-node",
+    runtime: {
+      outreach: hubOutreach,
+      events: { emit() {} },
+      nodeCapabilities: { dispatch: async (_nodeId, _cap, op, payload) => capability.invoke(op, payload) }
+    }
+  });
+  const onHub = () => hubOutreach.list().filter((item) => item.type === "fleet-active-work-recheck");
+  await hub.refresh();
+  assert.equal(onHub().length, 1);
+  assert.equal(onHub()[0].sourceRef.id, scheduled.recheck.id);
+  assert.match(onHub()[0].title, /Follow-through verified/);
+  await hub.refresh();
+  assert.equal(onHub().length, 1, "a second refresh does not post it again");
+  hubOutreach.resolve(onHub()[0].id, "dismissed", { status: "dismissed" });
+  await hub.refresh();
+  assert.equal(onHub().length, 1, "a dismissed notice stays dismissed");
+  assert.equal(onHub()[0].status, "dismissed");
 });
 
 test("the background tick runs a due recheck without a manual inventory scan", async () => {
