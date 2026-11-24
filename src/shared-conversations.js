@@ -77,7 +77,10 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
   store.saveSession({ id: sessionId, createdAt: new Date().toISOString(), messages: [], metadata: { thread } });
   for (const message of (source?.messages ?? []).filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string").slice(-50)) {
     store.appendMessage(sessionId, { role: message.role, content: message.content,
-      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}) } });
+      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}),
+        // Copying a chat doesn't lift a capture restriction (e.g. Pebble ring
+        // input stays out of skill mining).
+        ...(message.metadata?.noCapture === true ? { noCapture: true } : {}) } });
   }
   return sharedConversations(store).conversations.find(c => c.id === id);
 }

@@ -14,7 +14,7 @@ import { isPublicRoute } from "../src/auth.js";
 import { InMemoryAgentStore } from "../src/agent-store.js";
 import { AgentHost } from "../src/agent-host.js";
 import { createDefaultRuntime } from "../src/abi-runtime.js";
-import { sharedConversations, sharedThreadHistory } from "../src/shared-conversations.js";
+import { createSharedConversation, sharedConversations, sharedThreadHistory } from "../src/shared-conversations.js";
 import { SessionMiner } from "../src/session-miner.js";
 import { isSavedMemory } from "../src/memory-system.js";
 import { OutcomeStore } from "../src/outcome-store.js";
@@ -456,4 +456,19 @@ test("the receiver loads on the phone runtime (Node without ICU): no \\p{...} re
   for (const [text, expected] of [["...", false], ["?", false], ["\u2026", false], ["\u201Cquoted\u201D", true], ["4412", true], ["caf\u00E9", true], ["\u65E5\u672C", true]]) {
     assert.equal(WORD_CHAR_WITHOUT_ICU.test(text), expected, JSON.stringify(text));
   }
+});
+
+test("copying a ring conversation keeps noCapture, so the copy is not mined into a skill", async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pebble-peri-copy-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const store = new InMemoryAgentStore();
+  const ring = createSharedConversation(store, { thread: "agent" });
+  for (let i = 0; i < 3; i++) store.appendMessage(`devices:agent:${ring.id}`, { role: "user", content: "send me the weekly fixture revenue report", metadata: { thread: "agent", noCapture: true } });
+  store.appendMessage(`devices:agent:${ring.id}`, { role: "user", content: "owner fixture line", metadata: { thread: "agent" } });
+  const copy = createSharedConversation(store, { thread: "agent", sourceId: ring.id });
+  const copied = store.getSession(`devices:agent:${copy.id}`).messages;
+  assert.deepEqual(copied.map(m => m.metadata.noCapture), [true, true, true, undefined]);
+  // Only the copy and the original exist; neither yields a candidate.
+  const result = await new SessionMiner({ runtime: { agentHost: { store } }, dataDir, minOccurrences: 3 }).mine();
+  assert.equal(result.skipped, true);
 });
