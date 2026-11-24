@@ -1759,6 +1759,26 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.at(-1).queue, false);
 });
 
+test("a watch-only chat is scanned and reviewed like any other, but the supervisor never messages it", async (t) => {
+  // Its PR is red: a normal chat would get a nudge.
+  const thread = makeThread({ key: "codex:watched", id: "watched" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], env: { OPENAGI_FLEET_SELF_SESSION_IDS: "watched" } });
+  const snapshot = await supervisor.tick();
+  const row = snapshot.threads.find((r) => r.key === "codex:watched");
+  assert.ok(row, "it is in the scan, not excluded as self");
+  assert.notEqual(row.state, "excluded");
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /watch-only chat: the supervisor never messages it/);
+  assert.equal(delivered.length, 0);
+  // The owner's own message still goes through.
+  assert.equal((await supervisor.sendOwnerMessage("codex:watched", "Take the review comments next.")).delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  // The same chat, not listed, is nudged.
+  const { supervisor: plain, delivered: nudged } = fixture(t, { mode: "auto", threads: [makeThread({ key: "codex:watched", id: "watched" })] });
+  await plain.tick();
+  assert.equal(nudged.length, 1);
+});
+
 test("an owner send that is refused always leaves a receipt saying why", async (t) => {
   const { supervisor } = fixture(t, { threads: [makeThread()] });
   await supervisor.tick();
@@ -5618,4 +5638,23 @@ test("a risky answer kept for typing keeps later sends to its thread typed-only"
   assert.equal(later.delivery.status, "blocked");
   assert.match(later.delivery.detail, /approve it in the chat/);
   assert.equal(delivered.length, 0, "no codex exec fallback");
+});
+
+// #329 review (Codex P2): a watch-only session is scanned, but its Codex
+// permission cards are never auto-approved; they stay the owner's to answer.
+test("auto-approve never clicks a watch-only session's card", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Allow this conversation", "Always allow", "Deny"], stateId: "0123456789abcdef" };
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["Fix billing", "Something else"] }),
+    inspect: async () => ({ status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }),
+    clickLabel: async (request) => { clicks.push(request); return { status: "sent", detail: "clicked" }; }
+  };
+  const thread = makeThread({ agentStatus: "running", prRefs: [], meta: { originator: "Codex Desktop" } });
+  const { supervisor } = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use",
+    env: { OPENAGI_FLEET_AUTO_APPROVE: "codex", OPENAGI_FLEET_SELF_SESSION_IDS: "t1" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.equal(clicks.length, 0);
+  assert.equal(supervisor.getState().actions.some((action) => action.playbook === "auto-approve" && action.status === "sent"), false);
 });
