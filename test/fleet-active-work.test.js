@@ -1416,6 +1416,44 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
   }
 });
 
+test("project summaries list current blockers, not blockers on verified outcomes", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    for (let i = 0; i < 5; i += 1) {
+      const done = ctx.supervisor.trackWork({ project: "BlockerHistory", goal: `Finished slice ${i}`, blocker: `Old blocker ${i}` });
+      const verified = await ctx.supervisor.actActiveWork(done.item.id, { op: "confirm_done" });
+      assert.equal(verified.item.outcomeVerified, true);
+    }
+    const open = ctx.supervisor.trackWork({ project: "BlockerHistory", goal: "Unfinished slice", blocker: "Staging credentials missing", nextMilestone: "Staging deploy" });
+    const summary = ctx.supervisor.getActiveWork({ project: "BlockerHistory" }).projectSummaries
+      .find((entry) => entry.project === "BlockerHistory");
+    assert.ok(summary);
+    assert.deepEqual(summary.blockers.map((entry) => entry.id), [open.item.id]);
+    assert.deepEqual(summary.nextMilestones, ["Staging deploy"]);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("recording a blocker without a state change invalidates the scan cache", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({ project: "BlockerScan", goal: "Deploy to staging", permittedNudges: "propose_only", threadKey: "paseo:srv_mac.seo_ads" });
+    const mark = () => ctx.supervisor.activeWork.state.items.find((item) => item.id === tracked.item.id).lastEvaluatedMark;
+    const scan = () => ctx.supervisor.scanActiveWork({ pageSize: 50, maxRepoChecks: 0, maxPromptsPerPass: 50, resetCursor: true });
+    await scan();
+    const first = mark();
+    await scan();
+    assert.equal(mark(), first, "an unchanged item keeps its evaluation mark");
+
+    ctx.supervisor.trackWork({ id: tracked.item.id, project: "BlockerScan", goal: "Deploy to staging", blocker: "Staging credentials missing" });
+    await scan();
+    assert.notEqual(mark(), first, "the newly blocked item is re-evaluated");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
 test("dispatch dedupe keys keep their digest within the persisted limit for long project and theme names", () => {
   const ctx = seedRepresentativeFixtures();
   try {

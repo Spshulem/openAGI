@@ -1708,8 +1708,10 @@ export class ActiveWorkManager {
       if (!item.outcomeVerified && item.nextCheckAt && (!current.nextCheckAt || item.nextCheckAt < current.nextCheckAt)) {
         current.nextCheckAt = item.nextCheckAt;
       }
-      if (item.nextMilestone) current.nextMilestones.push(item.nextMilestone);
-      if (item.blocker) current.blockers.push({ blocker: item.blocker, owner: item.nextActionOwner, id: item.id });
+      // Verified outcomes still count toward historical stage/health totals,
+      // but their stored milestone and blocker are no longer current.
+      if (!item.outcomeVerified && item.nextMilestone) current.nextMilestones.push(item.nextMilestone);
+      if (!item.outcomeVerified && item.blocker) current.blockers.push({ blocker: item.blocker, owner: item.nextActionOwner, id: item.id });
       return groups.set(item.project, current);
     }, new Map()).values()].map((summary) => ({
       ...summary,
@@ -2390,7 +2392,11 @@ export class ActiveWorkManager {
         livePr?.headOid ?? livePr?.headSha ?? null,
         livePr?.updatedAt ?? null,
         livePr?.mergedAt ?? null,
-        completionReviewedAt ?? ""
+        completionReviewedAt ?? "",
+        // A recorded blocker changes the projection (blocked / actionable)
+        // without a state change. Append only when present so existing
+        // unblocked items keep their mark and are not re-evaluated en masse.
+        ...(item.blocker ? [`blocker:${item.blocker}`] : [])
       ]));
 
       // Verdicts are only valid for the evidence mark they evaluated. Clear a
