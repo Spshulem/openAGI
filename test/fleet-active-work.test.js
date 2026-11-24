@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { parseUntrustedTranscriptSignals } from "../src/fleet/active-work.js";
+import { dispatchDedupeKey } from "../src/fleet/themes.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
@@ -1412,6 +1413,47 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
     assert.match(ask.body.ask.prompt, /UnifiedWork/);
   } finally {
     fs.rmSync(ctx.dataDir, { recursive: true, force: true });
+  }
+});
+
+test("dispatch dedupe keys keep their digest within the persisted limit for long project and theme names", () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const project = "P".repeat(80);
+    const theme = "T".repeat(80);
+    const first = dispatchDedupeKey(project, theme, "Ship it", "dispatch-1");
+    const second = dispatchDedupeKey(project, theme, "Ship it", "dispatch-2");
+    assert.ok(first.length <= 160 && second.length <= 160);
+    assert.notEqual(first, second);
+
+    const a = ctx.supervisor.trackWork({ project: "OpenAGI", goal: "First directive", dedupeKey: first });
+    const b = ctx.supervisor.trackWork({ project: "OpenAGI", goal: "Second directive", dedupeKey: second });
+    assert.notEqual(a.item.id, b.item.id, "distinct dispatches produce distinct Work records");
+    assert.equal(ctx.supervisor.activeWork.state.items.find((it) => it.id === a.item.id).goal, "First directive");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("resume_owner includes a separate acceptance contract in the default follow-up", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: "Implement desktop",
+      doneCriteria: "Desktop tests pass",
+      acceptanceCriteria: "Also run mobile QA",
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads"
+    });
+    const retry = await ctx.supervisor.actActiveWork(tracked.item.id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes("Implement desktop"));
+    assert.ok(delivered.includes("Desktop tests pass"));
+    assert.ok(delivered.includes("Also run mobile QA"), "the follow-up carries the acceptance contract");
+  } finally {
+    ctx.cleanup();
   }
 });
 

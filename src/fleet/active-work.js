@@ -2814,10 +2814,16 @@ export class ActiveWorkManager {
       // 4,000 chars) so a retried dispatch never drops late or revised
       // requirements. originalAsk stays historical context only.
       const fullAsk = cleanText(item.goal || item.originalAsk, 4000);
+      // Verification checks the separate acceptance contract, so the owner
+      // must receive it too or the follow-up can never satisfy it.
+      const acceptance = cleanText(item.acceptanceCriteria ?? "", 500);
+      const acceptanceLine = acceptance && acceptance !== cleanText(item.doneCriteria ?? "", 500)
+        ? `. Acceptance requires: ${acceptance}`
+        : "";
       const defaultMessage = input.message
         ? cleanText(input.message, 1200)
         : cleanText(
-            `Follow up on "${fullAsk}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
+            `Follow up on "${fullAsk}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${acceptanceLine}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
             6000
           );
       if (input.confirmed !== true) {

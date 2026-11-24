@@ -21,9 +21,16 @@ export const PASEO_LABEL_COLORS = Object.freeze([
   "red"
 ]);
 
-function dispatchDedupeKey(project, theme, goal, dispatchId = "") {
-  const slug = (value) => String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general";
-  return `dispatch:${slug(project)}:${slug(theme)}:${shortHash(`${goal}:${dispatchId}`)}`;
+// trackWork clamps dedupe keys to 160 characters. Bound each readable slug so
+// the digest (which carries the full project/theme/goal/dispatch identity)
+// always survives: 9 + 60 + 1 + 60 + 1 + 16 = 147.
+const DISPATCH_KEY_SLUG_MAX = 60;
+
+export function dispatchDedupeKey(project, theme, goal, dispatchId = "") {
+  const slug = (value) => (String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general")
+    .slice(0, DISPATCH_KEY_SLUG_MAX).replace(/-+$/g, "") || "general";
+  const digest = shortHash(JSON.stringify([String(project ?? ""), String(theme ?? ""), String(goal ?? ""), String(dispatchId ?? "")]));
+  return `dispatch:${slug(project)}:${slug(theme)}:${digest}`;
 }
 
 const THEME_RULES = [
