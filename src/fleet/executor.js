@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { isSelfThread, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, isWatchOnlyThread, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
@@ -228,7 +228,8 @@ export const SELF_SESSION_BLOCK = "the supervisor's own session: it is not nudge
 function selfBlock(thread, config, playbook) {
   // Checked on its own: the host may be known only by PASEO_AGENT_ID.
   if (isSelfThread(thread, { selfSessionIds: config?.hostSessionIds ?? [] })) return SELF_HOST_BLOCK;
-  if (!isSelf(thread, config)) return null;
+  // Watch-only sessions follow the same rule: only the owner's own words go there.
+  if (!isSelf(thread, config) && !isWatchOnlyThread(thread, config)) return null;
   return OWNER_DIRECTED.has(playbook) ? null : SELF_SESSION_BLOCK;
 }
 

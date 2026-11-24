@@ -58,7 +58,10 @@ test("resolveFleetConfig reads env and lets overrides win", () => {
 
 test("the supervisor's own sessions: configured ids and the display prompt", () => {
   const env = { CLAUDE_CODE_SESSION_ID: "self-1", OPENAGI_FLEET_SELF_SESSION_IDS: "01a0df66-b269-7540-81f5-592808f2e1f1, 01a1316f-4fc1-7072-8c53-d96ce5fb8085" };
-  assert.deepEqual(resolveFleetConfig(env, { home: "/h" }).selfSessionIds, ["self-1", "01a0df66-b269-7540-81f5-592808f2e1f1", "01a1316f-4fc1-7072-8c53-d96ce5fb8085"]);
+  // The process's own session is self; listed ids are watched, never messaged.
+  const resolved = resolveFleetConfig(env, { home: "/h" });
+  assert.deepEqual(resolved.selfSessionIds, ["self-1"]);
+  assert.deepEqual(resolved.watchOnlySessionIds, ["01a0df66-b269-7540-81f5-592808f2e1f1", "01a1316f-4fc1-7072-8c53-d96ce5fb8085"]);
   assert.equal(isSupervisorOwnPrompt("You are the Agent Supervisor display. Reply with exactly: Agent Supervisor connected — monitoring C…"), true);
   assert.equal(isSupervisorOwnPrompt("Explain how the Agent Supervisor display works"), false);
   assert.equal(isSupervisorOwnPrompt(null), false);
