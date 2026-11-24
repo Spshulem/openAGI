@@ -186,6 +186,16 @@ export const INTENT_FAMILIES = Object.freeze({
       String.raw`(?:switch|move|fail\s*over|rotate|change)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|model)\b`
     ].join("|"),
     tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider"]
+  },
+  // This chat's own thinking depth: "set your reasoning effort to extra high",
+  // "think harder", "reset your effort".
+  effort: {
+    pattern: [
+      String.raw`(?:set|change|switch|raise|increase|bump|turn\s+up|lower|decrease|reduce|turn\s+down|drop|put|reset|clear|use)\b[^.!?\n]{0,60}?\b(?:reasoning|thinking)(?:\s+(?:effort|level|depth|mode))?\b`,
+      String.raw`(?:set|change|switch|raise|increase|bump|lower|decrease|reduce|reset|clear)\b[^.!?\n]{0,40}?\beffort\b`,
+      String.raw`think\s+(?:harder|more|deeper|less|lighter)\b`
+    ].join("|"),
+    tools: ["chat_reasoning_effort"]
   }
 });
 

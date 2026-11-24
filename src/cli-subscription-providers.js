@@ -11,6 +11,8 @@ import os from "node:os";
 import path from "node:path";
 import { clipToolOutput } from "./context-trim.js";
 
+const CODEX_CLI_EFFORTS = Object.freeze(["minimal", "low", "medium", "high", "xhigh"]);
+
 const MAX_CLI_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CLI_TIMEOUT_MS = 120_000;
 const FINAL_ANSWER_NOTE = [
@@ -513,10 +515,17 @@ export class CodexCliProvider {
     return model || this.model;
   }
 
+  // `codex exec -c model_reasoning_effort=...` per turn; unset keeps the
+  // CLI's own configured default.
+  reasoningEffortSupport() {
+    return { supported: true, provider: this.name, model: this.model, options: [...CODEX_CLI_EFFORTS], configuredDefault: null };
+  }
+
   async generate(args = {}) {
     const bin = this.resolveBinary();
     if (!bin) throw new Error("Codex CLI ('codex') was not found on this host.");
     const chosenModel = this.resolveModel(args);
+    const effort = CODEX_CLI_EFFORTS.includes(args.reasoningEffort) ? args.reasoningEffort : null;
     const runner = new CliTurnRunner({
       name: this.name,
       env: this.env,
@@ -550,6 +559,7 @@ export class CodexCliProvider {
             "--skip-git-repo-check",
             "-s", "read-only",
             "-m", model,
+            ...(effort ? ["-c", `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
             ...imageArgs,
             "--output-schema", schemaPath,
             "-o", outPath,

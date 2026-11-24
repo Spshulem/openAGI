@@ -171,6 +171,10 @@ export class ChatGPTPlanProvider {
     return this.inner.resolveModel(args);
   }
 
+  reasoningEffortSupport(args) {
+    return { ...this.inner.reasoningEffortSupport(args), provider: this.name };
+  }
+
   async generate(args = {}) {
     if (!this.isConfigured()) throw new ChatGPTPlanError("chatgpt-signed-out", SIGNED_OUT_MESSAGE);
     const relabel = (fn) => (typeof fn === "function"
