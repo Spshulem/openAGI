@@ -528,6 +528,17 @@ function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
 }
 
+// Who wrote the turn at ownerSpokeAt, as this computer's reader knows it,
+// without sending the words: "owner" when it had the owner's own text for
+// that turn, "unattributed" when it had none (often the supervisor's own
+// turn, its text kept out of lastUserText). A remote approval check needs
+// it: a supervisor stamp a few seconds away proves nothing about a turn
+// the reader saw the owner write.
+function ownerAttribution(thread) {
+  if (!ownerSpokeAt(thread)) return null;
+  return String(thread?.lastUserText ?? "").trim() ? "owner" : "unattributed";
+}
+
 const KNOWN_CACHE_MAX = 600;
 
 function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
@@ -5843,6 +5854,7 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        lastOwnerBy: ownerAttribution(thread),
         // When the supervisor itself last wrote there (a time, no text), so
         // a remote approval check can tell its own message from the owner's.
         lastSupervisorAt: thread.meta?.lastSupervisorAt ?? null,
