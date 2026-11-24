@@ -1,3 +1,4 @@
+// CI probe for #371: a src-only change that the iOS UI suites cannot observe.
 import http from "node:http";
 import https from "node:https";
 import { Readable } from "node:stream";
