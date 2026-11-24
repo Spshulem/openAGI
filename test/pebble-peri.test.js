@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHmac } from "node:crypto";
 import { PassThrough } from "node:stream";
-import { PebblePeriReceiver, classifyPebbleIntent, PEBBLE_PERI_MAX_TRANSCRIPT_CHARS } from "../src/integrations/pebble-peri.js";
+import { PebblePeriReceiver, classifyPebbleIntent, PEBBLE_PERI_MAX_TRANSCRIPT_CHARS, WORD_CHAR_WITHOUT_ICU } from "../src/integrations/pebble-peri.js";
 import { createCompanionRoutes, pebbleTransportSecure } from "../src/companion-routes.js";
 import { isPublicRoute } from "../src/auth.js";
 import { InMemoryAgentStore } from "../src/agent-store.js";
@@ -447,4 +447,13 @@ test("ring messages never grade an earlier reply as owner feedback", async t => 
   assert.equal(followups.length, 0);
   await host.handleMessage({ text: "owner fixture", sessionId: "s", routeTo: false }, {});
   assert.equal(followups.length, 1);
+});
+
+test("the receiver loads on the phone runtime (Node without ICU): no \\p{...} regex literal, and the fallback agrees", () => {
+  const source = fs.readFileSync(new URL("../src/integrations/pebble-peri.js", import.meta.url), "utf8");
+  const literals = source.split("\n").filter(line => /\\p\{/.test(line) && !/new RegExp\(/.test(line) && !/^\s*\/\//.test(line));
+  assert.deepEqual(literals, [], "a \\p{...} literal is a SyntaxError at load without ICU");
+  for (const [text, expected] of [["...", false], ["?", false], ["\u2026", false], ["\u201Cquoted\u201D", true], ["4412", true], ["caf\u00E9", true], ["\u65E5\u672C", true]]) {
+    assert.equal(WORD_CHAR_WITHOUT_ICU.test(text), expected, JSON.stringify(text));
+  }
 });

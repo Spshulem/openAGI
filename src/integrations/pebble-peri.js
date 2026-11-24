@@ -45,6 +45,15 @@ const MEMORY_COMMAND = new RegExp(`${LEAD}${MEMORY_PHRASE}\\b[\\s,:;.!-]*`, "i")
 // Anything that reads like a request to save, said any other way.
 const ANY_SAVE_PHRASE = new RegExp(`\\b(?:${NOTE_PHRASE}|${MEMORY_PHRASE}|keep\\s+(?:this|that|it)\\b[^.?!]{0,20}\\bnotes?\\b|(?:save|note)\\s+(?:this|that|it)\\b|(?:don['’]?t|do\\s+not|never)\\s+(?:remember|keep|save)\\b)`, "i");
 
+// Built at runtime: the phone runtime (Node without ICU) rejects a \p{...}
+// regex literal at parse time, which would crash the embedded daemon on load.
+// The fallback counts ASCII letters/digits and any non-ASCII character except
+// common typographic punctuation (ellipsis, quotes, dashes).
+export const WORD_CHAR_WITHOUT_ICU = /[A-Za-z0-9\u00C0-\u2012\u2016-\u2017\u2027-\uFFFF]/;
+const HAS_WORD_CHAR = (() => {
+  try { return new RegExp("[\\p{L}\\p{N}]", "u"); } catch { return WORD_CHAR_WITHOUT_ICU; }
+})();
+
 // "note" and "memory" only for an explicit leading command with something to
 // save. Any other mention of saving ("can you remember that?", "don't keep
 // this note", a command with nothing after it, both commands at once) is
@@ -57,7 +66,7 @@ export function classifyPebbleIntent(text) {
     const body = value.slice(match[0].length).trim();
     // "Remember this?" is a question, not a command; and there must be
     // something to save, not just punctuation.
-    if (!/[\p{L}\p{N}]/u.test(body) || body.startsWith("?") || ANY_SAVE_PHRASE.test(body)) return { kind: "ambiguous" };
+    if (!HAS_WORD_CHAR.test(body) || body.startsWith("?") || ANY_SAVE_PHRASE.test(body)) return { kind: "ambiguous" };
     return { kind, body };
   }
   return ANY_SAVE_PHRASE.test(value) ? { kind: "ambiguous" } : { kind: "chat", body: value.trim() };
