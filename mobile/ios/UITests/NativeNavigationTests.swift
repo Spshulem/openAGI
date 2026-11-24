@@ -574,6 +574,9 @@ final class NativeNavigationTests: XCTestCase {
         let start = app.buttons["supervisor-voice-start"].firstMatch
         XCTAssertTrue(start.waitForExistence(timeout: 5))
         XCTAssertEqual(start.label, "Talk with Supervisor")
+        for id in ["chat-attach", "chat-composer", "chat-dictation", "supervisor-voice-start", "chat-send"] {
+            XCTAssertTrue(element(app, id).isHittable, "The Supervisor composer lays out every control: \(id)")
+        }
         XCTAssertFalse(element(app, "supervisor-voice-state").exists, "No voice status row until voice starts")
         XCTAssertFalse(element(app, "supervisor-voice-stop").exists)
         tap(app, "chat-conversations")
