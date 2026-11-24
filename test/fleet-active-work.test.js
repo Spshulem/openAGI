@@ -1414,3 +1414,37 @@ test("durable Work records keep the original ask, lifecycle stage, health, evide
     fs.rmSync(ctx.dataDir, { recursive: true, force: true });
   }
 });
+
+test("resume_owner retries a long blocked dispatch with the complete ask before clearing the blocker", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const finalRequirement = "FINAL REQUIREMENT: keep VoiceOver labels on every Work row.";
+    const longGoal = `${"Ship the unified Work view with durable follow-through. ".repeat(36)}${finalRequirement}`;
+    assert.ok(longGoal.length > 2000 && longGoal.length <= 4000);
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: longGoal,
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads",
+      blocker: "Dispatch delivery blocked: owner offline"
+    });
+    const id = tracked.item.id;
+    const stored = () => ctx.supervisor.activeWork.state.items.find((item) => item.id === id);
+    stored().blocker = "Dispatch delivery blocked: owner offline";
+    stored().state = "blocked";
+
+    // A short custom note is delivered but does not count as recovering the dispatch.
+    const shortNote = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", message: "Ping", confirmed: true });
+    assert.equal(shortNote.status, "resumed_owner");
+    assert.equal(stored().blocker, "Dispatch delivery blocked: owner offline");
+
+    const retry = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes(finalRequirement), "the retried dispatch carries the final requirement");
+    assert.equal(stored().blocker, null);
+    assert.equal(stored().state, "active");
+  } finally {
+    ctx.cleanup();
+  }
+});

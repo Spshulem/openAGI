@@ -2810,11 +2810,15 @@ export class ActiveWorkManager {
           detail: "The linked coding session is archived."
         };
       }
-      const defaultMessage = cleanText(
-        input.message
-          || `Follow up on "${item.goal}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
-        1200
-      );
+      // The default follow-up carries the complete supported ask (up to
+      // 4,000 chars) so a retried dispatch never drops late requirements.
+      const fullAsk = cleanText(item.originalAsk || item.goal, 4000);
+      const defaultMessage = input.message
+        ? cleanText(input.message, 1200)
+        : cleanText(
+            `Follow up on "${fullAsk}" (${item.project}${item.theme ? ` / ${item.theme}` : ""}). Done means: ${item.doneCriteria}${item.nextAction ? `. Next step: ${item.nextAction}` : ""}`,
+            6000
+          );
       if (input.confirmed !== true) {
         return {
           ok: true,
@@ -2839,7 +2843,13 @@ export class ActiveWorkManager {
       const delivery = sent?.delivery ?? { status: "blocked", detail: "Delivery unavailable" };
       if (delivery.status === "sent") {
         if (item.state === "paused") item.state = "active";
-        if (typeof item.blocker === "string" && item.blocker.startsWith("Dispatch delivery blocked:")) {
+        // A dispatch is only recovered once the complete ask reached the owner;
+        // a shorter custom note is delivered but leaves the blocker visible.
+        if (
+          typeof item.blocker === "string"
+          && item.blocker.startsWith("Dispatch delivery blocked:")
+          && defaultMessage.includes(fullAsk)
+        ) {
           item.blocker = null;
           if (item.state === "blocked") item.state = "active";
           item.nextAction = "Owner evidence received and verified";
