@@ -261,3 +261,24 @@ test("tradeoffs are said to be missing when the source states none", async () =>
   const ctx = buildDecisionContext({ question: { kind: "agent-ask", threadKey: "paseo:s.t", title: "Pick a vendor?", options: ["vendor a", "vendor b"] }, recentMessages: [{ role: "user", text: "Choose a vendor for the pilot" }, { role: "assistant", text: "Both vendors pass the security review. Pick a vendor?" }] });
   assert.match(renderDecisionContext(ctx), /Options: Vendor a; Vendor b\. Tradeoffs: not stated by the agent\./);
 });
+
+// #366 review P2 (3rd round): a decision's options are never cut to fit the
+// per-decision budget; the decision is shown whole or deferred, never
+// marked surfaced with a missing choice.
+test("a five-option decision with long tradeoffs keeps every option, or is deferred", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  const why = "because this changes how every regional cluster is rolled and who gets paged overnight during the change window";
+  const reply = ["DECISION CONTEXT", "Goal: Roll out the new storage engine to every region", "Assigned: Plan and run the rollout", "Verified: Canary in one region is healthy for 48h", "Blocked: The rollout order needs Spencer's call", "Decision: Which rollout plan should we use?", "Options:",
+    ...["Option one all regions at once", "Option two east first", "Option three west first", "Option four canary per region", "Option five final staged weekly"].map((o) => `- ${o} — ${why}`), "Recommendation: Option four canary per region"].join("\n");
+  sup.store.upsertQuestion({ dedupeKey: "ask:rollout", kind: "agent-ask", threadKey: "paseo:s.ro", title: "Storage rollout: which plan?", options: ["Option one all regions at once", "Option two east first", "Option three west first", "Option four canary per region", "Option five final staged weekly"],
+    contextSnapshot: { threadTitle: "Storage rollout", recentMessages: [{ role: "user", text: "Roll out the new storage engine everywhere" }, { role: "assistant", text: reply }], agentSummary: reply } });
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  if (res.posted) {
+    assert.match(msgs[0].text, /Option five final staged weekly/, "the fifth option is not cut off");
+  } else {
+    assert.equal(res.reason, "decision-too-long");
+    assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: NOW }).deltas.length, 1, "deferred, not marked surfaced");
+  }
+});
