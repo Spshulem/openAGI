@@ -86,7 +86,9 @@ function emptyState() {
     preferences: defaultPreferences(),
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
+    queuedOwnerMessages: [],
     supervisorChatNotices: {},
+    lastProactiveChatAt: null,
     surfacedDecisions: {},
     providerFailovers: {},
     contextRequestLog: {}
@@ -158,7 +160,6 @@ export function actionableDecisionMaterialHash(question) {
     prRef,
     Boolean(question.mergeAsk),
     normalizeDecisionText(rawTitle),
-    normalizeDecisionText(question.body ?? ""),
     normOpts
   ]));
 }
@@ -1500,7 +1501,11 @@ export class FleetStore {
       preferences: normalizePreferences(raw.preferences),
       organization: normalizeOrganization(raw.organization),
       followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
+      queuedOwnerMessages: Array.isArray(raw.queuedOwnerMessages)
+        ? raw.queuedOwnerMessages.filter((q) => isObject(q) && typeof q.id === "string" && typeof q.threadKey === "string" && typeof q.message === "string").slice(-100)
+        : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
+      lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,
       surfacedDecisions: isObject(raw.surfacedDecisions)
         ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
         : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
@@ -1704,6 +1709,101 @@ export class FleetStore {
     if (!dedupeKey) return null;
     const entry = this.state.supervisorChatNotices?.[dedupeKey];
     return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  lastProactiveChatAt() {
+    const stamp = this.state.lastProactiveChatAt;
+    return typeof stamp === "string" && Number.isFinite(Date.parse(stamp)) ? stamp : null;
+  }
+
+  recordProactiveChatAt(at = this.now()) {
+    const stamp = iso(toMs(at, this.now()));
+    this.state.lastProactiveChatAt = stamp;
+    this._save();
+    return stamp;
+  }
+
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message" } = {}) {
+    const cleanKey = String(threadKey ?? "").trim();
+    const cleanMsg = String(message ?? "").trim().slice(0, 4000);
+    if (!cleanKey || !cleanMsg) return null;
+    const nowMs = this.now();
+    const nowIso = iso(nowMs);
+    this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])
+      .filter((item) => {
+        const createdMs = toMs(item?.createdAt, 0);
+        return createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+      });
+    const existing = this.state.queuedOwnerMessages.find(
+      (item) => item.threadKey === cleanKey && item.message === cleanMsg
+    );
+    if (existing) {
+      return { ...existing, deduped: true };
+    }
+    const entry = {
+      id: makeId("qmsg"),
+      threadKey: cleanKey,
+      message: cleanMsg,
+      ...(Array.isArray(images) && images.length > 0 ? { images: images.slice(0, 4) } : {}),
+      ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
+      ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
+      source: clampText(String(source || "owner-message"), 40),
+      createdAt: nowIso,
+      attempts: 0,
+      lastAttemptAt: null,
+      lastDetail: null
+    };
+    this.state.queuedOwnerMessages = [...this.state.queuedOwnerMessages, entry].slice(-100);
+    this._save();
+    return { ...entry, deduped: false };
+  }
+
+  queuedOwnerMessages(threadKey = null) {
+    const nowMs = this.now();
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const active = list.filter((item) => {
+      if (!item?.id || !item?.threadKey || !item?.message) return false;
+      const createdMs = toMs(item.createdAt, 0);
+      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) return false;
+      return true;
+    });
+    if (active.length !== list.length) {
+      this.state.queuedOwnerMessages = active;
+      this._save();
+    }
+    const filterKey = threadKey ? String(threadKey).trim() : null;
+    return (filterKey ? active.filter((item) => item.threadKey === filterKey) : active).map((item) => ({ ...item }));
+  }
+
+  removeQueuedOwnerMessage(id) {
+    const cleanId = String(id ?? "").trim();
+    if (!cleanId) return false;
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const next = list.filter((item) => item?.id !== cleanId);
+    if (next.length === list.length) return false;
+    this.state.queuedOwnerMessages = next;
+    this._save();
+    return true;
+  }
+
+  noteQueuedOwnerMessageAttempt(id, detail = null, { maxAttempts = 20 } = {}) {
+    const cleanId = String(id ?? "").trim();
+    if (!cleanId) return null;
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const idx = list.findIndex((item) => item?.id === cleanId);
+    if (idx < 0) return null;
+    const item = list[idx];
+    item.attempts = (Number(item.attempts) || 0) + 1;
+    item.lastAttemptAt = iso(this.now());
+    item.lastDetail = detail ? clampText(redactSecrets(String(detail)), 200) : item.lastDetail;
+    let dropped = false;
+    if (item.attempts >= maxAttempts) {
+      list.splice(idx, 1);
+      dropped = true;
+    }
+    this.state.queuedOwnerMessages = list;
+    this._save();
+    return { ...item, dropped };
   }
 
   recordSupervisorChatNotice(dedupeKey, summary = "") {

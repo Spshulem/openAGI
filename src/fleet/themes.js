@@ -1034,21 +1034,22 @@ export async function dispatchManagerGoal(
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
     const persisted = persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
-    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images, goalId: persisted?.item?.id ?? null });
-    const ok = sent?.delivery?.status === "sent";
+    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, queue: true, images, goalId: persisted?.item?.id ?? null });
+    const deliveryStatus = sent?.delivery?.status ?? "blocked";
+    const ok = deliveryStatus === "sent" || deliveryStatus === "queued";
     if (!ok) recordDeliveryFailure(persisted, sent);
     else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
       threadKey: cleanKey,
-      status: ok ? "sent" : "blocked",
+      status: ok ? deliveryStatus : "blocked",
       by: "owner",
       reason: clampText(`manager goal routed to ${cleanKey}: ${cleanGoal}`, 240)
     });
     return {
       ok,
-      status: ok ? "routed_existing" : "blocked",
+      status: deliveryStatus === "queued" ? "queued_existing" : (ok ? "routed_existing" : "blocked"),
       message: sent?.delivery?.detail ?? null,
       project: project ? { id: String(project).toLowerCase(), name: String(project) } : null,
       matchedSession: { key: cleanKey, title: knownTitle, state: knownState },
@@ -1117,6 +1118,7 @@ export async function dispatchManagerGoal(
     await batchHydrateCandidateTranscripts(supervisor, preRanked.slice(0, 4), { factory });
   }
 
+  const goalPrNumbers = new Set([...cleanGoal.matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]));
   for (const entry of preRanked) {
     const combinedText = [
       entry.session.title,
@@ -1125,7 +1127,12 @@ export async function dispatchManagerGoal(
       ...(entry.session.prRefs ?? []),
       entry.recentContext
     ].filter(Boolean).join("\n");
-    entry.lexicalScore = Math.max(entry.surfaceScore, lexicalSimilarity(cleanGoal, goalTerms, combinedText, entry.session));
+    const sessionPrNumbers = new Set([
+      ...[...String(entry.session.title ?? "").matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]),
+      ...(entry.session.prRefs ?? []).map((r) => String(r).split("#")[1]).filter(Boolean)
+    ]);
+    const prBoost = goalPrNumbers.size > 0 && [...goalPrNumbers].some((n) => sessionPrNumbers.has(n)) ? 0.85 : 0;
+    entry.lexicalScore = Math.max(entry.surfaceScore, lexicalSimilarity(cleanGoal, goalTerms, combinedText, entry.session), prBoost);
     entry.decisionProb = null;
   }
 
@@ -1241,22 +1248,23 @@ export async function dispatchManagerGoal(
       workflowStage: "implementing",
       nextAction: "Existing owner acknowledges the request"
     });
-    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images, goalId: persisted?.item?.id ?? null });
-    const delivered = sent?.delivery?.status === "sent";
+    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, queue: true, images, goalId: persisted?.item?.id ?? null });
+    const deliveryStatus = sent?.delivery?.status ?? "blocked";
+    const delivered = deliveryStatus === "sent" || deliveryStatus === "queued";
     if (!delivered) recordDeliveryFailure(persisted, sent);
     else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
       threadKey: best.session.key,
-      status: delivered ? "sent" : "blocked",
+      status: delivered ? deliveryStatus : "blocked",
       by: "owner",
       reason: clampText(`routed manager goal to existing ${targetProject.name} session "${best.session.title}" (conf=${matchedSummary.confidence})`, 240)
     });
     supervisor?.emitFleet?.("goal-dispatched");
     return {
       ok: delivered,
-      status: delivered ? "routed_existing" : "blocked",
+      status: deliveryStatus === "queued" ? "queued_existing" : (delivered ? "routed_existing" : "blocked"),
       message: sent?.delivery?.detail ?? null,
       project: projectSummary,
       inferredTheme: best.session.theme || inferredTheme.name,

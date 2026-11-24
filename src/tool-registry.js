@@ -325,13 +325,25 @@ export class ToolRegistry {
       && /\b(?:computer[- ]?(?:use|control)|screenshot)\b/i.test(prevAssistant)
       && /\b(?:dropped|failed|ended|timed out|could not|couldn['’]t)\b/i.test(prevAssistant)
       && /^\s*(?:try again|retry|run it again|do it again)(?:\s*[.!])?\s*$/i.test(String(turn.intent ?? ""));
+    const isOwnerNonVoiceSupervisor = Boolean(
+      turn.supervisorAutoApprove === true
+      && owner.via !== "voice"
+    );
+    // Internal non-destructive Supervisor bookkeeping & preference tools never
+    // need a spoken "yes <N>" gate on an authenticated non-voice owner turn.
+    // Hard Red Lines (PR merges, deploys, app restarts, deletes, external sends,
+    // spending money, credentials) stay strictly gated.
+    const isNonDestructiveOwnerBookkeeping = isOwnerNonVoiceSupervisor && (
+      ["fleet_track_work", "fleet_preferences", "fleet_organize_project", "fleet_sync_themes"].includes(tool.name)
+      || (tool.name === "fleet_act_active_work" && !["propose_archive", "resume_owner"].includes(String(args?.op ?? "")))
+    );
     const conversationalCover = ((
       tool.supervisorAutoApprove === true
       || intentCovers("approve", tool.name)
       || tool.name === "fleet_send_message"
       || tool.name === "reply_to_coding_agent"
     ) && isConversationalAssentOrChoice(turn.intent ?? "", prevAssistant)) || retryComputerSession;
-    const autoApproved = (
+    const autoApproved = isNonDestructiveOwnerBookkeeping || (
       turn.supervisorAutoApprove === true
       && tool.supervisorAutoApprove === true
       && isSupervisorActionableDirective(turn.intent ?? "", { previousAssistantText: prevAssistant })
@@ -1332,30 +1344,185 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "set_provider",
-    description: "Switch the primary model provider live. 'auto' picks whichever has a key (Anthropic preferred), 'anthropic' forces Claude, 'openai' forces ChatGPT/GPT-5. Use this if the user wants to switch models mid-conversation or you detect repeated failures with the current one.",
+    trustedOutput: true,
+    description: "Inspect or change YOUR OWN active model provider, model ID, and/or reasoning effort live (persisted to .env and applied immediately for the next turn). Supports `preference` ('auto', 'anthropic', 'openai', 'chatgpt', 'codex-cli', 'claude-cli'), `model` (e.g. 'gpt-6.2-sol', 'claude-opus-5-5'), and `reasoningEffort` ('none'|'minimal'|'low'|'medium'|'high'|'xhigh'|'default'). Call with no arguments to inspect active provider/model/effort and which providers are configured. Refuses cleanly if asked to switch to an unconfigured provider.",
     parameters: {
       type: "object",
       properties: {
-        preference: { type: "string", enum: ["auto", "anthropic", "openai"] }
+        preference: { type: "string", enum: ["auto", "anthropic", "openai", "chatgpt", "codex-cli", "claude-cli"] },
+        model: { type: "string", maxLength: 120, description: "Optional model ID to set for the active/selected provider (e.g. 'gpt-6.2-sol', 'claude-opus-5-5')." },
+        reasoningEffort: { type: "string", maxLength: 24, description: "Optional reasoning effort ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'extra high', or 'default' to clear)." }
       },
-      required: ["preference"],
       additionalProperties: false
     },
-    handler: async (args) => {
-      process.env.OPENAGI_PROVIDER = args.preference;
+    handler: async (args = {}, context = {}) => {
+      const { claudeCliStatus, codexCliStatus } = await import("./cli-subscription-providers.js");
+      const { status: chatgptStatus } = await import("./chatgpt-auth.js");
+      const resolvedDataDir = runtime?.dataDir ?? resolveDataDir();
+      const safeChatgptSignedIn = () => {
+        try { return Boolean(chatgptStatus?.({ dataDir: resolvedDataDir })?.signedIn); } catch { return false; }
+      };
+      const safeCliAvailable = (fn) => {
+        try { return Boolean(fn?.()?.available); } catch { return false; }
+      };
+      const configuredProviders = {
+        openai: Boolean(process.env.OPENAI_API_KEY),
+        anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+        chatgpt: safeChatgptSignedIn(),
+        codexCli: safeCliAvailable(codexCliStatus),
+        claudeCli: safeCliAvailable(claudeCliStatus)
+      };
+
+      const envUpdates = {};
+      const requestedPref = typeof args.preference === "string" && args.preference.trim()
+        ? args.preference.trim().toLowerCase()
+        : null;
+      const requestedModel = typeof args.model === "string" && args.model.trim()
+        ? args.model.trim().slice(0, 120)
+        : null;
+      const rawEffort = typeof args.reasoningEffort === "string" && args.reasoningEffort.trim()
+        ? args.reasoningEffort.trim().toLowerCase()
+        : null;
+
+      // Read-only inspection when called with no mutation fields.
+      if (!requestedPref && !requestedModel && !rawEffort) {
+        const provider = runtime.agentHost?.modelProvider;
+        const effortInfo = context.sessionId && runtime.agentHost?.store
+          ? describeSessionReasoningEffort({ store: runtime.agentHost.store, provider, sessionId: context.sessionId })
+          : null;
+        return {
+          preference: process.env.OPENAGI_PROVIDER ?? "auto",
+          current: provider?.constructor?.name ?? null,
+          model: provider?.resolveModel?.({ task: "chat" }) ?? provider?.model ?? null,
+          reasoningEffort: effortInfo?.effective ?? process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? process.env.OPENAI_REASONING_EFFORT ?? null,
+          supportedEfforts: effortInfo?.options ?? [],
+          configuredProviders
+        };
+      }
+
+      if (requestedPref === "anthropic" && !configuredProviders.anthropic) {
+        return {
+          ok: false,
+          error: "Anthropic API is not configured on this host (ANTHROPIC_API_KEY is unset).",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "openai" && !configuredProviders.openai) {
+        return {
+          ok: false,
+          error: "OpenAI API is not configured on this host (OPENAI_API_KEY is unset).",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "chatgpt" && !configuredProviders.chatgpt) {
+        return {
+          ok: false,
+          error: "ChatGPT plan is not signed in on this host.",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "claude-cli" && !configuredProviders.claudeCli) {
+        return {
+          ok: false,
+          error: "Claude CLI is not available on this host.",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "codex-cli" && !configuredProviders.codexCli) {
+        return {
+          ok: false,
+          error: "Codex CLI is not available on this host.",
+          configuredProviders
+        };
+      }
+
+      let inferredPref = requestedPref;
+      if (!inferredPref && requestedModel) {
+        if (/^claude/i.test(requestedModel)) {
+          if (!configuredProviders.anthropic && !configuredProviders.claudeCli) {
+            return {
+              ok: false,
+              error: `Cannot switch to Claude model "${requestedModel}": neither Anthropic API nor Claude CLI is configured on this host.`,
+              configuredProviders
+            };
+          }
+          inferredPref = configuredProviders.anthropic ? "anthropic" : "claude-cli";
+        }
+      }
+
+      if (inferredPref) {
+        process.env.OPENAGI_PROVIDER = inferredPref;
+        envUpdates.OPENAGI_PROVIDER = inferredPref;
+      }
+
+      if (requestedModel) {
+        const isClaude = /^claude/i.test(requestedModel) || inferredPref === "anthropic" || inferredPref === "claude-cli";
+        if (isClaude) {
+          process.env.ANTHROPIC_MODEL = requestedModel;
+          envUpdates.ANTHROPIC_MODEL = requestedModel;
+        } else {
+          process.env.OPENAI_MODEL = requestedModel;
+          envUpdates.OPENAI_MODEL = requestedModel;
+        }
+      }
+
+      let normalizedEffort = null;
+      let clearedEffort = false;
+      if (rawEffort) {
+        if (["default", "clear", "reset", "auto"].includes(rawEffort)) {
+          clearedEffort = true;
+          delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+        } else {
+          normalizedEffort = normalizeReasoningEffort(rawEffort);
+          if (!normalizedEffort) {
+            return {
+              ok: false,
+              error: `Invalid reasoningEffort "${rawEffort}". Use one of: none, minimal, low, medium, high, xhigh (extra high), or default.`
+            };
+          }
+          process.env.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+        }
+      }
+
       const { createModelProvider } = await import("./model-provider.js");
       if (runtime.agentHost) {
         runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
       }
-      // Persist
-      try {
-        const { saveEnv } = await import("./setup-wizard.js");
-        saveEnv({ values: { OPENAGI_PROVIDER: args.preference } });
-      } catch { /* ignore */ }
+      // Also mirror reasoningEffort onto the current chat session override so
+      // per-session overrides never shadow a newly requested effort.
+      if (context.sessionId && runtime.agentHost?.store && (normalizedEffort || clearedEffort)) {
+        try {
+          applySessionReasoningEffort({
+            store: runtime.agentHost.store,
+            provider: runtime.agentHost.modelProvider,
+            sessionId: context.sessionId,
+            effort: clearedEffort ? null : normalizedEffort,
+            setBy: "owner:set_provider"
+          });
+        } catch { /* unsupported provider effort is reported in readback below */ }
+      }
+      // Persist to .env so changes survive restarts.
+      if (Object.keys(envUpdates).length > 0) {
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({ values: envUpdates });
+        } catch { /* ignore */ }
+      }
+      const activeProvider = runtime.agentHost?.modelProvider;
+      const effortReadback = context.sessionId && runtime.agentHost?.store
+        ? describeSessionReasoningEffort({ store: runtime.agentHost.store, provider: activeProvider, sessionId: context.sessionId })
+        : null;
       return {
-        preference: args.preference,
-        current: runtime.agentHost?.modelProvider?.constructor?.name,
-        model: runtime.agentHost?.modelProvider?.model
+        ok: true,
+        preference: process.env.OPENAGI_PROVIDER ?? "auto",
+        current: activeProvider?.constructor?.name ?? null,
+        model: activeProvider?.resolveModel?.({ task: "chat" }) ?? activeProvider?.model ?? null,
+        reasoningEffort: effortReadback?.effective ?? process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? process.env.OPENAI_REASONING_EFFORT ?? null,
+        supportedEfforts: effortReadback?.options ?? [],
+        configuredProviders,
+        takesEffect: "next_turn"
       };
     }
   });

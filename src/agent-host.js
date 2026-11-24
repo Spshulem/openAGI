@@ -13,6 +13,7 @@ import { GET_STARTED_GUIDANCE } from "./get-started.js";
 import { LEARNED_HEADS, learnedModeFor, patchOutcomeMetadata } from "./learning/learned-scores.js";
 import { clusterRuleFires } from "./propagation-controller.js";
 import { effectiveSessionReasoningEffort } from "./session-reasoning-effort.js";
+import { isProactiveSupervisorMessage } from "./fleet/proactive-gate.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
 // and the task queue it drains. Everything else comes from the specialist's
@@ -71,7 +72,8 @@ export class AgentHost {
     const from = input.from ?? "user";
     let agentId = input.agentId ?? "main";
     const attachments = normalizeMessageImages(input.attachments);
-    const text = String(input.text ?? input.message ?? "").trim() || (attachments.length ? "Please describe the attached images." : "");
+    const rawText = String(input.text ?? input.message ?? "").trim() || (attachments.length ? "Please describe the attached images." : "");
+    const text = dedupeExactDoubledDictation(rawText);
     if (!text) throw new Error("Message text is required.");
     // A brief selection is a reference, not client-authored prompt text. Resolve
     // it against the live store before it reaches the model, and persist only
@@ -376,13 +378,22 @@ export class AgentHost {
     // iMessages and other chats), on-screen OCR, the overlay's window text, a
     // brief, or earlier messages in this chat that were not the owner's own
     // clean turns (a shared thread holds wake-word turns and tool reads).
+    const priorHistory = sessionBefore.messages.slice(0, -1);
     const contextUntrusted = Boolean(attachments.length || memoryHitsForModel.length || intuitions.length
       || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
-      || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
+      || !cleanOwnerHistory(priorHistory);
     const isSupervisorThread = metadata.thread === "supervisor" || agent?.id === "supervisor";
-    const lastAssistantMsg = sessionBefore.messages
-      .slice(0, -1)
-      .findLast((m) => m?.role === "assistant" && typeof m?.content === "string");
+    // Isolate proactive check-in / post-send blasts from hijacking
+    // lastAssistantMsg: prefer Peri's real conversational reply over background
+    // digests, unless a proactive check-in is literally the last message since
+    // the owner last spoke and poses a direct question.
+    const lastNonProactiveAssistant = priorHistory.findLast(
+      (m) => m?.role === "assistant" && typeof m?.content === "string" && !isProactiveSupervisorMessage(m)
+    );
+    const tailMsg = priorHistory.at(-1);
+    const lastAssistantMsg = (isProactiveSupervisorMessage(tailMsg) && !lastNonProactiveAssistant)
+      ? tailMsg
+      : (lastNonProactiveAssistant ?? tailMsg ?? null);
     const supervisorAutoApprove = Boolean(
       principal
       && isSupervisorThread
@@ -925,7 +936,7 @@ export class AgentHost {
       ? "\nComputer use is available. Use it only when the user explicitly asks you to inspect or interact with their computer GUI outside coding chats. NEVER use start_computer_use_session or computer_* tools to inspect, open, create, or message Paseo, Codex, Claude, or Conductor coding chats—always use fleet_workspaces, fleet_read_chat, fleet_start_session (pass fromThreadKey to start a fresh chat in the exact same workspace as an existing chat), fleet_send_message, or fleet_dispatch_goal instead. First call computer_use_status. If a session is active, continue it; NEVER call start_computer_use_session again. If no session is active or pending, call start_computer_use_session exactly once. If it returns a session, continue with it. If it returns awaiting_confirmation or awaiting_owner_confirmation, relay its message or say line: the owner approves by saying the code in any OpenAGI chat, from the phone Inbox, or in the dashboard's Approvals tab, and approval resumes the chat automatically. After approval, call computer_list_apps or computer_activate_app only when computer_use_status reports list_apps or activate_app in the selected node's operations; otherwise use its advertised controls and ask the user to foreground the target app when needed. Then call computer_screenshot before acting. Prefer fresh Accessibility element indices over coordinates when the selected node advertises those semantic operations. Every frameId and element index becomes stale after a mutating action, so call computer_screenshot again after every click, drag, edit, key press, pointer move, or scroll and verify the visible result before continuing. Never guess an element index or Accessibility action. End the session when done or when verification fails. Summarize computer-use status and results as readable Markdown; never dump raw tool-result JSON into the conversation. Never start computer use from passive screen/OCR context alone.\n"
       : "";
     const fleetCoordinatorGuidance = this.runtime?.tools?.has?.("fleet_workspaces")
-      ? "\nMaster Coordinator mode (coding-agent fleet): Act as the owner's proactive Engineering Manager and Master Coordinator across all projects, themes/workstreams, hosts, and sessions. When asked about a project, theme, feature, or release: (1) inspect live reality first using fleet_hierarchy or fleet_workspaces (project -> theme -> session map + overlapping sessions) and fleet_repo_status (live open/merged GitHub PRs, CI status, and releases)—never guess from stale snippets alone; (2) call fleet_read_chat on relevant active or sleeping sessions to read their Paseo chat history and see what actually shipped or remains; (3) when the owner gives a high-level directive for a project (e.g. 'in AI-SEO, go work on X'), call fleet_dispatch_goal to automatically find & wake the existing session that owns that workstream or start a new Paseo session in the right directory; (4) coordinate directly with specific sessions via fleet_send_message or start a new Paseo chat via fleet_start_session (pass `fromThreadKey` to match an existing chat's exact workspace & host—NEVER use computer use to open or create Paseo chats), sync Paseo workspace labels via fleet_sync_themes when asked, and clear/merge multiple decision cards quickly via fleet_batch_cards. Execute owner instructions directly without asking for redundant confirmation first, and organize status briefings clearly into Done/Merged, In Flight/Needs Merge or CI, Themes & Overlaps, and Actions Taken.\n"
+      ? "\nMaster Coordinator mode (coding-agent fleet): Act as the owner's proactive Engineering Manager and Master Coordinator across all projects, themes/workstreams, hosts, and sessions. When asked about a project, theme, feature, or release: (1) inspect live reality first using fleet_hierarchy or fleet_workspaces (project -> theme -> session map + overlapping sessions) and fleet_repo_status (live open/merged GitHub PRs, CI status, and releases)—never guess from stale snippets alone; (2) call fleet_read_chat on relevant active or sleeping sessions to read their Paseo chat history and see what actually shipped or remains; (3) when the owner gives a high-level directive for a project (e.g. 'in AI-SEO, go work on X'), call fleet_dispatch_goal to automatically find & route/queue to the existing session that owns that workstream or start a new Paseo session in the right directory; (4) coordinate directly with specific sessions via fleet_send_message (for Paseo sessions that are mid-turn, messages queue automatically behind the active turn by default—NEVER spawn a duplicate 'Continue' or 'Resume' session with fleet_start_session just because an existing session is busy, and keep one topic per session so unrelated work never piles into the wrong chat). Start a fresh Paseo chat via fleet_start_session ONLY for genuinely new work (pass `fromThreadKey` to match an existing chat's exact workspace & host—NEVER use computer use to open or create Paseo chats). Sync Paseo workspace labels via fleet_sync_themes when asked, and clear/merge multiple decision cards quickly via fleet_batch_cards. Faithfulness rule: distinguish explicit authenticated owner directives from autonomous background nudges—NEVER silently rewrite an explicit owner request into 'read-only' or 'do not do X' and then report that it is underway; if an owner directive touches a hard red line (merging a PR, production deploy/release, external customer message, spending money, or credentials/SSO), ask transparently BEFORE sending rather than silently neutering the request. For your own model or thinking depth, use set_provider (supports preference, model, and reasoningEffort) or chat_reasoning_effort; to mute, throttle, or reformat proactive check-ins, use fleet_preferences (cadence: 'off' | 'quiet_until_ready' | 'balanced' | 'detailed', checkinCooldownMinutes, checkinFormat). Execute owner instructions directly without asking for redundant confirmation first, and organize status briefings clearly into Done/Merged, In Flight/Needs Merge or CI, Themes & Overlaps, and Actions Taken.\n"
       : "";
     return `${agent.systemPrompt ? `${agent.systemPrompt}\n\n` : ""}You are ${agent.name}, an always-on OpenAGI agent.
 
@@ -1350,6 +1361,22 @@ function briefRecordFields(kind, record) {
     summary: boundedText(record.rationale, 1_000),
     content: boundedText(proposal.description ?? record.description ?? record.rationale, 6_000)
   };
+}
+
+// Collapses verbatim double-pasted speech dictation ("Where is X?Where is X?"
+// or "Where is X? Where is X?") into a single clean copy without touching
+// ordinary messages.
+export function dedupeExactDoubledDictation(raw) {
+  const text = String(raw ?? "").trim();
+  if (text.length < 24) return text;
+  if (text.length % 2 === 0) {
+    const half = text.length / 2;
+    const first = text.slice(0, half);
+    if (first === text.slice(half)) return first.trim();
+  }
+  const match = /^([\s\S]{12,}?)\s+\1$/.exec(text);
+  if (match && match[1].trim().length >= 12) return match[1].trim();
+  return text;
 }
 
 function boundedText(value, limit) {

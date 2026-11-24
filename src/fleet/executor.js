@@ -766,7 +766,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
       try {
-        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected });
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue });
         const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
         return { ...result, actionId: id };
       }

@@ -306,13 +306,13 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null } = {}) {
     const startedAtMs = Date.now();
     try {
       return await this.request('POST', '/fleet/api/send', {
         threadKey,
         message,
-        ...(queue === true ? { queue: true } : {}),
+        ...(typeof queue === 'boolean' ? { queue } : {}),
         ...(Array.isArray(images) && images.length ? { images } : {})
       });
     } catch (error) {

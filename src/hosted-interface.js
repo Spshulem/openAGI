@@ -28,6 +28,7 @@ import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
 import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
+import { createHubProactiveGuard, isProactiveSupervisorText } from "./fleet/proactive-gate.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
@@ -261,6 +262,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
+  const hubProactiveGuard = createHubProactiveGuard({
+    getPreferences: () => runtime.fleetSupervisor?.getState?.()?.preferences ?? {},
+    getRecentMessages: () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [],
+    getModelProvider: () => runtime.agentHost?.modelProvider ?? channels?.agentHost?.modelProvider ?? null,
+    judgeProactiveUpdate: options.judgeProactiveUpdate ?? null
+  });
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
@@ -2087,9 +2094,55 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: "invalid_messages" });
         }
         try {
+          const conversationId = typeof body.conversationId === "string" ? body.conversationId : "main";
+          const rawMessages = Array.isArray(body.messages) ? body.messages : body.messages;
+          let filteredMessages = rawMessages;
+          let suppressedCount = 0;
+          let lastSuppressReason = null;
+          if (conversationId === "main" && Array.isArray(rawMessages)) {
+            filteredMessages = [];
+            for (const item of rawMessages) {
+              const text = typeof item?.text === "string" ? item.text : (typeof item?.content === "string" ? item.content : "");
+              const isProactive = item?.role === "assistant" && (item?.proactive === true || isProactiveSupervisorText(text));
+              if (!isProactive) {
+                filteredMessages.push(item);
+                continue;
+              }
+              const verdict = await hubProactiveGuard.evaluate({
+                text,
+                kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
+                decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
+                alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true
+              });
+              if (!verdict.send) {
+                suppressedCount += 1;
+                lastSuppressReason = verdict.reason ?? "suppressed";
+                continue;
+              }
+              filteredMessages.push({
+                ...item,
+                text: verdict.text,
+                proactive: true,
+                proactiveMeta: {
+                  ...(item?.proactiveMeta && typeof item.proactiveMeta === "object" ? item.proactiveMeta : {}),
+                  agentReviewed: verdict.agentReviewed === true
+                }
+              });
+            }
+            if (filteredMessages.length === 0 && suppressedCount > 0) {
+              return sendJson(res, 200, {
+                ok: true,
+                thread: "supervisor",
+                conversationId,
+                appended: [],
+                suppressed: true,
+                reason: lastSuppressReason
+              });
+            }
+          }
           return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
-            conversationId: typeof body.conversationId === "string" ? body.conversationId : "main",
-            messages: body.messages,
+            conversationId,
+            messages: filteredMessages,
             sourceName: typeof body.sourceName === "string" ? body.sourceName : null,
             sourceNodeId: typeof body.sourceNodeId === "string" ? body.sourceNodeId : null
           }));
