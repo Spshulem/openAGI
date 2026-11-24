@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 export const NODE_ENROLLMENT_CODE_TTL_MS = 30 * 60 * 1000;
+export const DELEGATED_ENROLLMENT_CODE_TTL_MS = 10 * 60 * 1000;
 export const NODE_ENROLLMENT_MAX_ATTEMPTS = 5;
 export const NODE_ENROLLMENT_LOCKOUT_MS = 15 * 60 * 1000;
 
@@ -15,10 +16,11 @@ export class NodeEnrollmentCodes {
     this.lockedUntil = 0;
   }
 
-  issue(platform, { now = Date.now() } = {}) {
+  issue(platform, { now = Date.now(), ttlMs = NODE_ENROLLMENT_CODE_TTL_MS, issuedVia = null } = {}) {
     if (!this.platforms.has(platform)) throw new Error("unsupported node platform");
     const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
-    this.active = { code, platform, createdAt: now };
+    const ttl = Math.min(NODE_ENROLLMENT_CODE_TTL_MS, Math.max(60_000, Number(ttlMs) || NODE_ENROLLMENT_CODE_TTL_MS));
+    this.active = { code, platform, createdAt: now, ttlMs: ttl, issuedVia: typeof issuedVia === "string" ? issuedVia : null };
     if (now >= this.lockedUntil) {
       this.lockedUntil = 0;
       this.failedAttempts = 0;
@@ -26,7 +28,7 @@ export class NodeEnrollmentCodes {
     return {
       code,
       platform,
-      expiresAt: new Date(now + NODE_ENROLLMENT_CODE_TTL_MS).toISOString()
+      expiresAt: new Date(now + ttl).toISOString()
     };
   }
 
@@ -36,14 +38,17 @@ export class NodeEnrollmentCodes {
     // Requests made before the owner has issued a code reveal nothing and
     // must not let an internet caller pre-lock the next legitimate pairing.
     if (!this.active) return { ok: false, reason: "no-active-code" };
-    if (now - this.active.createdAt > NODE_ENROLLMENT_CODE_TTL_MS) {
+    if (now - this.active.createdAt > this.active.ttlMs) {
       this.active = null;
       return this._fail(now, "expired");
     }
     if (this.active.platform !== platform || !safeEqual(code, this.active.code)) {
       return this._fail(now, "invalid");
     }
-    const enrollment = { platform: this.active.platform };
+    const enrollment = {
+      platform: this.active.platform,
+      ...(this.active.issuedVia ? { issuedVia: this.active.issuedVia } : {})
+    };
     this.active = null;
     this.failedAttempts = 0;
     return { ok: true, ...enrollment };
