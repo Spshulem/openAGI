@@ -290,10 +290,9 @@ function selectExecutionModeId(providerEntry, sourceAgent = null, permissionMode
 function normalizeFailoverTitle(raw) {
   return String(raw ?? "")
     .toLowerCase()
-    // Strip leading emojis/symbols and Paseo's auto-summarized "Continue " prefix.
-    .replace(/^[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D\s\-–—:]+/gu, "")
-    .replace(/^(?:continu(?:e|ing)|resume|resuming)\s+/i, "")
     .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/^(?:continu(?:e|ing)|resume|resuming)\s+/i, "")
     .trim();
 }
 
