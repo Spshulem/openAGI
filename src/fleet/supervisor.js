@@ -37,7 +37,7 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
-import { failoverPaseoSessionProvider } from "./paseo-delivery.js";
+import { failoverPaseoSessionProvider, titlesMatchForFailover } from "./paseo-delivery.js";
 import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import { OwnerPrecedentStore } from "./precedent-memory.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -541,6 +541,64 @@ function failoverSignature(thread) {
   ]));
 }
 
+const AUTO_FAILOVER_MAX_AGE_MS = 24 * 60 * 60_000;
+
+// Autonomous background Paseo actions (auto-failover, precedent nudges, and
+// goal-continuation) only act on this host's own Paseo sessions unless remote
+// management is explicitly enabled. This prevents multiple paired OpenAGI
+// supervisors (e.g. Mac + BuildBot3) from double-spawning failovers or
+// tag-teaming the same remote session with separate ledgers.
+function allowsAutonomousPaseoAction(thread, config) {
+  if (thread?.kind !== "paseo") return true;
+  if (config?.paseo?.manageRemoteHosts === true) return true;
+  return thread?.meta?.isLocalHost !== false;
+}
+
+// Detects when an agent's latest reply explicitly reports that the tracked
+// goal / Definition of Done is already complete, so the supervisor stops
+// nagging it and hands off to owner verification instead.
+function agentReportedGoalComplete(thread) {
+  const text = stripAgentInternalMarkup(String(thread?.lastAgentFull || thread?.lastAgentText || ""));
+  if (!text) return false;
+  const claimsDone = /\b(?:definition\s+of\s+done\s+(?:is|has\s+been)\s+(?:met|satisfied|complete|completed)|(?:the\s+)?goal\s+(?:is|has\s+been)\s+(?:met|complete|completed|achieved)|nothing\s+(?:in[\s-]scope\s+)?(?:is\s+)?left\s+to\s+(?:do|run|execute)|no\s+new\s+work\s+(?:left|remaining|this\s+turn)|all\s+(?:in[\s-]scope\s+)?(?:items|work|steps|sections|checks)\s+(?:are|have\s+been)\s+(?:complete|completed|verified|done)|ready\s+for\s+(?:your|owner)\s+(?:review|sign[\s-]off|verification))\b/i.test(text);
+  if (!claimsDone) return false;
+  const indicatesRemaining = /\b(?:not\s+(?:yet\s+)?(?:met|complete|completed|done|verified)|remaining\s+(?:items|batches|steps|tables|issues)|next\s+batch|still\s+(?:blocked|need\s+to|failing|pending|missing|unverified))\b/i.test(text);
+  return !indicatesRemaining;
+}
+
+function findExistingFailoverContinuation(sourceThread, items = []) {
+  const serverId = sourceThread?.meta?.serverId;
+  const cwd = String(sourceThread?.meta?.paseoCwd ?? "").trim();
+  const sourceProvider = String(sourceThread?.meta?.provider ?? "").trim().toLowerCase().split("/")[0];
+  if (!serverId || !cwd || !sourceProvider) return null;
+  const errorAtMs = Date.parse(sourceThread?.error?.at ?? sourceThread?.lastAgentAt ?? "") || 0;
+  const sourceCreatedMs = Date.parse(sourceThread?.meta?.createdAt ?? "") || 0;
+  const minCreatedMs = errorAtMs > 0 ? errorAtMs - 5 * 60_000 : sourceCreatedMs;
+  for (const entry of items) {
+    const cand = entry?.thread;
+    if (!cand || cand.key === sourceThread.key || cand.kind !== "paseo" || cand.archived) continue;
+    if (cand.agentStatus === "error" || cand.error) continue;
+    if (cand.meta?.serverId !== serverId) continue;
+    if (String(cand.meta?.paseoCwd ?? "").trim() !== cwd) continue;
+    const candProvider = String(cand.meta?.provider ?? "").trim().toLowerCase().split("/")[0];
+    if (!candProvider || candProvider === sourceProvider) continue;
+    if (!titlesMatchForFailover(sourceThread.title, cand.title)) continue;
+    const candCreatedMs = Date.parse(cand.meta?.createdAt ?? cand.lastActivityAt ?? "") || 0;
+    if (minCreatedMs > 0 && candCreatedMs > 0 && candCreatedMs < minCreatedMs) continue;
+    return cand;
+  }
+  return null;
+}
+
+function nudgeProgressMark(itemPr, activeGoal) {
+  return {
+    head: itemPr?.headOid ?? null,
+    unresolved: itemPr?.unresolvedThreads ?? null,
+    processed: activeGoal?.cursor?.processed ?? null,
+    remaining: activeGoal?.cursor?.remaining ?? activeGoal?.remainingCount ?? null
+  };
+}
+
 // A goal the owner snoozed or paused, or whose last batch is done and waits
 // for the owner's sign-off, is never restarted automatically: the sign-off
 // request is surfaced by Active Work follow-through instead.
@@ -999,6 +1057,7 @@ export class FleetSupervisor {
       const reachable = this.mode === "auto"
         && thread
         && !thread.watchOnly && !thread.meta?.watchOnly
+        && allowsAutonomousPaseoAction(thread, this.config)
         // Only an agent's own ask: Supervisor-raised questions (limits,
         // capped models, stuck groups) have no agent that knows more.
         && ["agent-ask", "agent-card"].includes(question.kind)
@@ -3285,9 +3344,14 @@ export class FleetSupervisor {
       kind: "nudge",
       playbook: "provider-failover",
       threadKey: switched.newKey,
-      route: "paseo-create",
+      route: switched.reused ? "paseo-reuse" : "paseo-create",
       status: "sent",
-      reason: clampText(`Switched "${switched.title || cleanKey}" from ${switched.exhaustedProvider} to ${switched.provider} (${failoverReason})`, 240),
+      reason: clampText(
+        switched.reused
+          ? `Adopted existing continuation "${switched.title || cleanKey}" (${switched.provider}) instead of duplicating ${cleanKey}`
+          : `Switched "${switched.title || cleanKey}" from ${switched.exhaustedProvider} to ${switched.provider} (${failoverReason})`,
+        240
+      ),
       detail: `Continued from ${cleanKey} in ${switched.newKey}`
     });
     this.emitFleet("provider-failover");
@@ -4911,14 +4975,46 @@ export class FleetSupervisor {
         if (!thread?.key || thread.kind !== "paseo" || thread.excluded || thread.archived) continue;
         // A watch-only session is never resumed or replaced on its own.
         if (thread.watchOnly) continue;
+        // Remote Paseo hosts are owned by their own local supervisor.
+        if (!allowsAutonomousPaseoAction(thread, config)) continue;
         if (store.mutedUntil(thread.key)) continue;
         if (classified?.state !== "infra-blocked") continue;
         if (!["usage-limit", "session-limit", "model-limit", "logged-out"].includes(String(classified?.infraKind ?? ""))) continue;
         const resetAtMs = Date.parse(thread.error?.resetAt ?? "");
         if (Number.isFinite(resetAtMs) && resetAtMs > started && resetAtMs - started <= 20 * MIN) continue;
+        const sig = failoverSignature(thread);
         // Already handed off for this same failure: the replacement owns the
         // work now, even after the old session's mute expires.
-        if (store.providerFailoverFor(thread.key)?.failureSig === failoverSignature(thread)) continue;
+        if (store.providerFailoverFor(thread.key)?.failureSig === sig) continue;
+        // Never auto-failover stale historical error sessions (> 24h old)
+        // unless they actively own an unfinished, unpaused ActiveWork goal.
+        const activeGoal = this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? null);
+        const errorAtMs = Date.parse(thread.error?.at ?? thread.lastAgentAt ?? thread.lastActivityAt ?? "") || 0;
+        if (errorAtMs > 0 && started - errorAtMs > AUTO_FAILOVER_MAX_AGE_MS && !goalAcceptsAutoContinuation(activeGoal, started)) continue;
+        // If a live continuation session on an alternate provider already exists
+        // in Paseo (e.g. from another host or before a state reset), adopt it
+        // instead of creating a duplicate "Continue ..." session.
+        const existingContinuation = findExistingFailoverContinuation(thread, items);
+        if (existingContinuation) {
+          this.activeWork.reassignSessionOwner(thread.key, existingContinuation.key, {
+            label: existingContinuation.title || thread.title || null,
+            note: `Adopted existing continuation (${existingContinuation.meta?.provider || "alternate"})`
+          });
+          store.markCompletionReviewed(thread.key, started);
+          store.mute(thread.key, started + 12 * 60 * MIN);
+          store.recordProviderFailover(thread.key, { newKey: existingContinuation.key, failureSig: sig });
+          for (const q of store.openQuestions()) {
+            const coversSingle = q.threadKey === thread.key
+              || (Array.isArray(q.threadKeys) && q.threadKeys.length === 1 && q.threadKeys[0] === thread.key);
+            if (coversSingle && ["limit", "session-error", "stuck"].includes(q.kind)) {
+              store.resolveQuestion(q.id, `provider failover already continued in ${existingContinuation.key}`);
+              this.resolveOutreach(q, "failover", "acted");
+            }
+          }
+          failedOverKeys.add(thread.key);
+          autoAnsweredThreads.add(thread.key);
+          continue;
+        }
         const switched = await this.switchPaseoProvider(thread.key, {
           reason: classified.reason || thread.error?.text || "usage limit reached"
         });
@@ -4962,28 +5058,43 @@ export class FleetSupervisor {
       // TestFlight MISSING_EXPORT_COMPLIANCE, transient stream disconnect).
       if (
         this.mode === "auto"
+        && allowsAutonomousPaseoAction(thread, config)
         && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
       ) {
         const ledger = store.ledgerFor(thread.key);
-        const lastNudgeMs = Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0;
+        const lastNudgeMs = Math.max(
+          Date.parse(ledger.lastNudgeAt ?? "") || 0,
+          Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0
+        );
         const cooldownOk = started - lastNudgeMs >= config.limits.nudgeCooldownMs
-          && (ledger.nudgesSinceProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
+          && (ledger.attemptsWithoutProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
         const route = cooldownOk ? chooseRoute(thread, "auto", this.lastDelivery) : null;
         if (route) {
           const precNudge = await this.precedentMemory.evaluateCandidate(
             { thread, pr: itemPr, classified, activeGoal },
             { decisionsConfig: this.config.decisions, env: this.deps.env ?? process.env, fetchImpl: this.deps.decisionsFetch ?? this.deps.fetchImpl }
           );
-          if (precNudge?.matched && precNudge.action === "nudge" && precNudge.directive) {
+          const precPlaybook = precNudge?.precedentId ? `precedent:${precNudge.precedentId}` : null;
+          const lastOwnerMs = Date.parse(thread.lastUserAt ?? "") || 0;
+          const alreadySentPrecedent = Boolean(
+            precPlaybook && ledger.nudges.some((entry) =>
+              entry?.playbook === precPlaybook
+              && entry?.status === "sent"
+              && (Date.parse(entry.sentAt ?? entry.at ?? "") || 0) >= lastOwnerMs
+            )
+          );
+          if (precNudge?.matched && precNudge.action === "nudge" && precNudge.directive && !alreadySentPrecedent) {
             decisions.push({
               threadKey: thread.key,
               state: classified.state,
               action: "nudge",
-              playbook: `precedent:${precNudge.precedentId}`,
+              playbook: precPlaybook,
               route,
               judged: true,
               reason: precNudge.summary,
               message: precNudge.directive,
+              messageHash: shortHash(precNudge.directive),
+              progressMark: nudgeProgressMark(itemPr, activeGoal),
               precedentMeta: {
                 precedentId: precNudge.precedentId,
                 summary: precNudge.summary,
@@ -5000,22 +5111,34 @@ export class FleetSupervisor {
       // Suppress premature "finished / Got it" completion receipts while an ActiveWork
       // goal for this session is still unverified, and resume if permittedNudges === "resume_owner".
       if (!isErr && activeGoal && !activeGoal.outcomeVerified) {
+        if (["idle-no-pr", "done"].includes(classified.state) && agentReportedGoalComplete(thread)) {
+          if (!activeGoal.awaitingFollowup) {
+            activeGoal.awaitingFollowup = true;
+            this.activeWork._save?.();
+          }
+          continue;
+        }
         if (
           this.mode === "auto"
+          && allowsAutonomousPaseoAction(thread, config)
           && activeGoal.permittedNudges === "resume_owner"
           && goalAcceptsAutoContinuation(activeGoal, started)
           && ["idle-no-pr", "done"].includes(classified.state)
           && !decisions.some((d) => d.threadKey === thread.key && SENDING.has(d.action))
         ) {
           const ledger = store.ledgerFor(thread.key);
-          const lastNudgeMs = Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0;
+          const lastNudgeMs = Math.max(
+            Date.parse(ledger.lastNudgeAt ?? "") || 0,
+            Date.parse(ledger.nudges.at(-1)?.at ?? "") || 0
+          );
           const cooldownOk = started - lastNudgeMs >= config.limits.nudgeCooldownMs
-            && (ledger.nudgesSinceProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
+            && (ledger.attemptsWithoutProgress ?? 0) < config.limits.maxNudgesWithoutProgress;
           const route = cooldownOk ? chooseRoute(thread, "auto", this.lastDelivery) : null;
           if (route) {
             const cursorNote = activeGoal.cursor?.remaining != null
               ? ` (${activeGoal.cursor.remaining} remaining)`
               : (Number.isInteger(activeGoal.remainingCount) && activeGoal.remainingCount > 0 ? ` (${activeGoal.remainingCount} remaining)` : "");
+            const continuationMsg = `Active goal continuation${cursorNote}: "${clampText(activeGoal.goal, 260)}". Definition of Done: "${clampText(activeGoal.doneCriteria || "Verify all in-scope items are complete", 260)}". Continue the next batch or remaining verification steps until Done Criteria is met (do not merge PRs, deploy to production, send external customer messages, or spend money without owner approval). If blocked on the owner, state the exact decision needed.`;
             decisions.push({
               threadKey: thread.key,
               state: classified.state,
@@ -5024,7 +5147,9 @@ export class FleetSupervisor {
               route,
               judged: true,
               reason: `active goal unverified${cursorNote}: ${clampText(activeGoal.goal, 120)}`,
-              message: `Active goal continuation${cursorNote}: "${clampText(activeGoal.goal, 260)}". Definition of Done: "${clampText(activeGoal.doneCriteria || "Verify all in-scope items are complete", 260)}". Continue the next batch or remaining verification steps until Done Criteria is met (do not merge PRs, deploy to production, send external customer messages, or spend money without owner approval). If blocked on the owner, state the exact decision needed.`
+              message: continuationMsg,
+              messageHash: shortHash(continuationMsg),
+              progressMark: nudgeProgressMark(itemPr, activeGoal)
             });
           }
         }
@@ -5212,8 +5337,10 @@ export class FleetSupervisor {
         && fields.threadKey
         && !fields.mergeAsk
         && !store.mutedUntil(fields.threadKey)
-        // Precedents never answer a watch-only session on the owner's behalf.
+        // Precedents never answer a watch-only session on the owner's behalf,
+        // and never race a peer supervisor on a remote Paseo host.
         && !(byKey.get(fields.threadKey)?.watchOnly || askThread?.watchOnly)
+        && allowsAutonomousPaseoAction(byKey.get(fields.threadKey) ?? askThread, config)
         && sends < config.limits.maxSendsPerTick
       ) {
         const askActiveGoal = this.activeWork.findActiveGoalForThread(fields.threadKey, askPrRef);
@@ -5424,6 +5551,10 @@ export class FleetSupervisor {
       // PR read just above) goes first: checked again right before each send.
       if (decision.action === "nudge" && target?.meta?.paseoClosed) {
         decision.reason = `${decision.reason}; held: Paseo session sleeping`;
+        continue;
+      }
+      if (decision.action === "nudge" && !allowsAutonomousPaseoAction(target, config)) {
+        decision.reason = `${decision.reason}; held: remote Paseo host owned by peer supervisor`;
         continue;
       }
       if (decision.action === "nudge" && (this.pushing.has(decision.threadKey) || this.ownerAnswerThreads(started).has(decision.threadKey))) {
