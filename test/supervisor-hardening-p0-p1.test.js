@@ -918,3 +918,186 @@ test("Codex review fixes: set_provider writes CHATGPT_MODEL / CODEX_CLI_MODEL / 
   assert.equal(process.env.CHATGPT_MODEL, "gpt-6.2-sol");
   assert.equal(process.env.OPENAI_MODEL, undefined);
 });
+
+test("Codex round-2 fixes: security preferences stay gated, unconfirmed queued sends never replay, unsupported effort rolls back, duplicate/blocked reuse never clones, and local hub posts share guard", async (t) => {
+  // 1. fleet_preferences with defaultPermissionMode='bypass' stays gated on a tainted status-read turn.
+  const dir1 = makeTmpDir(t, "pref-sec-");
+  const pendingActions = new PendingActionStore({ dir: dir1 });
+  const reg = new ToolRegistry();
+  reg.pendingActions = pendingActions;
+  let prefCalls = 0;
+  reg.register({
+    name: "fleet_preferences",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    handler: async () => { prefCalls += 1; return { status: "updated" }; }
+  });
+  const owner = ownerPrincipal("phone", "iphone-1");
+  const statusCtx = {
+    sessionId: "devices:supervisor:main",
+    __owner: owner,
+    __turn: { untrusted: true, intent: "What is the status of the checkout work?", supervisorAutoApprove: true }
+  };
+  const unsafePref = await reg.invoke("fleet_preferences", { defaultPermissionMode: "bypass" }, statusCtx);
+  assert.equal(unsafePref.ok, true);
+  assert.equal(unsafePref.result?.status, "awaiting_owner_confirmation");
+  assert.equal(prefCalls, 0);
+
+  // Notification cadence bookkeeping still runs directly without confirmation.
+  const safePref = await reg.invoke("fleet_preferences", { cadence: "off" }, statusCtx);
+  assert.equal(safePref.ok, true);
+  assert.equal(safePref.result?.status, "updated");
+  assert.equal(prefCalls, 1);
+
+  // 2. Unconfirmed queued delivery is removed immediately and NEVER replayed on a subsequent drain.
+  const dir2 = makeTmpDir(t, "unconfirmed-q-");
+  let deliverCalls = 0;
+  const sup2 = new FleetSupervisor({
+    dataDir: dir2,
+    config: { mode: "propose", paseo: { enabled: true, only: true } },
+    deps: {
+      executor: {
+        async deliver() {
+          deliverCalls += 1;
+          return {
+            status: "blocked",
+            unconfirmed: true,
+            route: "paseo-send",
+            detail: "Previous delivery has no confirmed turn; no automatic resend"
+          };
+        }
+      }
+    }
+  });
+  const thread2 = {
+    key: "paseo:host1.agent-unc",
+    kind: "paseo",
+    id: "agent-unc",
+    title: "Checkout PR #910",
+    cwd: "/work/app",
+    agentStatus: "running",
+    meta: { serverId: "host1", paseoCwd: "/work/app" }
+  };
+  sup2.lastThreads.set(thread2.key, thread2);
+  await sup2.sendOwnerMessage(thread2.key, "Run final deploy checks");
+  assert.equal(sup2.store.queuedOwnerMessages(thread2.key).length, 1);
+  sup2.lastThreads.set(thread2.key, { ...thread2, agentStatus: "idle" });
+  const firstDrain = await sup2.drainQueuedOwnerMessages();
+  assert.equal(firstDrain.length, 1);
+  assert.equal(firstDrain[0].status, "unconfirmed");
+  assert.equal(sup2.store.queuedOwnerMessages(thread2.key).length, 0, "unconfirmed delivery must not remain in retry queue");
+  const secondDrain = await sup2.drainQueuedOwnerMessages();
+  assert.equal(secondDrain.length, 0);
+  assert.equal(deliverCalls, 1, "must never automatically resend an unconfirmed delivery");
+
+  // 3. set_provider rejects unsupported reasoningEffort ('xhigh' on 'gpt-5') and rolls back env cleanly.
+  const dir3 = makeTmpDir(t, "effort-val-");
+  const prevEnv = {
+    OPENAGI_DATA_DIR: process.env.OPENAGI_DATA_DIR,
+    OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT
+  };
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    _resetDataDirCache();
+  });
+  process.env.OPENAGI_DATA_DIR = dir3;
+  _resetDataDirCache();
+  process.env.OPENAGI_PROVIDER = "openai";
+  process.env.OPENAI_API_KEY = "sk-test-fake-key-1234567890";
+  process.env.OPENAI_MODEL = "gpt-5.4";
+  delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+  const store3 = new InMemoryAgentStore({ storePath: path.join(dir3, "sessions.json") });
+  store3.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const runtime3 = {
+    agentHost: { store: store3, modelProvider: { constructor: { name: "OpenAIResponsesProvider" }, model: "gpt-5.4" } },
+    budget: null
+  };
+  const reg3 = new ToolRegistry();
+  registerCoreTools(reg3, runtime3);
+  const badEffort = await reg3.invoke("set_provider", { model: "gpt-5", reasoningEffort: "xhigh" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(badEffort.ok, true);
+  assert.equal(badEffort.result.ok, false);
+  assert.match(badEffort.result.error, /not supported/i);
+  assert.equal(process.env.OPENAI_MODEL, "gpt-5.4", "model env must roll back on unsupported effort");
+  assert.equal(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT, undefined, "unsupported effort must not be persisted");
+
+  // 4. Duplicate or blocked match in startPaseoSession NEVER falls through to api.agents.create.
+  let createCalls = 0;
+  const dupFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "host1" }, hosts: [] }) },
+    agents: {
+      list: async () => ({ agents: [] }),
+      create: async () => { createCalls += 1; return { id: "clone-bad" }; }
+    }
+  });
+  const dupSup = {
+    config: { paseo: { enabled: true } },
+    lastThreads: new Map([[thread2.key, { ...thread2, agentStatus: "idle" }]]),
+    knownThreads: new Map(),
+    store: { recordAction() {} },
+    sendOwnerMessage: async () => ({ delivery: { status: "blocked", duplicate: true, route: "paseo-send", detail: "already in this chat" } })
+  };
+  const dupRes = await startPaseoSession(dupSup, {
+    title: "Checkout PR #910",
+    prompt: "Run final deploy checks",
+    cwd: "/work/app",
+    serverId: "host1",
+    factory: dupFactory
+  });
+  assert.equal(dupRes.reused, true);
+  assert.equal(dupRes.duplicate, true);
+  assert.equal(createCalls, 0, "duplicate match must reuse existing session without spawning a clone");
+
+  dupSup.sendOwnerMessage = async () => ({ delivery: { status: "blocked", route: null, detail: "permission prompt pending" } });
+  const blkRes = await startPaseoSession(dupSup, {
+    title: "Checkout PR #910",
+    prompt: "Another instruction",
+    cwd: "/work/app",
+    serverId: "host1",
+    factory: dupFactory
+  });
+  assert.equal(blkRes.status, "blocked");
+  assert.equal(blkRes.reused, true);
+  assert.equal(createCalls, 0, "blocked existing session must not silently fall through to create a clone");
+
+  // 5. Local hub postSupervisorChatUpdate routes through runtime.hubProactiveGuard and shares cooldown with remote appends!
+  const dir5 = makeTmpDir(t, "shared-hub-guard-");
+  let now5 = Date.parse("2026-11-24T20:00:00.000Z");
+  const sessionStore5 = new InMemoryAgentStore({ storePath: path.join(dir5, "sessions.json") });
+  sessionStore5.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const sharedGuard = createHubProactiveGuard({
+    getPreferences: () => ({ cadence: "balanced", checkinCooldownMinutes: 30 }),
+    getRecentMessages: () => sessionStore5.getSession("devices:supervisor:main")?.messages ?? [],
+    now: () => now5,
+    judgeProactiveUpdate: async ({ candidateText }) => ({ send: true, text: candidateText, reason: "ok" })
+  });
+  const sup5 = new FleetSupervisor({
+    dataDir: dir5,
+    runtime: { agentHost: { store: sessionStore5 }, hubProactiveGuard: sharedGuard, events: { emit() {} } },
+    config: { mode: "propose", proactiveSupervisorChat: true, paseo: { enabled: true, only: true } },
+    deps: { now: () => now5 }
+  });
+  const localPost = await sup5.postSupervisorChatUpdate("**Supervisor check-in: one decision needs you.**\nLocal decision A", {
+    dedupeKey: "local-a",
+    metadata: { kind: "proactive_supervisor_delta", decisionKeys: ["k:a"], decisionTokens: ["k:a:h1"] }
+  });
+  assert.equal(localPost.posted, true);
+  // 2 minutes later, a paired-node append hits the EXACT SAME hub guard and is deferred by global cooldown!
+  now5 += 2 * 60_000;
+  const remoteAttempt = await sharedGuard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nRemote decision B",
+    decisionKeys: ["k:b"],
+    decisionTokens: ["k:b:h1"]
+  });
+  assert.equal(remoteAttempt.send, false);
+  assert.equal(remoteAttempt.deferred, true);
+  assert.equal(remoteAttempt.reason, "hub_cooldown");
+});

@@ -2784,6 +2784,25 @@ export class FleetSupervisor {
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
         results.push({ id: entry.id, threadKey: entry.threadKey, status: "sent", delivery });
+      } else if (
+        delivery?.unconfirmed === true
+        || /previous delivery has no confirmed turn|no automatic resend|turn confirmation timed out/i.test(String(delivery?.detail ?? ""))
+      ) {
+        // Never replay an uncertain/accepted Paseo delivery as a fresh owner
+        // send: remove from the retry queue and leave its durable receipt for
+        // reconciliation without risking duplicate execution.
+        this.store.removeQueuedOwnerMessage(entry.id);
+        this.store.recordAction({
+          threadKey: entry.threadKey,
+          playbook: "owner-message",
+          status: "blocked",
+          route: "paseo-queue",
+          detail: clampText(
+            delivery?.detail || "Queued message reached Paseo but turn confirmation timed out; held without automatic resend.",
+            240
+          )
+        });
+        results.push({ id: entry.id, threadKey: entry.threadKey, status: "unconfirmed", delivery });
       } else {
         this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
         results.push({ id: entry.id, threadKey: entry.threadKey, status: delivery?.status ?? "blocked", delivery });
@@ -2839,11 +2858,36 @@ export class FleetSupervisor {
     const remoteRequired = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     const sessionStore = this.runtime?.agentHost?.store;
 
-    // Context-aware agent review on the hub (or when a test injects judgeProactiveUpdate):
-    // let Peri inspect recent Supervisor chat history and preferences before interrupting
-    // Spencer, suppressing redundant/stale/contradictory follow-ups instead of blindly spamming.
+    // Context-aware agent review + shared hub proactive gate:
+    // On the hub, route local proactive updates through the exact same
+    // serialized `hubProactiveGuard` used by paired-node appends so local and
+    // remote digests share one cooldown, dedupe map, and agent review pass.
     let agentReviewed = false;
-    if (proactive && (!remoteRequired || typeof this.deps.judgeProactiveUpdate === "function")) {
+    if (proactive && !remoteRequired && typeof this.runtime?.hubProactiveGuard?.evaluate === "function") {
+      const verdict = await this.runtime.hubProactiveGuard.evaluate({
+        text: cleanContent,
+        kind: metadata?.kind ?? "proactive_supervisor_delta",
+        decisionKeys: Array.isArray(metadata?.decisionKeys) ? metadata.decisionKeys : [],
+        decisionTokens: Array.isArray(metadata?.decisionTokens) ? metadata.decisionTokens : [],
+        alreadyAgentReviewed: false,
+        judgeFn: this.deps.judgeProactiveUpdate ?? null
+      });
+      agentReviewed = verdict.agentReviewed === true;
+      if (!verdict.send) {
+        const isDeferred = Boolean(verdict.deferred === true || verdict.reason === "hub_cooldown");
+        if (dedupeKey && !isDeferred) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
+        return {
+          posted: false,
+          suppressed: true,
+          deferred: isDeferred,
+          agentReviewed,
+          reason: verdict.reason || "suppressed_by_hub"
+        };
+      }
+      if (verdict.text) {
+        cleanContent = clampTailLines(redactSecrets(String(verdict.text).trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
+      }
+    } else if (proactive && (!remoteRequired || typeof this.deps.judgeProactiveUpdate === "function")) {
       const recentMessages = sessionStore?.getSession?.("devices:supervisor:main")?.messages ?? [];
       const verdict = await reviewProactiveUpdateWithAgent({
         candidateText: cleanContent,

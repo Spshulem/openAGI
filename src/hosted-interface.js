@@ -266,8 +266,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     getPreferences: () => runtime.fleetSupervisor?.getState?.()?.preferences ?? {},
     getRecentMessages: () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [],
     getModelProvider: () => runtime.agentHost?.modelProvider ?? channels?.agentHost?.modelProvider ?? null,
+    getLastPostedAtMs: () => Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
+    onPosted: (atMs) => {
+      try { runtime.fleetSupervisor?.store?.recordProactiveChatAt?.(atMs); } catch { /* best-effort */ }
+    },
     judgeProactiveUpdate: options.judgeProactiveUpdate ?? null
   });
+  runtime.hubProactiveGuard = hubProactiveGuard;
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;

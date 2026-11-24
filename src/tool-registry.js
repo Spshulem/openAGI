@@ -329,12 +329,19 @@ export class ToolRegistry {
       turn.supervisorAutoApprove === true
       && owner.via !== "voice"
     );
-    // Internal non-destructive Supervisor bookkeeping & preference tools never
-    // need a spoken "yes <N>" gate on an authenticated non-voice owner turn.
-    // Hard Red Lines (PR merges, deploys, app restarts, deletes, external sends,
-    // spending money, credentials) stay strictly gated.
+    // Internal non-destructive Supervisor bookkeeping & notification-display
+    // preferences never need a spoken "yes <N>" gate on an authenticated
+    // non-voice owner turn. Security/autonomy-changing preference fields
+    // (defaultPermissionMode, mergePolicy, autoSlices, choice, etc.) and Hard
+    // Red Lines stay strictly subject to owner-intent / confirmation checks.
+    const SAFE_PREFERENCE_BOOKKEEPING_KEYS = new Set(["cadence", "checkinCooldownMinutes", "checkinFormat"]);
+    const isSafePreferenceBookkeeping = tool.name === "fleet_preferences"
+      && args && typeof args === "object"
+      && Object.keys(args).length > 0
+      && Object.keys(args).every((k) => SAFE_PREFERENCE_BOOKKEEPING_KEYS.has(k));
     const isNonDestructiveOwnerBookkeeping = isOwnerNonVoiceSupervisor && (
-      ["fleet_track_work", "fleet_preferences", "fleet_organize_project", "fleet_sync_themes"].includes(tool.name)
+      ["fleet_track_work", "fleet_organize_project", "fleet_sync_themes"].includes(tool.name)
+      || isSafePreferenceBookkeeping
       || (tool.name === "fleet_act_active_work" && !["propose_archive", "resume_owner"].includes(String(args?.op ?? "")))
     );
     const conversationalCover = ((
@@ -1450,45 +1457,11 @@ export function registerCoreTools(registry, runtime) {
         }
       }
 
-      if (inferredPref) {
-        process.env.OPENAGI_PROVIDER = inferredPref;
-        envUpdates.OPENAGI_PROVIDER = inferredPref;
-      }
-
-      if (requestedModel) {
-        const isClaude = /^claude/i.test(requestedModel) || inferredPref === "anthropic" || inferredPref === "claude-cli";
-        const effectivePref = String(inferredPref || process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
-        const currentClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
-        const resolveModelEnvKey = () => {
-          if (effectivePref === "anthropic") return "ANTHROPIC_MODEL";
-          if (effectivePref === "claude-cli") return "CLAUDE_CLI_MODEL";
-          if (effectivePref === "openai") return "OPENAI_MODEL";
-          if (effectivePref === "chatgpt") return "CHATGPT_MODEL";
-          if (effectivePref === "codex-cli") return "CODEX_CLI_MODEL";
-          if (isClaude) {
-            if (currentClass === "ClaudeCliProvider") return "CLAUDE_CLI_MODEL";
-            return configuredProviders.anthropic ? "ANTHROPIC_MODEL" : "CLAUDE_CLI_MODEL";
-          }
-          if (currentClass === "ChatGPTPlanProvider") return "CHATGPT_MODEL";
-          if (currentClass === "CodexCliProvider") return "CODEX_CLI_MODEL";
-          if (currentClass === "OpenAIResponsesProvider") return "OPENAI_MODEL";
-          if (configuredProviders.openai) return "OPENAI_MODEL";
-          if (configuredProviders.chatgpt) return "CHATGPT_MODEL";
-          if (configuredProviders.codexCli) return "CODEX_CLI_MODEL";
-          return "OPENAI_MODEL";
-        };
-        const modelEnvKey = resolveModelEnvKey();
-        process.env[modelEnvKey] = requestedModel;
-        envUpdates[modelEnvKey] = requestedModel;
-      }
-
       let normalizedEffort = null;
       let clearedEffort = false;
       if (rawEffort) {
         if (["default", "clear", "reset", "auto"].includes(rawEffort)) {
           clearedEffort = true;
-          delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
-          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
         } else {
           normalizedEffort = normalizeReasoningEffort(rawEffort);
           if (!normalizedEffort) {
@@ -1497,14 +1470,93 @@ export function registerCoreTools(registry, runtime) {
               error: `Invalid reasoningEffort "${rawEffort}". Use one of: none, minimal, low, medium, high, xhigh (extra high), or default.`
             };
           }
-          process.env.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
-          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
         }
       }
 
+      const modelEnvKey = requestedModel
+        ? (() => {
+            const isClaude = /^claude/i.test(requestedModel) || inferredPref === "anthropic" || inferredPref === "claude-cli";
+            const effectivePref = String(inferredPref || process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
+            const currentClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
+            if (effectivePref === "anthropic") return "ANTHROPIC_MODEL";
+            if (effectivePref === "claude-cli") return "CLAUDE_CLI_MODEL";
+            if (effectivePref === "openai") return "OPENAI_MODEL";
+            if (effectivePref === "chatgpt") return "CHATGPT_MODEL";
+            if (effectivePref === "codex-cli") return "CODEX_CLI_MODEL";
+            if (isClaude) {
+              if (currentClass === "ClaudeCliProvider") return "CLAUDE_CLI_MODEL";
+              return configuredProviders.anthropic ? "ANTHROPIC_MODEL" : "CLAUDE_CLI_MODEL";
+            }
+            if (currentClass === "ChatGPTPlanProvider") return "CHATGPT_MODEL";
+            if (currentClass === "CodexCliProvider") return "CODEX_CLI_MODEL";
+            if (currentClass === "OpenAIResponsesProvider") return "OPENAI_MODEL";
+            if (configuredProviders.openai) return "OPENAI_MODEL";
+            if (configuredProviders.chatgpt) return "CHATGPT_MODEL";
+            if (configuredProviders.codexCli) return "CODEX_CLI_MODEL";
+            return "OPENAI_MODEL";
+          })()
+        : null;
+
+      // Snapshot affected env keys so validation failures roll back cleanly
+      // without leaking unsupported settings into process.env or .env.
+      const prevEnvSnapshot = {
+        OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+        OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT,
+        ...(modelEnvKey ? { [modelEnvKey]: process.env[modelEnvKey] } : {})
+      };
+      const restoreEnvSnapshot = () => {
+        for (const [k, v] of Object.entries(prevEnvSnapshot)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      };
+
+      if (inferredPref) {
+        process.env.OPENAGI_PROVIDER = inferredPref;
+        envUpdates.OPENAGI_PROVIDER = inferredPref;
+      }
+      if (requestedModel && modelEnvKey) {
+        process.env[modelEnvKey] = requestedModel;
+        envUpdates[modelEnvKey] = requestedModel;
+      }
+
       const { createModelProvider } = await import("./model-provider.js");
+      const candidateProvider = createModelProvider({ budgetGuard: runtime.budget });
+      const candidateModel = candidateProvider?.resolveModel?.({ task: "chat" }) ?? candidateProvider?.model ?? null;
+
+      // Validate reasoningEffort against the selected provider & model BEFORE
+      // persisting to process.env / .env so unsupported efforts (e.g. xhigh on
+      // gpt-5) never break subsequent chat turns.
+      if (normalizedEffort) {
+        const support = typeof candidateProvider?.reasoningEffortSupport === "function"
+          ? candidateProvider.reasoningEffortSupport({ task: "chat" })
+          : { supported: false, options: [], reason: "Active provider does not support reasoning effort." };
+        const allowed = Array.isArray(support?.options) ? support.options : [];
+        if (!support?.supported || !allowed.includes(normalizedEffort)) {
+          restoreEnvSnapshot();
+          return {
+            ok: false,
+            error: allowed.length > 0
+              ? `Reasoning effort "${normalizedEffort}" is not supported by ${candidateModel || candidateProvider?.constructor?.name || "the active model"}. Supported efforts: ${allowed.join(", ")}.`
+              : (support?.reason || `The active model (${candidateModel || candidateProvider?.constructor?.name || "unknown"}) does not support a reasoning effort setting.`),
+            model: candidateModel,
+            supportedEfforts: allowed,
+            configuredProviders
+          };
+        }
+        process.env.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+        envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+      } else if (clearedEffort) {
+        delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+        envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+      }
+
+      // Rebuild provider with the validated effort env var in place.
+      const finalProvider = (normalizedEffort || clearedEffort)
+        ? createModelProvider({ budgetGuard: runtime.budget })
+        : candidateProvider;
       if (runtime.agentHost) {
-        runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+        runtime.agentHost.modelProvider = finalProvider;
       }
       // Also mirror reasoningEffort onto the current chat session override so
       // per-session overrides never shadow a newly requested effort.
@@ -1517,7 +1569,7 @@ export function registerCoreTools(registry, runtime) {
             effort: clearedEffort ? null : normalizedEffort,
             setBy: "owner:set_provider"
           });
-        } catch { /* unsupported provider effort is reported in readback below */ }
+        } catch { /* unsupported provider effort is already checked above */ }
       }
       // Persist to .env so changes survive restarts.
       if (Object.keys(envUpdates).length > 0) {

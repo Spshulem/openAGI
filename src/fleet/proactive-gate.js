@@ -247,6 +247,8 @@ export function createHubProactiveGuard({
   getRecentMessages = () => [],
   getModelProvider = () => null,
   judgeProactiveUpdate = null,
+  getLastPostedAtMs = null,
+  onPosted = null,
   now = () => Date.now()
 } = {}) {
   let lastPostedAtMs = 0;
@@ -269,7 +271,7 @@ export function createHubProactiveGuard({
     }
   };
 
-  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false } = {}) => {
+  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false, judgeFn = null } = {}) => {
     const cleanText = String(text ?? "").trim();
     if (!cleanText) return { send: false, reason: "empty" };
     const nowMs = now();
@@ -296,8 +298,10 @@ export function createHubProactiveGuard({
       return { send: false, reason: "hub_decisions_deduped" };
     }
 
+    const externalLastPosted = Number(getLastPostedAtMs?.()) || 0;
+    const effectiveLastPostedAtMs = Math.max(lastPostedAtMs, externalLastPosted);
     const cooldownMs = effectiveCheckinCooldownMs(prefs);
-    if (!skipCooldown && cooldownMs > 0 && lastPostedAtMs > 0 && nowMs - lastPostedAtMs < cooldownMs) {
+    if (!skipCooldown && cooldownMs > 0 && effectiveLastPostedAtMs > 0 && nowMs - effectiveLastPostedAtMs < cooldownMs) {
       return { send: false, deferred: true, reason: "hub_cooldown" };
     }
 
@@ -311,7 +315,7 @@ export function createHubProactiveGuard({
         recentMessages: getRecentMessages?.() ?? [],
         preferences: prefs,
         modelProvider: getModelProvider?.() ?? null,
-        judgeFn: judgeProactiveUpdate
+        judgeFn: judgeFn ?? judgeProactiveUpdate
       });
       agentReviewed = verdict.agentReviewed;
       if (!verdict.send) {
@@ -323,6 +327,7 @@ export function createHubProactiveGuard({
     }
 
     lastPostedAtMs = nowMs;
+    try { onPosted?.(nowMs); } catch { /* best-effort */ }
     recentFingerprints.set(fp, nowMs);
     recentFingerprints.set(contentFingerprint(finalText), nowMs);
     for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);

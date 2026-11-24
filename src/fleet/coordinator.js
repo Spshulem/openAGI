@@ -1602,19 +1602,21 @@ export async function startPaseoSession(supervisor, {
         ...(normalizedImages.length ? { images: normalizedImages } : {})
       });
       const deliveryStatus = sent?.delivery?.status ?? "blocked";
-      if (deliveryStatus === "sent" || deliveryStatus === "queued") {
+      const alreadyDelivered = sent?.delivery?.duplicate === true;
+      if (deliveryStatus === "sent" || deliveryStatus === "queued" || alreadyDelivered) {
         supervisor.store?.recordAction?.({
           kind: "session-reuse",
           playbook: "owner-reuse-session",
           threadKey: liveExisting.key,
           route: sent.delivery.route ?? (deliveryStatus === "queued" ? "paseo-queue" : "paseo-send"),
-          status: deliveryStatus,
+          status: alreadyDelivered ? "reused" : deliveryStatus,
           by: "owner",
           reason: clampText(`reused existing Paseo session "${liveExisting.title}" instead of creating a duplicate`, 240)
         });
         return {
           status: deliveryStatus === "queued" ? "queued_existing" : "reused_existing",
           reused: true,
+          ...(alreadyDelivered ? { duplicate: true } : {}),
           key: liveExisting.key,
           serverId: resolvedServerId,
           agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
@@ -1628,6 +1630,24 @@ export async function startPaseoSession(supervisor, {
           openChat: openChatFor(liveExisting)
         };
       }
+      // Never silently fall through to api.agents.create and spawn a duplicate
+      // clone when an existing live session matched but blocked delivery (e.g.
+      // pending permission prompt); propagate the blocked reuse result cleanly.
+      return {
+        status: "blocked",
+        reused: true,
+        key: liveExisting.key,
+        serverId: resolvedServerId,
+        agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
+        title: liveExisting.title,
+        workspace: workspaceLabel ?? liveExisting.workspace ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+        inferredWorkspace,
+        cwd: resolvedCwd,
+        provider: liveExisting.meta?.provider ?? null,
+        model: liveExisting.meta?.model ?? null,
+        delivery: sent?.delivery ?? { status: "blocked", route: null, detail: "Existing session blocked delivery; no duplicate session created." },
+        openChat: openChatFor(liveExisting)
+      };
     }
   }
 
