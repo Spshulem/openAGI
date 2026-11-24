@@ -271,7 +271,7 @@ export function createHubProactiveGuard({
     }
   };
 
-  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false, judgeFn = null } = {}) => {
+  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false, judgeFn = null, persist = null } = {}) => {
     const cleanText = String(text ?? "").trim();
     if (!cleanText) return { send: false, reason: "empty" };
     const nowMs = now();
@@ -298,10 +298,14 @@ export function createHubProactiveGuard({
       return { send: false, reason: "hub_decisions_deduped" };
     }
 
+    // Post-send verification failure notices on owner-directed watches are
+    // one-shot truth reports (resolved once the watch settles), so exempt them
+    // from global check-in cooldown rather than silently dropping them.
+    const bypassCooldown = skipCooldown === true || kind === "follow_through_verification";
     const externalLastPosted = Number(getLastPostedAtMs?.()) || 0;
     const effectiveLastPostedAtMs = Math.max(lastPostedAtMs, externalLastPosted);
     const cooldownMs = effectiveCheckinCooldownMs(prefs);
-    if (!skipCooldown && cooldownMs > 0 && effectiveLastPostedAtMs > 0 && nowMs - effectiveLastPostedAtMs < cooldownMs) {
+    if (!bypassCooldown && cooldownMs > 0 && effectiveLastPostedAtMs > 0 && nowMs - effectiveLastPostedAtMs < cooldownMs) {
       return { send: false, deferred: true, reason: "hub_cooldown" };
     }
 
@@ -326,12 +330,27 @@ export function createHubProactiveGuard({
       finalText = verdict.text || cleanText;
     }
 
+    // Commit dedupe & cooldown state ONLY after persistence succeeds when a
+    // persist callback is provided, so a failed conversation-store append never
+    // permanently suppresses retries after storage recovers.
+    let persistResult = null;
+    if (typeof persist === "function") {
+      try {
+        persistResult = await persist(finalText, { agentReviewed });
+        if (persistResult === false || persistResult?.ok === false) {
+          return { send: false, deferred: true, reason: "persist_failed", agentReviewed };
+        }
+      } catch (error) {
+        return { send: false, deferred: true, reason: "persist_failed", error, agentReviewed };
+      }
+    }
+
     lastPostedAtMs = nowMs;
     try { onPosted?.(nowMs); } catch { /* best-effort */ }
     recentFingerprints.set(fp, nowMs);
     recentFingerprints.set(contentFingerprint(finalText), nowMs);
     for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);
-    return { send: true, text: finalText, agentReviewed };
+    return { send: true, text: finalText, agentReviewed, ...(persistResult != null ? { persistResult } : {}) };
   };
 
   return {

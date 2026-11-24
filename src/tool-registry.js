@@ -335,14 +335,24 @@ export class ToolRegistry {
     // (defaultPermissionMode, mergePolicy, autoSlices, choice, etc.) and Hard
     // Red Lines stay strictly subject to owner-intent / confirmation checks.
     const SAFE_PREFERENCE_BOOKKEEPING_KEYS = new Set(["cadence", "checkinCooldownMinutes", "checkinFormat"]);
+    const SAFE_ACTIVE_WORK_BOOKKEEPING_OPS = new Set([
+      "scan_inventory",
+      "schedule_recheck",
+      "snooze",
+      "enroll_project",
+      "dismiss_proposal",
+      "assign_orphan"
+    ]);
     const isSafePreferenceBookkeeping = tool.name === "fleet_preferences"
       && args && typeof args === "object"
       && Object.keys(args).length > 0
       && Object.keys(args).every((k) => SAFE_PREFERENCE_BOOKKEEPING_KEYS.has(k));
+    const isSafeActiveWorkBookkeeping = tool.name === "fleet_act_active_work"
+      && SAFE_ACTIVE_WORK_BOOKKEEPING_OPS.has(String(args?.op ?? "").trim().toLowerCase());
     const isNonDestructiveOwnerBookkeeping = isOwnerNonVoiceSupervisor && (
       ["fleet_track_work", "fleet_organize_project", "fleet_sync_themes"].includes(tool.name)
       || isSafePreferenceBookkeeping
-      || (tool.name === "fleet_act_active_work" && !["propose_archive", "resume_owner"].includes(String(args?.op ?? "")))
+      || isSafeActiveWorkBookkeeping
     );
     const conversationalCover = ((
       tool.supervisorAutoApprove === true

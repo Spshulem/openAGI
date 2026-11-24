@@ -1101,3 +1101,148 @@ test("Codex round-2 fixes: security preferences stay gated, unconfirmed queued s
   assert.equal(remoteAttempt.deferred, true);
   assert.equal(remoteAttempt.reason, "hub_cooldown");
 });
+
+test("Codex round-3 fixes: confirm_done stays gated, follow-through notices bypass cooldown, FIFO holds when idle with backlog, manageRemoteHosts publishes, failed persist never commits dedupe", async (t) => {
+  // 1. fleet_act_active_work op='confirm_done' stays gated on tainted status-read turn (snooze still allowed).
+  const dir1 = makeTmpDir(t, "confirm-done-gate-");
+  const pendingActions = new PendingActionStore({ dir: dir1 });
+  const reg = new ToolRegistry();
+  reg.pendingActions = pendingActions;
+  let actCalls = [];
+  reg.register({
+    name: "fleet_act_active_work",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    handler: async (args) => { actCalls.push(args.op); return { ok: true }; }
+  });
+  const owner = ownerPrincipal("phone", "iphone-1");
+  const statusCtx = {
+    sessionId: "devices:supervisor:main",
+    __owner: owner,
+    __turn: { untrusted: true, intent: "What is the status of the checkout work?", supervisorAutoApprove: true }
+  };
+  const gated = await reg.invoke("fleet_act_active_work", { id: "aw_1", op: "confirm_done" }, statusCtx);
+  assert.equal(gated.ok, true);
+  assert.equal(gated.result?.status, "awaiting_owner_confirmation");
+  assert.deepEqual(actCalls, []);
+  const snoozed = await reg.invoke("fleet_act_active_work", { id: "aw_1", op: "snooze" }, statusCtx);
+  assert.equal(snoozed.ok, true);
+  assert.deepEqual(actCalls, ["snooze"]);
+
+  // 2. follow_through_verification bypasses global cooldown, AND failed persist never commits hub dedupe!
+  let nowMs = Date.parse("2026-11-24T20:30:00.000Z");
+  let failPersist = true;
+  const guard = createHubProactiveGuard({
+    getPreferences: () => ({ cadence: "balanced", checkinCooldownMinutes: 30 }),
+    getRecentMessages: () => [],
+    now: () => nowMs,
+    judgeProactiveUpdate: async ({ candidateText }) => ({ send: true, text: candidateText, reason: "ok" })
+  });
+  const failedPersist = await guard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nPR #801 ready",
+    decisionKeys: ["ready:acme/app#801"],
+    decisionTokens: ["ready:acme/app#801:sha1"],
+    persist: async () => {
+      if (failPersist) throw new Error("disk full");
+      return { ok: true };
+    }
+  });
+  assert.equal(failedPersist.send, false);
+  assert.equal(failedPersist.deferred, true);
+  assert.equal(failedPersist.reason, "persist_failed");
+
+  // Once storage recovers, exact same message & decision token MUST succeed (not hub_deduped)!
+  failPersist = false;
+  const retriedPersist = await guard.evaluate({
+    text: "**Supervisor check-in: one decision needs you.**\nPR #801 ready",
+    decisionKeys: ["ready:acme/app#801"],
+    decisionTokens: ["ready:acme/app#801:sha1"],
+    persist: async () => ({ ok: true })
+  });
+  assert.equal(retriedPersist.send, true, "failed persist must never commit hub dedupe");
+
+  // 2 minutes later (inside 30m cooldown), a post-send follow_through_verification error still gets through!
+  nowMs += 2 * 60_000;
+  const ftwNotice = await guard.evaluate({
+    text: "**Post-send verification — Checkout hit a session error**",
+    kind: "follow_through_verification",
+    persist: async () => ({ ok: true })
+  });
+  assert.equal(ftwNotice.send, true, "follow_through_verification must bypass global check-in cooldown");
+
+  // 3. Strict per-thread FIFO: when idle with an existing queued backlog, a new ordinary message appends behind it!
+  const dir3 = makeTmpDir(t, "fifo-backlog-");
+  const deliveredOrder = [];
+  const sup3 = new FleetSupervisor({
+    dataDir: dir3,
+    config: { mode: "propose", paseo: { enabled: true, only: true } },
+    deps: {
+      executor: {
+        async deliver({ message }) {
+          deliveredOrder.push(message);
+          return { status: "sent", route: "paseo-send", detail: "delivered" };
+        }
+      }
+    }
+  });
+  const thread3 = {
+    key: "paseo:host1.agent-fifo",
+    kind: "paseo",
+    id: "agent-fifo",
+    title: "DB migration",
+    cwd: "/work/app",
+    agentStatus: "running",
+    meta: { serverId: "host1", paseoCwd: "/work/app" }
+  };
+  sup3.lastThreads.set(thread3.key, thread3);
+  await sup3.sendOwnerMessage(thread3.key, "First migrate the test database");
+  // Session becomes idle BEFORE the drain runs; a dependent second directive arrives.
+  sup3.lastThreads.set(thread3.key, { ...thread3, agentStatus: "idle" });
+  const secondQueued = await sup3.sendOwnerMessage(thread3.key, "Then run the database integration tests");
+  assert.equal(secondQueued.delivery.status, "queued", "must append behind existing backlog to preserve FIFO");
+  assert.equal(deliveredOrder.length, 0);
+  await sup3.drainQueuedOwnerMessages();
+  await sup3.drainQueuedOwnerMessages();
+  assert.deepEqual(deliveredOrder, [
+    "First migrate the test database",
+    "Then run the database integration tests"
+  ]);
+
+  // 4. manageRemoteHosts=true allows remote Paseo sessions to publish proactive check-ins.
+  const dir4 = makeTmpDir(t, "remote-manage-");
+  const sessionStore4 = new InMemoryAgentStore({ storePath: path.join(dir4, "sessions.json") });
+  sessionStore4.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const sup4 = new FleetSupervisor({
+    dataDir: dir4,
+    runtime: { agentHost: { store: sessionStore4 }, events: { emit() {} } },
+    config: { mode: "propose", proactiveSupervisorChat: true, paseo: { enabled: true, only: true, manageRemoteHosts: true } },
+    deps: { judgeProactiveUpdate: async ({ candidateText }) => ({ send: true, text: candidateText, reason: "ok" }) }
+  });
+  const remoteRow = {
+    key: "paseo:remote-host.agent-r1",
+    kind: "paseo",
+    id: "agent-r1",
+    title: "Remote managed PR #888",
+    workspace: "app",
+    agentStatus: "idle",
+    prRefs: ["acme/app#888"],
+    meta: { serverId: "remote-host", isLocalHost: false, paseoCwd: "/work/app" }
+  };
+  sup4.lastThreads.set(remoteRow.key, remoteRow);
+  sup4.store.upsertQuestion({
+    dedupeKey: "ready:acme/app#888",
+    kind: "ready",
+    threadKey: remoteRow.key,
+    prRef: "acme/app#888",
+    title: "Remote managed PR #888 ready to merge",
+    body: "All checks green.",
+    options: ["merged", "later"],
+    contextSnapshot: {
+      threadTitle: "Remote managed PR #888",
+      workspace: "app",
+      pr: { ref: "acme/app#888", state: "OPEN", ciState: "SUCCESS", head: "sha888" }
+    }
+  });
+  const remoteDigest = await sup4.maybePostProactiveSupervisorDigest({ started: Date.now() });
+  assert.equal(remoteDigest.posted, true, "manageRemoteHosts=true must allow publishing remote Paseo decisions");
+});

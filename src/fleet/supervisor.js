@@ -2637,7 +2637,11 @@ export class FleetSupervisor {
       || thread.requiresAttention === true
       || ["async_question", "permission", "input"].includes(String(thread.attentionReason ?? thread.meta?.attentionReason ?? "").toLowerCase())
     );
-    if (isPaseoSend && effectiveQueue && ownerChoice == null && !pausedForHuman && ["running", "initializing"].includes(String(thread.agentStatus ?? "").toLowerCase())) {
+    // Preserve strict per-thread FIFO: if this Paseo session already has
+    // queued ordinary messages awaiting drain, append behind that backlog
+    // instead of leapfrogging dependent instructions.
+    const hasExistingQueue = isPaseoSend && this.store.queuedOwnerMessages(effectiveKey).length > 0;
+    if (isPaseoSend && effectiveQueue && ownerChoice == null && (hasExistingQueue || (!pausedForHuman && ["running", "initializing"].includes(String(thread.agentStatus ?? "").toLowerCase())))) {
       return enqueueBusyPaseo();
     }
     // The owner is speaking to this thread: a judged or planned nudge in
@@ -2858,11 +2862,55 @@ export class FleetSupervisor {
     const remoteRequired = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     const sessionStore = this.runtime?.agentHost?.store;
 
+    const nowIso = new Date(nowMs).toISOString();
+    // Without an explicit id, the id names one occurrence: retries inside the
+    // cooldown window dedupe, a later occurrence of the same report is new.
+    const windowIndex = minGapMs > 0 ? Math.floor(nowMs / minGapMs) : nowMs;
+    const stableMsgId = typeof messageId === "string" && /^[\w-]{1,200}$/.test(messageId)
+      ? messageId
+      : (dedupeKey ? `msg_sup_${shortHash(`${dedupeKey}:${windowIndex}`)}` : null);
+    const buildSharedPayload = (textBody, reviewedFlag) => {
+      const proactiveMeta = proactive
+        ? {
+            kind: typeof metadata?.kind === "string" ? metadata.kind : "proactive_supervisor",
+            ...(Array.isArray(metadata?.decisionKeys) ? { decisionKeys: metadata.decisionKeys } : {}),
+            ...(Array.isArray(metadata?.decisionTokens) ? { decisionTokens: metadata.decisionTokens } : {}),
+            ...(reviewedFlag ? { agentReviewed: true } : {})
+          }
+        : null;
+      return {
+        ...(stableMsgId ? { id: stableMsgId } : {}),
+        role: "assistant",
+        text: textBody,
+        at: nowIso,
+        ...(proactive ? { proactive: true, proactiveMeta } : {})
+      };
+    };
+    const persistLocalPayload = (payload) => {
+      if (!sessionStore || typeof sessionStore.getSession !== "function" || typeof sessionStore.appendMessage !== "function") {
+        return false;
+      }
+      const appendedRes = appendSharedThreadMessages(sessionStore, "supervisor", {
+        conversationId: "main",
+        messages: [payload]
+      });
+      if ((appendedRes?.appended?.length ?? 0) > 0) {
+        this.runtime?.events?.emit?.("conversation.updated", {
+          sessionId: "devices:supervisor:main",
+          proactive: true,
+          at: nowIso,
+          ...(Object.keys(metadata).length ? { metadata } : {})
+        });
+      }
+      return true;
+    };
+
     // Context-aware agent review + shared hub proactive gate:
     // On the hub, route local proactive updates through the exact same
-    // serialized `hubProactiveGuard` used by paired-node appends so local and
-    // remote digests share one cooldown, dedupe map, and agent review pass.
+    // serialized `hubProactiveGuard` used by paired-node appends, committing
+    // dedupe/cooldown ONLY after conversation persistence succeeds.
     let agentReviewed = false;
+    let deliveredLocal = false;
     if (proactive && !remoteRequired && typeof this.runtime?.hubProactiveGuard?.evaluate === "function") {
       const verdict = await this.runtime.hubProactiveGuard.evaluate({
         text: cleanContent,
@@ -2870,11 +2918,19 @@ export class FleetSupervisor {
         decisionKeys: Array.isArray(metadata?.decisionKeys) ? metadata.decisionKeys : [],
         decisionTokens: Array.isArray(metadata?.decisionTokens) ? metadata.decisionTokens : [],
         alreadyAgentReviewed: false,
-        judgeFn: this.deps.judgeProactiveUpdate ?? null
+        judgeFn: this.deps.judgeProactiveUpdate ?? null,
+        persist: async (finalText, { agentReviewed: reviewedFlag }) => {
+          const clamped = clampTailLines(redactSecrets(String(finalText ?? cleanContent).trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
+          cleanContent = clamped;
+          const ok = persistLocalPayload(buildSharedPayload(clamped, reviewedFlag));
+          if (!ok) return { ok: false };
+          deliveredLocal = true;
+          return { ok: true };
+        }
       });
       agentReviewed = verdict.agentReviewed === true;
       if (!verdict.send) {
-        const isDeferred = Boolean(verdict.deferred === true || verdict.reason === "hub_cooldown");
+        const isDeferred = Boolean(verdict.deferred === true || verdict.reason === "hub_cooldown" || verdict.reason === "persist_failed");
         if (dedupeKey && !isDeferred) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
         return {
           posted: false,
@@ -2884,9 +2940,9 @@ export class FleetSupervisor {
           reason: verdict.reason || "suppressed_by_hub"
         };
       }
-      if (verdict.text) {
-        cleanContent = clampTailLines(redactSecrets(String(verdict.text).trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
-      }
+      if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, cleanContent);
+      this.store.recordProactiveChatAt(nowMs);
+      return { posted: true, deliveredRemote: false, deliveredLocal, remoteRequired: false, messageId: stableMsgId };
     } else if (proactive && (!remoteRequired || typeof this.deps.judgeProactiveUpdate === "function")) {
       const recentMessages = sessionStore?.getSession?.("devices:supervisor:main")?.messages ?? [];
       const verdict = await reviewProactiveUpdateWithAgent({
@@ -2908,34 +2964,12 @@ export class FleetSupervisor {
       }
     }
 
-    const nowIso = new Date(nowMs).toISOString();
-    // Without an explicit id, the id names one occurrence: retries inside the
-    // cooldown window dedupe, a later occurrence of the same report is new.
-    const windowIndex = minGapMs > 0 ? Math.floor(nowMs / minGapMs) : nowMs;
-    const stableMsgId = typeof messageId === "string" && /^[\w-]{1,200}$/.test(messageId)
-      ? messageId
-      : (dedupeKey ? `msg_sup_${shortHash(`${dedupeKey}:${windowIndex}`)}` : null);
-    const proactiveMeta = proactive
-      ? {
-          kind: typeof metadata?.kind === "string" ? metadata.kind : "proactive_supervisor",
-          ...(Array.isArray(metadata?.decisionKeys) ? { decisionKeys: metadata.decisionKeys } : {}),
-          ...(Array.isArray(metadata?.decisionTokens) ? { decisionTokens: metadata.decisionTokens } : {}),
-          ...(agentReviewed ? { agentReviewed: true } : {})
-        }
-      : null;
-    const sharedMsgPayload = {
-      ...(stableMsgId ? { id: stableMsgId } : {}),
-      role: "assistant",
-      text: cleanContent,
-      at: nowIso,
-      ...(proactive ? { proactive: true, proactiveMeta } : {})
-    };
+    const sharedMsgPayload = buildSharedPayload(cleanContent, agentReviewed);
 
     let deliveredRemote = false;
     let suppressedRemote = false;
     let deferredRemote = false;
     let remoteReason = null;
-    let deliveredLocal = false;
     if (remoteRequired) {
       try {
         const identity = readOrCreateIdentity(this.dataDir);
@@ -2977,21 +3011,9 @@ export class FleetSupervisor {
       } catch { /* fallback to local store if remote hub append fails */ }
     }
 
-    if (!suppressedRemote && sessionStore && typeof sessionStore.getSession === "function" && typeof sessionStore.appendMessage === "function") {
+    if (!suppressedRemote && !deliveredLocal) {
       try {
-        const appendedRes = appendSharedThreadMessages(sessionStore, "supervisor", {
-          conversationId: "main",
-          messages: [sharedMsgPayload]
-        });
-        if ((appendedRes?.appended?.length ?? 0) > 0) {
-          this.runtime?.events?.emit?.("conversation.updated", {
-            sessionId: "devices:supervisor:main",
-            proactive: true,
-            at: nowIso,
-            ...(Object.keys(metadata).length ? { metadata } : {})
-          });
-        }
-        deliveredLocal = true;
+        deliveredLocal = persistLocalPayload(sharedMsgPayload);
       } catch { /* best-effort */ }
     }
 
@@ -3184,12 +3206,12 @@ export class FleetSupervisor {
       const keys = q.threadKeys ?? (q.threadKey ? [q.threadKey] : []);
       if (keys.length && keys.every((key) => this.store.mutedUntil(key))) return false;
       // Single-publisher rule: never announce remote Paseo sessions from a peer
-      // node (the host that owns the session publishes it) and never announce
+      // node unless remote management is explicitly enabled, and never announce
       // already-failed-over dead sessions.
       if (q.threadKey) {
         if (this.store.providerFailoverFor?.(q.threadKey)) return false;
         const thread = this.lastThreads.get(q.threadKey) ?? this.knownThreads.get(q.threadKey) ?? null;
-        if (thread?.kind === "paseo" && thread?.meta?.isLocalHost === false) return false;
+        if (thread && !allowsAutonomousPaseoAction(thread, this.config)) return false;
       }
       const ctx = this.decisionContextFor(q);
       contexts.set(q.id, ctx);

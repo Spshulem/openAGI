@@ -2106,38 +2106,75 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           let deferredCount = 0;
           let lastSuppressReason = null;
           if (conversationId === "main" && Array.isArray(rawMessages)) {
-            filteredMessages = [];
+            const sourceName = typeof body.sourceName === "string" ? body.sourceName : null;
+            const sourceNodeId = typeof body.sourceNodeId === "string" ? body.sourceNodeId : null;
+            const nonProactive = [];
+            const appendedAll = [];
+            let lastAppendPayload = null;
             for (const item of rawMessages) {
               const text = typeof item?.text === "string" ? item.text : (typeof item?.content === "string" ? item.content : "");
               const isProactive = item?.role === "assistant" && (item?.proactive === true || isProactiveSupervisorText(text));
               if (!isProactive) {
-                filteredMessages.push(item);
+                nonProactive.push(item);
                 continue;
+              }
+              if (nonProactive.length > 0) {
+                const resPart = appendSharedThreadMessages(store, "supervisor", {
+                  conversationId,
+                  messages: nonProactive.splice(0, nonProactive.length),
+                  sourceName,
+                  sourceNodeId
+                });
+                lastAppendPayload = resPart;
+                if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
               }
               const verdict = await hubProactiveGuard.evaluate({
                 text,
                 kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
                 decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
                 decisionTokens: Array.isArray(item?.proactiveMeta?.decisionTokens) ? item.proactiveMeta.decisionTokens : [],
-                alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true
+                alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true,
+                persist: async (finalText, { agentReviewed }) => {
+                  const resPart = appendSharedThreadMessages(store, "supervisor", {
+                    conversationId,
+                    messages: [{
+                      ...item,
+                      text: finalText,
+                      proactive: true,
+                      proactiveMeta: {
+                        ...(item?.proactiveMeta && typeof item.proactiveMeta === "object" ? item.proactiveMeta : {}),
+                        agentReviewed: agentReviewed === true
+                      }
+                    }],
+                    sourceName,
+                    sourceNodeId
+                  });
+                  return resPart;
+                }
               });
               if (!verdict.send) {
+                if (verdict.error) throw verdict.error;
                 suppressedCount += 1;
                 if (verdict.deferred === true) deferredCount += 1;
                 lastSuppressReason = verdict.reason ?? "suppressed";
                 continue;
               }
-              filteredMessages.push({
-                ...item,
-                text: verdict.text,
-                proactive: true,
-                proactiveMeta: {
-                  ...(item?.proactiveMeta && typeof item.proactiveMeta === "object" ? item.proactiveMeta : {}),
-                  agentReviewed: verdict.agentReviewed === true
-                }
-              });
+              if (verdict.persistResult) {
+                lastAppendPayload = verdict.persistResult;
+                if (Array.isArray(verdict.persistResult?.appended)) appendedAll.push(...verdict.persistResult.appended);
+              }
             }
-            if (filteredMessages.length === 0 && suppressedCount > 0) {
+            if (nonProactive.length > 0) {
+              const resPart = appendSharedThreadMessages(store, "supervisor", {
+                conversationId,
+                messages: nonProactive,
+                sourceName,
+                sourceNodeId
+              });
+              lastAppendPayload = resPart;
+              if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
+            }
+            if (!lastAppendPayload && suppressedCount > 0) {
               return sendJson(res, 200, {
                 ok: true,
                 thread: "supervisor",
@@ -2147,6 +2184,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 deferred: deferredCount > 0 && deferredCount === suppressedCount,
                 reason: lastSuppressReason
               });
+            }
+            if (lastAppendPayload) {
+              return sendJson(res, 200, { ...lastAppendPayload, appended: appendedAll });
             }
           }
           return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
