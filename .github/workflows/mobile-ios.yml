@@ -2,8 +2,15 @@ name: iOS mobile
 
 on:
   pull_request:
+    # Everything the iOS app builds in or talks to: its sources, the shared
+    # Swift package, the embedded daemon (src/, the mobile entry, built-in
+    # skills, package*.json) and the push relay. Changes that cannot reach
+    # the iOS build or its tests are left out below: the Android app, its
+    # workflow, and the mobile docs (no app target bundles them). Skill
+    # Markdown under examples/skills is runtime data and stays covered.
     paths:
       - "mobile/**"
+      - "shared/**"
       - "src/**"
       - "bin/mobile-entry.mjs"
       - "examples/skills/**"
@@ -11,7 +18,18 @@ on:
       - "relay/**"
       - ".github/workflows/mobile-*.yml"
       - ".github/workflows/push-relay.yml"
+      - "!mobile/android/**"
+      - "!.github/workflows/mobile-android.yml"
+      - "!mobile/*.md"
+      - "!mobile/**/*.md"
   workflow_dispatch:
+
+# A new push to the same PR replaces the run still testing the old head: one
+# 1-2 h macOS run per head instead of a queue of stale ones. Manual runs
+# (workflow_dispatch, release checks) are never cancelled.
+concurrency:
+  group: ios-mobile-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
