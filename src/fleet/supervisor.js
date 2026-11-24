@@ -525,10 +525,6 @@ const CONTEXT_REQUEST_RETRY_MS = 30 * 60_000;
 const CONTEXT_REQUEST_MAX_ATTEMPTS = 3;
 const CONTEXT_REQUEST_THREAD_COOLDOWN_MS = 6 * 60 * 60_000;
 
-function formatCount(value) {
-  return value === null || value === undefined ? "unknown" : String(value);
-}
-
 // Infra blocks the policy resolves without the owner: limits wait for their
 // reset, overload and network back off, codex-lb and BuildBot3 wait for
 // recovery.
@@ -2781,9 +2777,7 @@ export class FleetSupervisor {
     const nowMs = this.now();
     const contexts = new Map();
     const openQs = this.store.openQuestions();
-    // FYIs and session errors are reported apart from decisions and never
-    // trigger a check-in on their own.
-    const nonDecisions = openQs.filter((q) => q && q.status === "open" && classifyAsk(q) !== "decision");
+    // FYIs and session errors are never part of a check-in.
     const openActionable = openQs.filter((q) => {
       if (!q || q.status !== "open" || classifyAsk(q) !== "decision") return false;
       if (this.awaitingReview.has(q.id)) return false;
@@ -2801,49 +2795,43 @@ export class FleetSupervisor {
     // without ever being re-pushed due to elapsed scans, aggregate count changes,
     // reordering, or question ID churn. Only genuinely new or materially changed
     // actionable decisions emit a delta message.
-    const { deltas } = this.store.diffSurfacedDecisions(openActionable, { now: started });
-    if (!deltas.length) return { posted: false, reason: "no-delta" };
+    // Only verified decisions are announced: a real decision with options,
+    // what it is about, and why it waits (blocker or current status), all
+    // recovered from evidence. Others stay in Needs You until supplied.
+    const verified = openActionable.filter((q) => {
+      const ctx = contexts.get(q.id);
+      return Boolean(ctx && !ctx.missing.includes("decision") && (ctx.goal || ctx.itemName) && (ctx.blocked || ctx.status));
+    });
+    const { deltas: allDeltas } = this.store.diffSurfacedDecisions(verified, { now: started });
+    if (!allDeltas.length) return { posted: false, reason: "no-delta" };
 
-    // Running sessions, tracked goals, and decisions are different things; say
-    // each separately so a count is never mistaken for an ask. A count this
-    // machine cannot know is said to be unknown, never rendered as zero.
-    const errors = nonDecisions.filter((q) => classifyAsk(q) === "session_error").length;
-    const fyis = nonDecisions.length - errors;
-    const footer = [
-      `Decisions waiting on you: ${openActionable.length}`,
-      `Sessions running here: ${formatCount(this.runningSessionCount(snapshot))}`,
-      this.trackedGoalSummary().text,
-      ...(fyis || errors ? [`FYIs / session errors (no decision needed): ${fyis} / ${errors}`] : [])
-    ].join(" · ");
+    // The top few, most consequential first: merge/ready asks, then agent
+    // asks, then tool permissions; newest change first within each.
+    const rank = (q) => (q.kind === "ready" || q.mergeAsk ? 0 : (q.kind === "prompt" ? 2 : 1));
+    const changedAt = (q) => Date.parse(q.updatedAt ?? q.createdAt ?? "") || 0;
+    const deltas = [...allDeltas].sort((a, b) => rank(a.question) - rank(b.question) || changedAt(b.question) - changedAt(a.question));
 
-    // Each decision gets a fixed share of the message, and only what fits is
-    // sent: a decision cut off by the length cap would otherwise be marked
-    // surfaced without being seen. Unsent decisions stay pending.
+    // At most four, each with a fixed share of the message; only what fits is
+    // sent, and unsent decisions stay pending. No counts, backlog, FYIs or
+    // routine recovery: the check-in is only what needs the owner now.
+    const MAX_DECISIONS = 4;
     const DIGEST_MAX = 6000;
-    const PER_DECISION = 1700;
-    const header = (n, change) => (n === 1
-      ? (change === "updated"
-          ? "**Supervisor check-in: one decision changed and needs you.**"
-          : "**Supervisor check-in: one new decision needs you.**")
-      : `**Supervisor check-in: ${n} new or changed decisions need you.**`);
+    const PER_DECISION = 1400;
+    const header = (n) => (n === 1
+      ? "**Supervisor check-in: one decision needs you.**"
+      : `**Supervisor check-in: ${n} decisions need you.**`);
+    const WHY = "_Picked because each is new or changed since the last check-in, waits on your call, and its context is verified from the source; everything else is handled by the Supervisor or unchanged._";
     const renderDelta = ({ question: q, change }) => {
       const ctx = contexts.get(q.id) ?? this.decisionContextFor(q);
       const badge = change === "updated" ? "Changed" : "New";
       const name = ctx?.itemName || stripInternalIds(q.title) || "Untitled decision";
-      const body = ctx
-        ? renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION })
-        : clampText(stripInternalIds(redactSecrets(q.body || q.title || "")), 400);
+      const body = renderDecisionContext(ctx, { markdown: true, compact: true, maxChars: PER_DECISION });
       return ["", `**${badge}: ${clampText(name, 140)}**`, body];
     };
-    let shownDeltas = deltas.slice(0, 3);
+    let shownDeltas = deltas.slice(0, MAX_DECISIONS);
     let lines;
     for (;;) {
-      const overflowCount = deltas.length - shownDeltas.length;
-      lines = [header(shownDeltas.length, shownDeltas[0]?.change), ...shownDeltas.flatMap(renderDelta)];
-      if (overflowCount > 0) {
-        lines.push("", `*${overflowCount} more new or changed decision${overflowCount === 1 ? " is" : "s are"} in Needs You.*`);
-      }
-      lines.push("", footer);
+      lines = [header(shownDeltas.length), WHY, ...shownDeltas.flatMap(renderDelta)];
       if (lines.join("\n").length <= DIGEST_MAX || shownDeltas.length <= 1) break;
       shownDeltas = shownDeltas.slice(0, -1);
     }
