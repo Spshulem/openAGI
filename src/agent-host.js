@@ -290,7 +290,8 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionBefore.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral && channel !== "autopilot" && channel !== "cron") {
+    // A no-capture turn (untrusted device input) never grades an earlier reply.
+    if (!ephemeral && implicitCapture && channel !== "autopilot" && channel !== "cron") {
       try { this.runtime.outcomes?.resolveByUserFollowup?.(sessionId, text); } catch { /* best effort */ }
     }
 

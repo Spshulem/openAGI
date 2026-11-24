@@ -17,6 +17,7 @@ import { createDefaultRuntime } from "../src/abi-runtime.js";
 import { sharedConversations, sharedThreadHistory } from "../src/shared-conversations.js";
 import { SessionMiner } from "../src/session-miner.js";
 import { isSavedMemory } from "../src/memory-system.js";
+import { OutcomeStore } from "../src/outcome-store.js";
 
 const ORIGIN = "https://agent.example.test";
 
@@ -215,6 +216,9 @@ test("intent classification is strict and leading-only", () => {
   assert.equal(classifyPebbleIntent("Remind me to call mom").kind, "chat");
   assert.equal(classifyPebbleIntent("I said keep this note earlier").kind, "ambiguous");
   assert.equal(classifyPebbleIntent("save this").kind, "ambiguous");
+  for (const question of ["Remember this?", "Keep this note?", "Remember this? We talked about it yesterday.", "Keep this note: ..."]) {
+    assert.equal(classifyPebbleIntent(question).kind, "ambiguous", question);
+  }
 });
 
 test("nothing logs the transcript, secret or signature", async t => {
@@ -397,4 +401,50 @@ test("a save recording waits for a turn already running in the ring's chat", asy
   const lines = store.getSession(`devices:agent:${device.conversationId}`).messages.map(m => `${m.role}:${m.content}`);
   assert.deepEqual(lines, ["user:What is the fixture question?", "assistant:fixture answer",
     "user:keep this note: fixture order", "assistant:Kept as a private Pebble note."]);
+});
+
+test("two concurrent first recordings for a ring provisioned while chat was down share one conversation", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pebble-peri-race-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new InMemoryAgentStore();
+  const agentHost = { store, async handleMessage(input) { store.appendMessage(input.sessionId, { role: "user", content: input.text, metadata: input.metadata }); } };
+  let up = false, clock = Date.parse("2026-11-23T12:00:00Z");
+  const receiver = new PebblePeriReceiver({ dir, runtime: {}, getAgentHost: () => (up ? agentHost : null), now: () => clock });
+  const { device, secret } = receiver.provision({ label: "Late ring" }, ORIGIN);
+  assert.equal(device.conversationId, null);
+  up = true;
+  const h = { receiver, device, secret, now: () => clock };
+  const [a, b] = [await signed(h, { text: "first fixture question" }), await signed(h, { text: "second fixture question" })];
+  const results = await Promise.all([receiver.handle(device.id, a.headers, a.raw), receiver.handle(device.id, b.headers, b.raw)]);
+  await receiver.idle();
+  assert.deepEqual(results.map(r => r.status), [202, 202]);
+  const chats = store.listSessions({ prefix: "devices:agent:" });
+  assert.equal(chats.length, 1, "one ordered chat per ring");
+  assert.equal(receiver.status(ORIGIN).devices[0].conversationId, chats[0].id.split(":").at(-1));
+});
+
+test("ring messages never grade an earlier reply as owner feedback", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pebble-peri-outcome-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sweep = (noCapture) => {
+    const outcomes = new OutcomeStore({ dir: fs.mkdtempSync(path.join(dir, "o-")) });
+    const store = new InMemoryAgentStore();
+    const outcome = outcomes.record({ kind: "agent-reply", sessionId: "s", channel: "local", scrutinyAction: "act" });
+    store.appendMessage("s", { role: "assistant", content: "owner answer", metadata: { outcomeId: outcome.id } });
+    store.appendMessage("s", { role: "user", content: "Keep this note: the door is broken", metadata: noCapture ? { noCapture: true } : {} });
+    return outcomes.resolveSweep({ agentStore: store, now: new Date(Date.now() + 7 * 60 * 60 * 1000) }).find(r => r.id === outcome.id || r.outcomeId === outcome.id);
+  };
+  assert.equal(sweep(false)?.source, "user-followup", "control: an owner message is feedback");
+  assert.notEqual(sweep(true)?.source, "user-followup");
+  const followups = [];
+  const runtime = { outcomes: { resolveByUserFollowup: (...args) => followups.push(args), record: () => null },
+    memory: { remember: () => ({ id: "m" }) },
+    processSignal: () => ({ id: "out", scrutiny: { action: "act", score: 0.6, reasons: [], dimensions: { novelty: 0.3, risk: 0.3, repetition: 0.3 } }, customContext: [], propagation: {} }) };
+  const host = new AgentHost({ store: new InMemoryAgentStore(), runtime, modelProvider: { isConfigured: () => true, model: "stub",
+    generate: async () => ({ text: "ok", provider: "stub", model: "stub", toolCalls: [] }) } });
+  host.messageToSignal = async ({ text }) => ({ id: "sig", summary: text, content: text, tags: [] });
+  await host.handleMessage({ text: "ring fixture", sessionId: "s", routeTo: false }, { implicitCapture: false, toolAllowlist: [] });
+  assert.equal(followups.length, 0);
+  await host.handleMessage({ text: "owner fixture", sessionId: "s", routeTo: false }, {});
+  assert.equal(followups.length, 1);
 });

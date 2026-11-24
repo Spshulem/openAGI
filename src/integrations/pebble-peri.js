@@ -55,7 +55,9 @@ export function classifyPebbleIntent(text) {
     const match = command.exec(value);
     if (!match) continue;
     const body = value.slice(match[0].length).trim();
-    if (!body || ANY_SAVE_PHRASE.test(body)) return { kind: "ambiguous" };
+    // "Remember this?" is a question, not a command; and there must be
+    // something to save, not just punctuation.
+    if (!/[\p{L}\p{N}]/u.test(body) || body.startsWith("?") || ANY_SAVE_PHRASE.test(body)) return { kind: "ambiguous" };
     return { kind, body };
   }
   return ANY_SAVE_PHRASE.test(value) ? { kind: "ambiguous" } : { kind: "chat", body: value.trim() };
@@ -146,8 +148,11 @@ export class PebblePeriReceiver {
     store.saveSession({ ...session, metadata: { ...session.metadata, thread: "agent", title: label, source: "pebble-index" } });
     return conversation.id;
   }
+  // Synchronous from the re-read to the write, so two concurrent first
+  // recordings can't each create a conversation.
   conversationFor(device) {
-    if (device.conversationId) return device.conversationId;
+    const current = this.readDevices().devices[device.id] ?? device;
+    if (current.conversationId) return current.conversationId;
     const id = this.createConversation(device.label);
     if (id) this.updateDevice(device.id, d => { d.conversationId = id; });
     return id;
