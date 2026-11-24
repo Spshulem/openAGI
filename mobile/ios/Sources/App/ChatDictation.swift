@@ -76,9 +76,12 @@ struct DictationTranscript: Equatable {
     }
 
     // The request failed (after a long silence iOS reports "no speech"): keep
-    // what it heard; the next request starts a fresh segment.
+    // what it heard; the next request starts a fresh segment. Its results are
+    // not cumulative with the failed request's, so the utterances that
+    // request ended are no longer repeats to strip (as after a final result).
     mutating func endSegment() -> String {
         if !live.isEmpty { finished.append(live); live = "" }
+        requestCommitted = []
         return draft
     }
 

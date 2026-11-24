@@ -179,6 +179,15 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertEqual(t.endSegment(), "Before. Half a Still here.", "an empty segment adds nothing")
     }
 
+    // Review fix (#343): words an utterance-end marker kept in the failed
+    // request are not stripped from the replacement request's fresh results.
+    func testAReplacementRequestKeepsWordsThatRepeatTheFailedRequest() {
+        var t = DictationTranscript(base: "")
+        XCTAssertEqual(t.receive("No.", isFinal: false, endsUtterance: true), "No.")
+        XCTAssertEqual(t.endSegment(), "No.")
+        XCTAssertEqual(t.receive("No.", isFinal: false), "No. No.")
+    }
+
     func testOnlyAStoppedMicrophoneOrRepeatedImmediateFailuresEndDictation() {
         let silence = ChatDictation.failureEndsDictation(listenedFor: 8, quickFailures: 2, microphoneRunning: true)
         XCTAssertFalse(silence.ends, "a failure after a long silence keeps listening")
