@@ -16,6 +16,7 @@ import { AgentHost } from "../src/agent-host.js";
 import { createDefaultRuntime } from "../src/abi-runtime.js";
 import { sharedConversations, sharedThreadHistory } from "../src/shared-conversations.js";
 import { SessionMiner } from "../src/session-miner.js";
+import { isSavedMemory } from "../src/memory-system.js";
 
 const ORIGIN = "https://agent.example.test";
 
@@ -186,6 +187,7 @@ test("'keep this note' saves a private note only; 'remember this' saves to priva
   assert.equal(h.memories.length, 1);
   assert.equal(h.memories[0].item.content, "the fixture gate code is 4412");
   assert.equal(h.memories[0].item.metadata.untrustedInput, true);
+  assert.equal(isSavedMemory(h.memories[0].item), true, "shown as a saved fact, exempt from automated cleanup");
   assert.equal(h.notes().length, 1); assert.equal(h.turns.length, 0);
   assert.match(h.chat().at(-1).content, /private memory/);
 });
@@ -370,4 +372,29 @@ test("AgentHost stamps noCapture on the stored user message of a no-capture turn
   await host.handleMessage({ text: "fixture owner", sessionId: "owner", routeTo: false }, {});
   assert.equal(store.getSession("ring").messages[0].metadata.noCapture, true);
   assert.equal(store.getSession("owner").messages[0].metadata.noCapture, undefined);
+});
+
+test("a save recording waits for a turn already running in the ring's chat", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pebble-peri-order-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const runtime = { memory: { remember: () => ({ id: "m" }) },
+    processSignal: () => ({ id: "out", scrutiny: { action: "act", score: 0.6, reasons: [], dimensions: { novelty: 0.3, risk: 0.3, repetition: 0.3 } }, customContext: [], propagation: {} }) };
+  const store = new InMemoryAgentStore();
+  const host = new AgentHost({ store, runtime, modelProvider: { isConfigured: () => true, model: "stub",
+    generate: async () => { await gate; return { text: "fixture answer", provider: "stub", model: "stub", toolCalls: [] }; } } });
+  host.messageToSignal = async ({ text }) => ({ id: "sig", summary: text, content: text, tags: [] });
+  let clock = Date.parse("2026-11-23T12:00:00Z");
+  const receiver = new PebblePeriReceiver({ dir, runtime, getAgentHost: () => host, now: () => clock });
+  const { device, secret } = receiver.provision({ label: "Order ring" }, ORIGIN);
+  const h = { receiver, device, secret, now: () => clock };
+  assert.equal((await h.receiver.handle(device.id, ...Object.values(await signed(h, { text: "What is the fixture question?" })).slice(0, 2))).status, 202);
+  assert.equal((await h.receiver.handle(device.id, ...Object.values(await signed(h, { text: "keep this note: fixture order" })).slice(0, 2))).status, 202);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  release();
+  await receiver.idle();
+  const lines = store.getSession(`devices:agent:${device.conversationId}`).messages.map(m => `${m.role}:${m.content}`);
+  assert.deepEqual(lines, ["user:What is the fixture question?", "assistant:fixture answer",
+    "user:keep this note: fixture order", "assistant:Kept as a private Pebble note."]);
 });

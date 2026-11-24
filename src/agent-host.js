@@ -47,8 +47,16 @@ export class AgentHost {
     const queueKey = String(
       input?.sessionId ?? `${input?.channel ?? "local"}:${input?.from ?? "user"}:${input?.agentId ?? "main"}`
     );
+    return this.runInSession(queueKey, () => this.handleMessageNow(input, options));
+  }
+
+  // Run work in a session's turn order. Transports that append a complete
+  // exchange without a model turn (e.g. a Pebble save confirmation) use this
+  // so it never interleaves with a turn already running in that chat.
+  async runInSession(sessionId, work) {
+    const queueKey = String(sessionId);
     const prior = this.sessionTurnTails.get(queueKey) ?? Promise.resolve();
-    const run = prior.catch(() => {}).then(() => this.handleMessageNow(input, options));
+    const run = prior.catch(() => {}).then(() => work());
     this.sessionTurnTails.set(queueKey, run);
     try {
       return await run;

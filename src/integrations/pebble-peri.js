@@ -259,25 +259,34 @@ export class PebblePeriReceiver {
       );
       return;
     }
-    let reply;
-    if (intent.kind === "note") {
-      this.addNote({ deviceId: device.id, text: intent.body, recordedAt });
-      reply = "Kept as a private Pebble note.";
-    } else if (intent.kind === "memory") {
-      if (typeof this.runtime?.memory?.remember === "function") {
-        this.runtime.memory.remember(
-          // Same weighting as the chat "remember" tool's normal importance.
-          { source: "pebble-index", scope: "main", content: intent.body, tags: ["pebble", "pebble:remember-this"],
-            risk: 0.45, repetition: 0.4, novelty: 0.55, metadata: { deviceId: device.id, recordedAt, untrustedInput: true } },
-          { source: "pebble-index", strength: 0.6 }
-        );
-        reply = "Saved to private memory.";
-      } else reply = "Private memory isn't available on this server, so nothing was saved.";
-    } else {
-      reply = "Nothing was saved: that sounded like a save request but wasn't clear. Start a recording with \"keep this note\" or \"remember this\", followed by what to save.";
-    }
-    store.appendMessage(sessionId, { role: "user", content: text, channel: "pebble", from: `pebble:${device.id}`, metadata });
-    store.appendMessage(sessionId, { role: "assistant", content: reply, channel: "pebble", metadata: { thread: "agent", source: "pebble-index" } });
+    // A save is a complete exchange without a model turn; it still waits its
+    // turn in the chat so it never lands inside another reply.
+    const exchange = () => {
+      let reply;
+      if (intent.kind === "note") {
+        this.addNote({ deviceId: device.id, text: intent.body, recordedAt });
+        reply = "Kept as a private Pebble note.";
+      } else if (intent.kind === "memory") {
+        if (typeof this.runtime?.memory?.remember === "function") {
+          this.runtime.memory.remember(
+            // Same weighting as the chat "remember" tool's normal importance,
+            // marked as an explicit user save (shown under saved memories,
+            // exempt from automated cleanup) with its untrusted provenance.
+            { source: "pebble-index", scope: "main", content: intent.body, tags: ["pebble", "pebble:remember-this"],
+              risk: 0.45, repetition: 0.4, novelty: 0.55,
+              metadata: { userAuthored: true, channel: "pebble", deviceId: device.id, recordedAt, untrustedInput: true } },
+            { source: "pebble-index", strength: 0.6 }
+          );
+          reply = "Saved to private memory.";
+        } else reply = "Private memory isn't available on this server, so nothing was saved.";
+      } else {
+        reply = "Nothing was saved: that sounded like a save request but wasn't clear. Start a recording with \"keep this note\" or \"remember this\", followed by what to save.";
+      }
+      store.appendMessage(sessionId, { role: "user", content: text, channel: "pebble", from: `pebble:${device.id}`, metadata });
+      store.appendMessage(sessionId, { role: "assistant", content: reply, channel: "pebble", metadata: { thread: "agent", source: "pebble-index", noCapture: true } });
+    };
+    if (typeof agentHost.runInSession === "function") await agentHost.runInSession(sessionId, exchange);
+    else exchange();
   }
 
   pruneReceipts() {
