@@ -805,7 +805,17 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
     return `Paseo chat stopped on ${kind && kind !== "other" ? `a ${kind} error` : "an error"}; only Supervisor error recovery resends`;
   }
   if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
-  if (errorRecovery && (!["idle", "error"].includes(agent.status) || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  // Error recovery accepts idle/error sessions, plus verified stuck-running
+  // sessions where a transient provider/system error terminated the turn
+  // (`!agent.activeTurn` and `thread.error.kind` set by the Paseo source).
+  const stuckRunningAfterError = Boolean(
+    agent.status === "running"
+    && !agent.activeTurn
+    && RESUMABLE_ERROR_KINDS.has(thread?.error?.kind)
+  );
+  if (errorRecovery && ((!["idle", "error"].includes(agent.status) && !stuckRunningAfterError) || agent.activeTurn)) {
+    return "Paseo chat is active, closed, or unavailable";
+  }
   if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";

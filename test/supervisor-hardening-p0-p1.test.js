@@ -1397,3 +1397,129 @@ test("Codex round-5 fixes: queued drain redirects to failover replacement and cl
   );
   assert.equal(tasks.get("tsk_1").status, "open", "blocked reuse must not mark task in_progress");
 });
+
+test("Codex round-6 fixes: generic decision body hashes cleanly, queue rolls back on write error, stuck-running error recovers, and saveEnv persists/clears self-config keys", async (t) => {
+  // 1. Generic "Needs your decision" title hashes body so distinct questions produce distinct material hashes.
+  const hMig = actionableDecisionMaterialHash({
+    kind: "agent-ask",
+    threadKey: "paseo:host1.a1",
+    title: "Needs your decision",
+    body: "Should I run the database migration?",
+    options: ["continue", "open thread"]
+  });
+  const hProd = actionableDecisionMaterialHash({
+    kind: "agent-ask",
+    threadKey: "paseo:host1.a1",
+    title: "Needs your decision",
+    body: "Should I deploy to production?",
+    options: ["continue", "open thread"]
+  });
+  assert.notEqual(hMig, hProd, "generic decision titles must differentiate by body");
+
+  // 2. enqueueOwnerMessage rolls back and returns null when _save fails (lastWriteError set).
+  const dir = makeTmpDir(t, "queue-write-err-");
+  const store = new FleetStore({ dir });
+  store._save = () => { store.lastWriteError = "ENOSPC"; };
+  const failedEnq = store.enqueueOwnerMessage({ threadKey: "paseo:host1.a1", message: "Do not lose me" });
+  assert.equal(failedEnq, null);
+  assert.equal(store.queuedOwnerMessages("paseo:host1.a1").length, 0);
+
+  // 3. saveEnv persists CHATGPT_MODEL / OPENAI_MODEL_TASK_CHAT / OPENAI_REASONING_EFFORT_TASK_CHAT and clears on reset!
+  const dirEnv = makeTmpDir(t, "env-persist-");
+  const prevEnv = {
+    OPENAGI_DATA_DIR: process.env.OPENAGI_DATA_DIR,
+    OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+    OPENAI_MODEL: process.env.OPENAI_MODEL,
+    OPENAI_MODEL_TASK_CHAT: process.env.OPENAI_MODEL_TASK_CHAT,
+    OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT
+  };
+  t.after(() => {
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    _resetDataDirCache();
+  });
+  process.env.OPENAGI_DATA_DIR = dirEnv;
+  _resetDataDirCache();
+  process.env.OPENAGI_PROVIDER = "openai";
+  process.env.OPENAI_API_KEY = "sk-test-fake-key-1234567890";
+  process.env.OPENAI_MODEL = "gpt-5.4";
+  process.env.OPENAI_MODEL_TASK_CHAT = "gpt-5.4";
+  delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+
+  const sessionStore = new InMemoryAgentStore({ storePath: path.join(dirEnv, "sessions.json") });
+  sessionStore.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const rt = {
+    dataDir: dirEnv,
+    agentHost: { store: sessionStore, modelProvider: { constructor: { name: "OpenAIResponsesProvider" }, model: "gpt-5.4" } },
+    budget: null
+  };
+  const reg = new ToolRegistry();
+  registerCoreTools(reg, rt);
+  const set1 = await reg.invoke("set_provider", { model: "gpt-5.4", reasoningEffort: "xhigh" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(set1.result.ok, true);
+  let envText = fs.readFileSync(path.join(dirEnv, ".env"), "utf8");
+  assert.match(envText, /OPENAI_MODEL_TASK_CHAT=gpt-5\.4/);
+  assert.match(envText, /OPENAI_REASONING_EFFORT_TASK_CHAT=xhigh/);
+
+  // Switching to gpt-5 must clear OPENAI_REASONING_EFFORT_TASK_CHAT on disk too!
+  const set2 = await reg.invoke("set_provider", { model: "gpt-5" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(set2.result.ok, true);
+  envText = fs.readFileSync(path.join(dirEnv, ".env"), "utf8");
+  assert.match(envText, /OPENAI_MODEL_TASK_CHAT=gpt-5/);
+  assert.doesNotMatch(envText, /OPENAI_REASONING_EFFORT_TASK_CHAT=/);
+
+  // 4. Verified stuck-running session after transient overloaded error passes deliverPaseo errorRecovery preflight!
+  const dirRec = makeTmpDir(t, "stuck-rec-");
+  let sentCount = 0;
+  const stuckAgent = {
+    id: "sess_stuck",
+    title: "Stuck capacity session",
+    status: "running",
+    activeTurn: null,
+    provider: "codex",
+    cwd: "/workspace/app",
+    workspaceId: "wks_1",
+    updatedAt: "2026-11-24T20:00:00Z"
+  };
+  const recFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "srv_1" }, hosts: [] }) },
+    agents: {
+      ref: () => ({
+        refresh: async () => {},
+        current: () => stuckAgent,
+        send: async (_text, opts) => {
+          sentCount += 1;
+          return { clientMessageId: opts?.messageId };
+        },
+        timeline: {
+          refetch: async () => ({
+            agent: stuckAgent,
+            entries: sentCount > 0
+              ? [{ id: "e_u", type: "user_message", text: "[OpenAGI supervisor] Resume", timestamp: "2026-11-24T20:00:01Z" }, { id: "e_a", type: "assistant_message", text: "Resuming now", timestamp: "2026-11-24T20:00:02Z" }]
+              : []
+          })
+        }
+      })
+    }
+  });
+  const stuckThread = {
+    ...paseoThread(stuckAgent, "srv_1"),
+    error: { kind: "overloaded", detail: "at capacity", at: "2026-11-24T19:50:00Z" }
+  };
+  const recRes = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: stuckThread,
+    text: "[OpenAGI supervisor] Resume",
+    store: { dir: dirRec },
+    actionId: "act_rec",
+    base: { playbook: "resume", messageHash: "h_rec" },
+    factory: recFactory
+  });
+  assert.equal(sentCount, 1, "verified stuck-running session after transient error must pass errorRecovery preflight");
+  assert.notEqual(recRes.detail, "Paseo chat is active, closed, or unavailable");
+});

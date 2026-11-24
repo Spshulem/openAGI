@@ -1391,6 +1391,7 @@ export function registerCoreTools(registry, runtime) {
       };
 
       const envUpdates = {};
+      const envClears = [];
       const requestedPref = typeof args.preference === "string" && args.preference.trim()
         ? args.preference.trim().toLowerCase()
         : null;
@@ -1572,14 +1573,14 @@ export function registerCoreTools(registry, runtime) {
         envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
       } else if (clearedEffort) {
         delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
-        envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+        envClears.push("OPENAI_REASONING_EFFORT_TASK_CHAT");
       } else {
         const existingTaskEffort = String(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? "").trim().toLowerCase();
         if (existingTaskEffort && (!support?.supported || !allowedEfforts.includes(existingTaskEffort))) {
           clearedIncompatibleEffort = existingTaskEffort;
           clearedEffort = true;
           delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
-          envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = "";
+          envClears.push("OPENAI_REASONING_EFFORT_TASK_CHAT");
         }
       }
 
@@ -1587,6 +1588,21 @@ export function registerCoreTools(registry, runtime) {
       const finalProvider = (normalizedEffort || clearedEffort)
         ? createModelProvider({ budgetGuard: runtime.budget })
         : candidateProvider;
+      // Persist to .env BEFORE finalizing success so restart persistence is
+      // verified rather than silently dropped.
+      if (Object.keys(envUpdates).length > 0 || envClears.length > 0) {
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({ dataDir: runtime?.dataDir, values: envUpdates, clear: envClears });
+        } catch (err) {
+          restoreEnvSnapshot();
+          return {
+            ok: false,
+            error: `Failed to persist provider/model settings to .env: ${err?.message || "disk write error"}`,
+            configuredProviders
+          };
+        }
+      }
       if (runtime.agentHost) {
         runtime.agentHost.modelProvider = finalProvider;
       }
@@ -1602,13 +1618,6 @@ export function registerCoreTools(registry, runtime) {
             setBy: "owner:set_provider"
           });
         } catch { /* unsupported provider effort is already checked above */ }
-      }
-      // Persist to .env so changes survive restarts.
-      if (Object.keys(envUpdates).length > 0) {
-        try {
-          const { saveEnv } = await import("./setup-wizard.js");
-          saveEnv({ values: envUpdates });
-        } catch { /* ignore */ }
       }
       const activeProvider = runtime.agentHost?.modelProvider;
       const effortReadback = context.sessionId && runtime.agentHost?.store

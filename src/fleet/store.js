@@ -155,11 +155,18 @@ export function actionableDecisionMaterialHash(question) {
     const members = (Array.isArray(question.threadKeys) ? question.threadKeys : []).map(String).sort();
     return shortHash(JSON.stringify(["group", rawDedupe, normOpts, members]));
   }
+  const normTitle = normalizeDecisionText(rawTitle);
+  // Generic titles (e.g. "Needs your decision" from the decisions-gate path)
+  // place the actual request in `question.body`, so include normalized body
+  // text there while keeping specific titles resilient to context-refresh prose.
+  const genericTitle = !normTitle || /^(?:needs?\s+(?:your\s+)?decision|decision\s+needed|owner\s+decision|waiting\s+on\s+(?:you|owner)|question|action\s+needed|input\s+needed|needs\s+you)$/i.test(normTitle);
+  const normBody = genericTitle ? normalizeDecisionText(question.body ?? "") : "";
   return shortHash(JSON.stringify([
     kind,
     prRef,
     Boolean(question.mergeAsk),
-    normalizeDecisionText(rawTitle),
+    normTitle,
+    ...(normBody ? [normBody] : []),
     normOpts
   ]));
 }
@@ -1759,8 +1766,13 @@ export class FleetStore {
       lastAttemptAt: null,
       lastDetail: null
     };
-    this.state.queuedOwnerMessages = [...this.state.queuedOwnerMessages, entry].slice(-100);
+    const prevQueue = this.state.queuedOwnerMessages;
+    this.state.queuedOwnerMessages = [...prevQueue, entry].slice(-100);
     this._save();
+    if (this.lastWriteError) {
+      this.state.queuedOwnerMessages = prevQueue;
+      return null;
+    }
     return { ...entry, deduped: false };
   }
 
