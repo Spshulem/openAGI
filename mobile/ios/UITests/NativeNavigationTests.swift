@@ -703,6 +703,26 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues.")
     }
 
+    // Review on #341: after a long silence iOS fails the waiting request with
+    // "no speech". The mic must stay on, nothing heard is lost, and later
+    // speech joins the same unsent draft.
+    func testLongSilenceKeepsListeningAndKeepsTheDraft() {
+        let app = launch(["--ui-dictation-pause-fixture", "--ui-dictation-silence"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "Still here."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed, "Speech after a long silence must reach the draft")
+        XCTAssertEqual(mic.label, "Stop dictation", "The microphone must still be listening after a long silence")
+        XCTAssertFalse(app.staticTexts["Dictation stopped. Your draft is saved; tap the microphone to try again."].exists)
+        XCTAssertFalse(app.staticTexts["Still here."].exists, "Dictation must never send by itself")
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues. Still here.")
+    }
+
     // The same pause on device: no final marker and no timing; the next
     // partial restarts from empty. Earlier words stay, nothing repeats.
     func testDictationRestartAfterPauseWithoutFinalKeepsAndAppends() {

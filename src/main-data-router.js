@@ -8,6 +8,8 @@ import { isMobileRouteAllowed } from "./mobile-node.js";
 // unchanged: the main, not the worker, decides what that client may access.
 export function isMainDataRoute(method, pathname, searchParams = null) {
   if (method === "POST" && pathname === "/nodes/enroll/exchange") return true;
+  // Glasses enroll on main. A worker only relays the owner's request for a code.
+  if (method === "POST" && pathname === G2_CODE_ROUTE) return true;
   // Inbox rows, their destinations/actions, and cleanup must share one store.
   // This is routing only: main still checks the unchanged credential and may
   // refuse these owner-only endpoints. Other cron jobs stay worker-local.
@@ -30,6 +32,13 @@ function failure(res, status, error, message) {
   if (res.headersSent) return res.destroy();
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
   res.end(JSON.stringify({ error, message }));
+}
+
+const G2_CODE_ROUTE = "/nodes/g2/enrollment-code";
+
+function g2CodeNotAuthorized(res, origin) {
+  failure(res, 403, "main_not_authorized",
+    `Your main (${origin}) has not authorized this computer to request glasses codes. Pair this computer again with the main owner's pairing token: OPENAGI_REMOTE_TOKEN=… openagi pair ${origin}`);
 }
 
 export function mainDataTimeout(method, pathname, timeoutMs = 15_000) {
@@ -57,6 +66,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     return true;
   }
   const exchange = req.method === "POST" && url.pathname === "/nodes/enroll/exchange";
+  const g2Code = req.method === "POST" && url.pathname === G2_CODE_ROUTE;
   const incomingToken = req.headers.authorization;
   const incomingID = req.headers["x-openagi-node-id"];
   const headers = { "content-type": "application/json", "x-openagi-main-hop": "1" };
@@ -68,6 +78,10 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     // upstream enrollment, preserving every restriction main places on it.
     const scoped = pairing.nodeEnrollmentConfirmed === true && pairing.ownerProxyToken;
     const token = scoped || pairing.token;
+    if (g2Code && !scoped) {
+      g2CodeNotAuthorized(res, origin);
+      return true;
+    }
     if (!token) {
       failure(res, 502, "main-pairing-required", "This worker needs owner authorization from main for workspace access. Reconnect this worker to main using the main owner's pairing token; the phone pairing has been kept.");
       return true;
@@ -94,6 +108,11 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     // Do not redirect credentials, copy cookies, or hide failed upstream
     // authorization behind an empty local store. Keep the existing pairing
     // intact so a worker misconfiguration cannot revoke a valid phone.
+    if (g2Code && [401, 403].includes(response.statusCode)) {
+      response.resume();
+      g2CodeNotAuthorized(res, origin);
+      return;
+    }
     if (!exchange && [401, 403].includes(response.statusCode)) {
       response.resume();
       failure(res, 502, "main-pairing-required", "This server is a worker. Its main has not authorized this client. Connect using the main's existing phone pairing; your current pairing has been kept.");
@@ -114,7 +133,9 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
   });
   upstream.setTimeout(mainDataTimeout(req.method, url.pathname, timeoutMs),
     () => upstream.destroy(new Error("main timeout")));
-  upstream.on("error", () => failure(res, 502, "main-unavailable", "Couldn't reach the main agent. Your worker's local data has not been substituted."));
+  upstream.on("error", () => (g2Code
+    ? failure(res, 502, "main_offline", `Couldn't reach your main at ${origin}. Check that it is on and reachable from this computer, then try again. No code was created.`)
+    : failure(res, 502, "main-unavailable", "Couldn't reach the main agent. Your worker's local data has not been substituted.")));
   res.on("close", () => upstream.destroy());
   req.on("aborted", () => upstream.destroy());
   req.on("error", () => upstream.destroy());

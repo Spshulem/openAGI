@@ -19,6 +19,9 @@ struct LocalAgentAcceptanceView: View {
 
     @State private var report: Report?
 
+    private static let taskPersistenceTimeout: TimeInterval = 5
+    private static let taskPersistencePollInterval: Duration = .milliseconds(250)
+
     var body: some View {
         NavigationStack {
             Form {
@@ -60,8 +63,17 @@ struct LocalAgentAcceptanceView: View {
             let stream = try await local.sendMessageStreaming(
                 text: "Add one task to my Today list with exactly this title: \(marker). Use add_task, then confirm.", thread: .agent)
             for try await _ in stream {}
-            let tasks = try await local.tasks()
-            let created = tasks.first { $0.title.contains(marker) }
+            // The daemon can persist the add_task result shortly after the
+            // streamed reply ends, so poll for a bounded window instead of
+            // reading the task list exactly once.
+            var tasks = try await local.tasks()
+            var created = tasks.first { $0.title.contains(marker) }
+            let deadline = Date().addingTimeInterval(Self.taskPersistenceTimeout)
+            while created == nil, Date() < deadline {
+                try await Task.sleep(for: Self.taskPersistencePollInterval)
+                tasks = try await local.tasks()
+                created = tasks.first { $0.title.contains(marker) }
+            }
             createdTaskID = created?.id
             result.taskToolWorked = created != nil
             if case .fresh(let summary, _) = try await local.summary(ifNoneMatch: nil) {
