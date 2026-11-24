@@ -982,6 +982,10 @@ export class RemoteFleetSupervisor {
       .map((item) => String(item.sourceRef.id)));
     for (const notice of notifications) {
       if (!notice?.id || !notice.title || posted.has(String(notice.id))) continue;
+      // The coding node folded it into the item's open follow-through prompt,
+      // which mirrorActiveWork already carries here: a second entry would
+      // notify the owner twice about one blocker.
+      if (notice.reusedPrompt === true) continue;
       outreach.append({
         type: 'fleet-active-work-recheck',
         sourceRef: { kind: 'active-work-recheck', id: notice.id, itemId: notice.itemId ?? null, nodeId: this.nodeId },

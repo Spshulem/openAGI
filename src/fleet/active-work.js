@@ -1583,6 +1583,7 @@ export class ActiveWorkManager {
         type: recheck.result.type,
         title: recheck.result.title,
         summary: recheck.result.summary ?? "",
+        reusedPrompt: recheck.result.reusedPrompt === true,
         at: recheck.completedAt ?? null
       }));
 
@@ -2518,15 +2519,19 @@ export class ActiveWorkManager {
           const title = verified ? `Follow-through verified · ${projected.project}` : `Follow-through blocker · ${projected.project}`;
           const summary = verified ? `Recheck verified: ${projected.doneCriteria}` : `${projected.whySurfaced || "Actionable blocker found"} Choose resume, assign, confirm, or snooze.`;
           let item = null;
+          let reusedPrompt = false;
           if (typeof outreach?.append === "function") {
             const existing = rawRecheckItem?.outreachId ? outreach.get?.(rawRecheckItem.outreachId) : null;
             const openExisting = existing && ["unseen", "seen"].includes(existing.status) ? existing : null;
+            reusedPrompt = Boolean(openExisting);
             item = openExisting ?? outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
             if (item?.id && typeof outreach.update === "function") outreach.update(item.id, { title, summary, actions: ["dismiss"] });
           }
           // The copy is kept on the recheck so a hosted hub, which never sees
           // this computer's outreach, can post the same notice (getActiveWork).
-          recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId, title, summary };
+          // reusedPrompt: the notice went into the item's open follow-through
+          // prompt rather than a new entry; a hub mirrors that prompt already.
+          recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId, title, summary, ...(reusedPrompt ? { reusedPrompt: true } : {}) };
           recheck.status = "notified"; recheck.result = recheckNotification;
         } else {
           recheck.status = "checked"; recheck.result = { type: "notification_cap", itemId: recheck.itemId };

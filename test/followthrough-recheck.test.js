@@ -223,6 +223,56 @@ test("a recheck notice on a coding node reaches the hosted hub's outreach exactl
   assert.equal(onHub()[0].status, "dismissed");
 });
 
+// Review fix (#369): a due recheck that finds the blocker its item was
+// already prompted about reuses that open prompt on the node; the hub, which
+// mirrors the same prompt, must not add a second entry for it.
+test("a blocker recheck folded into an open prompt is one hub entry, not two", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-followthrough-"));
+  let now = Date.parse("2026-11-22T12:00:00.000Z");
+  const nodeOutreach = new OutreachStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "bb-node-outreach-")) });
+  const supervisor = new FleetSupervisor({
+    dataDir,
+    runtime: { outreach: nodeOutreach, events: { emit() {} } },
+    config: { enabled: false, mode: "propose", paseo: { enabled: false } },
+    deps: { now: () => now, executor: { deliver: async () => ({ status: "sent", route: "paseo-send" }) } }
+  });
+  const ownerKey = "paseo:bb.owner";
+  const text = "Blocked on credentials. 1 remaining.";
+  supervisor.knownThreads.set(ownerKey, {
+    key: ownerKey, kind: "paseo", id: "owner", title: "owner", workspace: "bb-recorder", agentStatus: "idle",
+    lastActivityAt: "2026-11-22T11:59:00.000Z", lastAgentAt: "2026-11-22T11:59:00.000Z",
+    lastAgentText: text, lastAgentFull: text, meta: { serverId: "bb", paseoCwd: "/work/bb-recorder" }, prRefs: []
+  });
+  const tracked = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Verify release", doneCriteria: "Release feed verified" });
+  assert.equal((await supervisor.actActiveWork(tracked.item.id, { op: "assign_orphan", targetKey: ownerKey })).ok, true);
+  await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 0, maxPromptsPerPass: 1, resetCursor: true });
+  const prompted = supervisor.activeWork.state.items.find((item) => item.id === tracked.item.id);
+  assert.ok(prompted.outreachId, "the blocker was prompted on the node");
+  supervisor.scheduleActiveWorkRecheck(tracked.item.id, { delaySeconds: 30 });
+  now += 31_000;
+  const pass = await supervisor.scanActiveWork({ pageSize: 10, maxRepoChecks: 0, maxPromptsPerPass: 0, resetCursor: true });
+  assert.equal(pass.recheckNotification?.type, "actionable_blocker");
+  assert.equal(pass.recheckNotification?.reusedPrompt, true);
+  assert.equal(pass.recheckNotification?.outreachId, prompted.outreachId, "the node reused its open prompt");
+
+  const capability = createFleetCapability(supervisor);
+  const hubOutreach = new OutreachStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "bb-hub-outreach-")) });
+  const hub = new RemoteFleetSupervisor({
+    nodeId: "coding-node",
+    runtime: {
+      outreach: hubOutreach,
+      events: { emit() {} },
+      nodeCapabilities: { dispatch: async (_nodeId, _cap, op, payload) => capability.invoke(op, payload) }
+    }
+  });
+  await hub.refresh();
+  await hub.refresh();
+  const forItem = hubOutreach.list().filter((item) => ["unseen", "seen"].includes(item.status)
+    && (item.sourceRef?.itemId === tracked.item.id || item.sourceRef?.id === tracked.item.id));
+  assert.equal(forItem.length, 1, "one hub entry for the blocker");
+  assert.equal(forItem[0].sourceRef.kind, "active-work");
+});
+
 test("the background tick runs a due recheck without a manual inventory scan", async () => {
   const { supervisor, advance } = fixture();
   const tracked = supervisor.trackWork({ project: "bb-recorder", theme: "Release", goal: "Verify release", doneCriteria: "Release feed verified" });
