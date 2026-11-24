@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { checkModelUpgrades, configuredModels, newestSuccessor, parseModelId, readModelUpgradeCache, suggestModelUpgrades } from "../src/model-upgrades.js";
+import { catalogServes, checkModelUpgrades, configuredModels, newestSuccessor, parseModelId, readModelUpgradeCache, suggestModelUpgrades } from "../src/model-upgrades.js";
 import { DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_SMALL_MODEL } from "../src/model-router.js";
 import { OpenAIResponsesProvider } from "../src/model-provider.js";
 import { CodexCliProvider, codexCliStatus } from "../src/cli-subscription-providers.js";
@@ -169,4 +169,17 @@ test("review fixes: OpenRouter key never sent to api.openai.com; denied models n
   assert.deepEqual(s.map((x) => [x.kind, x.key, x.suggested]), [["unavailable", "OPENAI_MODEL_NANO", null]],
     "no upgrade to the denied gpt-6.2-sol, no denied replacement");
   assert.equal(newestSuccessor("gpt-6-sol", ["gpt-6.1-sol", "gpt-6.2-sol"], { isDenied: (m) => m === "gpt-6.2-sol" }), "gpt-6.1-sol");
+});
+
+test("review fix: an alias served by a dated catalog id is not reported unavailable", () => {
+  const ids = ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-1-20250805"];
+  assert.equal(catalogServes("claude-haiku-4-5", ids), true);
+  assert.equal(catalogServes("claude-opus-4-1", ids), true);
+  assert.equal(catalogServes("gpt-5.5", ["gpt-5.5-2026-04-23"]), true);
+  assert.equal(catalogServes("claude-haiku-4-6", ids), false);
+  assert.equal(catalogServes("gpt-6", ["gpt-6-luna"]), false, "a variant is not a snapshot of the bare id");
+  assert.equal(catalogServes("claude-3-haiku", ["claude-3-haiku-20240307"]), true, "unparsed ids still match a dated build");
+  assert.equal(catalogServes("gpt-6.2-luna", ["gpt-6-luna", "gpt-6.2-sol"]), false, "a different version is not an alias");
+  const env = { ANTHROPIC_API_KEY: "ak", ANTHROPIC_MODEL: "claude-sonnet-4-6", ANTHROPIC_MODEL_NANO: "claude-haiku-4-5" };
+  assert.deepEqual(suggestModelUpgrades({ configured: configuredModels(env), available: { anthropic: ids }, env }), []);
 });

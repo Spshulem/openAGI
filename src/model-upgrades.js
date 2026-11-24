@@ -93,17 +93,35 @@ export function configuredModels(env = process.env) {
   return out;
 }
 
+// Whether the catalog serves `model`, counting aliases: "claude-haiku-4-5"
+// is served by "claude-haiku-4-5-20251001", and "gpt-5.5" by its dated
+// snapshots. Only a model with no exact, snapshot or alias match is reported
+// unavailable.
+export function catalogServes(model, ids = []) {
+  const want = String(model ?? "").trim().toLowerCase();
+  if (!want) return false;
+  const parsed = parseModelId(want);
+  return ids.some((raw) => {
+    const id = String(raw).trim().toLowerCase();
+    if (id === want) return true;
+    // Alias of a dated/latest build only — "gpt-6" is not served by "gpt-6-luna".
+    if (id.startsWith(`${want}-`) && /^(\d{8}|\d{4}-\d{2}-\d{2}|latest)$/.test(id.slice(want.length + 1))) return true;
+    if (!parsed) return false;
+    const cand = parseModelId(id);
+    return Boolean(cand && cand.base === parsed.base);
+  });
+}
+
 export function suggestModelUpgrades({ configured = [], available = {}, env = process.env } = {}) {
   const isDenied = (model) => deniedModel(model, env);
   const suggestions = [];
   for (const entry of configured) {
     const ids = available[entry.provider];
     if (!Array.isArray(ids) || ids.length === 0) continue; // catalog not read: say nothing
-    const lower = new Set(ids.map((i) => String(i).toLowerCase()));
     const successor = newestSuccessor(entry.model, ids, { isDenied });
     if (successor) {
       suggestions.push({ kind: "upgrade", ...entry, suggested: successor });
-    } else if (!lower.has(entry.model.toLowerCase())) {
+    } else if (!catalogServes(entry.model, ids)) {
       const fallback = entry.provider === "openai"
         ? (/(mini|nano|luna)/.test(entry.key + entry.model) ? DEFAULT_OPENAI_SMALL_MODEL : DEFAULT_OPENAI_MODEL)
         : null;
