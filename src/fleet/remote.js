@@ -931,6 +931,7 @@ export class RemoteFleetSupervisor {
 
   mirrorActiveWork(activeWork) {
     const outreach = this.runtime?.outreach;
+    this.mirrorRecheckNotifications(activeWork?.recheckNotifications);
     if (!activeWork || !Array.isArray(activeWork.prompts)) return;
     const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
     this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
@@ -973,6 +974,32 @@ export class RemoteFleetSupervisor {
         });
       }
       if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
+    }
+  }
+
+  // A recheck's result is a one-time notice, not a live prompt: post each
+  // once, and never again once the owner has seen or dismissed it.
+  mirrorRecheckNotifications(notifications) {
+    const outreach = this.runtime?.outreach;
+    if (!outreach || !Array.isArray(notifications)) return;
+    const posted = new Set(outreach.list()
+      .filter((item) => item.sourceRef?.kind === 'active-work-recheck' && item.sourceRef.nodeId === this.nodeId)
+      .map((item) => String(item.sourceRef.id)));
+    for (const notice of notifications) {
+      if (!notice?.id || !notice.title || posted.has(String(notice.id))) continue;
+      // The coding node folded it into the item's open follow-through prompt,
+      // which mirrorActiveWork already carries here: a second entry would
+      // notify the owner twice about one blocker.
+      if (notice.reusedPrompt === true) continue;
+      outreach.append({
+        type: 'fleet-active-work-recheck',
+        sourceRef: { kind: 'active-work-recheck', id: notice.id, itemId: notice.itemId ?? null, nodeId: this.nodeId },
+        title: notice.title,
+        summary: notice.summary ?? '',
+        actions: ['dismiss'],
+        needsDecision: false
+      });
+      posted.add(String(notice.id));
     }
   }
 }
