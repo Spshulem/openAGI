@@ -1767,7 +1767,10 @@ export class FleetStore {
       lastDetail: null
     };
     const prevQueue = this.state.queuedOwnerMessages;
-    this.state.queuedOwnerMessages = [...prevQueue, entry].slice(-100);
+    // Reject overflow cleanly instead of silently evicting an already-accepted
+    // undelivered directive for another session.
+    if (prevQueue.length >= 100) return null;
+    this.state.queuedOwnerMessages = [...prevQueue, entry];
     this._save();
     if (this.lastWriteError) {
       this.state.queuedOwnerMessages = prevQueue;

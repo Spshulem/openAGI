@@ -2594,7 +2594,7 @@ export class FleetSupervisor {
         source: "owner-message"
       });
       if (!queued) {
-        const detail = "Message exceeds the 24,000-character queue limit and was not sent while the Paseo session is mid-turn.";
+        const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
         const action = this.store.recordAction({
           threadKey: effectiveKey,
           playbook: "owner-message",

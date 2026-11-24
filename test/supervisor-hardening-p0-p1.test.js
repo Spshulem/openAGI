@@ -1522,4 +1522,43 @@ test("Codex round-6 fixes: generic decision body hashes cleanly, queue rolls bac
   });
   assert.equal(sentCount, 1, "verified stuck-running session after transient error must pass errorRecovery preflight");
   assert.notEqual(recRes.detail, "Paseo chat is active, closed, or unavailable");
+
+  // 5. Queue overflow (100 entries) rejects the 101st instead of evicting the oldest undelivered directive.
+  const dirCap = makeTmpDir(t, "queue-cap-");
+  const capStore = new FleetStore({ dir: dirCap });
+  for (let i = 0; i < 100; i += 1) {
+    assert.ok(capStore.enqueueOwnerMessage({ threadKey: `paseo:host1.a${i}`, message: `Directive ${i}` }));
+  }
+  assert.equal(capStore.enqueueOwnerMessage({ threadKey: "paseo:host1.a100", message: "Overflow 100" }), null);
+  assert.equal(capStore.queuedOwnerMessages().length, 100);
+  assert.equal(capStore.queuedOwnerMessages("paseo:host1.a0").length, 1, "oldest directive must not be evicted");
+
+  // 6. On dual-key host with OPENAGI_PROVIDER=auto, switching to gpt-5.2 infers OpenAI instead of staying on Anthropic.
+  const dirDual = makeTmpDir(t, "dual-key-");
+  const prevAnthropic = process.env.ANTHROPIC_API_KEY;
+  t.after(() => {
+    if (prevAnthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropic;
+  });
+  process.env.OPENAGI_DATA_DIR = dirDual;
+  _resetDataDirCache();
+  process.env.OPENAGI_PROVIDER = "auto";
+  process.env.ANTHROPIC_API_KEY = "sk-ant-test-fake-123456";
+  process.env.OPENAI_API_KEY = "sk-test-fake-key-1234567890";
+  delete process.env.OPENAI_MODEL_TASK_CHAT;
+  delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+  const dualSessionStore = new InMemoryAgentStore({ storePath: path.join(dirDual, "sessions.json") });
+  dualSessionStore.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const dualRt = {
+    dataDir: dirDual,
+    agentHost: { store: dualSessionStore, modelProvider: { constructor: { name: "AnthropicProvider" }, model: "claude-opus-4-6" } },
+    budget: null
+  };
+  const dualReg = new ToolRegistry();
+  registerCoreTools(dualReg, dualRt);
+  const dualRes = await dualReg.invoke("set_provider", { model: "gpt-5.2" }, { sessionId: "devices:supervisor:main" });
+  assert.equal(dualRes.result.ok, true);
+  assert.equal(dualRes.result.current, "OpenAIResponsesProvider");
+  assert.equal(dualRes.result.model, "gpt-5.2");
+  assert.equal(process.env.OPENAGI_PROVIDER, "openai");
 });

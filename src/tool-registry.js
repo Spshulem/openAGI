@@ -1465,6 +1465,24 @@ export function registerCoreTools(registry, runtime) {
             };
           }
           inferredPref = configuredProviders.anthropic ? "anthropic" : "claude-cli";
+        } else if (/^(?:gpt-|o[1-9](?:\b|-)|chatgpt|codex)/i.test(requestedModel)) {
+          const curClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
+          const alreadyOpenAIFamily = ["OpenAIResponsesProvider", "ChatGPTPlanProvider", "CodexCliProvider"].includes(curClass);
+          if (!configuredProviders.openai && !configuredProviders.chatgpt && !configuredProviders.codexCli && !alreadyOpenAIFamily) {
+            return {
+              ok: false,
+              error: `Cannot switch to OpenAI model "${requestedModel}": neither OpenAI API, ChatGPT plan, nor Codex CLI is configured on this host.`,
+              configuredProviders
+            };
+          }
+          const curPref = String(process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
+          if (!["openai", "chatgpt", "codex-cli"].includes(curPref) && (!alreadyOpenAIFamily || configuredProviders.anthropic)) {
+            if (curClass === "ChatGPTPlanProvider" && configuredProviders.chatgpt) inferredPref = "chatgpt";
+            else if (curClass === "CodexCliProvider" && configuredProviders.codexCli) inferredPref = "codex-cli";
+            else if (configuredProviders.openai) inferredPref = "openai";
+            else if (configuredProviders.chatgpt) inferredPref = "chatgpt";
+            else if (configuredProviders.codexCli) inferredPref = "codex-cli";
+          }
         }
       }
 
