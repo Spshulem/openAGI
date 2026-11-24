@@ -419,8 +419,13 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
       .map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp }))
   );
   const detectedError = currentError(agent, entries);
+  // A session Paseo still reports "running" has an error here only when its
+  // last turn ended in an unrecovered [System Error] with no active turn
+  // (currentError): that turn failed, whatever the kind, so a transient one
+  // (capacity, network) reaches the backoff instead of reading as running.
   const hardTerminalError = Boolean(
-    detectedError && ["usage-limit", "session-limit", "model-limit", "logged-out", "disk-full"].includes(detectedError.kind)
+    detectedError && (["usage-limit", "session-limit", "model-limit", "logged-out", "disk-full"].includes(detectedError.kind)
+      || agent.status === "running")
   );
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,

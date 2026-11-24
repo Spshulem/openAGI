@@ -674,7 +674,7 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
         const extraOpts = {
           ...sendOptions,
-          ...(body?.queue === true ? { queue: true } : {}),
+          ...(typeof body?.queue === "boolean" ? { queue: body.queue } : {}),
           ...(images?.length ? { images } : {})
         };
         const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);
