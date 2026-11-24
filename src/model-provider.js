@@ -1,6 +1,6 @@
 import { imageContent, imageHistory, unsupportedImageInput } from "./message-attachments.js";
 import { redactFailureDiagnostic } from "./agent-failure.js";
-import { DEFAULT_OPENAI_MODEL, ModelRouter, reasoningEffortsForModel } from "./model-router.js";
+import { DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, ModelRouter, reasoningEffortsForModel } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
@@ -434,7 +434,7 @@ export class OpenAIResponsesProvider {
 export class AnthropicProvider {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    this.model = options.model ?? process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+    this.model = options.model ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_ANTHROPIC_MODEL;
     this.baseUrl = options.baseUrl ?? process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1";
     this.version = options.version ?? "2023-06-01";
     this.maxTokens = options.maxTokens ?? 4096;

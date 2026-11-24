@@ -2915,7 +2915,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // Re-run the newer-model check now (same as the daily job).
       if (method === "POST" && pathname === "/settings/models/upgrades/check") {
         const { checkModelUpgrades } = await import("./model-upgrades.js");
-        const result = await checkModelUpgrades({ dataDir, outreach: runtime.outreach });
+        const result = await checkModelUpgrades({ dataDir, outreach: runtime.outreachConfig?.enabled ? runtime.outreach : null });
         return sendJson(res, 200, { checkedAt: result.checkedAt, checked: result.checked, errors: result.errors, suggestions: result.suggestions });
       }
       // A one-line round trip through the active model, so the settings

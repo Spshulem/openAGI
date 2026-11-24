@@ -13,7 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic, readJsonFile } from "./file-utils.js";
-import { DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_SMALL_MODEL } from "./model-router.js";
+import { DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_SMALL_MODEL } from "./model-router.js";
 
 const CACHE_FILE = "model-upgrades.json";
 
@@ -24,14 +24,17 @@ const SNAPSHOT = /-(\d{4}-\d{2}-\d{2}|\d{8})$/;
 // "gpt-6.1-sol" → { line: "gpt", version: [6, 1], variant: "sol" }
 // "claude-sonnet-4-6" → { line: "claude", version: [4, 6], variant: "sonnet" }
 // Returns null for ids this check does not reason about.
-export function parseModelId(raw) {
-  const id = String(raw ?? "").trim().toLowerCase().replace(/^(openai|anthropic)\//, "");
+// `raw` keeps the caller's exact spelling (e.g. a provider-prefixed
+// "openai/gpt-6.2-sol"); everything else is normalized for comparison only.
+export function parseModelId(input) {
+  const raw = String(input ?? "").trim();
+  const id = raw.toLowerCase().replace(/^(openai|anthropic)\//, "");
   if (!id || SPECIALTY.test(id)) return null;
   const base = id.replace(SNAPSHOT, "");
   let m = base.match(/^gpt-(\d+)(?:\.(\d+))?(?:-([a-z]+))?$/);
-  if (m) return { id, base, line: "gpt", version: [Number(m[1]), Number(m[2] ?? 0)], variant: m[3] ?? "", snapshot: base !== id };
+  if (m) return { raw, id, base, line: "gpt", version: [Number(m[1]), Number(m[2] ?? 0)], variant: m[3] ?? "", snapshot: base !== id };
   m = base.match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?$/);
-  if (m) return { id, base, line: "claude", version: [Number(m[2]), Number(m[3] ?? 0)], variant: m[1], snapshot: base !== id };
+  if (m) return { raw, id, base, line: "claude", version: [Number(m[2]), Number(m[3] ?? 0)], variant: m[1], snapshot: base !== id };
   return null;
 }
 
@@ -48,7 +51,8 @@ function variantsFor(variant) {
 
 // The newest available model that is the same line and variant as `current`
 // and strictly newer. Undated aliases win over dated snapshots of the same
-// version.
+// version. Returns the catalog's own id, so the suggestion is a value that
+// endpoint actually serves.
 export function newestSuccessor(current, availableIds = []) {
   const cur = parseModelId(current);
   if (!cur) return null;
@@ -61,7 +65,7 @@ export function newestSuccessor(current, availableIds = []) {
     if (!best || newer(cand.version, best.version)
       || (cand.version.join(".") === best.version.join(".") && best.snapshot && !cand.snapshot)) best = cand;
   }
-  return best?.id ?? null;
+  return best?.raw ?? null;
 }
 
 // Which env keys hold a model, and which provider's catalog they are checked
@@ -79,7 +83,7 @@ export function configuredModels(env = process.env) {
     for (const key of Object.keys(env).filter((k) => k.startsWith("OPENAI_MODEL_TASK_")).sort()) add("openai", key);
   }
   if (env.ANTHROPIC_API_KEY) {
-    add("anthropic", "ANTHROPIC_MODEL");
+    add("anthropic", "ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL);
     add("anthropic", "ANTHROPIC_MODEL_MINI");
     add("anthropic", "ANTHROPIC_MODEL_NANO");
     for (const key of Object.keys(env).filter((k) => k.startsWith("ANTHROPIC_MODEL_TASK_")).sort()) add("anthropic", key);
@@ -100,7 +104,8 @@ export function suggestModelUpgrades({ configured = [], available = {} } = {}) {
       const fallback = entry.provider === "openai"
         ? (/(mini|nano|luna)/.test(entry.key + entry.model) ? DEFAULT_OPENAI_SMALL_MODEL : DEFAULT_OPENAI_MODEL)
         : null;
-      suggestions.push({ kind: "unavailable", ...entry, suggested: fallback && lower.has(fallback) ? fallback : null });
+      const served = fallback ? ids.find((i) => parseModelId(i)?.id === fallback) ?? null : null;
+      suggestions.push({ kind: "unavailable", ...entry, suggested: served });
     }
   }
   return suggestions;
@@ -109,7 +114,7 @@ export function suggestModelUpgrades({ configured = [], available = {} } = {}) {
 const CATALOGS = {
   openai: { keyEnv: "OPENAI_API_KEY", url: (env) => `${String(env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "")}/models`,
     headers: (key) => ({ authorization: `Bearer ${key}` }) },
-  anthropic: { keyEnv: "ANTHROPIC_API_KEY", url: () => "https://api.anthropic.com/v1/models?limit=1000",
+  anthropic: { keyEnv: "ANTHROPIC_API_KEY", url: (env) => `${String(env.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1").replace(/\/+$/, "")}/models?limit=1000`,
     headers: (key) => ({ "x-api-key": key, "anthropic-version": "2023-06-01" }) }
 };
 
@@ -161,12 +166,16 @@ export async function checkModelUpgrades({ env = process.env, dataDir, fetchImpl
   const previous = dataDir ? readModelUpgradeCache(dataDir) : null;
   const notified = new Set(previous?.notified ?? []);
   const announced = [];
+  // outreach is null when the owner turned proactive outreach off: the check
+  // and cache still run, nothing is announced, and nothing is marked as
+  // announced (so turning outreach back on still delivers it once).
   for (const s of suggestions) {
+    if (typeof outreach?.append !== "function") break;
     const ref = `${s.kind}:${s.key}:${s.model}->${s.suggested ?? "none"}`;
     if (notified.has(ref)) continue;
     notified.add(ref);
     const text = describe(s);
-    outreach?.append?.({ type: "suggestion", sourceRef: { kind: "model-upgrade", id: ref }, title: text.title, summary: text.summary, dedupeOpen: true });
+    outreach.append({ type: "suggestion", sourceRef: { kind: "model-upgrade", id: ref }, title: text.title, summary: text.summary, dedupeOpen: true });
     announced.push(ref);
   }
   const result = {

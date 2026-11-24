@@ -1030,7 +1030,9 @@ export class AbiRuntime {
     }
     if (job.task === "model-upgrade-check") {
       const { checkModelUpgrades } = await import("./model-upgrades.js");
-      return checkModelUpgrades({ dataDir: this.modelUpgradeDir, outreach: this.outreach, now });
+      // Outreach opt-out (OPENAGI_OUTREACH_DISABLED / outreach.json) silences
+      // the announcement; the read-only check and settings cache still run.
+      return checkModelUpgrades({ dataDir: this.modelUpgradeDir, outreach: this.outreachConfig?.enabled ? this.outreach : null, now });
     }
     if (job.task === "grounded-sweep") {
       return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };

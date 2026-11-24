@@ -25,6 +25,7 @@
 // only matter for fresh installs and unset keys.
 export const DEFAULT_OPENAI_MODEL = "gpt-6.2-sol";
 export const DEFAULT_OPENAI_SMALL_MODEL = "gpt-6-luna";
+export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
 export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 

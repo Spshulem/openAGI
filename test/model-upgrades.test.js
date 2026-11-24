@@ -95,3 +95,62 @@ test("checkModelUpgrades caches, announces each suggestion once, and never edits
   assert.equal(items.length, 1, "same suggestion is not re-announced");
   assert.equal(JSON.stringify(env), before, "config untouched");
 });
+
+test("review fixes: prefixed catalog ids, Anthropic default + base URL, outreach opt-out", async (t) => {
+  // The suggestion is the catalog's own id, not a stripped one.
+  assert.equal(newestSuccessor("openai/gpt-6.1-sol", ["openai/gpt-6.1-sol", "openai/gpt-6.2-sol"]), "openai/gpt-6.2-sol");
+  const prefixed = suggestModelUpgrades({
+    configured: [{ provider: "openai", key: "OPENAI_MODEL_NANO", model: "openai/gpt-6.2-luna" }],
+    available: { openai: ["openai/gpt-6-luna", "openai/gpt-6.2-sol"] }
+  });
+  assert.equal(prefixed[0].suggested, "openai/gpt-6-luna");
+
+  // An Anthropic key with ANTHROPIC_MODEL unset checks the model that runs.
+  const anth = configuredModels({ ANTHROPIC_API_KEY: "ak" });
+  assert.deepEqual(anth.map((c) => [c.key, c.model, c.explicit]), [["ANTHROPIC_MODEL", "claude-sonnet-4-6", false]]);
+
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-model-upg2-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const urls = [];
+  const fetchImpl = async (url) => { urls.push(url); return new Response(JSON.stringify({ data: [{ id: "claude-sonnet-4-6" }, { id: "claude-sonnet-4-7" }] })); };
+  const env = { ANTHROPIC_API_KEY: "proxy-key", ANTHROPIC_BASE_URL: "https://proxy.example/v1/" };
+
+  // Outreach off: the check and cache still run, nothing is announced or
+  // marked announced.
+  const silent = await checkModelUpgrades({ env, dataDir, fetchImpl, outreach: null });
+  assert.equal(urls[0], "https://proxy.example/v1/models?limit=1000", "the configured base URL, not api.anthropic.com");
+  assert.equal(silent.suggestions[0].suggested, "claude-sonnet-4-7");
+  assert.deepEqual(silent.announced, []);
+  assert.equal(readModelUpgradeCache(dataDir).suggestions.length, 1);
+
+  // Outreach back on: delivered once.
+  const items = [];
+  const on = await checkModelUpgrades({ env, dataDir, fetchImpl, outreach: { append: (i) => items.push(i) } });
+  assert.equal(items.length, 1);
+  assert.equal(on.announced.length, 1);
+});
+
+test("the daily job passes no outreach store when outreach is disabled", async (t) => {
+  const { createDurableRuntime } = await import("../src/index.js");
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-model-upg-rt-"));
+  fs.writeFileSync(path.join(dataDir, "outreach.json"), JSON.stringify({ enabled: false }));
+  const runtime = createDurableRuntime({ dataDir, registerDefaults: false, integrations: false, skills: false, autoConnectMcp: false });
+  t.after(() => {
+    for (const store of [runtime?.observations, runtime?.vectorStore, runtime?.sessionIndex]) store?.db?.close?.();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  assert.equal(runtime.outreachConfig.enabled, false);
+  const appended = [];
+  runtime.outreach.append = (i) => { appended.push(i); return i; };
+  const prev = { k: process.env.OPENAI_API_KEY, f: globalThis.fetch };
+  process.env.OPENAI_API_KEY = "sk-test";
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ id: "gpt-6.2-sol" }, { id: "gpt-7-sol" }] }));
+  try {
+    const result = await runtime.runJobTask({ id: "model-upgrade-check", task: "model-upgrade-check" });
+    assert.equal(result.suggestions[0].suggested, "gpt-7-sol");
+    assert.deepEqual(appended, [], "nothing announced while outreach is off");
+  } finally {
+    if (prev.k === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prev.k;
+    globalThis.fetch = prev.f;
+  }
+});
