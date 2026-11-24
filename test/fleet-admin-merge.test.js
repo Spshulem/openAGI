@@ -59,6 +59,10 @@ function fakeGh(over = {}) {
       const rules = over.rules ?? [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }, { type: "required_status_checks", parameters: { required_status_checks: [{ context: "test", integration_id: 15368 }] } }, { type: "deletion" }];
       return { code: 0, stdout: JSON.stringify(page === 1 ? rules : []), stderr: "" };
     }
+    if (a === "api" && /\/compare\//.test(b)) {
+      if (over.compare === "error") return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+      return { code: 0, stdout: JSON.stringify({ status: "ahead", ahead_by: 1, behind_by: 0, ...(over.compare ?? {}) }), stderr: "" };
+    }
     if (a === "api" && /\/commits\/[0-9a-f]+\/check-runs/.test(b)) {
       const runs = over.checkRuns ?? [{ id: 1, name: "test", status: "completed", conclusion: "success", app: { id: 15368 } }];
       return { code: 0, stdout: JSON.stringify({ total_count: runs.length, check_runs: page === 1 ? runs : [] }), stderr: "" };
@@ -241,6 +245,30 @@ test("Admin Merge never bypasses classic protection's required deployments, and 
   const none = fakeGh();
   await executeAdminMerge({ prRef: PR, consent: consentFor(), run: none.run });
   assert.equal(none.calls.some((c) => String(c[4] ?? "").includes("branchProtectionRule")), false);
+});
+
+test("Admin Merge checks base ancestry itself when the branch must be up to date (BLOCKED can mask BEHIND)", async () => {
+  const strictRuleset = { rules: [{ type: "pull_request" }, { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "test" }] } }] };
+  const strictClassic = { protection: { required_pull_request_reviews: {}, required_status_checks: { strict: true, contexts: ["test"], checks: [] } } };
+  for (const policy of [strictRuleset, strictClassic]) {
+    const behind = fakeGh({ ...policy, compare: { status: "diverged", behind_by: 3 } });
+    const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: behind.run });
+    assert.equal(out.reason, "behind_base", JSON.stringify(policy));
+    assert.match(out.detail, /3 commit\(s\) behind main/);
+    assert.equal(behind.merges().length, 0);
+
+    const unreadable = fakeGh({ ...policy, compare: "error" });
+    assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: unreadable.run })).reason, "ancestry_unreadable");
+    assert.equal(unreadable.merges().length, 0);
+
+    const current = fakeGh(policy);
+    assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: current.run })).status, "merged");
+    assert.ok(current.calls.some((c) => c[2] === `repos/${REPO}/compare/main...${SHA}`));
+  }
+  // Not strict: being behind is allowed by the branch, so no comparison is needed.
+  const loose = fakeGh({ compare: { behind_by: 9 } });
+  assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: loose.run })).status, "merged");
+  assert.equal(loose.calls.some((c) => /\/compare\//.test(c[2] ?? "")), false);
 });
 
 test("Admin Merge reads every page of branch rules before allowing a bypass", async () => {

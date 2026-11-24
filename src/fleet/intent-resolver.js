@@ -429,6 +429,24 @@ async function unverifiedCommits(run, ghBin, parsed, headSha) {
   return { ok: true, unverified };
 }
 
+// "Require branches to be up to date": a strict ruleset status-check policy
+// or classic strict status checks. GitHub can report such a PR as BLOCKED
+// (its missing review) rather than BEHIND, so this is checked on its own.
+function requiresUpToDate(rules, protection) {
+  if (protection?.required_status_checks?.strict === true) return true;
+  return (Array.isArray(rules) ? rules : []).some((rule) => rule?.type === "required_status_checks"
+    && rule?.parameters?.strict_required_status_checks_policy === true);
+}
+
+// How many base commits the head lacks, from GitHub's own comparison.
+async function commitsBehindBase(run, ghBin, repo, base, headSha) {
+  const res = await ghApiJson(run, ghBin, `repos/${repo}/compare/${encodeURIComponent(base)}...${headSha}`);
+  if (!res.ok) return res;
+  const behind = res.data?.behind_by;
+  if (!Number.isInteger(behind) || behind < 0) return { ok: false, message: `GitHub did not say how far ${headSha.slice(0, 7)} is behind ${base}.` };
+  return { ok: true, behind };
+}
+
 // Classic protection settings the REST protection response leaves out
 // (required deployments), read from the branch's own protection rule.
 async function classicGraphqlSettings(run, ghBin, parsed, base) {
@@ -576,6 +594,13 @@ export async function preflightAdminMerge({
   }
   if (blockers.length > 0) {
     return halt("other_rule", ref, `Admin Merge only waives the required review, but ${base} also has: ${blockers.join("; ")}. Supervisor will not bypass that or change any rule.`, { otherRules: blockers });
+  }
+  if (requiresUpToDate(rules.data, classic)) {
+    const ancestry = await commitsBehindBase(run, ghBin, parsed.repo, base, liveSha);
+    if (!ancestry.ok) return halt("ancestry_unreadable", ref, `${base} requires branches to be up to date and Admin Merge could not confirm ${ref} is. GitHub said: ${ancestry.message}`);
+    if (ancestry.behind > 0) {
+      return halt("behind_base", ref, `${ref} is ${ancestry.behind} commit(s) behind ${base}, which requires branches to be up to date. Admin Merge never bypasses that.`, { canFixCi: true });
+    }
   }
   const requiredByRules = requiredContexts(rules.data, classic);
   const contexts = await unmetRequiredContexts(run, ghBin, parsed.repo, liveSha, requiredByRules);

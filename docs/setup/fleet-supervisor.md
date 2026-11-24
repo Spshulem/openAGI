@@ -194,7 +194,9 @@ merge halts:
 - The head and base branch are unchanged since the preview. The head is also
   unchanged since the reviewed commit if the card pinned one.
 - There are no conflicts, the PR is not behind its base, and GitHub knows
-  whether it can merge.
+  whether it can merge. When the branch requires being up to date, Admin
+  Merge compares base and head itself, because GitHub can report such a PR
+  as review-blocked instead of behind.
 - No check is failing or pending.
 - Every check the branch's rulesets and protection require has passed on that
   exact head. Where a rule names the app that must post a check, the check must
