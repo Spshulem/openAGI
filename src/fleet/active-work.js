@@ -43,6 +43,8 @@ import { buildDecisionContext, renderDecisionContext } from "./decision-context.
 const HOUR_MS = 60 * 60_000;
 const ACTIVE_WORK_FILE = "active-work.json";
 const MAX_ITEMS = 400;
+// Passes a due recheck may wait for its repo's PR evidence before using cached evidence.
+const MAX_RECHECK_REPO_DEFERRALS = 3;
 const MAX_PROPOSALS = 150;
 const MAX_EVIDENCE_LINKS = 24;
 const MAX_ACTIONS_LOG = 200;
@@ -161,7 +163,8 @@ function emptyPersistentState() {
       inputTokens: 0,
       promptsEmitted: 0
     },
-    actions: []
+    actions: [],
+    rechecks: []
   };
 }
 
@@ -510,7 +513,8 @@ export class ActiveWorkManager {
         ...base.spend,
         ...(raw.spend && typeof raw.spend === "object" ? raw.spend : {})
       },
-      actions: Array.isArray(raw.actions) ? raw.actions.slice(-MAX_ACTIONS_LOG) : []
+      actions: Array.isArray(raw.actions) ? raw.actions.slice(-MAX_ACTIONS_LOG) : [],
+      rechecks: Array.isArray(raw.rechecks) ? raw.rechecks.slice(-MAX_ITEMS) : []
     };
   }
 
@@ -576,6 +580,47 @@ export class ActiveWorkManager {
       }
     }
     return slugs;
+  }
+
+  // Schedule one bounded one-shot recheck for a tracked outcome. The timing
+  // contract is intentionally strict: callers must provide delaySeconds only.
+  // Rechecks are persisted with the evidence mark so a restart cannot create a
+  // second check for the same handoff.
+  scheduleRecheck(id, input = {}) {
+    const item = this.state.items.find((candidate) => candidate.id === id);
+    if (!item) return { ok: false, status: "unknown_item" };
+    const keys = ["delaySeconds", "intervalSeconds", "dailyAt"].filter((key) => input[key] !== undefined && input[key] !== null);
+    if (keys.length !== 1 || keys[0] !== "delaySeconds") {
+      throw new Error("A recheck requires exactly one one-shot delaySeconds value; recurring timing is not supported.");
+    }
+    const delaySeconds = Number(input.delaySeconds);
+    if (!Number.isSafeInteger(delaySeconds) || delaySeconds < 30 || delaySeconds > 365 * 86400) {
+      throw new Error("Use a one-shot recheck delay from 30 seconds to one year.");
+    }
+    const evidenceMark = String(input.evidenceMark ?? item.lastEvaluatedMark ?? item.updatedAt ?? "").slice(0, 200);
+    const existing = this.state.rechecks.find((recheck) => recheck.status === "pending" && recheck.itemId === id && recheck.evidenceMark === evidenceMark);
+    if (existing) return { ok: true, status: "reused", recheck: structuredClone(existing) };
+    const nowMs = this.now();
+    const pending = this.state.rechecks.filter((recheck) => recheck.status === "pending");
+    if (pending.length >= MAX_ITEMS) throw new Error("Active Work recheck capacity is full; existing pending rechecks must run before scheduling another.");
+    const recheck = { id: makeId("recheck"), itemId: id, evidenceMark, dueAt: new Date(nowMs + delaySeconds * 1000).toISOString(), createdAt: new Date(nowMs).toISOString(), status: "pending", result: null };
+    // Prune completed history first; an accepted pending recheck is never
+    // discarded to make room.
+    const keepCompleted = MAX_ITEMS - pending.length - 1;
+    const completed = keepCompleted > 0 ? this.state.rechecks.filter((candidate) => candidate.status !== "pending").slice(-keepCompleted) : [];
+    this.state.rechecks = [...completed, ...pending, recheck];
+    this._recordAudit({ op: "recheck_scheduled", itemId: id, recheckId: recheck.id, evidenceMark });
+    this._save();
+    return { ok: true, status: "scheduled", recheck: structuredClone(recheck) };
+  }
+
+  hasDueRechecks(now = this.now()) {
+    const nowMs = typeof now === "number" ? now : Date.parse(now);
+    return this.state.rechecks.some((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs);
+  }
+
+  listRechecks({ status = null } = {}) {
+    return this.state.rechecks.filter((recheck) => !status || recheck.status === status).map((recheck) => structuredClone(recheck));
   }
 
   trackWork(input = {}) {
@@ -1971,8 +2016,11 @@ export class ActiveWorkManager {
     // 2. Bounded repo preflight for enrolled projects/repos (reusing inspectRepoStatus).
     const enrolledRepos = [];
     const repoToProject = new Map();
+    const itemRepo = (item) => item?.repo ?? parsePrRef(item?.prRef)?.repo ?? null;
+    // Repos whose PR evidence was refreshed this pass; a due recheck waits for its own.
+    const inspectedRepos = new Set();
     for (const item of this.state.items) {
-      const r = item.repo ?? parsePrRef(item.prRef)?.repo ?? null;
+      const r = itemRepo(item);
       if (r && !repoToProject.has(r.toLowerCase())) {
         repoToProject.set(r.toLowerCase(), item.project);
         enrolledRepos.push(r);
@@ -1981,11 +2029,15 @@ export class ActiveWorkManager {
 
     let repoChecksRun = 0;
     if (boundedRepos > 0 && enrolledRepos.length > 0 && this.supervisor) {
+      const dueRepos = new Set(this.state.rechecks
+        .filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs)
+        .map((recheck) => itemRepo(this.state.items.find((item) => item.id === recheck.itemId)))
+        .filter(Boolean)
+        .map((repo) => String(repo).toLowerCase()));
       const repoStart = (this.state.inventoryCursor.repoOffset ?? 0) % enrolledRepos.length;
-      const reposThisPass = [];
-      for (let i = 0; i < Math.min(boundedRepos, enrolledRepos.length); i += 1) {
-        reposThisPass.push(enrolledRepos[(repoStart + i) % enrolledRepos.length]);
-      }
+      const rotatedRepos = enrolledRepos.map((_, index) => enrolledRepos[(repoStart + index) % enrolledRepos.length]);
+      const orderedRepos = [...rotatedRepos.filter((repo) => dueRepos.has(String(repo).toLowerCase())), ...rotatedRepos.filter((repo) => !dueRepos.has(String(repo).toLowerCase()))];
+      const reposThisPass = orderedRepos.slice(0, Math.min(boundedRepos, enrolledRepos.length));
       this.state.inventoryCursor.repoOffset = (repoStart + reposThisPass.length) % enrolledRepos.length;
 
       for (const repoSlug of reposThisPass) {
@@ -1994,6 +2046,7 @@ export class ActiveWorkManager {
             ? await this.supervisor.inspectRepoStatus({ repo: repoSlug, limit: 15 })
             : await inspectRepoStatus(this.supervisor, { repo: repoSlug, limit: 15 });
           repoChecksRun += 1;
+          inspectedRepos.add(String(repoSlug).toLowerCase());
           for (const openPr of status?.openPrs ?? []) {
             if (!openPr?.ref) continue;
             const prevPr = prsByRef.get(openPr.ref.toLowerCase()) ?? null;
@@ -2160,7 +2213,10 @@ export class ActiveWorkManager {
       const ownerKey = item.owner?.threadKey ?? null;
       const session = ownerKey ? (sessionsByKey.get(ownerKey) ?? null) : null;
       const ownerMissing = Boolean(ownerKey && !session);
-      const inCurrentPage = !ownerKey || sessions.length === 0 || pageSessionKeys.has(ownerKey) || (session ? pageSessionKeys.has(session.key) : false);
+      const dueRecheck = this.state.rechecks.some((recheck) =>
+        recheck.status === "pending" && recheck.itemId === item.id && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs
+      );
+      const inCurrentPage = dueRecheck || !ownerKey || sessions.length === 0 || pageSessionKeys.has(ownerKey) || (session ? pageSessionKeys.has(session.key) : false);
 
       const progressMs = parseIsoMs(item.lastMeaningfulProgress?.at ?? item.lastMeaningfulProgressAt ?? item.createdAt) ?? nowMs;
       const staleAfterMs = (item.cadence?.staleAfterHours ?? 24) * HOUR_MS;
@@ -2401,10 +2457,51 @@ export class ActiveWorkManager {
       }
     }
 
+    // A due recheck is consumed by this pass. Emit at most one proactive
+    // result per pass, and only for a verified outcome or one deterministic
+    // blocker. No owner turn or model call is needed.
+    let recheckNotification = null;
+    const dueRechecks = this.state.rechecks
+      .filter((recheck) => recheck.status === "pending" && (parseIsoMs(recheck.dueAt) ?? Infinity) <= nowMs)
+      .sort((a, b) => Number(this.state.items.find((item) => item.id === b.itemId)?.outcomeVerified === true) - Number(this.state.items.find((item) => item.id === a.itemId)?.outcomeVerified === true));
+    for (const recheck of dueRechecks) {
+      const rawRecheckItem = this.state.items.find((candidate) => candidate.id === recheck.itemId);
+      // Never complete a recheck on cached PR evidence: wait (bounded) until
+      // its repo's turn in the repo preflight comes up.
+      const recheckRepo = itemRepo(rawRecheckItem)?.toLowerCase() ?? null;
+      if (boundedRepos > 0 && this.supervisor && recheckRepo && !inspectedRepos.has(recheckRepo) && (recheck.deferredPasses ?? 0) < MAX_RECHECK_REPO_DEFERRALS) {
+        recheck.deferredPasses = (recheck.deferredPasses ?? 0) + 1;
+        continue;
+      }
+      const projected = rawRecheckItem ? this._projectItem(rawRecheckItem, { nowMs, sessionsByKey, prsByRef }) : null;
+      const verified = projected?.outcomeVerified === true;
+      const blocked = ["blocked", "blocked_pr"].includes(projected?.followThroughState);
+      if (verified || blocked) {
+        if (!recheckNotification) {
+          const outreach = this.runtime?.outreach;
+          if (typeof outreach?.append === "function") {
+            const title = verified ? `Follow-through verified · ${projected.project}` : `Follow-through blocker · ${projected.project}`;
+            const summary = verified ? `Recheck verified: ${projected.doneCriteria}` : `${projected.whySurfaced || "Actionable blocker found"} Choose resume, assign, confirm, or snooze.`;
+            const existing = rawRecheckItem?.outreachId ? outreach.get?.(rawRecheckItem.outreachId) : null;
+            const openExisting = existing && ["unseen", "seen"].includes(existing.status) ? existing : null;
+            const item = openExisting ?? outreach.append({ type: "fleet-active-work-recheck", sourceRef: { kind: "active-work-recheck", id: recheck.id, itemId: recheck.itemId }, title, summary, actions: ["dismiss"], needsDecision: false, dedupeOpen: true });
+            if (item?.id && typeof outreach.update === "function") outreach.update(item.id, { title, summary, actions: ["dismiss"] });
+            recheckNotification = { type: verified ? "verified_outcome" : "actionable_blocker", outreachId: item?.id ?? null, itemId: recheck.itemId };
+          }
+          recheck.status = "notified"; recheck.result = recheckNotification;
+        } else {
+          recheck.status = "checked"; recheck.result = { type: "notification_cap", itemId: recheck.itemId };
+        }
+        recheck.completedAt = nowIso;
+      } else {
+        recheck.status = "checked"; recheck.result = { type: "still_open", itemId: recheck.itemId }; recheck.completedAt = nowIso;
+      }
+    }
     this._save();
 
     return {
       at: nowIso,
+      recheckNotification,
       page: {
         startOffset,
         nextOffset,
@@ -2475,6 +2572,10 @@ export class ActiveWorkManager {
 
     const item = this.state.items.find((it) => it.id === cleanId);
     if (!item) return null;
+
+    if (op === "schedule_recheck") {
+      return this.scheduleRecheck(cleanId, input);
+    }
 
     if (op === "confirm_done") {
       item.outcomeVerified = true;
@@ -2803,13 +2904,13 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
       needsConfirmation: true,
       supervisorAutoApprove: true,
       description:
-        "Act on a Supervisor Active Work item or project proposal, or run one bounded resumable inventory pass (`op='scan_inventory'`). Choices: `resume_owner` (resumes existing session only; never spawns duplicates), `assign_orphan` (links existing session or human owner), `confirm_done` (verifies outcome), `snooze`, `propose_archive` (proposes verified archive candidate; never auto-archives), `enroll_project`, `dismiss_proposal`.",
+        "Act on a Supervisor Active Work item or project proposal, or run one bounded resumable inventory pass (`op='scan_inventory'`). Choices: `resume_owner` (resumes existing session only; never spawns duplicates), `assign_orphan` (links existing session or human owner), `confirm_done` (verifies outcome), `snooze`, `schedule_recheck` (one-shot delay only, durable and deduped), `propose_archive` (proposes verified archive candidate; never auto-archives), `enroll_project`, `dismiss_proposal`.",
       parameters: {
         type: "object",
         properties: {
           op: {
             type: "string",
-            enum: ["resume_owner", "assign_orphan", "confirm_done", "snooze", "propose_archive", "enroll_project", "dismiss_proposal", "scan_inventory"],
+            enum: ["resume_owner", "assign_orphan", "confirm_done", "snooze", "schedule_recheck", "propose_archive", "enroll_project", "dismiss_proposal", "scan_inventory"],
             description: "Follow-through action to execute"
           },
           id: { type: "string", maxLength: 80, description: "Active Work item id ('tw_...') or proposal id ('prop_...'); omit for op='scan_inventory'" },
@@ -2818,7 +2919,10 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
           hours: { type: "number", minimum: 0, maximum: 336, description: "Snooze duration in hours (0 wakes immediately, default 24)" },
           message: { type: "string", maxLength: 1200, description: "Follow-up message to send existing owner for resume_owner" },
           note: { type: "string", maxLength: 180, description: "Verification note for confirm_done" },
-          pageSize: { type: "integer", minimum: 1, maximum: 50, description: "Bounded page size for op='scan_inventory'" }
+          pageSize: { type: "integer", minimum: 1, maximum: 50, description: "Bounded page size for op='scan_inventory'" },
+          delaySeconds: { type: "integer", minimum: 30, maximum: 31536000, description: "One-shot recheck delay; do not combine with recurring timing" },
+          intervalSeconds: { type: "integer", minimum: 300, description: "Rejected for schedule_recheck; recurring timing is not supported" },
+          dailyAt: { type: "string", description: "Rejected for schedule_recheck; recurring timing is not supported" }
         },
         required: ["op"],
         additionalProperties: false
@@ -2836,7 +2940,10 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
           ...(args.hours !== undefined ? { hours: Number(args.hours) } : {}),
           ...(args.message ? { message: cleanText(args.message, 1200) } : {}),
           ...(args.note ? { note: cleanText(args.note, 180) } : {}),
-          ...(args.pageSize !== undefined ? { pageSize: Number(args.pageSize) } : {})
+          ...(args.pageSize !== undefined ? { pageSize: Number(args.pageSize) } : {}),
+          ...(args.delaySeconds !== undefined ? { delaySeconds: Number(args.delaySeconds) } : {}),
+          ...(args.intervalSeconds !== undefined ? { intervalSeconds: Number(args.intervalSeconds) } : {}),
+          ...(args.dailyAt !== undefined ? { dailyAt: String(args.dailyAt) } : {})
         };
       },
       approvalTtlMs: 15 * 60_000,
@@ -2849,6 +2956,10 @@ export function registerActiveWorkTools(registry, supervisor, { source = "integr
         if (args.op === "scan_inventory") {
           if (typeof supervisor.scanActiveWork !== "function") throw new Error("Inventory scan is not available.");
           return supervisor.scanActiveWork({ pageSize: args.pageSize ?? 12 });
+        }
+        if (args.op === "schedule_recheck") {
+          if (typeof supervisor.scheduleActiveWorkRecheck !== "function") throw new Error("Active Work rechecks are not available.");
+          return supervisor.scheduleActiveWorkRecheck(args.id, args);
         }
         // Safety invariant: propose_archive via conversational tool strictly proposes
         // the archive candidate (`confirmed: false`), never auto-archiving a chat.
