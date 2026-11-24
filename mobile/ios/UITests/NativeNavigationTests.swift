@@ -95,7 +95,7 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "open-settings")
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         capture("native-settings", app: app)
-        for (id, title) in [("model", "Model"), ("instructions", "Instructions"), ("integrations", "Integrations"), ("skills", "Skills"), ("scheduled", "Scheduled")] {
+        for (id, title) in [("model", "Model"), ("budget", "Budget"), ("instructions", "Instructions"), ("integrations", "Integrations"), ("skills", "Skills"), ("scheduled", "Scheduled")] {
             tap(app, "settings-\(id)", in: "settings-form")
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
             back(app, from: title, to: "Settings")
@@ -552,7 +552,10 @@ final class NativeNavigationTests: XCTestCase {
             result.tap()
             let title = kind == "agent" ? "Chat" : "Supervisor chat"
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
-            XCTAssertTrue(app.staticTexts["Earlier synthetic question"].isHittable)
+            let question = app.staticTexts["Earlier synthetic question"]
+            let questionHittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: question)
+            XCTAssertEqual(XCTWaiter.wait(for: [questionHittable], timeout: 5), .completed)
+            XCTAssertTrue(question.isHittable)
             XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].isHittable)
             XCTAssertFalse(app.buttons["chat-jump-latest"].exists,
                            "Selecting an already-visible result must not create a redundant jump button")
@@ -676,6 +679,45 @@ final class NativeNavigationTests: XCTestCase {
         back(app, from: "Approval", to: "Inbox")
         XCTAssertFalse(element(app, "inbox-approval-computer-access").exists)
         XCTAssertTrue(app.staticTexts["Approve the first synthetic action"].waitForExistence(timeout: 5))
+    }
+
+    // Owner's repro: start dictating, pause about a second (iOS finalizes
+    // that segment), then keep talking. The mic must stay on and every word
+    // must stay in the same unsent draft.
+    func testDictationPauseKeepsListeningAndKeepsEverythingInOneUnsentDraft() {
+        let app = launch(["--ui-dictation-pause-fixture"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let both = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "After the pause it continues."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [both], timeout: 6), .completed, "Speech after the pause must reach the draft")
+        let draft = field.value as? String ?? ""
+        XCTAssertTrue(draft.hasPrefix("Before the pause."), "Text from before the pause must not be replaced or lost: \(draft)")
+        XCTAssertEqual(mic.label, "Stop dictation", "The microphone must still be listening after a pause")
+        XCTAssertFalse(app.staticTexts["After the pause it continues."].exists, "Dictation must never send by itself")
+        capture("native-dictation-pause", app: app)
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues.")
+    }
+
+    // The same pause on device: no final marker and no timing; the next
+    // partial restarts from empty. Earlier words stay, nothing repeats.
+    func testDictationRestartAfterPauseWithoutFinalKeepsAndAppends() {
+        let app = launch(["--ui-dictation-restart-fixture"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let both = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "After the pause it continues."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [both], timeout: 6), .completed, "Speech after the pause must reach the draft")
+        XCTAssertEqual(mic.label, "Stop dictation", "The microphone must still be listening after a pause")
+        mic.tap()
+        XCTAssertEqual(field.value as? String, "Before the pause After the pause it continues.",
+                       "Earlier words kept, new words appended once")
     }
 
     func testLongLiveDictationStaysInBoundedEditorWithAccessibleControls() {

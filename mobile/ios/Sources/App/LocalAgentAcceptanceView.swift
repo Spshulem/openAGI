@@ -19,6 +19,9 @@ struct LocalAgentAcceptanceView: View {
 
     @State private var report: Report?
 
+    private static let taskPersistenceTimeout: TimeInterval = 5
+    private static let taskPersistencePollInterval: Duration = .milliseconds(250)
+
     var body: some View {
         NavigationStack {
             Form {
@@ -60,13 +63,19 @@ struct LocalAgentAcceptanceView: View {
             let stream = try await local.sendMessageStreaming(
                 text: "Add one task to my Today list with exactly this title: \(marker). Use add_task, then confirm.", thread: .agent)
             for try await _ in stream {}
-            // The embedded daemon sends the final stream frame before its
-            // durable task journal is guaranteed to be visible to the next
-            // HTTP request. Poll briefly so this acceptance check measures
-            // the real tool result instead of a persistence race.
-            createdTaskID = try await waitForTaskID(client: local, marker: marker)
-            result.taskToolWorked = createdTaskID != nil
-            let tasks = try await local.tasks()
+            // The daemon can persist the add_task result shortly after the
+            // streamed reply ends, so poll for a bounded window instead of
+            // reading the task list exactly once.
+            var tasks = try await local.tasks()
+            var created = tasks.first { $0.title.contains(marker) }
+            let deadline = Date().addingTimeInterval(Self.taskPersistenceTimeout)
+            while created == nil, Date() < deadline {
+                try await Task.sleep(for: Self.taskPersistencePollInterval)
+                tasks = try await local.tasks()
+                created = tasks.first { $0.title.contains(marker) }
+            }
+            createdTaskID = created?.id
+            result.taskToolWorked = created != nil
             if case .fresh(let summary, _) = try await local.summary(ifNoneMatch: nil) {
                 result.todayWorked = summary.today.contains { $0.id == createdTaskID }
             }
@@ -104,19 +113,6 @@ struct LocalAgentAcceptanceView: View {
             .appendingPathComponent("openagi-device-acceptance.json")
         try? JSONEncoder().encode(result).write(to: output, options: .atomic)
         report = result
-    }
-
-    private func waitForTaskID(client: DaemonClient, marker: String) async throws -> String? {
-        for attempt in 0..<20 {
-            let tasks = try await client.tasks()
-            if let task = tasks.first(where: { $0.title.contains(marker) }) {
-                return task.id
-            }
-            if attempt < 19 {
-                try await Task.sleep(for: .milliseconds(250))
-            }
-        }
-        return nil
     }
 }
 #endif

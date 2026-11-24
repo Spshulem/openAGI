@@ -547,7 +547,7 @@ and at 55 minutes.
 |---|---|---|
 | `OPENAGI_VOICE` | off | `1` opens the voice relay on main |
 | `OPENAGI_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model (mini models are refused) |
-| `OPENAGI_VOICE_DAILY_USD` | `5` | Daily voice spend cap; the ledger channel is `voice` |
+| `OPENAGI_VOICE_DAILY_USD` | unset (no separate cap) | Optional extra voice-only daily cap. Voice always reserves and records against the shared `OPENAGI_DAILY_USD_LIMIT` budget; the ledger channel is `voice` |
 
 The cap includes conservative reservations for audio and pending responses.
 Reservations are saved before work reaches OpenAI and settled when usage is
