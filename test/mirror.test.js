@@ -322,3 +322,27 @@ test("the no-capture restriction survives a mirror round trip, so phone skill mi
   assert.equal(result.skipped, true, "no skill candidate from mirrored ring input");
   await settle(mac.runtime, phone.runtime);
 });
+
+test("a ring chat copied on the phone keeps noCapture through offline export and import", async () => {
+  const mac = makeRuntime("mac-offline-nocapture");
+  const phone = makeRuntime("phone-offline-nocapture", { OPENAGI_PROFILE: "mobile" });
+  const ringId = "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed";
+  const ring = `devices:agent:${ringId}`;
+  const store = mac.runtime.agentHost.store;
+  store.saveSession({ id: ring, createdAt: new Date().toISOString(), messages: [], metadata: { thread: "agent" } });
+  for (let i = 0; i < 3; i++) store.appendMessage(ring, { role: "user", content: "send me the weekly fixture revenue report", channel: "pebble", metadata: { thread: "agent", noCapture: true } });
+  importMirrorSnapshot(phone.runtime, buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir }), { dataDir: phone.dir });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const { createSharedConversation } = await import("../src/shared-conversations.js");
+  const copy = createSharedConversation(phone.runtime.agentHost.store, { thread: "agent", sourceId: ringId });
+  const work = listOfflineWork(phone.runtime, { dataDir: phone.dir });
+  assert.deepEqual(work.messages[`agent:${copy.id}`].map((m) => m.metadata.noCapture), [true, true, true]);
+  const imported = importOfflineWork(mac.runtime, work, { dataDir: mac.dir, fromNodeId: "phone-1" });
+  assert.equal(imported.added.messages, 3);
+  const back = mac.runtime.agentHost.store.getSession(`devices:agent:${copy.id}`).messages;
+  assert.deepEqual(back.map((m) => m.metadata.noCapture), [true, true, true]);
+  const { SessionMiner } = await import("../src/session-miner.js");
+  const result = await new SessionMiner({ runtime: mac.runtime, dataDir: mac.dir, minOccurrences: 3 }).mine();
+  assert.equal(result.skipped, true, "no skill candidate from the copied ring input");
+  await settle(mac.runtime, phone.runtime);
+});

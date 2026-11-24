@@ -715,7 +715,10 @@ export function importOfflineWork(runtime, work, { dataDir, fromNodeId } = {}) {
         from: m.role === "user" ? `node:${fromNodeId}:offline` : "openagi",
         createdAt: typeof m.createdAt === "string" ? m.createdAt : nowIso(),
         metadata: { ...origin, thread, ...(m.role === "user" ? { sourceNodeId: fromNodeId } : {}),
-          ...(m.attachments?.length ? { attachments: normalizeMessageImages(m.attachments) } : {}) }
+          ...(m.attachments?.length ? { attachments: normalizeMessageImages(m.attachments) } : {}),
+          // A chat copied on the phone gets new ids; its capture restriction
+          // must come back with it.
+          ...(m.metadata?.noCapture === true ? { noCapture: true } : {}) }
       };
       store.appendMessage(sessionId, message);
       appended.push(message);
