@@ -229,6 +229,10 @@ export class PebblePeriReceiver {
     if (text.length > PEBBLE_PERI_MAX_TRANSCRIPT_CHARS || /[\x00]/.test(text)) return reject(413, "transcription_too_long");
     if (typeof fields.recordedAt !== "string" || !/^\d{13}$/.test(fields.recordedAt)) return reject(400, "invalid_recording");
     const recordedAt = new Date(Number(fields.recordedAt)).toISOString();
+    // Commit the receipt only when the chat can take the recording. A 503
+    // lets Pebble retry once the host is back instead of losing it as a
+    // "duplicate".
+    if (!this.getAgentHost()?.store) return reject(503, "chat_unavailable");
     const conversationId = this.conversationFor(device);
     if (!conversationId) return reject(503, "chat_unavailable");
     writeJsonAtomic(receiptPath, { at: this.now(), outcome: "accepted" });
@@ -246,7 +250,7 @@ export class PebblePeriReceiver {
     const store = agentHost?.store;
     if (!store) return;
     const sessionId = `devices:agent:${conversationId}`;
-    const metadata = { thread: "agent", sourceName: device.label, source: "pebble-index", untrustedInput: true, pebble: { trigger: PERI_TRIGGER, recordedAt, deviceId: device.id } };
+    const metadata = { thread: "agent", sourceName: device.label, source: "pebble-index", untrustedInput: true, noCapture: true, pebble: { trigger: PERI_TRIGGER, recordedAt, deviceId: device.id } };
     const intent = classifyPebbleIntent(text);
     if (intent.kind === "chat") {
       await agentHost.handleMessage(

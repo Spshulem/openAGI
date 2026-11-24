@@ -151,7 +151,9 @@ export class AgentHost {
           agentId,
           channel,
           from,
-          metadata: { ...metadata, ...(attachments.length ? { attachments } : {}) }
+          // noCapture travels with the stored message so background miners
+          // (skill suggestions, proactive excerpts) skip it too.
+          metadata: { ...metadata, ...(attachments.length ? { attachments } : {}), ...(implicitCapture ? {} : { noCapture: true }) }
         });
 
     // This is the first durable milestone. Streaming clients receive the real

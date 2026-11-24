@@ -15,6 +15,7 @@ import { InMemoryAgentStore } from "../src/agent-store.js";
 import { AgentHost } from "../src/agent-host.js";
 import { createDefaultRuntime } from "../src/abi-runtime.js";
 import { sharedConversations, sharedThreadHistory } from "../src/shared-conversations.js";
+import { SessionMiner } from "../src/session-miner.js";
 
 const ORIGIN = "https://agent.example.test";
 
@@ -329,4 +330,44 @@ test("processSignal honors memoryWrite: false", () => {
   const shape = { source: "test", type: "message", domain: "general", taskType: "chat", summary: "fixture", content: "fixture body", tags: [], risk: 0.2, novelty: 0.3, repetition: 0.2 };
   assert.equal(runtime.processSignal({ id: "sig_nc", ...shape }, { memoryWrite: false, allowPropagation: false }).memory, null);
   assert.ok(runtime.processSignal({ id: "sig_c", ...shape }).memory);
+});
+
+test("a recording that arrives while the chat host is down is refused retryably, then accepted on retry", async t => {
+  const h = harness(t);
+  const request = await signed(h, { text: "keep this note: fixture while down" });
+  let up = false;
+  h.receiver.getAgentHost = () => (up ? h.agentHost : null);
+  assert.deepEqual(await deliver(h, request), { status: 503, body: { error: "chat_unavailable" } });
+  assert.equal(h.notes().length, 0);
+  up = true;
+  assert.equal((await deliver(h, request)).status, 202, "the same delivery is not treated as a duplicate");
+  assert.deepEqual(h.notes().map(n => n.text), ["fixture while down"]);
+});
+
+test("ring messages are stored as noCapture and the skill miner skips them", async t => {
+  const h = harness(t);
+  for (const text of ["keep this note: weekly fixture report", "keep this note: weekly fixture report again"]) await deliver(h, await signed(h, { text }));
+  assert.ok(h.chat().filter(m => m.role === "user").every(m => m.metadata.noCapture === true));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pebble-peri-miner-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const store = new InMemoryAgentStore();
+  const say = (id, text, metadata) => store.appendMessage(id, { role: "user", content: text, metadata });
+  for (const id of ["a", "b", "c"]) say(`devices:agent:${id}`, "send me the weekly fixture revenue report", { noCapture: true });
+  const miner = new SessionMiner({ runtime: { agentHost: { store } }, dataDir, minOccurrences: 3 });
+  assert.deepEqual(await miner.mine(), { skipped: true, reason: "insufficient user messages" });
+  for (const id of ["d", "e", "f"]) say(id, "send me the weekly fixture revenue report", {});
+  assert.equal((await miner.mine()).mined, 3, "ordinary owner turns are still mined");
+});
+
+test("AgentHost stamps noCapture on the stored user message of a no-capture turn only", async () => {
+  const runtime = { memory: { remember: () => ({ id: "m" }) },
+    processSignal: () => ({ id: "out", scrutiny: { action: "act", score: 0.6, reasons: [], dimensions: { novelty: 0.3, risk: 0.3, repetition: 0.3 } }, customContext: [], propagation: {} }) };
+  const store = new InMemoryAgentStore();
+  const host = new AgentHost({ store, runtime, modelProvider: { isConfigured: () => true, model: "stub",
+    generate: async () => ({ text: "ok", provider: "stub", model: "stub", toolCalls: [] }) } });
+  host.messageToSignal = async ({ text }) => ({ id: "sig", summary: text, content: text, tags: [] });
+  await host.handleMessage({ text: "fixture ring", sessionId: "ring", routeTo: false }, { implicitCapture: false, toolAllowlist: [] });
+  await host.handleMessage({ text: "fixture owner", sessionId: "owner", routeTo: false }, {});
+  assert.equal(store.getSession("ring").messages[0].metadata.noCapture, true);
+  assert.equal(store.getSession("owner").messages[0].metadata.noCapture, undefined);
 });
