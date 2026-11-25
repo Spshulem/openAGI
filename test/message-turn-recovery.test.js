@@ -12,7 +12,7 @@ import { NodeRegistry } from "../src/node-registry.js";
 
 const SESSION = "devices:agent:main";
 
-async function phoneApp(t, generate) {
+async function phoneApp(t, generate, { thread = "agent" } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-turn-recovery-"));
   const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
   const phone = { id: "mobile:recovery-phone", token: "r".repeat(43) };
@@ -30,9 +30,9 @@ async function phoneApp(t, generate) {
   const send = (body, { stream = false, signal } = {}) => fetch(`${base}/message`, {
     method: "POST", signal,
     headers: { ...auth, "content-type": "application/json", accept: stream ? "text/event-stream" : "application/json" },
-    body: JSON.stringify({ thread: "agent", ...body })
+    body: JSON.stringify({ thread, ...body })
   });
-  const history = async (query = "") => (await fetch(`${base}/conversations/agent/messages${query}`, { headers: auth })).json();
+  const history = async (query = "", of = thread) => (await fetch(`${base}/conversations/${of}/messages${query}`, { headers: auth })).json();
   return { runtime, calls, send, history };
 }
 
@@ -161,4 +161,68 @@ test("request ids are validated, and a send without one keeps the old contract",
   assert.equal(calls.length, 0);
   assert.equal((await (await send({ text: "same" })).json()).reply, "Reply 1");
   assert.equal((await (await send({ text: "same" })).json()).reply, "Reply 2", "no id: each send is its own turn");
+});
+
+// The iPhone's Supervisor chat is the same ChatConversation on thread
+// "supervisor", sending exactly these fields (DaemonClient.sendMessageStreaming
+// adds the legacy from/sessionId key for older mains). Every recovery step
+// must hold on its own session and history route, never the agent thread's.
+const SUPERVISOR_SESSION = "devices:supervisor:main";
+const supervisorSend = { from: "mobile-supervisor", sessionId: "mobile-supervisor" };
+
+test("supervisor thread: a locked phone's turn keeps running, is listed in flight on its own route, and is followed, not rerun", async (t) => {
+  const model = gate();
+  const { runtime, calls, send, history } = await phoneApp(t, async () => { await model.opened; return reply("Fleet is green."); }, { thread: "supervisor" });
+  const locked = new AbortController();
+  const response = await send({ ...supervisorSend, text: "how is the fleet", requestId: "ios-sup-aaaaaaaa" }, { stream: true, signal: locked.signal });
+  const { text } = await readUntil(response, "session");
+  assert.ok(frames(text).some((f) => f.event === "session" && f.data.id === SUPERVISOR_SESSION && f.data.requestId === "ios-sup-aaaaaaaa"));
+  locked.abort();
+
+  const running = await history();
+  assert.equal(running.thread, "supervisor");
+  assert.deepEqual(running.messages.map((m) => [m.role, m.text, m.requestId]), [["user", "how is the fleet", "ios-sup-aaaaaaaa"]]);
+  assert.deepEqual(running.inFlight.map((turn) => turn.requestId), ["ios-sup-aaaaaaaa"]);
+  const agent = await history("", "agent");
+  assert.deepEqual([agent.messages, agent.inFlight], [[], []], "the agent thread neither shows nor runs the supervisor's turn");
+
+  // A resend with the same id (the phone's once-only retry) follows the run.
+  const again = readUntil(await send({ ...supervisorSend, text: "how is the fleet", requestId: "ios-sup-aaaaaaaa" }, { stream: true }), "final");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  model.open();
+  assert.equal(frames((await again).text).find((f) => f.event === "final").data.reply, "Fleet is green.");
+
+  const done = await history();
+  assert.deepEqual(done.messages.map((m) => [m.role, m.text, m.requestId, m.status]),
+    [["user", "how is the fleet", "ios-sup-aaaaaaaa", undefined], ["assistant", "Fleet is green.", "ios-sup-aaaaaaaa", undefined]]);
+  assert.deepEqual(done.inFlight, []);
+  assert.equal(calls.length, 1, "the model ran once");
+  assert.equal(runtime.agentHost.store.getSession(SUPERVISOR_SESSION).messages.length, 2, "one user line, one reply");
+});
+
+test("supervisor thread: a finished turn replays; failures carry status; a turn lost to a restart is interrupted", async (t) => {
+  let fail = false;
+  const { runtime, calls, send, history } = await phoneApp(t, async () => {
+    if (fail) throw Object.assign(new Error("429 rate limit"), { status: 429 });
+    return reply("Done while you were away.");
+  }, { thread: "supervisor" });
+  assert.equal((await (await send({ ...supervisorSend, text: "merge it", requestId: "ios-sup-bbbbbbbb" })).json()).reply, "Done while you were away.");
+  const replay = await (await send({ ...supervisorSend, text: "merge it", requestId: "ios-sup-bbbbbbbb" })).json();
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.reply, "Done while you were away.");
+  assert.equal(calls.length, 1);
+
+  fail = true;
+  assert.equal((await send({ ...supervisorSend, text: "rerun ci", requestId: "ios-sup-cccccccc" })).status, 500);
+  const failed = (await history()).messages.at(-1);
+  assert.deepEqual([failed.role, failed.requestId, failed.status], ["assistant", "ios-sup-cccccccc", "failed"]);
+
+  runtime.agentHost.store.appendMessage(SUPERVISOR_SESSION, { role: "user", content: "lost", channel: "node", from: "node:x", metadata: { thread: "supervisor", requestId: "ios-sup-dddddddd" } });
+  const page = await history();
+  assert.equal(page.messages.at(-1).requestId, "ios-sup-dddddddd");
+  assert.deepEqual(page.inFlight, [], "stored, never answered, nothing running: the phone shows it as interrupted");
+  const interrupted = await send({ ...supervisorSend, text: "lost", requestId: "ios-sup-dddddddd" });
+  assert.equal((await interrupted.json()).code, "interrupted");
+  assert.equal(calls.length, 2, "neither replay nor the interrupted turn reached the model");
+  assert.equal((await history("", "agent")).messages.length, 0);
 });

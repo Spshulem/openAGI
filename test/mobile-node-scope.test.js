@@ -71,9 +71,14 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/nodes/heartbeat"],
     ["POST", "/nodes/revoke"],
     ["POST", "/nodes/speech-token"],
+    ["GET", "/nodes/reconnect/requests"],
+    ["POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/approve"],
+    ["POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/deny"],
     ["GET", "/fleet/api/state"],
+    ["GET", "/fleet/api/walkthrough"],
     ["POST", "/fleet/api/scan"],
     ["POST", "/fleet/api/mode"],
+    ["POST", "/fleet/api/walkthrough"],
     ["POST", "/fleet/api/send"],
     ["POST", "/fleet/api/tasks/claim"],
     ["POST", "/fleet/api/questions/fq_abc-1"],
@@ -90,8 +95,6 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/fleet/api/threads/claude:abc/unmute"],
     ["GET", "/conversations/agent/messages"],
     ["GET", "/conversations/supervisor/messages"],
-    ["GET", "/conversations/agent/turns"],
-    ["GET", "/conversations/supervisor/turns"],
     ["GET", "/lifelog/moments"]
   ];
   for (const [method, pathname] of allowed) {
@@ -118,6 +121,8 @@ test("one representative route from every excluded family is refused", () => {
     ["POST", "/computer-use/toggle"],
     ["POST", "/nodes/capture-memory"],
     ["POST", "/nodes/enroll"],
+    ["GET", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000"],
+    ["POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/ack"],
     ["POST", "/nodes/g2/ask"],
     ["GET", "/budget/ledger"],
     ["GET", "/observations"],

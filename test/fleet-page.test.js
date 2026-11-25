@@ -985,3 +985,73 @@ test("managed exec sessions remain visible and watching requires an explicit in-
   assert.ok(named("Watch session"));
   assert.deepEqual(page.requests.filter(r => r.path === "/coding-agents/watch").map(r => r.body.enabled), [true, false]);
 });
+
+test("Admin Merge: offered only on a review-held PR from the real snapshot fields, previewed before a separate confirm", async () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const reviewHeld = () => {
+    const s = sampleState();
+    s.snapshot.threads[0].pr = { ...s.snapshot.threads[0].pr, mergeState: "BLOCKED", reviewDecision: "REVIEW_REQUIRED" };
+    return s;
+  };
+  // Without reviewDecision (the sample) there is no offer.
+  const plain = boot();
+  await settle();
+  assert.equal(findAll(plain.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Admin Merge…").length, 0);
+
+  const page = boot({ state: reviewHeld() });
+  await settle();
+  const offer = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Admin Merge…")[0];
+  assert.ok(offer, "offered from snapshot pr.ref + mergeState + reviewDecision");
+
+  const consent = { token: "tok_abcdefghijklmnopqrstu", action: "admin_merge", repo: "o/r", number: 12, headSha: SHA, baseRef: "main", expiresAt: new Date(Date.now() + 300_000).toISOString() };
+  page.responses.push({ status: 200, body: { result: {
+    ok: true, status: "preview", consent,
+    plan: { repo: "o/r", number: 12, baseRef: "main", headSha: SHA, githubLogin: "owner-login",
+      waives: [{ rule: "required_review", label: "Required approving review", detail: "GitHub reports o/r#12 as REVIEW_REQUIRED." }],
+      stillEnforced: ["Required checks passing on 0123456 (test)", "Every other branch rule"] }
+  } } });
+  await offer.click();
+  await settle();
+  const preview = page.requests.filter((r) => r.method === "POST").at(-1);
+  assert.equal(preview.path, "/fleet/api/cards/fq_one/admin-merge");
+  assert.deepEqual(preview.body, { preview: true });
+  const text = page.el("needsList").textContent;
+  for (const part of ["Waives only:", "Required approving review", "Still enforced:", SHA, "owner-login", "into main"]) assert.ok(text.includes(part), part);
+  assert.equal(page.requests.filter((r) => r.method === "POST").length, 1, "preview alone merges nothing");
+
+  // An automatic poll while the owner reads keeps the preview and its confirm.
+  const poll = () => page.timers.filter((t) => t.ms === 30_000).at(-1).fn();
+  await poll();
+  await settle();
+  assert.ok(page.el("needsList").textContent.includes("Waives only:"), "preview survives polling");
+
+  // GitHub refuses: its message is shown verbatim.
+  const denial = "GitHub rejected the Admin Merge of o/r#12: You're not authorized to bypass the required review on this branch.";
+  page.responses.push({ status: 200, body: { result: { ok: false, status: "halted", reason: "github_rejected", detail: denial }, state: reviewHeld() } });
+  const confirm = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Admin Merge o/r#12 at 0123456")[0];
+  assert.ok(confirm);
+  await confirm.click();
+  await settle();
+  const sent = page.requests.filter((r) => r.method === "POST").at(-1);
+  assert.equal(sent.path, "/fleet/api/cards/fq_one/admin-merge");
+  assert.deepEqual(sent.body, { consent });
+  assert.equal(page.el("status").textContent, denial);
+  assert.ok(page.el("status").className.includes("err"));
+  // The consent is spent: the next render offers a fresh preview, not the old one.
+  await poll();
+  await settle();
+  assert.equal(page.el("needsList").textContent.includes("Waives only:"), false);
+  const again = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Admin Merge…")[0];
+  assert.ok(again);
+
+  // Cancel drops the preview for good.
+  page.responses.push({ status: 200, body: { result: { ok: true, status: "preview", consent, plan: { repo: "o/r", number: 12, baseRef: "main", headSha: SHA, waives: [], stillEnforced: [] } } } });
+  await again.click();
+  await settle();
+  const cancel = findAll(page.el("needsList"), (e) => e.tagName === "BUTTON" && e.textContent === "Cancel")[0];
+  await cancel.click();
+  await settle();
+  await poll();
+  await settle();
+  assert.equal(page.el("needsList").textContent.includes("Waives only:"), false);
+});

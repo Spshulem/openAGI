@@ -139,6 +139,19 @@ final class SharedConversationClientTests: XCTestCase {
         XCTAssertEqual(try request(path: "/fleet/api/actions/a1/send").httpMethod, "POST")
     }
 
+    func testSupervisorWalkthroughUsesTheSharedCursorAndIdentity() async throws {
+        let response = #"{"active":true,"paused":false,"currentId":"card-1","total":2,"items":[{"id":"card-1","kind":"card","title":"Review PR","summary":"CI is green","cardId":"card-1"},{"id":"q-2","kind":"question","title":"Choose a route","summary":"The agent is waiting","questionId":"q-2"}]}"#
+        stub(["/fleet/api/walkthrough": (200, response)])
+        let walkthrough = try await makeClient().fleetWalkthrough(operation: "next", expectedId: "card-1")
+        XCTAssertEqual(walkthrough.currentId, "card-1")
+        let sent = try request(path: "/fleet/api/walkthrough")
+        XCTAssertEqual(sent.httpMethod, "POST")
+        let json = try body(of: sent)
+        XCTAssertEqual(json["operation"] as? String, "next")
+        XCTAssertEqual(json["expectedId"] as? String, "card-1")
+        XCTAssertEqual(walkthrough.items.map(\.id), ["card-1", "q-2"])
+    }
+
     func testFleetOnADaemonWithoutASupervisorMapsToUnavailable() async {
         stub(["/fleet/api/state": (503, #"{"error":"fleet supervisor disabled"}"#)])
         do {
@@ -363,10 +376,9 @@ final class SharedConversationClientTests: XCTestCase {
         conversation.pauseRecovery()
     }
 
-    // Main never confirmed the send (the connection went first): it waits
-    // in the outbox as "Not sent", and goes again when the app is next
-    // active only after the turns route says main never got it -- with the
-    // same turn id, so main replays or follows it rather than running it twice.
+    // Main never confirmed the send (the connection went first): offer it
+    // again, and resend once when the app is next active, with the same
+    // turn id so main replays or follows it rather than running it twice.
     @MainActor
     func testASendMainNeverConfirmedIsResentOnceWithTheSameTurnId() async throws {
         final class State: @unchecked Sendable { var turns: [String] = [] }
@@ -379,20 +391,14 @@ final class SharedConversationClientTests: XCTestCase {
                 if state.turns.count == 1 { return (ok, Data()) }
                 return (ok, Data("event: session\ndata: {\"id\":\"devices:agent:main\",\"messageCount\":1}\n\nevent: final\ndata: {\"reply\":\"Done.\"}\n\n".utf8))
             }
-            if request.url?.path == "/conversations/agent/turns" {
-                let id = state.turns.first ?? ""
-                return (ok, Data(#"{"thread":"agent","conversationId":"main","active":[],"turns":[{"requestId":"\#(id)","state":"unknown"}]}"#.utf8))
-            }
             return (ok, Data(#"{"thread":"agent","messages":[],"nextBefore":null,"inFlight":[]}"#.utf8))
         }
         let conversation = ChatConversation(thread: .agent, client: makeClient(),
                                             store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
         await conversation.send("hello")
-        XCTAssertTrue(conversation.messages.isEmpty, "back in the outbox, not a failed line")
-        let unconfirmed = try XCTUnwrap(conversation.queuedSubmissions.first)
-        XCTAssertEqual(unconfirmed.state, .notSent)
-        XCTAssertEqual(conversation.displayState(of: unconfirmed), .notSent)
-        XCTAssertFalse(unconfirmed.isEditable, "main may have it: never edited")
+        let unconfirmed = try XCTUnwrap(conversation.messages.last)
+        XCTAssertTrue(unconfirmed.isFailed && unconfirmed.retrySafe && unconfirmed.autoRetry)
+        XCTAssertEqual(unconfirmed.text, ChatHistoryCodec.unconfirmedText)
 
         await conversation.resume()
         XCTAssertEqual(state.turns.count, 2)

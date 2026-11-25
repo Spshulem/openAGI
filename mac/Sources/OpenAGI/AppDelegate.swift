@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SupervisorChannelsKit
 import UserNotifications
 
 @MainActor
@@ -184,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
   func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
     let menu = NSMenu(title: "OpenAGI")
-    let waitingCount = FleetConsumer.shared.questions.count + PendingApprovalConsumer.shared.items.count
+    let waitingCount = Self.needsYouWaitingCount
     let needsTitle = waitingCount > 0 ? "Needs You (\(waitingCount))" : "Needs You"
     let items: [(String, Selector)] = [
       ("Open Supervisor Workspace", #selector(openWorkspaceFromMenu)),
@@ -211,11 +212,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     guard let app = NSApp else { return }
     app.setActivationPolicy(showsInDock ? .regular : .accessory)
     if showsInDock {
-      let waitingCount = FleetConsumer.shared.questions.count + PendingApprovalConsumer.shared.items.count
-      updateDockBadge(count: waitingCount)
+      updateDockBadge(count: needsYouWaitingCount)
     } else {
       app.dockTile.badgeLabel = nil
     }
+  }
+
+  /// Needs You's one number, as the workspace sidebar shows it: actionable
+  /// decisions plus pending tool approvals, never FYIs or completions.
+  static var needsYouWaitingCount: Int {
+    SupervisorAttentionCounting.needsYouTotal(
+      needsYouFlags: FleetConsumer.shared.questions.map(\.needsYou),
+      pendingApprovals: PendingApprovalConsumer.shared.items.count
+    )
   }
 
   static func updateDockBadge(count: Int) {

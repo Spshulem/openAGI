@@ -320,3 +320,41 @@ test("/v1/decisions owner clarity gate unlocks clear ambiguous replies and keeps
   assert.equal(blocked.result.status, "awaiting_owner_confirmation");
   assert.equal(ran.length, 1);
 });
+
+test("a turn stopped while the decisions check runs leaves the chat's pending card pending and runs nothing", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-decisions-stop-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pendingActions = new PendingActionStore({ dir });
+  const tools = new ToolRegistry();
+  tools.bindPendingActions(pendingActions);
+  const ran = [];
+  tools.register({
+    name: "fleet_send_message", needsConfirmation: true, supervisorAutoApprove: false,
+    summarize: (args) => `Send "${args.text}" to Drive chat`,
+    handler: async (args) => { ran.push(args.text); return { ok: true }; }
+  });
+  const makeContext = (intent, decisionsFetch, signal) => ({
+    sessionId: "sup-decisions-stop",
+    __owner: ownerPrincipal("phone", "p-1"),
+    __turn: { untrusted: true, intent, previousAssistantText: "Should I tell the Google Drive chat to continue with PR #9797?" },
+    runtime: { fleetSupervisor: { config: { decisions: { apiKey: "sk-test-decisions-1234567890", model: "gpt-6-luna" } } } },
+    decisionsFetch,
+    ...(signal ? { signal } : {})
+  });
+  const answer = (probability) => ({ ok: true, json: async () => ({ model: "gpt-6-luna", answers: [{ name: "owner_clearly_authorized", probability }] }) });
+  // An earlier turn raised a code card for this message in this chat.
+  const raised = await tools.invoke("fleet_send_message", { text: "continue with PR #9797" },
+    makeContext("what is the drive pr status now", async () => answer(0.08)));
+  const cardId = raised.result.actionId;
+  assert.equal(pendingActions.get(cardId).status, "pending");
+  // The owner's next turn would clear it, but Send Now stops that turn while
+  // the decisions check is still out.
+  const stop = new AbortController();
+  const result = await tools.invoke("fleet_send_message", { text: "continue with PR #9797" },
+    makeContext("go ahead with the drive one now", async () => { stop.abort(); return answer(0.94); }, stop.signal));
+  assert.equal(result.ok, false);
+  assert.match(result.error, /cancelled/i);
+  assert.deepEqual(ran, [], "nothing ran");
+  assert.equal(pendingActions.get(cardId).status, "pending", "the card is still the owner's to approve");
+  assert.equal(pendingActions.list({ status: "approved" }).length, 0, "no approval was recorded");
+});

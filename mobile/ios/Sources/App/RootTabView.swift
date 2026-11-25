@@ -100,8 +100,19 @@ struct RootTabView: View {
             await model.refreshData()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
+            switch phase {
+            case .active:
+                // A `/events` socket iOS cut while suspended can look open for
+                // up to its hour-long timeout; reconnect, and its `hello`
+                // refreshes the open chats again.
+                if runsBackgroundServices { model.startEventStream() }
+                model.conversations.resumeOpenChats()
                 Task { await model.refreshData() }
+            case .background:
+                model.conversations.enterBackground()
+                model.stopEventStream()
+            default:
+                break
             }
         }
         .task { if runsBackgroundServices { await PushRegistrar.shared.start() } }

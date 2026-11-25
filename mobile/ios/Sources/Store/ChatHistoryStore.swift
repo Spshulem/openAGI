@@ -49,48 +49,6 @@ private struct SavedConversation: Codable {
     var entries: [SavedChatEntry]
 }
 
-// One message in a conversation's outbox: written before anything goes to
-// the network, so a force-quit, a crash or a dead connection never loses it
-// and never sends it twice. Keeps the full image data (the history file
-// keeps only previews) so it can still be sent after a relaunch.
-public struct SavedOutboxItem: Codable, Sendable, Equatable {
-    public var id: UUID
-    public var requestID: String
-    public var text: String
-    public var attachments: [ChatAttachment]
-    public var focusedCardID: String?
-    public var createdAt: Date
-    // "queued", "sending", "notSent" or "failed". A string, so a state this
-    // build does not know reads as "failed" (needs the person), not lost.
-    public var state: String
-    // A POST with this id may have reached main.
-    public var maybeDelivered: Bool
-    public var failureText: String?
-    public var retryNeedsNewID: Bool?
-    public var shownQueued: Bool?
-
-    public init(id: UUID, requestID: String, text: String, attachments: [ChatAttachment], focusedCardID: String?,
-                createdAt: Date, state: String, maybeDelivered: Bool, failureText: String? = nil,
-                retryNeedsNewID: Bool? = nil, shownQueued: Bool? = nil) {
-        self.id = id
-        self.requestID = requestID
-        self.text = text
-        self.attachments = attachments
-        self.focusedCardID = focusedCardID
-        self.createdAt = createdAt
-        self.state = state
-        self.maybeDelivered = maybeDelivered
-        self.failureText = failureText
-        self.retryNeedsNewID = retryNeedsNewID
-        self.shownQueued = shownQueued
-    }
-}
-
-private struct SavedOutbox: Codable {
-    var nodeID: String
-    var items: [SavedOutboxItem]
-}
-
 // A conversation kept on the phone so a relaunch, a process kill, or a
 // daemon that is unreachable right now does not wipe it -- the same job as
 // Android's ChatHistoryStore. The daemon's shared thread is the source of
@@ -103,13 +61,9 @@ public struct ChatHistoryStore: Sendable {
     public static let maxEntries = 200
 
     private let file: URL
-    // The outbox sits beside the history, scoped the same way. A separate
-    // file: the history is rewritten often and must not carry image data.
-    private let outboxFile: URL
 
     public init(thread: String, directory: URL = ChatHistoryStore.defaultDirectory) {
         self.file = directory.appending(path: "chat-\(thread).json")
-        self.outboxFile = directory.appending(path: "chat-\(thread).outbox.json")
     }
 
     // Application Support, not the App Group container: the widget never
@@ -138,27 +92,7 @@ public struct ChatHistoryStore: Sendable {
         try? data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 
-    public func loadOutbox(nodeID: String) -> [SavedOutboxItem] {
-        guard let data = try? Data(contentsOf: outboxFile),
-              let saved = try? ProtocolDecoder.json.decode(SavedOutbox.self, from: data),
-              saved.nodeID == nodeID
-        else { return [] }
-        return saved.items
-    }
-
-    // Never trimmed: every item is something the person asked to send.
-    public func saveOutbox(nodeID: String, items: [SavedOutboxItem]) {
-        guard !items.isEmpty else {
-            try? FileManager.default.removeItem(at: outboxFile)
-            return
-        }
-        guard let data = try? ProtocolDecoder.jsonEncoder.encode(SavedOutbox(nodeID: nodeID, items: items)) else { return }
-        try? FileManager.default.createDirectory(at: outboxFile.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: outboxFile, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-    }
-
     public func delete() {
         try? FileManager.default.removeItem(at: file)
-        try? FileManager.default.removeItem(at: outboxFile)
     }
 }

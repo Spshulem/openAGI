@@ -11,7 +11,7 @@ const CONVERSATION_ID = /^(?:main|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-
 const DEVICE_SESSION = /^devices:(agent|supervisor):(main|[0-9a-f-]{36})$/;
 const WEB_SESSION = /^local:browser(?:-[^:\x00]{1,180})?:main$/;
 const HISTORY_PATH = /^\/conversations\/(agent|supervisor)\/messages$/;
-const TURNS_PATH = /^\/conversations\/(agent|supervisor)\/turns$/;
+const INTERRUPT_PATH = /^\/conversations\/(agent|supervisor)\/interrupt$/;
 const MESSAGE_ID = /^[\w-]{1,200}$/;
 
 // Same { code, status } shape as G2ChannelError so both transports can map it.
@@ -34,7 +34,13 @@ export function sharedSessionId(thread, conversationId = "main") {
 export function sharedThreadForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[1] ?? null; }
 export function sharedConversationForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[2] ?? null; }
 export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
-export function sharedTurnsThread(pathname) { return TURNS_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+export function sharedInterruptThread(pathname) { return INTERRUPT_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+// /conversations/:thread/queue[/:requestId[/send-now]] (conversation-queue.js).
+const QUEUE_PATH = /^\/conversations\/(agent|supervisor)\/queue(?:\/([A-Za-z0-9_-]{8,128})(\/send-now)?)?$/;
+export function sharedQueueRoute(pathname) {
+  const match = QUEUE_PATH.exec(String(pathname ?? ""));
+  return match ? { thread: match[1], requestId: match[2] ?? null, sendNow: Boolean(match[3]) } : null;
+}
 
 // Paired owner phones can read human-visible web chat, but never address its
 // session on /message. Continuing makes a separate shared-device session;
@@ -64,7 +70,8 @@ export function sharedConversations(store) {
     const session = store.getSession(item.id);
     const messages = session.messages.filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string");
     return { id: item.conversationId, thread: item.thread, readOnly: item.readOnly === true,
-      title: messages.find(m => m.role === "user")?.content.slice(0, 80) || (item.conversationId === "main" ? `Shared ${item.thread} chat` : "New chat"),
+      title: (typeof session.metadata?.title === "string" && session.metadata.title.trim() ? session.metadata.title.trim().slice(0, 80) : null)
+        || messages.find(m => m.role === "user")?.content.slice(0, 80) || (item.conversationId === "main" ? `Shared ${item.thread} chat` : "New chat"),
       preview: messages.at(-1)?.content.slice(0, 180) || "Start a conversation",
       updatedAt: session.updatedAt, messageCount: messages.length };
   }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) };
@@ -78,7 +85,10 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
   store.saveSession({ id: sessionId, createdAt: new Date().toISOString(), messages: [], metadata: { thread } });
   for (const message of (source?.messages ?? []).filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string").slice(-50)) {
     store.appendMessage(sessionId, { role: message.role, content: message.content,
-      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}) } });
+      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}),
+        // Copying a chat doesn't lift a capture restriction (e.g. Pebble ring
+        // input stays out of skill mining).
+        ...(message.metadata?.noCapture === true ? { noCapture: true } : {}) } });
   }
   return sharedConversations(store).conversations.find(c => c.id === id);
 }
@@ -86,7 +96,7 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
 // Same projection as the G2 history view: user and assistant text only, never
 // tool calls, tool results or private metadata. Oldest-first; `before` pages
 // toward older messages and `nextBefore` is the cursor for the next page.
-export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main", liveTurns = null } = {}) {
+export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main", liveTurns = null, queue = null } = {}) {
   if (!store?.getSession) throw fail("history_unavailable", 503, "Main history is not configured.");
   const sessionId = visibleSessionID(store, thread, conversationId);
   const size = limit === undefined || limit === null ? 50 : limit;
@@ -114,7 +124,10 @@ export function sharedThreadHistory(store, thread, { before, limit, conversation
     // Turns still running here with no client attached (the phone that sent
     // one was backgrounded or lost its stream): "still working", not gone.
     // Only the latest page can contain them.
-    ...(before || !liveTurns ? {} : { inFlight: liveTurns.list(sessionId) })
+    ...(before || !liveTurns ? {} : { inFlight: liveTurns.list(sessionId) }),
+    // The hub's queue for this conversation, in order, so every device shows
+    // the same waiting messages (conversation-queue.js). Newest page only.
+    ...(before || !queue ? {} : { queue: queue.snapshot(sessionId) })
   };
 }
 
@@ -152,7 +165,17 @@ export function appendSharedThreadMessages(
     const at = typeof item.at === "string" && item.at.trim() ? item.at.trim().slice(0, 64) : null;
     const itemSourceName = typeof item.sourceName === "string" ? item.sourceName : sourceName;
     const itemSourceNodeId = typeof item.sourceNodeId === "string" ? item.sourceNodeId : sourceNodeId;
-    normalized.push({ id, role, text, at, sourceName: itemSourceName, sourceNodeId: itemSourceNodeId });
+    const proactive = role === "assistant" && item.proactive === true;
+    const proactiveMeta = proactive && item.proactiveMeta && typeof item.proactiveMeta === "object" && !Array.isArray(item.proactiveMeta)
+      ? {
+          ...(typeof item.proactiveMeta.kind === "string" ? { kind: item.proactiveMeta.kind.slice(0, 80) } : {}),
+          ...(Array.isArray(item.proactiveMeta.decisionKeys)
+            ? { decisionKeys: item.proactiveMeta.decisionKeys.filter((k) => typeof k === "string").slice(0, 12).map((k) => k.slice(0, 160)) }
+            : {}),
+          ...(item.proactiveMeta.agentReviewed === true ? { agentReviewed: true } : {})
+        }
+      : null;
+    normalized.push({ id, role, text, at, sourceName: itemSourceName, sourceNodeId: itemSourceNodeId, proactive, proactiveMeta });
   }
   const existingSession = store.getSession(sessionId);
   const existingIds = new Set((existingSession?.messages ?? []).map((m) => m?.id).filter(Boolean));
@@ -171,6 +194,7 @@ export function appendSharedThreadMessages(
       ...(entry.at ? { createdAt: entry.at } : {}),
       metadata: {
         thread,
+        ...(entry.proactive ? { proactive: true, ...(entry.proactiveMeta ? { proactiveMeta: entry.proactiveMeta } : {}) } : {}),
         ...(entry.role === "user" && typeof entry.sourceName === "string" && entry.sourceName.trim()
           ? { sourceName: entry.sourceName.trim().slice(0, 80) }
           : {}),

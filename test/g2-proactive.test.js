@@ -354,6 +354,44 @@ test("answering a supervisor question from the glasses uses its fixed choices", 
   assert.equal(status.needsYou, 1);
 });
 
+test("walkthrough identities remain actionable after their mirrored alert is snoozed", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  const at = new Date(now()).toISOString();
+  outreach.push({ id: "o-walk", status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: "fq_walk" },
+    title: "Choose a branch", summary: "The Supervisor is waiting.", needsDecision: true, actions: ["feature", "main", "dismiss"] });
+  let answered = null;
+  runtime.fleetSupervisor = {
+    getState: () => ({ questions: [{ id: "fq_walk", title: "Choose a branch", body: "Pick one", options: ["feature", "main"] }], cards: [] }),
+    answerQuestion: async (id, answer) => { answered = [id, answer]; return { question: { status: "answered" }, delivery: { detail: "saved" } }; }
+  };
+  call({ op: "configure", settings: { supervisorOnly: true } });
+  const started = call({ op: "walkthrough", command: "start" }).walkthrough;
+  assert.equal(started.currentId, "fq_walk");
+  call({ op: "snooze", id: "o-walk" });
+  assert.deepEqual(call({ op: "feed" }).items, []);
+  assert.deepEqual(await store.answerFleet("one", { id: "question:fq_walk", answer: "feature" }), { ok: true, detail: "saved" });
+  assert.deepEqual(answered, ["fq_walk", "feature"]);
+});
+
+test("walkthrough card identities reach the normal preflight gate after snooze", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  const at = new Date(now()).toISOString();
+  outreach.push({ id: "o-card-walk", status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: "fq_card_walk" },
+    title: "PR ready", summary: "CI is green", needsDecision: true, actions: ["merged", "dismiss"] });
+  let acted = null;
+  runtime.fleetSupervisor = {
+    getState: () => ({ questions: [{ id: "fq_card_walk", title: "Merge?", options: ["merged"] }], cards: [{ id: "q:fq_card_walk", kind: "merge_ready", questionId: "fq_card_walk", headline: "PR ready", decisionFact: "CI is green" }] }),
+    actCard: async (id, payload) => { acted = [id, payload.op]; return { ok: true, status: "merged", detail: "merged" }; }
+  };
+  call({ op: "configure", settings: { supervisorOnly: true } });
+  const started = call({ op: "walkthrough", command: "start" }).walkthrough;
+  assert.equal(started.currentId, "q:fq_card_walk");
+  call({ op: "snooze", id: "o-card-walk" });
+  assert.deepEqual(call({ op: "feed" }).items, []);
+  assert.deepEqual(await store.actFleetCard("one", { id: "card:q:fq_card_walk", cardOp: "primary" }), { ok: true, status: "merged", detail: "merged" });
+  assert.deepEqual(acted, ["q:fq_card_walk", "primary"]);
+});
+
 test("dismissing a supervisor question on the glasses closes it on the fleet computer; snooze stays local", async (t) => {
   const { runtime, call, outreach, now, advance } = fixture(t);
   const at = new Date(now()).toISOString();

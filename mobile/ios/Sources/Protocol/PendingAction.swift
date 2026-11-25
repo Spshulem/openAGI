@@ -93,11 +93,15 @@ extension PendingAction {
     // conversation raised since `since`, before limiting, so other chats'
     // requests can neither appear here nor displace this turn's own.
     public static func raised(in actions: [PendingAction], thread: ConversationThread, conversationID: String,
-                              since: Date, scopedToSession: Bool = true, limit: Int = 3) -> [PendingAction] {
+                              since: Date, scopedToSession: Bool = true, excluding hidden: Set<String> = [],
+                              limit: Int = 3) -> [PendingAction] {
         let session = "devices:\(thread.rawValue):\(conversationID)"
         // Newest request first: a card asked for again outranks its creation date.
         return Array(actions
-            .filter { (!scopedToSession || $0.sessionID == session) && $0.lastRaisedAt >= since.addingTimeInterval(-5) }
+            // Cards put away in this chat are dropped before the limit, so
+            // they never take a slot from one still waiting.
+            .filter { (!scopedToSession || $0.sessionID == session) && $0.lastRaisedAt >= since.addingTimeInterval(-5)
+                && !hidden.contains($0.id) }
             .sorted { $0.lastRaisedAt > $1.lastRaisedAt }
             .prefix(limit))
     }

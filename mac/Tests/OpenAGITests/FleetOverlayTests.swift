@@ -236,7 +236,7 @@ final class FleetOverlayTests: XCTestCase {
   }
 
   func testSharedSupervisorPayloadExcludesUnsupportedNodeFields() {
-    let allowed: Set<String> = ["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId", "requestId"]
+    let allowed: Set<String> = ["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId"]
 
     let plain = SharedSupervisorClient.buildMessagePayload(text: "Hello")
     XCTAssertTrue(Set(plain.keys).isSubset(of: allowed))

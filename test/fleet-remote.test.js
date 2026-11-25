@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createFleetCapability, RemoteFleetSupervisor } from '../src/fleet/remote.js';
 import { createFleetRoute } from '../src/fleet/routes.js';
-import { DEFAULTS, resolveFleetConfig } from '../src/fleet/contracts.js';
+import { DEFAULTS, resolveFleetConfig, shortHash } from '../src/fleet/contracts.js';
 import { FleetSupervisor } from '../src/fleet/supervisor.js';
 import { OutreachStore } from '../src/outreach-store.js';
 import { G2Proactive } from '../src/g2-proactive.js';
@@ -667,4 +667,303 @@ test("a reply the fleet computer refuses surfaces as an error on the main", asyn
   const route = createFleetRoute({ supervisor: remote });
   const res = await route('POST', '/fleet/api/questions/fq_one', null, async () => ({ reply: 'Use main.' }));
   assert.equal(res.status, 409, 'the main reads canReply from the mirrored state');
+});
+
+test('feedback said while the fleet computer is unreachable is kept on the main and sent once it is back', async t => {
+  const { dir, state } = fixture(t);
+  const recorded = [];
+  let online = false;
+  const fake = createFleetCapability({
+    getState: () => structuredClone(state),
+    recordFeedback: (input) => { const record = { id: `fb_${recorded.length + 1}`, status: 'new', ...input }; recorded.push(record); return record; },
+    feedback: () => [...recorded].reverse()
+  });
+  const runtime = { nodeCapabilities: { dispatch: async (_node, _cap, operation, payload) => {
+    if (!online) throw new Error('offline');
+    return fake.invoke(operation, payload);
+  } } };
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  const queued = await remote.recordFeedback({ utterance: 'Approvals still ask for codes', intent: 'fix', source: 'text' });
+  assert.equal(queued.status, 'queued');
+  assert.match(queued.id, /^fb_local_/);
+  assert.equal(recorded.length, 0);
+  // Survives a restart of the main.
+  const restarted = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  assert.equal(restarted.feedbackOutbox.length, 1);
+  online = true;
+  await restarted.refresh();
+  assert.deepEqual(recorded.map(r => r.utterance), ['Approvals still ask for codes']);
+  assert.equal(restarted.feedbackOutbox.length, 0);
+  assert.equal(new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir }).feedbackOutbox.length, 0, 'sent once, not again');
+  // Online, it goes straight through.
+  const direct = await restarted.recordFeedback({ utterance: 'Thanks', intent: 'dismiss', source: 'text' });
+  assert.equal(direct.id, 'fb_2');
+});
+
+// Incident tw_d9544149a037e8c1, second failure: every error on the way to the
+// fleet computer read "Fleet computer unavailable or request failed. Retry
+// when it is online.", whether the computer was down, refused the request
+// (a GitHub failure behind fleet_repo_status), or the request could never fit
+// the link (a layout report with a screenshot).
+function sendFixture(t, { dataDir = null } = {}) {
+  const state = { mode: 'auto', enabled: true, lastError: null, snapshot: { threads: [] }, questions: [], actions: [] };
+  const calls = [];
+  const runtime = { nodeCapabilities: { dispatch: null } };
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: 'fleet-box', dataDir, sendRetryDelaysMs: [0, 0] });
+  const route = (handlers) => {
+    runtime.nodeCapabilities.dispatch = async (_node, _cap, _op, payload) => {
+      calls.push(`${payload.method} ${payload.path}`);
+      const handler = handlers[`${payload.method} ${payload.path}`] ?? (() => ({ status: 200, body: { state } }));
+      const response = await handler(payload);
+      return { state: structuredClone(state), response };
+    };
+  };
+  return { state, calls, runtime, remote, route, sends: () => calls.filter((c) => c === 'POST /fleet/api/send').length };
+}
+
+test('a fleet computer that answered with its own error is not reported as offline', async t => {
+  const { remote, route, state } = sendFixture(t);
+  route({ 'GET /fleet/api/repo-status': () => ({ status: 400, body: { error: 'GraphQL: API rate limit already exceeded for user ID 1234567.' } }) });
+  await assert.rejects(remote.inspectRepoStatus({ repo: 'Spshulem/openAGI', limit: 5 }), (error) => {
+    assert.match(error.message, /GraphQL: API rate limit already exceeded/);
+    assert.doesNotMatch(error.message, /unavailable/);
+    assert.equal(error.kind, 'refused');
+    assert.equal(error.reached, true);
+    assert.equal(error.status, 400);
+    return true;
+  });
+  assert.equal(remote.getState().lastError, state.lastError, 'the computer is up: no outage is recorded');
+  const [attempt] = remote.recentAttempts();
+  assert.equal(attempt.kind, 'refused');
+  assert.equal(attempt.path, '/fleet/api/repo-status');
+});
+
+test('an image send over the link limit fails once with what to do, never retried as an outage', async t => {
+  const { remote, runtime, calls } = sendFixture(t);
+  runtime.nodeCapabilities.dispatch = async () => { calls.push('POST /fleet/api/send'); throw new Error('node control command exceeded the transport limit'); };
+  const images = [{ mediaType: 'image/png', data: 'A'.repeat(400 * 1024) }];
+  await assert.rejects(remote.sendOwnerMessage('paseo:s.ios', 'Layout report tw_6940c997df8ef084', { images }), (error) => {
+    assert.match(error.message, /over the 256 KB limit/);
+    assert.match(error.message, /about 400 KB/);
+    assert.match(error.message, /forwardImages: false/);
+    assert.doesNotMatch(error.message, /Retry when it is online/);
+    assert.equal(error.retryable, false);
+    return true;
+  });
+  assert.equal(calls.length, 1, 'a request that cannot fit is never sent again');
+  assert.doesNotMatch(String(remote.getState().lastError), /unavailable/);
+});
+
+test('a send that never reached the computer is retried, bounded, and each attempt is on the receipt', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  let failures = 1;
+  route({ 'POST /fleet/api/send': () => ({ status: 200, body: { delivery: { status: 'sent', route: 'paseo-send', detail: 'Paseo message and turn confirmed' } } }) });
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send' && failures-- > 0) throw new Error('selected node is not connected (no poll in 90 s)');
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'sent');
+  assert.deepEqual(result.delivery.attempts.map((a) => a.kind), ['unreachable', 'ok']);
+  assert.match(result.delivery.attempts[0].detail, /not connected/);
+  assert.equal(sends(), 1, 'one request reached the computer');
+});
+
+test('an unreachable computer is tried at most three times and says so', async t => {
+  const { remote, runtime } = sendFixture(t);
+  let tries = 0;
+  runtime.nodeCapabilities.dispatch = async (_n, _c, _o, payload) => {
+    if (payload.path === '/fleet/api/send') tries += 1;
+    throw new Error('selected node is not connected (no poll in 90 s)');
+  };
+  await assert.rejects(remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration'), (error) => {
+    assert.match(error.message, /Fleet computer unavailable \(selected node is not connected/);
+    assert.match(error.message, /\(3 attempts\)/);
+    assert.equal(error.attempts.length, 3);
+    return true;
+  });
+  assert.equal(tries, 3);
+  assert.match(remote.getState().lastError, /unavailable/);
+});
+
+test('a send whose reply was lost is reconciled against the computer\'s receipt, not sent twice', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') {
+      await deliver(...args);
+      // The computer sent it and journaled the receipt; its answer was lost.
+      state.actions.push({ id: 'fa_landed', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'paseo-send',
+        messageHash: shortHash('[OpenAGI supervisor] Investigate the missing integration'), status: 'sent', detail: 'Paseo message and turn confirmed', at: new Date().toISOString() });
+      throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true });
+    }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'sent');
+  assert.equal(result.delivery.reconciled, true);
+  assert.equal(result.delivery.actionId, 'fa_landed');
+  assert.equal(sends(), 1);
+});
+
+test('a lost reply with no receipt is unconfirmed, never sent, and never resent', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') { await deliver(...args); throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true }); }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'unknown');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.match(result.delivery.detail, /not sent again/);
+  assert.equal(sends(), 1);
+});
+
+test('failed attempts are kept across a restart without the message text', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-remote-attempts-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { remote, runtime } = sendFixture(t, { dataDir: dir });
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error('node control command exceeded the transport limit'); };
+  await assert.rejects(remote.sendOwnerMessage('paseo:s.ios', 'secret layout notes', { images: [{ data: 'A'.repeat(300 * 1024) }] }));
+  const restarted = new RemoteFleetSupervisor({ runtime, nodeId: 'fleet-box', dataDir: dir });
+  const [attempt] = restarted.recentAttempts();
+  assert.equal(attempt.kind, 'too-large');
+  assert.equal(attempt.path, '/fleet/api/send');
+  assert.doesNotMatch(fs.readFileSync(path.join(dir, 'fleet-remote-attempts.json'), 'utf8'), /secret layout notes|AAAA/);
+});
+
+// Review fix (#350): a command the node acknowledged and then failed may have
+// run; it is reconciled, never sent again.
+test('an acknowledged failure that is not a timeout is reconciled, not retried', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') { await deliver(...args); throw Object.assign(new Error('node-capability-command-failed'), { nodeAcknowledged: true }); }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'unknown');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(sends(), 1, 'never sent a second time');
+});
+
+// Review fix (#350): the executor journals a computer-use send that may
+// have landed as failed + unconfirmed. Rebuilt from that receipt after a
+// lost reply, it stays unconfirmed: not "Not delivered", not resent.
+test('a reconciled receipt that is failed but unconfirmed stays unconfirmed', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') {
+      await deliver(...args);
+      state.actions.push({ id: 'fa_maybe', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'computer-use',
+        messageHash: shortHash('[OpenAGI supervisor] Investigate the missing integration'), status: 'failed', unconfirmed: true,
+        detail: 'typed, but the chat could not be read back', at: new Date().toISOString() });
+      throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true });
+    }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.status, 'failed');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(result.delivery.reconciled, true);
+  assert.equal(result.delivery.verifiedAt, null);
+  assert.equal(result.reconciledAfterTimeout, undefined);
+  assert.equal(sends(), 1, 'never sent a second time');
+});
+
+test('before a retry, a receipt that may have landed stops the resend and stays unconfirmed', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  let first = true;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send' && first) {
+      first = false;
+      await deliver(...args);
+      state.actions.push({ id: 'fa_maybe', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'computer-use',
+        messageHash: shortHash('[OpenAGI supervisor] Investigate the missing integration'), status: 'sent', unconfirmed: true,
+        detail: 'typed, but the chat could not be read back', at: new Date().toISOString() });
+      // The link dropped before the request was acknowledged.
+      throw new Error('selected node is not connected (no poll in 90 s)');
+    }
+    return deliver(...args);
+  };
+  const result = await remote.sendOwnerMessage('paseo:s.agent', 'Investigate the missing integration');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(result.reconciledAfterTimeout, undefined, 'not reported as a confirmed send');
+  assert.equal(sends(), 1, 'never sent a second time');
+});
+
+// Review fix (#350): the same short text sent twice on purpose. A receipt
+// that existed before this request is the earlier send's, never this one's.
+test('a repeated short message is not reported sent from the previous send\'s receipt', async t => {
+  const { remote, route, state, sends } = sendFixture(t);
+  route({});
+  state.actions.push({ id: 'fa_earlier', threadKey: 'paseo:s.agent', playbook: 'owner-message', route: 'paseo-send',
+    messageHash: shortHash('[OpenAGI supervisor] continue'), status: 'sent', detail: 'Paseo message and turn confirmed', at: new Date(Date.now() - 2000).toISOString() });
+  await remote.refresh();
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  let failures = 3;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send' && failures-- > 0) throw new Error('selected node is not connected (no poll in 90 s)');
+    return deliver(...args);
+  };
+  await assert.rejects(remote.sendOwnerMessage('paseo:s.agent', 'continue'), /unavailable/);
+  assert.equal(sends(), 0, 'it never reached the computer, and is not called sent');
+});
+
+// Incident tw_d9544149a037e8c1: an owner send with a screenshot to the BB
+// Recorder release chat came back "Fleet computer unavailable or request
+// failed" while the main's link to the fleet computer was down (heartbeat
+// 502 windows). A request that never reached the computer is retried with
+// exactly the same text and attachments, reaches it once, and is reported
+// sent only from that send's own result.
+test('an image send that never reached the computer is retried with the same attachments, once', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  const bodies = [];
+  route({ 'POST /fleet/api/send': (payload) => { bodies.push(payload.body); return { status: 200, body: { delivery: { status: 'sent', route: 'paseo-send', detail: 'Paseo message, 1 image(s), and turn confirmed', attachedImages: 1 } } }; } });
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  const attempts = [];
+  let offline = 1;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') {
+      attempts.push(structuredClone(args[3].body));
+      if (offline-- > 0) throw new Error('selected node is not connected (no poll in 90 s)');
+    }
+    return deliver(...args);
+  };
+  const images = [{ mimeType: 'image/png', data: Buffer.from('release-screenshot').toString('base64') }];
+  const key = 'paseo:srv_6csfaHcKvC-A.375e1a66-c3c1-4a32-82a8-f29b4ade001b';
+  const result = await remote.sendOwnerMessage(key, 'Submit 0.4.1 for App Review; screenshot attached.', { images });
+  assert.equal(result.delivery.status, 'sent');
+  assert.deepEqual(result.delivery.attempts.map((a) => a.kind), ['unreachable', 'ok']);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[0], attempts[1], 'the retry carries the same text and attachments');
+  assert.deepEqual(attempts[1].images, images);
+  assert.equal(sends(), 1, 'the computer received it once');
+  assert.equal(bodies.length, 1);
+  // Nothing in the attempt log carries the text or the image data.
+  assert.doesNotMatch(JSON.stringify(remote.recentAttempts()), /Submit 0\.4\.1|cmVsZWFzZS1zY3JlZW5zaG90/);
+});
+
+test('an image send the computer took but did not answer is reconciled, never resent', async t => {
+  const { remote, route, sends } = sendFixture(t);
+  route({});
+  const deliver = remote.runtime.nodeCapabilities.dispatch;
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => {
+    if (args[3].path === '/fleet/api/send') { await deliver(...args); throw Object.assign(new Error('node control command timed out'), { nodeAcknowledged: true }); }
+    return deliver(...args);
+  };
+  const images = [{ mimeType: 'image/png', data: Buffer.from('release-screenshot').toString('base64') }];
+  const result = await remote.sendOwnerMessage('paseo:srv_6csfaHcKvC-A.375e1a66-c3c1-4a32-82a8-f29b4ade001b', 'Screenshot attached.', { images });
+  assert.equal(result.delivery.status, 'unknown');
+  assert.equal(result.delivery.unconfirmed, true);
+  assert.equal(sends(), 1);
 });

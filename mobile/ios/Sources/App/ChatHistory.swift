@@ -255,6 +255,10 @@ enum ChatHistoryMerge {
                 local[index].serverID.flatMap { serverIndexForID[$0] } ?? matchedServerIndex[local[index].id]
             }
             if message.isStreaming {
+                // Main already stored this turn's reply (or its failure):
+                // that copy is on the page, so the placeholder would repeat it.
+                if message.role == .assistant, let id = message.requestID,
+                   server.contains(where: { $0.role == .assistant && $0.requestId == id }) { continue }
                 result.append((message, .distantFuture))
             } else if message.isFailed {
                 if message.role == .assistant, let asked = askedAt, hasReply(after: asked, in: server) { continue }
@@ -317,11 +321,8 @@ enum ChatTurnRecovery {
     static let interruptedText = "This reply stopped before it finished (OpenAGI restarted)."
     static let staleText = "No reply yet. OpenAGI may still be working on it."
 
-    // `alsoRunning`: turns the turns route last called queued or running. A
-    // turn waiting behind another one may not be in the page's `inFlight`.
-    static func resolve(_ messages: [ChatMessage], page: ConversationPage, alsoRunning: Set<String> = [],
-                        now: Date = Date()) -> [ChatMessage] {
-        let running = Set((page.inFlight ?? []).map(\.requestId)).union(alsoRunning)
+    static func resolve(_ messages: [ChatMessage], page: ConversationPage, now: Date = Date()) -> [ChatMessage] {
+        let running = Set((page.inFlight ?? []).map(\.requestId))
         var result: [ChatMessage] = []
         for var message in messages {
             guard message.isDetached, let id = message.requestID else { result.append(message); continue }

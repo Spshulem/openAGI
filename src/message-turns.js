@@ -7,15 +7,90 @@
 // starting another. Once it has ended, its user record and terminal assistant
 // record (both carry metadata.requestId) say how it ended, so a repeat
 // replays that outcome. Neither path calls the model again.
-
-import { createHash } from "node:crypto";
-import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
+//
+// The owner can also stop a running turn to send a correction first
+// (`interruptTurn`). That aborts the turn's signal; AgentHost stops before
+// the next model hop or tool call. A tool already running is not cancelled
+// and nothing is rolled back: the answer says whether the turn has stopped
+// yet, so no client ever reports an interrupt that did not happen.
 
 const STAGE = /^[a-z_-]{1,40}$/;
+const TOOL = /^[\w.:-]{1,100}$/;
+
+// The abort reason for an owner's interrupt. AgentHost reads it off the
+// signal (not off whatever error a provider threw while aborting) to record
+// the turn as stopped rather than failed.
+export const OWNER_INTERRUPTED = "OWNER_INTERRUPTED";
+export function ownerInterruptReason() {
+  const error = new Error("Stopped by the owner to send a new message.");
+  error.name = "AbortError";
+  error.code = OWNER_INTERRUPTED;
+  return error;
+}
+export function isOwnerInterrupt(signal) {
+  return Boolean(signal?.aborted && signal.reason?.code === OWNER_INTERRUPTED);
+}
+
+// What the owner reads where a stopped reply would be (agent-failure.js
+// PUBLIC_FAILURES.stopped says the same).
+export const STOPPED_TEXT = "Stopped so your next message could go first. Anything already under way may have finished; nothing was undone.";
+
+// The signal a running tool sees. An owner interrupt stops the turn before
+// its next model call or tool, never the action already running: a typing
+// or paste computer action must finish, and its approval must survive. Any
+// other abort (a cancelled G2 request, shutdown) still reaches the tool.
+const toolSignals = new WeakMap();
+export function toolSignal(signal) {
+  if (!signal || typeof signal.addEventListener !== "function") return signal;
+  if (isOwnerInterrupt(signal)) return new AbortController().signal;
+  if (signal.aborted) return signal;
+  let derived = toolSignals.get(signal);
+  if (!derived) {
+    const controller = new AbortController();
+    signal.addEventListener("abort", () => { if (!isOwnerInterrupt(signal)) controller.abort(signal.reason); }, { once: true });
+    derived = controller.signal;
+    toolSignals.set(signal, derived);
+  }
+  return derived;
+}
+
+// Owner-stopped turns, remembered in memory so a repeat of the id (a second
+// interrupt, a resend after a dropped stream) replays the stop instead of
+// running a message the owner replaced. A turn stopped while it still waited
+// behind another has no stored records until its slot comes (AgentHost then
+// writes them), so this covers that gap. Bounded; oldest go first.
+const STOPPED_LIMIT = 500;
+const STOPPED_TTL_MS = 6 * 60 * 60 * 1000;
 
 export class LiveTurns {
-  constructor() {
+  constructor({ now = () => Date.now() } = {}) {
     this.turns = new Map();
+    this.stopped = new Map();
+    this.now = now;
+  }
+
+  markStopped(sessionId, requestId) {
+    const key = LiveTurns.key(sessionId, requestId);
+    this.stopped.delete(key);
+    this.stopped.set(key, this.now());
+    while (this.stopped.size > STOPPED_LIMIT) this.stopped.delete(this.stopped.keys().next().value);
+  }
+
+  wasStopped(sessionId, requestId) {
+    const key = LiveTurns.key(sessionId, requestId);
+    const at = this.stopped.get(key);
+    if (at === undefined) return false;
+    if (this.now() - at > STOPPED_TTL_MS) { this.stopped.delete(key); return false; }
+    return true;
+  }
+
+  // The same shape storedTurn returns for a failed turn, for a stop main
+  // remembers but has not stored yet.
+  stoppedTurn(store, sessionId, requestId) {
+    if (!this.wasStopped(sessionId, requestId)) return null;
+    let messageCount = 0;
+    try { messageCount = store?.getSession?.(sessionId)?.messages?.length ?? 0; } catch { /* count is advisory */ }
+    return { status: "failed", sessionId, messageCount, code: "stopped", message: { content: STOPPED_TEXT } };
   }
 
   static key(sessionId, requestId) {
@@ -38,7 +113,11 @@ export class LiveTurns {
   // first progress event. The turn leaves the registry once it settles.
   run(sessionId, requestId, start, listener = null) {
     const key = LiveTurns.key(sessionId, requestId);
-    const turn = { sessionId, requestId, stage: "queued", startedAt: new Date().toISOString(), listeners: new Set() };
+    const controller = new AbortController();
+    const turn = {
+      sessionId, requestId, stage: "queued", tool: null, startedAt: new Date().toISOString(),
+      listeners: new Set(), controller, settled: null
+    };
     if (listener) turn.listeners.add(listener);
     const emit = (kind, data) => {
       for (const each of turn.listeners) {
@@ -48,13 +127,29 @@ export class LiveTurns {
     this.turns.set(key, turn);
     turn.promise = (async () => {
       try {
-        return await start({
+        const result = await start({
+          signal: controller.signal,
           onProgress: (raw) => {
-            if (typeof raw?.stage === "string" && STAGE.test(raw.stage)) turn.stage = raw.stage;
+            if (typeof raw?.stage === "string" && STAGE.test(raw.stage)) {
+              turn.stage = raw.stage;
+              // The action a hop is running now, so an interrupt can say what
+              // it is waiting on. Cleared by any stage that names no tool.
+              turn.tool = typeof raw.tool === "string" && TOOL.test(raw.tool) ? raw.tool : null;
+            }
             emit("progress", raw);
           },
           onTextDelta: (raw) => emit("delta", raw)
         });
+        turn.settled = { status: "complete" };
+        return result;
+      } catch (error) {
+        if (isOwnerInterrupt(controller.signal)) {
+          turn.settled = { status: "interrupted" };
+          this.markStopped(sessionId, requestId);
+        } else {
+          turn.settled = { status: "failed", code: typeof error?.code === "string" ? error.code : null };
+        }
+        throw error;
       } finally {
         if (this.turns.get(key) === turn) this.turns.delete(key);
       }
@@ -66,6 +161,38 @@ export class LiveTurns {
     turn.listeners.add(listener);
     return () => turn.listeners.delete(listener);
   }
+}
+
+const sleep = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); timer.unref?.(); });
+
+// Stop one running turn so the owner's next message runs instead, and say
+// truthfully where it got to. Idempotent: a repeat (double tap, a resend
+// after a dropped response) aborts nothing new and reports the same state.
+//   interrupted  the turn has stopped; nothing more of it will run
+//   stopping     asked to stop; it ends after the action running now (tool)
+//   finished     it ended on its own first (outcome: complete | failed |
+//                interrupted-by-restart); nothing was interrupted
+//   not_found    main has no turn by this id in this conversation
+// A message sent after any of these runs after the turn has fully ended:
+// AgentHost serializes turns per session.
+export async function interruptTurn({ liveTurns, store, sessionId, requestId, settleMs = 4_000 }) {
+  const live = liveTurns?.get(sessionId, requestId) ?? null;
+  if (live) {
+    if (!live.controller.signal.aborted) live.controller.abort(ownerInterruptReason());
+    const tool = live.tool;
+    await Promise.race([live.promise.then(() => {}, () => {}), sleep(Math.max(0, settleMs))]);
+    if (!live.settled) return { status: "stopping", requestId, ...(tool ? { tool } : {}) };
+    return settledOutcome(live.settled, requestId);
+  }
+  const stored = storedTurn(store, sessionId, requestId);
+  if (!stored) return liveTurns?.wasStopped(sessionId, requestId) ? { status: "interrupted", requestId } : { status: "not_found", requestId };
+  if (stored.status === "failed" && stored.code === "stopped") return { status: "interrupted", requestId };
+  return { status: "finished", outcome: stored.status, requestId };
+}
+
+function settledOutcome(settled, requestId) {
+  if (settled.status === "interrupted") return { status: "interrupted", requestId };
+  return { status: "finished", outcome: settled.status, requestId };
 }
 
 // How a turn that is no longer running ended, from the session's own
@@ -108,120 +235,6 @@ export function replayedFailure(stored, requestId) {
   error.openagiSessionId = stored.sessionId;
   error.openagiRequestId = requestId;
   error.openagiFailurePersisted = stored.status !== "interrupted";
-  error.openagiReplayed = true;
-  return error;
-}
-
-// Main's own durable note of each turn a client named, so a repeat of the id
-// is recognised even after main restarts or the session's records rotate,
-// and a client reconnecting with sends it never heard back about can ask how
-// each one stands instead of guessing (and sending them all again).
-//
-//   queued       accepted; waiting behind another turn in the conversation
-//   running      started (the user line may already be stored)
-//   done/failed  ended with a reply or a failure record
-//   interrupted  main stopped while it ran: never rerun under the same id
-//
-// A turn still queued when main stopped never started, so its receipt is
-// dropped on load: the id reads as unknown and the client may send it again
-// under the same id. Receipts are keyed by id, never by text, so two
-// intentional sends with the same words stay two turns.
-const RECEIPT_STATES = new Set(["queued", "running", "done", "failed", "interrupted"]);
-const RECEIPT_LIMIT = 2000;
-const RECEIPT_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-export const CLIENT_TURN_ID = /^[A-Za-z0-9_-]{8,128}$/;
-
-// Only to catch a client reusing one id for different words.
-export function turnFingerprint(text) {
-  return createHash("sha256").update(String(text ?? "").trim(), "utf8").digest("hex").slice(0, 32);
-}
-
-export class TurnReceipts {
-  constructor(filePath = null, { limit = RECEIPT_LIMIT, maxAgeMs = RECEIPT_MAX_AGE_MS } = {}) {
-    this.filePath = filePath;
-    this.limit = limit;
-    this.maxAgeMs = maxAgeMs;
-    this.receipts = new Map();
-    if (!filePath) return;
-    const saved = readJsonFile(filePath, { receipts: [] });
-    let changed = false;
-    for (const item of Array.isArray(saved?.receipts) ? saved.receipts : []) {
-      if (typeof item?.sessionId !== "string" || typeof item?.requestId !== "string" || !RECEIPT_STATES.has(item.state)) continue;
-      if (item.state === "queued") { changed = true; continue; }
-      let receipt = item;
-      if (item.state === "running") {
-        changed = true;
-        receipt = { ...item, state: "interrupted", code: "interrupted", updatedAt: new Date().toISOString() };
-      }
-      this.receipts.set(LiveTurns.key(receipt.sessionId, receipt.requestId), receipt);
-    }
-    if (changed) this.save();
-  }
-
-  get(sessionId, requestId) {
-    return this.receipts.get(LiveTurns.key(sessionId, requestId)) ?? null;
-  }
-
-  // Written before the turn is handed to the agent, so an acknowledged send
-  // is on disk before anything can run.
-  accept(sessionId, requestId, fingerprint) {
-    const at = new Date().toISOString();
-    const receipt = { sessionId, requestId, state: "queued", fingerprint, acceptedAt: at, updatedAt: at };
-    this.receipts.set(LiveTurns.key(sessionId, requestId), receipt);
-    this.save();
-    return receipt;
-  }
-
-  mark(sessionId, requestId, state, { code } = {}) {
-    const current = this.get(sessionId, requestId);
-    if (!current || !RECEIPT_STATES.has(state) || current.state === state) return current;
-    const next = { ...current, state, updatedAt: new Date().toISOString(), ...(code ? { code } : {}) };
-    this.receipts.set(LiveTurns.key(sessionId, requestId), next);
-    this.save();
-    return next;
-  }
-
-  save() {
-    const cutoff = Date.now() - this.maxAgeMs;
-    const kept = [...this.receipts.values()]
-      .filter((r) => ["queued", "running"].includes(r.state) || Date.parse(r.updatedAt) >= cutoff)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .slice(0, this.limit);
-    if (kept.length !== this.receipts.size) {
-      this.receipts = new Map(kept.map((r) => [LiveTurns.key(r.sessionId, r.requestId), r]));
-    }
-    if (!this.filePath) return;
-    try { writeJsonAtomic(this.filePath, { version: 1, receipts: kept }); } catch { /* the session records still answer repeats */ }
-  }
-}
-
-// How each named turn stands, for a client reconciling its outbox: a live
-// turn first, then the session's own records, then main's receipt. "unknown"
-// means main never took that id (or dropped it before it started), so the
-// client may send it again under the same id.
-export function turnStates({ store, liveTurns, receipts, sessionId, requestIds }) {
-  return requestIds.map((requestId) => {
-    const live = liveTurns?.get(sessionId, requestId);
-    if (live) return { requestId, state: live.stage === "queued" ? "queued" : "running", stage: live.stage };
-    const stored = storedTurn(store, sessionId, requestId);
-    if (stored?.status === "complete") return { requestId, state: "done", replyId: stored.message.id };
-    if (stored?.status === "failed") return { requestId, state: "failed", code: stored.code, replyId: stored.message.id };
-    if (stored?.status === "interrupted") return { requestId, state: "interrupted", code: "interrupted" };
-    const receipt = receipts?.get(sessionId, requestId);
-    if (receipt && ["done", "failed", "interrupted"].includes(receipt.state)) {
-      return { requestId, state: receipt.state, ...(receipt.code ? { code: receipt.code } : {}) };
-    }
-    return { requestId, state: "unknown" };
-  });
-}
-
-// A repeat of a turn main has a receipt for but no records of any more (they
-// rotated out): it already ran, so it must not run again.
-export function alreadyHandledFailure(sessionId, requestId) {
-  const error = new Error("This message was already handled. Its reply is earlier in the conversation.");
-  error.code = "already_handled";
-  error.openagiSessionId = sessionId;
-  error.openagiRequestId = requestId;
   error.openagiReplayed = true;
   return error;
 }

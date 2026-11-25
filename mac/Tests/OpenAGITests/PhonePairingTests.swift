@@ -38,10 +38,15 @@ final class PhonePairingTests: XCTestCase {
     XCTAssertFalse((info["NSLocalNetworkUsageDescription"] as? String ?? "").isEmpty)
     let domains = try XCTUnwrap(ats["NSExceptionDomains"] as? [String: [String: Any]])
     XCTAssertEqual(Set(domains.keys), Set(["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12",
-      "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"]))
-    for policy in domains.values {
+      "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10", "ts.net"]))
+    for (domain, policy) in domains {
       XCTAssertEqual(policy["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true)
-      XCTAssertEqual(Set(policy.keys), ["NSExceptionAllowsInsecureHTTPLoads"])
+      if domain == "ts.net" {
+        XCTAssertEqual(policy["NSIncludesSubdomains"] as? Bool, true)
+        XCTAssertEqual(Set(policy.keys), ["NSExceptionAllowsInsecureHTTPLoads", "NSIncludesSubdomains"])
+      } else {
+        XCTAssertEqual(Set(policy.keys), ["NSExceptionAllowsInsecureHTTPLoads"])
+      }
     }
   }
 

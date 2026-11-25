@@ -160,6 +160,44 @@ export const INTENT_FAMILIES = Object.freeze({
   watch: {
     pattern: String.raw`(?:watch|monitor|keep an eye on|keep watching|stop watching)\s+(?:(?:a|an|the|my|that|this)\s+)*(?:codex|claude|cursor|coding agents?|agents?|coding sessions?)\b(?!'s)`,
     tools: ["watch_coding_agent"]
+  },
+  // Daily spend budget: "add $25 to my budget", "+$10 today", "set daily budget to $50".
+  budget: {
+    pattern: [
+      String.raw`(?:add|raise|increase|bump|set|change|update|adjust|top\s*up|extend|give\s+me|put)\b[^.!?\n]{0,80}?\b(?:daily\s+)?(?:budget|spend(?:\s+(?:limit|cap))?)\b`,
+      String.raw`(?:add|top\s*up|bump)\s+\+?\s*\$\s*\d+(?:\.\d{1,2})?(?:\s+(?:more|extra|for\s+today|today|to\s+(?:the\s+|my\s+)?(?:daily\s+)?(?:budget|limit)))?\b`,
+      String.raw`\+\s*\$\s*\d+(?:\.\d{1,2})?(?:\s+(?:more|extra|for\s+today|today|to\s+(?:the\s+|my\s+)?(?:daily\s+)?(?:budget|limit)))?(?=\s*(?:$|[.,;!?\n]))`,
+      String.raw`reset\s+(?:today['’]?s\s+)?(?:extra|bonus)\s+budget\b`
+    ].join("|"),
+    tools: ["update_budget"]
+  },
+  // Editable skills: "create a skill for AI SEO", "update the customer report skill", "save this workflow as a skill".
+  skills: {
+    pattern: [
+      String.raw`(?:create|make|build|write|save|author|update|edit|modify|revise|improve|install)\b[^.!?\n]{0,90}?\bskills?\b`,
+      String.raw`(?:turn|save)\s+(?:this|that|it)\s+into\s+a\s+skill\b`
+    ].join("|"),
+    tools: ["create_skill", "update_skill", "read_skill"]
+  },
+  // Persistent goals, preferences & provider failover: "track this goal",
+  // "switch that chat to Claude/Antigravity", "stop spamming status updates".
+  goals: {
+    pattern: [
+      String.raw`(?:track|set|add|create|update|manage|verify|continue|take\s+off|remove|drop|mark|close|snooze|pause|unpause|mute|unmute|stop)\b[^.!?\n]{0,90}?\b(?:goals?|outcomes?|active\s+work|definition\s+of\s+done|cadence|project\s+list|status\s+updates?|check[- ]?ins?|notifications?|preferences?|format)\b`,
+      String.raw`(?:switch|move|fail\s*over|rotate|change|set|update)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|openai|gpt|opus|sonnet|model)\b`
+    ].join("|"),
+    tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider", "fleet_preferences", "set_provider"]
+  },
+  // This chat's own thinking depth or model: "set your reasoning effort to extra high",
+  // "think harder", "reset your effort", "switch your model to gpt-6.2-sol".
+  effort: {
+    pattern: [
+      String.raw`(?:set|change|switch|raise|increase|bump|turn\s+up|lower|decrease|reduce|turn\s+down|drop|put|reset|clear|use)\b[^.!?\n]{0,60}?\b(?:reasoning|thinking)(?:\s+(?:effort|level|depth|mode))?\b`,
+      String.raw`(?:set|change|switch|raise|increase|bump|lower|decrease|reduce|reset|clear)\b[^.!?\n]{0,40}?\beffort\b`,
+      String.raw`(?:set|change|switch|update)\b[^.!?\n]{0,60}?\b(?:your|my|the)?\s*(?:model|provider)\b`,
+      String.raw`think\s+(?:harder|more|deeper|less|lighter)\b`
+    ].join("|"),
+    tools: ["chat_reasoning_effort", "set_provider"]
   }
 });
 
@@ -183,7 +221,8 @@ const SUPERVISOR_DIRECTIVE_RE = new RegExp(
   `${LEAD}(?:` + [
     String.raw`(?:ask|tell|have|get|make|let)\s+(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who)\b)\S`,
     String.raw`(?:send|attach|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
-    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto|retry|try\s+again)\b`,
+    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto|retry|try\s+again|stop|mute|unmute|pause|unpause|snooze|remove|drop|take\s+[\w\s-]{1,40}?\s+off|mark\s+[\w\s-]{1,40}?\s+(?:done|complete|finished)|change|update|set|switch|make\s+sure|follow\s+up|push\s+[\w\s-]{1,40}?\s+(?:through|forward))\b`,
+    String.raw`(?:i\s+thought\s+i\s+(?:told|asked)\s+you|i\s+already\s+(?:told|asked)\s+you|didn['’]?t\s+i\s+(?:tell|ask)\s+you|i['’]?m\s+still\s+waiting\s+(?:for|on)|still\s+waiting\s+(?:for|on)|we\s+can\s+(?:take|remove|drop|close|mark|skip|stop))\b`,
     String.raw`(?:kick|spin|fire)\s+[^.!?\n]{1,40}?\b(?:off|up)\b`,
     String.raw`(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b[,!.\s]+)?(?:gpt|claude|sonnet|opus|haiku|codex|gemini|o[134]\b|sol\b|model\b|(?:low|medium|high|max)\s+effort\b)(?:[^.!?\n]|\.(?=\d)){0,80}?\bin\s+paseo\b`,
     String.raw`(?:go\s+ahead|go\s+for\s+it|do\s+(?:it|that)|sounds\s+(?:good|fine)|looks\s+(?:good|fine)|fine\s+(?:with|by)\s+me|works\s+for\s+me|lgtm)\b`
@@ -210,6 +249,27 @@ export function assistantProposedActionOrQuestion(previousAssistantText) {
 // (e.g. "Continue, inspect the thread further, or skip?"), short owner replies
 // like "yes", "continue", "skip", or "option 1" count as clear authorization
 // without requiring a confirmation code.
+// A spoken request that is nothing but "tell <chat> <message>": "tell amman
+// ship it" sends "ship it" to amman with no code read back. The whole
+// sentence must be that shape, so "don't", "should I", a second chat or a
+// trailing condition all still ask, and the message may hold only plain
+// words and punctuation: anything comparison would drop (another script,
+// symbols, emoji) could ride along unheard. names: the target's labels.
+const spokenWords = (value) => String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const PLAIN_MESSAGE = /^[A-Za-z0-9\s.,!?'’";:()-]+$/;
+const SPOKEN_LEAD = "(?:(?:hey|ok|okay|so|please) )*";
+const SPOKEN_VERB = "(?:tell|ask|message|ping|nudge|text|send|reply to|write to)";
+const SPOKEN_TAIL = "(?: please| thanks| thank you)?";
+
+export function spokenRequestNamesTarget(intent, { names = [], message = "" } = {}) {
+  if (!PLAIN_MESSAGE.test(String(message ?? ""))) return false;
+  const said = spokenWords(intent);
+  const text = spokenWords(message);
+  if (!said || !text) return false;
+  return names.map(spokenWords).some((name) => name.length >= 3
+    && new RegExp(`^${SPOKEN_LEAD}${SPOKEN_VERB} ${name} (?:to |that )?(?:please )?${text}${SPOKEN_TAIL}$`).test(said));
+}
+
 export function isConversationalAssentOrChoice(intent, previousAssistantText) {
   const value = String(intent ?? "").trim();
   if (!value || value.length > 120) return false;
@@ -343,4 +403,36 @@ export function matchConfirmations(text) {
     return { decision, codes: [], all: true, count: 2 };
   }
   return { decision, codes, all };
+}
+
+// Strict parser for standalone owner budget commands so the owner can top up
+// or adjust the daily budget in chat even when the current daily budget is
+// already exhausted (0 LLM tokens required).
+export function parseDirectBudgetCommand(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw || raw.length > 160 || /\?\s*$/.test(raw)) return null;
+  const cleaned = raw.replace(/^[.,;:!?\s]+|[.,;:!?\s]+$/g, "");
+
+  if (/^(?:please\s+)?reset\s+(?:my\s+|the\s+)?(?:today['’]?s\s+)?(?:extra|bonus)\s+budget$/i.test(cleaned)) {
+    return { resetTodayBonus: true };
+  }
+
+  const plusOnly = /^(?:please\s+)?(?:\+\s*\$?\s*(\d+(?:\.\d{1,2})?)|(?:add|top\s*up|bump)\s+\+?\s*\$\s*(\d+(?:\.\d{1,2})?))(?:\s+(?:more|extra|for\s+today|today|to\s+(?:my\s+|the\s+)?(?:daily\s+)?(?:budget|spend(?:\s+limit)?|limit)))?$/i.exec(cleaned)
+    ?? /^(?:please\s+)?(?:add|top\s*up|put|give\s+me)\s+\+?\s*\$?\s*(\d+(?:\.\d{1,2})?)\s+(?:more\s+|extra\s+)?(?:to|onto|into|for)\s+(?:my\s+|the\s+|today['’]?s\s+)?(?:daily\s+)?(?:budget|spend(?:\s+limit)?)$/i.exec(cleaned);
+  if (plusOnly) {
+    const amount = Number(plusOnly[1] ?? plusOnly[2]);
+    if (Number.isFinite(amount) && amount >= 0.01 && amount <= 10000) {
+      return { addUsdToday: amount };
+    }
+  }
+
+  const setLimit = /^(?:please\s+)?(?:set|change|update|raise|increase|bump)\s+(?:my\s+|the\s+)?(?:daily\s+)?(?:budget|spend\s+(?:limit|cap))(?:\s+limit)?\s+to\s+\$?\s*(\d+(?:\.\d{1,2})?)(?:\s*(?:\/\s*day|per\s+day|a\s+day|daily))?$/i.exec(cleaned);
+  if (setLimit) {
+    const limit = Number(setLimit[1]);
+    if (Number.isFinite(limit) && limit >= 0.5 && limit <= 10000) {
+      return { dailyUsdLimit: limit };
+    }
+  }
+
+  return null;
 }

@@ -15,7 +15,7 @@ import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
-import { g2ConnectPage } from "./g2-connect-page.js";
+import { renderG2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
@@ -28,6 +28,9 @@ import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
 import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
+import { createHubProactiveGuard, isProactiveSupervisorText, latestProactiveMessageAtMs } from "./fleet/proactive-gate.js";
+import { DEFAULTS as FLEET_DEFAULTS } from "./fleet/contracts.js";
+import { resolveQuietTimeZone } from "./fleet/notify.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
@@ -52,6 +55,7 @@ import { ChannelManager } from "./channels.js";
 import { createCompanionRoutes, connectionsPage } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, renderAdvancedWizard, saveEnv } from "./setup-wizard.js";
+import { readModelUpgradeCache } from "./model-upgrades.js";
 import {
   NodeRegistry,
   readOrCreateIdentity,
@@ -71,7 +75,8 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
-import { CLIENT_TURN_ID, LiveTurns, TurnReceipts, alreadyHandledFailure, storedTurn, replayedResult, replayedFailure, turnFingerprint, turnStates } from "./message-turns.js";
+import { LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn, STOPPED_TEXT } from "./message-turns.js";
+import { ConversationQueue, QueueError, submissionDigest } from "./conversation-queue.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -89,8 +94,15 @@ import {
   EVEN_G2_PLATFORM,
   G2ChannelError
 } from "./integrations/g2-channel.js";
-import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { DELEGATED_ENROLLMENT_CODE_TTL_MS, NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import {
+  NodeReconnectManager,
+  isNodeReconnectRequestRoute,
+  isNodeReconnectNodeRoute,
+  isNodeReconnectMobileRoute,
+  reconnectRequestId
+} from "./node-reconnect.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
@@ -107,9 +119,11 @@ import {
   observeSharedThreads,
   parseLifelogMomentsQuery,
   sharedHistoryThread,
+  sharedInterruptThread,
   sharedSessionId,
-  sharedTurnsThread,
   sharedThreadForSession,
+  sharedConversationForSession,
+  sharedQueueRoute,
   sharedThreadHistory,
   appendSharedThreadMessages,
   sharedConversations,
@@ -159,11 +173,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })(),
         claudeCli: claudeCliStatus(),
         codexCli: codexCliStatus()
-      }
+      },
+      // Last daily model check (model-upgrades.js): newer models the keys can
+      // use, or configured models that are gone. Suggestions only.
+      upgrades: (() => { try { const c = readModelUpgradeCache(dataDir); return c ? { checkedAt: c.checkedAt, suggestions: c.suggestions ?? [], errors: c.errors ?? {} } : null; } catch { return null; } })()
     };
   };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
-  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
+  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor, dataDir });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
     ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM, MOBILE_PLATFORM] });
@@ -185,6 +202,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     getOrigin: () => getPublicUrl() ? new URL(getPublicUrl()).origin : `http://127.0.0.1:${server.address()?.port ?? port}` });
   const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
   const localIdentity = readOrCreateIdentity(dataDir);
+  const nodeReconnect = options.nodeReconnect ?? new NodeReconnectManager({
+    mainNodeId: localIdentity.nodeId,
+    nodeRegistry
+  });
   let localCapabilityCache = [];
   const capabilityFacade = {
     list(capabilityId) {
@@ -262,7 +283,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
-  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const getSupervisorChatMessages = () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [];
+  const proactiveNow = typeof options.proactiveNow === "function" ? options.proactiveNow : () => Date.now();
+  const hubProactiveGuard = createHubProactiveGuard({
+    getPreferences: () => runtime.fleetSupervisor?.getState?.()?.preferences ?? {},
+    getRecentMessages: getSupervisorChatMessages,
+    getModelProvider: () => runtime.agentHost?.modelProvider ?? channels?.agentHost?.modelProvider ?? null,
+    getLastPostedAtMs: () => Math.max(
+      Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
+      latestProactiveMessageAtMs(getSupervisorChatMessages(), { nowMs: proactiveNow() })
+    ),
+    getLastOwnerAckAtMs: () => Math.max(
+      Number(runtime.fleetSupervisor?.lastOwnerAckAtMs) || 0,
+      Date.parse(runtime.fleetSupervisor?.state?.lastOwnerAckAt ?? "") || 0,
+      Date.parse(runtime.fleetSupervisor?.store?.lastOwnerAckAt?.() ?? "") || 0
+    ),
+    getResolvedDecisionKeys: () => runtime.fleetSupervisor?.store?.resolvedDecisionKeys?.() ?? null,
+    getQuietHours: () => {
+      if (options.proactiveQuietHours !== undefined) return options.proactiveQuietHours;
+      if (String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() === "off") return null;
+      const sup = runtime.fleetSupervisor;
+      if (sup?.proactiveRespectQuietHours === false || sup?.config?.proactiveRespectQuietHours === false) return null;
+      const supQuiet = sup?.proactiveQuietHours ?? sup?.config?.notify?.quietHours;
+      if (supQuiet !== undefined && supQuiet !== null) return supQuiet;
+      return runtime.outreachConfig?.quietHours ?? sup?.config?.limits?.quietHours ?? FLEET_DEFAULTS.quietHours;
+    },
+    getTimeZone: () => options.proactiveTimeZone
+      ?? runtime.fleetSupervisor?.proactiveTimeZone
+      ?? resolveQuietTimeZone(runtime, runtime.fleetSupervisor?.config ?? null),
+    getMaxUnansweredProactive: (prefs) => {
+      if (options.maxUnansweredProactive !== undefined) return options.maxUnansweredProactive;
+      return prefs?.cadence === "detailed" ? 2 : 1;
+    },
+    failClosed: options.proactiveFailClosed ?? true,
+    onPosted: (atMs) => {
+      try { runtime.fleetSupervisor?.store?.recordProactiveChatAt?.(atMs); } catch { /* best-effort */ }
+    },
+    judgeProactiveUpdate: options.judgeProactiveUpdate ?? null,
+    now: proactiveNow
+  });
+  runtime.hubProactiveGuard = hubProactiveGuard;
+  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;
@@ -312,9 +373,65 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // Turns a paired phone named with its own request id, while they run: a
   // repeat of the id attaches here instead of running the turn again.
   const liveTurns = new LiveTurns();
-  // And main's durable receipt for each of them, so neither a restart nor a
-  // client replaying its outbox can run one twice.
-  const turnReceipts = new TurnReceipts(path.join(dataDir, "message-turns.json"));
+  // How long an interrupt waits for the turn to stop before answering
+  // "stopping" (it is waiting on a running tool). Tests shorten it.
+  const interruptSettleMs = Number.isFinite(options.interruptSettleMs) ? options.interruptSettleMs : 4_000;
+  // The authority a queued message runs with: the transport's, re-minted
+  // only while its sender may still speak for the owner. A phone must still
+  // be an enrolled phone; an owner proxy (a node acting for the owner's Mac)
+  // must still be enrolled and hold its proxy grant; the owner's own local
+  // clients (no node) always may.
+  const mintQueuedPrincipal = (spec) => {
+    if (!spec || typeof spec.via !== "string") return null;
+    if (spec.via === "phone") {
+      return nodeRegistry.enrollment?.(spec.nodeId)?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", spec.nodeId) : null;
+    }
+    if (spec.nodeId && !(nodeRegistry.enrollment?.(spec.nodeId) && nodeRegistry.hasOwnerProxyGrant?.(spec.nodeId))) return null;
+    try { return ownerPrincipal(spec.via, spec.nodeId ?? null); } catch { return null; }
+  };
+  // Send Now / Send anyway: move one waiting message first and stop whatever
+  // runs now, whichever device sent that. The outcome is what interruptTurn
+  // confirmed ("next" when nothing was running).
+  const sendQueuedNext = async (sessionId, requestId, actor) => {
+    const moved = conversationQueue.moveToFront(sessionId, requestId, actor);
+    const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+    const outcome = moved.running && moved.running !== requestId
+      ? { ...await interruptTurn({ liveTurns, store, sessionId, requestId: moved.running, settleMs: interruptSettleMs }), interrupted: moved.running }
+      : { status: "next", interrupted: null };
+    conversationQueue.dispatch(sessionId);
+    return { outcome, item: moved.item };
+  };
+  // The hub's queue for each shared device conversation (conversation-queue.js).
+  // Every named turn a phone or the owner's Mac sends to a shared thread runs
+  // through it, in order, with the sender's authority.
+  const conversationQueue = new ConversationQueue({
+    dir: path.join(dataDir, "conversation-queues"),
+    liveTurns,
+    ...(Number.isFinite(options.queueHoldMs) ? { holdMs: options.queueHoldMs } : {}),
+    // The sender's authority is checked again when the message runs, not
+    // only when it was queued: a device unpaired (or an owner proxy revoked)
+    // while its message waited, or across a restart, never runs it.
+    // The queue can dispatch while AgentHost still runs a turn it does not
+    // hold (no requestId, or a G2 turn), so the check runs again when
+    // AgentHost actually starts this one (`authorize`).
+    startTurn: (item, hooks) => {
+      if (!channels) return Promise.reject(Object.assign(new Error("agent host disabled"), { code: "agent-host-disabled" }));
+      const authorize = () => {
+        const principal = item.principal ? mintQueuedPrincipal(item.principal) : null;
+        if (item.principal && !principal) {
+          throw Object.assign(new Error("The device that sent this message is no longer paired."), { code: "SENDER_UNPAIRED" });
+        }
+        return principal;
+      };
+      try { authorize(); } catch (error) { return Promise.reject(error); }
+      return channels.handleLocalMessage(item.body, { ...hooks, authorize });
+    },
+    mintPrincipal: (spec) => mintQueuedPrincipal(spec),
+    onChange: ({ sessionId, revision }) => {
+      const thread = sharedThreadForSession(sessionId);
+      if (thread) events.emit("conversation.updated", { thread, conversationId: sharedConversationForSession(sessionId) ?? "main", queueRevision: revision });
+    }
+  });
   function broadcast(event, data) {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -387,6 +504,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // it, tells the other devices to reload that thread's history.
   const unobserveSharedThreads = [...new Set([runtime.agentHost?.store, channels?.agentHost?.store, channels?.g2?.agentHost?.store].filter(Boolean))]
     .map(store => observeSharedThreads(store, data => events.emit("conversation.updated", data)));
+  // Messages that were waiting when the hub last stopped run now.
+  try { conversationQueue.restore(); } catch (error) { console.error(`[openagi] conversation queue restore failed: ${error?.message ?? error}`); }
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -992,8 +1111,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
         "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
-      ].includes(pathname);
-      const sharedHistoryRoute = method === "GET" && (sharedHistoryThread(pathname) !== null || sharedTurnsThread(pathname) !== null);
+      ].includes(pathname)
+        || isNodeReconnectRequestRoute(method, pathname)
+        || isNodeReconnectNodeRoute(method, pathname);
+      const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message") || sharedHistoryRoute;
       const headerNodeId = typeof req.headers["x-openagi-node-id"] === "string"
@@ -1024,6 +1145,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const mobileNodeRoute = requestEnrollment?.platform === MOBILE_PLATFORM
         && isMobileRouteAllowed(method, pathname);
       const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
+      // A paired computer may ask main for a G2 code only with the owner-proxy
+      // grant main recorded at owner-authenticated pairing. Its operational
+      // token, a phone, or a pair of glasses never qualifies.
+      const g2CodeRequest = method === "POST" && pathname === "/nodes/g2/enrollment-code";
+      const g2CodeIssuer = g2CodeRequest && Boolean(requestNodeId)
+        && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)
         && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
@@ -1090,6 +1218,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : g2CodeRequest && requestNodeId
+            ? { ok: g2CodeIssuer, reason: "this computer is not authorized by the main owner to request glasses codes" }
           : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
@@ -1161,6 +1291,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           throw error;
         }
         try {
+          if (body.OPENAGI_DAILY_USD_LIMIT !== undefined && runtime.budget?.setDailyLimit) {
+            const parsedLimit = Number.parseFloat(String(body.OPENAGI_DAILY_USD_LIMIT));
+            if (Number.isFinite(parsedLimit) && parsedLimit >= 0.5 && parsedLimit <= 10000) {
+              runtime.budget.setDailyLimit(parsedLimit);
+            }
+          }
           const { createModelProvider } = await import("./model-provider.js");
           if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|CLAUDE_CLI_|CODEX_CLI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
@@ -1339,7 +1475,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/sessions") return sendJson(res, 200, runtime.agentHost?.store.listSessions() ?? []);
       if (method === "GET" && pathname.startsWith("/sessions/")) {
         const id = decodeURIComponent(pathname.slice("/sessions/".length));
-        return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
+        const session = runtime.agentHost?.store.getSession(id);
+        return sendJson(res, 200, session ? withLiveApprovalStatus(session, runtime.pendingActions) : { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
       if (method === "POST" && /^\/nodes\/[^/]+\/revoke$/.test(pathname)) {
@@ -1368,6 +1505,57 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: error.message });
         }
       }
+      // Safe recovery for a node whose heartbeat reaches this main but whose
+      // desktop owner-proxy grant is missing or stale. The request is created
+      // with the target node's operational credential, and approval is only
+      // accepted from an enrolled mobile owner device on this same main.
+      if (isNodeReconnectRequestRoute(method, pathname)
+          || isNodeReconnectNodeRoute(method, pathname)
+          || isNodeReconnectMobileRoute(method, pathname)) {
+        res.setHeader("cache-control", "no-store");
+      }
+      if (isNodeReconnectRequestRoute(method, pathname)) {
+        const result = nodeReconnect.create(requestNodeId);
+        if (!result.ok) return sendJson(res, result.code === "unknown_node" ? 404 : 409, { error: result.code, message: result.message });
+        return sendJson(res, result.created ? 201 : 200, result.request);
+      }
+      if (method === "GET" && pathname === "/nodes/reconnect/requests") {
+        if (requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "mobile_approval_required", message: "Reconnect requests are reviewed from an enrolled owner phone." });
+        }
+        return sendJson(res, 200, { requests: nodeReconnect.listForMobile() });
+      }
+      if (isNodeReconnectMobileRoute(method, pathname) && pathname !== "/nodes/reconnect/requests") {
+        if (requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "mobile_approval_required", message: "Approve this request from an enrolled owner phone." });
+        }
+        const id = reconnectRequestId(pathname);
+        const result = pathname.endsWith("/approve")
+          ? nodeReconnect.approve(id, requestNodeId)
+          : nodeReconnect.deny(id, requestNodeId);
+        if (!result.ok) {
+          const status = result.code === "unknown_request" ? 404
+            : result.code === "request_expired" ? 410
+              : result.code === "mobile_approval_required" || result.code === "approver_must_differ" ? 403 : 409;
+          return sendJson(res, status, { error: result.code, message: result.message });
+        }
+        // Deliberately omit any credential. The target must fetch it with its
+        // own operational credential after the phone confirms approval.
+        return sendJson(res, 200, result.request);
+      }
+      if (isNodeReconnectNodeRoute(method, pathname)) {
+        const id = reconnectRequestId(pathname);
+        const result = method === "GET"
+          ? nodeReconnect.statusForNode(id, requestNodeId)
+          : nodeReconnect.acknowledge(id, requestNodeId);
+        if (!result.ok) {
+          const status = result.code === "unknown_request" ? 404
+            : result.code === "forbidden_node" ? 403
+              : result.code === "request_expired" ? 410 : 409;
+          return sendJson(res, status, { error: result.code, message: result.message });
+        }
+        return sendJson(res, 200, result.request);
+      }
       if (method === "GET" && pathname === "/phone-pairing") {
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
@@ -1392,13 +1580,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
         const issued = nodeEnrollment.issue(platform);
-        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code issued (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
           ...(platform === EVEN_G2_PLATFORM
             ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
             : {})
+        });
+      }
+      if (g2CodeRequest) {
+        res.setHeader("cache-control", "no-store");
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "not_main", message: "This computer is not the main. Request the code from the main OpenAGI." });
+        }
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+          return sendJson(res, 400, { error: "invalid_request", message: "This request takes no options." });
+        }
+        let origin;
+        try {
+          const configured = new URL(getPublicUrl());
+          if (configured.protocol !== "https:" || configured.username || configured.password
+              || configured.pathname !== "/" || configured.search || configured.hash) throw new Error("invalid");
+          origin = configured.origin;
+        } catch {
+          return sendJson(res, 409, {
+            error: "main_public_url_required",
+            message: "Your main has no exact HTTPS public address, so glasses could not reach it. Set OPENAGI_PUBLIC_URL on the main, then try again."
+          });
+        }
+        const issuedVia = requestNodeId ?? null;
+        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM, { ttlMs: DELEGATED_ENROLLMENT_CODE_TTL_MS, issuedVia });
+        const via = issuedVia ? nodeRegistry.enrollment(issuedVia)?.name ?? issuedVia : "the owner";
+        console.log(`[openagi] Even G2 enrollment code issued for ${via} (valid 10 min, single use)`);
+        return sendJson(res, 200, {
+          code: issued.code,
+          platform: EVEN_G2_PLATFORM,
+          expiresAt: issued.expiresAt,
+          publicUrl: origin,
+          main: { name: localIdentity.name ?? null },
+          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1519,7 +1741,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         nodeRegistry.enroll(nodeId, nodeToken, {
           platform,
           name,
-          capabilities: capabilitiesForPlatform(platform)
+          capabilities: capabilitiesForPlatform(platform),
+          enrolledVia: consumed.issuedVia
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
@@ -2019,32 +2242,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
-        const turnsThread = sharedTurnsThread(pathname);
-        if (turnsThread) {
-          // How each turn a client named stands, so a client reconnecting
-          // with sends it never heard back about resumes only the ones main
-          // never took, one at a time, instead of sending them all again.
-          const ids = [...new Set(String(url.searchParams.get("ids") ?? "").split(",").filter(Boolean))];
-          if (ids.length < 1 || ids.length > 50 || ids.some((id) => !CLIENT_TURN_ID.test(id))) {
-            return sendJson(res, 400, { error: "invalid_ids", message: "ids must list 1 to 50 turn ids." });
-          }
-          const conversationId = url.searchParams.get("conversationId") ?? "main";
-          try {
-            const sessionId = sharedSessionId(turnsThread, conversationId);
-            return sendJson(res, 200, {
-              thread: turnsThread, conversationId,
-              active: liveTurns.list(sessionId),
-              turns: turnStates({ store, liveTurns, receipts: turnReceipts, sessionId, requestIds: ids })
-            });
-          } catch (error) {
-            if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
-            throw error;
-          }
-        }
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
-          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main", liveTurns }));
+          const historyActor = requestNodeId ? `node:${requestNodeId}` : "owner";
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main", liveTurns,
+            queue: { snapshot: (sessionId) => conversationQueue.snapshot(sessionId, historyActor) } }));
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2062,12 +2265,192 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: "invalid_messages" });
         }
         try {
+          const conversationId = typeof body.conversationId === "string" ? body.conversationId : "main";
+          const rawMessages = Array.isArray(body.messages) ? body.messages : body.messages;
+          let filteredMessages = rawMessages;
+          let suppressedCount = 0;
+          let deferredCount = 0;
+          let proactiveEvaluatedCount = 0;
+          let lastSuppressReason = null;
+          if (conversationId === "main" && Array.isArray(rawMessages)) {
+            const sourceName = typeof body.sourceName === "string" ? body.sourceName : null;
+            const sourceNodeId = typeof body.sourceNodeId === "string" ? body.sourceNodeId : null;
+            const nonProactive = [];
+            const appendedAll = [];
+            let lastAppendPayload = null;
+            for (const item of rawMessages) {
+              const text = typeof item?.text === "string" ? item.text : (typeof item?.content === "string" ? item.content : "");
+              const isProactive = item?.role === "assistant" && (item?.proactive === true || isProactiveSupervisorText(text));
+              if (!isProactive) {
+                nonProactive.push(item);
+                continue;
+              }
+              proactiveEvaluatedCount += 1;
+              if (nonProactive.length > 0) {
+                const resPart = appendSharedThreadMessages(store, "supervisor", {
+                  conversationId,
+                  messages: nonProactive.splice(0, nonProactive.length),
+                  sourceName,
+                  sourceNodeId
+                });
+                lastAppendPayload = resPart;
+                if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
+              }
+              const verdict = await hubProactiveGuard.evaluate({
+                text,
+                kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
+                decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
+                decisionTokens: Array.isArray(item?.proactiveMeta?.decisionTokens) ? item.proactiveMeta.decisionTokens : [],
+                decisionKinds: Array.isArray(item?.proactiveMeta?.decisionKinds) ? item.proactiveMeta.decisionKinds : [],
+                alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true,
+                persist: async (finalText, { agentReviewed }) => {
+                  const resPart = appendSharedThreadMessages(store, "supervisor", {
+                    conversationId,
+                    messages: [{
+                      ...item,
+                      text: finalText,
+                      proactive: true,
+                      proactiveMeta: {
+                        ...(item?.proactiveMeta && typeof item.proactiveMeta === "object" ? item.proactiveMeta : {}),
+                        agentReviewed: agentReviewed === true
+                      }
+                    }],
+                    sourceName,
+                    sourceNodeId
+                  });
+                  return resPart;
+                }
+              });
+              if (!verdict.send) {
+                if (verdict.error) throw verdict.error;
+                suppressedCount += 1;
+                if (verdict.deferred === true) deferredCount += 1;
+                lastSuppressReason = verdict.reason ?? "suppressed";
+                continue;
+              }
+              if (verdict.persistResult) {
+                lastAppendPayload = verdict.persistResult;
+                if (Array.isArray(verdict.persistResult?.appended)) appendedAll.push(...verdict.persistResult.appended);
+              }
+            }
+            if (nonProactive.length > 0) {
+              const resPart = appendSharedThreadMessages(store, "supervisor", {
+                conversationId,
+                messages: nonProactive,
+                sourceName,
+                sourceNodeId
+              });
+              lastAppendPayload = resPart;
+              if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
+            }
+            if (!lastAppendPayload && suppressedCount > 0) {
+              return sendJson(res, 200, {
+                ok: true,
+                thread: "supervisor",
+                conversationId,
+                appended: [],
+                suppressed: true,
+                deferred: deferredCount > 0 && deferredCount === suppressedCount,
+                reason: lastSuppressReason,
+                proactiveGuarded: true
+              });
+            }
+            if (lastAppendPayload) {
+              return sendJson(res, 200, {
+                ...lastAppendPayload,
+                appended: appendedAll,
+                ...(proactiveEvaluatedCount > 0 ? { proactiveGuarded: true } : {})
+              });
+            }
+          }
           return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
-            conversationId: typeof body.conversationId === "string" ? body.conversationId : "main",
-            messages: body.messages,
+            conversationId,
+            messages: filteredMessages,
             sourceName: typeof body.sourceName === "string" ? body.sourceName : null,
             sourceNodeId: typeof body.sourceNodeId === "string" ? body.sourceNodeId : null
           }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+      // The hub's conversation queue (conversation-queue.js): read it, edit
+      // or hold an item, remove one, or send one now. Same callers as the
+      // interrupt route. POST .../queue (adding) is handled with /message.
+      const queueRoute = sharedQueueRoute(pathname);
+      if (queueRoute && !(method === "POST" && queueRoute.requestId === null)) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store || !channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const actorKey = requestNodeId ? `node:${requestNodeId}` : "owner";
+        const actor = { key: actorKey, name: requestNodeId ? boundedMobileNodeName(requestEnrollment?.name) : "Mac" };
+        try {
+          const conversationId = url.searchParams.get("conversationId") ?? "main";
+          if (method === "GET" && !queueRoute.requestId) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            return sendJson(res, 200, { thread: queueRoute.thread, conversationId, ...conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (!queueRoute.requestId) return sendJson(res, 405, { error: "method_not_allowed" });
+          if (method === "PATCH" && !queueRoute.sendNow) {
+            const body = await readJsonLimited(req, 96 * 1024).catch(() => null);
+            if (!body || typeof body !== "object" || Array.isArray(body)
+                || Object.keys(body).some((key) => !["text", "hold", "baseRevision", "conversationId"].includes(key))
+                || (body.text !== undefined && typeof body.text !== "string")
+                || (body.hold !== undefined && typeof body.hold !== "boolean")
+                || (body.baseRevision !== undefined && !Number.isSafeInteger(body.baseRevision))) {
+              return sendJson(res, 400, { error: "invalid_queue_edit" });
+            }
+            const sessionId = sharedSessionId(queueRoute.thread, body.conversationId ?? conversationId);
+            const item = conversationQueue.update(sessionId, queueRoute.requestId, actor, body);
+            return sendJson(res, 200, { item, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (method === "DELETE" && !queueRoute.sendNow) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            const raw = url.searchParams.get("baseRevision");
+            if (raw !== null && !/^\d{1,9}$/.test(raw)) return sendJson(res, 400, { error: "invalid_queue_edit" });
+            conversationQueue.remove(sessionId, queueRoute.requestId, actor, { baseRevision: raw === null ? undefined : Number(raw) });
+            return sendJson(res, 200, { removed: queueRoute.requestId, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          if (method === "POST" && queueRoute.sendNow) {
+            const sessionId = sharedSessionId(queueRoute.thread, conversationId);
+            const { outcome, item } = await sendQueuedNext(sessionId, queueRoute.requestId, actor);
+            return sendJson(res, 200, { ...outcome, item, queue: conversationQueue.snapshot(sessionId, actorKey) });
+          }
+          return sendJson(res, 405, { error: "method_not_allowed" });
+        } catch (error) {
+          if (error instanceof QueueError) return sendJson(res, error.status, { error: error.code, message: error.message, ...(error.item ? { item: error.item } : {}) });
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+      // Stop a running turn in a shared thread so the owner's next message
+      // goes first (message-turns.js interruptTurn). Same callers as the
+      // thread's history, minus G2. The answer says whether the turn has
+      // actually stopped; a tool already running finishes and is not undone.
+      if (method === "POST" && sharedInterruptThread(pathname) !== null) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "forbidden_node" });
+        }
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store || !channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some((key) => !["requestId", "conversationId"].includes(key))
+            || typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.requestId)) {
+          return sendJson(res, 400, { error: "invalid_interrupt", message: "Send the requestId of the turn to stop." });
+        }
+        try {
+          const sessionId = sharedSessionId(sharedInterruptThread(pathname), body.conversationId ?? "main");
+          const outcome = await interruptTurn({ liveTurns, store, sessionId, requestId: body.requestId, settleMs: interruptSettleMs });
+          // A queued message that left the hub's queue without running has no
+          // records; the queue remembers how it ended.
+          const gone = outcome.status === "not_found" ? conversationQueue.tombstoneFor(sessionId, body.requestId) : null;
+          if (gone) return sendJson(res, 200, gone.outcome === "stopped" ? { status: "interrupted", requestId: body.requestId } : { status: "finished", outcome: gone.outcome, requestId: body.requestId });
+          return sendJson(res, 200, outcome);
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2111,7 +2494,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/g2/connect") {
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
-        return sendHtml(res, 200, g2ConnectPage);
+        const pairedRemote = mobileProfile ? null : readNodeConfig(dataDir)?.remote;
+        let mainOrigin = null;
+        if (pairedRemote) {
+          try { mainOrigin = pinnedRemoteOrigin(pairedRemote, { allowInsecureRemote: allowInsecureNodeRelay }); }
+          catch { mainOrigin = String(pairedRemote); }
+        }
+        return sendHtml(res, 200, renderG2ConnectPage({ mainOrigin }));
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -2253,9 +2642,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
 
-      if (method === "POST" && pathname === "/message") {
+      // POST /conversations/:thread/queue: a busy client adds a message to the
+      // hub's queue without holding a stream open. Same checks and binding
+      // as /message; answered as soon as the message is durably queued.
+      const enqueueRoute = method === "POST" && sharedQueueRoute(pathname)?.requestId === null ? sharedQueueRoute(pathname) : null;
+      if (method === "POST" && (pathname === "/message" || enqueueRoute)) {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        let sendNext = false;
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
         let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
+        if (enqueueRoute) {
+          if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(res, 400, { error: "message must be an object" });
+          if (typeof body.requestId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.requestId)) {
+            return sendJson(res, 400, { error: "invalid_request_id", message: "A queued message needs its requestId (8-128 letters, digits, _ or -)." });
+          }
+          if (requestNodeId && !ownerProxyRoute && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+          if (body.next !== undefined && typeof body.next !== "boolean") return sendJson(res, 400, { error: "invalid_queue_message", message: "next must be true or false." });
+          // "Send anyway": queue it, put it next and stop what runs now, in
+          // one request (a retry with the same id does the same, once).
+          sendNext = body.next === true;
+          delete body.next;
+          body.thread = enqueueRoute.thread;
+        }
+        const rawFrom = typeof body?.from === "string" ? body.from.slice(0, 120) : null;
         let clientTurnId = null;
         try {
           if (body && typeof body === "object" && !Array.isArray(body)) {
@@ -2324,23 +2735,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // An owner UI such as Paseo joins the same named shared thread as
         // paired devices. Resolve its identity here, never in the client.
         if (!requestNodeId && body?.thread !== undefined) {
-          // The Mac names its turns the same way a phone does.
-          if (body.requestId !== undefined && (typeof body.requestId !== "string" || !CLIENT_TURN_ID.test(body.requestId))) {
-            return sendJson(res, 400, { error: "requestId must be 8-128 letters, digits, _ or -" });
-          }
-          if (typeof body.requestId === "string") {
-            clientTurnId = body.requestId;
-            body = { ...body, metadata: { ...body.metadata, requestId: clientTurnId } };
-          }
-          delete body.requestId;
+          // The owner's Mac names its turns as phones do, so it can follow,
+          // replay and interrupt them in the shared thread. Owner UIs that
+          // already sent some other value keep working: it is ignored.
+          const ownerTurnId = typeof body.requestId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(body.requestId) ? body.requestId : null;
+          if (ownerTurnId) clientTurnId = ownerTurnId;
           try {
             const safeFocusedCardId = typeof body.focusedCardId === "string" && /^[A-Za-z0-9:_-]{1,120}$/.test(body.focusedCardId)
               ? body.focusedCardId
               : undefined;
+            const ownerBody = { ...body };
+            delete ownerBody.requestId;
             body = {
-              ...body,
+              ...ownerBody,
               sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
-              metadata: { ...body.metadata, thread: body.thread, ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}) }
+              metadata: {
+                ...body.metadata, thread: body.thread,
+                ...(safeFocusedCardId ? { focusedCardId: safeFocusedCardId } : {}),
+                ...(ownerTurnId ? { requestId: ownerTurnId } : {})
+              }
             };
           } catch (error) {
             if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
@@ -2376,20 +2789,77 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // runs follows that run (progress and its final reply); a repeat
         // after it ended replays how it ended. Neither reaches the model.
         let runTurn = (hooks) => channels.handleLocalMessage(body, { ...hooks, principal });
+        if (enqueueRoute && !(clientTurnId && typeof body.sessionId === "string")) {
+          return sendJson(res, 400, { error: "invalid_queue_message", message: "Queue a message in a shared thread with its requestId." });
+        }
         if (clientTurnId && typeof body.sessionId === "string") {
           const sessionId = body.sessionId;
-          const live = liveTurns.get(sessionId, clientTurnId);
-          const stored = live ? null : storedTurn(runtime.agentHost?.store ?? channels?.agentHost?.store, sessionId, clientTurnId);
-          const receipt = turnReceipts.get(sessionId, clientTurnId);
-          // One id is one message. The same id with other words is a client
-          // bug, never a second send: refuse it rather than replay or run it.
-          const fingerprint = turnFingerprint(body.text);
-          if (receipt?.fingerprint && receipt.fingerprint !== fingerprint) {
-            return sendJson(res, 409, { error: "request_id_conflict", message: "That requestId was already used for a different message." });
+          // Shared device threads queue on the hub (conversation-queue.js).
+          const shared = sharedThreadForSession(sessionId) !== null;
+          const digest = shared ? submissionDigest({ text: body.text, attachments: body.attachments, focusedCardId: body.metadata?.focusedCardId ?? null }) : null;
+          const queued = shared ? conversationQueue.find(sessionId, clientTurnId) : null;
+          if (queued && queued.digest !== digest) {
+            return sendJson(res, 409, { error: "request_conflict", message: "This message id already belongs to a different message." });
           }
-          if (live) {
+          const live = liveTurns.get(sessionId, clientTurnId);
+          const turnStore = runtime.agentHost?.store ?? channels?.agentHost?.store;
+          // A turn the owner stopped before it ever ran has no records yet,
+          // and a message removed from the queue never had any: replay how it
+          // ended, never run the replaced or removed message.
+          const gone = !live && shared ? conversationQueue.tombstoneFor(sessionId, clientTurnId) : null;
+          const stored = live ? null : (storedTurn(turnStore, sessionId, clientTurnId)
+            ?? liveTurns.stoppedTurn(turnStore, sessionId, clientTurnId)
+            ?? (gone ? { status: "failed", sessionId, messageCount: 0, code: gone.outcome, message: { content: gone.message } } : null));
+          const actorKey = requestNodeId ? `node:${requestNodeId}` : "owner";
+          const queueActor = { key: actorKey, name: requestNodeId ? boundedMobileNodeName(requestEnrollment?.name) : "Mac" };
+          if (enqueueRoute) {
+            if (live || stored) {
+              const again = sendNext && queued?.state === "queued"
+                ? await sendQueuedNext(sessionId, clientTurnId, queueActor).catch(() => null) : null;
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: true, ...(stored ? { outcome: stored.status === "complete" ? "complete" : stored.code ?? stored.status } : {}),
+                ...(again ? { sendNow: again.outcome } : {}), queue: conversationQueue.snapshot(sessionId, actorKey) });
+            }
+          }
+          if (shared && !live && !stored) {
+            let submitted;
+            try {
+              submitted = conversationQueue.submit({
+                sessionId, requestId: clientTurnId, thread: sharedThreadForSession(sessionId),
+                conversationId: sharedConversationForSession(sessionId) ?? "main",
+                text: body.text, body, digest,
+                source: requestNodeId
+                  ? { device: ownerProxyRoute ? "owner" : "phone", key: actorKey, nodeId: requestNodeId, name: String(body.metadata?.sourceName ?? (ownerProxyRoute ? "Mac" : "Phone")).slice(0, 80) }
+                  : { device: "owner", key: actorKey, nodeId: null, name: rawFrom === "mac-supervisor" ? "Mac" : "Owner" },
+                principalSpec: principal ? { via: principal.via, nodeId: principal.nodeId ?? null } : null
+              });
+            } catch (error) {
+              if (error instanceof QueueError) return sendJson(res, error.status, { error: error.code, message: error.message });
+              throw error;
+            }
+            if (enqueueRoute) {
+              const next = sendNext ? await sendQueuedNext(sessionId, clientTurnId, queueActor).catch(() => null) : null;
+              return sendJson(res, 202, { requestId: clientTurnId, duplicate: false, ...(next ? { sendNow: next.outcome } : {}),
+                queue: conversationQueue.snapshot(sessionId, actorKey) });
+            }
+            const turn = submitted.turn;
             runTurn = (hooks) => {
-              const off = liveTurns.subscribe(live, (kind, data) => { if (kind === "progress") hooks.onProgress?.(data); });
+              const off = liveTurns.subscribe(turn, (kind, data) => {
+                if (kind === "progress") hooks.onProgress?.(data);
+                else hooks.onTextDelta?.(data);
+              });
+              // Durably queued on the hub: accepted, even before it runs.
+              hooks.onProgress?.({ stage: "queued", session: { id: sessionId } });
+              return turn.promise.finally(off);
+            };
+          } else if (live) {
+            // A turn still waiting in the queue has sent no text yet, so a
+            // client attaching now can follow its text from the start.
+            const fromStart = live.stage === "queued";
+            runTurn = (hooks) => {
+              const off = liveTurns.subscribe(live, (kind, data) => {
+                if (kind === "progress") hooks.onProgress?.(data);
+                else if (fromStart) hooks.onTextDelta?.(data);
+              });
               hooks.onProgress?.({ stage: live.stage, session: { id: sessionId } });
               return live.promise.finally(off);
             };
@@ -2399,37 +2869,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               if (stored.status === "complete") return replayedResult(stored);
               throw replayedFailure(stored, clientTurnId);
             };
-          } else if (receipt && receipt.state !== "queued") {
-            // Main took this id before and its records have rotated out, or
-            // it was running when main stopped: it never runs again.
-            runTurn = async (hooks) => {
-              hooks.onProgress?.({ stage: "replayed", session: { id: sessionId } });
-              throw receipt.state === "interrupted"
-                ? replayedFailure({ status: "interrupted", sessionId }, clientTurnId)
-                : alreadyHandledFailure(sessionId, clientTurnId);
-            };
           } else {
-            // Accepted: the receipt is on disk before the turn can start, and
-            // follows it to running and to how it ended.
-            turnReceipts.accept(sessionId, clientTurnId, fingerprint);
-            const untracked = runTurn;
-            const fresh = async (hooks) => {
-              let started = false;
-              try {
-                const result = await untracked({
-                  ...hooks,
-                  onProgress: (raw) => {
-                    if (!started) { started = true; turnReceipts.mark(sessionId, clientTurnId, "running"); }
-                    hooks.onProgress?.(raw);
-                  }
-                });
-                turnReceipts.mark(sessionId, clientTurnId, "done");
-                return result;
-              } catch (error) {
-                turnReceipts.mark(sessionId, clientTurnId, "failed", { code: typeof error?.code === "string" ? error.code : "agent_failed" });
-                throw error;
-              }
-            };
+            const fresh = runTurn;
             runTurn = (hooks) => liveTurns.run(sessionId, clientTurnId, fresh, (kind, data) => {
               if (kind === "progress") hooks.onProgress?.(data);
               else hooks.onTextDelta?.(data);
@@ -2496,7 +2937,91 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 202, { accepted: true });
       }
 
-      if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget") {
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      }
+      if (method === "POST" && pathname === "/budget") {
+        if (!runtime.budget) return sendJson(res, 503, { error: "no-budget" });
+        if (typeof req.headers["x-openagi-timezone"] === "string") {
+          runtime.budget?.adoptClientTimeZone?.(req.headers["x-openagi-timezone"]);
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid_body", message: "Expected a JSON budget update." });
+        }
+        const allowedKeys = new Set(["dailyUsdLimit", "addUsdToday", "resetTodayBonus", "timeZone"]);
+        if (Object.keys(body).some((k) => !allowedKeys.has(k))) {
+          return sendJson(res, 400, { error: "unsupported_fields", message: "Unsupported budget fields." });
+        }
+        const hasLimit = body.dailyUsdLimit !== undefined && body.dailyUsdLimit !== null;
+        const hasBonus = body.addUsdToday !== undefined && body.addUsdToday !== null;
+        const hasReset = body.resetTodayBonus === true;
+        const hasTimeZone = typeof body.timeZone === "string" && body.timeZone.trim().length > 0;
+        if (!hasLimit && !hasBonus && !hasReset && !hasTimeZone) {
+          return sendJson(res, 400, { error: "empty_update", message: "Provide dailyUsdLimit, addUsdToday, or timeZone." });
+        }
+        try {
+          if (hasLimit) {
+            const parsed = Number(body.dailyUsdLimit);
+            if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Daily budget limit must be between $0.50 and $10,000." });
+            }
+          }
+          if (hasBonus) {
+            const parsedBonus = Number(body.addUsdToday);
+            if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+              return sendJson(res, 400, { error: "invalid_budget", message: "Added budget must be between $0.01 and $10,000." });
+            }
+          }
+          // The live update stands even if `.env` can't be written, but the
+          // caller must learn it will not survive a restart (a lowered cap
+          // would otherwise silently revert to the old, higher one).
+          const notPersisted = [];
+          let persistenceError = null;
+          const persistEnv = async (key, value) => {
+            try {
+              const { saveEnv } = await import("./setup-wizard.js");
+              saveEnv({ dataDir, values: { [key]: value } });
+            } catch (error) {
+              notPersisted.push(key);
+              persistenceError ??= String(error?.message ?? error);
+            }
+          };
+          if (hasTimeZone && typeof runtime.budget.setTimeZone === "function") {
+            runtime.budget.setTimeZone(body.timeZone.trim());
+            process.env.OPENAGI_TIMEZONE = runtime.budget.timeZone;
+            await persistEnv("OPENAGI_TIMEZONE", runtime.budget.timeZone);
+          }
+          if (hasLimit) {
+            runtime.budget.setDailyLimit(Number(body.dailyUsdLimit));
+            process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+            await persistEnv("OPENAGI_DAILY_USD_LIMIT", String(runtime.budget.dailyUsdLimit));
+          }
+          if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+            runtime.budget.clearBonusToday();
+          }
+          if (hasBonus) {
+            runtime.budget.addBonusToday(Number(body.addUsdToday));
+          }
+          const updated = runtime.budget.status();
+          runtime.events?.emit?.("budget-updated", updated);
+          if (notPersisted.length > 0) {
+            return sendJson(res, 200, {
+              ...updated,
+              persisted: false,
+              notPersisted,
+              persistenceError,
+              warning: "Applied for now, but not saved: the previous setting returns when OpenAGI restarts."
+            });
+          }
+          return sendJson(res, 200, (hasLimit || hasTimeZone) ? { ...updated, persisted: true } : updated);
+        } catch (error) {
+          return sendJson(res, 400, { error: "invalid_budget", message: String(error?.message ?? "Invalid budget update.") });
+        }
+      }
       if (method === "GET" && pathname === "/budget/ledger") {
         const ledger = runtime.budget?.ledger;
         if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
@@ -2732,6 +3257,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           await rebuildModelProvider();
         }
         return sendJson(res, 200, modelSettings());
+      }
+      // Re-run the newer-model check now (same as the daily job).
+      if (method === "POST" && pathname === "/settings/models/upgrades/check") {
+        const { checkModelUpgrades } = await import("./model-upgrades.js");
+        const result = await checkModelUpgrades({ dataDir, outreach: runtime.outreachConfig?.enabled ? runtime.outreach : null });
+        return sendJson(res, 200, { checkedAt: result.checkedAt, checked: result.checked, errors: result.errors, suggestions: result.suggestions });
       }
       // A one-line round trip through the active model, so the settings
       // screen can say "works" or show why not.
@@ -3099,6 +3630,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Pass extraCookies so /fleet?token= signs in like the dashboard does.
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
       }
+      if (pathname === "/goals" && (method === "GET" || method === "POST")) {
+        res.setHeader("Cache-Control", "no-store");
+        if (method === "GET") {
+          const activeWork = typeof runtime.fleetSupervisor?.getActiveWork === "function"
+            ? await Promise.resolve(runtime.fleetSupervisor.getActiveWork({ includeSnoozed: true, includeDone: url.searchParams.get("includeDone") === "true" })).catch(() => null)
+            : null;
+          const taskGoals = typeof runtime.tasks?.listGoals === "function"
+            ? runtime.tasks.listGoals({}).map((g) => ({ ...g, progress: runtime.tasks.goalProgress?.(g.id) ?? null }))
+            : [];
+          return sendJson(res, 200, {
+            activeWork,
+            taskGoals
+          });
+        }
+        const body = await readJsonLimited(req, 32 * 1024).catch(() => null);
+        if (!body || typeof body.goal !== "string" || !body.goal.trim()) {
+          return sendJson(res, 400, { error: "invalid_goal", message: "Provide { goal, doneCriteria, project?, cadence? }." });
+        }
+        const doneCriteria = typeof body.doneCriteria === "string" && body.doneCriteria.trim()
+          ? body.doneCriteria.trim()
+          : `Verify ${body.goal.trim().slice(0, 120)}`;
+        const tracked = typeof runtime.fleetSupervisor?.trackWork === "function"
+          ? await runtime.fleetSupervisor.trackWork({
+              project: body.project ?? "General",
+              theme: body.theme ?? null,
+              customer: body.customer ?? null,
+              goal: body.goal.trim(),
+              doneCriteria,
+              cadence: body.cadence ?? "daily",
+              permittedNudges: body.permittedNudges ?? "resume_owner",
+              threadKey: body.threadKey ?? null,
+              prRef: body.prRef ?? null,
+              linkedSkill: body.linkedSkill ?? null,
+              cursor: body.cursor ?? null
+            })
+          : null;
+        return sendJson(res, 200, { ok: true, tracked });
+      }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
         const acceptsImages = method === "POST" && (
@@ -3147,6 +3716,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (applied?.pendingAction) {
             queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
           }
+          hubProactiveGuard.noteOwnerActivity(proactiveNow());
           if (applied?.nonResolving) return sendJson(res, 200, { item: runtime.outreach.get(id), plan: applied.plan, nonResolving: true });
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
@@ -3340,10 +3910,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // with a reason when already current or not fast-forwardable.
         const { applyUpdate } = await import("./self-update.js");
         const result = await applyUpdate();
-        sendJson(res, result.updated ? 202 : 200, result);
+        const willRestart = result.updated && !result.restartRequired;
+        sendJson(res, willRestart ? 202 : 200, result);
         if (result.updated) {
-          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to });
-          setTimeout(() => process.exit(0), 300); // respawn with new code
+          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to, restartRequired: Boolean(result.restartRequired) });
+          // Unsupervised portable installs have nothing to respawn them: keep
+          // serving and report that a manual restart is required.
+          if (willRestart) setTimeout(() => process.exit(0), 300); // respawn with new code
         }
         return;
       }
@@ -4328,6 +4901,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      conversationQueue.close();
       closing = true;
       for (const unobserve of unobserveSharedThreads) unobserve();
       g2Requests?.close();
@@ -4996,6 +5570,38 @@ function readForm(req) {
     });
     req.on("error", reject);
   });
+}
+
+// A reply's metadata.pendingApprovals is the record of the code cards that
+// turn raised. Stamp each with the card's current state on the way out (a
+// copy; the stored session is untouched) so the chat shows Approve / Deny
+// only while the card can still be decided. A card the store no longer has
+// reads "unknown" and gets no buttons.
+export function withLiveApprovalStatus(session, store) {
+  if (!Array.isArray(session?.messages) || !session.messages.some((m) => Array.isArray(m?.metadata?.pendingApprovals))) return session;
+  return {
+    ...session,
+    messages: session.messages.map((message) => {
+      const cards = message?.metadata?.pendingApprovals;
+      if (!Array.isArray(cards)) return message;
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          pendingApprovals: cards.map((card) => {
+            const action = typeof card?.id === "string" ? store?.get?.(card.id) ?? null : null;
+            // A card the owner's later instruction ran is closed as denied
+            // "superseded": it did run, so it must not read "Nothing was run."
+            const status = !action ? "unknown"
+              : action.status === "approved" && action.error != null ? "failed"
+              : action.status === "denied" && /^superseded\b/.test(String(action.error ?? "")) ? "superseded"
+              : action.status;
+            return { ...card, status, ...(action?.expiresAt ? { expiresAt: action.expiresAt } : {}) };
+          })
+        }
+      };
+    })
+  };
 }
 
 function renderApp() {
@@ -5897,7 +6503,7 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     input.style.height = Math.min(180, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -5958,6 +6564,13 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
       sendBtn.disabled = false;
     }
   });
+}
+
+// Only an unmodified Return submits a chat draft. Shift+Return is left to the
+// textarea so it inserts a newline; composition events must also reach the IME.
+function shouldSubmitComposerKey(e) {
+  return e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+    && !e.isComposing && e.keyCode !== 229;
 }
 
 function showToast(msg, ok = true) {
@@ -6639,7 +7252,7 @@ function renderChat() {
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (shouldSubmitComposerKey(e)) {
       e.preventDefault();
       $("composer").requestSubmit();
     }
@@ -6925,9 +7538,76 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const pendingNote = pending
     ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
     : "";
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${pendingNote}\`;
+  const approvals = renderChatApprovals(msg);
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${approvals}\${pendingNote}\`;
+  if (approvals) wireChatApprovals(div);
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+// Code cards the reply raised (metadata.pendingApprovals, stamped with live
+// status by GET /sessions/:id). Buttons only while a card is pending; after
+// that the card shows its state. Typing "yes NN" keeps working alongside.
+function chatApprovalStateLabel(status) {
+  return ({
+    pending: "Waiting for your answer.",
+    executing: "Running…",
+    approved: "Approved.",
+    failed: "Approved, but it failed.",
+    denied: "Denied. Nothing was run.",
+    superseded: "Already run from your later message.",
+    expired: "Expired. Ask again to retry.",
+    interrupted: "Interrupted. Ask again to retry."
+  })[status] ?? "No longer available.";
+}
+
+function renderChatApprovals(msg) {
+  const cards = msg?.role === "assistant" && Array.isArray(msg.metadata?.pendingApprovals) ? msg.metadata.pendingApprovals : [];
+  return cards.filter((card) => card && typeof card.id === "string").map((card) => {
+    const live = card.status === "pending";
+    const hint = live && card.code ? " · or reply yes " + card.code : "";
+    return '<div class="card chat-approval" data-approval-id="' + escapeHtml(card.id) + '" data-approval-status="' + escapeHtml(card.status ?? "unknown") + '" style="padding:10px 12px; margin-top:8px;">'
+      + '<div style="font-weight:600;">' + escapeHtml(card.summary || card.toolName || "Agent action") + '</div>'
+      + '<div class="muted" style="font-size:12px;">' + escapeHtml((card.toolName ?? "") + hint) + '</div>'
+      + (live
+        ? '<div class="row" style="gap:8px; margin-top:8px;"><button type="button" data-approval-decision="approve">Approve</button><button type="button" class="secondary" data-approval-decision="deny">Deny</button></div>'
+        : "")
+      + '<div class="muted chat-approval-outcome" style="font-size:12px; margin-top:6px;"' + (live ? " hidden" : "") + '>' + escapeHtml(chatApprovalStateLabel(card.status)) + '</div>'
+      + '</div>';
+  }).join("");
+}
+
+// The same owner-authenticated routes the Approvals tab uses. A refusal
+// (already decided, expired, the tool failed) is final; only a transport
+// failure leaves the buttons usable for another try.
+async function decideChatApproval(id, decision) {
+  try {
+    const res = await postJson("/pending-actions/" + encodeURIComponent(id) + "/" + decision, {});
+    if (decision === "deny") return { ok: true, final: true, text: "Denied. Nothing was run." };
+    return { ok: true, final: true, text: res?.continuation?.status === "queued" ? "Approved. The agent is continuing in this chat." : "Approved." };
+  } catch (err) {
+    return { ok: false, final: err.status != null, text: (decision === "approve" ? "Approve" : "Deny") + " failed: " + err.message };
+  }
+}
+
+function wireChatApprovals(root) {
+  root.querySelectorAll(".chat-approval").forEach((card) => {
+    const buttons = Array.from(card.querySelectorAll("[data-approval-decision]"));
+    const outcome = card.querySelector(".chat-approval-outcome");
+    for (const button of buttons) {
+      button.addEventListener("click", async () => {
+        buttons.forEach((b) => { b.disabled = true; });
+        const result = await decideChatApproval(card.dataset.approvalId, button.dataset.approvalDecision);
+        if (outcome) {
+          outcome.textContent = result.text;
+          outcome.hidden = false;
+          outcome.className = "chat-approval-outcome " + (result.ok ? "muted" : "err");
+        }
+        if (!result.final) buttons.forEach((b) => { b.disabled = false; });
+        refreshApprovalBadge().catch(() => {});
+      });
+    }
+  });
 }
 
 // Keep transient model text outside state.messages: only the exact provider
@@ -8146,11 +8826,13 @@ async function renderChannels() {
 
 async function renderBudget() {
   const b = await fetchJson("/budget");
-  const pct = Math.min(100, (b.spentUsd / Math.max(b.dailyUsdLimit, 0.0001)) * 100);
+  const effectiveLimit = Number(b.effectiveLimitUsd ?? b.dailyUsdLimit ?? 10);
+  const bonusUsdToday = Number(b.bonusUsdToday ?? 0);
+  const pct = Math.min(100, (b.spentUsd / Math.max(effectiveLimit, 0.0001)) * 100);
   const stateClass = pct > 90 ? "err" : pct > 70 ? "warn" : "ok";
   main.innerHTML = \`
     <div class="pane">
-      <h2>Credits</h2>
+      <h2>Credits &amp; Daily Budget</h2>
       <div class="card">
         <div class="row between" style="align-items:center;">
           <span class="name">Today · \${escapeHtml(b.today)}</span>
@@ -8161,11 +8843,34 @@ async function renderBudget() {
         </div>
       </div>
 
+      <div class="card" style="margin-top:12px;">
+        <div class="row between" style="align-items:center;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div class="name">Adjust budget</div>
+            <div class="desc">Add extra room just for today or change your daily limit immediately.</div>
+          </div>
+          <div class="row" style="gap:8px;flex-wrap:wrap;">
+            <button class="btn" id="budgetAdd10Btn" type="button">+$10 today</button>
+            <button class="btn" id="budgetAdd25Btn" type="button">+$25 today</button>
+            \${bonusUsdToday > 0 ? '<button class="btn ghost" id="budgetResetBonusBtn" type="button">Reset today extra</button>' : ""}
+          </div>
+        </div>
+        <div class="row" style="margin-top:12px;gap:8px;align-items:center;flex-wrap:wrap;">
+          <label class="desc" for="budgetDailyInput">Daily limit ($/day)</label>
+          <input id="budgetDailyInput" type="number" min="0.5" max="10000" step="0.5" value="\${Number(b.dailyUsdLimit ?? 10).toFixed(2)}" style="width:120px;" />
+          <button class="btn primary" id="budgetSaveLimitBtn" type="button">Save daily limit</button>
+          <button class="btn ghost" data-budget-preset="25" type="button">$25/day</button>
+          <button class="btn ghost" data-budget-preset="50" type="button">$50/day</button>
+          <button class="btn ghost" data-budget-preset="100" type="button">$100/day</button>
+          <span id="budgetSaveMsg" class="desc"></span>
+        </div>
+      </div>
+
       <h3>Today</h3>
       <div class="grid stats">
         <div class="card"><span class="desc">Spent</span><div class="stat-value">$\${b.spentUsd.toFixed(4)}</div></div>
         <div class="card"><span class="desc">Remaining</span><div class="stat-value">$\${b.remainingUsd.toFixed(4)}</div></div>
-        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}</div></div>
+        <div class="card"><span class="desc">Daily limit</span><div class="stat-value">$\${b.dailyUsdLimit.toFixed(2)}\${bonusUsdToday > 0 ? \` (+\$\${bonusUsdToday.toFixed(2)} today)\` : ""}</div></div>
         <div class="card"><span class="desc">Calls</span><div class="stat-value">\${b.calls}</div></div>
         <div class="card"><span class="desc">Input tokens</span><div class="stat-value">\${b.tokens.input.toLocaleString()}</div></div>
         <div class="card"><span class="desc">Output tokens</span><div class="stat-value">\${b.tokens.output.toLocaleString()}</div></div>
@@ -8175,7 +8880,7 @@ async function renderBudget() {
 
       <h3>Last 14 days</h3>
       <div id="budgetHistory" class="grid"></div>
-      <p class="desc" style="margin-top:12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+      <p class="desc" style="margin-top:12px;">Saved daily limits persist to <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code> and take effect immediately.</p>
       <h3>Spend over time (30 days)</h3>
       <div id="creditChart" class="card"></div>
       <h3>By activity (30 days)</h3>
@@ -8187,6 +8892,26 @@ async function renderBudget() {
     </div>
   \`;
   const hist = $("budgetHistory");
+  const applyBudgetPatch = async (patch) => {
+    const msg = $("budgetSaveMsg");
+    if (msg) msg.textContent = "Saving…";
+    try {
+      await postJson("/budget", patch);
+      await renderBudget();
+    } catch (err) {
+      if (msg) msg.textContent = err?.message || "Failed to update budget.";
+    }
+  };
+  $("budgetAdd10Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 10 }));
+  $("budgetAdd25Btn")?.addEventListener("click", () => applyBudgetPatch({ addUsdToday: 25 }));
+  $("budgetResetBonusBtn")?.addEventListener("click", () => applyBudgetPatch({ resetTodayBonus: true }));
+  $("budgetSaveLimitBtn")?.addEventListener("click", () => {
+    const val = Number.parseFloat($("budgetDailyInput")?.value ?? "");
+    applyBudgetPatch({ dailyUsdLimit: val });
+  });
+  for (const btn of main.querySelectorAll("[data-budget-preset]")) {
+    btn.addEventListener("click", () => applyBudgetPatch({ dailyUsdLimit: Number(btn.getAttribute("data-budget-preset")) }));
+  }
   for (const d of (b.history ?? [])) {
     const c = document.createElement("div");
     c.className = "card";

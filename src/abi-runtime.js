@@ -85,11 +85,12 @@ Do not invent work. Be conservative — fewer actions, higher signal.`;
 // Conservative on the empty path so we don't burn LLM cycles inventing
 // work. Users who want a different cadence can edit the cron job in
 // the dashboard; setting it to disabled turns the autopilot off entirely.
-const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue.
+const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue and advance active goals until their Definition of Done is genuinely met.
 
-1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do.
-2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, etc). When the task is done, call \`complete_task\` with the task id. If it's still in progress or needs to be deferred, call \`move_task\` to update its status / bucket / due date.
-   - DRAFT-ONLY tasks (tagged \`plan-action\`, or whose description says "produce a draft only"): prepare the artifact and leave it for the user — write the draft into your reply and/or save it, but do NOT send, publish, or schedule anything externally. Mark \`complete_task\` once the draft is ready for review.
+1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do (and check \`list_goals\` if multi-batch goals are active).
+2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, \`verify_goal_progress\`, etc).
+   - **CRITICAL CONTINUATION RULE (Never Stop After 10 Items):** If the user's goal covers an exhaustive set (e.g. "clean ALL my emails", "go through all 888 issues", "verify all 10 customer questions"), processing one batch of 5-20 items is NOT completion. Update progress via \`verify_goal_progress\` (recording \`cursor.processed\`, \`cursor.remaining\`, and \`cursor.lastCursorToken\`) or \`move_task\` so the next pulse automatically continues the next batch until \`remaining === 0\` and \`doneCriteria\` is verified. Only call \`complete_task\` once the ENTIRE goal is satisfied or blocked on a hard owner red line.
+   - DRAFT-ONLY & HARD RED LINES: Never merge PRs, deploy to production, send external emails/messages to customers, or spend money without explicit owner confirmation. Prepare drafts (\`save_draft\`) for human review when external sends are needed.
 3. If the queue is empty (\`{task: null}\`): you don't need to invent work. Glance at recent sessions only if something obviously needs a follow-up — otherwise reply "standing by" in one sentence and stop.
 
 The user is not in this conversation — the only output that matters is what you DO via tools, not what you say. Take no action if you have no committed work; do not summarize, do not editorialize.`;
@@ -182,6 +183,7 @@ export class AbiRuntime {
     // only while OPENAGI_LEARNED_PROPAGATION is not off (learnedClusterStats).
     this.clusterStats = options.clusterStats ?? null;
     this.learningDir = options.dataDir ? path.join(options.dataDir, "learning") : undefined;
+    this.modelUpgradeDir = options.dataDir ?? resolveDataDir();
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // FTS5 index over the agent's own chat transcripts, so search_sessions can
@@ -311,19 +313,34 @@ export class AbiRuntime {
       // metered model the interval is the single biggest cost lever. Default
       // 30 min; set OPENAGI_AUTOPILOT_INTERVAL_MIN to slow it (e.g. 120 = 2h).
       const autopilotMin = Number(process.env.OPENAGI_AUTOPILOT_INTERVAL_MIN) || 30;
-      this.cron.addJob({
-        id: "agent-pulse",
-        name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
-        enabled: true,
-        task: "autopilot",
-        intervalMs: autopilotMin * 60 * 1000,
-        input: {
-          agentId: "main",
-          prompt: AGENT_PULSE_PROMPT,
-          // Only fire (spend a base-model call) when there's queued agent work.
-          requireQueuedWork: true
-        }
-      });
+      const existingPulse = this.cron.jobs?.get?.("agent-pulse") ?? null;
+      const upgradeLegacyPulse = Boolean(
+        existingPulse && !String(existingPulse.input?.prompt ?? "").includes("verify_goal_progress")
+      );
+      if (upgradeLegacyPulse && typeof this.cron.updateJob === "function") {
+        // Upgrade only the prompt: the owner's saved cadence, timeout, enabled
+        // state, and next run stay exactly as they were configured.
+        this.cron.updateJob("agent-pulse", {
+          input: { ...(existingPulse.input ?? {}), prompt: AGENT_PULSE_PROMPT, requireQueuedWork: true }
+        });
+      } else {
+        this.cron.addJob({
+          id: "agent-pulse",
+          name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
+          enabled: existingPulse ? existingPulse.enabled !== false : true,
+          replace: upgradeLegacyPulse,
+          task: "autopilot",
+          intervalMs: autopilotMin * 60 * 1000,
+          ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
+          ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
+          input: {
+            agentId: "main",
+            prompt: AGENT_PULSE_PROMPT,
+            // Only fire (spend a base-model call) when there's queued agent work.
+            requireQueuedWork: true
+          }
+        });
+      }
       this.cron.addJob({
         id: "weekly-harsh-review",
         name: "Weekly harsh review",
@@ -361,6 +378,16 @@ export class AbiRuntime {
       // reached 1.26 GiB of screen OCR. 05:15 is deliberately AFTER the 02:30
       // nightly miner (which reads a 28-day window) and off every other slot, so
       // retention never shares a tick with another job.
+      // Daily: list the models the owner's keys can reach and suggest newer
+      // ones (or flag a configured model that no longer exists). Read-only
+      // against the provider; never changes config.
+      this.cron.addJob({
+        id: "model-upgrade-check",
+        name: "Daily check for newer models (suggests, never switches)",
+        enabled: true,
+        task: "model-upgrade-check",
+        dailyAt: "05:35"
+      });
       this.cron.addJob({
         id: "grounded-sweep",
         name: "Daily grading of drafts, suggestions and agent tasks by what happened",
@@ -749,7 +776,7 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else if (!options.ephemeral && !options.isolatedContext) {
+    } else if (!options.ephemeral && !options.isolatedContext && options.memoryWrite !== false) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
@@ -995,10 +1022,17 @@ export class AbiRuntime {
         this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
         // Respawn with the new code (systemd Restart=always / launchd
         // KeepAlive / Mac DaemonController bring it back). Defer so the
-        // tick result can flush first.
-        setTimeout(() => process.exit(0), 500);
+        // tick result can flush first. An unsupervised portable install
+        // reports restartRequired instead — exiting would never come back.
+        if (!result.restartRequired) setTimeout(() => process.exit(0), 500);
       }
       return result;
+    }
+    if (job.task === "model-upgrade-check") {
+      const { checkModelUpgrades } = await import("./model-upgrades.js");
+      // Outreach opt-out (OPENAGI_OUTREACH_DISABLED / outreach.json) silences
+      // the announcement; the read-only check and settings cache still run.
+      return checkModelUpgrades({ dataDir: this.modelUpgradeDir, outreach: this.outreachConfig?.enabled ? this.outreach : null, now });
     }
     if (job.task === "grounded-sweep") {
       return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };
