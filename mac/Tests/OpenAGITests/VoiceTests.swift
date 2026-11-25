@@ -458,6 +458,19 @@ final class VoiceTests: XCTestCase {
     XCTAssertEqual(try VoiceConnection(base: "http://127.0.0.1:1234", token: "test-daemon-token-1234").url.scheme, "ws")
   }
 
+  // The paired main is often reached over Tailscale (WireGuard-encrypted), as
+  // the app already does for every other hub request.
+  func testConnectionAcceptsTheHubsTailscaleAddressButNoOtherCleartextHost() throws {
+    let tailnetIP = try VoiceConnection(base: "http://100.73.29.88:43210", token: "test-daemon-token-1234")
+    XCTAssertEqual(tailnetIP.url.absoluteString, "ws://100.73.29.88:43210/nodes/voice?rate=24000&mode=ptt")
+    XCTAssertEqual(try VoiceConnection(base: "http://main.tail1234.ts.net:43210", token: "test-daemon-token-1234").url.scheme, "ws")
+    XCTAssertEqual(try VoiceConnection(base: "https://main.tail1234.ts.net:8443", token: "test-daemon-token-1234").url.scheme, "wss")
+    XCTAssertThrowsError(try VoiceConnection(base: "http://100.128.0.1", token: "test-daemon-token-1234"), "outside 100.64.0.0/10")
+    XCTAssertThrowsError(try VoiceConnection(base: "http://100.73.29.88.evil.example", token: "test-daemon-token-1234"))
+    XCTAssertThrowsError(try VoiceConnection(base: "http://ts.net.evil.example", token: "test-daemon-token-1234"))
+    XCTAssertThrowsError(try VoiceConnection(base: "http://192.0.2.10", token: "test-daemon-token-1234"))
+  }
+
   func testDisabledVoiceAndAuthenticationErrorsAreClear() {
     XCTAssertTrue(VoiceConnection.failureMessage(status: 404).contains("OPENAGI_VOICE=1"))
     XCTAssertTrue(VoiceConnection.failureMessage(status: 403).contains("daemon token"))

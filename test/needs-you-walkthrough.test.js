@@ -57,3 +57,36 @@ test("pause holds the position; next is refused until resume", async (t) => {
   assert.deepEqual([resumed.paused, resumed.current.id], [false, "a"]);
   assert.equal((await step(voice, { op: "back", cardId: "a" })).current.id, "a", "back at the first item stays put");
 });
+
+test("each walkthrough item is decision-ready: goal, evidence, choices and recommendation from the card", async (t) => {
+  const { walkthroughItems } = await import("../src/fleet/walkthrough.js");
+  const { voiceInstructions } = await import("../src/voice/instructions.js");
+  const [item] = walkthroughItems({ cards: [card("pr", {
+    decisionHeadline: "Merge PR #482?",
+    recommendation: "Merge: CI is green and the change is covered by tests.",
+    brief: { context: "Stop emailing customers about cards that would clear on a retry.", currentState: "CI passed, 214 tests.",
+             whatChanged: "Retries a declined card once after 30 seconds.", decision: "Merge PR #482 into main?" },
+    primaryAction: { label: "Merge" }, secondaryAction: { label: "Not yet" }, options: ["Not yet", "Add a test first"]
+  })], questions: [], snapshot: { threads: [] } });
+  assert.equal(item.goal, "Stop emailing customers about cards that would clear on a retry.");
+  assert.equal(item.evidence, "CI passed, 214 tests. Retries a declined card once after 30 seconds.");
+  assert.equal(item.decision, "Merge PR #482 into main?");
+  assert.equal(item.recommendation, "Merge: CI is green and the change is covered by tests.");
+  assert.deepEqual(item.choices, ["Merge", "Not yet", "Add a test first"], "deduplicated, in the card's order");
+
+  const [bare] = walkthroughItems({ cards: [card("bare")], questions: [], snapshot: { threads: [] } });
+  assert.equal(bare.goal, null, "a missing beat stays missing rather than invented");
+  assert.deepEqual(bare.choices, ["Approve"]);
+  const [standalone] = walkthroughItems({
+    cards: [],
+    questions: [{ id: "q-solo", status: "open", title: "Deploy hotfix?", body: "Tests are green.", options: ["Deploy", "Hold"] }],
+    snapshot: { threads: [] }
+  });
+  assert.equal(standalone.title, "Deploy hotfix?");
+  assert.equal(standalone.summary, "Tests are green.");
+  assert.deepEqual(standalone.choices, ["Deploy", "Hold"]);
+  assert.match(voiceInstructions(), /goal.*evidence.*choices.*recommendation/s);
+  assert.match(voiceInstructions(), /title and summary/);
+  assert.match(voiceInstructions(), /options if choices is absent/);
+  assert.match(voiceInstructions(), /leave it out rather than guess/);
+});
