@@ -819,18 +819,21 @@ export class AgentHost {
     const sameChat = action.context?.sessionId === sessionId;
     // The owner stopped this turn (Send Now) before this approval started:
     // run nothing and leave the card pending, so it can still be approved.
-    // An approval already running is not passed the signal; it finishes.
-    if (signal?.aborted) return { ...receipt, status: "not run: you stopped this reply first; the action is still waiting for approval" };
+    // An approval whose tool has started finishes; the executor checks the
+    // signal again after its (awaited) validation, before claiming it.
+    const stoppedFirst = { ...receipt, status: "not run: you stopped this reply first; the action is still waiting for approval" };
+    if (signal?.aborted) return stoppedFirst;
     const queueContinuation = typeof this.runtime.queueApprovalContinuation === "function" ? this.runtime.queueApprovalContinuation : null;
     let executed;
     try {
-      const options = { decidedBy, ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
+      const options = { decidedBy, ...(signal ? { signal } : {}), ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
       executed = typeof this.runtime.executeApprovedAction === "function"
         ? await this.runtime.executeApprovedAction(action.id, options)
         : await executeApprovedAction(this.runtime, action.id, options);
     } catch (error) {
       return { ...receipt, status: "failed", error: String(error?.message ?? error).slice(0, 300) };
     }
+    if (executed?.cancelled) return stoppedFirst;
     if (sameChat && executed?.invokeResult?.ok) store.continuationNotNeeded?.(action.id);
     const invoked = executed?.invokeResult;
     if (!invoked) return { ...receipt, status: `not run: ${String(executed?.body?.error ?? "unavailable").slice(0, 200)}` };

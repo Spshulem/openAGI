@@ -502,16 +502,10 @@ final class ChatConversation {
         // Busy, or messages are still waiting (one is being edited), here or
         // on the hub: this one goes after them, never ahead.
         if decision == .queue {
-            guard !forgotten else { return false }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+            guard enqueueBehindWaiting(text, attachments: attachments) else { return false }
             draft = ""
             draftAttachments = []
             composerRevision += 1
-            queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
-                          requestID: Self.newRequestID(),
-                          origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)
-            if hubQueueAvailable { uploadPending() } else { drainIfIdle() }
             return true
         }
         guard let turn = beginSend(text, attachments: attachments) else { return false }
@@ -523,7 +517,29 @@ final class ChatConversation {
         return true
     }
 
+    // Busy, or messages are still waiting (one may be open in its editor,
+    // or main still runs a reply whose stream was lost): a new message goes
+    // after them, never ahead. Every way of sending checks this, including
+    // the approval bar's "yes NN" and a budget resend.
+    private var mustQueue: Bool { isBusy }
+
+    @discardableResult
+    private func enqueueBehindWaiting(_ rawText: String, attachments: [ChatAttachment]) -> Bool {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isReadOnly, !forgotten, !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+        queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
+                      requestID: Self.newRequestID(),
+                      origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)
+        if hubQueueAvailable { uploadPending() } else { drainIfIdle() }
+        return true
+    }
+
     func send(_ rawText: String, attachments: [ChatAttachment] = []) async {
+        if mustQueue {
+            enqueueBehindWaiting(rawText, attachments: attachments)
+            return
+        }
         guard let turn = beginSend(rawText, attachments: attachments) else { return }
         await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID, focusedCardID: focusedCardID)
     }
