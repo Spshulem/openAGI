@@ -77,7 +77,11 @@ function prUrlFor(ref, url = null) {
 
 // The owning agent's labeled reply to a context request, read from its latest
 // message. Labels are matched loosely; an unlabeled reply supplies nothing.
-const NO_DECISION_RE = /^\W*(?:not\s+set\b|none\b|n\/a\b|nothing\s+(?:to\s+decide|(?:is\s+)?needed|pending)\b|no\s+(?:explicit\s+|owner\s+|new\s+)?(?:question|decision|options?|recommendation|choice)s?\b|there\s+(?:is|are)\s+no\s+(?:question|decision|options?)\b|i\s+(?:did\s+not|didn't)\s+ask\b)/i;
+const NO_DECISION_RE = /^\W*(?:not\s+set\b|none\b(?!\s+of\b)|n\/a\b|nothing\s+(?:to\s+decide|(?:is\s+)?needed|pending)\b|no\s+(?:explicit\s+|owner\s+|new\s+)?(?:question|decision|options?|recommendation|choice)s?\b|there\s+(?:is|are)\s+no\s+(?:question|decision|options?)\b|i\s+(?:did\s+not|didn't)\s+ask\b)/i;
+// "None — keep the current setup" is a choice with its consequence, not a
+// statement that there is nothing to choose.
+const LABELED_CHOICE_RE = /^\W*[^—–:]{1,60}?\s*(?:—|–|:|\s-\s|→|=>)\s*\S/;
+const statesNoDecision = (text) => NO_DECISION_RE.test(text) && !LABELED_CHOICE_RE.test(text);
 
 export function parseAgentSuppliedContext(text) {
   const raw = String(text ?? "");
@@ -125,10 +129,10 @@ export function parseAgentSuppliedContext(text) {
   // An agent stating there is no decision ("Not set by me", "No options
   // were offered", "None") has supplied nothing to decide.
   for (const field of ["decision", "recommendation"]) {
-    if (out[field] && NO_DECISION_RE.test(out[field])) delete out[field];
+    if (out[field] && statesNoDecision(out[field])) delete out[field];
   }
   const options = (out.options ?? [])
-    .filter((entry) => !NO_DECISION_RE.test(entry))
+    .filter((entry) => !statesNoDecision(entry))
     .map((entry) => {
       const parts = /^(.{1,80}?)(?:\s+(?:—|–|-|→|=>)|\s*:)\s+(.+)$/.exec(entry);
       return parts

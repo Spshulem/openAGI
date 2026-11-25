@@ -349,3 +349,20 @@ test("an agent stating there is no decision never produces a verified decision",
   assert.ok(ctx.missing.includes("decision"), "no decision to verify");
   assert.doesNotMatch(String(ctx.decision ?? ""), /not set|no options/i);
 });
+
+// #383 review P2: "None — keep …" is a real opt-out choice, not an absence.
+test("an option or recommendation labeled 'None' with a consequence is kept", async () => {
+  const { parseAgentSuppliedContext } = await import("../src/fleet/decision-context.js");
+  const parsed = parseAgentSuppliedContext([
+    "DECISION CONTEXT",
+    "Goal: Choose where the docs site is hosted.",
+    "Decision: Move the docs site to the managed host, or keep it self-hosted?",
+    "Options:",
+    "- Managed host — less upkeep, costs a monthly fee",
+    "- None — keep the current self-hosted deployment",
+    "Recommendation: None: keep it self-hosted until the traffic doubles."
+  ].join("\n"));
+  assert.deepEqual(parsed.options.map((o) => o.label), ["Managed host", "None"]);
+  assert.match(parsed.options[1].consequence, /self-hosted/);
+  assert.match(parsed.recommendation, /^None: keep it self-hosted/);
+});
