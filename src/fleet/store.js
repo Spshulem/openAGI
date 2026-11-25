@@ -89,6 +89,7 @@ function emptyState() {
     queuedOwnerMessages: [],
     supervisorChatNotices: {},
     lastProactiveChatAt: null,
+    lastOwnerAckAt: null,
     surfacedDecisions: {},
     providerFailovers: {},
     contextRequestLog: {}
@@ -1513,6 +1514,7 @@ export class FleetStore {
         : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
       lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,
+      lastOwnerAckAt: typeof raw.lastOwnerAckAt === "string" && Number.isFinite(Date.parse(raw.lastOwnerAckAt)) ? raw.lastOwnerAckAt : null,
       surfacedDecisions: isObject(raw.surfacedDecisions)
         ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
         : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
@@ -1728,6 +1730,33 @@ export class FleetStore {
     this.state.lastProactiveChatAt = stamp;
     this._save();
     return stamp;
+  }
+
+  lastOwnerAckAt() {
+    const stamp = this.state.lastOwnerAckAt;
+    return typeof stamp === "string" && Number.isFinite(Date.parse(stamp)) ? stamp : null;
+  }
+
+  recordOwnerAck(at = this.now()) {
+    const nextMs = toMs(at, this.now());
+    const prevMs = Date.parse(this.state.lastOwnerAckAt ?? "");
+    const stamp = iso(Number.isFinite(prevMs) && prevMs > nextMs ? prevMs : nextMs);
+    this.state.lastOwnerAckAt = stamp;
+    this._save();
+    return stamp;
+  }
+
+  resolvedDecisionKeys() {
+    const openKeys = new Set();
+    const resolvedKeys = new Set();
+    for (const q of this.state.questions ?? []) {
+      const key = actionableDecisionKey(q);
+      if (!key) continue;
+      if (q.status === "open") openKeys.add(key);
+      else resolvedKeys.add(key);
+    }
+    for (const key of openKeys) resolvedKeys.delete(key);
+    return resolvedKeys;
   }
 
   enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null } = {}) {

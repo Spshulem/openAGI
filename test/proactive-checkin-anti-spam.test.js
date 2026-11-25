@@ -6,6 +6,7 @@ import test from "node:test";
 import { createHostedInterface } from "../src/hosted-interface.js";
 import { createDurableRuntime } from "../src/abi-runtime.js";
 import { InMemoryAgentStore } from "../src/agent-store.js";
+import { writeNodeConfig } from "../src/cli-client.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { isQuietHour, resolveQuietTimeZone } from "../src/fleet/notify.js";
@@ -384,4 +385,144 @@ test("POST /conversations/supervisor/append on hosted-interface enforces quiet h
   assert.equal(p2.deferred, true);
   assert.equal(p2.reason, "awaiting_owner_reply");
   assert.equal(p2.proactiveGuarded, true);
+});
+
+test("Codex P1: answering a check-in via Needs You card (or resolving its referenced decisionKeys) clears awaiting_owner_reply without a chat message", async (t) => {
+  const dir = makeTmpDir(t, "card-ack-clear-");
+  let nowMs = Date.parse("2026-11-25T17:00:00.000Z"); // 09:00 PST
+  const store = new InMemoryAgentStore();
+  store.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const runtime = {
+    events: { emit() {} },
+    agentHost: { store },
+    budget: { timeZone: "America/Los_Angeles" }
+  };
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    runtime,
+    config: { enabled: true, mode: "auto", proactiveSupervisorChat: true },
+    deps: {
+      now: () => nowMs,
+      judgeProactiveUpdate: async ({ candidateText }) => ({ send: true, message: candidateText })
+    }
+  });
+  const hubGuard = createHubProactiveGuard({
+    getPreferences: () => sup.store.preferences(),
+    getRecentMessages: () => store.getSession("devices:supervisor:main")?.messages ?? [],
+    getLastPostedAtMs: () => latestProactiveMessageAtMs(store.getSession("devices:supervisor:main")?.messages ?? [], { nowMs }),
+    getLastOwnerAckAtMs: () => Date.parse(sup.store.lastOwnerAckAt() ?? "") || 0,
+    getResolvedDecisionKeys: () => sup.store.resolvedDecisionKeys(),
+    getMaxUnansweredProactive: () => 1,
+    judgeProactiveUpdate: async ({ candidateText }) => ({ send: true, message: candidateText }),
+    now: () => nowMs
+  });
+  runtime.hubProactiveGuard = hubGuard;
+
+  // 1. First question is surfaced via proactive check-in (no user message in chat).
+  const q1 = sup.store.upsertQuestion({
+    dedupeKey: "ready:acme/app#701",
+    kind: "ready",
+    mergeAsk: true,
+    threadKey: "paseo:srv_local.a1",
+    prRef: "acme/app#701",
+    title: "PR #701 ready to merge?",
+    options: ["Merge", "skip"],
+    contextSnapshot: { threadTitle: "PR #701", recentMessages: [{ role: "user", text: "Ship #701" }, { role: "assistant", text: "CI green on #701. Merge or skip?" }] }
+  });
+  const first = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(first.posted, true);
+  assert.equal(countUnansweredProactiveMessages(store.getSession("devices:supervisor:main").messages), 1);
+
+  // 2. While q1 is unanswered, a second unrelated decision 1h later is deferred by awaiting_owner_reply.
+  nowMs += 60 * 60_000;
+  sup.store.upsertQuestion({
+    dedupeKey: "ready:acme/app#702",
+    kind: "ready",
+    mergeAsk: true,
+    threadKey: "paseo:srv_local.a2",
+    prRef: "acme/app#702",
+    title: "PR #702 ready to merge?",
+    options: ["Merge", "skip"],
+    contextSnapshot: { threadTitle: "PR #702", recentMessages: [{ role: "user", text: "Ship #702" }, { role: "assistant", text: "CI green on #702. Merge or skip?" }] }
+  });
+  const blocked = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(blocked.posted, false);
+  assert.equal(blocked.deferred, true);
+  assert.equal(blocked.reason, "awaiting_owner_reply");
+
+  // 3. Owner answers q1 through Needs You card (FleetSupervisor.answerQuestion) with NO chat message!
+  nowMs += 60_000;
+  await sup.answerQuestion(q1.id, "skip");
+  assert.ok(sup.store.lastOwnerAckAt(), "card answer records owner ack timestamp");
+  assert.ok(sup.store.resolvedDecisionKeys().has("ready:acme/app#701"), "resolved decision key tracked");
+  assert.equal(sup.getState().lastOwnerAckAt, sup.store.lastOwnerAckAt(), "getState exposes lastOwnerAckAt for RemoteFleetSupervisor");
+
+  // 4. Now unrelated PR #702 announces cleanly without needing a separate chat message!
+  const unblocked = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(unblocked.posted, true);
+  assert.equal(store.getSession("devices:supervisor:main").messages.length, 2);
+
+  // 5. Even without an ownerAck timestamp, if every referenced decisionKey is resolved in FleetStore, cap clears!
+  const syntheticMsgs = [{
+    id: "m_synth",
+    role: "assistant",
+    content: "PR #701 is ready.",
+    createdAt: new Date(nowMs + 10_000).toISOString(),
+    metadata: { proactive: true, proactiveMeta: { kind: "proactive_supervisor_delta", decisionKeys: ["ready:acme/app#701"] } }
+  }];
+  assert.equal(countUnansweredProactiveMessages(syntheticMsgs, { resolvedDecisionKeys: new Set(["ready:acme/app#701"]) }), 0);
+  assert.equal(countUnansweredProactiveMessages(syntheticMsgs, { resolvedDecisionKeys: new Set(["ready:acme/app#999"]) }), 1);
+});
+
+test("Codex P2: paired UTC worker defers quiet hours to authoritative owner-timezone hub instead of blocking afternoon check-ins", async (t) => {
+  const dir = makeTmpDir(t, "paired-utc-worker-");
+  writeNodeConfig({
+    remote: "http://100.64.0.9:43210",
+    token: null,
+    nodeToken: "node_tok",
+    ownerProxyToken: "proxy_tok",
+    nodeEnrollmentConfirmed: true
+  }, dir);
+  // 2026-11-25T22:30:00Z = 22:30 UTC (quiet in UTC!) = 14:30 PST (awake in America/Los_Angeles!)
+  const utcQuietButPstAfternoon = Date.parse("2026-11-25T22:30:00.000Z");
+  const hubCalls = [];
+  const sup = new FleetSupervisor({
+    dataDir: dir,
+    runtime: { events: { emit() {} }, budget: { timeZone: "UTC" } },
+    config: { enabled: true, mode: "auto", proactiveSupervisorChat: true },
+    deps: {
+      now: () => utcQuietButPstAfternoon,
+      supervisorChatFetch: async (url, init) => {
+        hubCalls.push({ url, body: JSON.parse(init.body) });
+        return { ok: true, status: 200, async json() { return { ok: true, appended: [{ id: "m1" }], proactiveGuarded: true }; } };
+      }
+    }
+  });
+  // Live paired worker daemon: timer is active, budget TZ is UTC, no explicit local quiet hours.
+  sup.timer = {};
+  const th = {
+    key: "paseo:srv_local.pm1",
+    kind: "paseo",
+    title: "Afternoon PR #810",
+    agentStatus: "idle",
+    lastAgentText: "CI green on PR #810. Ready to merge?",
+    prRefs: ["acme/app#810"],
+    meta: { serverId: "srv_local", isLocalHost: true }
+  };
+  sup.lastThreads.set(th.key, th);
+  sup.store.upsertQuestion({
+    dedupeKey: "ready:acme/app#810",
+    kind: "ready",
+    mergeAsk: true,
+    threadKey: th.key,
+    prRef: "acme/app#810",
+    title: "PR #810 ready to merge?",
+    options: ["Merge", "Hold"],
+    contextSnapshot: { threadTitle: "Afternoon PR #810", recentMessages: [{ role: "user", text: "Finish PR #810" }, { role: "assistant", text: th.lastAgentText }] }
+  });
+
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: utcQuietButPstAfternoon });
+  assert.equal(res.posted, true, "paired UTC worker must forward to hub at 14:30 PST instead of blocking locally on UTC 22:30");
+  assert.equal(hubCalls.length, 1);
+  assert.deepEqual(hubCalls[0].body.messages[0].proactiveMeta.decisionKinds, ["ready"]);
 });

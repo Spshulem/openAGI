@@ -1348,7 +1348,7 @@ export class FleetSupervisor {
       total: this.precedentMemory.list().length,
       recentApplications: this.precedentMemory.applications(5)
     };
-    return { ...baseState, ...deck, watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
+    return { ...baseState, ...deck, lastOwnerAckAt: store.lastOwnerAckAt(), watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
   }
 
     buildWatchdogSummary(snapshot) {
@@ -1663,11 +1663,17 @@ export class FleetSupervisor {
     return saved;
   }
 
+  recordOwnerActivity(at = this.now()) {
+    try { this.store.recordOwnerAck(at); } catch { /* best-effort */ }
+    try { this.runtime?.hubProactiveGuard?.noteOwnerActivity?.(at); } catch { /* best-effort */ }
+  }
+
   dismissQuestion(id) {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
     if (question.kind === "suggestion") {
       this.respondSuggestion(question.meta?.suggestionId, "Not now").catch(() => {});
+      this.recordOwnerActivity();
       this.emitFleet("question-dismissed");
       return this.store.question(id);
     }
@@ -1676,6 +1682,7 @@ export class FleetSupervisor {
     if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
       this.resolveOutreach(question, "Later", "acted");
       const closed = this.store.answerQuestion(id, "Later");
+      this.recordOwnerActivity();
       this.emitFleet("question-dismissed");
       return closed;
     }
@@ -1689,6 +1696,7 @@ export class FleetSupervisor {
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     const dismissed = this.store.dismissQuestion(id);
+    this.recordOwnerActivity();
     this.emitFleet("question-dismissed");
     return dismissed;
   }
@@ -2377,6 +2385,7 @@ export class FleetSupervisor {
         if (sent.queued) {
           this.resolveOutreach(question, answer, "acted");
           this.applyOverride(question, answer);
+          this.recordOwnerActivity();
           return { question: sent.queued, delivery: sent.delivery };
         }
         delivery = sent.delivery;
@@ -2397,6 +2406,7 @@ export class FleetSupervisor {
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
+      this.recordOwnerActivity();
       this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "answer", question, answer, now: this.now() }));
       try {
         this.precedentMemory.recordOwnerDecision({
@@ -2511,12 +2521,14 @@ export class FleetSupervisor {
       // thread must not mute it).
       if (sent.queued) {
         this.resolveOutreach(question, "reply", "acted");
+        this.recordOwnerActivity();
         return { question: sent.queued, delivery: sent.delivery };
       }
       if (sent.delivery.status !== "sent") {
         return { question: this.store.question(id), delivery: sent.delivery };
       }
       const answered = this.store.answerQuestion(id, text);
+      this.recordOwnerActivity();
       try {
         this.precedentMemory.recordOwnerDecision({
           question,
@@ -3504,11 +3516,16 @@ export class FleetSupervisor {
   async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
+    const nodeConfig = this.dataDir ? readNodeConfig(this.dataDir) : null;
+    const remoteHubManaged = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
     const explicitQuietConfig = this.proactiveQuietHoursExplicit
       || this.config?.notify?.quietHours !== undefined
       || this.config?.proactiveRespectQuietHours === true;
+    // Paired worker nodes (e.g. a UTC Linux worker forwarding to a hub in the
+    // owner's timezone) defer quiet-hours enforcement to the hub's authoritative
+    // hubProactiveGuard unless quiet hours were explicitly configured locally.
     const enforceQuietHours = this.proactiveRespectQuietHours !== false
-      && (Boolean(this.timer) || explicitQuietConfig)
+      && (explicitQuietConfig || (Boolean(this.timer) && !remoteHubManaged))
       && String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() !== "off";
     if (enforceQuietHours) {
       const quiet = this.proactiveQuietHours ?? this.config?.notify?.quietHours ?? this.config?.limits?.quietHours ?? DEFAULTS.quietHours;
@@ -4591,6 +4608,7 @@ export class FleetSupervisor {
           this.store.resolveQuestion(question.id, `merged ${prRef}`);
         }
         this.resolveOutreach(question, "merged", "acted");
+        this.recordOwnerActivity();
         this.store.recordAction({
           kind: "pr-merge",
           playbook: effectiveOp === "merge_and_deploy" ? "owner-merge-deploy" : "owner-merge",
@@ -4710,6 +4728,7 @@ export class FleetSupervisor {
       if (deliveredOk) {
         this.store.answerQuestion(question.id, replyText);
         this.resolveOutreach(question, "reply", "acted");
+        this.recordOwnerActivity();
         this.emitFleet("card-replied");
       }
       return {

@@ -293,6 +293,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
       latestProactiveMessageAtMs(getSupervisorChatMessages(), { nowMs: proactiveNow() })
     ),
+    getLastOwnerAckAtMs: () => Math.max(
+      Number(runtime.fleetSupervisor?.lastOwnerAckAtMs) || 0,
+      Date.parse(runtime.fleetSupervisor?.state?.lastOwnerAckAt ?? "") || 0,
+      Date.parse(runtime.fleetSupervisor?.store?.lastOwnerAckAt?.() ?? "") || 0
+    ),
+    getResolvedDecisionKeys: () => runtime.fleetSupervisor?.store?.resolvedDecisionKeys?.() ?? null,
     getQuietHours: () => {
       if (options.proactiveQuietHours !== undefined) return options.proactiveQuietHours;
       if (String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() === "off") return null;
@@ -3704,6 +3710,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (applied?.pendingAction) {
             queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
           }
+          hubProactiveGuard.noteOwnerActivity(proactiveNow());
           if (applied?.nonResolving) return sendJson(res, 200, { item: runtime.outreach.get(id), plan: applied.plan, nonResolving: true });
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });

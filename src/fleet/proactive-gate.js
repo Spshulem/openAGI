@@ -53,14 +53,26 @@ export function latestProactiveMessageAtMs(messages = [], { nowMs = Date.now() }
   return latest;
 }
 
-export function countUnansweredProactiveMessages(messages = []) {
+export function countUnansweredProactiveMessages(messages = [], { lastOwnerAckAtMs = 0, resolvedDecisionKeys = null } = {}) {
   if (!Array.isArray(messages) || !messages.length) return 0;
+  const ackMs = Number.isFinite(Number(lastOwnerAckAtMs)) && Number(lastOwnerAckAtMs) > 0 ? Number(lastOwnerAckAtMs) : 0;
+  const resolvedSet = resolvedDecisionKeys instanceof Set ? resolvedDecisionKeys : null;
   let count = 0;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const m = messages[i];
     if (!m || typeof m !== "object") continue;
     if (m.role === "user") break;
-    if (isProactiveCheckinMessage(m)) count += 1;
+    if (ackMs > 0) {
+      const ts = Date.parse(String(m.createdAt ?? m.at ?? m.timestamp ?? ""));
+      if (Number.isFinite(ts) && ts <= ackMs) break;
+    }
+    if (isProactiveCheckinMessage(m)) {
+      const dKeys = m.metadata?.proactiveMeta?.decisionKeys ?? m.proactiveMeta?.decisionKeys;
+      if (resolvedSet && Array.isArray(dKeys) && dKeys.length > 0 && dKeys.every((k) => resolvedSet.has(k))) {
+        continue;
+      }
+      count += 1;
+    }
   }
   return count;
 }
@@ -327,6 +339,8 @@ export function createHubProactiveGuard({
   getModelProvider = () => null,
   judgeProactiveUpdate = null,
   getLastPostedAtMs = null,
+  getLastOwnerAckAtMs = null,
+  getResolvedDecisionKeys = null,
   getQuietHours = null,
   getTimeZone = null,
   getMaxUnansweredProactive = null,
@@ -335,6 +349,7 @@ export function createHubProactiveGuard({
   now = () => Date.now()
 } = {}) {
   let lastPostedAtMs = 0;
+  let lastOwnerAckAtMs = 0;
   let lastReviewFailureAtMs = 0;
   let evalChain = Promise.resolve();
   const recentFingerprints = new Map();
@@ -404,11 +419,18 @@ export function createHubProactiveGuard({
     const recentMessages = getRecentMessages?.() ?? [];
 
     // Stop dripping check-ins when prior proactive check-in(s) are still
-    // unanswered by the owner (e.g. overnight or while away).
+    // unanswered by the owner (e.g. overnight or while away). Answering a
+    // Needs You card or resolving every referenced decision clears the cap.
     if (!bypassCooldown && typeof getMaxUnansweredProactive === "function") {
       const cap = Number(getMaxUnansweredProactive(prefs));
       if (Number.isFinite(cap) && cap > 0) {
-        const unanswered = countUnansweredProactiveMessages(recentMessages);
+        const externalAckMs = Number(getLastOwnerAckAtMs?.()) || 0;
+        const effectiveAckMs = Math.max(lastOwnerAckAtMs, externalAckMs);
+        const resolvedDecisionKeys = typeof getResolvedDecisionKeys === "function" ? getResolvedDecisionKeys() : null;
+        const unanswered = countUnansweredProactiveMessages(recentMessages, {
+          lastOwnerAckAtMs: effectiveAckMs,
+          resolvedDecisionKeys
+        });
         if (unanswered >= cap) {
           return { send: false, deferred: true, reason: "awaiting_owner_reply" };
         }
@@ -506,8 +528,16 @@ export function createHubProactiveGuard({
       evalChain = next.catch(() => {});
       return next;
     },
+    noteOwnerActivity(atMs = now()) {
+      const ts = Number(atMs);
+      if (Number.isFinite(ts) && ts > lastOwnerAckAtMs) {
+        lastOwnerAckAtMs = ts;
+      }
+      return lastOwnerAckAtMs;
+    },
     reset() {
       lastPostedAtMs = 0;
+      lastOwnerAckAtMs = 0;
       lastReviewFailureAtMs = 0;
       recentFingerprints.clear();
       recentDecisionTokens.clear();
