@@ -636,3 +636,37 @@ test("recovered chat that is busy mid-turn keeps held handoff waiting until idle
   await f.supervisor.tick({ reason: "test" });
   assert.equal(f.supervisor.handoffs.get("act_busy_res").status, "delivered");
 });
+
+// Review fix (#361, Codex P2 round 3): restart reconciliation requires matching
+// attachment identity (imagesHash) in both journal actions and Paseo receipts.
+test("restart recovery does not settle an image handoff from a receipt with different or missing attachments", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  const imgA = [{ mimeType: "image/png", data: Buffer.from("shot-A").toString("base64") }];
+  const imgB = [{ mimeType: "image/png", data: Buffer.from("shot-B").toString("base64") }];
+  await f.supervisor.sendOwnerMessage(KEY, "Please inspect this.", { idempotencyKey: "act_img_rec", images: imgB });
+  const started = new Date(f.now.value + MIN).toISOString();
+  f.supervisor.handoffs.update("act_img_rec", { dispatchingAt: started });
+  const hash = shortHash(`${SUPERVISOR_PREFIX} Please inspect this.`);
+  // Earlier text-only journal receipt for the same text must not settle imgB.
+  f.supervisor.store.recordAction({
+    threadKey: KEY, playbook: "owner-message", route: "paseo-send", status: "sent",
+    messageHash: hash, detail: "sent without image", at: new Date(f.now.value + MIN + 1000).toISOString()
+  });
+  // Paseo receipt with imgA must not settle imgB either.
+  const { paseoImagesHash } = await import("../src/fleet/paseo-delivery.js");
+  const receiptDir = path.join(f.dir, "fleet", "paseo-deliveries");
+  fs.mkdirSync(receiptDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(receiptDir, `${createHash("sha256").update(KEY).digest("hex")}.json`),
+    JSON.stringify({ messageId: "m-imgA", messageHash: hash, imagesHash: paseoImagesHash(imgA), pending: false })
+  );
+  assert.equal(f.supervisor.reconcileHandoffDispatch(f.supervisor.handoffs.get("act_img_rec")), null);
+  // Once a receipt with imgB's matching imagesHash is written, it reconciles cleanly.
+  f.supervisor.store.recordAction({
+    threadKey: KEY, playbook: "owner-message", route: "paseo-send", status: "sent",
+    messageHash: hash, imagesHash: paseoImagesHash(imgB), detail: "sent with imgB", at: new Date(f.now.value + MIN + 2000).toISOString()
+  });
+  const matched = f.supervisor.reconcileHandoffDispatch(f.supervisor.handoffs.get("act_img_rec"));
+  assert.equal(matched?.status, "delivered");
+});

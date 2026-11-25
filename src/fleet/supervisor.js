@@ -42,7 +42,7 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
-import { failoverPaseoSessionProvider, titlesMatchForFailover } from "./paseo-delivery.js";
+import { failoverPaseoSessionProvider, paseoImagesHash, titlesMatchForFailover } from "./paseo-delivery.js";
 import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import { OwnerPrecedentStore } from "./precedent-memory.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -2887,22 +2887,27 @@ export class FleetSupervisor {
   // sent, so it is safe to send.
   reconcileHandoffDispatch(entry) {
     const hash = shortHash(String(entry.message ?? "").trim().startsWith(SUPERVISOR_PREFIX) ? String(entry.message).trim() : `${SUPERVISOR_PREFIX} ${String(entry.message ?? "").trim()}`);
+    const entryImagesHash = paseoImagesHash(entry.images);
     const since = (Date.parse(entry.dispatchingAt) || 0) - 5_000;
-    const journaled = this.store.actions(200).find((action) => action.threadKey === entry.threadKey && action.messageHash === hash
-      && (Date.parse(action.at ?? "") || 0) >= since && ["sent", "blocked"].includes(action.status));
+    const journaled = this.store.actions(200).find((action) => action.threadKey === entry.threadKey
+      && action.messageHash === hash
+      && (action.imagesHash ?? null) === entryImagesHash
+      && (Date.parse(action.at ?? "") || 0) >= since
+      && ["sent", "blocked"].includes(action.status));
     if (journaled?.status === "sent") {
       return { status: "delivered", deliveredAt: journaled.at, deliveredActionId: journaled.id ?? null, detail: "delivered before a restart (journal receipt); not sent again" };
     }
     // The chat's Paseo receipt counts only if it was written for this
     // dispatch (at or after it started): an older receipt for the same text
-    // is a different send. A settled receipt only proves delivery when it
-    // carries explicit success evidence (not a sendError/executionError write).
+    // (or different attachments) is a different send. A settled receipt only
+    // proves delivery when it carries explicit success evidence (not a
+    // sendError/executionError write).
     let receipt = null;
     try {
       const file = path.join(this.dataDir, "fleet", "paseo-deliveries", `${createHash("sha256").update(entry.threadKey).digest("hex")}.json`);
       if (fs.statSync(file).mtimeMs >= since) receipt = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch { receipt = null; }
-    if (receipt?.messageHash === hash) {
+    if (receipt?.messageHash === hash && (receipt.imagesHash ?? null) === entryImagesHash) {
       if (receipt.pending) {
         return { status: "unconfirmed", detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" };
       }

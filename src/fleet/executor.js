@@ -4,7 +4,7 @@
 // thread, see ui-delivery.js), and agentapi send-message for Antigravity. This is the only fleet unit that writes to
 // other processes, so it re-checks every precondition instead of trusting policy.
 
-import { deliverPaseo } from "./paseo-delivery.js";
+import { deliverPaseo, paseoImagesHash } from "./paseo-delivery.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -761,7 +761,8 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     if (step.blocked) return blocked(step.blocked);
     if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
-    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(fallbackFrom ? { fallbackFrom } : {}) };
+    const imagesHash = step.paseo ? paseoImagesHash(images) : null;
+    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(imagesHash ? { imagesHash } : {}), ...(fallbackFrom ? { fallbackFrom } : {}) };
     if (step.paseo) {
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);

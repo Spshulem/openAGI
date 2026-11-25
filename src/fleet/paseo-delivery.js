@@ -842,6 +842,15 @@ export function isPermanentlyDisconnectedRuntimeError(raw) {
   return PERMANENT_DISCONNECT_ERROR_RE.test(text);
 }
 
+// Part of what makes two sends the same: the same words with different
+// attachments are a different message.
+export function paseoImagesHash(images) {
+  const normalizedImages = normalizePaseoImages(images);
+  return normalizedImages.length
+    ? createHash("sha256").update(normalizedImages.map((image) => `${image?.mediaType ?? image?.mimeType ?? ""}:${image?.data ?? image?.url ?? ""}`).join("\n")).digest("hex").slice(0, 16)
+    : null;
+}
+
 // noPermissionReply: this text was approved before any prompt now open in
 // the chat existed (a held handoff resuming), so it must never be read as an
 // answer to one: with a prompt open it is refused before anything is sent,
@@ -864,11 +873,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const heldUntil = ownerInitiated ? null : limitHeld(thread);
   if (heldUntil) return blocked(`Provider ${thread.error.kind} until ${heldUntil}; Supervisor resumes after the reset`);
   const normalizedImages = normalizePaseoImages(images);
-  // Part of what makes two sends the same: the same words with different
-  // attachments are a different message.
-  const imagesHash = normalizedImages.length
-    ? createHash("sha256").update(normalizedImages.map((image) => `${image?.mediaType ?? image?.mimeType ?? ""}:${image?.data ?? image?.url ?? ""}`).join("\n")).digest("hex").slice(0, 16)
-    : null;
+  const imagesHash = paseoImagesHash(normalizedImages);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
     : Boolean(thread?.excluded);
