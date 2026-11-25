@@ -302,9 +302,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     getQuietHours: () => {
       if (options.proactiveQuietHours !== undefined) return options.proactiveQuietHours;
       if (String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() === "off") return null;
-      return runtime.outreachConfig?.quietHours ?? FLEET_DEFAULTS.quietHours;
+      const sup = runtime.fleetSupervisor;
+      if (sup?.proactiveRespectQuietHours === false || sup?.config?.proactiveRespectQuietHours === false) return null;
+      const supQuiet = sup?.proactiveQuietHours ?? sup?.config?.notify?.quietHours;
+      if (supQuiet !== undefined && supQuiet !== null) return supQuiet;
+      return runtime.outreachConfig?.quietHours ?? sup?.config?.limits?.quietHours ?? FLEET_DEFAULTS.quietHours;
     },
-    getTimeZone: () => options.proactiveTimeZone ?? resolveQuietTimeZone(runtime, null),
+    getTimeZone: () => options.proactiveTimeZone
+      ?? runtime.fleetSupervisor?.proactiveTimeZone
+      ?? resolveQuietTimeZone(runtime, runtime.fleetSupervisor?.config ?? null),
     getMaxUnansweredProactive: (prefs) => {
       if (options.maxUnansweredProactive !== undefined) return options.maxUnansweredProactive;
       return prefs?.cadence === "detailed" ? 2 : 1;

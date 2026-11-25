@@ -526,3 +526,95 @@ test("Codex P2: paired UTC worker defers quiet hours to authoritative owner-time
   assert.equal(hubCalls.length, 1);
   assert.deepEqual(hubCalls[0].body.messages[0].proactiveMeta.decisionKinds, ["ready"]);
 });
+
+test("Codex round-2 P2: hosted-interface hubProactiveGuard honors local FleetSupervisor custom quietHours and proactiveRespectQuietHours=false", async (t) => {
+  // 1. Custom notify.quietHours { start: 0, end: 6 } in America/Los_Angeles allows 07:00 PST (which default 22-8 would block)
+  //    while still deferring 02:00 PST inside 00:00-06:00.
+  const dataDir1 = makeTmpDir(t, "hosted-custom-quiet-");
+  const runtime1 = createDurableRuntime({ dataDir: dataDir1 });
+  const store1 = new InMemoryAgentStore();
+  store1.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  let now1 = Date.parse("2026-11-25T10:00:00.000Z"); // 02:00 PST
+  runtime1.agentHost = {
+    store: store1,
+    modelProvider: {
+      name: "openai",
+      isConfigured: () => true,
+      async generate() { return { text: JSON.stringify({ send: true, reason: "ok", message: "PR #910 is green and ready to merge." }) }; }
+    },
+    handleMessage: async () => ({ reply: "ok", session: { id: "devices:supervisor:main" } })
+  };
+  const sup1 = new FleetSupervisor({
+    dataDir: dataDir1,
+    runtime: runtime1,
+    config: {
+      enabled: false,
+      mode: "auto",
+      proactiveSupervisorChat: true,
+      notify: { quietHours: { start: 0, end: 6 }, timeZone: "America/Los_Angeles" }
+    },
+    deps: { now: () => now1 }
+  });
+  runtime1.fleetSupervisor = sup1;
+  const app1 = createHostedInterface(runtime1, { dataDir: dataDir1, port: 0, authToken: "", proactiveNow: () => now1 });
+  t.after(async () => { await app1.close(); await runtime1.observations?.close?.(); });
+  await app1.listen();
+
+  const r1Quiet = await sup1.postSupervisorChatUpdate("**Supervisor check-in: one decision needs you.**\nPR #910", {
+    dedupeKey: "custom-q",
+    metadata: { kind: "proactive_supervisor_delta", decisionKeys: ["ready:r#910"], decisionKinds: ["ready"] }
+  });
+  assert.equal(r1Quiet.posted, false);
+  assert.equal(r1Quiet.deferred, true);
+  assert.equal(r1Quiet.reason, "quiet_hours");
+
+  now1 = Date.parse("2026-11-25T15:00:00.000Z"); // 07:00 PST (outside 00-06, inside default 22-08)
+  const r1 = await sup1.postSupervisorChatUpdate("**Supervisor check-in: one decision needs you.**\nPR #910", {
+    dedupeKey: "custom-q",
+    metadata: { kind: "proactive_supervisor_delta", decisionKeys: ["ready:r#910"], decisionKinds: ["ready"] }
+  });
+  assert.equal(r1.posted, true, "07:00 PST must pass custom 00:00-06:00 quiet hours instead of being blocked by default 22:00-08:00");
+
+  // 2. Explicit proactiveRespectQuietHours: false disables quiet hours on hubProactiveGuard too.
+  const dataDir2 = makeTmpDir(t, "hosted-no-quiet-");
+  const runtime2 = createDurableRuntime({ dataDir: dataDir2 });
+  const store2 = new InMemoryAgentStore();
+  store2.saveSession({ id: "devices:supervisor:main", messages: [], metadata: {} });
+  const pst2am = Date.parse("2026-11-25T10:00:00.000Z"); // 02:00 PST
+  runtime2.agentHost = {
+    store: store2,
+    modelProvider: {
+      name: "openai",
+      isConfigured: () => true,
+      async generate() { return { text: JSON.stringify({ send: true, reason: "ok", message: "PR #911 is green and ready to merge." }) }; }
+    },
+    handleMessage: async () => ({ reply: "ok", session: { id: "devices:supervisor:main" } })
+  };
+  const sup2 = new FleetSupervisor({
+    dataDir: dataDir2,
+    runtime: runtime2,
+    config: {
+      enabled: false,
+      mode: "auto",
+      proactiveSupervisorChat: true,
+      proactiveRespectQuietHours: false
+    },
+    deps: { now: () => pst2am }
+  });
+  runtime2.fleetSupervisor = sup2;
+  const app2 = createHostedInterface(runtime2, {
+    dataDir: dataDir2,
+    port: 0,
+    authToken: "",
+    proactiveTimeZone: "America/Los_Angeles",
+    proactiveNow: () => pst2am
+  });
+  t.after(async () => { await app2.close(); await runtime2.observations?.close?.(); });
+  await app2.listen();
+
+  const r2 = await sup2.postSupervisorChatUpdate("**Supervisor check-in: one decision needs you.**\nPR #911", {
+    dedupeKey: "no-q",
+    metadata: { kind: "proactive_supervisor_delta", decisionKeys: ["ready:r#911"], decisionKinds: ["ready"] }
+  });
+  assert.equal(r2.posted, true, "proactiveRespectQuietHours=false must disable quiet hours on hubProactiveGuard");
+});
