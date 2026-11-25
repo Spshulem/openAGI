@@ -81,7 +81,9 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
         Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + (body["requestId"].map { " #\($0)" } ?? "")
                         + ((body["next"] as? Bool) == true ? " NEXT" : ""))
         if path == "/conversations/supervisor/messages" {
-            return respond(200, Self.hideQueueInHistory ? ["messages": []] : ["messages": [], "queue": Self.queueJSON()])
+            var history: [String: Any] = ["messages": [Any]()]
+            if !Self.hideQueueInHistory { history["queue"] = Self.queueJSON() }
+            return respond(200, history)
         }
         if path == "/conversations/supervisor/queue", method == "POST" {
             if Self.offlineEnqueue {
