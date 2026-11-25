@@ -91,4 +91,24 @@ final class FleetNeedsYouMacTests: XCTestCase {
     let older = FleetCardBrief(id: "q1", whatChanged: "Rebased on main.")
     XCTAssertEqual(state.questions[0].needsYouDigest(card: older).sections(.state).first?.text, "Rebased on main.")
   }
+
+  func testDockMenuAndBadgeCountOnlyActionableDecisions() throws {
+    FleetConsumer.shared.apply(try fixtureState())
+    // Leave the shared consumer as other tests expect it: no supervisor.
+    defer { FleetConsumer.shared.apply(try! JSONDecoder().decode(FleetState.self, from: Data("{}".utf8))) }
+    XCTAssertEqual(AppDelegate.needsYouWaitingCount, 12 + PendingApprovalConsumer.shared.items.count)
+  }
+
+  func testAThreadlessClarificationCanStillBeAnsweredInTheInspector() throws {
+    let state = try fixtureState()
+    let clarification = try XCTUnwrap(state.questions.first { $0.id == "ny-net30" })
+    XCTAssertTrue(clarification.isClarificationQuestion)
+    let threadless = try JSONDecoder().decode(FleetQuestion.self, from: Data("""
+      {"id":"s1","kind":"suggestion","title":"Clarify","options":["Answer question"],"canReply":false}
+      """.utf8))
+    XCTAssertNil(threadless.threadKey)
+    XCTAssertTrue(SupervisorThreadInspectorView.acceptsReply(threadless))
+    let fyi = try JSONDecoder().decode(FleetQuestion.self, from: Data(#"{"id":"f1","kind":"completed","canReply":false}"#.utf8))
+    XCTAssertFalse(SupervisorThreadInspectorView.acceptsReply(fyi))
+  }
 }

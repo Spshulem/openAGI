@@ -274,9 +274,16 @@ struct SupervisorThreadInspectorView: View {
       ?? resolvedDetail?.openChat
   }
 
+  /// A question the inspector's reply field can answer. A clarification is
+  /// answered here even without a linked thread: sendWorkspaceQuestionReply
+  /// routes it through answerClarification.
+  static func acceptsReply(_ q: FleetQuestion) -> Bool {
+    q.canReply || q.isClarificationQuestion
+  }
+
   private var canComposeReply: Bool {
     if let q = resolvedQuestion {
-      return q.canReply || (q.threadKey != nil && q.isClarificationQuestion)
+      return Self.acceptsReply(q)
     }
     return directThreadKey != nil
   }

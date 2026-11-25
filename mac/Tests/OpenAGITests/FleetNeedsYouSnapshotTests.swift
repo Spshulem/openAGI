@@ -28,6 +28,11 @@ final class FleetNeedsYouSnapshotTests: XCTestCase {
     FleetConsumer.shared.apply(state)
   }
 
+  override func tearDown() async throws {
+    // Leave the shared consumer as other tests expect it: no supervisor.
+    FleetConsumer.shared.apply(try JSONDecoder().decode(FleetState.self, from: Data("{}".utf8)))
+  }
+
   func testRenderNeedsYouList() throws {
     for (name, appearance) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
       let nav = SupervisorWorkspaceNavigation()

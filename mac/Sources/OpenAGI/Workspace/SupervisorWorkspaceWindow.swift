@@ -1155,7 +1155,7 @@ struct SupervisorWorkspaceView: View {
           Text("\(waitingTotal) item\(waitingTotal == 1 ? "" : "s") need your input")
             .font(WorkspaceTheme.Typography.secondary.weight(.semibold))
             .foregroundStyle(WorkspaceTheme.ink)
-          Text("\(fleet.questions.count) decisions · \(approvals.items.count) tool approvals · \(supervisor.tasks.count) tasks")
+          Text("\(decisionItems.count) decisions · \(approvals.items.count) tool approvals · \(supervisor.tasks.count) tasks")
             .font(WorkspaceTheme.Typography.caption)
             .foregroundStyle(WorkspaceTheme.muted)
         }
