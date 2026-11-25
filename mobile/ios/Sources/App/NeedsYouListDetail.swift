@@ -61,6 +61,13 @@ extension SupervisorNeedsYouBadge.Tone {
 struct NeedsYouActions: Equatable {
     let decisions: [SupervisorCardAction]
     let canReply: Bool
+    /// "Answer question": the answer is typed, in the Supervisor chat, so
+    /// replying there is the decision. It is never sent as an answer.
+    let answersInChat: Bool
+    /// "Review plan" on a suggestion with a plan: reveals the plan here. It
+    /// is not an answer (the hub keeps the question open, and sending it
+    /// would hide the card without showing the plan).
+    let reviewsPlan: Bool
     let dismiss: SupervisorCardAction
 
     init(card: SupervisorCard) {
@@ -70,6 +77,8 @@ struct NeedsYouActions: Equatable {
         let isExplicitAction = ["merge_ready", "pr_ready", "ci_failed", "preference"].contains(card.kind ?? "")
             || ["merge", "fix_ci", "preference", "set_preference"].contains(op ?? "")
         let dismissAction = SupervisorCardAction(op: "dismiss", label: "Dismiss", value: "dismiss")
+        var answersInChat = false
+        var reviewsPlan = false
 
         if isCompletion {
             decisions = []
@@ -86,20 +95,35 @@ struct NeedsYouActions: Equatable {
                 dismiss = dismissAction
             }
         } else {
-            let options = card.options
+            let localOptions = card.options.filter { option in
+                switch option.lowercased() {
+                case "answer question":
+                    answersInChat = true
+                    return false
+                case "review plan" where card.plan != nil:
+                    reviewsPlan = true
+                    return false
+                default:
+                    return true
+                }
+            }
+            let options = localOptions
                 .filter { !$0.isEmpty && $0.lowercased() != "open thread" && $0.lowercased() != "dismiss" }
                 .prefix(4)
                 .map { SupervisorCardAction(op: "answer", label: Self.capitalizedFirst($0), value: $0) }
             if !options.isEmpty {
                 decisions = Array(options)
-            } else if let primary = card.primaryAction, !primary.label.isEmpty, primary.op != "dismiss" {
+            } else if !answersInChat && !reviewsPlan,
+                      let primary = card.primaryAction, !primary.label.isEmpty, primary.op != "dismiss" {
                 decisions = [primary]
             } else {
                 decisions = []
             }
             dismiss = dismissAction
         }
-        canReply = card.canReply || hasThread
+        canReply = card.canReply || hasThread || answersInChat
+        self.answersInChat = answersInChat
+        self.reviewsPlan = reviewsPlan
     }
 
     private static func capitalizedFirst(_ text: String) -> String {
@@ -194,6 +218,8 @@ struct NeedsYouDetailView: View {
     let onReplyInChat: (SupervisorCard) -> Void
     let onOpenContext: (SupervisorCard) -> Void
 
+    @State private var showsPlan = false
+
     var body: some View {
         Group {
             if let card {
@@ -267,9 +293,19 @@ struct NeedsYouDetailView: View {
                     Button {
                         onReplyInChat(card)
                     } label: {
-                        Label("Reply in Supervisor chat", systemImage: "arrowshape.turn.up.left")
+                        Label(actions.answersInChat ? "Answer in Supervisor chat" : "Reply in Supervisor chat",
+                              systemImage: "arrowshape.turn.up.left")
+                            .fontWeight(actions.answersInChat && actions.decisions.isEmpty ? .semibold : .regular)
                     }
                     .accessibilityIdentifier("needs-you-reply")
+                }
+                if actions.reviewsPlan, let plan = card.plan {
+                    DisclosureGroup(isExpanded: $showsPlan) {
+                        planDetails(plan)
+                    } label: {
+                        Text("Review plan")
+                    }
+                    .accessibilityIdentifier("needs-you-review-plan")
                 }
                 Button {
                     onAct(card, actions.dismiss)
@@ -328,6 +364,28 @@ private struct DecisionTitle: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+extension NeedsYouDetailView {
+    @ViewBuilder
+    fileprivate func planDetails(_ plan: SupervisorSuggestionPlan) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let label = plan.label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+                Text(label)
+                    .font(.subheadline.weight(.semibold))
+            }
+            if let next = plan.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty {
+                Text(next)
+                    .font(.subheadline)
+            }
+            if let acceptance = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acceptance.isEmpty {
+                Text("Acceptance: \(acceptance)")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+        .textSelection(.enabled)
     }
 }
 

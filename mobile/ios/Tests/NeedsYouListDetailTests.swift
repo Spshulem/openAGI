@@ -84,4 +84,28 @@ final class NeedsYouListDetailTests: XCTestCase {
         let older = SupervisorCard(id: "o", headline: "Ship it?", brief: SupervisorCardBrief(whatChanged: "Rebased on main."))
         XCTAssertEqual(older.needsYouDigest.sections(.state).first?.text, "Rebased on main.")
     }
+
+    func testReviewPlanRevealsThePlanAndIsNeverSentAsAnAnswer() {
+        let plan = SupervisorSuggestionPlan(label: "Fix plan", nextAction: "Patch the parser", acceptance: "Tests pass")
+        let card = SupervisorCard(id: "s", kind: "suggestion", headline: "Parser keeps failing",
+                                  options: ["Fix it", "Review plan", "Not now", "Never"], plan: plan)
+        let actions = NeedsYouActions(card: card)
+        XCTAssertTrue(actions.reviewsPlan)
+        XCTAssertEqual(actions.decisions.map(\.label), ["Fix it", "Not now", "Never"])
+        XCTAssertFalse(actions.decisions.contains { $0.value == "Review plan" })
+        // Without a plan to show, the option is the agent's own answer.
+        let planless = SupervisorCard(id: "p", kind: "suggestion", headline: "H", options: ["Review plan"])
+        XCTAssertFalse(NeedsYouActions(card: planless).reviewsPlan)
+        XCTAssertEqual(NeedsYouActions(card: planless).decisions.map(\.value), ["Review plan"])
+    }
+
+    func testAnswerQuestionIsTypedInTheSupervisorChat() {
+        let card = SupervisorCard(id: "q", kind: "suggestion", headline: "Clarify net 30", canReply: false,
+                                  options: ["Answer question"],
+                                  primaryAction: SupervisorCardAction(op: "answer", label: "Answer question", value: "Answer question"))
+        let actions = NeedsYouActions(card: card)
+        XCTAssertTrue(actions.answersInChat)
+        XCTAssertTrue(actions.canReply)
+        XCTAssertTrue(actions.decisions.isEmpty, "never sent as an answer without the typed reply")
+    }
 }
