@@ -202,6 +202,8 @@ struct ChatConversationView: View {
     @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
     @FocusState private var queuedEditFocused: Bool
+    // Observed so the composer's busy line follows Settings at once.
+    @AppStorage(BusySendBehavior.defaultsKey) private var busySendPreference = BusySendBehavior.default.rawValue
     @Environment(\.layoutDirection) private var layoutDirection
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -677,6 +679,7 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chat-attachment-error")
             }
             if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
+            if conversation.isBusy && canSend { busySendChoice }
             composerBar
             }
         }
@@ -811,6 +814,13 @@ struct ChatConversationView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.muted)
                 .accessibilityAddTraits(.isHeader)
+            if let running = conversation.hubRunning, running.mine != true {
+                Text("Running now from \(running.source?.name ?? "another device"): \(running.text)")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .accessibilityIdentifier("chat-queue-running")
+            }
             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                 if conversation.editingQueuedID == item.id {
                     queuedEditor(item)
@@ -854,7 +864,7 @@ struct ChatConversationView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.live)
                 .buttonStyle(.plain)
-                .disabled(conversation.editingQueuedID != nil)
+                .disabled(conversation.editingQueuedID != nil || item.origin?.heldBy != nil)
                 .accessibilityLabel("Edit queued message")
                 .accessibilityIdentifier("chat-queued-edit")
                 Button {
@@ -876,8 +886,31 @@ struct ChatConversationView: View {
                         .foregroundStyle(Theme.muted)
                 }
                 .buttonStyle(.plain)
+                .disabled(item.origin?.heldBy != nil)
                 .accessibilityLabel("Remove queued message")
                 .accessibilityIdentifier("chat-queued-remove")
+            }
+            if let origin = item.origin {
+                // Where this message is on the hub's shared queue.
+                let notes = [
+                    origin.mine ? nil : "From \(origin.sourceName ?? "another device")",
+                    origin.heldBy.map { "Being edited on \($0)" },
+                    origin.pendingUpload && origin.error == nil
+                        ? (origin.uploadAttempted ? "Checking whether main got this; Edit opens once it answers" : "Not on main yet; sends when connected") : nil
+                ].compactMap { $0 }
+                if !notes.isEmpty {
+                    Text(notes.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .accessibilityIdentifier("chat-queued-origin")
+                }
+                if let error = origin.error {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.caution)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("chat-queued-error")
+                }
             }
             if let state = item.sendNow {
                 Text(state.label)
@@ -1049,8 +1082,31 @@ struct ChatConversationView: View {
             .accessibilityIdentifier("chat-composer")
     }
 
+    // While a reply runs: what Send will do (the Settings preference) and the
+    // other choice for this one message.
+    private var busySendChoice: some View {
+        let preference = BusySendBehavior(rawValue: busySendPreference) ?? .default
+        return HStack(spacing: 8) {
+            Text(preference == .queue ? "A reply is running. Send queues this." : "A reply is running. Send stops it and sends this next.")
+                .font(.caption2)
+                .foregroundStyle(Theme.muted)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(preference.other == .sendNow ? "Send anyway" : "Queue instead") {
+                sendDraft(override: preference.other)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .tint(preference.other == .sendNow ? Theme.alert : Theme.live)
+            .accessibilityHint(preference.other == .sendNow
+                ? "Stops the current reply and sends this next. An action already running finishes; nothing is undone."
+                : "Waits until the current reply and earlier queued messages finish.")
+            .accessibilityIdentifier("chat-send-other")
+        }
+        .padding(.horizontal, 16)
+    }
+
     private var sendButton: some View {
-        Button(action: sendDraft) {
+        Button { sendDraft() } label: {
             Image(systemName: "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(canSend ? Color(uiColor: .systemBackground) : Theme.muted)
@@ -1059,8 +1115,14 @@ struct ChatConversationView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(.circle)
         }
-            .accessibilityLabel("Send")
+            .accessibilityLabel(conversation.isBusy ? conversation.busySendBehavior.busyLabel : "Send")
             .disabled(!canSend)
+            .contextMenu {
+                if conversation.isBusy && canSend {
+                    Button("Queue message", systemImage: "clock") { sendDraft(override: .queue) }
+                    Button("Send anyway", systemImage: "arrow.up.to.line") { sendDraft(override: .sendNow) }
+                }
+            }
             .accessibilityIdentifier("chat-send")
     }
 
@@ -1073,10 +1135,10 @@ struct ChatConversationView: View {
             .contentShape(.rect)
     }
 
-    private func sendDraft() {
+    private func sendDraft(override: BusySendBehavior? = nil) {
         guard canSend else { return }
         dictation.stop()
-        if conversation.submitDraft() { isPinnedToBottom = true }
+        if conversation.submitDraft(override: override) { isPinnedToBottom = true }
     }
 
     private var canSend: Bool {

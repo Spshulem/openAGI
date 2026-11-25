@@ -92,6 +92,10 @@ export class AgentHost {
   async handleMessageNow(input, options = {}) {
     if (isOwnerInterrupt(options.signal)) this.recordStoppedBeforeStart(input);
     options.signal?.throwIfAborted();
+    // A transport-owned check of the sender's authority, run only now that
+    // this turn's slot has come: a sender revoked while it waited is refused
+    // here (it throws) and nothing runs.
+    if (typeof options.authorize === "function") options = { ...options, principal: options.authorize() };
     const reportProgress = progressReporter(options.onProgress);
     const reportTextDelta = textDeltaReporter(options.onTextDelta);
     const channel = input.channel ?? "local";

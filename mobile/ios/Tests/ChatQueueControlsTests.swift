@@ -334,4 +334,20 @@ final class ChatQueueControlsTests: XCTestCase {
         try await waitFor("the queue to drain") { chat.queuedSubmissions.isEmpty && !chat.isSending }
         XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Running", "A", "C"])
     }
+
+    @MainActor
+    func testSendAnywayOnAMainWithoutAQueueStopsTheRunningReplyAndSendsNextAheadOfEarlierQueuedMessages() async throws {
+        let chat = conversation()
+        try await busy(chat, running: "Long reply", queued: ["Queued earlier"])
+        let running = try XCTUnwrap(HeldStreamProtocol.sentTurns[0].requestId)
+        HeldStreamProtocol.answerInterrupt = { requestId in
+            HeldStreamProtocol.release("Long reply", frames: Self.stopped)
+            return (200, "{\"status\":\"interrupted\",\"requestId\":\"\(requestId)\"}")
+        }
+        chat.draft = "Do this instead, now"
+        XCTAssertTrue(chat.submitDraft(override: .sendNow))
+        try await waitFor("the queue to drain") { !chat.isSending && chat.queuedSubmissions.isEmpty }
+        XCTAssertEqual(HeldStreamProtocol.interruptIDs, [running])
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Long reply", "Do this instead, now", "Queued earlier"])
+    }
 }

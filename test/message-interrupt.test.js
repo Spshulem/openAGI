@@ -236,10 +236,9 @@ test("a turn still waiting behind another one is dropped without running, and or
   assert.equal((await running).find((f) => f.event === "final").data.reply, "Answer to from the Mac");
   assert.equal((await correction).find((f) => f.event === "final").data.reply, "Answer to better question");
   assert.deepEqual(calls, ["from the Mac", "better question"], "the dropped turn never reached the model");
-  // Stored in order once its slot came: the question and its stop.
+  // It waited in the hub's queue and left it without running: no records.
   assert.deepEqual(stored(), [
     ["user", "from the Mac", "turn-mac-aaaaaaa"], ["assistant", "Answer to from the Mac", "turn-mac-aaaaaaa"],
-    ["user", "stale question", "turn-wait-aaaaa"], ["assistant", STOPPED, "turn-wait-aaaaa"],
     ["user", "better question", "turn-next-aaaaa"], ["assistant", "Answer to better question", "turn-next-aaaaa"]
   ]);
   assert.deepEqual((await interrupt("turn-wait-aaaaa")).body, { status: "interrupted", requestId: "turn-wait-aaaaa" });
@@ -266,9 +265,12 @@ test("a turn stopped before it ran is never run by a resend of its id, even befo
 
   first.open();
   await running;
-  await until(() => stored().some(([, , id]) => id === "turn-repl-aaaaa"));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual(calls, ["long one"], "the replaced message never ran");
-  assert.equal(stored().filter(([, , id]) => id === "turn-repl-aaaaa").length, 2, "one question, one stop");
+  assert.equal(stored().some(([, , id]) => id === "turn-repl-aaaaa"), false, "it never reached the conversation");
+  const later = await readAll(await send({ text: "replaced", requestId: "turn-repl-aaaaa" }));
+  assert.equal(later.find((f) => f.event === "failure").data.code, "stopped", "a later resend still replays the stop");
+  assert.deepEqual(calls, ["long one"]);
 });
 
 test("an owner interrupt never cancels the action running now; other aborts still do", async () => {

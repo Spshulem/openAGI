@@ -19,6 +19,12 @@ struct SupervisorQueueTray: View {
         .font(.caption2.weight(.semibold))
         .foregroundStyle(WorkspaceTheme.muted)
         .accessibilityAddTraits(.isHeader)
+      if let running = supervisor.hubRunning, running.mine != true {
+        Text("Running now from \(running.source?.name ?? "another device"): \(running.text)")
+          .font(.caption2)
+          .foregroundStyle(WorkspaceTheme.muted)
+          .lineLimit(2)
+      }
       ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
         if supervisor.queue.editingID == item.id {
           editor(item)
@@ -63,7 +69,7 @@ struct SupervisorQueueTray: View {
           .buttonStyle(.borderless)
           .font(.caption2.weight(.medium))
           .foregroundStyle(WorkspaceTheme.live)
-          .disabled(supervisor.queue.editingID != nil)
+          .disabled(supervisor.queue.editingID != nil || item.origin?.heldBy != nil)
           .help("Edit this queued message. Saving doesn't send it.")
         sendNowButton(item, enabled: canSendNow, isFirst: isFirst)
         Button { supervisor.removeQueued(id: item.id) } label: {
@@ -72,8 +78,28 @@ struct SupervisorQueueTray: View {
             .foregroundStyle(WorkspaceTheme.muted)
         }
         .buttonStyle(.plain)
+        .disabled(item.origin?.heldBy != nil)
         .help("Remove from queue")
         .accessibilityLabel("Remove queued message")
+      }
+      if let origin = item.origin {
+        let notes = [
+          origin.mine ? nil : "From \(origin.sourceName ?? "another device")",
+          origin.heldBy.map { "Being edited on \($0)" },
+          origin.pendingUpload && origin.error == nil
+            ? (origin.uploadAttempted ? "Checking whether main got this; Edit opens once it answers" : "Not on main yet; sends when connected") : nil
+        ].compactMap { $0 }
+        if !notes.isEmpty {
+          Text(notes.joined(separator: " · "))
+            .font(.caption2)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
+        if let error = origin.error {
+          Text(error)
+            .font(.caption2)
+            .foregroundStyle(WorkspaceTheme.caution)
+            .fixedSize(horizontal: false, vertical: true)
+        }
       }
       if let state = item.sendNow {
         Text(state.label)

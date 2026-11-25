@@ -1,4 +1,5 @@
 import SwiftUI
+import SupervisorChannelsKit
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
@@ -13,6 +14,8 @@ struct SettingsView: View {
     @State private var showingFallback = false
     @State private var showingDiscovery = false
     @State private var selectedDiscoveryServer: URL?
+    // Chat and Supervisor chat: what Send does while a reply runs.
+    @AppStorage(BusySendBehavior.defaultsKey) private var busySendBehavior = BusySendBehavior.default.rawValue
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -88,6 +91,20 @@ struct SettingsView: View {
                     Text("Replay the welcome and setup screens. Your pairing, saved models and conversations are kept. Use Return to app to leave setup.")
                 }
 
+                // Below the existing rows so nothing above it moves.
+                Section {
+                    Picker("While a reply is running", selection: $busySendBehavior) {
+                        ForEach(BusySendBehavior.allCases) { behavior in
+                            Text(behavior.title).tag(behavior.rawValue)
+                        }
+                    }
+                    .accessibilityIdentifier("settings-busy-send")
+                } header: {
+                    Text("Chat")
+                } footer: {
+                    Text((BusySendBehavior(rawValue: busySendBehavior) ?? .default).detail
+                         + " You can choose the other way for one message from the composer.")
+                }
                 Section {
                     Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
                 } header: {

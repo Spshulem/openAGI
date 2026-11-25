@@ -483,8 +483,25 @@ struct MacTaskItem: Identifiable, Decodable, Equatable, Sendable {
 private struct SyncedHistoryResponse: Decodable {
   struct InFlight: Decodable { let requestId: String }
   let messages: [SyncedSupervisorMessage]
+  /// The hub's queue for this conversation; nil from a hub without one.
+  let queue: HubQueueSnapshot?
   /// Turns main is still running (nil from a main too old to say).
   let inFlight: [InFlight]?
+}
+
+private struct QueueEnvelope: Decodable {
+  struct SendNow: Decodable { let status: String?; let tool: String? }
+  let queue: HubQueueSnapshot?
+  let sendNow: SendNow?
+}
+private struct QueueRefusalBody: Decodable { let error: String?; let message: String? }
+private struct QueueSendNowAnswer: Decodable { let status: String?; let tool: String?; let queue: HubQueueSnapshot? }
+
+/// The hub refused a queue change ("held", "conflict", "already_sent", ...).
+struct HubQueueRefused: Error, Equatable {
+  let code: String
+  let message: String?
+  var displayMessage: String { HubQueueRefusal.message(code: code, fallback: message) }
 }
 
 private struct TasksListResponse: Decodable {
@@ -545,6 +562,30 @@ final class SharedSupervisorClient: ObservableObject {
   private(set) var runningRequestId: String? = nil
   /// A reply is streaming now (with or without a turn id main knows).
   private(set) var replyInFlight = false
+  /// The hub keeps this conversation's queue (history came with one): the
+  /// tray mirrors it -- every device's waiting messages, in the hub's order
+  /// -- and Edit, Remove and Send Now are hub requests. Otherwise the queue
+  /// stays on this Mac, as before.
+  @Published private(set) var hubQueueAvailable = false
+  /// The message the hub runs now, when it came through the queue.
+  @Published private(set) var hubRunning: HubQueueItem? = nil
+  private var uploadTask: Task<Void, Never>?
+  private var holdRenewal: Task<Void, Never>?
+  /// The hub revision the open editor started from: Save sends this, so a
+  /// stale draft is refused (conflict) instead of replacing another edit.
+  private var editBaseRevision: Int?
+  /// The upload on the wire now, and messages removed here meanwhile (the
+  /// hub may have them, so they are removed there once it settles).
+  private var uploadingRequestID: String?
+  private var removeAfterUpload: Set<String> = []
+  /// Uploads that failed offline are tried again on a bounded backoff, so a
+  /// message never stays "not on main yet" after the connection returns.
+  private var uploadRetry: Task<Void, Never>?
+  private var uploadRetryDelay: UInt64 = 2
+  /// Where the "while a reply is running" preference is kept (tray menu).
+  private let preferences: UserDefaults
+  var busySendBehavior: BusySendBehavior { BusySendBehavior.stored(in: preferences) }
+  var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil || !outstandingRequestIds.isEmpty }
   /// Turns main is still running whose reply stream this Mac lost (it
   /// keeps running on main without the stream). Queued messages wait here
   /// until main has finished them, so Send Now can still go first, and Send
@@ -600,19 +641,85 @@ final class SharedSupervisorClient: ObservableObject {
 
   nonisolated static func newRequestId() -> String { "mac-" + UUID().uuidString.lowercased() }
 
+  private func isOnHub(_ item: QueuedSupervisorTurn?) -> Bool {
+    hubQueueAvailable && item != nil && item?.origin?.pendingUpload != true
+  }
+
   func removeQueued(id: UUID) {
+    guard let item = queue.item(id) else { return }
+    // On the wire now, or sent before without an answer: the hub may have
+    // it, so it is removed there too (removeAfterUploads), never only here
+    // where the hub would still run it.
+    if hubQueueAvailable, item.requestID == uploadingRequestID || item.origin?.uploadAttempted == true {
+      removeAfterUpload.insert(item.requestID)
+      queue.remove(id)
+      if queue.editingID == nil { queuedEditDraft = "" }
+      uploadPending()
+      return
+    }
+    if isOnHub(item) {
+      let revision = item.origin?.revision
+      queue.remove(id)
+      if queue.editingID == nil { queuedEditDraft = "" }
+      Task {
+        do {
+          let data = try await queueCall("/conversations/supervisor/queue/\(item.requestID)", method: "DELETE",
+                                         query: revision.map { "baseRevision=\($0)" })
+          applyHubQueue((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+        } catch {
+          await refreshMessages()
+          noteQueueError(item.requestID, error, fallback: "Couldn't reach main, so it is still queued.")
+        }
+      }
+      return
+    }
     guard queue.remove(id) != nil else { return }
     if queue.editingID == nil { queuedEditDraft = "" }
     drainIfIdle()
   }
 
   /// Opens the inline editor; the queue waits at this item until Save or
-  /// Cancel, so the old text is never sent and nothing jumps ahead.
+  /// Cancel, so the old text is never sent and nothing jumps ahead. On a hub
+  /// queue the item is held for this Mac meanwhile, for every device.
   @discardableResult
   func beginEditingQueued(id: UUID) -> Bool {
-    guard let text = queue.beginEditing(id) else { return false }
+    // Not while its upload is on the wire, nor after one that got no answer:
+    // the hub may already have it (and run it) without a hold. Asking again
+    // settles that; once the hub confirms it, Edit holds it there.
+    if hubQueueAvailable, let item = queue.item(id), item.origin?.pendingUpload == true, item.origin?.uploadAttempted == true {
+      uploadPending()
+      return false
+    }
+    guard let item = queue.item(id), item.origin?.heldBy == nil, item.requestID != uploadingRequestID,
+          let text = queue.beginEditing(id) else { return false }
+    queue.setOrigin(id) { $0.error = nil }
     queuedEditDraft = text
+    editBaseRevision = item.origin?.revision
+    if isOnHub(item) { holdWhileEditing(item) }
     return true
+  }
+
+  private func holdWhileEditing(_ item: QueuedSupervisorTurn) {
+    holdRenewal?.cancel()
+    holdRenewal = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self, self.queue.editingID == item.id else { return }
+        do {
+          let data = try await self.queueCall("/conversations/supervisor/queue/\(item.requestID)", method: "PATCH", body: ["hold": true])
+          self.applyHubQueue((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+        } catch let refused as HubQueueRefused {
+          if self.queue.editingID == item.id {
+            self.queue.cancelEdit()
+            self.queuedEditDraft = ""
+          }
+          self.queue.setOrigin(item.id) { $0.error = refused.displayMessage }
+          return
+        } catch {
+          // Offline: keep editing; Save says if it can't reach main.
+        }
+        try? await Task.sleep(nanoseconds: 45_000_000_000)
+      }
+    }
   }
 
   /// Saves in place (same position, same turn id). Never sends by itself.
@@ -623,23 +730,212 @@ final class SharedSupervisorClient: ObservableObject {
     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !item.payload.attachments.isEmpty {
       text = "Please inspect the attached screenshot(s)."
     }
+    let onHub = isOnHub(item)
+    let revision = editBaseRevision ?? item.origin?.revision
     guard queue.saveEdit(id, text: text) else { return false }
     queuedEditDraft = ""
-    drainIfIdle()
+    editBaseRevision = nil
+    holdRenewal?.cancel()
+    if onHub {
+      let saved = queue.item(id)?.text ?? text
+      var body: [String: Any] = ["text": saved, "hold": false]
+      if let revision { body["baseRevision"] = revision }
+      Task {
+        do {
+          let data = try await queueCall("/conversations/supervisor/queue/\(item.requestID)", method: "PATCH", body: body)
+          applyHubQueue((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+        } catch {
+          await refreshMessages()
+          noteQueueError(item.requestID, error, fallback: "Couldn't reach main, so your edit wasn't saved.")
+        }
+      }
+    } else if item.origin?.pendingUpload == true {
+      queue.setOrigin(id) { $0.error = nil }
+      uploadPending()
+    } else {
+      drainIfIdle()
+    }
     return true
   }
 
   func cancelQueuedEdit() {
+    let item = queue.editingID.flatMap { queue.item($0) }
     queue.cancelEdit()
     queuedEditDraft = ""
+    editBaseRevision = nil
+    holdRenewal?.cancel()
+    if isOnHub(item), let item {
+      Task {
+        let data = try? await queueCall("/conversations/supervisor/queue/\(item.requestID)", method: "PATCH", body: ["hold": false])
+        applyHubQueue(data.flatMap { try? JSONDecoder().decode(QueueEnvelope.self, from: $0) }?.queue)
+      }
+    }
+    // A message not yet on the hub waited for its editor; deliver it now.
+    if hubQueueAvailable { uploadPending() }
     drainIfIdle()
   }
 
-  func canSendQueuedNow(id: UUID) -> Bool { queue.canSendNow(id) }
+  /// The hub's queue as history or a queue request returned it. nil (an
+  /// older hub) leaves this Mac's own queue alone.
+  private func applyHubQueue(_ snapshot: HubQueueSnapshot?) {
+    mirrorHub(snapshot)
+    uploadPending()
+  }
+
+  private func mirrorHub(_ snapshot: HubQueueSnapshot?) {
+    guard let snapshot else { return }
+    // Older than what is shown (a slow refresh crossed a newer change).
+    if let shown = queue.hubRevision, snapshot.revision < shown { return }
+    if !hubQueueAvailable {
+      for item in queue.items where item.origin == nil {
+        queue.setOrigin(item.id) { $0.pendingUpload = true; $0.mine = true }
+      }
+      hubQueueAvailable = true
+    }
+    hubRunning = snapshot.running
+    // Every waiting message keeps its controls here, including this Mac's
+    // own streamed send that the hub queued behind another turn.
+    queue.mirror(snapshot, payload: { _ in SupervisorQueuedPayload(focusedCardId: nil, attachments: []) }, skip: removeAfterUpload)
+  }
+
+  private func noteQueueError(_ requestID: String, _ error: Error, fallback: String) {
+    guard let item = queue.item(requestID: requestID) else { return }
+    let text = (error as? HubQueueRefused)?.displayMessage ?? fallback
+    queue.setOrigin(item.id) { $0.error = text }
+  }
+
+  /// Sends messages the hub has not accepted yet, oldest first, each with
+  /// its own turn id (a resend is the same message; the hub keeps one).
+  private func uploadPending() {
+    guard hubQueueAvailable, uploadTask == nil else { return }
+    uploadTask = Task { [weak self] in
+      await self?.removeAfterUploads()
+      while let self, let next = self.queue.nextUpload {
+        var body: [String: Any] = ["text": next.text, "requestId": next.requestID, "from": "mac-supervisor"]
+        if let card = next.payload.focusedCardId, card.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil {
+          body["focusedCardId"] = card
+        }
+        if !next.payload.attachments.isEmpty { body["attachments"] = next.payload.attachments.map(\.agentHostPayload) }
+        if next.origin?.sendNext == true { body["next"] = true }
+        self.uploadingRequestID = next.requestID
+        // An earlier try that got no answer stays uncertain until the hub
+        // itself answers, whatever this try's failure.
+        let earlierUncertain = next.origin?.uploadAttempted == true
+        self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
+        var offline = false
+        do {
+          let data = try await self.queueCall("/conversations/supervisor/queue", method: "POST", body: body)
+          let envelope = try? JSONDecoder().decode(QueueEnvelope.self, from: data)
+          if next.origin?.sendNext == true {
+            // What the hub confirmed; it ran at once when nothing was running.
+            let outcome = envelope?.sendNow.map { TurnInterruptOutcome.fromServer(status: $0.status, tool: $0.tool) } ?? .nothingRunning
+            self.queue.setSendNowOutcome(next.id, outcome)
+          }
+          // Checked against the newest snapshot shown, which may have
+          // arrived (without it) while this answer was late.
+          self.queue.acknowledgeUpload(next.id, revision: envelope?.queue?.revision)
+          self.uploadingRequestID = nil
+          self.mirrorHub(envelope?.queue)
+          self.uploadRetryDelay = 2
+        } catch let refused as HubQueueRefused where refused.code == "queue_full" {
+          // Full for now, not refused: it stays next and is tried again.
+          offline = true
+          self.queue.setOrigin(next.id) { $0.uploadAttempted = false }
+        } catch let refused as HubQueueRefused {
+          self.queue.setOrigin(next.id) { $0.error = refused.displayMessage; $0.uploadAttempted = false }
+        } catch {
+          offline = true
+          if HubUpload.neverSent(error), !earlierUncertain { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
+          // Not stopped: main was not reached. It is tried again.
+          if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
+        }
+        self.uploadingRequestID = nil
+        await self.removeAfterUploads()
+        if offline {
+          self.scheduleUploadRetry()
+          break
+        }
+      }
+      self?.uploadTask = nil
+    }
+  }
+
+  private func scheduleUploadRetry() {
+    guard uploadRetry == nil else { return }
+    let delay = uploadRetryDelay
+    uploadRetryDelay = min(uploadRetryDelay * 2, 60)
+    uploadRetry = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+      guard let self else { return }
+      self.uploadRetry = nil
+      self.uploadPending()
+    }
+  }
+
+  /// Removals made while their upload was on the wire: remove them on the
+  /// hub too. Offline, they wait for the next try (scheduleUploadRetry).
+  private func removeAfterUploads() async {
+    for requestID in removeAfterUpload {
+      do {
+        let data = try await queueCall("/conversations/supervisor/queue/\(requestID)", method: "DELETE")
+        removeAfterUpload.remove(requestID)
+        mirrorHub((try? JSONDecoder().decode(QueueEnvelope.self, from: data))?.queue)
+      } catch is HubQueueRefused {
+        removeAfterUpload.remove(requestID)
+      } catch {
+        scheduleUploadRetry()
+        return
+      }
+    }
+  }
+
+  /// One hub queue request. A refusal is a HubQueueRefused with the hub's
+  /// own code, never a generic failure.
+  private func queueCall(_ path: String, method: String, body: [String: Any]? = nil, query: String? = nil) async throws -> Data {
+    var req = URLRequest(url: AppState.buildURL(base: baseURL, path: query.map { "\(path)?\($0)" } ?? path))
+    req.httpMethod = method
+    if let body {
+      req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      req.httpBody = try JSONSerialization.data(withJSONObject: body)
+    }
+    req.timeoutInterval = 20
+    authed(&req)
+    let (data, response) = try await session.data(for: req)
+    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+    if [400, 409, 429].contains(status) {
+      let refusal = try? JSONDecoder().decode(QueueRefusalBody.self, from: data)
+      throw HubQueueRefused(code: refusal?.error ?? "status_\(status)", message: refusal?.message)
+    }
+    try AppState.ensureOK(response, data)
+    return data
+  }
+
+  func canSendQueuedNow(id: UUID) -> Bool {
+    guard let item = queue.item(id) else { return false }
+    if hubQueueAvailable && (item.origin?.pendingUpload == true || item.origin?.heldBy != nil) { return false }
+    return queue.canSendNow(id)
+  }
 
   /// Moves the item to the front and asks main to stop the running reply.
   /// It goes next whatever main answers; its row shows what main confirmed.
   func sendQueuedNow(id: UUID) async {
+    if let item = queue.item(id), isOnHub(item) {
+      // The hub moves it first and stops whatever runs now, on any device.
+      guard canSendQueuedNow(id: id), queue.beginHubSendNow(id) else { return }
+      do {
+        let data = try await queueCall("/conversations/supervisor/queue/\(item.requestID)/send-now", method: "POST")
+        let answer = try JSONDecoder().decode(QueueSendNowAnswer.self, from: data)
+        queue.applyInterrupt(id, outcome: TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool))
+        applyHubQueue(answer.queue)
+      } catch let refused as HubQueueRefused {
+        queue.clearSendNow(id)
+        queue.setOrigin(id) { $0.error = refused.displayMessage }
+        await refreshMessages()
+      } catch {
+        queue.applyInterrupt(id, outcome: .unreachable)
+      }
+      return
+    }
     // The turn main is actually running: one whose stream this Mac lost runs
     // ahead of anything sent after it, so it is the one to stop.
     let target = outstandingRequestIds.first ?? runningRequestId
@@ -687,7 +983,7 @@ final class SharedSupervisorClient: ObservableObject {
   /// Sends the queue when nothing is running: after an edit closes, a
   /// removal, or a Send Now with no reply in flight.
   private func drainIfIdle() {
-    guard !isSending, !queue.isEmpty, !queue.isWaitingOnEdit, outstandingRequestIds.isEmpty else { return }
+    guard !hubQueueAvailable, !isSending, !queue.isEmpty, !queue.isWaitingOnEdit, outstandingRequestIds.isEmpty else { return }
     isSending = true
     Task {
       defer {
@@ -702,7 +998,7 @@ final class SharedSupervisorClient: ObservableObject {
   private func drainQueue() async {
     // A turn main still runs without this Mac's stream: what waits here goes
     // when it has ended (settleOutstanding), not behind it on main.
-    while outstandingRequestIds.isEmpty, let next = queue.takeNext() {
+    while !hubQueueAvailable, outstandingRequestIds.isEmpty, let next = queue.takeNext() {
       _ = await executeSingleMessage(next.text, focusedCardId: next.payload.focusedCardId,
                                      attachments: next.payload.attachments, requestId: next.requestID)
     }
@@ -719,13 +1015,16 @@ final class SharedSupervisorClient: ObservableObject {
     session = .shared
     baseURLOverride = nil
     tokenOverride = nil
+    preferences = .standard
   }
 
-  /// A separate client for tests: its own session, daemon URL and token.
-  init(testSession: URLSession, baseURL: URL, token: String) {
+  /// A separate client for tests: its own session, daemon URL, token and
+  /// preferences.
+  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard) {
     session = testSession
     baseURLOverride = baseURL
     tokenOverride = token
+    self.preferences = preferences
   }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
@@ -927,6 +1226,7 @@ final class SharedSupervisorClient: ObservableObject {
       try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(SyncedHistoryResponse.self, from: data)
       messages = decoded.messages
+      applyHubQueue(decoded.queue)
       settleOutstanding(decoded)
       lastError = nil
     } catch {
@@ -965,15 +1265,36 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   @discardableResult
-  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = []) async -> Bool {
+  /// Idle, it sends. While a reply runs (here or on the hub, or messages
+  /// still wait), the preference decides -- Queue message (default) or Send
+  /// immediately -- and `override` is the composer's one-message choice the
+  /// other way ("Send anyway" / "Queue instead").
+  func sendMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],
+                   override: BusySendBehavior? = nil) async -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+    let decision = SendDecision.resolve(busy: isBusy, preference: busySendBehavior, override: override)
+    if decision == .sendNext {
+      let id = queue.enqueue(text: text, payload: SupervisorQueuedPayload(focusedCardId: focusedCardId, attachments: attachments),
+                             requestID: Self.newRequestId(),
+                             origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true, sendNext: true) : nil)
+      if hubQueueAvailable {
+        queue.beginHubSendNow(id)
+        uploadPending()
+      } else {
+        // Main keeps no queue: this Mac's queue, front, then stop the
+        // running reply (or say plainly that it can't be).
+        await sendQueuedNow(id: id)
+      }
+      return true
+    }
     // Busy, or messages still wait (one is being edited): this one goes
     // after them, never ahead.
-    if isSending || !queue.isEmpty || !outstandingRequestIds.isEmpty {
+    if decision == .queue {
       queue.enqueue(text: text, payload: SupervisorQueuedPayload(focusedCardId: focusedCardId, attachments: attachments),
-                    requestID: Self.newRequestId())
-      drainIfIdle()
+                    requestID: Self.newRequestId(),
+                    origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)
+      if hubQueueAvailable { uploadPending() } else { drainIfIdle() }
       return true
     }
     isSending = true
@@ -1208,7 +1529,9 @@ final class SharedSupervisorClient: ObservableObject {
         return decoded?.reply ?? streamingReplyText
       case "failure":
         let failure = try? JSONDecoder().decode(SupervisorStreamFailure.self, from: data)
-        if failure?.code == "stopped" { throw SupervisorReplyInterrupted() }
+        // Stopped by Send Now, or taken out of the hub's queue: main stored
+        // or showed the outcome; not an error.
+        if failure?.code == "stopped" || failure?.code == "removed" { throw SupervisorReplyInterrupted() }
         let message = failure?.error ?? "Supervisor could not complete that request."
         throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
       default:

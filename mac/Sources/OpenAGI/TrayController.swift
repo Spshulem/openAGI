@@ -1,3 +1,4 @@
+import SupervisorChannelsKit
 import SwiftUI
 
 struct TrayLabel: View {
@@ -39,6 +40,7 @@ struct TrayLabel: View {
 
 struct TrayMenu: View {
   @ObservedObject var state: AppState
+  @AppStorage(BusySendBehavior.defaultsKey) private var busySendBehavior = BusySendBehavior.default.rawValue
   // Observe CaptureSettings.shared so the Capture submenu re-renders when
   // `enabled` or `pausedUntil` flips — otherwise after Disable the label
   // stays "Disable capture" until the menu is reopened.
@@ -236,6 +238,12 @@ struct TrayMenu: View {
       // terminal-managed listener is preserved and explained instead.
       Button(restartLabel) { restartDaemon() }
       Button("Open Supervisor Workspace…") { SupervisorWindowController.shared.show() }
+      // Supervisor chat: what Send does while a reply runs (this Mac).
+      Picker("While Supervisor replies", selection: $busySendBehavior) {
+        ForEach(BusySendBehavior.allCases) { behavior in
+          Text(behavior.title).tag(behavior.rawValue)
+        }
+      }
       Button("Open dashboard…") { state.openDashboard() }
       Button("Connect a phone…") { openPhonePairing() }
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }

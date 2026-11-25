@@ -106,6 +106,8 @@ struct SupervisorWorkspaceView: View {
   @ObservedObject var nav: SupervisorWorkspaceNavigation
   @ObservedObject private var app = AppState.shared
   @ObservedObject private var supervisor = SharedSupervisorClient.shared
+  /// Observed so the composer's busy line follows the tray menu at once.
+  @AppStorage(BusySendBehavior.defaultsKey) private var busySendPreference = BusySendBehavior.default.rawValue
   @ObservedObject private var fleet = FleetConsumer.shared
   @ObservedObject private var approvals = PendingApprovalConsumer.shared
 
@@ -2556,6 +2558,27 @@ struct SupervisorWorkspaceView: View {
     }
   }
 
+  /// While a reply runs: what Send will do (the tray menu preference) and
+  /// the other choice for this one message.
+  private var busySendChoice: some View {
+    let preference = BusySendBehavior(rawValue: busySendPreference) ?? .default
+    return HStack(spacing: 8) {
+      Text(preference == .queue ? "A reply is running. Send queues this." : "A reply is running. Send stops it and sends this next.")
+        .font(.caption)
+        .foregroundStyle(WorkspaceTheme.muted)
+      Spacer()
+      Button(preference.other == .sendNow ? "Send anyway" : "Queue instead") {
+        sendFromWorkspace(override: preference.other)
+      }
+      .buttonStyle(.bordered)
+      .controlSize(.small)
+      .help(preference.other == .sendNow
+        ? "Stop the current reply and send this next (⌥↩). An action already running finishes; nothing is undone."
+        : "Wait until the current reply and earlier queued messages finish (⌥↩).")
+    }
+    .padding(.horizontal, 10)
+  }
+
   // MARK: - Floating Liquid Glass Bottom Dock & Inline Supervisor Sheet
 
   private var floatingBottomDock: some View {
@@ -2601,6 +2624,11 @@ struct SupervisorWorkspaceView: View {
 
       if !supervisor.queuedMessages.isEmpty {
         SupervisorQueueTray(supervisor: supervisor)
+      }
+
+      if supervisor.isBusy && composerMode != .startTask
+          && (!composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !composerImages.isEmpty) {
+        busySendChoice
       }
 
       if !composerImages.isEmpty {
@@ -2699,6 +2727,12 @@ struct SupervisorWorkspaceView: View {
         .onSubmit {
           sendFromWorkspace()
         }
+        // ⌥↩ while a reply runs: the other choice for this one message.
+        .onKeyPress(.return, phases: .down) { press in
+          guard press.modifiers.contains(.option), supervisor.isBusy, composerMode != .startTask else { return .ignored }
+          sendFromWorkspace(override: supervisor.busySendBehavior.other)
+          return .handled
+        }
 
       HStack(spacing: 2) {
         ForEach(WorkspaceComposerMode.allCases) { mode in
@@ -2782,7 +2816,16 @@ struct SupervisorWorkspaceView: View {
       }
       .buttonStyle(.plain)
       .disabled(!canSend)
-      .help(supervisor.isSending ? "Queue message for Supervisor" : "Send to Supervisor")
+      .help(supervisor.isBusy
+        ? "\(supervisor.busySendBehavior.busyLabel) (⌥↩: \(supervisor.busySendBehavior.other == .sendNow ? "Send anyway" : "Queue instead"))"
+        : "Send to Supervisor")
+      .accessibilityLabel(supervisor.isBusy ? supervisor.busySendBehavior.busyLabel : "Send to Supervisor")
+      .contextMenu {
+        if supervisor.isBusy && canSend && composerMode != .startTask {
+          Button("Queue message") { sendFromWorkspace(override: .queue) }
+          Button("Send anyway") { sendFromWorkspace(override: .sendNow) }
+        }
+      }
     }
     .padding(.horizontal, 10)
     .padding(.vertical, 6)
@@ -2910,7 +2953,9 @@ struct SupervisorWorkspaceView: View {
     }
   }
 
-  private func sendFromWorkspace() {
+  /// `override`: the one-message choice against the "while a reply is
+  /// running" preference ("Send anyway" / "Queue instead"; also ⌥↩).
+  private func sendFromWorkspace(override: BusySendBehavior? = nil) {
     var rawDraft = composerText
     var imgs = composerImages
     let extracted = WorkspaceImageAttachment.extractInlineLocalImages(from: rawDraft, limit: max(0, 4 - imgs.count))
@@ -2965,7 +3010,7 @@ struct SupervisorWorkspaceView: View {
     composerImages = []
     composerStatusNote = nil
     Task {
-      let ok = await supervisor.sendMessage(textToSend, attachments: imgs)
+      let ok = await supervisor.sendMessage(textToSend, attachments: imgs, override: override)
       if !ok {
         if composerText.isEmpty {
           composerText = rawDraft

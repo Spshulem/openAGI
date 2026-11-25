@@ -274,6 +274,13 @@ export class NodeRegistry {
     return actual.length === hash.length && crypto.timingSafeEqual(actual, hash);
   }
 
+  // Whether this node still holds an owner-proxy grant (it was not revoked
+  // or re-enrolled without one), without needing its credential.
+  hasOwnerProxyGrant(nodeId) {
+    if (typeof nodeId !== "string") return false;
+    return typeof this._read().credentials[nodeId]?.ownerProxyTokenHash === "string";
+  }
+
   // Rotate the separate owner-proxy credential after an explicit reconnect
   // approval. The raw value is returned only to the reconnect manager so it
   // can be delivered to the already-authenticated target node; only its hash
