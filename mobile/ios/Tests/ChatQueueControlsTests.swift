@@ -273,6 +273,27 @@ final class ChatQueueControlsTests: XCTestCase {
     }
 
     @MainActor
+    func testAnApprovalTapOrResendNeverJumpsAheadOfAQueueHeldByAnOpenEdit() async throws {
+        let chat = conversation()
+        try await busy(chat, running: "Running", queued: ["Typo here"])
+        // Tapped while the reply runs: queued, not dropped.
+        await chat.send("yes 41")
+        XCTAssertEqual(chat.queuedSubmissions.map(\.text), ["Typo here", "yes 41"])
+        XCTAssertTrue(chat.beginEditingQueued(id: chat.queuedSubmissions[0].id))
+        HeldStreamProtocol.release("Running", frames: "event: final\ndata: {\"reply\":\"ok\"}\n\n")
+        try await waitFor("the running reply to end") { !chat.isSending }
+        // The approval bar (or a budget resend) while the queue waits at the edit.
+        await chat.send("yes 42")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Running"], "nothing runs ahead of the held message")
+        XCTAssertEqual(chat.queuedSubmissions.map(\.text), ["Typo here", "yes 41", "yes 42"])
+        chat.queuedEditDraft = "Typo fixed"
+        XCTAssertTrue(chat.saveQueuedEdit())
+        try await waitFor("the queue to drain") { chat.queuedSubmissions.isEmpty && !chat.isSending }
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Running", "Typo fixed", "yes 41", "yes 42"])
+    }
+
+    @MainActor
     func testSendNowStopsTheReplyMainIsStillRunningAfterItsStreamDroppedAndTheCorrectionGoesNext() async throws {
         let chat = conversation()
         try await busy(chat, running: "Long job", queued: ["Queued behind it", "Correction"])
