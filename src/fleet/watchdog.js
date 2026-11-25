@@ -94,6 +94,14 @@ function taskProgressAt(task) {
     .at(-1) ?? null;
 }
 
+// When the thread last showed progress. A source that knows its newest
+// timeline event (lastProgressAt) is trusted over lastActivityAt: for Paseo,
+// lastActivityAt is the record's updatedAt, refreshed while an open turn
+// produces nothing (a tool call hung 10 h 44 m that way on 2026-11-25).
+function activityAt(thread) {
+  return thread.lastProgressAt ?? thread.lastActivityAt;
+}
+
 /**
  * Estimates how long Supervisor should wait before checking in on an active
  * coding session or linked task, and whether that check-in window has elapsed.
@@ -138,7 +146,7 @@ export function estimateExpectedCheckIn(thread, { classified = null, pr = null, 
 
   if (expectedMinutes === null) return null;
 
-  const anchorIso = [thread.lastActivityAt, thread.lastAgentAt, thread.lastUserAt, taskProgressAt(task)]
+  const anchorIso = [activityAt(thread), thread.lastAgentAt, thread.lastUserAt, taskProgressAt(task)]
     .filter((iso) => Number.isFinite(Date.parse(iso ?? "")))
     .sort()
     .at(-1) ?? null;
@@ -170,7 +178,7 @@ export function estimateExpectedCheckIn(thread, { classified = null, pr = null, 
 export function diagnoseAgentBlocker(thread, { pr = null, now = Date.now(), limits = DEFAULTS } = {}) {
   if (!thread || thread.archived || thread.excluded) return null;
 
-  const latestAt = [thread.lastActivityAt, thread.lastAgentAt, thread.lastUserAt]
+  const latestAt = [activityAt(thread), thread.lastAgentAt, thread.lastUserAt]
     .filter((iso) => Number.isFinite(Date.parse(iso ?? "")))
     .sort()
     .at(-1) ?? null;

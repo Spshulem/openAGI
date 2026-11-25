@@ -376,7 +376,7 @@ function currentError(agent, entries) {
   };
 }
 
-export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null, sleepingActive = false, silentStuck = false } = {}) {
+export function paseoThread(agent, serverId, entries = [], historyKnown = true, { planArtifactPath = null, workspaceMeta = null, sleepingActive = false, silentStuck = false, lastProgressAt = null } = {}) {
   const messages = entries.filter(e => ["user_message", "assistant_message"].includes(e.item?.type));
   const users = messages.filter(e => e.item.type === "user_message");
   const owner = users.findLast(e => !e.item.text?.startsWith(SUPERVISOR_PREFIX));
@@ -440,7 +440,12 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
     excluded: agent.archivedAt ? "closed"
       : (agent.status === "closed" && !sleepingActive) ? "closed"
       : !historyKnown ? "history-unavailable" : null,
-    lastActivityAt: agent.updatedAt, lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
+    lastActivityAt: agent.updatedAt,
+    // The newest timeline event a recent history read saw (null when
+    // unknown). Unlike lastActivityAt (Paseo's updatedAt), it does not move
+    // while an open turn produces nothing.
+    ...(lastProgressAt ? { lastProgressAt } : {}),
+    lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
     lastUserText: stripAgentInternalMarkup(redactSecrets(owner?.item.text ?? "")).slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
     lastAgentText: clampTailLines(text, 900), lastAgentTail: text, lastAgentFull: text,
     error: detectedError, openTasks: [], prRefs, live: null, writerLocked: false,
@@ -475,6 +480,10 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true, 
 // attempted reads first so a slow chat cannot starve the rest of a migration.
 export function createPaseoSource({ factory } = {}) {
   const cache = new Map();
+  // key -> { latestEventMs, fetchedAt }: the newest timeline event a
+  // successful history read saw. Kept apart from the cache, which each fetch
+  // resets, so a failed read never erases what is known about progress.
+  const progress = new Map();
   let active;
   return function listPaseoThreads(config) {
     // Retain ownership even if an outer caller times out during client close.
@@ -538,13 +547,43 @@ export function createPaseoSource({ factory } = {}) {
       const isRecentSleeping = (a) => Boolean(
         !a.archivedAt && a.status === "closed" && (Date.parse(a.updatedAt ?? "") || 0) >= scanStartedAt - lookbackMs
       );
-      const isSilentRunning = (a) => Boolean(
+      // A turn that is open and not waiting on a permission.
+      const isBusy = (a) => Boolean(
         !a.archivedAt
         && !a.pendingPermissions?.length
         && (a.activeTurn || ["running", "initializing"].includes(a.status))
+      );
+      // Paseo's own record has not changed for the stall window.
+      const isSilentRunning = (a) => Boolean(
+        isBusy(a)
         && (Date.parse(a.updatedAt ?? "") || 0) > 0
         && scanStartedAt - (Date.parse(a.updatedAt ?? "") || 0) >= liveStallMs
       );
+      // agent.updatedAt is liveness, not progress: Paseo refreshes it while a
+      // turn is open even if one tool call has produced nothing for hours
+      // (2026-11-25: a recursive glob ran 10 h 44 m that way). A recent,
+      // successful history read whose newest event is older than the stall
+      // window is evidence of no progress; no recent read is no evidence.
+      const progressFreshMs = 15 * 60_000;
+      const progressOf = (key) => {
+        const known = progress.get(key);
+        return known && scanStartedAt - known.fetchedAt <= progressFreshMs ? known : null;
+      };
+      // The evidence must cover the current turn: a read taken before the
+      // turn started (or before the owner's latest message) says nothing
+      // about it, and silence is counted from the newest of the last event,
+      // the turn's start and that message.
+      const turnProgressMs = (a, key) => {
+        const known = progressOf(key);
+        if (!known) return null;
+        const startedMs = Math.max(Date.parse(a.activeTurn?.startedAt ?? "") || 0, Date.parse(a.lastUserMessageAt ?? "") || 0);
+        if (startedMs > known.fetchedAt) return null;
+        return Math.max(known.latestEventMs, startedMs);
+      };
+      const isBusyWithoutProgress = (a, key) => {
+        const latest = isBusy(a) ? turnProgressMs(a, key) : null;
+        return latest !== null && scanStartedAt - latest >= liveStallMs;
+      };
       const isRunningNeedsErrorProbe = (a, key) => Boolean(
         !a.archivedAt
         && (a.activeTurn || a.status === "running")
@@ -605,6 +644,7 @@ export function createPaseoSource({ factory } = {}) {
             // included), not just the bounded message excerpts above.
             const latestEventMs = Math.max(0, ...history.entries.map(e => Date.parse(e?.timestamp ?? "") || 0));
             cache.set(key, { attempted: Date.now(), stamp: row.agent.updatedAt, entries, planArtifactPath, latestEventMs });
+            if (latestEventMs > 0) progress.set(key, { latestEventMs, fetchedAt: Date.now() });
           } catch { /* uncertain history stays excluded and is tried later */ }
         }));
       }
@@ -620,7 +660,8 @@ export function createPaseoSource({ factory } = {}) {
           ...histEntries.map((e) => Date.parse(e?.timestamp ?? "") || 0),
           history?.stamp === a.updatedAt ? (history?.latestEventMs ?? 0) : 0
         );
-        const silentStuck = isSilentRunning(a) && scanStartedAt - latestTimelineMs >= liveStallMs;
+        const silentStuck = (isSilentRunning(a) && scanStartedAt - latestTimelineMs >= liveStallMs) || isBusyWithoutProgress(a, key);
+        const lastProgressMs = (isBusy(a) ? turnProgressMs(a, key) : progressOf(key)?.latestEventMs) ?? 0;
         const known = ["running", "initializing"].includes(a.status)
           || (a.status === "closed" && !sleepingActive)
           || (history?.stamp === a.updatedAt);
@@ -641,7 +682,8 @@ export function createPaseoSource({ factory } = {}) {
           planArtifactPath: known ? history?.planArtifactPath ?? null : null,
           workspaceMeta,
           sleepingActive,
-          silentStuck
+          silentStuck,
+          lastProgressAt: lastProgressMs > 0 ? new Date(lastProgressMs).toISOString() : null
         });
         row.meta.isLocalHost = Boolean(selfIsLocal && id === directory.self?.serverId);
         return row;
