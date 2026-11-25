@@ -470,6 +470,27 @@ test("a save that fails when a message is dispatched never strands the queue; th
   });
 });
 
+test("a message refused because its phone was unpaired is remembered: it shows as ended and a resend after re-pairing never runs it", async (t) => {
+  const h = await hub(t);
+  const running = frames(await h.message("mac", { text: "[slow] busy", requestId: "mac-busy-00021" }));
+  await until(() => h.calls.length === 1);
+  const waiting = frames(await h.message("phone", { text: "refused when its turn came", requestId: "ios-unpair-0003" }));
+  await until(async () => (await h.queue("mac")).body.items.length === 2);
+  h.nodeRegistry.revoke(phone.id);
+  h.slow.open();
+  await running;
+  assert.equal((await waiting).find((f) => f.event === "failure")?.data.code, "sender-unpaired");
+  h.nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
+  const ended = (await h.queue("phone")).body.ended.find((entry) => entry.requestId === "ios-unpair-0003");
+  assert.equal(ended?.outcome, "not_run", "a phone that lost its stream can learn how it ended");
+  // Re-paired, the phone resends the same id (it never saw the answer).
+  const resent = await h.enqueue("phone", { text: "refused when its turn came", requestId: "ios-unpair-0003" });
+  assert.equal(resent.body.duplicate, true);
+  assert.equal(resent.body.outcome, "not_run");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(h.calls, ["[slow] busy"], "the refused command never runs");
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
 
 test("Send anyway from the Mac stops the iPhone's reply midstream and goes next; pending messages keep their order", async (t) => {

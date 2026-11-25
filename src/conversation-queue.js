@@ -27,6 +27,8 @@ import path from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { STOPPED_TEXT } from "./message-turns.js";
 
+const UNPAIRED_TEXT = "The device that sent this is no longer paired.";
+
 export const QUEUE_LIMIT = 50;
 export const HOLD_MS = 90_000;
 const TOMBSTONE_LIMIT = 200;
@@ -91,7 +93,7 @@ export class ConversationQueue {
         if (item.state === "running" && item.started) continue;
         const principal = this.mintPrincipal(item.principal);
         if (!principal && item.principal) {
-          this.tombstone(state, item.requestId, "not_run", "The device that sent this is no longer paired.");
+          this.tombstone(state, item.requestId, "not_run", UNPAIRED_TEXT);
           continue;
         }
         state.items.push({ ...item, state: "queued", started: false });
@@ -186,7 +188,8 @@ export class ConversationQueue {
       return this.startTurn(current, { ...hooks, onProgress });
     });
     turn.promise.then(() => this.settled(sessionId, entry.requestId, "complete"),
-      (error) => this.settled(sessionId, entry.requestId, error?.code === "OWNER_INTERRUPTED" ? "stopped" : error?.code === "QUEUE_REMOVED" ? "removed" : "failed"));
+      (error) => this.settled(sessionId, entry.requestId, error?.code === "OWNER_INTERRUPTED" ? "stopped"
+        : error?.code === "QUEUE_REMOVED" ? "removed" : error?.code === "SENDER_UNPAIRED" ? "not_run" : "failed"));
     return turn;
   }
 
@@ -235,6 +238,10 @@ export class ConversationQueue {
       const began = state.items[index].started === true;
       state.items.splice(index, 1);
       if (!began && outcome === "stopped") this.tombstone(state, requestId, "stopped", STOPPED_TEXT);
+      // Its sender was no longer allowed when its turn came (checked as it
+      // starts): like a revoked sender found at restore, it is remembered,
+      // so a resend after re-pairing replays this instead of running it.
+      if (!began && outcome === "not_run") this.tombstone(state, requestId, "not_run", UNPAIRED_TEXT);
     }
     if (state.running === requestId) state.running = null;
     this.changed(sessionId);
