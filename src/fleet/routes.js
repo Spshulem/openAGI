@@ -701,10 +701,12 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
+        const idempotencyKey = typeof body?.idempotencyKey === "string" && /^[A-Za-z0-9_.:-]{1,160}$/.test(body.idempotencyKey) ? body.idempotencyKey : null;
         const extraOpts = {
           ...sendOptions,
           ...(typeof body?.queue === "boolean" ? { queue: body.queue } : {}),
-          ...(images?.length ? { images } : {})
+          ...(images?.length ? { images } : {}),
+          ...(idempotencyKey ? { idempotencyKey } : {})
         };
         const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);
         return ok({ delivery: result?.delivery ?? null, state: state() });

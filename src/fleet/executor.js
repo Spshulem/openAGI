@@ -4,7 +4,7 @@
 // thread, see ui-delivery.js), and agentapi send-message for Antigravity. This is the only fleet unit that writes to
 // other processes, so it re-checks every precondition instead of trusting policy.
 
-import { deliverPaseo } from "./paseo-delivery.js";
+import { deliverPaseo, paseoImagesHash } from "./paseo-delivery.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -737,7 +737,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
 
   // typedOnly: a risky ask's owner answer, which only ever goes typed into
   // the app; a block there returns as is, never by a background route.
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, holdOnPermission = false } = {}) {
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, holdOnPermission = false, noPermissionReply = false } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -761,12 +761,13 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     if (step.blocked) return blocked(step.blocked);
     if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
-    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(fallbackFrom ? { fallbackFrom } : {}) };
+    const imagesHash = step.paseo ? paseoImagesHash(images) : null;
+    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(imagesHash ? { imagesHash } : {}), ...(fallbackFrom ? { fallbackFrom } : {}) };
     if (step.paseo) {
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
       try {
-        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue, holdOnPermission });
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue, holdOnPermission, ...(noPermissionReply ? { noPermissionReply: true } : {}) });
         const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
         return { ...result, actionId: id };
       }
