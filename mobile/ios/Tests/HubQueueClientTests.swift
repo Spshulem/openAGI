@@ -20,11 +20,16 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var holdNextEnqueue = false
     // Accept the next queued message, then drop the connection (no answer).
     nonisolated(unsafe) static var dropNextEnqueueAnswer = false
+    // Every queue POST fails without reaching the hub (offline), and history
+    // stops carrying the queue, so neither a retry nor a poll can settle an
+    // earlier upload's outcome.
+    nonisolated(unsafe) static var offlineEnqueue = false
+    nonisolated(unsafe) static var hideQueueInHistory = false
     nonisolated(unsafe) static var revision = 1
     private struct Held: @unchecked Sendable { let proto: FakeHubProtocol; let runLoop: CFRunLoop; let answer: [String: Any] }
     nonisolated(unsafe) private static var heldEnqueue: Held?
 
-    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; ended = []; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil; dropNextEnqueueAnswer = false; revision = 1 } }
+    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; ended = []; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil; dropNextEnqueueAnswer = false; revision = 1; offlineEnqueue = false; hideQueueInHistory = false } }
     static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
     static func releaseEnqueue() {
         guard let held = lock.withLock({ () -> Held? in defer { heldEnqueue = nil }; return heldEnqueue }) else { return }
@@ -75,8 +80,14 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
         defer { Self.lock.unlock() }
         Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + (body["requestId"].map { " #\($0)" } ?? "")
                         + ((body["next"] as? Bool) == true ? " NEXT" : ""))
-        if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
+        if path == "/conversations/supervisor/messages" {
+            return respond(200, Self.hideQueueInHistory ? ["messages": []] : ["messages": [], "queue": Self.queueJSON()])
+        }
         if path == "/conversations/supervisor/queue", method == "POST" {
+            if Self.offlineEnqueue {
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+                return
+            }
             if Self.failNextEnqueue {
                 // Never reached the hub (no connection): nothing was taken.
                 Self.failNextEnqueue = false
@@ -365,14 +376,15 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(chat.submitDraft())
         try await waitFor("the hub to take it") { FakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then offline" } }
         try await Task.sleep(for: .milliseconds(50))
-        // The retry (asked for by an Edit tap) cannot even connect: that
-        // says nothing about the first try. (A refresh would settle it from
-        // the hub's snapshot instead.)
-        FakeHubProtocol.failNextEnqueue = true
+        // Now every retry (an Edit tap, the background poll) cannot even
+        // connect: that says nothing about the first try. History stops
+        // carrying the queue, so a poll cannot settle it either.
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.offlineEnqueue = true; FakeHubProtocol.hideQueueInHistory = true }
         let item = try XCTUnwrap(chat.queuedSubmissions.first)
         XCTAssertFalse(chat.beginEditingQueued(id: item.id))
-        try await waitFor("the failed retry") { FakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
+        try await waitFor("a failed retry") { FakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count >= 2 }
         try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(chat.beginEditingQueued(id: item.id), "still no local-only edit")
         XCTAssertEqual(chat.queuedSubmissions.first?.origin?.uploadAttempted, true, "still possibly on the hub")
         chat.removeQueuedSubmission(id: item.id)
         try await waitFor("the hub removal") { !FakeHubProtocol.snapshot().contains { $0.requestId == item.requestID } }

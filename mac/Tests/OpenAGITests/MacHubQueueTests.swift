@@ -14,13 +14,16 @@ final class MacFakeHubProtocol: URLProtocol {
   static var fullNextEnqueue = false
   /// Accept the next queued message, then drop the connection (no answer).
   static var dropNextEnqueueAnswer = false
+  /// Every queue POST fails without reaching the hub (offline), however
+  /// often it is retried.
+  static var offlineEnqueue = false
   /// Accept the next queued message but hold its answer until released.
   static var holdNextEnqueue = false
   static var revision = 1
   private static var heldEnqueue: (proto: MacFakeHubProtocol, runLoop: CFRunLoop, answer: [String: Any])?
 
   static func reset() {
-    lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; dropNextEnqueueAnswer = false; holdNextEnqueue = false; heldEnqueue = nil; revision = 1 }
+    lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; dropNextEnqueueAnswer = false; holdNextEnqueue = false; heldEnqueue = nil; revision = 1; offlineEnqueue = false }
   }
   static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
   static func releaseEnqueue() {
@@ -71,6 +74,10 @@ final class MacFakeHubProtocol: URLProtocol {
     Self.log.append("\(method) \(path)" + (body["text"].map { " \($0)" } ?? "") + ((body["next"] as? Bool) == true ? " NEXT" : ""))
     if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
     if path == "/conversations/supervisor/queue", method == "POST" {
+      if Self.offlineEnqueue {
+        client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
+        return
+      }
       if Self.failNextEnqueue {
         Self.failNextEnqueue = false
         client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
@@ -263,11 +270,11 @@ final class MacHubQueueTests: XCTestCase {
     try await waitFor("the hub to take it") { MacFakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then offline" } }
     try await waitFor("the lost answer") { supervisor.queuedMessages.first?.origin?.uploadAttempted == true }
     try await Task.sleep(nanoseconds: 50_000_000)
-    // The retry (asked for by an Edit tap) cannot even connect.
-    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.failNextEnqueue = true }
+    // Now every retry (an Edit tap, the backoff) cannot even connect.
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.offlineEnqueue = true }
     let item = try XCTUnwrap(supervisor.queuedMessages.first)
     XCTAssertFalse(supervisor.beginEditingQueued(id: item.id))
-    try await waitFor("the failed retry") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
+    try await waitFor("a failed retry") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count >= 2 }
     try await Task.sleep(nanoseconds: 50_000_000)
     XCTAssertEqual(supervisor.queuedMessages.first?.origin?.uploadAttempted, true, "still possibly on the hub")
     XCTAssertFalse(supervisor.beginEditingQueued(id: item.id), "still no local-only edit")
