@@ -22,11 +22,11 @@ import {
 } from "./contracts.js";
 import { chooseRoute } from "./policy.js";
 import { readThreadConversation } from "./conversation.js";
-import { normalizePaseoImages } from "./paseo-delivery.js";
+import { normalizePaseoImages, readHostModelUsageCounts, resolveDefaultPaseoModeId, selectBestPaseoModel, titlesMatchForFailover } from "./paseo-delivery.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
 
-const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
 
 function cleanName(value) {
@@ -41,7 +41,7 @@ export function deriveProjectInfo({ cwd = null, workspace = null, projectName = 
     ?? null;
   const rawCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim().replace(/\/+$/, "") : null;
   const ws = cleanName(workspace);
-  const explicitProj = projectName && !/imported history/i.test(String(projectName))
+  const explicitProj = projectName && !/imported[-_ ]history/i.test(String(projectName))
     ? cleanName(projectName)
     : null;
 
@@ -71,7 +71,7 @@ export function deriveProjectInfo({ cwd = null, workspace = null, projectName = 
       project = codexWtMatch[1];
     } else if (devMatch) {
       project = devMatch[1];
-    } else if (!/\/imported history(?:\/|$)/i.test(rawCwd)) {
+    } else if (!/\/imported[-_ ]history(?:\/|$)/i.test(rawCwd) && !/\/codex-worktrees\/[0-9a-f]+$/i.test(rawCwd)) {
       const base = path.basename(rawCwd);
       if (base && base !== "." && base !== "/" && !OPAQUE_ID_RE.test(base) && !/^\d{3,6}$/.test(base)) {
         project = base;
@@ -1027,6 +1027,72 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
   try { if (mergedRes.code === 0) rawMerged = JSON.parse(mergedRes.stdout || "[]"); } catch { rawMerged = []; }
   try { if (releaseRes.code === 0) rawReleases = JSON.parse(releaseRes.stdout || "[]"); } catch { rawReleases = []; }
 
+  // Open/merged list endpoints do not include a tracked PR that was closed
+  // without merging. Reconcile a small bounded set of cached Active Work/PR
+  // refs with the authoritative single-PR endpoint so an obsolete orphan
+  // cannot remain OPEN forever.
+  const trackedRefs = new Map();
+  const addTrackedRef = (ref) => {
+    const parsed = parsePrRef(ref);
+    if (parsed?.repo?.toLowerCase() === resolvedRepo.toLowerCase()) {
+      const canonicalRef = `${resolvedRepo}#${parsed.number}`;
+      trackedRefs.set(canonicalRef, {
+        number: parsed.number,
+        reconciledAt: supervisor?.lastPrs?.get?.(canonicalRef)?.reconciledAt ?? null
+      });
+    }
+  };
+  for (const ref of supervisor?.lastPrs?.keys?.() ?? []) addTrackedRef(ref);
+  for (const thread of [...(supervisor?.knownThreads ?? []), ...(supervisor?.lastThreads ?? [])].map(([, value]) => value)) {
+    for (const ref of thread?.prRefs ?? []) addTrackedRef(ref);
+  }
+  for (const item of supervisor?.activeWork?.state?.items ?? []) addTrackedRef(item?.prRef);
+  const represented = new Set([
+    ...(Array.isArray(rawOpen) ? rawOpen : []).map((pr) => `${resolvedRepo}#${pr.number}`),
+    ...(Array.isArray(rawMerged) ? rawMerged : []).map((pr) => `${resolvedRepo}#${pr.number}`)
+  ]);
+  const trackedPrs = [];
+  const trackedCandidates = [...trackedRefs.entries()]
+    .filter(([ref]) => !represented.has(ref))
+    .sort(([, a], [, b]) => (Date.parse(a.reconciledAt ?? "") || 0) - (Date.parse(b.reconciledAt ?? "") || 0))
+    .slice(0, 8);
+  await Promise.all(trackedCandidates.map(async ([ref, number]) => {
+    try {
+      const viewed = await runImpl(
+        ghBin,
+        ["pr", "view", String(number.number), "--repo", resolvedRepo,
+          "--json", "number,title,state,headRefName,baseRefName,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,updatedAt,closedAt,mergedAt,url,headRefOid"],
+        { timeoutMs: 12_000 }
+      );
+      if (viewed.code !== 0) return;
+      const pr = JSON.parse(viewed.stdout || "{}");
+      const rollup = summarizeStatusRollup(pr.statusCheckRollup);
+      const reconciledAt = new Date().toISOString();
+      trackedPrs.push({
+        number: number.number,
+        ref,
+        title: clampText(redactSecrets(String(pr.title ?? "")), 160),
+        url: pr.url ?? null,
+        state: String(pr.state ?? "").toUpperCase() || null,
+        headRef: pr.headRefName ?? null,
+        baseRef: pr.baseRefName ?? null,
+        headOid: pr.headRefOid ?? null,
+        isDraft: Boolean(pr.isDraft),
+        mergeState: pr.mergeStateStatus ?? null,
+        reviewDecision: pr.reviewDecision ?? null,
+        ciState: rollup.ciState,
+        failingChecks: rollup.failingChecks,
+        pendingChecks: rollup.pendingChecks,
+        updatedAt: pr.updatedAt ?? null,
+        closedAt: pr.closedAt ?? null,
+        mergedAt: pr.mergedAt ?? null,
+        reconciledAt
+      });
+      const cached = supervisor?.lastPrs?.get?.(ref);
+      if (cached) supervisor.lastPrs.set(ref, { ...cached, reconciledAt });
+    } catch { /* a stale/missing ref is left unchanged */ }
+  }));
+
   const allThreads = collapseMigratedThreads(
     new Map([
       ...(supervisor?.knownThreads ?? []),
@@ -1113,6 +1179,7 @@ export async function inspectRepoStatus(supervisor, { repo = null, workspace = n
       overlappingPrCount: openPrs.filter((p) => p.overlapping).length
     },
     openPrs,
+    trackedPrs,
     recentlyMerged,
     releases
   };
@@ -1159,11 +1226,19 @@ export async function resolvePaseoAgentConfig(api, cwd, {
   provider = null,
   model = null,
   effort = null,
-  modeId = null
+  modeId = null,
+  preferences = null
 } = {}) {
   const rawProv = typeof provider === "string" ? provider.trim() : "";
   const rawModel = typeof model === "string" ? model.trim() : "";
-  const KNOWN_PROVIDERS = new Set(["codex", "claude", "opencode", "gemini", "cursor"]);
+  const KNOWN_PROVIDERS = new Set(["codex", "claude", "antigravity", "opencode", "gemini", "cursor"]);
+  const prefDefaultProvider = String(preferences?.defaultProvider ?? "claude").toLowerCase();
+  const prefPermissionMode = String(preferences?.defaultPermissionMode ?? "bypass").toLowerCase();
+  const prefDefaultModels = preferences?.defaultModels ?? {
+    claude: "claude-opus-5-5",
+    codex: "gpt-6.2-sol",
+    antigravity: "gemini-4-carbon-high"
+  };
 
   let explicitFamily = null;
   let modelQuery = rawModel || null;
@@ -1190,15 +1265,17 @@ export async function resolvePaseoAgentConfig(api, cwd, {
 
   const entries = Array.isArray(snap?.entries) ? snap.entries.filter((e) => e?.status === "ready") : [];
   if (entries.length > 0) {
+    const primaryDefault = prefDefaultProvider === "codex" ? "codex" : prefDefaultProvider === "antigravity" ? "antigravity" : "claude";
+    const secondaryDefault = primaryDefault === "claude" ? "codex" : "claude";
     const orderedEntries = explicitFamily
       ? [
           ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === explicitFamily),
           ...entries.filter((e) => String(e.provider ?? "").toLowerCase() !== explicitFamily)
         ]
       : [
-          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "codex"),
-          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === "claude"),
-          ...entries.filter((e) => !["codex", "claude"].includes(String(e.provider ?? "").toLowerCase()))
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === primaryDefault),
+          ...entries.filter((e) => String(e.provider ?? "").toLowerCase() === secondaryDefault),
+          ...entries.filter((e) => ![primaryDefault, secondaryDefault].includes(String(e.provider ?? "").toLowerCase()))
         ];
 
     if (modelQuery) {
@@ -1222,7 +1299,9 @@ export async function resolvePaseoAgentConfig(api, cwd, {
           }
           const hayTokens = tokenizeMatchQuery(`${mid} ${mlabel} ${entry.provider ?? ""}`);
           if (qTokens.length > 0 && qTokens.every((t) => hayTokens.includes(t) || midLower.includes(t) || labelLower.includes(t))) {
-            const score = 50 + qTokens.length + famMatchBonus + (m?.isDefault ? 1 : 0);
+            // Prefer newer semantic generations (e.g. opus 5.5 over opus 4.7 when user says "opus")
+            const genBonus = /5[-.]5/.test(midLower) ? 8 : /-[5-9]\b/.test(midLower) ? 5 : /-4[-.]7/.test(midLower) ? -10 : 0;
+            const score = 50 + qTokens.length + famMatchBonus + genBonus;
             if (score > bestScore) {
               bestScore = score;
               bestMatch = { entry, model: m };
@@ -1234,11 +1313,15 @@ export async function resolvePaseoAgentConfig(api, cwd, {
 
       if (bestMatch) {
         const thinkingOptionId = matchThinkingOptionId(bestMatch.model, effort);
+        const resolvedModeId = resolveDefaultPaseoModeId(bestMatch.entry, {
+          permissionMode: prefPermissionMode,
+          explicitModeId: modeId
+        });
         return {
           provider: `${bestMatch.entry.provider}/${bestMatch.model.id}`,
           model: bestMatch.model.id,
           ...(thinkingOptionId ? { thinkingOptionId } : {}),
-          ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+          ...(resolvedModeId ? { modeId: resolvedModeId } : {})
         };
       }
     }
@@ -1247,27 +1330,55 @@ export async function resolvePaseoAgentConfig(api, cwd, {
       ? entries.find((e) => String(e.provider ?? "").toLowerCase() === explicitFamily)
       : null)
       ?? orderedEntries[0];
-    const pickedModel = picked?.models?.find((m) => m?.isDefault) ?? picked?.models?.[0] ?? null;
+    const pickedProviderLower = String(picked?.provider ?? "").toLowerCase();
+    const usageCounts = await readHostModelUsageCounts(api);
+    const pickedModel = selectBestPaseoModel(picked, {
+      usageCounts,
+      preferredModelId: prefDefaultModels?.[pickedProviderLower] ?? null
+    });
     if (picked?.provider && (modelQuery || pickedModel?.id)) {
       const chosenModelId = modelQuery || pickedModel.id;
       const thinkingOptionId = matchThinkingOptionId(pickedModel, effort);
+      const resolvedModeId = resolveDefaultPaseoModeId(picked, {
+        permissionMode: prefPermissionMode,
+        explicitModeId: modeId
+      });
       return {
         provider: `${picked.provider}/${chosenModelId}`,
         model: chosenModelId,
         ...(thinkingOptionId ? { thinkingOptionId } : {}),
-        ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+        ...(resolvedModeId ? { modeId: resolvedModeId } : {})
       };
     }
   }
 
-  const fallbackFamily = explicitFamily || (modelQuery && /claude|sonnet|opus|haiku/i.test(modelQuery) ? "claude" : "codex");
-  const fallbackSpec = modelQuery ? `${fallbackFamily}/${modelQuery}` : (rawProv || fallbackFamily);
+  // Discovery failed: an explicit provider wins, then the family the
+  // requested model names, then the configured default provider, so a
+  // Claude model is never paired with Codex (or an Antigravity default lost).
+  const BUILTIN_DEFAULT_MODELS = { claude: "claude-opus-5-5", codex: "gpt-6.2-sol", antigravity: "gemini-4-carbon-high" };
+  const modelFamily = !modelQuery ? null
+    : /claude|opus|sonnet|haiku/i.test(modelQuery) ? "claude"
+      : /gpt|sol|astra|codex/i.test(modelQuery) ? "codex"
+        : /gemini/i.test(modelQuery) ? (["gemini", "antigravity"].includes(prefDefaultProvider) ? prefDefaultProvider : "antigravity")
+          : null;
+  const fallbackFamily = explicitFamily
+    || modelFamily
+    || (KNOWN_PROVIDERS.has(prefDefaultProvider) ? prefDefaultProvider : "claude");
+  const defaultFallbackModel = modelQuery
+    || prefDefaultModels?.[fallbackFamily]
+    || BUILTIN_DEFAULT_MODELS[fallbackFamily]
+    || null;
+  const fallbackSpec = defaultFallbackModel ? `${fallbackFamily}/${defaultFallbackModel}` : (rawProv || fallbackFamily);
   const thinkingOptionId = normalizeEffortId(effort);
+  const resolvedModeId = resolveDefaultPaseoModeId(
+    { provider: fallbackFamily },
+    { permissionMode: prefPermissionMode, explicitModeId: modeId }
+  );
   return {
     provider: fallbackSpec,
-    ...(modelQuery ? { model: modelQuery } : {}),
+    ...(defaultFallbackModel ? { model: defaultFallbackModel } : {}),
     ...(thinkingOptionId ? { thinkingOptionId } : {}),
-    ...(typeof modeId === "string" && modeId.trim() ? { modeId: modeId.trim() } : {})
+    ...(resolvedModeId ? { modeId: resolvedModeId } : {})
   };
 }
 
@@ -1283,6 +1394,7 @@ export async function startPaseoSession(supervisor, {
   effort = null,
   modeId = null,
   images = null,
+  allowDuplicate = false,
   factory
 } = {}) {
   if (!supervisor?.config?.paseo?.enabled) {
@@ -1442,6 +1554,103 @@ export async function startPaseoSession(supervisor, {
     }
   }
 
+  // Anti-clone guard: never spawn duplicate "Continue ..." / "Resume ..." /
+  // "Failover ..." agents or duplicate an active session on the exact same
+  // title/PR in the same workspace when we can queue/send to the existing live
+  // Paseo session instead.
+  if (allowDuplicate !== true && typeof supervisor?.sendOwnerMessage === "function" && resolvedServerId && resolvedCwd) {
+    const continueLike = /^(?:continu(?:e|ing)|resum(?:e|ing)|failover|recover\s+idle)\b|\bafter\s+failover\b/i.test(cleanTitle || "")
+      || /^(?:continu(?:e|ing)|resum(?:e|ing))\s+(?:the\s+|this\s+|where\s+|work\b|active\s+work\b|pr\s*#\d+)/i.test(cleanPrompt);
+    const extractPrNums = (text) => new Set([...String(text ?? "").matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]));
+    const reqPrNums = extractPrNums(`${cleanTitle ?? ""} ${cleanPrompt}`);
+    const normResolvedCwd = resolvedCwd.replace(/\/+$/, "");
+    const knownPool = new Map([
+      ...(supervisor?.knownThreads ?? []),
+      ...(supervisor?.lastThreads ?? [])
+    ]);
+    const liveExisting = [...knownPool.values()]
+      .filter((t) => {
+        if (!t?.key || t.kind !== "paseo" || t.archived || t.excluded) return false;
+        if (["error", "closed"].includes(String(t.agentStatus ?? "").toLowerCase())) return false;
+        if (t.meta?.serverId !== resolvedServerId) return false;
+        const tCwd = String(t.meta?.paseoCwd ?? t.cwd ?? "").trim().replace(/\/+$/, "");
+        if (!tCwd || tCwd !== normResolvedCwd) return false;
+        const tPrNums = new Set([
+          ...extractPrNums(t.title),
+          ...(t.prRefs ?? []).map((r) => String(r).split("#")[1]).filter(Boolean)
+        ]);
+        const sharedPr = [...reqPrNums].some((num) => tPrNums.has(num));
+        const exactNorm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        const exactTitleMatch = Boolean(cleanTitle && t.title && exactNorm(cleanTitle) === exactNorm(t.title));
+        // Only apply fuzzy failover title matching when the request is a
+        // continuation/recovery ("Continue ...", "Resume ...", "Failover ...");
+        // distinct new-work titles (e.g. "Fix Android production checkout" vs
+        // "Fix Android production login") must stay separate sessions.
+        const fuzzyTitleMatch = Boolean(continueLike && cleanTitle && t.title && titlesMatchForFailover(cleanTitle, t.title));
+        const promptTitleMatch = Boolean(continueLike && t.title && titlesMatchForFailover(cleanTitle || cleanPrompt.slice(0, 90), t.title));
+        const sameSourceLive = Boolean(continueLike && cleanFromKey && t.key === cleanFromKey);
+        return exactTitleMatch || fuzzyTitleMatch || promptTitleMatch || sameSourceLive || (continueLike && sharedPr);
+      })
+      .sort((a, b) => {
+        const rank = (s) => (s.agentStatus === "running" ? 0 : s.agentStatus === "idle" ? 1 : 2);
+        return rank(a) - rank(b) || String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? ""));
+      })[0] ?? null;
+
+    if (liveExisting) {
+      const sent = await supervisor.sendOwnerMessage(liveExisting.key, cleanPrompt, {
+        queue: true,
+        ...(normalizedImages.length ? { images: normalizedImages } : {})
+      });
+      const deliveryStatus = sent?.delivery?.status ?? "blocked";
+      const alreadyDelivered = sent?.delivery?.duplicate === true;
+      if (deliveryStatus === "sent" || deliveryStatus === "queued" || alreadyDelivered) {
+        supervisor.store?.recordAction?.({
+          kind: "session-reuse",
+          playbook: "owner-reuse-session",
+          threadKey: liveExisting.key,
+          route: sent.delivery.route ?? (deliveryStatus === "queued" ? "paseo-queue" : "paseo-send"),
+          status: alreadyDelivered ? "reused" : deliveryStatus,
+          by: "owner",
+          reason: clampText(`reused existing Paseo session "${liveExisting.title}" instead of creating a duplicate`, 240)
+        });
+        return {
+          status: deliveryStatus === "queued" ? "queued_existing" : "reused_existing",
+          reused: true,
+          ...(alreadyDelivered ? { duplicate: true } : {}),
+          key: liveExisting.key,
+          serverId: resolvedServerId,
+          agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
+          title: liveExisting.title,
+          workspace: workspaceLabel ?? liveExisting.workspace ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+          inferredWorkspace,
+          cwd: resolvedCwd,
+          provider: liveExisting.meta?.provider ?? null,
+          model: liveExisting.meta?.model ?? null,
+          delivery: sent.delivery,
+          openChat: openChatFor(liveExisting)
+        };
+      }
+      // Never silently fall through to api.agents.create and spawn a duplicate
+      // clone when an existing live session matched but blocked delivery (e.g.
+      // pending permission prompt); propagate the blocked reuse result cleanly.
+      return {
+        status: "blocked",
+        reused: true,
+        key: liveExisting.key,
+        serverId: resolvedServerId,
+        agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
+        title: liveExisting.title,
+        workspace: workspaceLabel ?? liveExisting.workspace ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+        inferredWorkspace,
+        cwd: resolvedCwd,
+        provider: liveExisting.meta?.provider ?? null,
+        model: liveExisting.meta?.model ?? null,
+        delivery: sent?.delivery ?? { status: "blocked", route: null, detail: "Existing session blocked delivery; no duplicate session created." },
+        openChat: openChatFor(liveExisting)
+      };
+    }
+  }
+
   const createCfg = {
     ...supervisor.config,
     paseo: { ...supervisor.config.paseo, timeoutMs: Math.min(supervisor.config.paseo.timeoutMs ?? 30_000, 30_000) }
@@ -1450,7 +1659,14 @@ export async function startPaseoSession(supervisor, {
   const created = await withPaseo(createCfg, async (client, signal) => {
     const directory = await client.hosts.list();
     const api = await hostApi(client, resolvedServerId, directory);
-    const agentConfig = await resolvePaseoAgentConfig(api, resolvedCwd, { provider, model, effort, modeId });
+    const ownerPreferences = supervisor?.store?.preferences?.() ?? supervisor?.getState?.()?.preferences ?? null;
+    const agentConfig = await resolvePaseoAgentConfig(api, resolvedCwd, {
+      provider,
+      model,
+      effort,
+      modeId,
+      preferences: ownerPreferences
+    });
     signal.throwIfAborted();
     const handle = await api.agents.create({
       config: agentConfig,

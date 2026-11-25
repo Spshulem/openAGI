@@ -75,4 +75,20 @@ final class FleetNeedsYouMacTests: XCTestCase {
     XCTAssertEqual(digest.sections.map(\.kind), [.blocker, .decision, .evidence])
     XCTAssertNil(q.needsYouBadge(card: nil), "a plain decision carries no badge")
   }
+
+  func testCurrentStateLeadsAndWhatChangedBecomesEvidence() throws {
+    let state = try JSONDecoder().decode(FleetState.self, from: Data("""
+      {"questions":[{"id":"q1","kind":"agent-ask","title":"Ship it?","decisionFact":"Production needs you."}],
+       "cards":[{"id":"q1","brief":{"context":"Ship checkout","currentState":"Green and staged.",
+                 "whatChanged":"Rebased on main; 3 visual changes.","decision":"Ship now or Monday?"}}]}
+      """.utf8))
+    let card = try XCTUnwrap(state.cards.first)
+    XCTAssertEqual(card.currentState, "Green and staged.")
+    let digest = state.questions[0].needsYouDigest(card: card)
+    XCTAssertEqual(digest.sections(.state).first?.text, "Green and staged.")
+    XCTAssertEqual(digest.sections(.evidence).first?.text, "Rebased on main; 3 visual changes.")
+    // Without a current state, what changed is where it stands.
+    let older = FleetCardBrief(id: "q1", whatChanged: "Rebased on main.")
+    XCTAssertEqual(state.questions[0].needsYouDigest(card: older).sections(.state).first?.text, "Rebased on main.")
+  }
 }

@@ -2,9 +2,15 @@ name: iOS mobile
 
 on:
   pull_request:
+    # Everything the iOS app builds in or talks to: its sources, the shared
+    # Swift package, the embedded daemon (src/, the mobile entry, built-in
+    # skills, package*.json) and the push relay. Changes that cannot reach
+    # the iOS build or its tests are left out below: the Android app, its
+    # workflow, and the mobile docs (no app target bundles them). Skill
+    # Markdown under examples/skills is runtime data and stays covered.
     paths:
       - "mobile/**"
-      - "shared/SupervisorChannelsKit/**"
+      - "shared/**"
       - "src/**"
       - "bin/mobile-entry.mjs"
       - "examples/skills/**"
@@ -12,7 +18,19 @@ on:
       - "relay/**"
       - ".github/workflows/mobile-*.yml"
       - ".github/workflows/push-relay.yml"
+      - "scripts/ios-ui-scope.mjs"
+      - "!mobile/android/**"
+      - "!.github/workflows/mobile-android.yml"
+      - "!mobile/*.md"
+      - "!mobile/**/*.md"
   workflow_dispatch:
+
+# A new push to the same PR replaces the run still testing the old head: one
+# 1-2 h macOS run per head instead of a queue of stale ones. Manual runs
+# (workflow_dispatch, release checks) are never cancelled.
+concurrency:
+  group: ios-mobile-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -22,7 +40,11 @@ jobs:
     runs-on: xcode-27
     timeout-minutes: 120
     steps:
+      # Two commits: a pull request checks out GitHub's merge commit, whose
+      # first parent is the base, so HEAD^1..HEAD is exactly the PR's change.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       # 27.2 links the native Duo vertical bars and reserved-region APIs with the supported App Store SDK.
       - uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -36,6 +58,25 @@ jobs:
         with:
           node-version: '22.21.1'
       - run: npm ci --omit=dev --ignore-scripts
+      # The UI suites use synthetic responses and never start the embedded
+      # daemon, so a change only to its JavaScript (or to tests and docs)
+      # cannot change their result: it still gets the device build and every
+      # unit test, including the embedded-daemon integration test. Anything
+      # else, a manual run, or an unknown diff runs every suite.
+      - name: Decide which iOS suites this change needs
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && git rev-parse -q --verify HEAD^2 >/dev/null; then
+            decision=$(git diff --name-only HEAD^1 HEAD | node scripts/ios-ui-scope.mjs)
+          else
+            decision=$(printf 'ui=true\nreason=not a pull request merge; running every suite\n')
+          fi
+          echo "$decision" >> "$GITHUB_OUTPUT"
+          echo "$decision"
+          {
+            echo "### iOS suites"
+            echo "$decision" | sed -e 's/^ui=true$/UI suites: run/' -e 's/^ui=false$/UI suites: skipped/' -e 's/^reason=/Why: /'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Fetch embedded runtime
         run: mobile/ios/scripts/fetch-node-runtime.sh
       - name: Install XcodeGen
@@ -67,6 +108,7 @@ jobs:
           retention-days: 7
       # Exercise the expanded-pane regression before the longer phone suites.
       - name: Test expanded workspace navigation
+        if: steps.scope.outputs.ui == 'true'
         working-directory: mobile/ios
         run: |
           device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"].startswith("iPad Pro 13-inch")))')
@@ -104,6 +146,8 @@ jobs:
           xcrun simctl shutdown "$simulator_id"
       - name: Build and test iOS app
         working-directory: mobile/ios
+        env:
+          UI_SUITES: ${{ steps.scope.outputs.ui }}
         run: |
           device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "iPhone Duo"))')
           xcrun simctl list runtimes -j > "$RUNNER_TEMP/openagi-runtimes.json"
@@ -126,18 +170,20 @@ jobs:
           python3 scripts/seed-test-photo.py "$simulator_id"
           # Fail fast on the long-history scroll/send regression, before the
           # remaining unit and UI suites. The full run skips this tested case.
-          xcodebuild test \
-            -project OpenAGI.xcodeproj \
-            -scheme OpenAGI \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=$simulator_id" \
-            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
-            -resultBundlePath "$RUNNER_TEMP/OpenAGI-Duo-scroll-UI.xcresult" \
-            -only-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_ALLOWED=YES
+          if [ "$UI_SUITES" = "true" ]; then
+            xcodebuild test \
+              -project OpenAGI.xcodeproj \
+              -scheme OpenAGI \
+              -configuration Debug \
+              -destination "platform=iOS Simulator,id=$simulator_id" \
+              -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+              -resultBundlePath "$RUNNER_TEMP/OpenAGI-Duo-scroll-UI.xcresult" \
+              -only-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              CODE_SIGN_IDENTITY=- \
+              CODE_SIGNING_ALLOWED=YES
+          fi
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -150,22 +196,25 @@ jobs:
             -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
-          xcrun simctl terminate "$simulator_id" sh.openagi.OpenAGI >/dev/null 2>&1 || true
-          sleep 2
-          xcodebuild test \
-            -project OpenAGI.xcodeproj \
-            -scheme OpenAGI \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=$simulator_id" \
-            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
-            -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
-            -only-testing:OpenAGIUITests \
-            -skip-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_ALLOWED=YES
+          if [ "$UI_SUITES" = "true" ]; then
+            xcrun simctl terminate "$simulator_id" sh.openagi.OpenAGI >/dev/null 2>&1 || true
+            sleep 2
+            xcodebuild test \
+              -project OpenAGI.xcodeproj \
+              -scheme OpenAGI \
+              -configuration Debug \
+              -destination "platform=iOS Simulator,id=$simulator_id" \
+              -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+              -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
+              -only-testing:OpenAGIUITests \
+              -skip-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              CODE_SIGN_IDENTITY=- \
+              CODE_SIGNING_ALLOWED=YES
+          fi
       - name: Test native iPhone navigation and controls
+        if: steps.scope.outputs.ui == 'true'
         working-directory: mobile/ios
         run: |
           xcrun simctl shutdown "$OPENAGI_DUO_SIM" || true

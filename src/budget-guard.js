@@ -7,6 +7,9 @@ import { CreditLedger } from "./credit-ledger.js";
 // USD per 1M tokens. Keep specific variants (…-nano, …-mini, …-5.5) listed so
 // priceFor's longest-prefix match doesn't bill a nano call at flagship rates.
 const DEFAULT_PRICES = {
+  "claude-opus-5-5": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  "claude-opus-5": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  "claude-sonnet-5-5": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-opus-4-7": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
   "claude-haiku-4-5": { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 },
@@ -23,8 +26,11 @@ const DEFAULT_PRICES = {
   // published, so it is not modelled here (the per-call input cap in the
   // providers keeps chat turns far below it).
   "gpt-6-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
-  // gpt-6.1-sol (the owner's ceiling): past 272K input tokens the whole
+  // gpt-6.1-sol / gpt-6.2-sol (the owner's ceiling): past 272K input tokens the whole
   // request bills at 2x input/cache and 1.5x output; the cap keeps calls under.
+  "gpt-6.2-astra": { in: 10, out: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "gpt-6.2-sol": { in: 2, out: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+  "gpt-6.2-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-6.1-sol": { in: 2, out: 10, cacheRead: 0.1, cacheWrite: 2.5 },
   "gpt-6-luna": { in: 0.1, out: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
   "gpt-5.6-terra": { in: 2, out: 12, cacheRead: 0.2, cacheWrite: 0 },
@@ -45,28 +51,230 @@ const DEFAULT_PRICES = {
   default: { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 }
 };
 
+const TIMEZONE_FORMATTERS = new Map();
+
+export function resolveBudgetTimeZone(candidate) {
+  if (typeof candidate !== "string") return null;
+  const trimmed = candidate.trim();
+  if (!trimmed || trimmed.length > 80) return null;
+  if (trimmed === "Etc/UTC" || trimmed === "Etc/GMT" || trimmed === "GMT") return "UTC";
+  try {
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: trimmed,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(new Date(0));
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+function formatDayInTimeZone(value, timeZone) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const zone = resolveBudgetTimeZone(timeZone) ?? "UTC";
+  let formatter = TIMEZONE_FORMATTERS.get(zone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    });
+    TIMEZONE_FORMATTERS.set(zone, formatter);
+  }
+  return formatter.format(date);
+}
+
 export class BudgetGuard {
   constructor(options = {}) {
     this.storePath = options.storePath ?? path.join(resolveDataDir(), "budget", "usage.json");
     this.dailyUsdLimit = options.dailyUsdLimit ?? Number.parseFloat(process.env.OPENAGI_DAILY_USD_LIMIT ?? "10");
     this.prices = { ...DEFAULT_PRICES, ...(options.prices ?? {}) };
+    this._now = typeof options.now === "function" ? options.now : () => new Date();
     ensureDir(path.dirname(this.storePath));
     this.state = readJsonFile(this.storePath, { version: 1, days: {} });
     this.ledger = options.ledger ?? new CreditLedger({ storePath: path.join(path.dirname(this.storePath), "ledger.jsonl") });
+    // An owner's setTimeZone() choice is stored with `timeZoneExplicit` so it
+    // keeps outranking client X-OpenAGI-Timezone adoption across restarts.
+    this._explicitTimeZone = resolveBudgetTimeZone(options.timeZone)
+      ?? resolveBudgetTimeZone(process.env.OPENAGI_TIMEZONE ?? process.env.OPENAGI_TIME_ZONE)
+      ?? (this.state.timeZoneExplicit === true ? resolveBudgetTimeZone(this.state.timeZone) : null)
+      ?? null;
+    this.timeZone = this._explicitTimeZone
+      ?? resolveBudgetTimeZone(this.state.timeZone)
+      ?? resolveBudgetTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone)
+      ?? "UTC";
+    this._syncTimeZoneBuckets({ persistIfEmpty: false });
   }
 
-  todayKey() {
-    return new Date().toISOString().slice(0, 10);
+  dayKeyFor(value, timeZone = this.timeZone) {
+    return formatDayInTimeZone(value, timeZone);
+  }
+
+  todayKey(now = this._now()) {
+    return formatDayInTimeZone(now, this.timeZone) ?? new Date().toISOString().slice(0, 10);
+  }
+
+  _syncTimeZoneBuckets({ persistIfEmpty = true } = {}) {
+    const prevZone = resolveBudgetTimeZone(this.state.daysTimeZone) ?? "UTC";
+    if (prevZone === this.timeZone) {
+      this.state.daysTimeZone = this.timeZone;
+      return false;
+    }
+    const rows = typeof this.ledger?._readAll === "function"
+      ? this.ledger._readAll()
+      : (this.ledger?.query?.({ days: 30, now: this._now() }) ?? []);
+    if (rows.length > 0) {
+      const rebucketed = {};
+      let minCoveredKey = null;
+      for (const row of rows) {
+        if (!row?.at) continue;
+        const nextKey = this.dayKeyFor(row.at, this.timeZone);
+        const oldKey = this.dayKeyFor(row.at, prevZone);
+        if (!nextKey) continue;
+        for (const candidateKey of [nextKey, oldKey]) {
+          if (candidateKey && (!minCoveredKey || candidateKey < minCoveredKey)) {
+            minCoveredKey = candidateKey;
+          }
+        }
+        const day = (rebucketed[nextKey] ??= {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          usd: 0,
+          calls: 0
+        });
+        const tokens = row.tokens ?? {};
+        const usd = Number.isFinite(Number(row.usd)) ? Math.max(0, Number(row.usd)) : 0;
+        day.input += Number(tokens.input ?? 0) || 0;
+        day.output += Number(tokens.output ?? 0) || 0;
+        day.cacheRead += Number(tokens.cacheRead ?? 0) || 0;
+        day.cacheWrite += Number(tokens.cacheWrite ?? 0) || 0;
+        day.usd += usd;
+        if (row.channel === "voice") day.voiceUsd = (day.voiceUsd ?? 0) + usd;
+        day.calls += 1;
+      }
+      if (minCoveredKey) {
+        this.state.days ??= {};
+        for (const existingKey of Object.keys(this.state.days)) {
+          if (existingKey >= minCoveredKey) {
+            delete this.state.days[existingKey];
+          }
+        }
+        for (const [k, bucket] of Object.entries(rebucketed)) {
+          this.state.days[k] = bucket;
+        }
+      }
+    }
+    this.state.daysTimeZone = this.timeZone;
+    if (persistIfEmpty || rows.length > 0 || Object.keys(this.state.days ?? {}).length > 0) {
+      this.persist();
+    }
+    return true;
+  }
+
+  setTimeZone(candidate) {
+    const valid = resolveBudgetTimeZone(candidate);
+    if (!valid) {
+      const err = new Error("Invalid IANA time zone.");
+      err.code = "INVALID_BUDGET";
+      throw err;
+    }
+    this.timeZone = valid;
+    this._explicitTimeZone = valid;
+    this.state.timeZone = valid;
+    this.state.timeZoneExplicit = true;
+    this._syncTimeZoneBuckets({ persistIfEmpty: true });
+    this.persist();
+    return this.status();
+  }
+
+  adoptClientTimeZone(candidate) {
+    const valid = resolveBudgetTimeZone(candidate);
+    if (!valid) return false;
+    if (this._explicitTimeZone) return false;
+    if (valid === "UTC" && this.timeZone !== "UTC") return false;
+    if (valid === this.timeZone && this.state.timeZone === valid && this.state.daysTimeZone === valid) {
+      return false;
+    }
+    this.timeZone = valid;
+    this.state.timeZone = valid;
+    this._syncTimeZoneBuckets({ persistIfEmpty: true });
+    this.persist();
+    return true;
+  }
+
+  bonusTodayUsd() {
+    const raw = Number(this.state.bonusByDay?.[this.todayKey()] ?? 0);
+    return Number.isFinite(raw) && raw > 0 ? Number(raw.toFixed(4)) : 0;
+  }
+
+  effectiveDailyLimitUsd() {
+    return Number((this.dailyUsdLimit + this.bonusTodayUsd()).toFixed(4));
+  }
+
+  setDailyLimit(limitUsd) {
+    const parsed = Number(limitUsd);
+    if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+      const err = new Error("Daily budget limit must be between $0.50 and $10,000.");
+      err.code = "INVALID_BUDGET";
+      throw err;
+    }
+    this.dailyUsdLimit = Number(parsed.toFixed(2));
+    return this.status();
+  }
+
+  addBonusToday(addUsd) {
+    const parsed = Number(addUsd);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 10000) {
+      const err = new Error("Added budget must be between $0.01 and $10,000.");
+      err.code = "INVALID_BUDGET";
+      throw err;
+    }
+    const today = this.todayKey();
+    this.state.bonusByDay ??= {};
+    this.state.bonusByDay[today] = Number((this.bonusTodayUsd() + parsed).toFixed(2));
+    const keepKeys = new Set(
+      Object.keys(this.state.bonusByDay)
+        .sort((a, b) => b.localeCompare(a))
+        .slice(0, 14)
+    );
+    keepKeys.add(today);
+    for (const key of Object.keys(this.state.bonusByDay)) {
+      if (!keepKeys.has(key)) delete this.state.bonusByDay[key];
+    }
+    this.persist();
+    return this.status();
+  }
+
+  clearBonusToday() {
+    const today = this.todayKey();
+    if (this.state.bonusByDay && today in this.state.bonusByDay) {
+      delete this.state.bonusByDay[today];
+      this.persist();
+    }
+    return this.status();
   }
 
   status() {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
+    const bonusUsdToday = this.bonusTodayUsd();
+    const effectiveLimitUsd = this.effectiveDailyLimitUsd();
+    const reservedUsd = Object.values(this.voiceReservationsToday()).reduce((sum, usd) => sum + usd, 0);
     return {
       today,
+      timeZone: this.timeZone,
       dailyUsdLimit: this.dailyUsdLimit,
+      bonusUsdToday,
+      effectiveLimitUsd,
       spentUsd: Number(day.usd.toFixed(4)),
-      remainingUsd: Number((this.dailyUsdLimit - day.usd).toFixed(4)),
+      remainingUsd: Number((effectiveLimitUsd - day.usd).toFixed(4)),
+      exceeded: day.usd + reservedUsd >= effectiveLimitUsd,
       calls: day.calls,
       tokens: { input: day.input, output: day.output, cacheRead: day.cacheRead, cacheWrite: day.cacheWrite },
       history: Object.entries(this.state.days)
@@ -80,10 +288,11 @@ export class BudgetGuard {
     const today = this.todayKey();
     const day = this.state.days[today] ?? { usd: 0 };
     const reservedUsd = Object.values(this.voiceReservationsToday()).reduce((sum, usd) => sum + usd, 0);
-    if (day.usd + reservedUsd + additionalUsd >= this.dailyUsdLimit) {
+    const effectiveLimit = this.effectiveDailyLimitUsd();
+    if (day.usd + reservedUsd + additionalUsd >= effectiveLimit) {
       const error = new Error(
-        `Daily budget reached: $${day.usd.toFixed(4)} of $${this.dailyUsdLimit.toFixed(2)}. ` +
-        `Raise OPENAGI_DAILY_USD_LIMIT or wait until tomorrow.`
+        `Daily budget reached: $${day.usd.toFixed(4)} of $${effectiveLimit.toFixed(2)}. ` +
+        `Add budget or raise your daily limit in Settings.`
       );
       error.code = "BUDGET_EXCEEDED";
       throw error;
@@ -92,7 +301,9 @@ export class BudgetGuard {
 
   record(usage, model, meta = {}) {
     if (!usage) return null;
-    const today = this.todayKey();
+    const now = meta.now instanceof Date ? meta.now : this._now();
+    const today = this.todayKey(now);
+    this.state.daysTimeZone = this.timeZone;
     if (!this.state.days[today]) this.state.days[today] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
 
     const tokens = normalizeUsage(usage);
@@ -108,7 +319,7 @@ export class BudgetGuard {
 
     try {
       this.ledger?.record({
-        at: nowIso(),
+        at: meta.at ?? now.toISOString(),
         model,
         tokens,
         usd,
@@ -117,7 +328,7 @@ export class BudgetGuard {
         sessionId: meta.sessionId ?? null,
         from: meta.from ?? null,
         tools: Array.isArray(meta.tools) ? meta.tools : []
-      });
+      }, { now });
     } catch { /* ledger is best-effort; never break a reply over it */ }
 
     this.persist();
@@ -129,7 +340,9 @@ export class BudgetGuard {
   // writes a ledger row with its channel.
   recordUsd(usd, model, meta = {}) {
     const added = Number.isFinite(Number(usd)) ? Math.max(0, Number(usd)) : 0;
-    const today = this.todayKey();
+    const now = meta.now instanceof Date ? meta.now : this._now();
+    const today = this.todayKey(now);
+    this.state.daysTimeZone = this.timeZone;
     if (!this.state.days[today]) this.state.days[today] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
     const day = this.state.days[today];
     const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...(meta.tokens ?? {}) };
@@ -141,22 +354,25 @@ export class BudgetGuard {
     day.calls += 1;
     try {
       this.ledger?.record({
-        at: nowIso(), model, tokens, usd: added,
+        at: meta.at ?? now.toISOString(), model, tokens, usd: added,
         channel: meta.channel ?? null, agentId: meta.agentId ?? null, sessionId: meta.sessionId ?? null,
         from: meta.from ?? null, tools: Array.isArray(meta.tools) ? meta.tools : []
-      });
+      }, { now });
     } catch (error) { if (meta.channel === "voice") throw error; }
     this.persist();
     return { added, today: day.usd, limit: this.dailyUsdLimit };
   }
 
-  // USD one channel spent today (UTC day, as todayKey), from the ledger.
+  // USD one channel spent today (in the guard's configured local day), from the ledger.
   channelUsdToday(channel) {
+    const today = this.todayKey();
     try {
-      const ledgerUsd = (this.ledger?.query({ days: 1 }) ?? []).filter((row) => row.channel === channel).reduce((sum, row) => sum + Number(row.usd ?? 0), 0);
-      return channel === "voice" ? Math.max(ledgerUsd, this.state.days[this.todayKey()]?.voiceUsd ?? 0) : ledgerUsd;
+      const ledgerUsd = (this.ledger?.query({ days: 2, now: this._now() }) ?? [])
+        .filter((row) => row.channel === channel && this.dayKeyFor(row.at) === today)
+        .reduce((sum, row) => sum + Number(row.usd ?? 0), 0);
+      return channel === "voice" ? Math.max(ledgerUsd, this.state.days[today]?.voiceUsd ?? 0) : ledgerUsd;
     } catch {
-      return channel === "voice" ? (this.state.days[this.todayKey()]?.voiceUsd ?? 0) : 0;
+      return channel === "voice" ? (this.state.days[today]?.voiceUsd ?? 0) : 0;
     }
   }
 

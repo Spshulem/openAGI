@@ -2112,3 +2112,29 @@ test("rich decision context survives rotation via contextSnapshot, deduplicates 
     cleanup();
   }
 });
+
+// #329 review (Codex P2): an automatic routine-slice answer never goes to a
+// watch-only session; its ask stays open for the owner.
+test("automatic routine slices never answer a watch-only session", async () => {
+  const { supervisor, cleanup } = tempSupervisor();
+  try {
+    await supervisor.setMode("auto");
+    const prefs = supervisor.store.preferences();
+    prefs.autoSlices.in_scope_test_fix = "auto";
+    supervisor.store.savePreferences(prefs);
+    const deliveries = [];
+    supervisor._executor = { deliver: async (payload) => { deliveries.push(payload); return { status: "sent", route: payload.route ?? "paseo-send", detail: "Delivered" }; } };
+    const thread = { key: "paseo:t-watch", kind: "paseo", title: "Fix unit tests", workspace: "openAGI", agentStatus: "idle", state: "needs-human", route: "paseo-send", watchOnly: true };
+    const t0 = Date.now() - 10 * 60_000;
+    const decision = { action: "ask-user", threadKey: thread.key, playbook: null, question: {
+      dedupeKey: "ask:paseo:t-watch:msg1", kind: "agent-ask", threadKey: thread.key, title: "Re-run failing unit tests in scope?",
+      body: "Unit test flake in test suite.", options: ["yes", "no"], agentAskedAt: new Date(t0).toISOString() } };
+    await supervisor.act([decision], { mode: "auto", byKey: new Map([[thread.key, thread]]), manager: null, started: t0 + 60_000,
+      config: supervisor.config, items: [{ thread }], skipReview: true });
+    assert.equal(deliveries.length, 0, "no autonomous answer to a watch-only session");
+    const stored = supervisor.store.state.questions.find((q) => q.dedupeKey === "ask:paseo:t-watch:msg1");
+    assert.equal(stored?.status, "open", "the ask stays open for the owner");
+  } finally {
+    cleanup();
+  }
+});

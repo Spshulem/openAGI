@@ -6,6 +6,7 @@ import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
 import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
 import { renderModelSetup } from "./model-setup-ui.js";
+import { DEFAULT_OPENAI_MODEL } from "./model-router.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
@@ -16,9 +17,9 @@ import { validateOpenAIKey } from "./provider-credentials.js";
 const WIZARD_FIELDS = [
   "OPENAGI_PROVIDER",
   "OPENAGI_LOCAL_BASE_URL", "OPENAGI_LOCAL_MODEL", "OPENAGI_LOCAL_API_KEY",
-  "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
-  "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "OPENAI_BASE_URL",
-  "CLAUDE_CLI_MODEL", "CODEX_CLI_MODEL",
+  "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_MODEL_TASK_CHAT",
+  "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_TASK_CHAT", "OPENAI_REASONING_EFFORT", "OPENAI_REASONING_EFFORT_TASK_CHAT", "OPENAI_BASE_URL",
+  "CHATGPT_MODEL", "CLAUDE_CLI_MODEL", "CODEX_CLI_MODEL",
   "OPENAGI_AUTH_TOKEN",
   "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_FROM_NUMBER", "SENDBLUE_WEBHOOK_SECRET",
   ...MESSAGING_CONFIG_KEYS,
@@ -37,7 +38,7 @@ const WIZARD_FIELDS = [
   "OPENAGI_COMPUTER_USE", "OPENAGI_COMPUTER_BACKEND", "OPENAGI_CUA_DRIVER_PATH", "OPENAGI_OCU_PATH",
   "OPENAGI_ALLOW_INSECURE_NODE_RELAY",
   "OPENAGI_PUBLIC_URL",
-  "OPENAGI_DAILY_USD_LIMIT",
+  "OPENAGI_DAILY_USD_LIMIT", "OPENAGI_TIMEZONE",
   "EXA_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "BRAVE_API_KEY",
   "PERPLEXITY_API_KEY", "SERPAPI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID",
   "WEB_SEARCH_PROVIDER",
@@ -257,7 +258,7 @@ export function renderAdvancedWizard({ proposedToken, existingEnv = {} } = {}) {
       <label>OPENAI_API_KEY${saved("OPENAI_API_KEY")}</label>
       <input type="password" name="OPENAI_API_KEY" placeholder="sk-proj-…" autocomplete="off">
       <label style="margin-top:8px;">Model</label>
-      <input type="text" name="OPENAI_MODEL" value="${val("OPENAI_MODEL", "gpt-5")}">
+      <input type="text" name="OPENAI_MODEL" value="${val("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)}">
       <label style="margin-top:8px;">Responses-compatible base URL</label>
       <input type="url" name="OPENAI_BASE_URL" value="${val("OPENAI_BASE_URL", "https://api.openai.com/v1")}">
       <p>For a compatible service, use that service's key, base URL and model name together. Region restrictions require a provider available in your region.</p>

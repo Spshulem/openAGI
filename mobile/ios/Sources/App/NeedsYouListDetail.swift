@@ -10,14 +10,18 @@ import SwiftUI
 extension SupervisorCard {
     var needsYouDigest: SupervisorNeedsYouDigest {
         let pr = prContext?.ref ?? prRef
+        // Where it stands: the hub's short current state, else what changed.
+        // When both are there, what changed leads the evidence.
+        let current = brief?.currentState
+        let changed = brief?.whatChanged ?? summary
         return SupervisorNeedsYouDigest(
             headline: headline,
             goal: brief?.context,
-            state: brief?.whatChanged ?? summary,
+            state: current ?? changed,
             blocker: decisionFact,
             decision: brief?.decision,
             recommendation: recommendation ?? plan?.nextAction,
-            evidence: [agentSummary, pr.map { "Pull request \($0)" }]
+            evidence: [current == nil ? nil : changed, agentSummary, pr.map { "Pull request \($0)" }]
         )
     }
 

@@ -72,4 +72,16 @@ final class NeedsYouListDetailTests: XCTestCase {
         let meta = card.needsYouMeta(now: now)
         XCTAssertTrue(meta?.hasPrefix("/Checkout · ") == true, meta ?? "nil")
     }
+
+    func testCurrentStateLeadsAndWhatChangedBecomesEvidence() {
+        let card = SupervisorCard(id: "c", headline: "Ship it?", decisionFact: "Production needs you.",
+                                  brief: SupervisorCardBrief(context: "Ship checkout", currentState: "Green and staged.",
+                                                             whatChanged: "Rebased on main; 3 visual changes.",
+                                                             decision: "Ship now or Monday?"))
+        let digest = card.needsYouDigest
+        XCTAssertEqual(digest.sections(.state).first?.text, "Green and staged.")
+        XCTAssertEqual(digest.sections(.evidence).first?.text, "Rebased on main; 3 visual changes.")
+        let older = SupervisorCard(id: "o", headline: "Ship it?", brief: SupervisorCardBrief(whatChanged: "Rebased on main."))
+        XCTAssertEqual(older.needsYouDigest.sections(.state).first?.text, "Rebased on main.")
+    }
 }

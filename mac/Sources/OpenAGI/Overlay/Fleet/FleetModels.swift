@@ -559,6 +559,7 @@ struct FleetCardBrief: Decodable, Equatable {
   let needsYou: Bool
   let kind: String?
   let context: String?
+  let currentState: String?
   let whatChanged: String?
   let decision: String?
   let recommendation: String?
@@ -572,16 +573,17 @@ struct FleetCardBrief: Decodable, Equatable {
   enum CodingKeys: String, CodingKey {
     case id, questionId, needsYou, kind, brief, recommendation, prRef, prUrl, ciState
   }
-  private enum BriefKeys: String, CodingKey { case context, whatChanged, decision }
+  private enum BriefKeys: String, CodingKey { case context, currentState, whatChanged, decision }
 
   init(id: String, questionId: String? = nil, needsYou: Bool = true, kind: String? = nil,
-       context: String? = nil, whatChanged: String? = nil, decision: String? = nil,
+       context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil,
        recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil) {
     self.id = id
     self.questionId = questionId
     self.needsYou = needsYou
     self.kind = kind
     self.context = context
+    self.currentState = currentState
     self.whatChanged = whatChanged
     self.decision = decision
     self.recommendation = recommendation
@@ -598,10 +600,12 @@ struct FleetCardBrief: Decodable, Equatable {
     kind = try? c.decodeIfPresent(String.self, forKey: .kind)
     if let b = try? c.nestedContainer(keyedBy: BriefKeys.self, forKey: .brief) {
       context = try? b.decodeIfPresent(String.self, forKey: .context)
+      currentState = try? b.decodeIfPresent(String.self, forKey: .currentState)
       whatChanged = try? b.decodeIfPresent(String.self, forKey: .whatChanged)
       decision = try? b.decodeIfPresent(String.self, forKey: .decision)
     } else {
       context = nil
+      currentState = nil
       whatChanged = nil
       decision = nil
     }

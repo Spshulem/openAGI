@@ -139,7 +139,7 @@ struct SupervisorWorkspaceView: View {
 
   @State private var showNewSessionCreator = false
   @State private var newSessionWorkspace = ""
-  @State private var newSessionModel = "gpt-5.4"
+  @State private var newSessionModel = "gpt-6.2-sol"
   @State private var newSessionEffort = "medium"
   @State private var newSessionTitle = ""
   @State private var newSessionPrompt = ""
@@ -946,7 +946,7 @@ struct SupervisorWorkspaceView: View {
                   await supervisor.selectModelPreference(
                     preference: "codex-cli",
                     modelField: "codexCliModel",
-                    modelId: "gpt-5.4"
+                    modelId: "gpt-6.2-sol"
                   )
                 }
               } label: {
@@ -1033,6 +1033,37 @@ struct SupervisorWorkspaceView: View {
             }
           }
         }
+        Menu {
+          if let b = supervisor.budgetStatus {
+            Text(String(format: "Today: $%.2f / $%.2f", b.spentUsd, b.effectiveLimit))
+            Divider()
+          }
+          Button("Add $10 for Today") {
+            Task { _ = await supervisor.updateBudget(addUsdToday: 10) }
+          }
+          Button("Add $25 for Today") {
+            Task { _ = await supervisor.updateBudget(addUsdToday: 25) }
+          }
+          if let bonus = supervisor.budgetStatus?.bonusUsdToday, bonus > 0 {
+            Button("Reset Today's Extra") {
+              Task { _ = await supervisor.updateBudget(resetTodayBonus: true) }
+            }
+          }
+          Divider()
+          ForEach([10.0, 25.0, 50.0, 100.0], id: \.self) { limit in
+            Button {
+              Task { _ = await supervisor.updateBudget(dailyUsdLimit: limit) }
+            } label: {
+              if let b = supervisor.budgetStatus, abs(b.dailyUsdLimit - limit) < 0.01 {
+                Label(String(format: "Daily Limit: $%.0f/day", limit), systemImage: "checkmark")
+              } else {
+                Text(String(format: "Daily Limit: $%.0f/day", limit))
+              }
+            }
+          }
+        } label: {
+          Label("Daily Budget", systemImage: "dollarsign.circle")
+        }
         Button("Refresh Everything") {
           Task {
             await supervisor.refreshAll()
@@ -1070,6 +1101,52 @@ struct SupervisorWorkspaceView: View {
 
   @ViewBuilder
   private var generalStage: some View {
+    let latestHitBudget = (supervisor.messages.last?.role == "assistant"
+      && ((supervisor.messages.last?.text.localizedCaseInsensitiveContains("daily budget exceeded") ?? false)
+          || (supervisor.messages.last?.text.localizedCaseInsensitiveContains("daily budget reached") ?? false)))
+      || (supervisor.lastError?.localizedCaseInsensitiveContains("daily budget") ?? false)
+    if supervisor.budgetStatus?.isExceeded == true || latestHitBudget {
+      HStack(spacing: WorkspaceTheme.Spacing.x3) {
+        Image(systemName: "dollarsign.circle.fill")
+          .foregroundStyle(WorkspaceTheme.alert)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Daily budget limit reached")
+            .font(WorkspaceTheme.Typography.secondary.weight(.semibold))
+            .foregroundStyle(WorkspaceTheme.ink)
+          if let b = supervisor.budgetStatus {
+            Text(String(format: "Spent $%.2f of $%.2f today. Add room for today or raise your daily limit.", b.spentUsd, b.effectiveLimit))
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          } else {
+            Text("Add budget for today or raise your daily limit to continue.")
+              .font(WorkspaceTheme.Typography.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+        Spacer()
+        WorkspaceActionButton(prominent: true, small: true) {
+          Task { _ = await supervisor.updateBudget(addUsdToday: 10) }
+        } label: {
+          Text("+$10 Today")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+        WorkspaceActionButton(prominent: false, small: true) {
+          Task { _ = await supervisor.updateBudget(addUsdToday: 25) }
+        } label: {
+          Text("+$25 Today")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+        WorkspaceActionButton(prominent: false, small: true) {
+          Task { _ = await supervisor.updateBudget(dailyUsdLimit: 50) }
+        } label: {
+          Text("Set $50/day")
+        }
+        .disabled(supervisor.isUpdatingBudget)
+      }
+      .padding(WorkspaceTheme.Spacing.x3)
+      .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
+    }
+
     if waitingTotal > 0 {
       HStack(spacing: WorkspaceTheme.Spacing.x3) {
         Image(systemName: "bell.badge.fill")
@@ -1728,8 +1805,8 @@ struct SupervisorWorkspaceView: View {
 
           HStack(spacing: WorkspaceTheme.Spacing.x3) {
             Picker("Model", selection: $newSessionModel) {
-              Text("GPT-5.4").tag("gpt-5.4")
               Text("GPT-6.2 Sol").tag("gpt-6.2-sol")
+              Text("GPT-5.4").tag("gpt-5.4")
               Text("Claude Sonnet 4.6").tag("claude-sonnet-4-6")
               Text("Claude Opus 4.7").tag("claude-opus-4-7")
             }

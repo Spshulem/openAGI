@@ -17,12 +17,14 @@ extension FleetQuestion {
     let prRef = card?.prRef ?? self.prRef
     return SupervisorNeedsYouDigest(
       headline: decisionHeadline ?? title,
+      // Where it stands: the hub's short current state, else what changed.
+      // When both are there, what changed leads the evidence.
       goal: card?.context,
-      state: card?.whatChanged,
+      state: card?.currentState ?? card?.whatChanged,
       blocker: decisionFact,
       decision: decision,
       recommendation: card?.recommendation ?? (isClarificationQuestion ? nil : nextAction),
-      evidence: [displayAskContext, reviewNote, prRef.map { "Pull request \($0)" }]
+      evidence: [card?.currentState == nil ? nil : card?.whatChanged, displayAskContext, reviewNote, prRef.map { "Pull request \($0)" }]
     )
   }
 
