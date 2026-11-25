@@ -51,8 +51,16 @@ export class AgentHost {
     const queueKey = String(
       input?.sessionId ?? `${input?.channel ?? "local"}:${input?.from ?? "user"}:${input?.agentId ?? "main"}`
     );
+    return this.runInSession(queueKey, () => this.handleMessageNow(input, options));
+  }
+
+  // Run work in a session's turn order. Transports that append a complete
+  // exchange without a model turn (e.g. a Pebble save confirmation) use this
+  // so it never interleaves with a turn already running in that chat.
+  async runInSession(sessionId, work) {
+    const queueKey = String(sessionId);
     const prior = this.sessionTurnTails.get(queueKey) ?? Promise.resolve();
-    const run = prior.catch(() => {}).then(() => this.handleMessageNow(input, options));
+    const run = prior.catch(() => {}).then(() => work());
     this.sessionTurnTails.set(queueKey, run);
     try {
       return await run;
@@ -107,6 +115,10 @@ export class AgentHost {
     // no session in the dashboard list, no auto-task, no memory write,
     // no outcome — they're a connectivity check, not a conversation.
     const ephemeral = input.ephemeral === true;
+    // Transport-owned (options, never body): a device input such as a Pebble
+    // Index recording keeps its chat turn but makes no implicit long-term
+    // save: no auto-task, no signal or turn memory, no outcome, no specialist.
+    const implicitCapture = options.implicitCapture !== false;
 
     reportProgress("routing");
 
@@ -132,7 +144,7 @@ export class AgentHost {
     // to invoke add_task. Best-effort; failures don't block the chat reply.
     // A scheduled prompt was already captured when it was created; scanning it
     // again on every fire would add the same task each time.
-    if (!ephemeral && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot" && input.origin !== "cron") {
+    if (!ephemeral && implicitCapture && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot" && input.origin !== "cron") {
       const detected = detectTaskInChat(text);
       if (detected) {
         try {
@@ -152,7 +164,9 @@ export class AgentHost {
           agentId,
           channel,
           from,
-          metadata: { ...metadata, ...(attachments.length ? { attachments } : {}) }
+          // noCapture travels with the stored message so background miners
+          // (skill suggestions, proactive excerpts) skip it too.
+          metadata: { ...metadata, ...(attachments.length ? { attachments } : {}), ...(implicitCapture ? {} : { noCapture: true }) }
         });
 
     // This is the first durable milestone. Streaming clients receive the real
@@ -281,7 +295,8 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionBefore.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral && channel !== "autopilot" && channel !== "cron") {
+    // A no-capture turn (untrusted device input) never grades an earlier reply.
+    if (!ephemeral && implicitCapture && channel !== "autopilot" && channel !== "cron") {
       try { this.runtime.outcomes?.resolveByUserFollowup?.(sessionId, text); } catch { /* best effort */ }
     }
 
@@ -290,7 +305,8 @@ export class AgentHost {
     const output = this.runtime.processSignal(signal, {
       scope: isSpecialist ? `specialist:${agent.id}` : "main",
       parentSpecialistId: isSpecialist ? agent.id : null,
-      allowPropagation: !options.subagentDepth,
+      allowPropagation: !options.subagentDepth && implicitCapture,
+      memoryWrite: implicitCapture,
       ephemeral,
       isolatedContext
     });
@@ -561,7 +577,7 @@ export class AgentHost {
     const meaningfulAutopilotWork = input.origin !== "autopilot" || recordedToolCalls.some((call) => (
       toolRegistry?.get?.(call.name)?.sideEffects === true
     ));
-    const outcomeRecord = ephemeral || !meaningfulAutopilotWork ? null : this.runtime.outcomes?.record({
+    const outcomeRecord = ephemeral || !implicitCapture || !meaningfulAutopilotWork ? null : this.runtime.outcomes?.record({
       kind: input.origin === "autopilot" ? "autopilot-fire" : input.origin === "cron" ? "cron-fire" : "agent-reply",
       refId: null, // patched after we know assistant message id
       signalId: signal.id,
@@ -632,7 +648,7 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionAfter.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral && !isolatedContext) {
+    if (!ephemeral && !isolatedContext && implicitCapture) {
       try { this.runtime.memory.remember(
         {
           source: "agent-host",
