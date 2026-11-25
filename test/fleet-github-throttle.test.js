@@ -309,16 +309,47 @@ test("extending a hold keeps the weaker hold queued to follow it", () => {
   const laterReset = new Date(T0 + 30 * 60_000).toISOString();
   throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
   throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
-  assert.equal(throttle.current().then?.kind, "low-budget");
   throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
   assert.equal(throttle.current().kind, "secondary");
-  assert.equal(Date.parse(throttle.current().until) > T0 + 120_000, true, "the second secondary extends the hold");
-  assert.equal(throttle.current().then?.kind, "low-budget", "the queued hold survives the extension");
-  c.now.value = Date.parse(throttle.current().until) + 1000;
+  const slowUntil = Date.parse(throttle.current().until);
+  assert.equal(slowUntil > T0 + 120_000, true, "the second secondary extends the hold");
+  c.now.value = slowUntil + 1000;
   assert.equal(throttle.current()?.kind, "low-budget", "background polling still waits for the reset");
   assert.notEqual(throttle.blocking({ background: true }), null);
   assert.equal(throttle.blocking({ background: false }), null);
 });
+
+// Review fix (#351): a 15-minute secondary hold, then a low budget resetting
+// in 30 minutes, then a used-up budget with no reset time: once the slow-down
+// ends, owner actions must still wait for that window's reset.
+test("a used-up budget seen during a slow-down still stops owner actions after it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.enter("secondary", { retryAfterSec: 900 });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  throttle.observe({ code: 1, stdout: "", stderr: PRIMARY_TEXT });
+  assert.equal(throttle.needsProbe(), false, "no probe while GitHub asked to slow down");
+  c.now.value = T0 + 15 * 60_000 + 1000;
+  const held = throttle.blocking({ background: false });
+  assert.notEqual(held, null, "owner actions stay stopped: the budget is used up");
+  assert.equal(held.kind, "primary");
+  assert.equal(Date.parse(held.until) >= Date.parse(laterReset), true, "until that window's known reset");
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(throttle.blocking({ background: false }), null);
+  assert.equal(throttle.current(), null);
+});
+
+// The single-hold file an earlier version wrote still loads.
+test("a hold saved in the earlier single-hold format is read after an upgrade", (t) => {
+  const file = path.join(tmp(t), "github-throttle.json");
+  const until = new Date(T0 + 10 * 60_000).toISOString();
+  fs.writeFileSync(file, JSON.stringify({ kind: "primary", until, since: new Date(T0).toISOString(), resetKnown: true, windowResetAt: until }));
+  const throttle = new GithubThrottle({ now: () => T0 + 60_000, file });
+  assert.equal(throttle.blocking({ background: false })?.kind, "primary");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version ?? null, null, "untouched until the next change");
+});
+
 
 // Review fix (#351): a restart after the active hold ended but while its
 // queued hold still ran used to drop both, so background polling resumed in
