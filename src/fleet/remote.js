@@ -122,6 +122,7 @@ function fromReceipt(receipt, attempts, detail) {
   const confirmed = receipt.status === 'sent' && !unconfirmed;
   return { ...(confirmed ? { reconciledAfterTimeout: true } : {}),
     delivery: { status: receipt.status, ...(unconfirmed ? { unconfirmed: true } : {}), route: receipt.route ?? null, detail,
+      ...(receipt.handoffKey ? { handoffKey: receipt.handoffKey } : {}),
       actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true,
       verifiedAt: unconfirmed ? null : (receipt.finishedAt ?? receipt.at ?? null), attempts } };
 }
@@ -344,8 +345,54 @@ export class RemoteFleetSupervisor {
   // known: receipt ids that already existed when this request started. They
   // belong to earlier sends (the same short text can be sent twice on
   // purpose) and never count as this one's.
-  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null) {
+  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null, idempotencyKey = null) {
     try { await this.refresh(); } catch { /* still unreachable: judge on what is here */ }
+    // When an approval key was sent, reconcile against its persisted handoff
+    // outcome first: a held offline handoff sits in `handoffs` even when the
+    // executor's preliminary attempt journaled a `blocked` host-unavailable row.
+    if (idempotencyKey) {
+      const handoffs = Array.isArray(this.state.handoffs) ? this.state.handoffs : [];
+      const handoff = handoffs.find((entry) => entry?.key === idempotencyKey) ?? null;
+      if (handoff) {
+        if (handoff.status === 'queued') {
+          return {
+            status: 'queued',
+            queued: true,
+            route: 'paseo-queue',
+            handoffKey: handoff.key,
+            detail: handoff.detail || 'Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).',
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'waiting') {
+          return {
+            status: 'queued',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            detail: `${handoff.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.`,
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'delivered') {
+          return {
+            status: 'sent',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            id: handoff.deliveredActionId ?? null,
+            detail: handoff.detail ?? `already delivered for this approval at ${handoff.deliveredAt ?? handoff.updatedAt}; not sent again`,
+            at: handoff.deliveredAt ?? handoff.updatedAt ?? null
+          };
+        }
+        return {
+          status: 'blocked',
+          route: 'paseo-send',
+          handoffKey: handoff.key,
+          ...(handoff.status === 'unconfirmed' ? { unconfirmed: true } : {}),
+          detail: `approved handoff ${handoff.status}: ${handoff.detail}`,
+          at: handoff.updatedAt ?? null
+        };
+      }
+    }
     // The executor journals the prefixed text it sent (flattened for
     // computer-use): either form of this exact message counts.
     const hashes = ownerMessageHashes(message, images);
@@ -428,9 +475,12 @@ export class RemoteFleetSupervisor {
   // all; one it received but did not answer may have gone out, so its own
   // receipt decides, and with none it is reported unconfirmed, never sent
   // and never sent twice. Every attempt is in the result.
-  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null, idempotencyKey = null } = {}) {
     const hasImages = Array.isArray(images) && images.length > 0;
-    const body = { threadKey, message, ...(typeof queue === 'boolean' ? { queue } : {}), ...(hasImages ? { images } : {}) };
+    // The approval's key travels with every attempt: the fleet computer
+    // never carries out the same approval twice, and holds it while the
+    // chat's host is offline.
+    const body = { threadKey, message, ...(typeof queue === 'boolean' ? { queue } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
     const startedAt = Date.now();
     const known = new Set((Array.isArray(this.state.actions) ? this.state.actions : []).map((action) => action?.id).filter(Boolean));
     const attempts = [];
@@ -443,8 +493,8 @@ export class RemoteFleetSupervisor {
       } catch (error) {
         attempts.push(attemptSummary(attempt, error));
         if (error.uncertain) {
-          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 160)} (the fleet computer's receipt; its reply to this request was lost)`);
+          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 220)} (the fleet computer's receipt; its reply to this request was lost)`);
           return { delivery: { status: 'unknown', unconfirmed: true, route: null,
             detail: 'the fleet computer took the message but did not answer in time and has no receipt for it yet; not sent again so it cannot arrive twice. Check fleet_thread receipts before resending.',
             attempts } };
@@ -461,10 +511,10 @@ export class RemoteFleetSupervisor {
         // It never reached the computer, so nothing went out; but if an
         // earlier reply was lost, its receipt says so before sending again.
         await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
-        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-        // A send that may have landed is not sent again either.
-        if (receipt && (receipt.status === 'sent' || receipt.unconfirmed === true)) {
-          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 200));
+        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+        // A send that may have landed (or was persisted as a held handoff) is not sent again either.
+        if (receipt && (receipt.status === 'sent' || receipt.status === 'queued' || receipt.unconfirmed === true)) {
+          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 220));
         }
       }
     }
