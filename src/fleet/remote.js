@@ -182,10 +182,23 @@ export class RemoteFleetSupervisor {
     this.intervalMs = intervalMs;
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
     this.modeFile = dataDir ? path.join(dataDir, "fleet-remote-mode.json") : null;
+    this.preferencesFile = dataDir ? path.join(dataDir, "fleet-remote-preferences.json") : null;
     // Only the fleet computer knows its mode. Until it answers, this is the
     // last mode it reported (kept across restarts), or none: never a guess.
     this.reportedMode = this.lastReportedMode();
-    this.state = { mode: this.reportedMode, enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
+    this.reportedPreferences = this.lastReportedPreferences();
+    this.state = {
+      mode: this.reportedMode,
+      ...(this.reportedPreferences ? { preferences: this.reportedPreferences } : {}),
+      enabled: true,
+      running: false,
+      lastTickAt: null,
+      lastError: 'Waiting for the fleet computer',
+      snapshot: null,
+      questions: [],
+      actions: [],
+      settings: { remoteNode: nodeId }
+    };
     this.refreshing = null;
     this.questionsAuthoritative = false;
     this.timer = null;
@@ -219,6 +232,25 @@ export class RemoteFleetSupervisor {
     try {
       if (this.modeFile) writeJsonAtomic(this.modeFile, { nodeId: this.nodeId, mode });
       this.reportedMode = mode;
+    } catch { /* unsaved: the next report writes it */ }
+  }
+  lastReportedPreferences() {
+    if (!this.preferencesFile) return null;
+    try {
+      const saved = readJsonFile(this.preferencesFile, null);
+      if (saved?.nodeId !== this.nodeId || !saved?.preferences || typeof saved.preferences !== "object") return null;
+      return normalizePreferences(saved.preferences);
+    } catch {
+      return null;
+    }
+  }
+  noteReportedPreferences(prefs) {
+    if (!prefs || typeof prefs !== "object") return;
+    const normalized = normalizePreferences(prefs);
+    if (this.reportedPreferences && JSON.stringify(normalized) === JSON.stringify(this.reportedPreferences)) return;
+    try {
+      if (this.preferencesFile) writeJsonAtomic(this.preferencesFile, { nodeId: this.nodeId, preferences: normalized });
+      this.reportedPreferences = normalized;
     } catch { /* unsaved: the next report writes it */ }
   }
   getState() {
@@ -277,6 +309,7 @@ export class RemoteFleetSupervisor {
         this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
+        this.noteReportedPreferences(this.state.preferences);
         this.mirrorQuestions();
         this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();

@@ -21,7 +21,7 @@ import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, thr
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
-import { createNotifier } from "./notify.js";
+import { createNotifier, isQuietHour, resolveQuietTimeZone } from "./notify.js";
 import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, groupItemName, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
@@ -832,7 +832,10 @@ export class FleetSupervisor {
     this.deps = deps ?? {};
     this.skip = { bb3: false, github: false, ...skip };
     this.proactiveSupervisorChat = config?.proactiveSupervisorChat === true;
-    this.proactiveRespectQuietHours = config?.proactiveRespectQuietHours === true;
+    this.proactiveRespectQuietHours = config?.proactiveRespectQuietHours !== false;
+    this.proactiveQuietHoursExplicit = config?.proactiveRespectQuietHours === true || config?.notify?.quietHours !== undefined;
+    this.proactiveQuietHours = config?.notify?.quietHours ?? null;
+    this.proactiveTimeZone = config?.notify?.timeZone ?? config?.timeZone ?? null;
     this.config = config?.paths && config?.limits ? config : resolveFleetConfig(process.env, config ?? {});
     this._store = null;
     this._executor = null;
@@ -3206,6 +3209,7 @@ export class FleetSupervisor {
             kind: typeof metadata?.kind === "string" ? metadata.kind : "proactive_supervisor",
             ...(Array.isArray(metadata?.decisionKeys) ? { decisionKeys: metadata.decisionKeys } : {}),
             ...(Array.isArray(metadata?.decisionTokens) ? { decisionTokens: metadata.decisionTokens } : {}),
+            ...(Array.isArray(metadata?.decisionKinds) ? { decisionKinds: metadata.decisionKinds } : {}),
             ...(reviewedFlag ? { agentReviewed: true } : {})
           }
         : null;
@@ -3248,6 +3252,7 @@ export class FleetSupervisor {
         kind: metadata?.kind ?? "proactive_supervisor_delta",
         decisionKeys: Array.isArray(metadata?.decisionKeys) ? metadata.decisionKeys : [],
         decisionTokens: Array.isArray(metadata?.decisionTokens) ? metadata.decisionTokens : [],
+        decisionKinds: Array.isArray(metadata?.decisionKinds) ? metadata.decisionKinds : [],
         alreadyAgentReviewed: false,
         judgeFn: this.deps.judgeProactiveUpdate ?? null,
         persist: async (finalText, { agentReviewed: reviewedFlag }) => {
@@ -3287,8 +3292,9 @@ export class FleetSupervisor {
       });
       agentReviewed = verdict.agentReviewed === true;
       if (!verdict.send) {
-        if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
-        return { posted: false, suppressed: true, agentReviewed, reason: verdict.reason || "suppressed_by_agent" };
+        const isDeferred = verdict.deferred === true;
+        if (dedupeKey && !isDeferred) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
+        return { posted: false, suppressed: true, deferred: isDeferred, agentReviewed, reason: verdict.reason || "suppressed_by_agent" };
       }
       if (verdict.text) {
         cleanContent = clampTailLines(redactSecrets(String(verdict.text).trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
@@ -3498,15 +3504,18 @@ export class FleetSupervisor {
   async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
-    const quiet = this.config?.notify?.quietHours ?? null;
-    if (quiet && Number.isInteger(quiet.start) && Number.isInteger(quiet.end)) {
-      const hour = new Date(started).getHours();
-      const inQuiet = quiet.start <= quiet.end
-        ? (hour >= quiet.start && hour < quiet.end)
-        : (hour >= quiet.start || hour < quiet.end);
-      if (inQuiet) return null;
-    } else if ((this.proactiveRespectQuietHours || this.config?.proactiveRespectQuietHours === true) && this.notifier?.isQuietHours?.(new Date(started))) {
-      return null;
+    const explicitQuietConfig = this.proactiveQuietHoursExplicit
+      || this.config?.notify?.quietHours !== undefined
+      || this.config?.proactiveRespectQuietHours === true;
+    const enforceQuietHours = this.proactiveRespectQuietHours !== false
+      && (Boolean(this.timer) || explicitQuietConfig)
+      && String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() !== "off";
+    if (enforceQuietHours) {
+      const quiet = this.proactiveQuietHours ?? this.config?.notify?.quietHours ?? this.config?.limits?.quietHours ?? DEFAULTS.quietHours;
+      const tz = this.proactiveTimeZone ?? resolveQuietTimeZone(this.runtime, this.config);
+      if (isQuietHour(new Date(started), quiet, tz)) {
+        return { posted: false, deferred: true, reason: "quiet_hours" };
+      }
     }
 
     const notifyPrefs = this.store.preferences();
@@ -3625,7 +3634,10 @@ export class FleetSupervisor {
         kind: "proactive_supervisor_delta",
         deltaCount: shownDeltas.length,
         decisionKeys: shownDeltas.map((d) => d.decisionKey),
-        decisionTokens: shownDeltas.map((d) => `${d.decisionKey}:${d.materialHash || ""}`)
+        decisionTokens: shownDeltas.map((d) => `${d.decisionKey}:${d.materialHash || ""}`),
+        decisionKinds: shownDeltas.map((d) => (d.question?.mergeAsk || d.question?.kind === "ready"
+          ? "ready"
+          : (d.question?.risky ? "risky" : String(d.question?.kind ?? "agent-ask"))))
       }
     });
     // Only what was shown, and only once it reached the owner's copy (or was
