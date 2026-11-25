@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
+import { buildSupervisorCard } from "../src/fleet/cards.js";
 
 // A card reply that only queues behind a coding agent's running turn closed
 // the owner's card as answered at once. If that queued message then never
@@ -120,4 +121,38 @@ test("a newer, different answer from the owner stands: an old undelivered reply 
   const q = ctx.sup.store.question(ctx.question.id);
   assert.equal(q.status, "answered");
   assert.equal(q.answer, "No, hold the merge.");
+});
+
+// Review fix (#384): an expired reply pruned from the queue, then a restart
+// before the next drain, lost its recovery record: the queued message was
+// already gone, so the card was never put back.
+test("a restart between the expiry and the next drain still puts the card back", async (t) => {
+  const ctx = setup(t);
+  await replyQueued(ctx);
+  ctx.clock.now = NOW + 25 * HOUR;
+  assert.equal(ctx.sup.store.queuedOwnerMessages(ctx.thread.key).length, 0, "the expired message was pruned");
+  // Restart: a fresh supervisor over the same data directory.
+  const restarted = new FleetSupervisor({
+    dataDir: ctx.sup.dataDir,
+    runtime: { events: { emit() {} } },
+    config: { enabled: true, mode: "auto", paseo: { enabled: true, only: true } },
+    deps: { now: () => ctx.clock.now, executor: { async deliver() { throw new Error("must not send"); } } }
+  });
+  await restarted.drainQueuedOwnerMessages({ byKey: new Map([[ctx.thread.key, ctx.thread]]), started: ctx.clock.now });
+  const q = restarted.store.question(ctx.question.id);
+  assert.equal(q.status, "open");
+  assert.match(q.deliveryNote, /never sent/);
+});
+
+// Review fix (#384): the note was stored but shown nowhere, so an owner
+// could re-answer an unconfirmed reply that had already landed.
+test("the reopened card says what happened to the reply before anything else", async (t) => {
+  const ctx = setup(t, { deliver: () => ({ status: "unknown", unconfirmed: true, route: "paseo-send", detail: "turn confirmation timed out" }) });
+  await replyQueued(ctx);
+  ctx.setIdle();
+  const idle = { ...ctx.thread, agentStatus: "idle" };
+  await ctx.sup.drainQueuedOwnerMessages({ byKey: new Map([[idle.key, idle]]), started: NOW + 60_000 });
+  const card = buildSupervisorCard(ctx.sup.store.question(ctx.question.id), { now: NOW + 60_000 });
+  assert.match(card.deliveryNote, /Check the chat before sending it again/);
+  assert.match(card.summary, /^Your queued reply may have reached the agent/);
 });

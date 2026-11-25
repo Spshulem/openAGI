@@ -87,6 +87,7 @@ function emptyState() {
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
     queuedOwnerMessages: [],
+    undeliveredOwnerReplies: [],
     supervisorChatNotices: {},
     lastProactiveChatAt: null,
     lastOwnerAckAt: null,
@@ -1543,6 +1544,11 @@ export class FleetStore {
       followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
       queuedOwnerMessages: Array.isArray(raw.queuedOwnerMessages)
         ? raw.queuedOwnerMessages.filter((q) => isObject(q) && typeof q.id === "string" && typeof q.threadKey === "string" && typeof q.message === "string").slice(-100)
+        : [],
+      // Cards whose queued reply expired undelivered, waiting to be put back:
+      // the queued message is already gone, so a restart must keep these.
+      undeliveredOwnerReplies: Array.isArray(raw.undeliveredOwnerReplies)
+        ? raw.undeliveredOwnerReplies.filter((u) => isObject(u) && typeof u.id === "string" && typeof u.questionId === "string").slice(-50)
         : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
       lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,

@@ -1151,7 +1151,12 @@ export function buildSupervisorCard(
     contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
     decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },
     sessionTitle,
-    summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
+    // A reply that never reached the agent says so first, so the owner does
+    // not re-answer blind (an unconfirmed one may already have landed).
+    summary: question.deliveryNote
+      ? clampText(redactSecrets(`${question.deliveryNote} — ${buildSummary(question, row, { headline, prMeta, agentSummary })}`), 700)
+      : buildSummary(question, row, { headline, prMeta, agentSummary }),
+    ...(question.deliveryNote ? { deliveryNote: question.deliveryNote } : {}),
     recommendation,
     brief,
     ...(plan ? { plan } : {}),
