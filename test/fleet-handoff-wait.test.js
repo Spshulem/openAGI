@@ -767,3 +767,52 @@ test("initial keyed approval queued on a running chat preserves approval identit
   assert.equal(replay.delivery.reconciled, true);
   assert.equal(sends(f.delivered).length, 1, "replaying a drained busy approval must never send twice");
 });
+
+// Review fix (#361, Codex P2 round 6): keep held handoff waiting when the
+// target chat's timeline could not be fetched (history-unavailable / historyKnown: false).
+test("unavailable chat history keeps held handoff waiting until history is known", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Ship once history loads.", { idempotencyKey: "act_hist_unavail" });
+  assert.equal(f.supervisor.handoffs.get("act_hist_unavail").status, "waiting");
+  f.host.up = true;
+  f.list[0].excluded = "history-unavailable";
+  f.list[0].meta.historyKnown = false;
+  f.list[0].lastUserText = null;
+  f.list[0].lastUserAt = null;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_hist_unavail").status, "waiting");
+  assert.equal(sends(f.delivered).length, 1, "must not resume while timeline history is unavailable");
+  // Once timeline history is fetched cleanly, resume delivers once.
+  f.list[0].excluded = null;
+  f.list[0].meta.historyKnown = true;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_hist_unavail").status, "delivered");
+  assert.equal(sends(f.delivered).length, 2);
+});
+
+// Review fix (#361, Codex P2 round 6): a newer owner instruction arriving while
+// a permission prompt is pending still supersedes an earlier waiting offline
+// handoff, while refusing to send prose into the open permission prompt.
+test("owner cancellation blocked by pending permission still supersedes waiting handoff", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Submit old build.", { idempotencyKey: "act_old_perm" });
+  assert.equal(f.supervisor.handoffs.get("act_old_perm").status, "waiting");
+  f.host.up = true;
+  f.list[0].meta.pendingPermission = { id: "perm-42" };
+  f.now.value += MIN;
+  await f.supervisor.tick({ reason: "test" });
+  const cancel = await f.supervisor.sendOwnerMessage(KEY, "Cancel that — do not submit.");
+  assert.equal(cancel.delivery.status, "blocked");
+  assert.equal(cancel.delivery.permissionRequired, true);
+  assert.equal(f.supervisor.handoffs.get("act_old_perm").status, "superseded");
+  // Clearing the permission prompt must NOT send the superseded handoff.
+  delete f.list[0].meta.pendingPermission;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_old_perm").status, "superseded");
+  assert.equal(sends(f.delivered).length, 1, "superseded handoff never sends after permission clears");
+});

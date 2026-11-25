@@ -2610,6 +2610,24 @@ export class FleetSupervisor {
     let thread = this.lastThreads.get(effectiveKey)
       ?? this.knownThreads.get(effectiveKey)
       ?? this.syntheticPaseoThread(effectiveKey, matchingOpen);
+    // Record latest owner send sequence and immediately supersede any waiting
+    // offline handoffs for this thread (keyed or unkeyed, e.g. fleet page
+    // replyTarget) BEFORE any await or early return (permissionPending,
+    // no-route, duplicate, busy-queue) so a newer owner instruction or
+    // cancellation always retires older waiting handoffs and prevents an older
+    // in-flight offline attempt from queuing behind it.
+    let sendSeq = null;
+    if (!resume && (thread?.kind === "paseo" || effectiveKey.startsWith("paseo:"))) {
+      const seqKey = thread?.key ?? effectiveKey;
+      this._threadOwnerSendSeq ??= new Map();
+      sendSeq = (this._threadOwnerSendSeq.get(seqKey) ?? 0) + 1;
+      this._threadOwnerSendSeq.set(seqKey, sendSeq);
+      this.handoffs.supersedeWaiting(seqKey, key);
+      if (redirectedFrom && redirectedFrom !== seqKey) {
+        this._threadOwnerSendSeq.set(redirectedFrom, (this._threadOwnerSendSeq.get(redirectedFrom) ?? 0) + 1);
+        this.handoffs.supersedeWaiting(redirectedFrom, key);
+      }
+    }
     let refreshedPermissionState = false;
     if (thread?.meta?.blockedOnOwner === true && ["codex", "conductor"].includes(thread.kind) && typeof this.refreshThread === "function") {
       try {
@@ -2740,18 +2758,6 @@ export class FleetSupervisor {
       || thread.requiresAttention === true
       || ["async_question", "permission", "input"].includes(String(thread.attentionReason ?? thread.meta?.attentionReason ?? "").toLowerCase())
     );
-    // Record latest owner send sequence and immediately supersede any waiting
-    // offline handoffs for this thread (keyed or unkeyed, e.g. fleet page
-    // replyTarget) BEFORE awaiting delivery so a newer cancellation arriving
-    // while an older attempt is in flight prevents the older attempt from
-    // queuing a stale resumable handoff.
-    let sendSeq = null;
-    if (!resume && thread.kind === "paseo") {
-      this._threadOwnerSendSeq ??= new Map();
-      sendSeq = (this._threadOwnerSendSeq.get(thread.key) ?? 0) + 1;
-      this._threadOwnerSendSeq.set(thread.key, sendSeq);
-      this.handoffs.supersedeWaiting(thread.key, key);
-    }
     // Preserve strict per-thread FIFO: if this Paseo session already has
     // queued ordinary messages awaiting drain, append behind that backlog
     // instead of leapfrogging dependent instructions. For resumed handoffs,
@@ -2877,8 +2883,16 @@ export class FleetSupervisor {
       for (const entry of this.handoffs.waiting()) {
         if ((Date.parse(entry.nextTryAt ?? "") || 0) > now) continue;
         const hostUnknown = unknownPrefixes.some((prefix) => String(entry.threadKey ?? "").startsWith(prefix));
-        const thread = hostUnknown ? null : (this.lastThreads.get(entry.threadKey) ?? this.knownThreads.get(entry.threadKey) ?? null);
-        const stale = handoffStaleReason(entry, thread ? { archived: Boolean(thread.archived), ownerSpokeAt: ownerSpokeAt(thread) } : null, now);
+        // Only trust threads freshly listed in the latest scan; cached entries
+        // or chats with unavailable history cannot prove the owner did not
+        // cancel the instruction since approval.
+        const thread = hostUnknown ? null : (this.lastThreads.get(entry.threadKey) ?? null);
+        const historyUnavailable = Boolean(thread && (thread.excluded === "history-unavailable" || thread.meta?.historyKnown === false));
+        const stale = handoffStaleReason(
+          entry,
+          thread ? { archived: Boolean(thread.archived), ownerSpokeAt: historyUnavailable ? null : ownerSpokeAt(thread) } : null,
+          now
+        );
         if (stale) {
           this.handoffs.update(entry.key, { status: "stale", detail: stale });
           this.store.recordAction({ threadKey: entry.threadKey, playbook: "owner-message", status: "blocked", route: "paseo-send", detail: `held handoff not sent: ${stale}` });
@@ -2892,6 +2906,10 @@ export class FleetSupervisor {
         // since a restart): keep waiting.
         if (!thread) {
           this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: the chat is not listed yet" });
+          continue;
+        }
+        if (historyUnavailable) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: chat history is unavailable; waiting for a fresh timeline before sending" });
           continue;
         }
         // A resume that started sending and never recorded its outcome (the
