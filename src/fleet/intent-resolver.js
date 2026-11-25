@@ -10,6 +10,7 @@
 
 import { clampText, clampTextLines, parsePrRef, redactSecrets, runCommand } from "./contracts.js";
 import { requiredChecksFor } from "./sources/github.js";
+import { githubThrottle, throttledGh } from "./github-throttle.js";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
@@ -42,6 +43,7 @@ async function verifyRequiredBranchChecks(run, ghBin, parsed) {
     ["pr", "checks", String(parsed.number), "--repo", parsed.repo, "--required", "--json", "name,state,bucket"],
     { timeoutMs: 15_000 }
   );
+  if (res.throttled) return { ok: false, throttled: true, detail: String(res.stderr ?? "") };
   if (res.code !== 0) {
     const combined = `${res.stderr ?? ""}\n${res.stdout ?? ""}`;
     if (/no required checks/i.test(combined)) return { ok: true };
@@ -90,12 +92,20 @@ export async function executeSafePrMerge({
   mergePolicy = "manual_confirm",
   config = null,
   ghBin = "gh",
-  run = runCommand
+  run: rawRun = runCommand,
+  throttle = githubThrottle
 } = {}) {
   const parsed = parsePrRef(prRef);
   if (!parsed || !REPO_PATTERN.test(parsed.repo) || !(parsed.number > 0)) {
     return { status: "halted", reason: "invalid_pr_ref", detail: "Invalid pull request reference." };
   }
+  // Every GitHub call here shares the account's GraphQL cooldown, is never
+  // merged with another caller's (each preflight is its own fresh read), and
+  // is never repeated after a throttle: the owner taps Merge again, which
+  // re-runs this whole preflight first.
+  const run = (bin, args, options) => throttledGh(rawRun, bin, args, options, { throttle, background: false, coalesce: false });
+  const held = throttle.blocking({ background: false });
+  if (held) return rateLimitedHalt(prRef, held, { step: "before" });
 
   const viewRes = await run(
     ghBin,
@@ -107,6 +117,7 @@ export async function executeSafePrMerge({
     { timeoutMs: 25_000 }
   );
 
+  if (viewRes.throttled) return rateLimitedHalt(prRef, viewRes.cooldown ?? throttle.blocking({ background: false }), { step: "preflight" });
   if (viewRes.code !== 0 || !viewRes.stdout) {
     return {
       status: "halted",
@@ -178,6 +189,7 @@ export async function executeSafePrMerge({
         ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--auto", "--squash", ...headArgs],
         { timeoutMs: 30_000 }
       );
+      if (queueRes.throttled) return rateLimitedHalt(prRef, queueRes.cooldown ?? throttle.blocking({ background: false }), { step: "merge" });
       if (queueRes.code === 0) {
         return {
           status: "queued_when_green",
@@ -240,6 +252,8 @@ export async function executeSafePrMerge({
     ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--squash", ...headArgs],
     { timeoutMs: 30_000 }
   );
+  // Refused for the limit: GitHub ran no merge. Stop here; never retried.
+  if (mergeRes.throttled) return rateLimitedHalt(prRef, mergeRes.cooldown ?? throttle.blocking({ background: false }), { step: "merge" });
   if (mergeRes.code === 0) {
     return {
       status: "merged",
@@ -255,6 +269,29 @@ export async function executeSafePrMerge({
     reason: "gh_merge_failed",
     prRef,
     detail: clampText(redactSecrets(mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection reviews)."), 220)
+  };
+}
+
+// A merge stopped by GitHub's rate limit. Says plainly that nothing merged,
+// whether anything reached GitHub, and when trying again can work. The card
+// stays open; nothing is replayed automatically.
+function rateLimitedHalt(prRef, cooldown, { step, action = "Merge" } = {}) {
+  const until = cooldown?.until ?? null;
+  const when = until ? `${new Date(until).toISOString().slice(11, 16)} UTC` : "GitHub's limit resets";
+  const why = cooldown?.kind === "secondary" ? "GitHub asked this account to slow down (secondary rate limit)" : "GitHub's GraphQL rate limit for this account is used up";
+  const what = step === "before"
+    ? "Nothing was sent to GitHub."
+    : step === "preflight"
+      ? "GitHub refused the pre-merge check, so no merge was sent."
+      : "GitHub refused the merge request itself; no merge is confirmed.";
+  return {
+    status: "halted",
+    reason: "github_rate_limited",
+    prRef,
+    mergeConfirmed: false,
+    retryAt: until,
+    throttleKind: cooldown?.kind ?? "primary",
+    detail: `Not merged: ${prRef}. ${why} until ${when}. ${what} Nothing retries on its own; tap ${action} after ${when} and it re-checks the PR (head commit, checks, reviews) before merging.`
   };
 }
 
@@ -488,15 +525,46 @@ async function unresolvedReviewThreads(run, ghBin, parsed) {
   }
 }
 
+// A GitHub call refused for the rate limit, mid-preflight. Unwinds the whole
+// preflight so a throttled read never passes for an unreadable rule or a
+// missing check, and nothing merges.
+class GithubThrottled extends Error {
+  constructor(cooldown) {
+    super("GitHub rate limited");
+    this.cooldown = cooldown;
+  }
+}
+
+function adminMergeRun(rawRun, throttle) {
+  return async (bin, args, options) => {
+    const res = await throttledGh(rawRun, bin, args, options, { throttle, background: false, coalesce: false });
+    if (res.throttled) throw new GithubThrottled(res.cooldown ?? throttle.blocking({ background: false }));
+    return res;
+  };
+}
+
 // Live, read-only check of everything Admin Merge requires. Returns
-// { ok: true, plan } naming exactly what would be waived, or a halt.
+// { ok: true, plan } naming exactly what would be waived, or a halt. Shares
+// the account's GitHub cooldown with ordinary Merge and the pollers.
 export async function preflightAdminMerge({
   prRef,
   expectedHeadSha = null,
   config = null,
   ghBin = "gh",
-  run = runCommand
+  run: rawRun = runCommand,
+  throttle = githubThrottle
 } = {}) {
+  const held = throttle.blocking({ background: false });
+  if (held) return { ok: false, ...rateLimitedHalt(prRef, held, { step: "before", action: "Admin Merge" }) };
+  try {
+    return await adminMergePreflight({ prRef, expectedHeadSha, config, ghBin, run: adminMergeRun(rawRun, throttle) });
+  } catch (error) {
+    if (error instanceof GithubThrottled) return { ok: false, ...rateLimitedHalt(prRef, error.cooldown, { step: "preflight", action: "Admin Merge" }) };
+    throw error;
+  }
+}
+
+async function adminMergePreflight({ prRef, expectedHeadSha, config, ghBin, run }) {
   const parsed = parsePrRef(prRef);
   if (!parsed || !REPO_PATTERN.test(parsed.repo) || !(parsed.number > 0)) {
     return halt("invalid_pr_ref", prRef ?? null, "Invalid pull request reference.");
@@ -668,7 +736,8 @@ export async function executeAdminMerge({
   expectedHeadSha = null,
   config = null,
   ghBin = "gh",
-  run = runCommand
+  run: rawRun = runCommand,
+  throttle = githubThrottle
 } = {}) {
   const parsed = parsePrRef(prRef);
   if (!parsed) return halt("invalid_pr_ref", prRef ?? null, "Invalid pull request reference.");
@@ -683,7 +752,7 @@ export async function executeAdminMerge({
     return halt("consent_mismatch", ref, `The Admin Merge consent was for ${consent.repo}#${consent.number}, not ${ref}. Nothing was merged.`);
   }
 
-  const preflight = await preflightAdminMerge({ prRef: ref, expectedHeadSha, config, ghBin, run });
+  const preflight = await preflightAdminMerge({ prRef: ref, expectedHeadSha, config, ghBin, run: rawRun, throttle });
   if (!preflight.ok) return preflight;
   const { plan } = preflight;
   if (plan.baseRef !== consent.baseRef) {
@@ -693,11 +762,17 @@ export async function executeAdminMerge({
     return halt("head_changed", ref, `${ref} moved to ${plan.headSha.slice(0, 7)} after you confirmed Admin Merge for ${consentSha.slice(0, 7)}. Nothing was merged; review the new commit and confirm again.`, { headRefOid: plan.headSha });
   }
 
-  const res = await run(
+  const res = await throttledGh(
+    rawRun,
     ghBin,
     ["pr", "merge", String(parsed.number), "--repo", parsed.repo, "--admin", "--squash", "--match-head-commit", consentSha],
-    { timeoutMs: 30_000 }
+    { timeoutMs: 30_000 },
+    { throttle, background: false, coalesce: false }
   );
+  // Refused for the limit: GitHub ran no merge. Stop; never retried.
+  if (res.throttled) {
+    return { ok: false, ...rateLimitedHalt(ref, res.cooldown ?? throttle.blocking({ background: false }), { step: "merge", action: "Admin Merge" }), plan, githubLogin: plan.githubLogin };
+  }
   const github = {
     exitCode: typeof res.code === "number" ? res.code : null,
     stdout: clampTextLines(redactSecrets(String(res.stdout ?? "")), GITHUB_DETAIL_MAX),

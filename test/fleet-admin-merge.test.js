@@ -13,6 +13,7 @@ import { createFleetCapability } from "../src/fleet/remote.js";
 import { isMobileRouteAllowed } from "../src/mobile-node.js";
 import { executeAdminMerge, executeSafePrMerge, preflightAdminMerge } from "../src/fleet/intent-resolver.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
+import { GithubThrottle } from "../src/fleet/github-throttle.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 
 const REPO = "acme/webapp";
@@ -269,6 +270,39 @@ test("Admin Merge checks base ancestry itself when the branch must be up to date
   const loose = fakeGh({ compare: { behind_by: 9 } });
   assert.equal((await executeAdminMerge({ prRef: PR, consent: consentFor(), run: loose.run })).status, "merged");
   assert.equal(loose.calls.some((c) => /\/compare\//.test(c[2] ?? "")), false);
+});
+
+test("Admin Merge shares the GitHub cooldown: a rate-limited preflight or merge stops, merges nothing, and is never retried", async () => {
+  const SECONDARY = "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)";
+  // Throttled mid-preflight (branch rules read): halts as rate limited, not as an unreadable rule.
+  const midway = fakeGh();
+  const throttle = new GithubThrottle();
+  const run = async (bin, args) => (args[0] === "api" && /\/rules\/branches\//.test(args[1] ?? "") ? { code: 1, stdout: "", stderr: SECONDARY } : midway.run(bin, args));
+  const out = await executeAdminMerge({ prRef: PR, consent: consentFor(), run, throttle });
+  assert.equal(out.ok, false);
+  assert.equal(out.reason, "github_rate_limited");
+  assert.equal(out.mergeConfirmed, false);
+  assert.match(out.detail, /^Not merged: acme\/webapp#42\..*secondary rate limit.*no merge was sent.*tap Admin Merge after/);
+  assert.equal(midway.merges().length, 0);
+
+  // While the cooldown holds, nothing reaches GitHub at all.
+  const held = fakeGh();
+  const before = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: held.run, throttle });
+  assert.equal(before.reason, "github_rate_limited");
+  assert.match(before.detail, /Nothing was sent to GitHub/);
+  assert.equal(held.calls.length, 0);
+  const preview = await preflightAdminMerge({ prRef: PR, run: held.run, throttle });
+  assert.equal(preview.ok, false);
+  assert.equal(preview.reason, "github_rate_limited");
+  assert.equal(held.calls.length, 0);
+
+  // The --admin call itself throttled: one attempt, no retry, no merge confirmed.
+  const atMerge = fakeGh({ adminMerge: { code: 1, stdout: "", stderr: SECONDARY } });
+  const fresh = new GithubThrottle();
+  const refused = await executeAdminMerge({ prRef: PR, consent: consentFor(), run: atMerge.run, throttle: fresh });
+  assert.equal(refused.reason, "github_rate_limited");
+  assert.match(refused.detail, /GitHub refused the merge request itself; no merge is confirmed/);
+  assert.equal(atMerge.merges().length, 1);
 });
 
 test("Admin Merge reads every page of branch rules before allowing a bypass", async () => {

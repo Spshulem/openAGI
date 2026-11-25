@@ -31,6 +31,7 @@ import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } fr
 import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
 import { ADMIN_MERGE_WAIVER, executeAdminMerge, executeSafePrMerge, preflightAdminMerge } from "./intent-resolver.js";
+import { throttleFor } from "./github-throttle.js";
 import { applyPreferencePatch, classifyQuestionSlice, effectiveCheckinCooldownMs, isSuppressedByQuietCadence, isSuppressedFromProactiveChat, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { dedupeDecisionDeltas, isClosedOrContradictoryDecision, reviewProactiveUpdateWithAgent } from "./proactive-gate.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
@@ -510,6 +511,17 @@ function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
 }
 
+// Who wrote the turn at ownerSpokeAt, as this computer's reader knows it,
+// without sending the words: "owner" when it had the owner's own text for
+// that turn, "unattributed" when it had none (often the supervisor's own
+// turn, its text kept out of lastUserText). A remote approval check needs
+// it: a supervisor stamp a few seconds away proves nothing about a turn
+// the reader saw the owner write.
+function ownerAttribution(thread) {
+  if (!ownerSpokeAt(thread)) return null;
+  return String(thread?.lastUserText ?? "").trim() ? "owner" : "unattributed";
+}
+
 const KNOWN_CACHE_MAX = 600;
 
 function setBounded(map, key, value, max = KNOWN_CACHE_MAX) {
@@ -872,6 +884,13 @@ export class FleetSupervisor {
   get uiBlockedSince() {
     this._uiBlockedSince ??= this.store.uiBlockedSince();
     return this._uiBlockedSince;
+  }
+
+  // The GitHub GraphQL cooldown every caller here shares (pollers, repo
+  // status, pre-send checks, the owner's Merge), kept with the fleet data.
+  get githubThrottle() {
+    this._githubThrottle ??= this.deps.githubThrottle ?? throttleFor(this.dataDir ? path.join(this.dataDir, "fleet", "github-throttle.json") : null);
+    return this._githubThrottle;
   }
 
   get store() {
@@ -4050,7 +4069,8 @@ export class FleetSupervisor {
       expectedHeadSha: target.expectedHeadSha,
       config: this.config,
       ghBin: this.config.bins?.gh ?? "gh",
-      run: this.deps.run ?? runCommand
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
     });
     if (!preflight.ok) return { kind: "admin_merge", ...preflight };
     const { plan } = preflight;
@@ -4110,7 +4130,8 @@ export class FleetSupervisor {
       expectedHeadSha: target.expectedHeadSha,
       config: this.config,
       ghBin: this.config.bins?.gh ?? "gh",
-      run: this.deps.run ?? runCommand
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
     });
     const merged = outcome.status === "merged" || outcome.status === "already_merged";
     this.store.updateAction(intent.id, {
@@ -4252,6 +4273,7 @@ export class FleetSupervisor {
       const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
       const prefs = this.store.preferences();
       const mergeOutcome = await executeSafePrMerge({
+        throttle: this.githubThrottle,
         prRef,
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
@@ -5362,7 +5384,7 @@ export class FleetSupervisor {
     const list = [...jobs.values()];
     await mapLimit(list, BRANCH_LOOKUP_CONCURRENCY, async (job) => {
       try {
-        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd })), 20_000, "pr lookup")) ?? null;
+        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd, throttle: this.githubThrottle })), 20_000, "pr lookup")) ?? null;
         job.ok = true;
       } catch (error) {
         job.error = error;
@@ -5397,7 +5419,7 @@ export class FleetSupervisor {
     if (wanted.length) {
       try {
         const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
       } catch {
         for (const thread of several) if (conductorOwn(thread)) keepConductorPr(thread, this.conductorPicks.get(thread.key));
         return;
@@ -5434,7 +5456,7 @@ export class FleetSupervisor {
     let fresh;
     try {
       const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand })), PRE_SEND_PR_MS, "github"))?.get(ref);
+      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand, throttle: this.githubThrottle })), PRE_SEND_PR_MS, "github"))?.get(ref);
     } catch {
       return null;
     }
@@ -5452,9 +5474,17 @@ export class FleetSupervisor {
     if (this.skip.github) return new Map();
     const refs = [...new Set([...inScope.map((thread) => thread.prRefs?.[0]), ...extraRefs].filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
+    // GitHub's limit is used up (or nearly): this scan does not ask, and says
+    // so, instead of failing each PR one by one. Last settled reads stand.
+    const cooling = this.githubThrottle.blocking({ background: true });
+    if (cooling) {
+      sourceErrors.github = clampText(cooling.message, 200);
+      for (const ref of refs) unread.add(ref);
+      return new Map();
+    }
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
-      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
     } catch (error) {
       sourceErrors.github = clampText(error?.message, 200);
       for (const ref of refs) unread.add(ref);
@@ -6427,6 +6457,10 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        lastOwnerBy: ownerAttribution(thread),
+        // When the supervisor itself last wrote there (a time, no text), so
+        // a remote approval check can tell its own message from the owner's.
+        lastSupervisorAt: thread.meta?.lastSupervisorAt ?? null,
         requiresAttention: Boolean(thread.meta?.requiresAttention),
         attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).
