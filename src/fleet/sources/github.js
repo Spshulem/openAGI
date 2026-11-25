@@ -3,6 +3,7 @@
 // is a gh/git query. Failed branch lookups throw so a confirmed absence is
 // never confused with an unavailable GitHub response.
 
+import { githubThrottle, throttledGh } from "../github-throttle.js";
 import fs from "node:fs";
 import path from "node:path";
 import { clampText, clampTextLines, parsePrRef, prRefKey, redactSecrets, repoFromRemote, runCommand } from "../contracts.js";
@@ -65,14 +66,14 @@ function gateSelection(required) {
 
 export function buildGateSuitesQuery(repo, oid, after, required) {
   const [owner, name] = repo.split("/");
-  return `query { rateLimit{cost remaining} repository(owner:"${owner}",name:"${name}"){ object(oid:${JSON.stringify(oid)}){ ... on Commit { checkSuites(first:${MORE_GATE_SUITES},after:${JSON.stringify(after)}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}} } } } }`;
+  return `query { rateLimit{cost remaining resetAt} repository(owner:"${owner}",name:"${name}"){ object(oid:${JSON.stringify(oid)}){ ... on Commit { checkSuites(first:${MORE_GATE_SUITES},after:${JSON.stringify(after)}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}} } } } }`;
 }
 
 // Pages the head's remaining check suites while a required check is still
 // missing, so a check run past the first page is not read as never run.
 // Bounded to MAX_GATE_SUITES suites. A failed page marks the lookup unread,
 // so a gate still not found is unknown rather than confirmed absent.
-async function gateSuitePages(repo, node, config, run) {
+async function gateSuitePages(repo, node, config, run, throttle = githubThrottle) {
   const required = requiredChecksFor(repo, config);
   const gateCommit = node.gateCommit?.nodes?.[0]?.commit;
   const suites = gateCommit?.checkSuites;
@@ -84,7 +85,7 @@ async function gateSuitePages(repo, node, config, run) {
   while (page?.hasNextPage && page.endCursor && read < MAX_GATE_SUITES && gates().some((gate) => gate.state === null)) {
     let result;
     try {
-      result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildGateSuitesQuery(repo, gateCommit.oid, page.endCursor, required)}`], { timeoutMs: GH_TIMEOUT_MS });
+      result = await throttledGh(run, config.bins.gh, ["api", "graphql", "-f", `query=${buildGateSuitesQuery(repo, gateCommit.oid, page.endCursor, required)}`], { timeoutMs: GH_TIMEOUT_MS }, { throttle });
     } catch {
       return;
     }
@@ -111,7 +112,7 @@ export function buildPrQuery(refs, config = null) {
     const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){...P${gates}}`).join(" ");
     return `r${index}: repository(owner:"${owner}",name:"${name}"){ ${pulls} }`;
   });
-  return `${PR_FRAGMENT}\nquery { rateLimit{cost remaining}\n${repos.join("\n")} }`;
+  return `${PR_FRAGMENT}\nquery { rateLimit{cost remaining resetAt}\n${repos.join("\n")} }`;
 }
 
 function uniqueRefs(refs) {
@@ -353,11 +354,11 @@ export function normalizePr(repo, node, config) {
 // unread (optional) collects refs GitHub could not answer this call: a
 // failed or unparseable batch, or a malformed node. A PR GitHub reports as
 // missing is an answer, not unread.
-async function fetchBatch(batch, config, run, out, unread) {
+async function fetchBatch(batch, config, run, out, unread, throttle = githubThrottle) {
   const miss = (refs) => { for (const ref of refs) unread?.add(prRefKey(ref.repo, ref.number)); };
   let result;
   try {
-    result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch, config)}`], { timeoutMs: GH_TIMEOUT_MS });
+    result = await throttledGh(run, config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch, config)}`], { timeoutMs: GH_TIMEOUT_MS }, { throttle });
   } catch {
     miss(batch);
     return;
@@ -384,7 +385,7 @@ async function fetchBatch(batch, config, run, out, unread) {
       continue;
     }
     // A failed suite page leaves the gate as read from the batch.
-    try { await gateSuitePages(ref.repo, node, config, run); } catch { /* keep the batch read */ }
+    try { await gateSuitePages(ref.repo, node, config, run, throttle); } catch { /* keep the batch read */ }
     try {
       const pr = normalizePr(ref.repo, node, config);
       out.set(pr.ref, pr);
@@ -395,11 +396,11 @@ async function fetchBatch(batch, config, run, out, unread) {
   }
 }
 
-export async function fetchPrStates(refs, config, { run = runCommand, unread = null } = {}) {
+export async function fetchPrStates(refs, config, { run = runCommand, unread = null, throttle = githubThrottle } = {}) {
   const out = new Map();
   const parsed = uniqueRefs(refs);
   for (let index = 0; index < parsed.length; index += BATCH_SIZE) {
-    await fetchBatch(parsed.slice(index, index + BATCH_SIZE), config, run, out, unread);
+    await fetchBatch(parsed.slice(index, index + BATCH_SIZE), config, run, out, unread, throttle);
   }
   return out;
 }
@@ -417,7 +418,7 @@ export function buildPrStateQuery(refs) {
     const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){number state mergedAt closedAt updatedAt}`).join(" ");
     return `r${index}: repository(owner:"${owner}",name:"${name}"){ ${pulls} }`;
   });
-  return `query { rateLimit{cost remaining}\n${repos.join("\n")} }`;
+  return `query { rateLimit{cost remaining resetAt}\n${repos.join("\n")} }`;
 }
 
 // Just each PR's state, for choosing among a thread's PRs and for the
@@ -425,7 +426,7 @@ export function buildPrStateQuery(refs) {
 // or null when GitHub answered that the number is no PR (an issue, or a
 // "#123" that never was one). A ref GitHub could not answer is left out and
 // added to unread.
-export async function fetchPrStateLite(refs, config, { run = runCommand, unread = null } = {}) {
+export async function fetchPrStateLite(refs, config, { run = runCommand, unread = null, throttle = githubThrottle } = {}) {
   const out = new Map();
   const parsed = uniqueRefs(refs);
   for (let index = 0; index < parsed.length; index += LITE_BATCH_SIZE) {
@@ -433,7 +434,7 @@ export async function fetchPrStateLite(refs, config, { run = runCommand, unread 
     const miss = (list) => { for (const ref of list) unread?.add(prRefKey(ref.repo, ref.number)); };
     let result;
     try {
-      result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrStateQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS });
+      result = await throttledGh(run, config.bins.gh, ["api", "graphql", "-f", `query=${buildPrStateQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS }, { throttle });
     } catch {
       miss(batch);
       continue;
@@ -482,17 +483,18 @@ async function headInPr(run, config, cwd, head, prHead) {
   }
 }
 
-export async function findPrForBranch(repo, branch, config, { run = runCommand, head = null, cwd = null } = {}) {
+export async function findPrForBranch(repo, branch, config, { run = runCommand, head = null, cwd = null, throttle = githubThrottle } = {}) {
   const name = String(branch ?? "").trim();
   if (!REPO_PATTERN.test(String(repo ?? "")) || !name || name.startsWith("-") || NON_PR_BRANCHES.has(name)) return null;
   let result;
   try {
-    result = await run(config.bins.gh, [
+    result = await throttledGh(run, config.bins.gh, [
       "pr", "list", "--repo", repo, "--head", name, "--state", "all", "--json", "number,state,updatedAt,headRefOid"
-    ], { timeoutMs: GH_TIMEOUT_MS });
+    ], { timeoutMs: GH_TIMEOUT_MS }, { throttle });
   } catch (error) {
     throw new Error(`PR branch lookup unavailable: ${error?.message ?? error}`);
   }
+  if (result?.throttled) throw new Error(`PR branch lookup unavailable: ${result.stderr}`);
   const rows = result?.code === 0 ? parseJson(result.stdout) : null;
   if (!Array.isArray(rows)) throw new Error("PR branch lookup unavailable");
   const candidates = rows.filter((row) => Number.isInteger(row?.number));
