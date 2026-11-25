@@ -296,7 +296,7 @@ export class ProactiveObserver {
     if (sessions.length === 0) return null;
     const full = store.getSession(sessions[0].id) ?? sessions[0];
     const userMessages = (full.messages ?? [])
-      .filter((m) => m.role === "user" && typeof m.content === "string")
+      .filter((m) => m.role === "user" && typeof m.content === "string" && m.metadata?.noCapture !== true)
       .slice(-3)
       .map((m) => m.content.slice(0, 150));
     return userMessages.length > 0 ? userMessages : null;

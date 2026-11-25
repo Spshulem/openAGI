@@ -62,7 +62,8 @@ export function sharedConversations(store) {
     const session = store.getSession(item.id);
     const messages = session.messages.filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string");
     return { id: item.conversationId, thread: item.thread, readOnly: item.readOnly === true,
-      title: messages.find(m => m.role === "user")?.content.slice(0, 80) || (item.conversationId === "main" ? `Shared ${item.thread} chat` : "New chat"),
+      title: (typeof session.metadata?.title === "string" && session.metadata.title.trim() ? session.metadata.title.trim().slice(0, 80) : null)
+        || messages.find(m => m.role === "user")?.content.slice(0, 80) || (item.conversationId === "main" ? `Shared ${item.thread} chat` : "New chat"),
       preview: messages.at(-1)?.content.slice(0, 180) || "Start a conversation",
       updatedAt: session.updatedAt, messageCount: messages.length };
   }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) };
@@ -76,7 +77,10 @@ export function createSharedConversation(store, { thread, sourceId } = {}) {
   store.saveSession({ id: sessionId, createdAt: new Date().toISOString(), messages: [], metadata: { thread } });
   for (const message of (source?.messages ?? []).filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string").slice(-50)) {
     store.appendMessage(sessionId, { role: message.role, content: message.content,
-      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}) } });
+      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}),
+        // Copying a chat doesn't lift a capture restriction (e.g. Pebble ring
+        // input stays out of skill mining).
+        ...(message.metadata?.noCapture === true ? { noCapture: true } : {}) } });
   }
   return sharedConversations(store).conversations.find(c => c.id === id);
 }
