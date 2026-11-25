@@ -721,9 +721,14 @@ are never probed through local git or filesystem scans. Migration aliases
 suppress duplicate legacy supervision.
 
 Structured Paseo error events and a failed agent's current `lastError` feed the
-same error policy as other sources. A model-capacity failure appears as red
-`infra-blocked` / `model-limit` and asks the owner to switch models or wait;
-the supervisor does not change models or repeatedly send “continue.” Error
+same error policy as other sources. A model-capacity failure ("Selected
+model is at capacity", Codex's `server_overloaded`) is transient: it appears
+as red `infra-blocked` / `overloaded`, backs off (5, 15, then 30 minutes, or
+longer if the provider's own Retry-After asks for it, up to an hour) and
+resumes, at most `maxNudgesWithoutProgress` times before the owner hears it
+once. A per-model cap ("You've reached your … limit") is `model-limit` and
+asks the owner to switch models or wait. The supervisor never changes models
+itself, and a transient failure never starts a provider failover. Error
 notices stay separate from assistant replies and judge conversation. A new
 active turn or later message clears a historical timeline error. Unknown
 history still excludes the chat from actions. This detects the failure; it

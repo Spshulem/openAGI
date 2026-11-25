@@ -5123,12 +5123,40 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   finally { release(); await tick; }
 });
 
-test("Paseo capacity failure produces a visible model question without sending to the chat", async (t) => {
+// Capacity is transient (2026-11-24: 18 of 27 scheduled turns on one model
+// got it, the other 9 succeeded), so it backs off and resumes, bounded; it
+// is never a switch-model question or a provider failover clone.
+test("Paseo capacity failure backs off without a question, a send or a failover clone", async (t) => {
   const thread = paseoThread({
     id: "failed", provider: "codex", status: "error", model: "test-model",
+    updatedAt: ago(2 * MIN), lastUserMessageAt: ago(30 * MIN)
+  }, "host", [{ timestamp: ago(2 * MIN), item: {
+    type: "error", message: "Selected model is at capacity. Please try a different model."
+  } }]);
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", review: { enabled: false },
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => supervisor.stop());
+  await supervisor.tick({ reason: "test" });
+  const state = supervisor.getState();
+  const row = state.snapshot.threads[0];
+  assert.equal(row.state, "infra-blocked");
+  assert.equal(row.error.kind, "overloaded");
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /overloaded; backing off 5m/);
+  assert.equal(state.questions.length, 0, "no switch-model question");
+  assert.equal(delivered.length, 0, "nothing sent inside the backoff");
+  assert.deepEqual(state.providerFailovers ?? {}, {}, "no failover clone for a transient error");
+});
+
+test("a per-model cap still asks to switch models without sending to the chat", async (t) => {
+  const thread = paseoThread({
+    id: "capped", provider: "claude", status: "error", model: "test-model",
     updatedAt: ago(5 * MIN), lastUserMessageAt: ago(30 * MIN)
   }, "host", [{ timestamp: ago(5 * MIN), item: {
-    type: "error", message: "Selected model is at capacity. Please try a different model."
+    type: "error", message: "You've reached your Fable limit. Switch to another model to continue."
   } }]);
   const { supervisor, delivered, notified } = fixture(t, {
     mode: "auto", review: { enabled: false },
@@ -5138,17 +5166,38 @@ test("Paseo capacity failure produces a visible model question without sending t
   t.after(() => supervisor.stop());
   await supervisor.tick({ reason: "test" });
   const state = supervisor.getState();
-  assert.equal(state.snapshot.threads[0].state, "infra-blocked");
-  assert.equal(state.snapshot.threads[0].health, "red");
   assert.equal(state.snapshot.threads[0].error.kind, "model-limit");
   assert.equal(state.questions.length, 1);
-  assert.match(state.questions[0].title, /test-model capped\. Switch model\?/);
+  assert.match(state.questions[0].title, /Fable capped\. Switch model\?/);
   assert.deepEqual(state.questions[0].options, ["switched", "wait"]);
   await supervisor.tick({ reason: "test" });
   assert.equal(supervisor.getState().questions.length, 1, "the same failure is deduplicated");
   assert.equal(new Set(notified.map(q => q.id)).size, 1);
   assert.equal(delivered.length, 0);
 });
+
+test("a transient failure's Retry-After hint holds the resume past the backoff step", async (t) => {
+  const thread = paseoThread({
+    id: "hinted", provider: "codex", status: "error", model: "test-model",
+    updatedAt: ago(6 * MIN), lastUserMessageAt: ago(30 * MIN)
+  }, "host", [{ timestamp: ago(6 * MIN), item: {
+    type: "error", message: "unexpected status 503 Service Unavailable. Retry-After: 900"
+  } }]);
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", review: { enabled: false },
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => supervisor.stop());
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.error.kind, "overloaded");
+  // The 5-minute step has passed, but the provider asked for 15.
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /the provider asked to retry at/);
+  assert.equal(delivered.length, 0);
+});
+
 
 // Live, 2026-11-21: a Paseo chat behind a model proxy with no Codex account
 // kept failing with this, and each scan read it as overloaded and resumed it.
