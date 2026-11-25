@@ -46,11 +46,13 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 ### P1-2. "Dismiss" means two different things on one card
 - **Before** (`img/duo-cover-supervisor-annotated.jpg` #3 and #4):
   - **X** (SupervisorView.swift:2049): a 24×24 icon that sends `op: "dismiss"` straight away. No confirmation, no accessibility label.
-  - **Grey "Dismiss" text** (SupervisorView.swift:2330): sends `card.secondaryAction`, which defaults to `op: "defer"` (Later). The code relabels "Later" as "Dismiss".
+  - **Grey "Dismiss" text** (SupervisorView.swift:2330): sends `card.secondaryAction`, which defaults to `op: "defer"`, and relabels "Later" as "Dismiss".
+  - **On the daemon, defer and dismiss are the same action today.** `src/fleet/supervisor.js:2826-2828` sends both `op: "defer"` and `op: "dismiss"` to `dismissQuestion()`. So both the X and the grey text dismiss the question for good; there is no reversible "Later".
   - **"Hide ▾"**: only collapses the deck on this device.
-  - So three controls look like dismissal and do three different things, and the obvious X is the irreversible one.
+  - So three controls look like dismissal: two actually dismiss (one with no label, one mislabeled), and one only hides locally.
 - **After:**
-  - One overflow menu (`Menu("More", systemImage: "ellipsis.circle")`) holding **Later** (defer), **Dismiss…** (dismiss, with a confirmation that says what happens) and **Hide cards** (collapse locally).
+  - One overflow menu (`Menu("More", systemImage: "ellipsis.circle")`) holding **Dismiss…** (with a confirmation that says what happens) and **Hide cards** (collapse locally).
+  - **Later** is offered only after the daemon gets a real, reversible defer (snooze, then return the question). That is a prerequisite; until then nothing in the UI may say "Later".
   - The X disappears from the card.
   - The archive confirmation stays exactly as it is (`pendingArchiveConfirmation`, SupervisorView.swift:494).
   - Labels say what actually happens; "Later" is never shown as "Dismiss".
@@ -97,12 +99,13 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 
 ### P2-3. Passive status looks like controls; real actions look passive
 - **Before:**
-  - "1 watched" is a button-shaped pill that is only status (#7).
+  - The "1 watched" pill (#7, `activeSessionsPill`, SupervisorView.swift:732-743) is a status readout and a navigation button at once. Tapping it switches the workspace to the Sessions channel (in UI tests it opens the sessions sheet). It doesn't read as navigation, and the count is easy to mistake for plain status.
   - "daemon.example.com · Synced" repeats at the top of Today, Inbox and Tasks.
   - The Supervisor `topBannerStack` (SupervisorView.swift:850) can stack up to five rows above the chat: walkthrough, warning, autonomy, catch-up and status note. They mix actions (Retry, Back, Pause, Next) with plain information, all in the same small type.
   - The status-note close button is an unlabeled `xmark`.
 - **After:**
   - Status as plain text with an icon. Show the connection line only when it isn't synced, plus always in Settings.
+  - Keep the watched pill's navigation. Either give it a clear label ("Sessions · 1 watched", with a disclosure) or move the action to the `#sessions` chip and leave the count as plain text. Sessions must stay reachable in one tap.
   - Fold the banners into one actionable row with the most urgent first (for example, can't reach → Retry). Put the rest behind "Details".
   - Every icon button gets a text label (HIG 5.1, SwiftUI Pro accessibility).
 
@@ -139,12 +142,13 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 | Free-text reply to the agent | Thread sheet "Reply to <workspace>" | Direct to the agent, explicit field | ✓ | ✓ | Same field, labeled "To agent" |
 | Reply in chat (Supervisor composer focused on a card) | Card "Reply in chat" | **Today: implicit auto-focus (P1-1)**. Proposed: explicit chip | ✓ | ✓ | Same chip |
 | Ask Supervisor | Supervisor composer | Tool confirmation is conditional for the owner: `ownerInvoke` can run `fleet_send_message` / `reply_to_coding_agent` without a prompt when the message reads as assent | ✓ | ✓ | Same, but the composer mode must be explicit (P1-1) |
-| Later (defer) | Grey "Dismiss" text (mislabeled) | None needed; reversible | ✓ | ✓ | Labeled "Later", in More |
-| Dismiss | Card X (no confirmation) | **Today: none (P1-2)**. Proposed: confirmation | ✓ | ✓ | In More, with confirmation |
+| Dismiss (via the X or the grey "Dismiss" text) | Card X (no confirmation); grey text sends `defer` | **Today: none (P1-2).** The daemon handles `defer` and `dismiss` the same way (`dismissQuestion()`), so both are permanent | ✓ | ✓ | One "Dismiss…" in More, with confirmation |
+| Later (reversible) | **Does not exist today** | Needs a daemon defer/snooze that brings the question back | — | — | Add only after the daemon supports it |
 | Archive session | Card action | `pendingArchiveConfirmation` dialog | ✓ | ✓ | Unchanged |
 | Hide cards (local collapse) | "Hide ▾" | Local only | ✓ | ✓ | In More |
 | Merge green PRs (batch) | #needs-you stage | Existing `batchAct` gating | ✓ | ✓ | Unchanged |
-| Approve a pending action | Inbox, Chat card → Review → ApprovalDetailView | Approve/Deny only in the detail view, with result handling and computer-unavailable copy | ✓ | ✓ | Unchanged; card stays Review-only |
+| Approve or deny from the detail view | Inbox row, Chat card → Review → ApprovalDetailView | Shows full arguments and context; result handling includes the computer-unavailable copy | ✓ | ✓ | Unchanged; the chat card stays Review-only |
+| Approve or deny by Inbox quick swipe | Inbox row swipe: Approve (leading), Deny (trailing). `InboxView.swift:79-94`, `quickDecide()` 139-155 | **No detail view first.** Full swipe is off (`allowsFullSwipe: false`), so a deliberate button tap is needed. Busy-guarded per action. Result is a banner ("Approved", the tool error, or "Couldn't reach OpenAGI"); no computer-unavailable copy | ✓ | ✓ | Keep it a deliberate tap. Consider keeping risky tools (computer use, send) out of quick decisions so they go through the detail view |
 | Hide an approval card in Chat | Chat card "Hide" | Local; the approval stays in the Inbox | ✓ | ✓ | Unchanged |
 | Dictation | Composer mic | Fills the editable draft; nothing is sent until Send | ✓ | ✓ | Same |
 | Live voice conversation | "Talk with Supervisor" bar | **Different behavior:** `startVoice()` starts `VoiceSession.handsFree(true)`; spoken turns are sent and saved without an editable draft or Send | ✓ | ✓ | Keep as its own clearly labeled mode (e.g. long-press on the mic). Do not merge it into dictation in a way that implies review before sending |
