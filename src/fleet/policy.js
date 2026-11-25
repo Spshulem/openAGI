@@ -179,7 +179,20 @@ export function decideThread(classified, thread, options = {}) {
   // A Codex card beside the thread's own decision (a resume, a nudge, a
   // question): its question is asked too.
   const card = classified.card ? cardIntent(ctx, classified.card.card) : null;
-  return card?.question ? { ...decision, cardQuestion: card.question } : decision;
+  const decided = card?.question ? { ...decision, cardQuestion: card.question } : decision;
+  return thread?.watchOnly ? watchOnly(decided) : decided;
+}
+
+// A watch-only chat (OPENAGI_FLEET_SELF_SESSION_IDS) is never messaged by
+// the supervisor: a planned nudge waits and says so, so the review card,
+// diagnostics and the owner still see what it would have sent. Questions to
+// the owner and owner replies go on as for any chat.
+export const WATCH_ONLY_REASON = "watch-only chat: the supervisor never messages it; reply to it yourself";
+
+function watchOnly(decision) {
+  if (decision?.action !== "nudge") return decision;
+  return { ...decision, action: "wait", route: null, withheld: { playbook: decision.playbook ?? null, message: decision.message ?? null },
+    reason: `${WATCH_ONLY_REASON}; would have: ${decision.reason ?? decision.playbook ?? "nudged"}` };
 }
 
 function makeContext(classified, thread, options) {
@@ -351,12 +364,19 @@ function backoffIntent(ctx, errorAt, kind) {
   const steps = ctx.limits.overloadBackoffMs;
   const attempts = attemptsWithoutProgress(ctx.ledger, ctx.progressMark);
   const delay = steps[Math.min(attempts, steps.length - 1)];
-  const resumeAt = addMs(errorAt, delay);
+  const backoffAt = addMs(errorAt, delay);
+  // The provider's own "retry after" (errors.js retryHintAt, capped at an
+  // hour) wins when it is later than the backoff step: retrying sooner
+  // would only be refused again.
+  const hintAt = TRANSIENT_HINT_KINDS.has(kind) ? ctx.thread?.error?.resetAt : null;
+  const hinted = Number.isFinite(Date.parse(hintAt ?? "")) && (!backoffAt || Date.parse(hintAt) > Date.parse(backoffAt));
+  const resumeAt = hinted ? hintAt : backoffAt;
   if (resumeAt && Date.parse(resumeAt) > ctx.now) {
-    return { type: "wait", notBefore: resumeAt, reason: `${kind}; backing off ${minutes(delay)}m` };
+    return { type: "wait", notBefore: resumeAt, reason: hinted ? `${kind}; the provider asked to retry at ${clock(resumeAt)}` : `${kind}; backing off ${minutes(delay)}m` };
   }
   return nudge("resume", `${kind}; retry ${attempts + 1}`, { immediate: true });
 }
+const TRANSIENT_HINT_KINDS = new Set(["overloaded", "network"]);
 
 // The repo's merge gate is the BuildBot3 full run itself: a required check
 // named for it, or one produced by bb-verify --full. Another required check
