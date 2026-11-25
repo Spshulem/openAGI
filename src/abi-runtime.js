@@ -183,6 +183,7 @@ export class AbiRuntime {
     // only while OPENAGI_LEARNED_PROPAGATION is not off (learnedClusterStats).
     this.clusterStats = options.clusterStats ?? null;
     this.learningDir = options.dataDir ? path.join(options.dataDir, "learning") : undefined;
+    this.modelUpgradeDir = options.dataDir ?? resolveDataDir();
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // FTS5 index over the agent's own chat transcripts, so search_sessions can
@@ -377,6 +378,16 @@ export class AbiRuntime {
       // reached 1.26 GiB of screen OCR. 05:15 is deliberately AFTER the 02:30
       // nightly miner (which reads a 28-day window) and off every other slot, so
       // retention never shares a tick with another job.
+      // Daily: list the models the owner's keys can reach and suggest newer
+      // ones (or flag a configured model that no longer exists). Read-only
+      // against the provider; never changes config.
+      this.cron.addJob({
+        id: "model-upgrade-check",
+        name: "Daily check for newer models (suggests, never switches)",
+        enabled: true,
+        task: "model-upgrade-check",
+        dailyAt: "05:35"
+      });
       this.cron.addJob({
         id: "grounded-sweep",
         name: "Daily grading of drafts, suggestions and agent tasks by what happened",
@@ -1016,6 +1027,12 @@ export class AbiRuntime {
         if (!result.restartRequired) setTimeout(() => process.exit(0), 500);
       }
       return result;
+    }
+    if (job.task === "model-upgrade-check") {
+      const { checkModelUpgrades } = await import("./model-upgrades.js");
+      // Outreach opt-out (OPENAGI_OUTREACH_DISABLED / outreach.json) silences
+      // the announcement; the read-only check and settings cache still run.
+      return checkModelUpgrades({ dataDir: this.modelUpgradeDir, outreach: this.outreachConfig?.enabled ? this.outreach : null, now });
     }
     if (job.task === "grounded-sweep") {
       return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };
