@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
 import { parseUntrustedTranscriptSignals } from "../src/fleet/active-work.js";
+import { dispatchDedupeKey } from "../src/fleet/themes.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { createFleetCapability, RemoteFleetSupervisor } from "../src/fleet/remote.js";
 import { registerFleetTools } from "../src/fleet/tools.js";
@@ -816,7 +817,8 @@ test("dedupe, scan pagination, evidence freshness, snooze, and completed work op
     const restarted = new FleetSupervisor({
       dataDir: ctx.dataDir,
       config: { enabled: false, paseo: { enabled: false } },
-      runtime: { outreach: ctx.outreach, events: { emit() {} } }
+      runtime: { outreach: ctx.outreach, events: { emit() {} } },
+      deps: { now: () => BASE_NOW }
     });
     assert.equal(restarted.getActiveWork({ project: "PersistedPR" }).items[0].followThroughState, "blocked_pr");
 
@@ -1181,6 +1183,7 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
   try {
     // 1. Mobile route allowlist checks
     assert.equal(isMobileRouteAllowed("GET", "/fleet/api/active-work"), true);
+    assert.equal(isMobileRouteAllowed("GET", "/fleet/api/ask-supervisor"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work/scan"), true);
     assert.equal(isMobileRouteAllowed("POST", "/fleet/api/active-work/tw_abc123/act"), true);
@@ -1246,6 +1249,9 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
 
     const remoteView = await remote.getActiveWork({ project: "Growth" });
     assert.equal(remoteView.items.length, 1);
+    const remoteAsk = await remote.getSupervisorWork({ project: "Growth" });
+    assert.equal(remoteAsk.project, "Growth");
+    assert.equal(remoteAsk.work.items.length, 1);
 
     // Proposal enrollment via RemoteFleetSupervisor
     await remote.scanActiveWork({ pageSize: 20, resetCursor: true });
@@ -1356,5 +1362,192 @@ test("exposes Active Work HTTP routes, mobile allowlist, RemoteFleetSupervisor r
   } finally {
     ctx.cleanup();
     fs.rmSync(remoteDir, { recursive: true, force: true });
+  }
+});
+
+test("durable Work records keep the original ask, lifecycle stage, health, evidence and project summary", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "UnifiedWork",
+      theme: "Supervisor",
+      goal: "Build unified Supervisor Work",
+      originalAsk: "Build unified Supervisor Work and project-scoped Ask Supervisor",
+      acceptanceCriteria: "Portfolio and project views show owner, evidence, blocker and next check",
+      doneCriteria: "iPhone and Duo QA evidence is recorded",
+      currentStep: "Implementing durable records",
+      nextMilestone: "Project-scoped read returns the same record",
+      nextActionOwner: "OpenAGI supervisor owner",
+      blocker: "PR #325 merge conflicts",
+      eta: "unknown",
+      nextCheckAt: "2026-11-21T13:00:00.000Z",
+      workflowStage: "implementing",
+      cadence: "hourly",
+      permittedNudges: "none"
+    });
+    assert.equal(tracked.item.originalAsk, "Build unified Supervisor Work and project-scoped Ask Supervisor");
+    assert.equal(tracked.item.acceptanceCriteria, "Portfolio and project views show owner, evidence, blocker and next check");
+    assert.equal(tracked.item.workflowStage, "implementing");
+    assert.equal(tracked.item.executionHealth, "blocked");
+    assert.equal(tracked.item.blocker, "PR #325 merge conflicts");
+    assert.equal(tracked.item.nextCheckAt, "2026-11-21T13:00:00.000Z");
+    assert.ok(tracked.item.lastMeaningfulEvidenceAt === null || typeof tracked.item.lastMeaningfulEvidenceAt === "string");
+
+    const projectSummary = ctx.supervisor.getActiveWork({ project: "UnifiedWork" }).projectSummaries
+      .find((entry) => entry.project === "UnifiedWork");
+    assert.ok(projectSummary);
+    assert.equal(projectSummary.total, 1);
+    assert.equal(projectSummary.stages.implementing, 1);
+    assert.equal(projectSummary.health.blocked, 1);
+
+    const route = createFleetRoute({ supervisor: ctx.supervisor });
+    const ask = await route(
+      "GET",
+      "/fleet/api/ask-supervisor",
+      new URL("http://localhost/fleet/api/ask-supervisor?project=UnifiedWork"),
+      async () => ({})
+    );
+    assert.equal(ask.status, 200);
+    assert.equal(ask.body.project, "UnifiedWork");
+    assert.equal(ask.body.work.items[0].originalAsk, "Build unified Supervisor Work and project-scoped Ask Supervisor");
+    assert.match(ask.body.ask.prompt, /UnifiedWork/);
+  } finally {
+    fs.rmSync(ctx.dataDir, { recursive: true, force: true });
+  }
+});
+
+test("project summaries list current blockers, not blockers on verified outcomes", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    for (let i = 0; i < 5; i += 1) {
+      const done = ctx.supervisor.trackWork({ project: "BlockerHistory", goal: `Finished slice ${i}`, blocker: `Old blocker ${i}` });
+      const verified = await ctx.supervisor.actActiveWork(done.item.id, { op: "confirm_done" });
+      assert.equal(verified.item.outcomeVerified, true);
+    }
+    const open = ctx.supervisor.trackWork({ project: "BlockerHistory", goal: "Unfinished slice", blocker: "Staging credentials missing", nextMilestone: "Staging deploy" });
+    const summary = ctx.supervisor.getActiveWork({ project: "BlockerHistory" }).projectSummaries
+      .find((entry) => entry.project === "BlockerHistory");
+    assert.ok(summary);
+    assert.deepEqual(summary.blockers.map((entry) => entry.id), [open.item.id]);
+    assert.deepEqual(summary.nextMilestones, ["Staging deploy"]);
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("recording a blocker without a state change invalidates the scan cache", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({ project: "BlockerScan", goal: "Deploy to staging", permittedNudges: "propose_only", threadKey: "paseo:srv_mac.seo_ads" });
+    const mark = () => ctx.supervisor.activeWork.state.items.find((item) => item.id === tracked.item.id).lastEvaluatedMark;
+    const scan = () => ctx.supervisor.scanActiveWork({ pageSize: 50, maxRepoChecks: 0, maxPromptsPerPass: 50, resetCursor: true });
+    await scan();
+    const first = mark();
+    await scan();
+    assert.equal(mark(), first, "an unchanged item keeps its evaluation mark");
+
+    ctx.supervisor.trackWork({ id: tracked.item.id, project: "BlockerScan", goal: "Deploy to staging", blocker: "Staging credentials missing" });
+    await scan();
+    assert.notEqual(mark(), first, "the newly blocked item is re-evaluated");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("dispatch dedupe keys keep their digest within the persisted limit for long project and theme names", () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const project = "P".repeat(80);
+    const theme = "T".repeat(80);
+    const first = dispatchDedupeKey(project, theme, "Ship it", "dispatch-1");
+    const second = dispatchDedupeKey(project, theme, "Ship it", "dispatch-2");
+    assert.ok(first.length <= 160 && second.length <= 160);
+    assert.notEqual(first, second);
+
+    const a = ctx.supervisor.trackWork({ project: "OpenAGI", goal: "First directive", dedupeKey: first });
+    const b = ctx.supervisor.trackWork({ project: "OpenAGI", goal: "Second directive", dedupeKey: second });
+    assert.notEqual(a.item.id, b.item.id, "distinct dispatches produce distinct Work records");
+    assert.equal(ctx.supervisor.activeWork.state.items.find((it) => it.id === a.item.id).goal, "First directive");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("resume_owner includes a separate acceptance contract in the default follow-up", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: "Implement desktop",
+      doneCriteria: "Desktop tests pass",
+      acceptanceCriteria: "Also run mobile QA",
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads"
+    });
+    const retry = await ctx.supervisor.actActiveWork(tracked.item.id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes("Implement desktop"));
+    assert.ok(delivered.includes("Desktop tests pass"));
+    assert.ok(delivered.includes("Also run mobile QA"), "the follow-up carries the acceptance contract");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("resume_owner retries the current goal, not the historical original ask", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: "Implement the desktop flow",
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads"
+    });
+    const id = tracked.item.id;
+    const updated = ctx.supervisor.trackWork({ id, project: "OpenAGI", goal: "Implement the desktop AND mobile flows" });
+    assert.equal(updated.item.goal, "Implement the desktop AND mobile flows");
+    assert.equal(updated.item.originalAsk, "Implement the desktop flow");
+
+    const retry = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes("Implement the desktop AND mobile flows"), "the retry carries the revised goal");
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test("resume_owner retries a long blocked dispatch with the complete ask before clearing the blocker", async () => {
+  const ctx = seedRepresentativeFixtures();
+  try {
+    const finalRequirement = "FINAL REQUIREMENT: keep VoiceOver labels on every Work row.";
+    const longGoal = `${"Ship the unified Work view with durable follow-through. ".repeat(36)}${finalRequirement}`;
+    assert.ok(longGoal.length > 2000 && longGoal.length <= 4000);
+    const tracked = ctx.supervisor.trackWork({
+      project: "OpenAGI",
+      goal: longGoal,
+      permittedNudges: "resume_owner",
+      threadKey: "paseo:srv_mac.seo_ads",
+      blocker: "Dispatch delivery blocked: owner offline"
+    });
+    const id = tracked.item.id;
+    const stored = () => ctx.supervisor.activeWork.state.items.find((item) => item.id === id);
+    stored().blocker = "Dispatch delivery blocked: owner offline";
+    stored().state = "blocked";
+
+    // A short custom note is delivered but does not count as recovering the dispatch.
+    const shortNote = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", message: "Ping", confirmed: true });
+    assert.equal(shortNote.status, "resumed_owner");
+    assert.equal(stored().blocker, "Dispatch delivery blocked: owner offline");
+
+    const retry = await ctx.supervisor.actActiveWork(id, { op: "resume_owner", confirmed: true });
+    assert.equal(retry.status, "resumed_owner");
+    const delivered = ctx.sentMessages.at(-1).message;
+    assert.ok(delivered.includes(finalRequirement), "the retried dispatch carries the final requirement");
+    assert.equal(stored().blocker, null);
+    assert.equal(stored().state, "active");
+  } finally {
+    ctx.cleanup();
   }
 });
