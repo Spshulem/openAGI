@@ -223,3 +223,22 @@ test("identical replies from two cards share one queued message, and both cards 
   }
   assert.equal(ctx.calls.length, 0);
 });
+
+// Review fix (#384): a busy fleet closing over 200 newer questions while a
+// reply waited in the queue pruned the reply's card, so after expiry there
+// was nothing to put back.
+test("a card whose reply is still queued is not pruned by later closed questions", async (t) => {
+  const ctx = setup(t);
+  await replyQueued(ctx);
+  for (let i = 0; i < 210; i += 1) {
+    const q = ctx.sup.store.upsertQuestion({ dedupeKey: `ask:busy:${i}`, kind: "agent-ask", threadKey: `paseo:srv_1.other_${i}`, title: `Other ${i}`, body: "?", options: ["yes"] });
+    ctx.clock.now += 1000;
+    ctx.sup.store.answerQuestion(q.id, "yes");
+  }
+  assert.ok(ctx.sup.store.question(ctx.question.id), "the awaited card survived pruning");
+  ctx.clock.now = NOW + 25 * HOUR;
+  await ctx.sup.drainQueuedOwnerMessages({ byKey: new Map([[ctx.thread.key, ctx.thread]]), started: ctx.clock.now });
+  const q = ctx.sup.store.question(ctx.question.id);
+  assert.equal(q?.status, "open");
+  assert.match(q.deliveryNote, /never sent/);
+});
