@@ -818,6 +818,9 @@ final class SharedSupervisorClient: ObservableObject {
         if !next.payload.attachments.isEmpty { body["attachments"] = next.payload.attachments.map(\.agentHostPayload) }
         if next.origin?.sendNext == true { body["next"] = true }
         self.uploadingRequestID = next.requestID
+        // An earlier try that got no answer stays uncertain until the hub
+        // itself answers, whatever this try's failure.
+        let earlierUncertain = next.origin?.uploadAttempted == true
         self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
         var offline = false
         do {
@@ -842,7 +845,7 @@ final class SharedSupervisorClient: ObservableObject {
           self.queue.setOrigin(next.id) { $0.error = refused.displayMessage; $0.uploadAttempted = false }
         } catch {
           offline = true
-          if HubUpload.neverSent(error) { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
+          if HubUpload.neverSent(error), !earlierUncertain { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
           // Not stopped: main was not reached. It is tried again.
           if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
         }

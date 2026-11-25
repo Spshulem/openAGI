@@ -403,6 +403,9 @@ final class ChatConversation {
             while let self, !self.forgotten,
                   let next = self.queue.nextUpload {
                 self.uploadingRequestID = next.requestID
+                // An earlier try that got no answer stays uncertain until the
+                // hub itself answers, whatever this try's failure.
+                let earlierUncertain = next.origin?.uploadAttempted == true
                 self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
                 var offline = false
                 do {
@@ -428,7 +431,7 @@ final class ChatConversation {
                     self.queue.setOrigin(next.id) { $0.error = refused.displayMessage; $0.uploadAttempted = false }
                 } catch {
                     offline = true
-                    if Self.neverReachedHub(error) { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
+                    if Self.neverReachedHub(error), !earlierUncertain { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
                     // Not stopped: main was not reached. It is tried again.
                     if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
                 }

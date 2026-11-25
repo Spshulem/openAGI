@@ -255,6 +255,27 @@ final class MacHubQueueTests: XCTestCase {
     XCTAssertEqual(MacFakeHubProtocol.snapshot().filter { $0.requestId == item.requestID }.count, 1)
   }
 
+  func testARetryThatCannotConnectKeepsAnEarlierUnansweredUploadUncertain() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-11", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.dropNextEnqueueAnswer = true }
+    _ = await supervisor.sendMessage("taken, answer lost, then offline")
+    try await waitFor("the hub to take it") { MacFakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then offline" } }
+    try await waitFor("the lost answer") { supervisor.queuedMessages.first?.origin?.uploadAttempted == true }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    // The retry (asked for by an Edit tap) cannot even connect.
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.failNextEnqueue = true }
+    let item = try XCTUnwrap(supervisor.queuedMessages.first)
+    XCTAssertFalse(supervisor.beginEditingQueued(id: item.id))
+    try await waitFor("the failed retry") { MacFakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertEqual(supervisor.queuedMessages.first?.origin?.uploadAttempted, true, "still possibly on the hub")
+    XCTAssertFalse(supervisor.beginEditingQueued(id: item.id), "still no local-only edit")
+    supervisor.removeQueued(id: item.id)
+    try await waitFor("the hub removal") { !MacFakeHubProtocol.snapshot().contains { $0.requestId == item.requestID } }
+    XCTAssertTrue(MacFakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(item.requestID)") })
+  }
+
   func testAnUploadAnswerOlderThanTheSnapshotShownLeavesNoStaleRow() async throws {
     MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-9", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
     let supervisor = await client()

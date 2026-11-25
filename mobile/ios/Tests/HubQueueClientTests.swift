@@ -357,6 +357,29 @@ final class HubQueueClientTests: XCTestCase {
     }
 
     @MainActor
+    func testARetryThatCannotConnectKeepsAnEarlierUnansweredUploadUncertain() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-11", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.dropNextEnqueueAnswer = true
+        chat.draft = "taken, answer lost, then offline"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the hub to take it") { FakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then offline" } }
+        try await Task.sleep(for: .milliseconds(50))
+        // The retry (asked for by an Edit tap) cannot even connect: that
+        // says nothing about the first try. (A refresh would settle it from
+        // the hub's snapshot instead.)
+        FakeHubProtocol.failNextEnqueue = true
+        let item = try XCTUnwrap(chat.queuedSubmissions.first)
+        XCTAssertFalse(chat.beginEditingQueued(id: item.id))
+        try await waitFor("the failed retry") { FakeHubProtocol.calls().filter { $0.hasPrefix("POST /conversations/supervisor/queue") }.count == 2 }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(chat.queuedSubmissions.first?.origin?.uploadAttempted, true, "still possibly on the hub")
+        chat.removeQueuedSubmission(id: item.id)
+        try await waitFor("the hub removal") { !FakeHubProtocol.snapshot().contains { $0.requestId == item.requestID } }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(item.requestID)") })
+    }
+
+    @MainActor
     func testAnUploadAnswerOlderThanTheSnapshotShownLeavesNoStaleRow() async throws {
         FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-9", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
         let chat = await chat()
