@@ -77,6 +77,16 @@ test("each walkthrough item is decision-ready: goal, evidence, choices and recom
   const [bare] = walkthroughItems({ cards: [card("bare")], questions: [], snapshot: { threads: [] } });
   assert.equal(bare.goal, null, "a missing beat stays missing rather than invented");
   assert.deepEqual(bare.choices, ["Approve"]);
+  const [standalone] = walkthroughItems({
+    cards: [],
+    questions: [{ id: "q-solo", status: "open", title: "Deploy hotfix?", body: "Tests are green.", options: ["Deploy", "Hold"] }],
+    snapshot: { threads: [] }
+  });
+  assert.equal(standalone.title, "Deploy hotfix?");
+  assert.equal(standalone.summary, "Tests are green.");
+  assert.deepEqual(standalone.choices, ["Deploy", "Hold"]);
   assert.match(voiceInstructions(), /goal.*evidence.*choices.*recommendation/s);
+  assert.match(voiceInstructions(), /title and summary/);
+  assert.match(voiceInstructions(), /options if choices is absent/);
   assert.match(voiceInstructions(), /leave it out rather than guess/);
 });

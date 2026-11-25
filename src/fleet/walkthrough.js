@@ -81,13 +81,15 @@ function decisionChoices(card) {
 function questionItem(question, cards) {
   if (!question || typeof question !== "object" || typeof question.id !== "string" || !question.id) return null;
   if (cards.some(card => card.questionId === question.id)) return null;
+  const options = supportedOptions(question.options);
   return {
     id: clean(question.id, ID_MAX), kind: "question", title: clean(question.title ?? "Needs your decision", 180),
     summary: clean(question.body ?? question.card ?? "The Supervisor is waiting for your choice.", 500),
     questionId: clean(question.id, ID_MAX),
     threadKey: typeof question.threadKey === "string" ? clean(question.threadKey, ID_MAX) : null,
     cardId: null, cardKind: null, prRef: typeof question.prRef === "string" ? clean(question.prRef, 100) : null,
-    options: supportedOptions(question.options)
+    options,
+    choices: options
   };
 }
 
