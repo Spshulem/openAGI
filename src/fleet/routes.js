@@ -217,6 +217,28 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         }
         return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
       }
+      if (parts.length === 1 && parts[0] === "ask-supervisor") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.getActiveWork !== "function") return fail(503, "Supervisor Work is not available.");
+        const project = url?.searchParams?.get("project") ?? "";
+        const limit = Number(url?.searchParams?.get("limit") ?? 50);
+        if (project.length > 160 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return fail(400, "Pass project up to 160 characters and a limit of 1-100.");
+        }
+        const work = await supervisor.getActiveWork({ project: project.trim() || null, limit });
+        return ok({
+          project: project.trim() || null,
+          work,
+          state: state(),
+          ask: {
+            prompt: project.trim()
+              ? `Ask Supervisor about ${project.trim()} work, blockers, owners, and next checks.`
+              : "Ask Supervisor about tracked work, blockers, owners, and next checks.",
+            source: "active-work",
+            unknownEtaIsExplicit: true
+          }
+        });
+      }
       if (parts[0] === "active-work" && (parts.length === 1 || (parts.length === 2 && parts[1] === "scan") || (parts.length === 3 && (parts[2] === "act" || parts[2] === "verify")))) {
         if (parts.length === 1 && method === "GET") {
           if (typeof supervisor.getActiveWork !== "function") {
@@ -652,7 +674,7 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
         const extraOpts = {
           ...sendOptions,
-          ...(body?.queue === true ? { queue: true } : {}),
+          ...(typeof body?.queue === "boolean" ? { queue: body.queue } : {}),
           ...(images?.length ? { images } : {})
         };
         const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);

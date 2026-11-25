@@ -84,6 +84,7 @@ const EXACT = new Set([
   "GET /fleet/api/search",
   "GET /fleet/api/workspaces",
   "GET /fleet/api/hierarchy",
+  "GET /fleet/api/ask-supervisor",
   "GET /fleet/api/active-work",
   "POST /fleet/api/active-work",
   "POST /fleet/api/active-work/scan",

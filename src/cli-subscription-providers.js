@@ -10,6 +10,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { clipToolOutput } from "./context-trim.js";
+import { DEFAULT_OPENAI_MODEL, reasoningEffortsForModel } from "./model-router.js";
+
+const CODEX_CLI_EFFORTS = Object.freeze(["minimal", "low", "medium", "high", "xhigh"]);
+// What the CLI's config accepts AND the target model takes.
+const codexEffortsForModel = (model) => reasoningEffortsForModel(model).filter((e) => CODEX_CLI_EFFORTS.includes(e));
 
 const MAX_CLI_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_CLI_TIMEOUT_MS = 120_000;
@@ -94,7 +99,7 @@ export function codexCliStatus({ env = process.env, homeDir = os.homedir() } = {
     || hasFile(path.join(homeDir, ".ccodex"));
   return {
     available: Boolean(bin && hasAuth),
-    model: String(env?.CODEX_CLI_MODEL ?? "").trim() || "gpt-5.4"
+    model: String(env?.CODEX_CLI_MODEL ?? "").trim() || DEFAULT_OPENAI_MODEL
   };
 }
 
@@ -493,7 +498,7 @@ export class CodexCliProvider {
     this.name = "codex-cli";
     this.env = options.env ?? process.env;
     this.homeDir = options.homeDir ?? os.homedir();
-    this.model = options.model ?? (String(this.env?.CODEX_CLI_MODEL ?? "").trim() || "gpt-5.4");
+    this.model = options.model ?? (String(this.env?.CODEX_CLI_MODEL ?? "").trim() || DEFAULT_OPENAI_MODEL);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS;
     this.maxToolHops = options.maxToolHops ?? (Number(this.env?.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.run = options.run ?? defaultRunCli;
@@ -513,10 +518,21 @@ export class CodexCliProvider {
     return model || this.model;
   }
 
+  // `codex exec -c model_reasoning_effort=...` per turn; unset keeps the
+  // CLI's own configured default.
+  reasoningEffortSupport() {
+    const options = codexEffortsForModel(this.model);
+    return {
+      supported: options.length > 0, provider: this.name, model: this.model, options, configuredDefault: null,
+      ...(options.length > 0 ? {} : { reason: `${this.model} does not take a reasoning-effort setting.` })
+    };
+  }
+
   async generate(args = {}) {
     const bin = this.resolveBinary();
     if (!bin) throw new Error("Codex CLI ('codex') was not found on this host.");
     const chosenModel = this.resolveModel(args);
+    const effort = codexEffortsForModel(chosenModel).includes(args.reasoningEffort) ? args.reasoningEffort : null;
     const runner = new CliTurnRunner({
       name: this.name,
       env: this.env,
@@ -550,6 +566,7 @@ export class CodexCliProvider {
             "--skip-git-repo-check",
             "-s", "read-only",
             "-m", model,
+            ...(effort ? ["-c", `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
             ...imageArgs,
             "--output-schema", schemaPath,
             "-o", outPath,

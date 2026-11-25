@@ -69,6 +69,8 @@ export function isPublicRoute(pathname) {
     pathname === "/channels/telnyx/webhook" ||
     pathname === "/channels/surge/webhook" ||
     pathname === "/webhooks/pebble" ||
+    // Index 01 → Peri: one signed URL per ring; the per-device HMAC is the auth.
+    /^\/webhooks\/pebble\/peri\/[a-f0-9]{32}$/.test(pathname) ||
     pathname === "/integrations/google/callback"
   );
 }
