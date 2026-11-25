@@ -17,6 +17,9 @@ import { defaultPreferences, normalizePreferences } from "./preferences.js";
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
+// Pending undelivered-reply recoveries kept: far above the owner-message
+// queue's 100, so none is dropped before its card is put back.
+const UNDELIVERED_REPLIES_MAX = 1000;
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
 const REOPEN_MS = 60 * 60 * 1000;
@@ -647,6 +650,9 @@ export class FleetStore {
   answerQuestion(id, answer) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
+    // A new answer replaces whatever happened to the last one.
+    const question = this._findQuestion(id);
+    if (question?.deliveryNote) { delete question.deliveryNote; delete question.deliveryNoteAt; }
     return this._closeQuestion(id, "answered", text);
   }
 
@@ -710,7 +716,9 @@ export class FleetStore {
     const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
     if (list.some((entry) => entry.id === item.id)) return;
     list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, threadKey: item.threadKey, reason, at: iso(this.now()) });
-    this.state.undeliveredOwnerReplies = list.slice(-50);
+    // Never evict one still waiting: each is a card that would stay closed.
+    // Bounded anyway: the queue holds 100 and every entry expires in a day.
+    this.state.undeliveredOwnerReplies = list.slice(-UNDELIVERED_REPLIES_MAX);
   }
 
   takeUndeliveredOwnerReplies() {
@@ -1548,7 +1556,7 @@ export class FleetStore {
       // Cards whose queued reply expired undelivered, waiting to be put back:
       // the queued message is already gone, so a restart must keep these.
       undeliveredOwnerReplies: Array.isArray(raw.undeliveredOwnerReplies)
-        ? raw.undeliveredOwnerReplies.filter((u) => isObject(u) && typeof u.id === "string" && typeof u.questionId === "string").slice(-50)
+        ? raw.undeliveredOwnerReplies.filter((u) => isObject(u) && typeof u.id === "string" && typeof u.questionId === "string").slice(-UNDELIVERED_REPLIES_MAX)
         : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
       lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,

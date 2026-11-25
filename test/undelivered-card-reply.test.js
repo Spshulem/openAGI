@@ -156,3 +156,47 @@ test("the reopened card says what happened to the reply before anything else", a
   assert.match(card.deliveryNote, /Check the chat before sending it again/);
   assert.match(card.summary, /^Your queued reply may have reached the agent/);
 });
+
+// Review fix (#384): the card put back because its chat was archived was
+// closed again at once by reconciliation ("session archived"), so the owner
+// never saw that the reply went nowhere.
+test("reconciliation keeps a card that is back because its archived chat never got the reply", async (t) => {
+  const ctx = setup(t);
+  await replyQueued(ctx);
+  const archived = { ...ctx.thread, archived: true };
+  ctx.sup.lastThreads.set(archived.key, archived);
+  await ctx.sup.drainQueuedOwnerMessages({ byKey: new Map([[archived.key, archived]]), started: NOW + 60_000 });
+  assert.equal(ctx.sup.store.question(ctx.question.id).status, "open");
+  await ctx.sup.reconcileOpenQuestions({ force: true });
+  const q = ctx.sup.store.question(ctx.question.id);
+  assert.equal(q.status, "open", "still in front of the owner");
+  assert.match(q.deliveryNote, /archived before your queued reply was sent/);
+  // An ordinary card on an archived chat is still closed.
+  const plain = ctx.sup.store.upsertQuestion({ dedupeKey: "ask:sales:plain", kind: "agent-ask", threadKey: archived.key, title: "Another ask", body: "?", options: ["yes"] });
+  await ctx.sup.reconcileOpenQuestions({ force: true });
+  assert.notEqual(ctx.sup.store.question(plain.id).status, "open");
+  // A new answer clears the note.
+  ctx.sup.store.answerQuestion(ctx.question.id, "Fine, drop it.");
+  assert.equal(ctx.sup.store.question(ctx.question.id).deliveryNote, undefined);
+});
+
+// Review fix (#384): more than 50 linked replies expiring before a drain
+// lost the oldest recovery records, so those cards stayed closed.
+test("every expired reply gets its card back, however many expire at once", async (t) => {
+  const ctx = setup(t);
+  const ids = [];
+  for (let i = 0; i < 60; i += 1) {
+    const q = ctx.sup.store.upsertQuestion({ dedupeKey: `ask:bulk:${i}`, kind: "agent-ask", threadKey: ctx.thread.key, title: `Ask ${i}`, body: "?", options: ["yes"] });
+    const text = `Reply number ${i}`;
+    const sent = await ctx.sup.sendOwnerMessage(ctx.thread.key, text, { questionId: q.id, questionAnswer: text });
+    assert.equal(sent.delivery.status, "queued");
+    ctx.sup.store.answerQuestion(q.id, text);
+    ids.push(q.id);
+  }
+  ctx.clock.now = NOW + 25 * HOUR;
+  assert.equal(ctx.sup.store.queuedOwnerMessages().length, 0, "all expired");
+  await ctx.sup.drainQueuedOwnerMessages({ byKey: new Map([[ctx.thread.key, ctx.thread]]), started: ctx.clock.now });
+  const reopened = ids.filter((id) => ctx.sup.store.question(id).status === "open");
+  assert.equal(reopened.length, ids.length, "none lost");
+  assert.equal(ctx.calls.length, 0);
+});

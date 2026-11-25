@@ -4211,8 +4211,10 @@ export class FleetSupervisor {
       const agentAtMs = Date.parse(thread.lastAgentAt ?? "") || 0;
       const ownerDirect = !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
 
-      // 1. Archived session: close immediately.
-      if (thread.archived || liveEntry?.agent?.archivedAt) {
+      // 1. Archived session: close immediately, unless the card is back
+      // because the owner's reply never reached that chat (it was archived
+      // first): the owner has to see that, so it stays until they act.
+      if ((thread.archived || liveEntry?.agent?.archivedAt) && !q.deliveryNote) {
         const reason = "session archived";
         this.store.resolveQuestion(q.id, reason);
         this.resolveOutreach(q, "resolved", "dismissed");
