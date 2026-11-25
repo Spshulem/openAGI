@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readThreadConversation, unavailableConversation } from "./conversation.js";
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
@@ -31,7 +31,7 @@ import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
-import { executeSafePrMerge } from "./intent-resolver.js";
+import { ADMIN_MERGE_WAIVER, executeAdminMerge, executeSafePrMerge, preflightAdminMerge } from "./intent-resolver.js";
 import { HANDOFF_RETRY_MS, HandoffQueue, handoffStaleReason } from "./handoff-queue.js";
 import { throttleFor } from "./github-throttle.js";
 import { applyPreferencePatch, classifyQuestionSlice, effectiveCheckinCooldownMs, isSuppressedByQuietCadence, isSuppressedFromProactiveChat, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
@@ -713,6 +713,10 @@ const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
 // answered in the agent's app, never here.
 const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
+// Admin Merge: how long a previewed consent stays confirmable, and the one
+// answer every non-owner path gets.
+const ADMIN_MERGE_CONSENT_TTL_MS = 5 * 60_000;
+const ADMIN_MERGE_OWNER_ONLY = "Admin Merge only runs from the owner's own Admin Merge control, after previewing exactly what it waives.";
 // Asks the owner must read in full before any button: a release or deploy,
 // a delete, a merge.
 const RISKY_ASK = /\b(?:prod(?:uction)?|releas(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?|delet(?:e|es|ed|ing|ion)|destroy|wipe|merg(?:e|es|ed|ing)|force[- ]push|rewrite (?:git )?history)\b|--admin\b/i;
@@ -887,6 +891,8 @@ export class FleetSupervisor {
     this.judgeTriedAt = new Map();
     // threadKey -> when the owner last answered one of its questions.
     this.ownerAnsweredAt = new Map();
+    // token -> the owner's previewed Admin Merge (see previewAdminMerge).
+    this.adminMergeConsents = new Map();
   }
 
   now() {
@@ -4314,6 +4320,131 @@ export class FleetSupervisor {
     return { ...routed, dispatched: false, delivery: null };
   }
 
+  // ─── Admin Merge (owner-only) ─────────────────────────────────────────
+  // Reached only through the owner's own POST /fleet/api/cards/:id/admin-merge
+  // (initiator "owner"); never through actCard, batch actions, or any agent
+  // tool. Preview is read-only and issues a short-lived, single-use consent
+  // bound to this card and the exact repo, PR number, head SHA, and action.
+  // Confirm spends it, audits the owner's intent before GitHub is called, and
+  // records GitHub's own answer. No deploy follows.
+  adminMergeTarget(cardId) {
+    const id = String(cardId ?? "").trim();
+    if (!id) return null;
+    const card = (this.getState().cards ?? []).find((c) => c.id === id || c.questionId === id) ?? null;
+    const question = this.store.question(card?.questionId ?? id);
+    if (!question || question.status !== "open") return null;
+    return {
+      card,
+      question,
+      prRef: card?.prRef ?? question.prRef ?? null,
+      expectedHeadSha: card?.headSha ?? question.askedHead ?? null
+    };
+  }
+
+  pruneAdminMergeConsents() {
+    const now = this.now();
+    for (const [token, consent] of this.adminMergeConsents) {
+      if (consent.expiresAt <= now) this.adminMergeConsents.delete(token);
+    }
+  }
+
+  async previewAdminMerge(cardId, { initiator = null } = {}) {
+    if (initiator !== "owner") return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    const target = this.adminMergeTarget(cardId);
+    if (!target) return null;
+    if (!target.prRef) return { ok: false, kind: "admin_merge", status: "halted", reason: "no_pr", detail: "This card is not about a pull request." };
+    const preflight = await preflightAdminMerge({
+      prRef: target.prRef,
+      expectedHeadSha: target.expectedHeadSha,
+      config: this.config,
+      ghBin: this.config.bins?.gh ?? "gh",
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
+    });
+    if (!preflight.ok) return { kind: "admin_merge", ...preflight };
+    const { plan } = preflight;
+    this.pruneAdminMergeConsents();
+    const token = randomBytes(18).toString("base64url");
+    const issuedAt = this.now();
+    const expiresAt = issuedAt + ADMIN_MERGE_CONSENT_TTL_MS;
+    const consent = { action: plan.action, repo: plan.repo, number: plan.number, headSha: plan.headSha, baseRef: plan.baseRef };
+    this.adminMergeConsents.set(token, { ...consent, questionId: target.question.id, prRef: plan.prRef, issuedAt, expiresAt });
+    return {
+      ok: true,
+      kind: "admin_merge",
+      status: "preview",
+      prRef: plan.prRef,
+      plan,
+      consent: { token, ...consent, expiresAt: new Date(expiresAt).toISOString() },
+      detail: `Admin Merge would squash-merge ${plan.prRef} at ${plan.headSha.slice(0, 7)}, waiving only the required approving review.`
+    };
+  }
+
+  async adminMergeCard(cardId, { initiator = null, consent = null } = {}) {
+    if (initiator !== "owner") return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    const target = this.adminMergeTarget(cardId);
+    if (!target) return null;
+    const token = typeof consent?.token === "string" ? consent.token : "";
+    const issued = token ? this.adminMergeConsents.get(token) ?? null : null;
+    // Single use: a confirmation is spent whether or not it matches.
+    if (issued) this.adminMergeConsents.delete(token);
+    if (!issued || issued.expiresAt <= this.now()) {
+      return { ok: false, kind: "admin_merge", status: "consent_required", detail: "That Admin Merge confirmation expired or was already used. Preview Admin Merge again and confirm." };
+    }
+    const headSha = String(consent.headSha ?? "").trim().toLowerCase();
+    if (issued.questionId !== target.question.id || consent.action !== issued.action
+        || consent.repo !== issued.repo || consent.number !== issued.number || headSha !== issued.headSha
+        || consent.baseRef !== issued.baseRef) {
+      return { ok: false, kind: "admin_merge", status: "consent_mismatch", detail: `The confirmation does not match the Admin Merge you previewed (${issued.prRef} at ${issued.headSha.slice(0, 7)} into ${issued.baseRef}). Nothing was merged.` };
+    }
+    const bound = { action: issued.action, repo: issued.repo, number: issued.number, headSha: issued.headSha, baseRef: issued.baseRef };
+    const intent = this.store.recordAction({
+      kind: "pr-admin-merge",
+      playbook: "owner-admin-merge",
+      threadKey: target.question.threadKey ?? null,
+      status: "started",
+      by: "owner",
+      reason: `Owner confirmed Admin Merge of ${issued.prRef} at ${issued.headSha.slice(0, 7)}, waiving only the required review.`,
+      adminMerge: {
+        ...bound,
+        prRef: issued.prRef,
+        waives: [ADMIN_MERGE_WAIVER],
+        previewedAt: new Date(issued.issuedAt).toISOString(),
+        confirmedAt: new Date(this.now()).toISOString()
+      }
+    });
+    const outcome = await executeAdminMerge({
+      prRef: target.prRef,
+      consent: bound,
+      expectedHeadSha: target.expectedHeadSha,
+      config: this.config,
+      ghBin: this.config.bins?.gh ?? "gh",
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
+    });
+    const merged = outcome.status === "merged" || outcome.status === "already_merged";
+    this.store.updateAction(intent.id, {
+      status: merged ? "done" : "blocked",
+      reason: outcome.detail,
+      adminMerge: {
+        ...intent.adminMerge,
+        result: outcome.status,
+        resultReason: outcome.reason ?? null,
+        githubLogin: outcome.githubLogin ?? null,
+        github: outcome.github ?? null
+      }
+    });
+    if (merged) {
+      this.store.resolveQuestion(target.question.id, outcome.status === "merged" ? `admin merged ${issued.prRef}` : `merged ${issued.prRef}`);
+      this.resolveOutreach(target.question, "merged", "acted");
+      this.emitFleet("pr-admin-merged");
+    } else {
+      this.emitFleet("pr-admin-merge-halted");
+    }
+    const { plan: _plan, ...rest } = outcome;
+    return { kind: "admin_merge", ...rest, auditId: intent.id };
+  }
+
   async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
@@ -4356,6 +4487,12 @@ export class FleetSupervisor {
       ? (resolvedAction?.op ?? "answer")
       : normalizedOp;
     const effectiveValue = value ?? resolvedAction?.value ?? null;
+
+    // Admin Merge is never a card action: no agent tool, batch, or relayed
+    // answer reaches it. Only the owner's own admin-merge route does.
+    if (effectiveOp === "admin_merge") {
+      return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    }
 
     if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {
       const dismissed = this.dismissQuestion(question.id);
@@ -4429,7 +4566,6 @@ export class FleetSupervisor {
         prRef,
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
-        ownerConfirmed: true,
         config: this.config,
         ghBin: this.config.bins?.gh ?? "gh",
         run: this.deps.run ?? runCommand
@@ -6596,6 +6732,7 @@ export class FleetSupervisor {
               ci: pr.ci,
               unresolvedThreads: pr.unresolvedThreads,
               mergeState: pr.mergeState,
+              reviewDecision: pr.reviewDecision ?? null,
               head: String(pr.headOid ?? "").slice(0, 10)
             }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),

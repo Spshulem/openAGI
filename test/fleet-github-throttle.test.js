@@ -176,11 +176,12 @@ test("a throttled preflight sends no merge; a throttled merge is not retried, no
   assert.equal(preflight.calls.some((c) => c.startsWith("pr merge")), false);
 
   // Window over: the owner taps Merge again. The preflight runs fresh; the
-  // merge itself is refused for the limit.
+  // merge itself is refused for the limit. (A review-blocked PR never gets
+  // this far: ordinary Merge halts with review_required before any merge.)
   now.value = Date.parse(RESET) + 10_000;
   const merging = ghStub({
     answer: (args) => args[1] === "view"
-      ? { code: 0, stdout: JSON.stringify({ ...GREEN_PR, mergeStateStatus: "BLOCKED", reviewDecision: "REVIEW_REQUIRED" }), stderr: "" }
+      ? { code: 0, stdout: JSON.stringify(GREEN_PR), stderr: "" }
       : { code: 1, stdout: "", stderr: PRIMARY_TEXT }
   });
   const refused = await executeSafePrMerge({ prRef: "Spshulem/openAGI#321", expectedHeadSha: "abc1234", ownerConfirmed: true, run: merging.run, throttle });

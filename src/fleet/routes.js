@@ -606,6 +606,35 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
         return ok({ result: outcome, state: state() });
       }
+      // The owner's Admin Merge: { preview: true } shows exactly what would
+      // be waived and returns a single-use consent; { consent } confirms that
+      // exact repo/PR/head SHA. Owner-only: no paired-phone allowlist entry,
+      // and no agent tool, batch, or card action leads here.
+      if (parts.length === 3 && parts[0] === "cards" && parts[2] === "admin-merge") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const cardId = pathCardId(parts[1]);
+        if (!cardId) return fail(400, "Bad card id.");
+        if (typeof supervisor.previewAdminMerge !== "function" || typeof supervisor.adminMergeCard !== "function") {
+          return fail(503, "Admin Merge is not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        let outcome;
+        if (body.preview === true) {
+          outcome = await supervisor.previewAdminMerge(cardId, { initiator: "owner" });
+        } else {
+          const c = isPlainObject(body.consent) ? body.consent : null;
+          const consent = c && typeof c.token === "string" && c.token.length <= 64
+            && typeof c.action === "string" && typeof c.repo === "string" && c.repo.length <= 200
+            && Number.isInteger(c.number) && typeof c.headSha === "string" && c.headSha.length <= 64
+            && typeof c.baseRef === "string" && c.baseRef.length <= 255
+            ? { token: c.token, action: c.action, repo: c.repo, number: c.number, headSha: c.headSha, baseRef: c.baseRef }
+            : null;
+          if (!consent) return fail(400, "Send { preview: true } first, then { consent } exactly as the preview returned it.");
+          outcome = await supervisor.adminMergeCard(cardId, { initiator: "owner", consent });
+        }
+        if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
+        return ok({ result: outcome, state: state() });
+      }
       if (parts.length === 1 && parts[0] === "state") {
         if (method !== "GET") return fail(405, "Use GET.");
         await supervisor.refresh?.();
