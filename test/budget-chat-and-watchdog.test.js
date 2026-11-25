@@ -573,3 +573,37 @@ test("no stall is claimed without evidence: pending permission, or history that 
   assert.notEqual(unread.agentStatus, "stalled", "no history read is no evidence of a stall");
   assert.equal(unread.meta.silentStuck, undefined);
 });
+
+// Review fix (#382): an idle chat last active hours ago, scanned, then given
+// a new turn by its owner before the next history read, was reported stalled
+// from the idle chat's old timeline. Evidence must cover the current turn.
+test("a new turn started after the last history read is never stalled by the old timeline", async (t) => {
+  const storeDir = makeTempDir(t, "paseo-new-turn-");
+  const now = Date.now();
+  const agent = salesGlobAgent(now, {
+    status: "idle", activeTurn: null,
+    updatedAt: new Date(now - 3 * HOUR).toISOString(),
+    lastUserMessageAt: new Date(now - 3 * HOUR).toISOString()
+  });
+  const entries = salesGlobTimeline(now, 3 * HOUR).filter((e) => e.item.type !== "tool_call");
+  let reads = 0;
+  const factory = liveButSilentFactory({ agent, entries });
+  const counted = () => {
+    const client = factory();
+    const ref = client.agents.ref;
+    client.agents.ref = (...args) => { const r = ref(...args); const refetch = r.timeline.refetch; r.timeline.refetch = async (...a) => { reads += 1; return refetch(...a); }; return r; };
+    return client;
+  };
+  const cfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: storeDir });
+  const source = createPaseoSource({ factory: counted });
+  const [idle] = await source(cfg);
+  assert.equal(idle.agentStatus, "idle");
+  assert.equal(reads, 1);
+  // The owner starts a new turn; no new history read happens before the next scan.
+  Object.assign(agent, { status: "running", activeTurn: { turnId: "turn-new", startedAt: new Date(Date.now()).toISOString() },
+    updatedAt: new Date(Date.now()).toISOString(), lastUserMessageAt: new Date(Date.now()).toISOString() });
+  const [started] = await source(cfg);
+  assert.equal(reads, 1, "the second scan read no new history");
+  assert.equal(started.agentStatus, "running", "a turn the evidence does not cover is not a stall");
+  assert.equal(started.meta.silentStuck, undefined);
+});

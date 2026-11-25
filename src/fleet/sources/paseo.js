@@ -569,9 +569,21 @@ export function createPaseoSource({ factory } = {}) {
         const known = progress.get(key);
         return known && scanStartedAt - known.fetchedAt <= progressFreshMs ? known : null;
       };
-      const isBusyWithoutProgress = (a, key) => Boolean(
-        isBusy(a) && progressOf(key) && scanStartedAt - progressOf(key).latestEventMs >= liveStallMs
-      );
+      // The evidence must cover the current turn: a read taken before the
+      // turn started (or before the owner's latest message) says nothing
+      // about it, and silence is counted from the newest of the last event,
+      // the turn's start and that message.
+      const turnProgressMs = (a, key) => {
+        const known = progressOf(key);
+        if (!known) return null;
+        const startedMs = Math.max(Date.parse(a.activeTurn?.startedAt ?? "") || 0, Date.parse(a.lastUserMessageAt ?? "") || 0);
+        if (startedMs > known.fetchedAt) return null;
+        return Math.max(known.latestEventMs, startedMs);
+      };
+      const isBusyWithoutProgress = (a, key) => {
+        const latest = isBusy(a) ? turnProgressMs(a, key) : null;
+        return latest !== null && scanStartedAt - latest >= liveStallMs;
+      };
       const isRunningNeedsErrorProbe = (a, key) => Boolean(
         !a.archivedAt
         && (a.activeTurn || a.status === "running")
@@ -649,7 +661,7 @@ export function createPaseoSource({ factory } = {}) {
           history?.stamp === a.updatedAt ? (history?.latestEventMs ?? 0) : 0
         );
         const silentStuck = (isSilentRunning(a) && scanStartedAt - latestTimelineMs >= liveStallMs) || isBusyWithoutProgress(a, key);
-        const lastProgressMs = progressOf(key)?.latestEventMs ?? 0;
+        const lastProgressMs = (isBusy(a) ? turnProgressMs(a, key) : progressOf(key)?.latestEventMs) ?? 0;
         const known = ["running", "initializing"].includes(a.status)
           || (a.status === "closed" && !sleepingActive)
           || (history?.stamp === a.updatedAt);
