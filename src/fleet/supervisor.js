@@ -2546,19 +2546,32 @@ export class FleetSupervisor {
   // idempotencyKey: the owner approval this send carries out. The same
   // approval is never sent twice, and if the chat's Paseo host is offline
   // it is held (status "queued") and sent when the host is back.
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, idempotencyKey = null, resume = false } = {}) {
-    const startedAt = Date.now();
-    // Capture the approval/send-start boundary before awaiting delivery so any
-    // owner cancellation written while the initial attempt is in flight makes
-    // the held handoff stale rather than sending on top of it.
-    const approvalStartedAt = new Date(this.now()).toISOString();
+  async sendOwnerMessage(threadKey, message, opts = {}) {
+    const { idempotencyKey = null, resume = false } = opts ?? {};
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const key = typeof idempotencyKey === "string" && idempotencyKey.trim() ? idempotencyKey.trim().slice(0, 160) : null;
     if (key && !resume) {
       const known = this.handoffs.get(key);
       if (known) return { delivery: handoffDelivery(known) };
+      this._inFlightApprovals ??= new Map();
+      const inFlight = this._inFlightApprovals.get(key);
+      if (inFlight) return await inFlight;
+      const promise = this._deliverOwnerMessage(threadKey, text, { ...opts, key }).finally(() => {
+        if (this._inFlightApprovals.get(key) === promise) this._inFlightApprovals.delete(key);
+      });
+      this._inFlightApprovals.set(key, promise);
+      return await promise;
     }
+    return await this._deliverOwnerMessage(threadKey, text, { ...opts, key });
+  }
+
+  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false } = {}) {
+    const startedAt = Date.now();
+    // Capture the approval/send-start boundary before awaiting delivery so any
+    // owner cancellation written while the initial attempt is in flight makes
+    // the held handoff stale rather than sending on top of it.
+    const approvalStartedAt = new Date(this.now()).toISOString();
     let effectiveKey = String(threadKey ?? "").trim();
     let redirectedFrom = null;
     // Dead / failed-over session guard: if this session was already failed over

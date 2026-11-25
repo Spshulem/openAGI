@@ -670,3 +670,35 @@ test("restart recovery does not settle an image handoff from a receipt with diff
   const matched = f.supervisor.reconcileHandoffDispatch(f.supervisor.handoffs.get("act_img_rec"));
   assert.equal(matched?.status, "delivered");
 });
+
+// Review fix (#361, Codex P2 round 4): concurrent retries with the same
+// idempotencyKey while the first attempt is in flight coalesce onto the
+// in-flight delivery instead of incrementing sendSeq and superseding it.
+test("concurrent retries with the same approval key coalesce instead of superseding", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  const origDeliver = f.supervisor.executor.deliver.bind(f.supervisor.executor);
+  let releaseFirst;
+  let deliverCalls = 0;
+  f.supervisor.executor.deliver = async (args) => {
+    deliverCalls += 1;
+    if (deliverCalls === 1) {
+      await new Promise((resolve) => { releaseFirst = resolve; });
+    }
+    return origDeliver(args);
+  };
+  const first = f.supervisor.sendOwnerMessage(KEY, "Ship once host is back.", { idempotencyKey: "act_coalesce" });
+  while (!releaseFirst) await new Promise((r) => setTimeout(r, 5));
+  const retry = f.supervisor.sendOwnerMessage(KEY, "Ship once host is back.", { idempotencyKey: "act_coalesce" });
+  releaseFirst();
+  const [res1, res2] = await Promise.all([first, retry]);
+  assert.equal(deliverCalls, 1, "in-flight retry must coalesce instead of invoking executor twice");
+  assert.equal(res1.delivery.status, "queued");
+  assert.equal(res2.delivery.status, "queued");
+  assert.equal(f.supervisor.handoffs.get("act_coalesce").status, "waiting");
+  f.host.up = true;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_coalesce").status, "delivered");
+  assert.equal(sends(f.delivered).length, 2, "one initial offline attempt plus one resumed delivery");
+});
