@@ -182,6 +182,9 @@ struct SupervisorThreadInspectorView: View {
   @State private var isSending = false
   @State private var replyFeedback: FleetNote? = nil
   @State private var showAttachMenu = false
+  @State private var showConversation = false
+  @State private var showPlanDetails = false
+  @FocusState private var replyFocused: Bool
 
   private var resolvedQuestion: FleetQuestion? {
     guard case let .question(id) = selection else { return nil }
@@ -237,7 +240,11 @@ struct SupervisorThreadInspectorView: View {
 
   private var inspectorKindBadge: String {
     switch selection {
-    case .question: return resolvedQuestion?.risky == true ? "Risky Decision" : "Needs Decision"
+    case .question:
+      if let q = resolvedQuestion, !SupervisorAttentionCounting.isActionable(needsYou: q.needsYou) {
+        return "Update · no decision needed"
+      }
+      return "Needs your decision"
     case .session: return "Coding Session"
     case .task: return "Board Task"
     case .activity: return "Activity Event"
@@ -267,9 +274,16 @@ struct SupervisorThreadInspectorView: View {
       ?? resolvedDetail?.openChat
   }
 
+  /// A question the inspector's reply field can answer. A clarification is
+  /// answered here even without a linked thread: sendWorkspaceQuestionReply
+  /// routes it through answerClarification.
+  static func acceptsReply(_ q: FleetQuestion) -> Bool {
+    q.canReply || q.isClarificationQuestion
+  }
+
   private var canComposeReply: Bool {
     if let q = resolvedQuestion {
-      return q.canReply || (q.threadKey != nil && q.isClarificationQuestion)
+      return Self.acceptsReply(q)
     }
     return directThreadKey != nil
   }
@@ -278,9 +292,13 @@ struct SupervisorThreadInspectorView: View {
     VStack(spacing: 0) {
       headerBar
       WorkspaceHairline(leadingInset: 0)
-      rootStateStrip
-      WorkspaceHairline(leadingInset: 0)
-      transcriptBody
+      if let q = resolvedQuestion {
+        questionDetail(q)
+      } else {
+        rootStateStrip
+        WorkspaceHairline(leadingInset: 0)
+        transcriptBody
+      }
       if canComposeReply {
         WorkspaceHairline(leadingInset: 0)
         bottomReplyDock
@@ -292,6 +310,156 @@ struct SupervisorThreadInspectorView: View {
         await fleet.loadDetail(tk)
       }
     }
+    .onChange(of: selection) { _, _ in
+      showConversation = false
+      showPlanDetails = false
+    }
+  }
+
+  // MARK: - Needs You decision
+
+  /// One decision, top to bottom: what it is, the goal, where it stands, why
+  /// it needs you, the decision and the recommendation, the actions, then
+  /// evidence and (on request) the plan and the conversation.
+  private func questionDetail(_ q: FleetQuestion) -> some View {
+    let card = fleet.cardBriefs[q.id]
+    let digest = q.needsYouDigest(card: card)
+    let badge = q.needsYouBadge(card: card)
+    return ScrollView {
+      VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x4) {
+        VStack(alignment: .leading, spacing: 6) {
+          if let badge {
+            Text(badge.text)
+              .font(.caption.weight(.medium))
+              .foregroundStyle(badge.tone.color)
+              .padding(.horizontal, 6)
+              .padding(.vertical, 1)
+              .background(badge.tone.color.opacity(0.12), in: Capsule())
+          }
+          Text(digest.title)
+            .font(WorkspaceTheme.Typography.headline)
+            .foregroundStyle(WorkspaceTheme.ink)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+          if let meta = questionMeta(q) {
+            Text(meta)
+              .font(.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+              .lineLimit(2)
+          }
+          if q.blockingCount > 0 {
+            WorkspaceBlockingPill(
+              summary: q.blockingSummary ?? "Blocking \(q.blockingCount) downstream task\(q.blockingCount == 1 ? "" : "s")"
+            )
+          }
+        }
+
+        NeedsYouSections(digest: digest, kinds: [.goal, .state, .blocker])
+        NeedsYouSections(digest: digest, kinds: [.decision, .recommendation])
+
+        if !q.remainingItemIds.isEmpty {
+          Text("More owner questions remain; answer this one before the next is presented.")
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
+        if let answered = q.clarificationAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answered.isEmpty {
+          Text("Your answer: \(answered)")
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
+
+        actionStrip
+        if let note = fleet.notes[q.id] {
+          FleetNoteRow(note: note) { fleet.clearNote(q.id) }
+        }
+
+        if let plan = q.plan, planHasDetails(plan) {
+          DisclosureGroup(isExpanded: $showPlanDetails) {
+            planDetails(plan)
+              .padding(.top, 4)
+          } label: {
+            Text(plan.label ?? "Plan details")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+
+        NeedsYouSections(digest: digest, kinds: [.evidence])
+        if let url = card?.prUrl.flatMap({ URL(string: $0) }) {
+          Link("Open pull request ↗", destination: url)
+            .font(.caption)
+        }
+
+        let parsedLabels = SupervisorBoardLabel.extract(from: rawLabels)
+        if !parsedLabels.isEmpty {
+          WorkspaceLabelChipsRow(labels: parsedLabels, activeFilters: $activeLabelFilters)
+        }
+
+        if directThreadKey != nil {
+          DisclosureGroup(isExpanded: $showConversation) {
+            VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+              threadMessages
+            }
+            .padding(.top, 4)
+          } label: {
+            Text(conversationLabel)
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(WorkspaceTheme.muted)
+          }
+        }
+      }
+      .padding(WorkspaceTheme.Spacing.x4)
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
+
+  /// "#atlas /Checkout · atlas · Checkout (Codex) · asked 3h ago".
+  private func questionMeta(_ q: FleetQuestion) -> String? {
+    var parts: [String] = []
+    if let project = q.project?.trimmingCharacters(in: .whitespacesAndNewlines), !project.isEmpty {
+      parts.append("#\(project)")
+    }
+    if let label = q.chatLabel ?? openChat?.label, !label.isEmpty { parts.append(label) }
+    if let actor = actorText, !actor.isEmpty { parts.append(actor) }
+    if let at = q.askedTime.flatMap(FleetWatching.parseDate) {
+      parts.append("asked \(FleetThreadSummary.ago(at, now: Date()))")
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " · ")
+  }
+
+  private var conversationLabel: String {
+    if let count = resolvedDetail?.conversation?.messages.count, count > 0 {
+      return "Conversation · \(count) message\(count == 1 ? "" : "s")"
+    }
+    return "Conversation"
+  }
+
+  private func planHasDetails(_ plan: FleetSuggestionPlan) -> Bool {
+    let parts = [plan.acceptance, plan.issueDraft?.title, plan.issueDraft?.body]
+    return parts.contains { !($0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) }
+  }
+
+  private func planDetails(_ plan: FleetSuggestionPlan) -> some View {
+    VStack(alignment: .leading, spacing: 6) {
+      if let acceptance = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acceptance.isEmpty {
+        Text("Acceptance: \(acceptance)")
+          .font(.caption)
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
+      if let issueTitle = plan.issueDraft?.title?.trimmingCharacters(in: .whitespacesAndNewlines), !issueTitle.isEmpty {
+        Text("Issue: \(issueTitle)")
+          .font(.caption.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.ink)
+      }
+      if let issueBody = plan.issueDraft?.body?.trimmingCharacters(in: .whitespacesAndNewlines), !issueBody.isEmpty {
+        WorkspaceMarkdownContent(
+          blocks: WorkspaceMarkdownParser.parse(issueBody),
+          bodyFont: WorkspaceTheme.Typography.caption,
+          textColor: WorkspaceTheme.muted
+        )
+      }
+    }
+    .textSelection(.enabled)
   }
 
   private var headerBar: some View {
@@ -407,34 +575,30 @@ struct SupervisorThreadInspectorView: View {
   private var actionStrip: some View {
     if let q = resolvedQuestion {
       let busy = fleet.inFlight.contains(q.id) || fleet.stillSending.contains(q.id)
-      HStack(spacing: 6) {
-        ForEach(Array(q.tappableOptions.prefix(3).enumerated()), id: \.offset) { idx, opt in
-          WorkspaceActionButton(prominent: idx == 0 && !q.risky, small: true) {
-            if opt == "Answer question" {
-              draftText = ""
-            } else {
-              Task { await fleet.answer(q, option: opt) }
-            }
-          } label: {
-            Text(q.label(for: opt))
+      VStack(alignment: .leading, spacing: 8) {
+        // The agent's options side by side when they fit the inspector,
+        // else one per line: never truncated.
+        ViewThatFits(in: .horizontal) {
+          HStack(spacing: 6) { optionButtons(q, busy: busy) }
+          VStack(alignment: .leading, spacing: 6) { optionButtons(q, busy: busy) }
+        }
+        HStack(spacing: 6) {
+          Button("Ask Supervisor") {
+            onOpenQuestionInChat(q)
           }
+          .buttonStyle(.borderless)
+          .font(.caption.weight(.medium))
+          .foregroundStyle(WorkspaceTheme.live)
+
+          Spacer(minLength: 0)
+          Button("Dismiss") {
+            Task { await fleet.dismiss(q) }
+          }
+          .buttonStyle(.borderless)
+          .font(.caption)
+          .foregroundStyle(WorkspaceTheme.muted)
           .disabled(busy)
         }
-        Button("Ask Supervisor") {
-          onOpenQuestionInChat(q)
-        }
-        .buttonStyle(.borderless)
-        .font(.caption.weight(.medium))
-        .foregroundStyle(WorkspaceTheme.live)
-
-        Spacer(minLength: 0)
-        Button("Dismiss") {
-          Task { await fleet.dismiss(q) }
-        }
-        .buttonStyle(.borderless)
-        .font(.caption)
-        .foregroundStyle(WorkspaceTheme.muted)
-        .disabled(busy)
       }
     } else if let task = resolvedTask {
       HStack(spacing: 8) {
@@ -489,6 +653,26 @@ struct SupervisorThreadInspectorView: View {
           Label("Link Task", systemImage: "checklist")
         }
       }
+    }
+  }
+
+  @ViewBuilder
+  private func optionButtons(_ q: FleetQuestion, busy: Bool) -> some View {
+    ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { idx, opt in
+      let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
+      WorkspaceActionButton(prominent: idx == 0 && !q.risky, small: true) {
+        if opt == "Answer question" {
+          replyFocused = true
+        } else if opt == "Review plan", q.plan != nil {
+          showPlanDetails.toggle()
+        } else {
+          Task { await fleet.answer(q, option: opt) }
+        }
+      } label: {
+        Text(q.label(for: opt))
+          .fixedSize()
+      }
+      .disabled(busy && !handlesLocally)
     }
   }
 
@@ -558,39 +742,7 @@ struct SupervisorThreadInspectorView: View {
             .workspaceCardSurface(cornerRadius: 12)
           }
 
-          if let key = directThreadKey {
-            if fleet.detailLoading.contains(key) && resolvedDetail?.conversation == nil {
-              HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Loading live thread…")
-                  .font(.caption)
-                  .foregroundStyle(WorkspaceTheme.muted)
-              }
-            }
-            if let rawMessages = resolvedDetail?.conversation?.messages, !rawMessages.isEmpty {
-              let messages = Self.dedupedMessages(rawMessages)
-              ForEach(messages) { msg in
-                messageCard(
-                  speaker: msg.displaySpeaker,
-                  isOwner: msg.isOwner,
-                  atISO: msg.at,
-                  text: Self.sanitizeTranscriptText(msg.text)
-                )
-              }
-            } else if let excerpt = resolvedDetail?.lastAgentText ?? resolvedThread?.lastAgentText ?? resolvedQuestion?.displayAskContext,
-                      !excerpt.isEmpty {
-              messageCard(
-                speaker: actorText ?? "Agent",
-                isOwner: false,
-                atISO: resolvedThread?.lastAgentAt,
-                text: Self.sanitizeTranscriptText(excerpt)
-              )
-            } else if !fleet.detailLoading.contains(key) {
-              Text("No transcript turns loaded yet.")
-                .font(.caption)
-                .foregroundStyle(WorkspaceTheme.muted)
-            }
-          }
+          threadMessages
           Color.clear.frame(height: 1).id("inspector-transcript-bottom")
         }
         .padding(WorkspaceTheme.Spacing.x4)
@@ -604,6 +756,44 @@ struct SupervisorThreadInspectorView: View {
       }
       .onChange(of: resolvedDetail?.conversation?.messages.last?.id) { _, _ in
         proxy.scrollTo("inspector-transcript-bottom", anchor: .bottom)
+      }
+    }
+  }
+
+  /// The linked thread's recent turns, or its last agent message.
+  @ViewBuilder
+  private var threadMessages: some View {
+    if let key = directThreadKey {
+      if fleet.detailLoading.contains(key) && resolvedDetail?.conversation == nil {
+        HStack(spacing: 8) {
+          ProgressView().controlSize(.small)
+          Text("Loading live thread…")
+            .font(.caption)
+            .foregroundStyle(WorkspaceTheme.muted)
+        }
+      }
+      if let rawMessages = resolvedDetail?.conversation?.messages, !rawMessages.isEmpty {
+        let messages = Self.dedupedMessages(rawMessages)
+        ForEach(messages) { msg in
+          messageCard(
+            speaker: msg.displaySpeaker,
+            isOwner: msg.isOwner,
+            atISO: msg.at,
+            text: Self.sanitizeTranscriptText(msg.text)
+          )
+        }
+      } else if let excerpt = resolvedDetail?.lastAgentText ?? resolvedThread?.lastAgentText ?? resolvedQuestion?.displayAskContext,
+                !excerpt.isEmpty {
+        messageCard(
+          speaker: actorText ?? "Agent",
+          isOwner: false,
+          atISO: resolvedThread?.lastAgentAt,
+          text: Self.sanitizeTranscriptText(excerpt)
+        )
+      } else if !fleet.detailLoading.contains(key) {
+        Text("No transcript turns loaded yet.")
+          .font(.caption)
+          .foregroundStyle(WorkspaceTheme.muted)
       }
     }
   }
@@ -707,6 +897,7 @@ struct SupervisorThreadInspectorView: View {
           text: $draftText,
           axis: .vertical
         )
+        .focused($replyFocused)
         .textFieldStyle(.plain)
         .font(WorkspaceTheme.Typography.secondary)
         .lineLimit(1...4)

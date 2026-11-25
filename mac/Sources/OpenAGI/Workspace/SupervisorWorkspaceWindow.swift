@@ -23,6 +23,9 @@ enum WorkspaceComposerMode: String, CaseIterable, Identifiable {
 @MainActor
 final class SupervisorWorkspaceNavigation: ObservableObject {
   @Published var selectedChannel: WorkspaceChannel? = .general
+  /// A Needs You question to select and open in the inspector (a deep link
+  /// or the review snapshot); the workspace clears it once opened.
+  @Published var requestedQuestionID: String? = nil
 }
 
 @MainActor
@@ -119,8 +122,12 @@ struct SupervisorWorkspaceView: View {
   @State private var hostWindow: NSWindow?
   @State private var pasteKeyMonitor: Any?
 
-  @State private var expandedQuestionIDs: Set<String> = []
-  @State private var revealedPlanQuestionIDs: Set<String> = []
+  @State private var showNeedsYouUpdates = false
+  /// Sidebar projects the owner opened or closed by hand; the rest follow
+  /// the default (open when something waits on you or it is selected).
+  @State private var expandedProjects: Set<String> = []
+  @State private var collapsedProjects: Set<String> = []
+  @FocusState private var needsYouListFocused: Bool
   @State private var expandedThreadKeys: Set<String> = []
   @State private var threadReplyText: [String: String] = [:]
   @State private var threadReplyImages: [String: [WorkspaceImageAttachment]] = [:]
@@ -160,8 +167,13 @@ struct SupervisorWorkspaceView: View {
     nav.selectedChannel ?? .general
   }
 
+  /// What Needs You shows: actionable decisions plus tool approvals. FYIs
+  /// and completions (needsYou false) are listed apart and never counted.
   private var waitingTotal: Int {
-    fleet.questions.count + approvals.items.count
+    SupervisorAttentionCounting.needsYouTotal(
+      needsYouFlags: fleet.questions.map(\.needsYou),
+      pendingApprovals: approvals.items.count
+    )
   }
 
   private var runningCount: Int {
@@ -170,7 +182,7 @@ struct SupervisorWorkspaceView: View {
 
   private var decisionItems: [SupervisorDecisionItem] {
     let byKey = Dictionary(fleet.threads.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
-    return fleet.questions.filter(\.needsYou).map { q in
+    return fleet.questions.filter { SupervisorAttentionCounting.isActionable(needsYou: $0.needsYou) }.map { q in
       let linked = q.threadKey.flatMap { byKey[$0] }
       let proj = SupervisorChannelGrouping.normalizeProject(
         explicit: q.project,
@@ -260,7 +272,10 @@ struct SupervisorWorkspaceView: View {
         id: "project:\(key)",
         kind: .project(norm),
         displayName: "# \(norm)",
-        waitingCount: proj.needsYouCount ?? 0,
+        // Decisions are counted from the open questions above, the same
+        // ones Needs You lists; a project known only from the hierarchy has
+        // none of them (its own needsYouCount can include FYIs).
+        waitingCount: 0,
         runningCount: proj.counts?.running ?? 0,
         totalCount: proj.counts?.total ?? 0
       ))
@@ -285,7 +300,7 @@ struct SupervisorWorkspaceView: View {
           project: projName,
           subchannel: "\(projName)/\(th.name)",
           displayName: display,
-          waitingCount: th.needsYouCount ?? 0,
+          waitingCount: 0,
           runningCount: th.counts?.running ?? 0,
           totalCount: th.counts?.total ?? 0
         ))
@@ -370,9 +385,9 @@ struct SupervisorWorkspaceView: View {
   private var orderedInspectorSelections: [WorkspaceInspectorSelection] {
     switch activeChannel {
     case .needsYou:
-      return fleet.questions
-        .filter { SupervisorBoardLabel.matches(tags: $0.labels, activeFilters: activeLabelFilters) }
-        .map { .question($0.id) }
+      let layout = needsYouLayout
+      let updates = showNeedsYouUpdates ? layout.updates : []
+      return (layout.groups.flatMap(\.questions) + updates).map { .question($0.id) }
     case .tasks:
       return filteredBoardTasks.map { .task($0.id) }
     case .sessions, .general:
@@ -380,10 +395,82 @@ struct SupervisorWorkspaceView: View {
     case .activity:
       return filteredActivityEvents.map { .activity($0.id) }
     case let .project(name):
-      return SupervisorChannelGrouping.filterSessions(sessionBriefs, project: name).map { .session($0.id) }
+      return projectDecisionQuestions(name, subchannel: nil).map { .question($0.id) }
+        + SupervisorChannelGrouping.filterSessions(sessionBriefs, project: name).map { .session($0.id) }
     case let .subchannel(project, sub):
-      return SupervisorChannelGrouping.filterSessions(sessionBriefs, project: project, subchannel: sub).map { .session($0.id) }
+      return projectDecisionQuestions(project, subchannel: sub).map { .question($0.id) }
+        + SupervisorChannelGrouping.filterSessions(sessionBriefs, project: project, subchannel: sub).map { .session($0.id) }
     }
+  }
+
+  /// Needs You in display order: actionable questions grouped by project,
+  /// FYIs and completions apart, and one why-line per row.
+  private struct NeedsYouLayout {
+    struct ProjectGroup: Identifiable {
+      let project: String
+      let questions: [FleetQuestion]
+      var id: String { project.lowercased() }
+    }
+    var groups: [ProjectGroup] = []
+    var updates: [FleetQuestion] = []
+    var reasons: [String: String] = [:]
+  }
+
+  private var needsYouLayout: NeedsYouLayout {
+    let byID = Dictionary(fleet.questions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let visible = decisionItems.filter { item in
+      let q = byID[item.id]
+      guard matchesQuery([item.project, item.headline, q?.body]) else { return false }
+      return SupervisorBoardLabel.matches(tags: q?.labels ?? [], activeFilters: activeLabelFilters)
+    }
+    var layout = NeedsYouLayout()
+    layout.groups = SupervisorChannelGrouping.groupByProject(visible).map { group in
+      NeedsYouLayout.ProjectGroup(project: group.project, questions: group.items.compactMap { byID[$0.id] })
+    }
+    layout.updates = fleet.questions.filter { q in
+      !SupervisorAttentionCounting.isActionable(needsYou: q.needsYou)
+        && matchesQuery([q.title, q.decisionHeadline, q.body, q.project])
+        && SupervisorBoardLabel.matches(tags: q.labels, activeFilters: activeLabelFilters)
+    }
+    let rows = layout.groups.flatMap(\.questions)
+    let reasons = SupervisorNeedsYouDigest.rowReasons(for: rows.map { $0.needsYouDigest(card: fleet.cardBriefs[$0.id]) })
+    for (q, reason) in zip(rows, reasons) {
+      if let reason { layout.reasons[q.id] = reason }
+    }
+    return layout
+  }
+
+  /// Actionable questions in one project (and theme), as the project
+  /// channel lists them.
+  private func projectDecisionQuestions(_ projName: String, subchannel: String?) -> [FleetQuestion] {
+    let byID = Dictionary(fleet.questions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    return decisionItems.compactMap { item -> FleetQuestion? in
+      guard item.project.caseInsensitiveCompare(projName) == .orderedSame else { return nil }
+      if let subchannel, !subchannel.isEmpty {
+        let iSub = (item.subchannel ?? "").lowercased()
+        if iSub != subchannel.lowercased() && !iSub.hasSuffix("/\(subchannel.lowercased())") { return nil }
+      }
+      guard let q = byID[item.id] else { return nil }
+      guard matchesQuery([item.headline, item.project, q.body]) else { return nil }
+      return SupervisorBoardLabel.matches(tags: q.labels, activeFilters: activeLabelFilters) ? q : nil
+    }
+  }
+
+  private func isSelectedQuestion(_ id: String) -> Bool {
+    inspectorSelection == .question(id)
+  }
+
+  /// Arrow keys move the selection through the list; the inspector, when
+  /// open, follows it.
+  private func moveSelection(_ delta: Int) {
+    let list = orderedInspectorSelections
+    guard !list.isEmpty else { return }
+    guard let current = inspectorSelection, let idx = list.firstIndex(of: current) else {
+      inspectorSelection = delta < 0 ? list.last : list.first
+      return
+    }
+    let next = min(max(0, idx + delta), list.count - 1)
+    inspectorSelection = list[next]
   }
 
   private func openInspector(_ selection: WorkspaceInspectorSelection) {
@@ -419,6 +506,11 @@ struct SupervisorWorkspaceView: View {
     }
     .onChange(of: waitingTotal) { _, count in
       AppDelegate.updateDockBadge(count: count)
+    }
+    .onChange(of: nav.requestedQuestionID, initial: true) { _, id in
+      guard let id else { return }
+      openInspector(.question(id))
+      nav.requestedQuestionID = nil
     }
     .background(WorkspaceWindowAccessor(window: $hostWindow))
     .onAppear {
@@ -573,27 +665,78 @@ struct SupervisorWorkspaceView: View {
   @ViewBuilder
   private func projectSidebarRows(_ summary: SupervisorChannelSummary) -> some View {
     let projName = projectName(for: summary)
-    let count = summary.waitingCount > 0 ? summary.waitingCount : summary.totalCount
-    sidebarBadgeRow(
-      title: "# \(projName)",
-      systemImage: summary.waitingCount > 0 ? "exclamationmark.circle.fill" : "folder",
-      count: count,
-      highlight: summary.waitingCount > 0
-    )
-    .tag(WorkspaceChannel.project(projName))
-
     let subs = mergedSubchannels(forProject: projName)
-    ForEach(subs) { sub in
-      let subCount = sub.waitingCount > 0 ? sub.waitingCount : sub.totalCount
-      sidebarBadgeRow(
-        title: "  \(sub.displayName)",
-        systemImage: "arrow.turn.down.right",
-        count: subCount,
-        highlight: sub.waitingCount > 0
-      )
-      .font(.caption)
-      .tag(WorkspaceChannel.subchannel(project: projName, subchannel: sub.subchannel))
+    if subs.isEmpty {
+      sidebarChannelRow(title: projName, systemImage: "number", waiting: summary.waitingCount)
+        .tag(WorkspaceChannel.project(projName))
+    } else {
+      DisclosureGroup(isExpanded: projectExpansion(projName, waiting: summary.waitingCount)) {
+        ForEach(subs) { sub in
+          sidebarChannelRow(
+            title: sub.displayName.hasPrefix("/") ? String(sub.displayName.dropFirst()) : sub.displayName,
+            systemImage: nil,
+            waiting: sub.waitingCount
+          )
+          .tag(WorkspaceChannel.subchannel(project: projName, subchannel: sub.subchannel))
+        }
+      } label: {
+        sidebarChannelRow(title: projName, systemImage: "number", waiting: summary.waitingCount)
+          .tag(WorkspaceChannel.project(projName))
+      }
     }
+  }
+
+  /// Open when the owner opened it, else when something in it waits on
+  /// them or it (or one of its themes) is selected.
+  private func projectExpansion(_ projName: String, waiting: Int) -> Binding<Bool> {
+    let key = projName.lowercased()
+    return Binding(
+      get: {
+        if collapsedProjects.contains(key) { return false }
+        if expandedProjects.contains(key) { return true }
+        switch activeChannel {
+        case let .project(name), let .subchannel(name, _):
+          if name.lowercased() == key { return true }
+        default:
+          break
+        }
+        return waiting > 0
+      },
+      set: { open in
+        if open {
+          expandedProjects.insert(key)
+          collapsedProjects.remove(key)
+        } else {
+          collapsedProjects.insert(key)
+          expandedProjects.remove(key)
+        }
+      }
+    )
+  }
+
+  /// A project or theme in the sidebar: its name, and a count only when
+  /// decisions there wait on the owner.
+  private func sidebarChannelRow(title: String, systemImage: String?, waiting: Int) -> some View {
+    HStack(spacing: 6) {
+      if let systemImage {
+        Label(title, systemImage: systemImage)
+          .lineLimit(1)
+      } else {
+        Text(title)
+          .lineLimit(1)
+      }
+      Spacer(minLength: 4)
+      if waiting > 0 {
+        Text("\(waiting)")
+          .font(.caption2.weight(.semibold).monospacedDigit())
+          .padding(.horizontal, 6)
+          .padding(.vertical, 1)
+          .background(WorkspaceTheme.caution.opacity(0.16), in: Capsule())
+          .foregroundStyle(WorkspaceTheme.caution)
+          .accessibilityLabel("\(waiting) waiting on you")
+      }
+    }
+    .help(title)
   }
 
   private func projectName(for summary: SupervisorChannelSummary) -> String {
@@ -666,6 +809,14 @@ struct SupervisorWorkspaceView: View {
         if next == .general {
           Task { @MainActor in
             proxy.scrollTo("workspace-bottom-anchor", anchor: .bottom)
+          }
+        }
+      }
+      // Keyboard selection keeps the selected row in view.
+      .onChange(of: inspectorSelection) { _, selection in
+        if case let .question(id)? = selection {
+          withAnimation(.easeOut(duration: 0.15)) {
+            proxy.scrollTo("needs-you-\(id)")
           }
         }
       }
@@ -1004,7 +1155,7 @@ struct SupervisorWorkspaceView: View {
           Text("\(waitingTotal) item\(waitingTotal == 1 ? "" : "s") need your input")
             .font(WorkspaceTheme.Typography.secondary.weight(.semibold))
             .foregroundStyle(WorkspaceTheme.ink)
-          Text("\(fleet.questions.count) decisions · \(approvals.items.count) tool approvals · \(supervisor.tasks.count) tasks")
+          Text("\(decisionItems.count) decisions · \(approvals.items.count) tool approvals · \(supervisor.tasks.count) tasks")
             .font(WorkspaceTheme.Typography.caption)
             .foregroundStyle(WorkspaceTheme.muted)
         }
@@ -1139,20 +1290,13 @@ struct SupervisorWorkspaceView: View {
       }
     }
 
-    let openQuestionKeys = Set(fleet.questions.compactMap(\.threadKey))
-    let filteredDecisions = decisionItems.filter { item in
-      let q = fleet.questions.first(where: { $0.id == item.id })
-      guard matchesQuery([item.project, item.headline, q?.body]) else { return false }
-      return SupervisorBoardLabel.matches(tags: q?.labels ?? [], activeFilters: activeLabelFilters)
-    }
-    let groups = SupervisorChannelGrouping.groupByProject(filteredDecisions)
+    let layout = needsYouLayout
 
     if !availableBoardLabels.isEmpty {
       WorkspaceLabelChipsRow(labels: availableBoardLabels, activeFilters: $activeLabelFilters)
     }
-    let _ = openQuestionKeys
 
-    if groups.isEmpty && filteredApprovals.isEmpty {
+    if layout.groups.isEmpty && filteredApprovals.isEmpty {
       VStack(spacing: WorkspaceTheme.Spacing.x2) {
         Text(trimmedQuery.isEmpty ? "Queue clear" : "Nothing matching \"\(trimmedQuery)\"")
           .font(WorkspaceTheme.Typography.body.weight(.medium))
@@ -1163,33 +1307,84 @@ struct SupervisorWorkspaceView: View {
       }
       .frame(maxWidth: .infinity)
       .padding(.vertical, WorkspaceTheme.Spacing.x8)
-    } else {
-      ForEach(groups) { group in
-        VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x2) {
-          HStack {
-            Text("#\(group.project) · \(group.items.count) waiting")
-              .font(WorkspaceTheme.Typography.section)
-              .foregroundStyle(WorkspaceTheme.ink)
-            Spacer()
-            if group.project.lowercased() != "general" {
-              Button("Open #\(group.project) ↗") {
-                nav.selectedChannel = .project(group.project)
-              }
-              .buttonStyle(.plain)
-              .foregroundStyle(WorkspaceTheme.live)
-              .font(WorkspaceTheme.Typography.caption.weight(.semibold))
-            }
-          }
-          .padding(.top, WorkspaceTheme.Spacing.x2)
+    }
 
-          ForEach(group.items) { item in
-            if let q = fleet.questions.first(where: { $0.id == item.id }) {
-              questionCardView(q)
+    if !layout.groups.isEmpty || !layout.updates.isEmpty {
+      VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
+        ForEach(layout.groups) { group in
+          VStack(alignment: .leading, spacing: 2) {
+            NeedsYouGroupHeader(
+              title: group.project.lowercased() == "general" ? "#general" : "#\(group.project)",
+              count: group.questions.count,
+              onOpen: group.project.lowercased() == "general" ? nil : { nav.selectedChannel = .project(group.project) }
+            )
+            ForEach(group.questions) { q in
+              needsYouRow(q, reason: layout.reasons[q.id])
             }
           }
         }
+
+        if !layout.updates.isEmpty {
+          DisclosureGroup(isExpanded: $showNeedsYouUpdates) {
+            VStack(alignment: .leading, spacing: 2) {
+              ForEach(layout.updates) { q in
+                needsYouRow(q, reason: nil, isUpdate: true)
+              }
+            }
+            .padding(.top, 2)
+          } label: {
+            HStack(spacing: 6) {
+              Text("Updates · no decision needed")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(WorkspaceTheme.muted)
+              Text("\(layout.updates.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(WorkspaceTheme.muted.opacity(0.8))
+            }
+          }
+          .padding(.horizontal, WorkspaceTheme.Spacing.x3)
+          .padding(.top, WorkspaceTheme.Spacing.x2)
+        }
       }
+      .focusable()
+      .focused($needsYouListFocused)
+      .focusEffectDisabled()
+      .onMoveCommand { direction in
+        switch direction {
+        case .up: moveSelection(-1)
+        case .down: moveSelection(1)
+        default: break
+        }
+      }
+      .onKeyPress(.return) {
+        if inspectorSelection == nil { moveSelection(1) }
+        guard inspectorSelection != nil else { return .ignored }
+        isInspectorOpen = true
+        return .handled
+      }
+      .onExitCommand {
+        isInspectorOpen = false
+      }
+      .accessibilityElement(children: .contain)
+      .accessibilityLabel("Needs You")
     }
+  }
+
+  /// One compact Needs You row; clicking selects it and opens the inspector.
+  private func needsYouRow(_ q: FleetQuestion, reason: String?, isUpdate: Bool = false) -> some View {
+    let card = fleet.cardBriefs[q.id]
+    return NeedsYouRow(
+      title: (q.decisionHeadline ?? q.title).trimmingCharacters(in: .whitespacesAndNewlines),
+      reason: reason,
+      badge: isUpdate ? nil : q.needsYouBadge(card: card),
+      meta: q.needsYouMeta(),
+      isSelected: isSelectedQuestion(q.id),
+      isUpdate: isUpdate
+    ) {
+      needsYouListFocused = true
+      openInspector(.question(q.id))
+    }
+    .id("needs-you-\(q.id)")
   }
 
   private var taskOpenQuestionKeys: Set<String> {
@@ -1746,23 +1941,14 @@ struct SupervisorWorkspaceView: View {
 
     WorkspaceLabelChipsRow(labels: availableBoardLabels, activeFilters: $activeLabelFilters)
 
-    let matchingCards = decisionItems.filter { item in
-      guard item.project.caseInsensitiveCompare(projName) == .orderedSame else { return false }
-      if let subchannel, !subchannel.isEmpty {
-        let iSub = (item.subchannel ?? "").lowercased()
-        if iSub != subchannel.lowercased() && !iSub.hasSuffix("/\(subchannel.lowercased())") { return false }
-      }
-      let q = fleet.questions.first(where: { $0.id == item.id })
-      guard matchesQuery([item.headline, item.project, q?.body]) else { return false }
-      return SupervisorBoardLabel.matches(tags: q?.labels ?? [], activeFilters: activeLabelFilters)
-    }
-    if !matchingCards.isEmpty {
-      Text("Waiting on You")
-        .font(WorkspaceTheme.Typography.section)
-        .foregroundStyle(WorkspaceTheme.ink)
-      ForEach(matchingCards) { item in
-        if let q = fleet.questions.first(where: { $0.id == item.id }) {
-          questionCardView(q)
+    let waiting = projectDecisionQuestions(projName, subchannel: subchannel)
+    if !waiting.isEmpty {
+      let reasons = SupervisorNeedsYouDigest.rowReasons(for: waiting.map { $0.needsYouDigest(card: fleet.cardBriefs[$0.id]) })
+      let reasonByID = Dictionary(zip(waiting.map(\.id), reasons), uniquingKeysWith: { first, _ in first })
+      VStack(alignment: .leading, spacing: 2) {
+        NeedsYouGroupHeader(title: "Waiting on you", count: waiting.count)
+        ForEach(waiting) { q in
+          needsYouRow(q, reason: reasonByID[q.id] ?? nil)
         }
       }
     }
@@ -1791,17 +1977,6 @@ struct SupervisorWorkspaceView: View {
 
   // MARK: - Question & Session Cards
 
-  private func toggleQuestionExpand(_ q: FleetQuestion) {
-    if expandedQuestionIDs.contains(q.id) {
-      expandedQuestionIDs.remove(q.id)
-    } else {
-      expandedQuestionIDs.insert(q.id)
-      if let tk = q.threadKey {
-        Task { await fleet.loadDetail(tk) }
-      }
-    }
-  }
-
   private func toggleThreadExpand(_ key: String) {
     if expandedThreadKeys.contains(key) {
       expandedThreadKeys.remove(key)
@@ -1809,259 +1984,6 @@ struct SupervisorWorkspaceView: View {
       expandedThreadKeys.insert(key)
       Task { await fleet.loadDetail(key) }
     }
-  }
-
-  private func questionCardView(_ q: FleetQuestion) -> some View {
-    let isExpanded = expandedQuestionIDs.contains(q.id)
-    let busy = fleet.inFlight.contains(q.id) || fleet.stillSending.contains(q.id)
-    let detail = q.threadKey.flatMap { fleet.details[$0] }
-    let openChat = q.openChat ?? q.chats.first ?? q.threadKey.flatMap { fleet.thread($0)?.openChat } ?? detail?.openChat
-    let slotKey = "q:\(q.id)"
-
-    return VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x3) {
-      HStack(alignment: .top, spacing: WorkspaceTheme.Spacing.x2) {
-        VStack(alignment: .leading, spacing: 4) {
-          if q.risky { FleetRiskyLabel() }
-          if q.blockingCount > 0 {
-            WorkspaceBlockingPill(
-              summary: q.blockingSummary ?? "Blocking \(q.blockingCount) downstream task\(q.blockingCount == 1 ? "" : "s")"
-            )
-          }
-          Button {
-            openInspector(.question(q.id))
-          } label: {
-            Text(q.decisionHeadline ?? q.title)
-              .font(WorkspaceTheme.Typography.body.weight(.semibold))
-              .foregroundStyle(WorkspaceTheme.ink)
-              .multilineTextAlignment(.leading)
-          }
-          .buttonStyle(.plain)
-
-          if let fact = q.decisionFact?.trimmingCharacters(in: .whitespacesAndNewlines), !fact.isEmpty {
-            Text(fact)
-              .font(WorkspaceTheme.Typography.caption)
-              .foregroundStyle(WorkspaceTheme.muted)
-              .lineLimit(2)
-              .multilineTextAlignment(.leading)
-          }
-          if !q.remainingItemIds.isEmpty {
-            Text("More owner questions remain; answer this one before the next is presented.")
-              .font(WorkspaceTheme.Typography.caption)
-              .foregroundStyle(WorkspaceTheme.live)
-              .lineLimit(2)
-          }
-
-          HStack(spacing: 6) {
-            if let actor = q.actorLabel, !actor.isEmpty {
-              WorkspaceActorPill(actor: actor)
-            }
-            if let sub = q.subchannel, !sub.isEmpty {
-              Text("/\(sub.split(separator: "/").last ?? Substring(sub))")
-                .font(.caption2.monospaced())
-                .foregroundStyle(WorkspaceTheme.muted)
-            }
-            if let label = q.chatLabel ?? openChat?.label {
-              Text(label)
-                .font(WorkspaceTheme.Typography.caption)
-                .foregroundStyle(WorkspaceTheme.muted)
-                .lineLimit(1)
-            }
-          }
-          let qLabels = SupervisorBoardLabel.extract(from: q.labels)
-          WorkspaceLabelChipsRow(labels: qLabels, activeFilters: $activeLabelFilters)
-        }
-        Spacer()
-        WorkspaceActionButton(small: true) {
-          openInspector(.question(q.id))
-        } label: {
-          Label("Inspect", systemImage: "sidebar.trailing")
-        }
-        .help("Open in Thread Inspector")
-        if let tk = q.threadKey, !tk.isEmpty {
-          WorkspaceActionButton(small: true) {
-            nav.selectedChannel = .sessions
-            openInspector(.session(tk))
-            Task { await fleet.loadDetail(tk) }
-          } label: {
-            Text("View Session")
-          }
-          .help("Jump to this coding session's live transcript and composer")
-        }
-        if let chat = openChat, let btnTitle = FleetChatOpener.buttonTitle(chat) {
-          WorkspaceActionButton(small: true) {
-            fleet.openChat(chat)
-          } label: {
-            Text("\(btnTitle) ↗")
-          }
-          .help(chat.link == nil ? (chat.note ?? "Bring \(chat.appName ?? "app") forward") : "Open this thread directly")
-        }
-        WorkspaceActionButton(small: true) {
-          toggleQuestionExpand(q)
-        } label: {
-          Label(isExpanded ? "Hide" : "Context", systemImage: isExpanded ? "chevron.up" : "chevron.down")
-        }
-      }
-
-      if isExpanded {
-        if !q.body.isEmpty {
-        Button {
-          if let tk = q.threadKey, !tk.isEmpty {
-            openInspector(.session(tk))
-            Task { await fleet.loadDetail(tk) }
-          } else {
-            openInspector(.question(q.id))
-          }
-        } label: {
-          WorkspaceMarkdownContent(
-            blocks: WorkspaceMarkdownParser.parse(q.body),
-            bodyFont: WorkspaceTheme.Typography.secondary,
-            textColor: WorkspaceTheme.muted
-          )
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("Click to inspect full thread context and conversation")
-      }
-
-        if let nextAction = q.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAction.isEmpty {
-        VStack(alignment: .leading, spacing: 4) {
-          Text(q.isClarificationQuestion ? "Question to unblock" : "Next step")
-            .font(WorkspaceTheme.Typography.caption.weight(.semibold))
-            .foregroundStyle(WorkspaceTheme.live)
-          WorkspaceMarkdownContent(
-            blocks: WorkspaceMarkdownParser.parse(nextAction),
-            bodyFont: WorkspaceTheme.Typography.secondary,
-            textColor: WorkspaceTheme.ink
-          )
-          if let answered = q.clarificationAnswer?.trimmingCharacters(in: .whitespacesAndNewlines), !answered.isEmpty {
-            Text("Your answer: \(answered)")
-              .font(WorkspaceTheme.Typography.caption)
-              .foregroundStyle(WorkspaceTheme.muted)
-          }
-        }
-        .padding(WorkspaceTheme.Spacing.x3)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(WorkspaceTheme.live.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-      }
-
-      if revealedPlanQuestionIDs.contains(q.id), let plan = q.plan {
-        VStack(alignment: .leading, spacing: 6) {
-          Text(plan.label ?? "Fix Plan")
-            .font(WorkspaceTheme.Typography.caption.weight(.semibold))
-            .foregroundStyle(WorkspaceTheme.ink)
-          if let acceptance = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acceptance.isEmpty {
-            Text("Acceptance: \(acceptance)")
-              .font(WorkspaceTheme.Typography.caption)
-              .foregroundStyle(WorkspaceTheme.muted)
-          }
-          if let issueTitle = plan.issueDraft?.title?.trimmingCharacters(in: .whitespacesAndNewlines), !issueTitle.isEmpty {
-            Text("Issue: \(issueTitle)")
-              .font(WorkspaceTheme.Typography.caption.weight(.medium))
-              .foregroundStyle(WorkspaceTheme.ink)
-          }
-          if let issueBody = plan.issueDraft?.body?.trimmingCharacters(in: .whitespacesAndNewlines), !issueBody.isEmpty {
-            WorkspaceMarkdownContent(
-              blocks: WorkspaceMarkdownParser.parse(issueBody),
-              bodyFont: WorkspaceTheme.Typography.caption,
-              textColor: WorkspaceTheme.muted
-            )
-          }
-        }
-        .padding(WorkspaceTheme.Spacing.x3)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-      }
-
-      HStack(spacing: WorkspaceTheme.Spacing.x2) {
-        ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { index, opt in
-          let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
-          WorkspaceActionButton(prominent: index == 0 && !q.risky, small: true) {
-            if opt == "Answer question" {
-              expandedQuestionIDs.insert(q.id)
-              focusedThreadSlot = slotKey
-            } else if opt == "Review plan", q.plan != nil {
-              if revealedPlanQuestionIDs.contains(q.id) {
-                revealedPlanQuestionIDs.remove(q.id)
-              } else {
-                revealedPlanQuestionIDs.insert(q.id)
-              }
-            } else {
-              Task { await fleet.answer(q, option: opt) }
-            }
-          } label: {
-            Text(q.label(for: opt))
-          }
-          .disabled(busy && !handlesLocally)
-        }
-
-        Button("Ask Supervisor") {
-          composerText = "About \"\(q.title)\": "
-          inlineChatOpen = true
-          composerFocused = true
-        }
-        .buttonStyle(.borderless)
-        .font(WorkspaceTheme.Typography.caption.weight(.medium))
-        .foregroundStyle(WorkspaceTheme.live)
-
-        Spacer()
-
-        Button("Dismiss") {
-          Task { await fleet.dismiss(q) }
-        }
-        .buttonStyle(.borderless)
-        .font(WorkspaceTheme.Typography.caption)
-        .foregroundStyle(WorkspaceTheme.muted)
-        .disabled(busy)
-      }
-
-      if let note = fleet.notes[q.id] {
-        FleetNoteRow(note: note) { fleet.clearNote(q.id) }
-      }
-
-      if isExpanded {
-        WorkspaceHairline(leadingInset: 0)
-        if let context = q.displayAskContext, !context.isEmpty {
-          VStack(alignment: .leading, spacing: 4) {
-            Text("Agent context")
-              .font(WorkspaceTheme.Typography.caption.weight(.semibold))
-              .foregroundStyle(WorkspaceTheme.muted)
-            WorkspaceMarkdownContent(
-              blocks: WorkspaceMarkdownParser.parse(context),
-              bodyFont: WorkspaceTheme.Typography.secondary,
-              textColor: WorkspaceTheme.ink
-            )
-              .padding(WorkspaceTheme.Spacing.x3)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-          }
-        }
-
-        if let tk = q.threadKey {
-          let thread = fleet.thread(tk)
-          let summary = FleetThreadSummary(thread: thread, detail: detail)
-          FleetThreadLines(summary: summary, showsExcerpt: detail?.conversation == nil && (q.displayAskContext?.isEmpty ?? true))
-          FleetConversationList(conversation: detail?.conversation, loading: fleet.detailLoading.contains(tk))
-        } else {
-          Text("Reply directly below to answer through Supervisor.")
-            .font(WorkspaceTheme.Typography.caption)
-            .foregroundStyle(WorkspaceTheme.muted)
-        }
-
-        directThreadComposer(
-          slotKey: slotKey,
-          placeholder: q.isClarificationQuestion
-            ? "Type your answer to unblock this plan…"
-            : "Reply directly to this session…",
-          onRefresh: q.threadKey.map { tk in { Task { await fleet.loadDetail(tk) } } }
-        ) { text, payloadImages in
-          await fleet.sendWorkspaceQuestionReply(q, message: text, images: payloadImages)
-        }
-      }
-    }
-    .padding(WorkspaceTheme.Spacing.x4)
-    .workspaceCardSurface(cornerRadius: WorkspaceTheme.cardRadius)
   }
 
   private func sessionCardView(_ session: SupervisorSessionBrief, showProjectTag: Bool) -> some View {

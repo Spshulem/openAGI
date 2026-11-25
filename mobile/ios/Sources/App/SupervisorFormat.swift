@@ -1,4 +1,5 @@
 import Foundation
+import SupervisorChannelsKit
 
 // Everything the Supervisor screen decides about words and order, kept pure
 // so it can be pinned by tests: health order, thread names, state labels in
@@ -316,10 +317,10 @@ enum SupervisorFormat {
     // synthesizes equivalent cards from `questions` + `snapshot.threads` when
     // connected to an older daemon or UI test fixture.
     static func resolvedCards(_ state: FleetState) -> [SupervisorCard] {
-        let cards = state.cards.filter { !$0.id.isEmpty && $0.needsYou }
+        let cards = state.cards.filter { !$0.id.isEmpty && SupervisorAttentionCounting.isActionable(needsYou: $0.needsYou) }
         if !cards.isEmpty { return cards }
         let threads = state.snapshot?.threads ?? []
-        return state.questions.filter { !$0.id.isEmpty && $0.needsYou }.map { question in
+        return state.questions.filter { !$0.id.isEmpty && SupervisorAttentionCounting.isActionable(needsYou: $0.needsYou) }.map { question in
             let keys = threadKeys(question)
             let primaryKey = question.threadKey ?? keys.first
             let thread = primaryKey.flatMap { key in threads.first(where: { $0.key == key }) }

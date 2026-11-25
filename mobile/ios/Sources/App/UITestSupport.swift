@@ -235,6 +235,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                                "configured": saved, "apiKeySaved": saved]]])
         case "/workspace/integrations/linear/sync":
             finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
+        case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-needs-you-fixture"):
+            deliver(status: 200, data: Data(UITestNeedsYouFixture.stateJSON.utf8), contentType: "application/json")
         case "/fleet/api/state":
             finish(object: ["mode": "observe", "enabled": false, "running": false,
                             "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],
