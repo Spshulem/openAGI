@@ -2703,9 +2703,14 @@ export class FleetSupervisor {
     }
     // Preserve strict per-thread FIFO: if this Paseo session already has
     // queued ordinary messages awaiting drain, append behind that backlog
-    // instead of leapfrogging dependent instructions.
+    // instead of leapfrogging dependent instructions. For resumed handoffs,
+    // keep tracking in the handoff queue (return busy) instead of transferring
+    // into the ordinary queue and losing approval/stale/TTL checks.
     const hasExistingQueue = isPaseoSend && this.store.queuedOwnerMessages(effectiveKey).length > 0;
     if (isPaseoSend && effectiveQueue && ownerChoice == null && (hasExistingQueue || (!pausedForHuman && ["running", "initializing"].includes(String(thread.agentStatus ?? "").toLowerCase())))) {
+      if (resume) {
+        return { delivery: { status: "busy", busy: true, route: "paseo-send", detail: "Paseo session is mid-turn; held handoff waits until idle." } };
+      }
       return enqueueBusyPaseo();
     }
     // The owner is speaking to this thread: a judged or planned nudge in
@@ -2726,6 +2731,9 @@ export class FleetSupervisor {
       ...(resume ? { noPermissionReply: true } : {})
     });
     if (isPaseoSend && effectiveQueue && delivery?.status === "busy") {
+      if (resume) {
+        return { delivery: { status: "busy", busy: true, route: "paseo-send", detail: delivery?.detail || "Paseo session is mid-turn; held handoff waits until idle." } };
+      }
       return enqueueBusyPaseo();
     }
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
@@ -2851,7 +2859,9 @@ export class FleetSupervisor {
           this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
         } else if (delivery?.unconfirmed) {
           this.handoffs.update(entry.key, { status: "unconfirmed", attempts, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
-        } else if (/pending permission prompt; a held handoff is never sent into it/.test(String(delivery?.detail ?? ""))) {
+        } else if (delivery?.status === "busy" || delivery?.busy === true) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat is mid-turn; it waits until its current turn finishes" });
+        } else if (delivery?.permissionRequired === true || /pending permission prompt; a held handoff is never sent into it|permission prompt pending/i.test(String(delivery?.detail ?? ""))) {
           this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat has a pending permission prompt; it waits until that prompt is answered" });
         } else if (HOST_UNAVAILABLE.test(String(delivery?.detail ?? ""))) {
           this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: `held: Paseo host ${entry.serverId ?? ""} is still offline` });
@@ -2888,7 +2898,7 @@ export class FleetSupervisor {
       if (receipt.pending) {
         return { status: "unconfirmed", detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" };
       }
-      if (receipt.delivered === true && !receipt.sendError && !receipt.executionError) {
+      if (receipt.delivered !== false && !receipt.sendError && !receipt.executionError && !receipt.clearedForNewSend) {
         return { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), detail: "delivered before a restart (Paseo receipt); not sent again" };
       }
     }

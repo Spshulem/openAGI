@@ -899,7 +899,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         // receipt decides; it is never sent a second time.
         if (ownerInitiated && previous.messageHash && previous.messageHash === base?.messageHash && (previous.imagesHash ?? null) === imagesHash) {
           if (priorCheck.confirmed || priorCheck.systemError) {
-            writeJsonAtomic(file, { ...previous, pending: false, delivered: true });
+            writeJsonAtomic(file, { ...previous, pending: false });
             return { status: "sent", route: "paseo-send", actionId, reconciled: true, messageId: previous.clientMessageId ?? previous.messageId ?? null,
               detail: priorCheck.systemError
                 ? `Paseo message delivered earlier (its turn then failed: ${priorCheck.systemError}); not sent again`
@@ -947,7 +947,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           statusCheckFor = { messageId: previous.messageId ?? null, outcome: rec.outcome };
         } else if (!priorCheck.confirmed) {
           // Owner explicitly initiated a new send; clear stale unconfirmed marker so older background nudges never brick manual coordination.
-          writeJsonAtomic(file, { ...previous, pending: false });
+          writeJsonAtomic(file, { ...previous, pending: false, delivered: false, clearedForNewSend: true });
         } else {
           writeJsonAtomic(file, { ...previous, pending: false });
           // This receipt belongs to an older action, not the current proposal.
@@ -1181,7 +1181,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         }
         return blocked("Message accepted; turn start unconfirmed. No automatic resend.");
       }
-      writeJsonAtomic(file, { ...correlated, pending: false, delivered: true });
+      writeJsonAtomic(file, { ...correlated, pending: false });
       if (statusCheckFor) {
         // The proposed message was not sent: the reply decides what is next.
         return { status: "blocked", route: "paseo-send", actionId, statusCheck: true, messageId: correlated.clientMessageId ?? messageId,

@@ -599,3 +599,40 @@ test("RemoteFleetSupervisor reconciles a lost reply against a queued handoff by 
   assert.equal(result.delivery.handoffKey, "act_remote_q");
   assert.equal(f.supervisor.handoffs.get("act_remote_q").status, "waiting");
 });
+
+// Review fix (#361, Codex P2 round 2): scanned permission blockers keep the
+// handoff waiting so clearing the permission still delivers automatically.
+test("scanned pendingPermission keeps held handoff waiting and delivers once cleared", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Ship release.", { idempotencyKey: "act_perm_scan" });
+  f.host.up = true;
+  f.list[0].meta.pendingPermission = { id: "perm-9" };
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_perm_scan").status, "waiting");
+  assert.match(f.supervisor.handoffs.get("act_perm_scan").detail, /pending permission prompt/);
+  delete f.list[0].meta.pendingPermission;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_perm_scan").status, "delivered");
+});
+
+// Review fix (#361, Codex P2 round 2): when the recovered chat is mid-turn,
+// keep tracking in the handoff queue (waiting) instead of marking blocked or
+// losing approval/stale/TTL checks in the ordinary busy queue.
+test("recovered chat that is busy mid-turn keeps held handoff waiting until idle", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Continue after restart.", { idempotencyKey: "act_busy_res" });
+  f.host.up = true;
+  f.list[0].agentStatus = "running";
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_busy_res").status, "waiting");
+  assert.equal(f.supervisor.store.queuedOwnerMessages(KEY).length, 0, "does not duplicate into ordinary busy queue");
+  f.list[0].agentStatus = "idle";
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_busy_res").status, "delivered");
+});
