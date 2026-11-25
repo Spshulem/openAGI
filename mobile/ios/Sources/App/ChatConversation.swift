@@ -177,7 +177,14 @@ final class ChatConversation {
     // no device runs or changes it meanwhile.
     @discardableResult
     func beginEditingQueued(id: UUID) -> Bool {
-        // Not while its upload is on the wire: the hub may already run it.
+        // Not while its upload is on the wire, nor after one that got no
+        // answer: the hub may already have it (and run it) without a hold.
+        // Asking again settles that; once the hub confirms it, Edit holds it
+        // there like any other waiting message.
+        if hubQueueAvailable, let item = queue.item(id), item.origin?.pendingUpload == true, item.origin?.uploadAttempted == true {
+            uploadPending()
+            return false
+        }
         guard !isReadOnly, let item = queue.item(id), item.origin?.heldBy == nil, item.requestID != uploadingRequestID,
               let text = queue.beginEditing(id) else { return false }
         queue.setOrigin(id) { $0.error = nil }
@@ -362,6 +369,12 @@ final class ChatConversation {
         if changed { persist() }
     }
 
+    private static func neverReachedHub(_ error: Error) -> Bool {
+        if case DaemonError.transport(let inner) = error { return HubUpload.neverSent(inner) }
+        if case DaemonError.unreachableHost = error { return true }
+        return HubUpload.neverSent(error)
+    }
+
     static let removedText = "Removed from the queue before it ran. Nothing was sent to the agent."
 
     #if DEBUG
@@ -410,10 +423,12 @@ final class ChatConversation {
                     // Full for now, not refused: it stays next to deliver and
                     // is tried again on the next refresh (nothing passes it).
                     offline = true
+                    self.queue.setOrigin(next.id) { $0.uploadAttempted = false }
                 } catch let refused as HubQueueRefused {
-                    self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
+                    self.queue.setOrigin(next.id) { $0.error = refused.displayMessage; $0.uploadAttempted = false }
                 } catch {
                     offline = true
+                    if Self.neverReachedHub(error) { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
                     // Not stopped: main was not reached. It is tried again.
                     if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
                 }

@@ -86,7 +86,8 @@ struct SupervisorQueueTray: View {
         let notes = [
           origin.mine ? nil : "From \(origin.sourceName ?? "another device")",
           origin.heldBy.map { "Being edited on \($0)" },
-          origin.pendingUpload && origin.error == nil ? "Not on main yet; sends when connected" : nil
+          origin.pendingUpload && origin.error == nil
+            ? (origin.uploadAttempted ? "Checking whether main got this; Edit opens once it answers" : "Not on main yet; sends when connected") : nil
         ].compactMap { $0 }
         if !notes.isEmpty {
           Text(notes.joined(separator: " · "))

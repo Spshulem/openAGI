@@ -57,8 +57,10 @@ export class ConversationQueue {
   // the sender's authority and returns its promise. mintPrincipal(spec)
   // rebuilds that authority, or returns null when the sender is no longer
   // allowed (checked again at restore, and by startTurn when it runs).
-  constructor({ dir, liveTurns, startTurn, mintPrincipal = () => null, onChange = () => {}, now = () => Date.now(), holdMs = HOLD_MS }) {
+  constructor({ dir, liveTurns, startTurn, mintPrincipal = () => null, onChange = () => {}, now = () => Date.now(), holdMs = HOLD_MS, saveRetryMs = 1_000 }) {
     this.holdMs = holdMs;
+    this.saveRetryMs = saveRetryMs;
+    this.saveRetries = new Map();
     this.dir = dir;
     this.liveTurns = liveTurns;
     this.startTurn = startTurn;
@@ -95,7 +97,7 @@ export class ConversationQueue {
         state.items.push({ ...item, state: "queued", started: false });
       }
       state.revision += 1;
-      this.persist(saved.sessionId);
+      this.save(saved.sessionId);
       for (const item of state.items) this.track(saved.sessionId, item);
       this.dispatch(saved.sessionId);
     }
@@ -177,7 +179,7 @@ export class ConversationQueue {
       const onProgress = (data) => {
         if (!current.started && this.find(sessionId, entry.requestId) === current) {
           current.started = true;
-          this.persist(sessionId);
+          this.save(sessionId);
         }
         hooks.onProgress?.(data);
       };
@@ -322,8 +324,36 @@ export class ConversationQueue {
   changed(sessionId) {
     const state = this.session(sessionId);
     state.revision += 1;
-    this.persist(sessionId);
+    this.save(sessionId);
     this.notify(sessionId);
+  }
+
+  // Saves a change already made (a dispatch, a finished turn, an edit). If
+  // the disk refuses, the queue keeps running from memory and the save is
+  // retried, backing off, until it lands: a transient storage error never
+  // leaves an item marked running with no turn, stranding the conversation.
+  // (A new message is different: submit() saves it before acknowledging it.)
+  save(sessionId) {
+    try {
+      this.persist(sessionId);
+      clearTimeout(this.saveRetries.get(sessionId));
+      this.saveRetries.delete(sessionId);
+    } catch {
+      if (!this.saveRetries.has(sessionId)) this.retrySave(sessionId, this.saveRetryMs);
+    }
+  }
+
+  retrySave(sessionId, delay) {
+    const timer = setTimeout(() => {
+      try {
+        this.persist(sessionId);
+        this.saveRetries.delete(sessionId);
+      } catch {
+        this.retrySave(sessionId, Math.min(delay * 2, 30_000));
+      }
+    }, delay);
+    timer.unref?.();
+    this.saveRetries.set(sessionId, timer);
   }
 
   notify(sessionId) {
@@ -373,6 +403,8 @@ export class ConversationQueue {
   }
 
   close() {
+    for (const timer of this.saveRetries.values()) clearTimeout(timer);
+    this.saveRetries.clear();
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
   }

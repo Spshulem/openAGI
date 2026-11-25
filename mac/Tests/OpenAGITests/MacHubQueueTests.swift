@@ -238,6 +238,23 @@ final class MacHubQueueTests: XCTestCase {
     XCTAssertTrue(supervisor.queuedMessages.isEmpty, "never comes back, and never runs on the hub")
   }
 
+  func testAMessageWhoseUploadGotNoAnswerOpensForEditOnlyOnceTheHubHasConfirmedIt() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-10", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.dropNextEnqueueAnswer = true }
+    _ = await supervisor.sendMessage("taken, answer lost, then edited")
+    try await waitFor("the hub to take it") { MacFakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then edited" } }
+    try await waitFor("the lost answer") { supervisor.queuedMessages.first?.origin?.uploadAttempted == true }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let item = try XCTUnwrap(supervisor.queuedMessages.first)
+    XCTAssertFalse(supervisor.beginEditingQueued(id: item.id), "the hub may already have it without a hold: no local-only edit")
+    // That Edit tap asked again (no backoff wait); the hub confirms it has it.
+    try await waitFor("the confirmation") { supervisor.queuedMessages.first?.origin?.pendingUpload == false }
+    XCTAssertTrue(supervisor.beginEditingQueued(id: item.id))
+    try await waitFor("the hub hold") { MacFakeHubProtocol.snapshot().first { $0.requestId == item.requestID }?.heldBy == "Mac" }
+    XCTAssertEqual(MacFakeHubProtocol.snapshot().filter { $0.requestId == item.requestID }.count, 1)
+  }
+
   func testAnUploadAnswerOlderThanTheSnapshotShownLeavesNoStaleRow() async throws {
     MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-9", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
     let supervisor = await client()

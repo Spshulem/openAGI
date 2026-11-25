@@ -683,7 +683,13 @@ final class SharedSupervisorClient: ObservableObject {
   /// queue the item is held for this Mac meanwhile, for every device.
   @discardableResult
   func beginEditingQueued(id: UUID) -> Bool {
-    // Not while its upload is on the wire: the hub may already run it.
+    // Not while its upload is on the wire, nor after one that got no answer:
+    // the hub may already have it (and run it) without a hold. Asking again
+    // settles that; once the hub confirms it, Edit holds it there.
+    if hubQueueAvailable, let item = queue.item(id), item.origin?.pendingUpload == true, item.origin?.uploadAttempted == true {
+      uploadPending()
+      return false
+    }
     guard let item = queue.item(id), item.origin?.heldBy == nil, item.requestID != uploadingRequestID,
           let text = queue.beginEditing(id) else { return false }
     queue.setOrigin(id) { $0.error = nil }
@@ -831,10 +837,12 @@ final class SharedSupervisorClient: ObservableObject {
         } catch let refused as HubQueueRefused where refused.code == "queue_full" {
           // Full for now, not refused: it stays next and is tried again.
           offline = true
+          self.queue.setOrigin(next.id) { $0.uploadAttempted = false }
         } catch let refused as HubQueueRefused {
-          self.queue.setOrigin(next.id) { $0.error = refused.displayMessage }
+          self.queue.setOrigin(next.id) { $0.error = refused.displayMessage; $0.uploadAttempted = false }
         } catch {
           offline = true
+          if HubUpload.neverSent(error) { self.queue.setOrigin(next.id) { $0.uploadAttempted = false } }
           // Not stopped: main was not reached. It is tried again.
           if next.origin?.sendNext == true { self.queue.setSendNowOutcome(next.id, .unreachable) }
         }

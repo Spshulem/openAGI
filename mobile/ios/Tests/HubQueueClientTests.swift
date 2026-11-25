@@ -78,8 +78,9 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
         if path == "/conversations/supervisor/messages" { return respond(200, ["messages": [], "queue": Self.queueJSON()]) }
         if path == "/conversations/supervisor/queue", method == "POST" {
             if Self.failNextEnqueue {
+                // Never reached the hub (no connection): nothing was taken.
                 Self.failNextEnqueue = false
-                client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
                 return
             }
             if Self.fullNextEnqueue {
@@ -335,6 +336,24 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(FakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(item.requestID)") })
         await chat.refresh()
         XCTAssertTrue(chat.queuedSubmissions.isEmpty, "never comes back, and never runs on the hub")
+    }
+
+    @MainActor
+    func testAMessageWhoseUploadGotNoAnswerOpensForEditOnlyOnceTheHubHasConfirmedIt() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-10", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.dropNextEnqueueAnswer = true
+        chat.draft = "taken, answer lost, then edited"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the hub to take it") { FakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost, then edited" } }
+        try await Task.sleep(for: .milliseconds(50))
+        let item = try XCTUnwrap(chat.queuedSubmissions.first)
+        XCTAssertFalse(chat.beginEditingQueued(id: item.id), "the hub may already have it without a hold: no local-only edit")
+        // That Edit tap asked again; the hub's answer confirms it has it.
+        try await waitFor("the confirmation") { chat.queuedSubmissions.first?.origin?.pendingUpload == false }
+        XCTAssertTrue(chat.beginEditingQueued(id: item.id))
+        try await waitFor("the hub hold") { FakeHubProtocol.snapshot().first { $0.requestId == item.requestID }?.heldBy == "iPhone" }
+        XCTAssertEqual(FakeHubProtocol.snapshot().filter { $0.requestId == item.requestID }.count, 1)
     }
 
     @MainActor

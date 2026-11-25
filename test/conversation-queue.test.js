@@ -445,6 +445,31 @@ test("a phone unpaired while its dispatched message waits behind a turn without 
   h.nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
 });
 
+test("a save that fails when a message is dispatched never strands the queue; the save is retried", async (t) => {
+  const { ConversationQueue } = await import("../src/conversation-queue.js");
+  const { LiveTurns } = await import("../src/message-turns.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-queue-savefail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ran = [];
+  const queue = new ConversationQueue({ dir, liveTurns: new LiveTurns(), saveRetryMs: 20,
+    startTurn: async (item) => { ran.push(item.text); return { reply: `Ack: ${item.text}` }; } });
+  t.after(() => queue.close());
+  // The enqueue itself is saved; the save made when it is dispatched fails once.
+  const persist = queue.persist.bind(queue);
+  let calls = 0;
+  queue.persist = (sessionId) => { calls += 1; if (calls === 2) throw new Error("disk full"); return persist(sessionId); };
+  const message = (requestId, text) => ({ sessionId: SESSION, requestId, thread: "supervisor", text, body: { text }, digest: text, source: { key: "phone", device: "phone" } });
+  const first = queue.submit(message("ios-savefail-1", "first"));
+  await first.turn.promise;
+  const second = queue.submit(message("ios-savefail-2", "second"));
+  await second.turn.promise;
+  assert.deepEqual(ran, ["first", "second"], "the dispatched message ran, and the next one was not blocked behind it");
+  await until(() => {
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".json"))), "utf8"));
+    return saved.items.length === 0 && saved.revision === queue.session(SESSION).revision;
+  });
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
 
 test("Send anyway from the Mac stops the iPhone's reply midstream and goes next; pending messages keep their order", async (t) => {

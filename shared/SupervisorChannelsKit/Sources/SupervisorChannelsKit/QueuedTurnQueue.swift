@@ -97,6 +97,23 @@ public enum QueuedSendNowState: Equatable, Sendable {
 /// Where a queued message lives when the hub keeps the queue (see
 /// HubQueueSnapshot): who sent it, whether this device did, who is editing
 /// it, and the revision an edit must name.
+public enum HubUpload {
+    /// The request could not have reached the hub (no connection, host not
+    /// found or not reachable): the hub cannot have the message. Any other
+    /// failure (a timeout, a dropped connection) may have come after the hub
+    /// took it, so the message is treated as possibly accepted.
+    public static func neverSent(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .internationalRoamingOff, .dataNotAllowed, .callIsActive:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 public struct QueuedOrigin: Equatable, Sendable {
     public var sourceName: String?
     public var mine: Bool
