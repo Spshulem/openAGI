@@ -282,3 +282,70 @@ test("a five-option decision with long tradeoffs keeps every option, or is defer
     assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: NOW }).deltas.length, 1, "deferred, not marked surfaced");
   }
 });
+
+// Live 2026-11-25: the hub's serialized agent review outlasted the node's
+// request, the node wrote its own copy of the check-in and re-posted it on
+// later ticks. A check-in the hub did not confirm is never written locally.
+test("on a paired node, a check-in the hub did not confirm is never written to the node's own chat", async (t) => {
+  const dir = tmp(t);
+  writeNodeConfig({ remote: "http://100.64.0.9:43210", token: null, nodeToken: "n", ownerProxyToken: "p", nodeEnrollmentConfirmed: true }, dir);
+  let nowMs = NOW;
+  let hub = "timeout";
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({
+    dataDir: dir, runtime,
+    config: { enabled: true, mode: "auto", proactiveSupervisorChat: true },
+    deps: {
+      now: () => nowMs,
+      supervisorChatFetch: async () => {
+        if (hub === "timeout") throw Object.assign(new Error("aborted"), { name: "AbortError" });
+        if (hub === "down") return { ok: false, status: 502 };
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+    }
+  });
+  sup.store.upsertQuestion({ dedupeKey: "ask:hub2", kind: "agent-ask", threadKey: "paseo:s.h2", title: "Publish the release notes?", options: ["publish", "hold"],
+    contextSnapshot: { threadTitle: "Release notes", recentMessages: [{ role: "user", text: "Draft the v0.0.85 release notes for the blog" }, { role: "assistant", text: "Notes drafted and reviewed. Publishing needs your approval. Publish them, or hold?" }] } });
+  for (const state of ["timeout", "down"]) {
+    hub = state;
+    const res = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+    assert.equal(res.posted, false, state);
+    assert.equal(res.reason, "hub-unconfirmed", state);
+    assert.equal(msgs.length, 0, `no node-only copy when the hub is ${state}`);
+    assert.equal(sup.store.lastProactiveChatAt(), null);
+    nowMs += 3 * 3_600_000;
+  }
+  hub = "up";
+  const ok = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(ok.deliveredRemote, true);
+  assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: nowMs }).deltas.length, 0, "surfaced once the hub confirms");
+});
+
+// Live 2026-11-25: an agent's context block said "Decision: Not set by me …
+// Options: No options were offered … Recommendation: None was made", and the
+// card went out as a decision. A stated absence is not a decision.
+test("an agent stating there is no decision never produces a verified decision", async () => {
+  const { parseAgentSuppliedContext, buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const block = [
+    "Work done. DECISION CONTEXT",
+    "Goal: Fix device fallback when a chosen mic disconnects.",
+    "Assigned: Prepare a separate, reviewable fix from current main.",
+    "Verified: Unit tests pass; the build worker is out of disk.",
+    "Blocked: The shared build worker needs disk space freed by its owner.",
+    "Decision: Not set by me. My last reply asked no explicit question.",
+    "Options:",
+    "- No options were offered in my last reply.",
+    "Recommendation: None was made in my last reply."
+  ].join("\n");
+  const parsed = parseAgentSuppliedContext(block);
+  assert.equal(parsed.decision, null);
+  assert.deepEqual(parsed.options, []);
+  assert.equal(parsed.recommendation, null);
+  assert.match(parsed.blocked, /disk space/);
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.r", title: "Needs your decision", options: ["continue", "open thread"] },
+    recentMessages: [{ role: "user", text: "Fix the device fallback in the recorder" }, { role: "assistant", text: block }]
+  });
+  assert.ok(ctx.missing.includes("decision"), "no decision to verify");
+  assert.doesNotMatch(String(ctx.decision ?? ""), /not set|no options/i);
+});
