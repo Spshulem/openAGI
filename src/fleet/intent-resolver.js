@@ -11,6 +11,14 @@ import { requiredChecksFor } from "./sources/github.js";
 import { githubThrottle, throttledGh } from "./github-throttle.js";
 
 const REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+// GitHub works out mergeability lazily: right after anything lands on a PR's
+// base (another merge), mergeable / mergeStateStatus read UNKNOWN for a few
+// seconds. The preflight reads it again this many times, waiting between
+// reads, before calling the outcome unknown. Reads only; nothing is merged
+// on a state the preflight has not seen.
+const MERGEABILITY_REREAD_DELAYS_MS = [2_000, 4_000];
+const PR_VIEW_FIELDS = "state,isDraft,mergeStateStatus,mergeable,reviewDecision,headRefOid,statusCheckRollup,url";
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const FAILED_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
 const FAILED_STATES = new Set(["FAILURE", "ERROR"]);
 const PENDING_STATUSES = new Set(["IN_PROGRESS", "QUEUED", "WAITING", "PENDING", "REQUESTED"]);
@@ -92,7 +100,9 @@ export async function executeSafePrMerge({
   config = null,
   ghBin = "gh",
   run: rawRun = runCommand,
-  throttle = githubThrottle
+  throttle = githubThrottle,
+  sleep = defaultSleep,
+  rereadDelaysMs = MERGEABILITY_REREAD_DELAYS_MS
 } = {}) {
   const parsed = parsePrRef(prRef);
   if (!parsed || !REPO_PATTERN.test(parsed.repo) || !(parsed.number > 0)) {
@@ -106,30 +116,39 @@ export async function executeSafePrMerge({
   const held = throttle.blocking({ background: false });
   if (held) return rateLimitedHalt(prRef, held, { step: "before" });
 
-  const viewRes = await run(
-    ghBin,
-    [
-      "pr", "view", String(parsed.number),
-      "--repo", parsed.repo,
-      "--json", "state,isDraft,mergeStateStatus,mergeable,reviewDecision,headRefOid,statusCheckRollup,url"
-    ],
-    { timeoutMs: 25_000 }
-  );
+  // One live read of the PR: { view } or { halt }.
+  const readPr = async () => {
+    const viewRes = await run(ghBin, ["pr", "view", String(parsed.number), "--repo", parsed.repo, "--json", PR_VIEW_FIELDS], { timeoutMs: 25_000 });
+    if (viewRes.throttled) return { halt: rateLimitedHalt(prRef, viewRes.cooldown ?? throttle.blocking({ background: false }), { step: "preflight" }) };
+    if (viewRes.code !== 0 || !viewRes.stdout) {
+      return { halt: {
+        status: "halted",
+        reason: "github_unreachable",
+        haltClass: "unknown",
+        mergeConfirmed: false,
+        detail: clampText(redactSecrets(viewRes.stderr || viewRes.error || "Could not verify PR status on GitHub before merging."), 220)
+      } };
+    }
+    try {
+      return { view: JSON.parse(viewRes.stdout) };
+    } catch {
+      return { halt: { status: "halted", reason: "github_parse_error", haltClass: "unknown", mergeConfirmed: false, detail: "Could not parse GitHub PR status." } };
+    }
+  };
+  const pendingMergeability = (v) => String(v?.state ?? "").toUpperCase() === "OPEN"
+    && (String(v?.mergeable ?? "").toUpperCase() === "UNKNOWN" || String(v?.mergeStateStatus ?? "").toUpperCase() === "UNKNOWN");
 
-  if (viewRes.throttled) return rateLimitedHalt(prRef, viewRes.cooldown ?? throttle.blocking({ background: false }), { step: "preflight" });
-  if (viewRes.code !== 0 || !viewRes.stdout) {
-    return {
-      status: "halted",
-      reason: "github_unreachable",
-      detail: clampText(redactSecrets(viewRes.stderr || viewRes.error || "Could not verify PR status on GitHub before merging."), 220)
-    };
-  }
-
-  let view;
-  try {
-    view = JSON.parse(viewRes.stdout);
-  } catch {
-    return { status: "halted", reason: "github_parse_error", detail: "Could not parse GitHub PR status." };
+  let read = await readPr();
+  if (read.halt) return read.halt;
+  let view = read.view;
+  let reads = 1;
+  for (const delay of rereadDelaysMs) {
+    if (!pendingMergeability(view)) break;
+    await sleep(delay);
+    read = await readPr();
+    if (read.halt) return read.halt;
+    view = read.view;
+    reads += 1;
   }
 
   const state = String(view.state ?? "").toUpperCase();
@@ -234,12 +253,37 @@ export async function executeSafePrMerge({
     && hasNonEmptyGreenRollup
     && configuredGatesGreen;
 
-  if ((mergeState === "BLOCKED" && !ownerOverrideEligible) || mergeState === "UNSTABLE" || mergeable === "UNKNOWN") {
+  // Three different stops, said differently: GitHub has not decided yet
+  // (transient), GitHub's rules confirm a block (policy), or checks GitHub
+  // counts are not all passing. Each fails closed: nothing is merged.
+  if (mergeable === "UNKNOWN" || mergeState === "UNKNOWN") {
+    return {
+      status: "halted",
+      reason: "mergeability_unknown",
+      haltClass: "transient",
+      mergeConfirmed: false,
+      prRef,
+      detail: `Not merged: ${prRef}. GitHub had not finished working out whether it can merge (still UNKNOWN after ${reads} live reads); this usually happens for a few seconds after another merge into its base branch. No branch rule or check failure was reported, and nothing was sent to merge. Tap Merge again; it re-checks live state first.`
+    };
+  }
+  if (mergeState === "BLOCKED" && !ownerOverrideEligible) {
     return {
       status: "halted",
       reason: "blocked",
+      haltClass: "policy",
+      mergeConfirmed: false,
       prRef,
-      detail: `${prRef} is blocked by branch protection, unposted checks, or required reviews (${mergeState || mergeable}). Merge halted safely.`
+      detail: `Not merged: GitHub reports ${prRef} as BLOCKED by its branch rules (review decision: ${reviewDecision || "none reported"}; mergeable: ${mergeable || "not reported"}). Merging needs what those rules require, such as an approving review or required checks.`
+    };
+  }
+  if (mergeState === "UNSTABLE") {
+    return {
+      status: "halted",
+      reason: "checks_unstable",
+      haltClass: "policy",
+      mergeConfirmed: false,
+      prRef,
+      detail: `Not merged: GitHub reports ${prRef} as UNSTABLE (some commit status it tracks is not passing). Merge halted safely.`
     };
   }
 
@@ -257,6 +301,44 @@ export async function executeSafePrMerge({
       headRefOid: liveSha || null,
       url: view.url ?? null,
       detail: `Merged ${prRef} via squash.`
+    };
+  }
+  // gh reported a failure: GitHub's own state says whether it merged anyway
+  // (a lost reply) before anything else is tried.
+  const after = await readPr();
+  // That read itself failed (unreachable, unparseable, or throttled): the
+  // merge may or may not have happened, so this is never a confirmed refusal,
+  // and nothing more (no admin retry) is tried on top of an unknown outcome.
+  if (after.halt) {
+    return {
+      status: "halted",
+      reason: "merge_unconfirmed",
+      haltClass: "unknown",
+      mergeConfirmed: false,
+      prRef,
+      detail: clampText(`gh reported the merge as failed, and GitHub could not be read back to confirm it (${redactSecrets(after.halt.detail ?? after.halt.reason ?? "no detail")}). ${prRef} may have merged: check it on GitHub before trying again.`, 320)
+    };
+  }
+  if (after.view && String(after.view.state ?? "").toUpperCase() === "MERGED") {
+    const mergedHead = String(after.view.headRefOid ?? "").trim();
+    if (!liveSha || !mergedHead || mergedHead === liveSha) {
+      return {
+        status: "merged",
+        prRef,
+        headRefOid: mergedHead || liveSha || null,
+        url: after.view.url ?? view.url ?? null,
+        reconciled: true,
+        detail: `Merged ${prRef} (GitHub shows it merged at the reviewed head although gh reported an error).`
+      };
+    }
+    return {
+      status: "halted",
+      reason: "head_changed",
+      haltClass: "unknown",
+      mergeConfirmed: false,
+      prRef,
+      headRefOid: mergedHead,
+      detail: `${prRef} shows as merged on GitHub, but at ${mergedHead.slice(0, 7)}, not the reviewed head ${liveSha.slice(0, 7)}. Check it on GitHub.`
     };
   }
 
@@ -290,6 +372,8 @@ export async function executeSafePrMerge({
     return {
       status: "halted",
       reason: "gh_merge_failed",
+      haltClass: "refused",
+      mergeConfirmed: false,
       prRef,
       detail: clampText(redactSecrets(adminRes.stderr || adminRes.stdout || mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection or admin permissions)."), 220)
     };
@@ -298,6 +382,8 @@ export async function executeSafePrMerge({
   return {
     status: "halted",
     reason: "gh_merge_failed",
+    haltClass: "refused",
+    mergeConfirmed: false,
     prRef,
     detail: clampText(redactSecrets(mergeRes.stderr || mergeRes.stdout || "GitHub refused the merge (check branch protection reviews)."), 220)
   };
