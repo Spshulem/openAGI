@@ -2600,24 +2600,7 @@ struct SupervisorWorkspaceView: View {
       }
 
       if !supervisor.queuedMessages.isEmpty {
-        queuedMessagesTray(
-          items: supervisor.queuedMessages,
-          onEdit: { id in
-            guard let popped = supervisor.popQueuedForEdit(id: id) else { return }
-            if composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-              composerText = popped.text
-            } else {
-              composerText += "\n" + popped.text
-            }
-            if !popped.attachments.isEmpty {
-              appendAttachments(popped.attachments, to: &composerImages)
-            }
-            composerFocused = true
-          },
-          onRemove: { id in
-            supervisor.removeQueued(id: id)
-          }
-        )
+        SupervisorQueueTray(supervisor: supervisor)
       }
 
       if !composerImages.isEmpty {

@@ -17,6 +17,11 @@ let package = Package(
         .target(
             name: "SupervisorChannelsKit",
             path: "Sources/SupervisorChannelsKit"
+        ),
+        .testTarget(
+            name: "SupervisorChannelsKitTests",
+            dependencies: ["SupervisorChannelsKit"],
+            path: "Tests/SupervisorChannelsKitTests"
         )
     ]
 )

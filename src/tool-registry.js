@@ -1,3 +1,4 @@
+import { toolSignal } from "./message-turns.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { describeSchedule, parseScheduleDays, scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
@@ -307,8 +308,17 @@ export class ToolRegistry {
   }
 
   async runHandler(tool, args, context) {
+    // Checked again here, at the last moment: an owner check or approval
+    // step awaited since invoke() looked, and a stop may have landed then.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     try {
-      const result = await tool.handler(args, context);
+      // `signal` stays the turn's own signal, so a skill or subagent this
+      // tool runs stops its nested model calls and tools on an interrupt.
+      // `actionSignal` is for cancelling work already in progress (a
+      // computer action): an owner's interrupt never reaches it, so that
+      // action finishes; other aborts still do (message-turns.js toolSignal).
+      const handlerContext = context?.signal ? { ...context, actionSignal: toolSignal(context.signal) } : context;
+      const result = await tool.handler(args, handlerContext);
       // Tool results are data: they can only ever taint the turn, never
       // write any other part of the server-built context.
       taintTurn(tool, context);
@@ -407,6 +417,9 @@ export class ToolRegistry {
         approvedBy = `owner:${owner.via}:decisions`;
       }
     }
+    // A stop that landed while the decisions check was out: nothing is
+    // claimed, raised or retired for a turn that will not run the tool.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({

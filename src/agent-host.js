@@ -3,6 +3,7 @@ import { InMemoryAgentStore } from "./agent-store.js";
 import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
 import { detectTaskInChat } from "./task-store.js";
+import { isOwnerInterrupt, ownerInterruptReason, STOPPED_TEXT } from "./message-turns.js";
 import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZE_RE } from "./signal-axes.js";
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
@@ -51,25 +52,45 @@ export class AgentHost {
     const queueKey = String(
       input?.sessionId ?? `${input?.channel ?? "local"}:${input?.from ?? "user"}:${input?.agentId ?? "main"}`
     );
-    return this.runInSession(queueKey, () => this.handleMessageNow(input, options));
+    return this.runInSession(queueKey, () => this.handleMessageNow(input, options), options.signal);
   }
 
   // Run work in a session's turn order. Transports that append a complete
   // exchange without a model turn (e.g. a Pebble save confirmation) use this
   // so it never interleaves with a turn already running in that chat.
-  async runInSession(sessionId, work) {
+  //
+  // `signal`: a turn interrupted while it still waits behind another one
+  // ends at once (its work then throws before doing anything when its slot
+  // comes); one already running is left to stop itself.
+  async runInSession(sessionId, work, signal = null) {
     const queueKey = String(sessionId);
     const prior = this.sessionTurnTails.get(queueKey) ?? Promise.resolve();
-    const run = prior.catch(() => {}).then(() => work());
+    let started = false;
+    const run = prior.catch(() => {}).then(() => {
+      started = true;
+      return work();
+    });
     this.sessionTurnTails.set(queueKey, run);
-    try {
-      return await run;
-    } finally {
+    // The tail is released when the turn itself settles, never when a caller
+    // stops waiting for it: the next turn must not overlap this one.
+    run.catch(() => {}).finally(() => {
       if (this.sessionTurnTails.get(queueKey) === run) this.sessionTurnTails.delete(queueKey);
-    }
+    });
+    // A turn interrupted while it still waits behind another one ends now.
+    // When its slot comes it throws before doing anything (handleMessageNow
+    // checks the signal first), so it never runs.
+    if (!signal || typeof signal.addEventListener !== "function" || signal.aborted) return run;
+    return await new Promise((resolve, reject) => {
+      // A turn already running is left to stop itself at its next check, so
+      // its stopped record is written before the caller hears the outcome.
+      const onAbort = () => { if (!started) reject(signal.reason ?? new Error("Request cancelled.")); };
+      signal.addEventListener("abort", onAbort, { once: true });
+      run.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }
 
   async handleMessageNow(input, options = {}) {
+    if (isOwnerInterrupt(options.signal)) this.recordStoppedBeforeStart(input);
     options.signal?.throwIfAborted();
     const reportProgress = progressReporter(options.onProgress);
     const reportTextDelta = textDeltaReporter(options.onTextDelta);
@@ -441,13 +462,13 @@ export class AgentHost {
         const spoken = matchConfirmation(text);
         if (spoken) {
           const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
-          confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+          confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal, signal: options.signal });
         }
       } else {
         const spokenBatch = matchConfirmations(text);
         if (spokenBatch) {
           const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
-          confirmation = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+          confirmation = await this.confirmSpokenBatch(spokenBatch, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal, signal: options.signal });
         }
       }
       if (confirmation?.untrusted) turnState.untrusted = true;
@@ -694,7 +715,10 @@ export class AgentHost {
       output
     };
     } catch (error) {
-      const failure = normalizeTurnFailure(error);
+      // The owner stopped this turn (message-turns.js interruptTurn). Judge
+      // that by the signal, not by whatever a provider threw while aborting.
+      const interrupted = isOwnerInterrupt(options.signal);
+      const failure = interrupted ? ownerInterruptReason() : normalizeTurnFailure(error);
       failure.openagiSessionId = sessionId;
       failure.openagiRequestId = requestId || null;
       const publicFailure = classifyAgentFailure(failure);
@@ -709,7 +733,7 @@ export class AgentHost {
         try {
           failedSession = this.store.appendMessage(sessionId, {
             role: "assistant",
-            content: `I couldn't complete that request: ${publicFailure.message}`,
+            content: interrupted ? publicFailure.message : `I couldn't complete that request: ${publicFailure.message}`,
             agentId,
             channel,
             from: "openagi",
@@ -736,10 +760,37 @@ export class AgentHost {
     }
   }
 
+  // The owner stopped this turn while it waited behind another one. Its
+  // slot has come, so the thread is in order: store the question and the
+  // stop, so a resend after a restart replays the stop instead of running a
+  // message the owner replaced. Never runs anything.
+  recordStoppedBeforeStart(input) {
+    const requestId = boundedText(input?.metadata?.requestId, 200);
+    if (input?.ephemeral === true || !requestId || typeof input?.sessionId !== "string") return;
+    const text = String(input.text ?? input.message ?? "").trim();
+    if (!text) return;
+    try {
+      const channel = input.channel ?? "local";
+      const from = input.from ?? "user";
+      const agentId = input.agentId ?? "main";
+      const sessionId = this.store.sessionKey({ channel, from, agentId, sessionId: input.sessionId });
+      const keep = {};
+      for (const key of ["thread", "sourceNodeId", "sourceName"]) {
+        const value = boundedText(input.metadata?.[key], 500);
+        if (value) keep[key] = value;
+      }
+      this.store.appendMessage(sessionId, { role: "user", content: text, agentId, channel, from, metadata: { ...keep, requestId } });
+      this.store.appendMessage(sessionId, {
+        role: "assistant", content: STOPPED_TEXT, agentId, channel, from: "openagi",
+        metadata: { status: "failed", code: "stopped", requestId }
+      });
+    } catch { /* the in-memory stop still answers repeats until restart */ }
+  }
+
   // Runs or denies the pending card the owner's spoken confirm names and
   // returns the receipt the model reports. Null when nothing matched (the
   // model then reads "yes" in context, as before).
-  async confirmSpoken(spoken, { sessionId, sinceIso, principal }) {
+  async confirmSpoken(spoken, { sessionId, sinceIso, principal, signal = null }) {
     const store = this.runtime.pendingActions;
     if (!store?.findByCode || !store?.chatCandidates) return null;
     let action = null;
@@ -762,16 +813,23 @@ export class AgentHost {
     // raised in another chat resumes that chat (a computer-use lease is bound
     // to it), as a dashboard approval does.
     const sameChat = action.context?.sessionId === sessionId;
+    // The owner stopped this turn (Send Now) before this approval started:
+    // run nothing and leave the card pending, so it can still be approved.
+    // An approval whose tool has started finishes; the executor checks the
+    // signal again after its (awaited) validation, before claiming it.
+    const stoppedFirst = { ...receipt, status: "not run: you stopped this reply first; the action is still waiting for approval" };
+    if (signal?.aborted) return stoppedFirst;
     const queueContinuation = typeof this.runtime.queueApprovalContinuation === "function" ? this.runtime.queueApprovalContinuation : null;
     let executed;
     try {
-      const options = { decidedBy, ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
+      const options = { decidedBy, ...(signal ? { signal } : {}), ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
       executed = typeof this.runtime.executeApprovedAction === "function"
         ? await this.runtime.executeApprovedAction(action.id, options)
         : await executeApprovedAction(this.runtime, action.id, options);
     } catch (error) {
       return { ...receipt, status: "failed", error: String(error?.message ?? error).slice(0, 300) };
     }
+    if (executed?.cancelled) return stoppedFirst;
     if (sameChat && executed?.invokeResult?.ok) store.continuationNotNeeded?.(action.id);
     const invoked = executed?.invokeResult;
     if (!invoked) {
@@ -793,13 +851,13 @@ export class AgentHost {
     };
   }
 
-  async confirmSpokenBatch(spokenBatch, { sessionId, sinceIso, principal }) {
+  async confirmSpokenBatch(spokenBatch, { sessionId, sinceIso, principal, signal = null }) {
     const store = this.runtime.pendingActions;
     if (!store?.findByCode || !store?.chatCandidates) return null;
     if (!spokenBatch.all && spokenBatch.codes.length <= 1) {
       return this.confirmSpoken(
         { decision: spokenBatch.decision, code: spokenBatch.codes[0] ?? null },
-        { sessionId, sinceIso, principal }
+        { sessionId, sinceIso, principal, signal }
       );
     }
     let codes = spokenBatch.codes;
@@ -815,14 +873,16 @@ export class AgentHost {
       codes = candidates.map((c) => c.confirmCode).filter(Boolean);
       if (codes.length === 0) return null;
       if (codes.length === 1) {
-        return this.confirmSpoken({ decision: spokenBatch.decision, code: codes[0] }, { sessionId, sinceIso, principal });
+        return this.confirmSpoken({ decision: spokenBatch.decision, code: codes[0] }, { sessionId, sinceIso, principal, signal });
       }
     }
     const actions = [];
     let untrusted = false;
     let instruction = null;
     for (const code of codes) {
-      const one = await this.confirmSpoken({ decision: spokenBatch.decision, code }, { sessionId, sinceIso, principal });
+      // Checked before each one: an interrupt lets the approval running now
+      // finish and starts none of the rest.
+      const one = await this.confirmSpoken({ decision: spokenBatch.decision, code }, { sessionId, sinceIso, principal, signal });
       if (!one) continue;
       if (one.untrusted) untrusted = true;
       if (!instruction && one.instruction) instruction = one.instruction;

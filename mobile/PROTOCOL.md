@@ -245,6 +245,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| POST | `/conversations/agent/interrupt` | stop the running reply so a queued message goes first, §3.1 |
+| POST | `/conversations/supervisor/interrupt` | same, supervisor thread, §3.1 |
 | GET | `/lifelog/moments` | read-only G2 lifelog moments, §3.2 |
 
 `:id` above means a task/action id as minted by `createId()`:
@@ -398,6 +400,45 @@ names each turn:
   also lists the thread's turns still running:
   `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
   A turn in `inFlight`, or whose reply is not there yet, is still working.
+
+#### Interrupting a reply (queued message "Send now")
+
+While a reply runs, a phone queues what the owner types and sends it, one at
+a time, after the reply ends. To send a queued message now instead, the
+client asks main to stop the running reply, then sends the message as the
+next turn in the same thread. No provider supports adding a message to a turn
+already running, so this is stop-then-send, never in-turn steering.
+
+`POST /conversations/:thread/interrupt` with
+`{"requestId": "<the running turn's id>", "conversationId"?: "…"}` (no other
+fields; `400` otherwise). Paired phones, owner proxies and the owner; not a
+G2 or other node. Main aborts that turn's signal: it stops before its next
+model call or tool call. A tool already running is not cancelled and nothing
+is rolled back. Main waits up to about 4 s for the turn to end, then answers
+`200` with one of:
+
+- `{"status": "interrupted"}`: the turn has stopped. Its stream ends with a
+  `failure` frame, code `stopped` (not `interrupted`, which still means
+  "main restarted"), and main stores the reply record "Stopped so your next
+  message could go first. Anything already under way may have finished;
+  nothing was undone." (`"status": "failed"`, code `stopped`).
+- `{"status": "stopping", "tool"?: "send_email"}`: asked to stop; it ends
+  after the action running now. The stream's `failure` frame follows.
+- `{"status": "finished", "outcome": "complete" | "failed" | "interrupted"}`:
+  it ended on its own first. Nothing was interrupted.
+- `{"status": "not_found"}`: main has no turn by that id in this thread (it
+  never arrived, or main restarted before storing it).
+
+Repeating the request (a double tap, a resend after a dropped response) is
+safe and reports the same state. A message sent after any answer runs after
+the old turn has fully ended: main runs one turn per thread at a time, and a
+turn still waiting behind another one is dropped without running. A main
+older than this route answers a phone's request with `401` (a heartbeat then
+succeeds) or the owner's with `404`: treat both as "this main can't
+interrupt", and say so; never report the reply as stopped.
+
+The owner's Mac sends `requestId` on its own `POST /message` with `thread`
+too, so its Supervisor chat can name and interrupt its turns the same way.
 
 A G2 joins the same threads through `POST /nodes/g2/experience`: op
 `submit` accepts `"thread"` (beside or inside `question`; no

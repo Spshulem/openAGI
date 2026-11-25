@@ -11,6 +11,7 @@ const CONVERSATION_ID = /^(?:main|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-
 const DEVICE_SESSION = /^devices:(agent|supervisor):(main|[0-9a-f-]{36})$/;
 const WEB_SESSION = /^local:browser(?:-[^:\x00]{1,180})?:main$/;
 const HISTORY_PATH = /^\/conversations\/(agent|supervisor)\/messages$/;
+const INTERRUPT_PATH = /^\/conversations\/(agent|supervisor)\/interrupt$/;
 const MESSAGE_ID = /^[\w-]{1,200}$/;
 
 // Same { code, status } shape as G2ChannelError so both transports can map it.
@@ -33,6 +34,7 @@ export function sharedSessionId(thread, conversationId = "main") {
 export function sharedThreadForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[1] ?? null; }
 export function sharedConversationForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[2] ?? null; }
 export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+export function sharedInterruptThread(pathname) { return INTERRUPT_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
 
 // Paired owner phones can read human-visible web chat, but never address its
 // session on /message. Continuing makes a separate shared-device session;
