@@ -652,7 +652,10 @@ struct ChatConversationView: View {
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let composerAccessory { composerAccessory(composerFocused) }
-            if supportsVoice {
+            // Idle voice lives in the composer (no extra height on small
+            // screens); the status row with Stop appears only while voice runs
+            // or has something to say, such as an error or setup note.
+            if supportsVoice, showsVoiceBar {
                 SupervisorVoiceBar(status: voice?.status ?? VoiceStatus(), note: voiceNote,
                                    start: startVoice, stop: { stopVoice() })
             }
@@ -689,6 +692,9 @@ struct ChatConversationView: View {
             composerField
             dictationButton.buttonStyle(.plain).foregroundStyle(dictation.isListening ? Theme.alert : Theme.muted)
                 .frame(width: 44, height: 44)
+            if supportsVoice && !showsVoiceBar {
+                voiceStartButton.buttonStyle(.plain).foregroundStyle(Theme.live).frame(width: 44, height: 44)
+            }
             sendButton.buttonStyle(.plain).frame(width: 44, height: 44)
         }
         .padding(.horizontal, 4).padding(.vertical, 2)
@@ -746,6 +752,16 @@ struct ChatConversationView: View {
             voice = session
             session.handsFree(true)
         }
+    }
+
+    private var voiceActive: Bool { (voice?.status.phase ?? .idle) != .idle || pendingVoiceStart != nil }
+    private var showsVoiceBar: Bool { voiceActive || voice?.status.message != nil || voiceNote != nil }
+
+    private var voiceStartButton: some View {
+        Button(action: startVoice) { composerIcon("waveform") }
+            .accessibilityLabel("Talk with Supervisor")
+            .accessibilityHint("Starts a spoken conversation. Your words and replies are saved in this chat.")
+            .accessibilityIdentifier("supervisor-voice-start")
     }
 
     private var dictationButton: some View {

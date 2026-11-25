@@ -17,12 +17,15 @@ struct VoiceButton: View {
         .controlSize(.small)
         .disabled(voice.phase == .connecting)
         .help("Talk to the hub Supervisor. Hold Option-Shift-Space to talk, then release to send.")
+        .accessibilityLabel(voice.micHeld ? "Send to Supervisor" : "Talk with Supervisor")
+        .accessibilityValue(status)
         Text(status).font(.system(size: 10)).foregroundStyle(.secondary)
         Spacer(minLength: 0)
         if voice.active {
           Button("End") { voice.stop() }
             .buttonStyle(.borderless).font(.system(size: 10))
             .help("End voice and stop the microphone")
+            .accessibilityLabel("Stop voice")
         }
       }
       if !voice.transcript.isEmpty {
@@ -33,6 +36,9 @@ struct VoiceButton: View {
       }
       if let message = voice.error ?? voice.notice {
         Text(message).font(.system(size: 10)).foregroundStyle(voice.error == nil ? Color.secondary : .red).lineLimit(4)
+      }
+      if voice.error != nil {
+        Text(VoiceSession.textFallbackNote).font(.system(size: 10)).foregroundStyle(.secondary)
       }
       if !voice.transcript.isEmpty || !voice.reply.isEmpty {
         Text("Voice uses the hub's shared Supervisor thread.")

@@ -113,12 +113,17 @@ struct SupervisorSection: View {
       .buttonStyle(.plain)
       .disabled(voice.phase == .connecting)
       .help("Talk to Supervisor (⌥⇧Space)")
+      .accessibilityLabel(voice.micHeld ? "Send to Supervisor" : "Talk with Supervisor")
+      .accessibilityValue(voice.active ? voiceStatusText : "Microphone off")
+      .accessibilityHint("Your words and the spoken replies are saved in the Supervisor chat.")
 
       if voice.active {
         Button("End") { voice.stop() }
           .buttonStyle(.borderless)
           .font(.system(size: 10))
           .foregroundStyle(WorkspaceTheme.muted)
+          .accessibilityLabel("Stop voice")
+          .accessibilityHint("Turns the microphone off and ends the voice session.")
       }
 
       Button {
@@ -162,7 +167,13 @@ struct SupervisorSection: View {
           .foregroundStyle(voice.error == nil ? WorkspaceTheme.muted : WorkspaceTheme.alert)
           .lineLimit(4)
       }
+      if voice.error != nil {
+        Text(VoiceSession.textFallbackNote)
+          .font(.system(size: 10))
+          .foregroundStyle(WorkspaceTheme.muted)
+      }
     }
+    .accessibilityElement(children: .combine)
     .padding(8)
     .frame(maxWidth: .infinity, alignment: .leading)
     .background(WorkspaceTheme.surfaceFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))

@@ -43,8 +43,10 @@ struct VoiceConnection {
     switch parts.scheme?.lowercased() {
     case "https", "wss": parts.scheme = "wss"
     case "http", "ws":
-      guard ["localhost", "127.0.0.1", "::1"].contains(host) else {
-        throw VoiceFailure("Voice needs a secure HTTPS connection to the paired hub.")
+      // Loopback, or the hub's Tailscale address: WireGuard already encrypts
+      // that link, and the app reaches the same hub over it for everything else.
+      guard ["localhost", "127.0.0.1", "::1"].contains(host) || Self.isTailscale(host) else {
+        throw VoiceFailure("Voice needs a secure connection to the paired hub: HTTPS, or its Tailscale address.")
       }
       parts.scheme = "ws"
     default: throw VoiceFailure("Voice needs a secure HTTPS connection to the paired hub.")
@@ -55,6 +57,14 @@ struct VoiceConnection {
     guard let url = parts.url else { throw VoiceFailure("The paired hub URL is invalid.") }
     self.url = url
     self.token = token
+  }
+
+  /// A tailnet host: MagicDNS (`*.ts.net`) or Tailscale's 100.64.0.0/10 range.
+  static func isTailscale(_ host: String) -> Bool {
+    let name = host.lowercased()
+    if name.hasSuffix(".ts.net") { return true }
+    let octets = name.split(separator: ".").compactMap { UInt8($0) }
+    return octets.count == 4 && name.split(separator: ".").count == 4 && octets[0] == 100 && (64...127).contains(octets[1])
   }
 
   static func failureMessage(status: Int?) -> String {
@@ -133,6 +143,8 @@ extension URLSessionWebSocketTask: VoiceSocket {}
 @MainActor
 final class VoiceSession: ObservableObject {
   static let shared = VoiceSession()
+  /// Shown with any voice error: the conversation itself is unaffected.
+  static let textFallbackNote = "You can keep typing in the Supervisor chat; it's the same conversation."
   @Published private(set) var phase: VoicePTT.Phase = .idle
   @Published private(set) var transcript = ""
   @Published private(set) var reply = ""
