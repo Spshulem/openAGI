@@ -149,6 +149,7 @@ claim universal hardware support.
 - [Coding Agents](docs/setup/coding-supervisor.md) and [Fleet supervisor](docs/setup/fleet-supervisor.md)
 - [Computer Use readiness](docs/setup/computer-use-readiness.md) and [optional backend](docs/setup/open-computer-use.md)
 - [Mobile setup](mobile/README.md) and [mobile feature surface](mobile/FEATURES.md)
+- [Recover a paired Mac node](docs/setup/node-reconnect.md)
 - [Even G2](docs/setup/even-g2.md), [remote channels](docs/setup/remote-channels.md), and [integrations](docs/setup/partner-and-integrations.md)
 - [Architecture](docs/abi-architecture.md), [whitepaper](WHITEPAPER.md), and [release process](docs/RELEASE.md)
 

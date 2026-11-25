@@ -596,8 +596,8 @@ struct ChatConversationView: View {
                                     // A main that predates shared threads runs
                                     // phone chats under other session ids; keep
                                     // showing every recent approval there.
-                                    scopedToSession: conversation.historyStatus != .needsUpdate)
-            .filter { !hiddenApprovals.contains($0.id) }
+                                    scopedToSession: conversation.historyStatus != .needsUpdate,
+                                    excluding: hiddenApprovals)
     }
 
     private var chatHome: some View {

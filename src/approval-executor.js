@@ -23,10 +23,27 @@ export async function executeApprovedAction(runtime, id, { decidedBy = "user", c
   if (action.status !== "pending") return { status: 409, body: { error: `action already ${action.status}` }, action };
   // The context it was asked in must still hold: the same chat, still there,
   // and nothing the owner said since that makes it stale.
-  const stale = await runtime.tools?.approvalStillValid?.(action);
+  const verdict = typeof runtime.tools?.approvalVerdict === "function"
+    ? await runtime.tools.approvalVerdict(action)
+    : staleVerdict(await runtime.tools?.approvalStillValid?.(action));
+  const stale = verdict?.reason ?? null;
   if (stale) {
-    runtime.pendingActions.expire?.(id, stale);
-    return { status: 410, body: { error: stale }, action: runtime.pendingActions.get(id) ?? action };
+    // Re-raised only if this call retired it: a card denied or run on
+    // another surface meanwhile stays as it is.
+    // The owner's own words behind a chat card go with it to the fresh one,
+    // so approving it still carries the rest of a multi-step request.
+    const ownerIntent = runtime.pendingActions.ownerIntentFor?.(id) ?? null;
+    const expired = runtime.pendingActions.expire?.(id, stale) ?? null;
+    const reraised = verdict.reraise && expired ? reraiseStaleApproval(runtime, action, stale, ownerIntent) : null;
+    // Nothing ran: say so in words a model cannot read as "on its way".
+    const error = reraised
+      ? `${stale} Nothing was sent or started. A fresh approval is waiting${reraised.confirmCode ? ` (code ${reraised.confirmCode})` : ""}; approve it to send.`
+      : stale;
+    return {
+      status: 410,
+      body: { error, notRun: true, ...(reraised ? { reraised: { actionId: reraised.id, ...(reraised.confirmCode ? { code: reraised.confirmCode } : {}) } } : {}) },
+      action: runtime.pendingActions.get(id) ?? action
+    };
   }
   if (signal?.aborted) return { status: 409, body: { error: "stopped before it ran; still waiting for approval" }, action, cancelled: true };
   const claim = runtime.pendingActions.claimForExecution?.(id, { claimedBy });
@@ -101,4 +118,33 @@ function approvedInvocationWasAttempted(invokeResult) {
   const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
   if (["awaiting_confirmation", "awaiting_owner_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
   return !(result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true);
+}
+
+function staleVerdict(reason) {
+  return typeof reason === "string" && reason ? { reason, reraise: false } : null;
+}
+
+// A card retired because the owner said more in its target since (the tool's
+// check asked for a re-raise), raised again with the very same arguments, in
+// the same chat and mode, so the request waits for a fresh "yes" instead of
+// vanishing. Null when the store cannot raise one.
+function reraiseStaleApproval(runtime, action, reason, ownerIntent = null) {
+  if (typeof runtime.pendingActions?.enqueue !== "function") return null;
+  const tool = runtime.tools?.get?.(action?.toolName);
+  try {
+    return runtime.pendingActions.enqueue({
+      toolName: action.toolName,
+      args: action.args,
+      context: action.context,
+      summary: action.summary,
+      reason: `Asked again: ${String(reason ?? "").slice(0, 200)}`,
+      dedupeKey: action.dedupeKey,
+      ttlMs: tool?.approvalTtlMs ?? null,
+      mode: action.mode ?? "queue",
+      announce: action.mode !== "chat",
+      ...(ownerIntent ? { ownerIntent } : {})
+    });
+  } catch {
+    return null;
+  }
 }

@@ -231,6 +231,12 @@ test("only shared workspace routes forward, with their allowed methods", () => {
   }
   assert.equal(isMainDataRoute("DELETE", "/message"), false);
   assert.equal(isMainDataRoute("POST", "/brief/focus/dismiss"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/request"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/ack"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/approve"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests/not-a-request"), false);
 });
 
 

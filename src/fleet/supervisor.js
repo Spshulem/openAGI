@@ -7,6 +7,8 @@
 // effects; hosted-interface calls start() on listen and stop() on close.
 
 import path from "node:path";
+import fs from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { readThreadConversation, unavailableConversation } from "./conversation.js";
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
@@ -29,7 +31,9 @@ import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
-import { executeSafePrMerge } from "./intent-resolver.js";
+import { ADMIN_MERGE_WAIVER, executeAdminMerge, executeSafePrMerge, preflightAdminMerge } from "./intent-resolver.js";
+import { HANDOFF_RETRY_MS, HandoffQueue, handoffStaleReason } from "./handoff-queue.js";
+import { throttleFor } from "./github-throttle.js";
 import { applyPreferencePatch, classifyQuestionSlice, effectiveCheckinCooldownMs, isSuppressedByQuietCadence, isSuppressedFromProactiveChat, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { dedupeDecisionDeltas, isClosedOrContradictoryDecision, reviewProactiveUpdateWithAgent } from "./proactive-gate.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
@@ -38,7 +42,7 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
-import { failoverPaseoSessionProvider, titlesMatchForFailover } from "./paseo-delivery.js";
+import { failoverPaseoSessionProvider, paseoImagesHash, titlesMatchForFailover } from "./paseo-delivery.js";
 import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import { OwnerPrecedentStore } from "./precedent-memory.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -505,8 +509,40 @@ function askTimes(questions) {
 
 // The owner's last message in the chat: null when the last user turn is the
 // supervisor's own (it arrives as a user turn too) or none was read.
+// The chat's Paseo host was not reachable: retryable once it is back.
+const HOST_UNAVAILABLE = /Paseo host unavailable/i;
+
+// What a held or finished handoff reports to the caller.
+function handoffDelivery(entry) {
+  if (entry.status === "delivered") {
+    return { status: "sent", route: "paseo-send", reconciled: true, actionId: entry.deliveredActionId ?? null, handoffKey: entry.key,
+      detail: `already delivered for this approval at ${entry.deliveredAt ?? entry.updatedAt}; not sent again` };
+  }
+  if (entry.status === "queued") {
+    return { status: "queued", queued: true, route: "paseo-queue", handoffKey: entry.key,
+      detail: entry.detail || "Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created)." };
+  }
+  if (entry.status === "waiting") {
+    return { status: "queued", route: "paseo-send", handoffKey: entry.key,
+      detail: `${entry.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.` };
+  }
+  return { status: "blocked", route: "paseo-send", handoffKey: entry.key, ...(entry.status === "unconfirmed" ? { unconfirmed: true } : {}),
+    detail: `approved handoff ${entry.status}: ${entry.detail}` };
+}
+
 function ownerSpokeAt(thread) {
   return String(thread?.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX) ? null : (thread?.lastUserAt ?? null);
+}
+
+// Who wrote the turn at ownerSpokeAt, as this computer's reader knows it,
+// without sending the words: "owner" when it had the owner's own text for
+// that turn, "unattributed" when it had none (often the supervisor's own
+// turn, its text kept out of lastUserText). A remote approval check needs
+// it: a supervisor stamp a few seconds away proves nothing about a turn
+// the reader saw the owner write.
+function ownerAttribution(thread) {
+  if (!ownerSpokeAt(thread)) return null;
+  return String(thread?.lastUserText ?? "").trim() ? "owner" : "unattributed";
 }
 
 const KNOWN_CACHE_MAX = 600;
@@ -677,6 +713,10 @@ const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
 // answered in the agent's app, never here.
 const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
+// Admin Merge: how long a previewed consent stays confirmable, and the one
+// answer every non-owner path gets.
+const ADMIN_MERGE_CONSENT_TTL_MS = 5 * 60_000;
+const ADMIN_MERGE_OWNER_ONLY = "Admin Merge only runs from the owner's own Admin Merge control, after previewing exactly what it waives.";
 // Asks the owner must read in full before any button: a release or deploy,
 // a delete, a merge.
 const RISKY_ASK = /\b(?:prod(?:uction)?|releas(?:e|es|ed|ing)|deploy(?:s|ed|ing|ment)?|delet(?:e|es|ed|ing|ion)|destroy|wipe|merg(?:e|es|ed|ing)|force[- ]push|rewrite (?:git )?history)\b|--admin\b/i;
@@ -851,6 +891,8 @@ export class FleetSupervisor {
     this.judgeTriedAt = new Map();
     // threadKey -> when the owner last answered one of its questions.
     this.ownerAnsweredAt = new Map();
+    // token -> the owner's previewed Admin Merge (see previewAdminMerge).
+    this.adminMergeConsents = new Map();
   }
 
   now() {
@@ -865,6 +907,19 @@ export class FleetSupervisor {
   get uiBlockedSince() {
     this._uiBlockedSince ??= this.store.uiBlockedSince();
     return this._uiBlockedSince;
+  }
+
+  // Owner-approved handoffs held while their chat's Paseo host is offline.
+  get handoffs() {
+    this._handoffs ??= new HandoffQueue({ dir: path.join(this.dataDir, "fleet"), now: () => this.now() });
+    return this._handoffs;
+  }
+
+  // The GitHub GraphQL cooldown every caller here shares (pollers, repo
+  // status, pre-send checks, the owner's Merge), kept with the fleet data.
+  get githubThrottle() {
+    this._githubThrottle ??= this.deps.githubThrottle ?? throttleFor(this.dataDir ? path.join(this.dataDir, "fleet", "github-throttle.json") : null);
+    return this._githubThrottle;
   }
 
   get store() {
@@ -1187,7 +1242,9 @@ export class FleetSupervisor {
     if (this.running) return this.running;
     this.runningReason = reason;
     this.running = this._tick(reason, { deferUi })
-      .then((snapshot) => { this.lastError = null; return snapshot; })
+      // A scan refreshes which chats and hosts are reachable: held handoffs
+      // whose host is back go out now (only when the Paseo scan itself succeeded).
+      .then(async (snapshot) => { this.lastError = null; await this.resumeHandoffs(snapshot).catch(() => {}); return snapshot; })
       .catch((error) => {
         this.lastError = clampText(error?.message ?? String(error), 300);
         throw error;
@@ -1288,7 +1345,7 @@ export class FleetSupervisor {
       total: this.precedentMemory.list().length,
       recentApplications: this.precedentMemory.applications(5)
     };
-    return { ...baseState, ...deck, watchdog, precedentsSummary };
+    return { ...baseState, ...deck, watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
   }
 
     buildWatchdogSummary(snapshot) {
@@ -2496,16 +2553,53 @@ export class FleetSupervisor {
   // on a computer-use Mac it is typed into the app, never a CLI.
   // queue: a Conductor chat busy with background tasks gets it after them
   // (its Send button) instead of now (⌘↩).
-  async sendOwnerMessage(threadKey, message, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null } = {}) {
-    const startedAt = Date.now();
+  // idempotencyKey: the owner approval this send carries out. The same
+  // approval is never sent twice, and if the chat's Paseo host is offline
+  // it is held (status "queued") and sent when the host is back.
+  async sendOwnerMessage(threadKey, message, opts = {}) {
+    const { idempotencyKey = null, resume = false } = opts ?? {};
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
+    const key = typeof idempotencyKey === "string" && idempotencyKey.trim() ? idempotencyKey.trim().slice(0, 160) : null;
+    if (key && !resume) {
+      const known = this.handoffs.get(key);
+      if (known) {
+        if (known.status === "queued") {
+          const stillQueued = this.store.queuedOwnerMessages().some(
+            (item) => item.idempotencyKey === key || (Array.isArray(item.idempotencyKeys) && item.idempotencyKeys.includes(key))
+          );
+          if (!stillQueued) {
+            const expired = handoffStaleReason(known, null, this.now()) || "queued message expired before delivery; approve again if it still applies.";
+            return { delivery: handoffDelivery(this.handoffs.update(key, { status: "stale", detail: expired })) };
+          }
+        }
+        return { delivery: handoffDelivery(known) };
+      }
+      this._inFlightApprovals ??= new Map();
+      const inFlight = this._inFlightApprovals.get(key);
+      if (inFlight) return await inFlight;
+      const promise = this._deliverOwnerMessage(threadKey, text, { ...opts, key }).finally(() => {
+        if (this._inFlightApprovals.get(key) === promise) this._inFlightApprovals.delete(key);
+      });
+      this._inFlightApprovals.set(key, promise);
+      return await promise;
+    }
+    return await this._deliverOwnerMessage(threadKey, text, { ...opts, key });
+  }
+
+  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false } = {}) {
+    const startedAt = Date.now();
+    // Capture the approval/send-start boundary before awaiting delivery so any
+    // owner cancellation written while the initial attempt is in flight makes
+    // the held handoff stale rather than sending on top of it.
+    const approvalStartedAt = new Date(this.now()).toISOString();
     let effectiveKey = String(threadKey ?? "").trim();
     let redirectedFrom = null;
     // Dead / failed-over session guard: if this session was already failed over
     // to a live replacement and is now closed/archived/errored, redirect cleanly
-    // instead of firing messages into a dead session.
-    const initialFailover = this.store.providerFailoverFor?.(effectiveKey) ?? null;
+    // instead of firing messages into a dead session (disabled for resumed
+    // handoffs, which promise delivery to the exact approved chat).
+    const initialFailover = !resume ? (this.store.providerFailoverFor?.(effectiveKey) ?? null) : null;
     if (initialFailover?.newKey && initialFailover.newKey !== effectiveKey) {
       const origThread = this.lastThreads.get(effectiveKey) ?? this.knownThreads.get(effectiveKey) ?? null;
       const origDead = Boolean(origThread && (origThread.archived || origThread.excluded === "closed" || ["error", "closed"].includes(String(origThread.agentStatus ?? "").toLowerCase())));
@@ -2522,6 +2616,24 @@ export class FleetSupervisor {
     let thread = this.lastThreads.get(effectiveKey)
       ?? this.knownThreads.get(effectiveKey)
       ?? this.syntheticPaseoThread(effectiveKey, matchingOpen);
+    // Record latest owner send sequence and immediately supersede any waiting
+    // offline handoffs for this thread (keyed or unkeyed, e.g. fleet page
+    // replyTarget) BEFORE any await or early return (permissionPending,
+    // no-route, duplicate, busy-queue) so a newer owner instruction or
+    // cancellation always retires older waiting handoffs and prevents an older
+    // in-flight offline attempt from queuing behind it.
+    let sendSeq = null;
+    if (!resume && (thread?.kind === "paseo" || effectiveKey.startsWith("paseo:"))) {
+      const seqKey = thread?.key ?? effectiveKey;
+      this._threadOwnerSendSeq ??= new Map();
+      sendSeq = (this._threadOwnerSendSeq.get(seqKey) ?? 0) + 1;
+      this._threadOwnerSendSeq.set(seqKey, sendSeq);
+      this.handoffs.supersedeWaiting(seqKey, key);
+      if (redirectedFrom && redirectedFrom !== seqKey) {
+        this._threadOwnerSendSeq.set(redirectedFrom, (this._threadOwnerSendSeq.get(redirectedFrom) ?? 0) + 1);
+        this.handoffs.supersedeWaiting(redirectedFrom, key);
+      }
+    }
     let refreshedPermissionState = false;
     if (thread?.meta?.blockedOnOwner === true && ["codex", "conductor"].includes(thread.kind) && typeof this.refreshThread === "function") {
       try {
@@ -2591,7 +2703,8 @@ export class FleetSupervisor {
         images,
         goalId,
         ownerChoice,
-        source: "owner-message"
+        source: "owner-message",
+        ...(key ? { idempotencyKey: key } : {})
       });
       if (!queued) {
         const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
@@ -2612,6 +2725,19 @@ export class FleetSupervisor {
         };
       }
       const detail = "Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).";
+      if (key && !resume && thread.kind === "paseo") {
+        this.handoffs.enqueue({
+          key,
+          threadKey: effectiveKey,
+          serverId: thread.meta?.serverId ?? null,
+          message: text,
+          images,
+          reason: detail,
+          createdAt: approvalStartedAt,
+          supersedeExisting: false,
+          status: "queued"
+        });
+      }
       const action = this.store.recordAction({
         threadKey: effectiveKey,
         playbook: "owner-message",
@@ -2625,6 +2751,7 @@ export class FleetSupervisor {
           status: "queued",
           queued: true,
           queueId: queued?.id ?? null,
+          ...(key ? { handoffKey: key } : {}),
           route: "paseo-queue",
           actionId: action?.id ?? null,
           detail,
@@ -2639,16 +2766,37 @@ export class FleetSupervisor {
     );
     // Preserve strict per-thread FIFO: if this Paseo session already has
     // queued ordinary messages awaiting drain, append behind that backlog
-    // instead of leapfrogging dependent instructions.
+    // instead of leapfrogging dependent instructions. For resumed handoffs,
+    // keep tracking in the handoff queue (return busy) instead of transferring
+    // into the ordinary queue and losing approval/stale/TTL checks.
     const hasExistingQueue = isPaseoSend && this.store.queuedOwnerMessages(effectiveKey).length > 0;
     if (isPaseoSend && effectiveQueue && ownerChoice == null && (hasExistingQueue || (!pausedForHuman && ["running", "initializing"].includes(String(thread.agentStatus ?? "").toLowerCase())))) {
+      if (resume) {
+        return { delivery: { status: "busy", busy: true, route: "paseo-send", detail: "Paseo session is mid-turn; held handoff waits until idle." } };
+      }
       return enqueueBusyPaseo();
     }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt, queue: effectiveQueue, images, recoverDisconnected, ...(risky ? { typedOnly: true } : {}), ...(ownerChoice != null ? { ownerChoice } : {}) });
+    const delivery = await this.executor.deliver({
+      thread,
+      message: text,
+      route,
+      playbook: "owner-message",
+      spentMs: Date.now() - startedAt,
+      deadlineAt,
+      queue: effectiveQueue,
+      images,
+      recoverDisconnected: resume ? false : recoverDisconnected,
+      ...(risky ? { typedOnly: true } : {}),
+      ...(ownerChoice != null ? { ownerChoice } : {}),
+      ...(resume ? { noPermissionReply: true } : {})
+    });
     if (isPaseoSend && effectiveQueue && delivery?.status === "busy") {
+      if (resume) {
+        return { delivery: { status: "busy", busy: true, route: "paseo-send", detail: delivery?.detail || "Paseo session is mid-turn; held handoff waits until idle." } };
+      }
       return enqueueBusyPaseo();
     }
     if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
@@ -2679,6 +2827,34 @@ export class FleetSupervisor {
         ?? (recovered ? this.activeWork.findActiveGoalForThread(thread.key, thread.prRefs?.[0] ?? matchingOpen?.prRef ?? null)?.id ?? null : null);
       followThroughWatch = this.registerFollowThroughWatch(watchThread, text, { source: "owner-message", question: matchingOpen, goalId: watchGoalId });
     }
+    if (key && !resume && thread.kind === "paseo") {
+      const supersededWhileInFlight = sendSeq != null && (this._threadOwnerSendSeq?.get(thread.key) ?? sendSeq) !== sendSeq;
+      if (delivery.status === "blocked" && HOST_UNAVAILABLE.test(String(delivery.detail ?? "")) && !delivery.unconfirmed) {
+        if (supersededWhileInFlight) {
+          this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "superseded", createdAt: approvalStartedAt, supersedeExisting: false });
+          const superseded = this.handoffs.update(key, { status: "superseded", detail: "replaced by a newer owner send while the offline attempt was in flight" });
+          return { delivery: handoffDelivery(superseded) };
+        }
+        const { entry } = this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, images,
+          reason: `held: Paseo host ${thread.meta?.serverId ?? "for this chat"} is offline`, createdAt: approvalStartedAt });
+        const prefixedHash = shortHash(text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`);
+        this.store.recordAction({ threadKey: thread.key, playbook: "owner-message", status: "queued", route, messageHash: prefixedHash, detail: `${entry.detail}; sends when the host is back (approval ${key})` });
+        return { delivery: handoffDelivery(entry) };
+      }
+      // Any other outcome (sent, unconfirmed, refused): this approval is the
+      // chat's latest unless a newer send superseded it while in flight.
+      if (!supersededWhileInFlight) this.handoffs.supersedeWaiting(thread.key, key);
+      // Accepted but unconfirmed: it may be in the chat, so this approval is
+      // never sent again, even after other messages replace its receipt.
+      if (delivery.unconfirmed) {
+        this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "unconfirmed", createdAt: approvalStartedAt });
+        this.handoffs.update(key, { status: "unconfirmed", detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+      }
+      if (delivery.status === "sent") {
+        this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "sent", createdAt: approvalStartedAt });
+        this.handoffs.update(key, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+      }
+    }
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
@@ -2698,6 +2874,126 @@ export class FleetSupervisor {
       ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
+  // Sends each held handoff whose chat's host is back, once, to that exact
+  // chat. Delivered only on a confirmed send; a send Paseo accepted without
+  // a confirmed turn is never repeated; one no longer safe to send stops
+  // with its reason.
+  async resumeHandoffs(snapshot = null) {
+    if (this.resumingHandoffs) return this.resumingHandoffs;
+    // Require a fresh Paseo scan before resuming waiting handoffs: if Paseo
+    // discovery failed, cached threads can hide a newer owner cancellation.
+    if (snapshot?.sourceErrors?.paseo) return null;
+    const unknownPrefixes = Array.isArray(snapshot?.unknownPrefixes) ? snapshot.unknownPrefixes : [];
+    this.resumingHandoffs = (async () => {
+      const now = this.now();
+      for (const entry of this.handoffs.waiting()) {
+        if ((Date.parse(entry.nextTryAt ?? "") || 0) > now) continue;
+        const hostUnknown = unknownPrefixes.some((prefix) => String(entry.threadKey ?? "").startsWith(prefix));
+        // Only trust threads freshly listed in the latest scan; cached entries
+        // or chats with unavailable history cannot prove the owner did not
+        // cancel the instruction since approval.
+        const thread = hostUnknown ? null : (this.lastThreads.get(entry.threadKey) ?? null);
+        const historyUnavailable = Boolean(thread && (thread.excluded === "history-unavailable" || thread.meta?.historyKnown === false));
+        const stale = handoffStaleReason(
+          entry,
+          thread ? { archived: Boolean(thread.archived), ownerSpokeAt: historyUnavailable ? null : ownerSpokeAt(thread) } : null,
+          now
+        );
+        if (stale) {
+          this.handoffs.update(entry.key, { status: "stale", detail: stale });
+          this.store.recordAction({ threadKey: entry.threadKey, playbook: "owner-message", status: "blocked", route: "paseo-send", detail: `held handoff not sent: ${stale}` });
+          continue;
+        }
+        if (hostUnknown) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: `waiting: Paseo host ${entry.serverId ?? ""} inventory could not be refreshed` });
+          continue;
+        }
+        // Not listed yet (host still offline, or the scan has not seen it
+        // since a restart): keep waiting.
+        if (!thread) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: the chat is not listed yet" });
+          continue;
+        }
+        if (historyUnavailable) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: "waiting: chat history is unavailable; waiting for a fresh timeline before sending" });
+          continue;
+        }
+        // A resume that started sending and never recorded its outcome (the
+        // process stopped): its receipt decides, never a second send.
+        if (entry.dispatchingAt) {
+          const settled = this.reconcileHandoffDispatch(entry);
+          if (settled) { this.handoffs.update(entry.key, { dispatchingAt: null, ...settled }); continue; }
+        }
+        // A newer approval may have replaced it while an earlier entry in
+        // this pass was sending.
+        if (this.handoffs.get(entry.key)?.status !== "waiting") continue;
+        const attempts = (entry.attempts ?? 0) + 1;
+        this.handoffs.update(entry.key, { dispatchingAt: new Date(this.now()).toISOString() });
+        let delivery;
+        try {
+          delivery = (await this.sendOwnerMessage(entry.threadKey, entry.message, { images: entry.images ?? null, resume: true, recoverDisconnected: false }))?.delivery ?? null;
+        } catch (error) {
+          delivery = { status: "blocked", detail: clampText(String(error?.message ?? error), 200) };
+        }
+        this.handoffs.update(entry.key, { dispatchingAt: null });
+        if (delivery?.status === "sent") {
+          this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+        } else if (delivery?.unconfirmed) {
+          this.handoffs.update(entry.key, { status: "unconfirmed", attempts, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+        } else if (delivery?.status === "busy" || delivery?.busy === true) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat is mid-turn; it waits until its current turn finishes" });
+        } else if (delivery?.permissionRequired === true || /pending permission prompt; a held handoff is never sent into it|permission prompt pending/i.test(String(delivery?.detail ?? ""))) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat has a pending permission prompt; it waits until that prompt is answered" });
+        } else if (HOST_UNAVAILABLE.test(String(delivery?.detail ?? ""))) {
+          this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: `held: Paseo host ${entry.serverId ?? ""} is still offline` });
+        } else {
+          this.handoffs.update(entry.key, { status: "blocked", attempts, detail: clampText(delivery?.detail ?? "send failed", 200) });
+        }
+      }
+    })().finally(() => { this.resumingHandoffs = null; });
+    return this.resumingHandoffs;
+  }
+
+  // What became of a dispatch whose outcome was never recorded: the
+  // journal's receipt for this exact message since the dispatch started, or
+  // the chat's Paseo delivery receipt for it. null: no trace it was ever
+  // sent, so it is safe to send.
+  reconcileHandoffDispatch(entry) {
+    const hash = shortHash(String(entry.message ?? "").trim().startsWith(SUPERVISOR_PREFIX) ? String(entry.message).trim() : `${SUPERVISOR_PREFIX} ${String(entry.message ?? "").trim()}`);
+    const entryImagesHash = paseoImagesHash(entry.images);
+    const since = (Date.parse(entry.dispatchingAt) || 0) - 5_000;
+    const journaled = this.store.actions(200).find((action) => action.threadKey === entry.threadKey
+      && action.messageHash === hash
+      && (action.imagesHash ?? null) === entryImagesHash
+      && (Date.parse(action.at ?? "") || 0) >= since
+      && ["sent", "blocked"].includes(action.status));
+    if (journaled?.status === "sent") {
+      return { status: "delivered", deliveredAt: journaled.at, deliveredActionId: journaled.id ?? null, detail: "delivered before a restart (journal receipt); not sent again" };
+    }
+    // The chat's Paseo receipt counts only if it was written for this
+    // dispatch (at or after it started): an older receipt for the same text
+    // (or different attachments) is a different send. A settled receipt only
+    // proves delivery when it carries explicit success evidence (not a
+    // sendError/executionError write).
+    let receipt = null;
+    try {
+      const file = path.join(this.dataDir, "fleet", "paseo-deliveries", `${createHash("sha256").update(entry.threadKey).digest("hex")}.json`);
+      if (fs.statSync(file).mtimeMs >= since) receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch { receipt = null; }
+    if (receipt?.messageHash === hash && (receipt.imagesHash ?? null) === entryImagesHash) {
+      if (receipt.pending) {
+        return { status: "unconfirmed", detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" };
+      }
+      if (receipt.delivered !== false && !receipt.sendError && !receipt.executionError && !receipt.clearedForNewSend) {
+        return { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), detail: "delivered before a restart (Paseo receipt); not sent again" };
+      }
+    }
+    if (journaled?.status === "blocked" && journaled.unconfirmed) {
+      return { status: "unconfirmed", detail: "an earlier attempt is unconfirmed; not sent again" };
+    }
+    return null;
+  }
+
   scheduleQueuedOwnerMessageDrain(delayMs = 15_000) {
     if (!this.timer || this.queuedOwnerTimer) return;
     if (!this.store.queuedOwnerMessages().length) return;
@@ -2709,7 +3005,7 @@ export class FleetSupervisor {
     this.queuedOwnerTimer.unref?.();
   }
 
-  async drainQueuedOwnerMessages({ byKey = null, started = this.now() } = {}) {
+  async drainQueuedOwnerMessages({ byKey = null, started = this.now(), unknownPrefixes = [] } = {}) {
     const queued = this.store.queuedOwnerMessages();
     if (!queued.length) return [];
     const seenThreads = new Set();
@@ -2734,13 +3030,18 @@ export class FleetSupervisor {
       if (seenThreads.has(entry.threadKey) || seenThreads.has(effectiveKey)) continue;
       seenThreads.add(entry.threadKey);
       seenThreads.add(effectiveKey);
+      if (Array.isArray(unknownPrefixes) && unknownPrefixes.some((p) => String(effectiveKey).startsWith(p))) continue;
       const thread = byKey?.get(effectiveKey)
         ?? this.lastThreads.get(effectiveKey)
         ?? this.knownThreads.get(effectiveKey)
         ?? this.syntheticPaseoThread(effectiveKey, null);
       if (!thread) continue;
+      const approvalKeys = [...new Set([entry.idempotencyKey, ...(Array.isArray(entry.idempotencyKeys) ? entry.idempotencyKeys : [])].filter(Boolean))];
       if (thread.archived) {
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, { status: "stale", detail: "the target chat was archived; not sent." });
+        }
         this.store.recordAction({
           threadKey: effectiveKey,
           playbook: "owner-message",
@@ -2801,6 +3102,9 @@ export class FleetSupervisor {
       }
       if (delivery?.status === "sent") {
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+        }
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
         results.push({ id: entry.id, threadKey: effectiveKey, ...(effectiveKey !== entry.threadKey ? { redirectedFrom: entry.threadKey } : {}), status: "sent", delivery });
@@ -2812,6 +3116,12 @@ export class FleetSupervisor {
         // send: remove from the retry queue and leave its durable receipt for
         // reconciliation without risking duplicate execution.
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, {
+            status: "unconfirmed",
+            detail: `${clampText(delivery?.detail || "Queued message reached Paseo but turn confirmation timed out", 160)}; not sent again so it cannot arrive twice`
+          });
+        }
         this.store.recordAction({
           threadKey: effectiveKey,
           playbook: "owner-message",
@@ -2824,7 +3134,12 @@ export class FleetSupervisor {
         });
         results.push({ id: entry.id, threadKey: effectiveKey, status: "unconfirmed", delivery });
       } else {
-        this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
+        const updated = this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
+        if (updated?.dropped) {
+          for (const k of approvalKeys) {
+            this.handoffs.update(k, { status: "blocked", detail: clampText(delivery?.detail ?? delivery?.status ?? "queued send failed", 200) });
+          }
+        }
         results.push({ id: entry.id, threadKey: effectiveKey, status: delivery?.status ?? "blocked", delivery });
       }
     }
@@ -4005,6 +4320,131 @@ export class FleetSupervisor {
     return { ...routed, dispatched: false, delivery: null };
   }
 
+  // ─── Admin Merge (owner-only) ─────────────────────────────────────────
+  // Reached only through the owner's own POST /fleet/api/cards/:id/admin-merge
+  // (initiator "owner"); never through actCard, batch actions, or any agent
+  // tool. Preview is read-only and issues a short-lived, single-use consent
+  // bound to this card and the exact repo, PR number, head SHA, and action.
+  // Confirm spends it, audits the owner's intent before GitHub is called, and
+  // records GitHub's own answer. No deploy follows.
+  adminMergeTarget(cardId) {
+    const id = String(cardId ?? "").trim();
+    if (!id) return null;
+    const card = (this.getState().cards ?? []).find((c) => c.id === id || c.questionId === id) ?? null;
+    const question = this.store.question(card?.questionId ?? id);
+    if (!question || question.status !== "open") return null;
+    return {
+      card,
+      question,
+      prRef: card?.prRef ?? question.prRef ?? null,
+      expectedHeadSha: card?.headSha ?? question.askedHead ?? null
+    };
+  }
+
+  pruneAdminMergeConsents() {
+    const now = this.now();
+    for (const [token, consent] of this.adminMergeConsents) {
+      if (consent.expiresAt <= now) this.adminMergeConsents.delete(token);
+    }
+  }
+
+  async previewAdminMerge(cardId, { initiator = null } = {}) {
+    if (initiator !== "owner") return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    const target = this.adminMergeTarget(cardId);
+    if (!target) return null;
+    if (!target.prRef) return { ok: false, kind: "admin_merge", status: "halted", reason: "no_pr", detail: "This card is not about a pull request." };
+    const preflight = await preflightAdminMerge({
+      prRef: target.prRef,
+      expectedHeadSha: target.expectedHeadSha,
+      config: this.config,
+      ghBin: this.config.bins?.gh ?? "gh",
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
+    });
+    if (!preflight.ok) return { kind: "admin_merge", ...preflight };
+    const { plan } = preflight;
+    this.pruneAdminMergeConsents();
+    const token = randomBytes(18).toString("base64url");
+    const issuedAt = this.now();
+    const expiresAt = issuedAt + ADMIN_MERGE_CONSENT_TTL_MS;
+    const consent = { action: plan.action, repo: plan.repo, number: plan.number, headSha: plan.headSha, baseRef: plan.baseRef };
+    this.adminMergeConsents.set(token, { ...consent, questionId: target.question.id, prRef: plan.prRef, issuedAt, expiresAt });
+    return {
+      ok: true,
+      kind: "admin_merge",
+      status: "preview",
+      prRef: plan.prRef,
+      plan,
+      consent: { token, ...consent, expiresAt: new Date(expiresAt).toISOString() },
+      detail: `Admin Merge would squash-merge ${plan.prRef} at ${plan.headSha.slice(0, 7)}, waiving only the required approving review.`
+    };
+  }
+
+  async adminMergeCard(cardId, { initiator = null, consent = null } = {}) {
+    if (initiator !== "owner") return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    const target = this.adminMergeTarget(cardId);
+    if (!target) return null;
+    const token = typeof consent?.token === "string" ? consent.token : "";
+    const issued = token ? this.adminMergeConsents.get(token) ?? null : null;
+    // Single use: a confirmation is spent whether or not it matches.
+    if (issued) this.adminMergeConsents.delete(token);
+    if (!issued || issued.expiresAt <= this.now()) {
+      return { ok: false, kind: "admin_merge", status: "consent_required", detail: "That Admin Merge confirmation expired or was already used. Preview Admin Merge again and confirm." };
+    }
+    const headSha = String(consent.headSha ?? "").trim().toLowerCase();
+    if (issued.questionId !== target.question.id || consent.action !== issued.action
+        || consent.repo !== issued.repo || consent.number !== issued.number || headSha !== issued.headSha
+        || consent.baseRef !== issued.baseRef) {
+      return { ok: false, kind: "admin_merge", status: "consent_mismatch", detail: `The confirmation does not match the Admin Merge you previewed (${issued.prRef} at ${issued.headSha.slice(0, 7)} into ${issued.baseRef}). Nothing was merged.` };
+    }
+    const bound = { action: issued.action, repo: issued.repo, number: issued.number, headSha: issued.headSha, baseRef: issued.baseRef };
+    const intent = this.store.recordAction({
+      kind: "pr-admin-merge",
+      playbook: "owner-admin-merge",
+      threadKey: target.question.threadKey ?? null,
+      status: "started",
+      by: "owner",
+      reason: `Owner confirmed Admin Merge of ${issued.prRef} at ${issued.headSha.slice(0, 7)}, waiving only the required review.`,
+      adminMerge: {
+        ...bound,
+        prRef: issued.prRef,
+        waives: [ADMIN_MERGE_WAIVER],
+        previewedAt: new Date(issued.issuedAt).toISOString(),
+        confirmedAt: new Date(this.now()).toISOString()
+      }
+    });
+    const outcome = await executeAdminMerge({
+      prRef: target.prRef,
+      consent: bound,
+      expectedHeadSha: target.expectedHeadSha,
+      config: this.config,
+      ghBin: this.config.bins?.gh ?? "gh",
+      run: this.deps.run ?? runCommand,
+      throttle: this.githubThrottle
+    });
+    const merged = outcome.status === "merged" || outcome.status === "already_merged";
+    this.store.updateAction(intent.id, {
+      status: merged ? "done" : "blocked",
+      reason: outcome.detail,
+      adminMerge: {
+        ...intent.adminMerge,
+        result: outcome.status,
+        resultReason: outcome.reason ?? null,
+        githubLogin: outcome.githubLogin ?? null,
+        github: outcome.github ?? null
+      }
+    });
+    if (merged) {
+      this.store.resolveQuestion(target.question.id, outcome.status === "merged" ? `admin merged ${issued.prRef}` : `merged ${issued.prRef}`);
+      this.resolveOutreach(target.question, "merged", "acted");
+      this.emitFleet("pr-admin-merged");
+    } else {
+      this.emitFleet("pr-admin-merge-halted");
+    }
+    const { plan: _plan, ...rest } = outcome;
+    return { kind: "admin_merge", ...rest, auditId: intent.id };
+  }
+
   async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
@@ -4047,6 +4487,12 @@ export class FleetSupervisor {
       ? (resolvedAction?.op ?? "answer")
       : normalizedOp;
     const effectiveValue = value ?? resolvedAction?.value ?? null;
+
+    // Admin Merge is never a card action: no agent tool, batch, or relayed
+    // answer reaches it. Only the owner's own admin-merge route does.
+    if (effectiveOp === "admin_merge") {
+      return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    }
 
     if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {
       const dismissed = this.dismissQuestion(question.id);
@@ -4116,10 +4562,10 @@ export class FleetSupervisor {
       const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
       const prefs = this.store.preferences();
       const mergeOutcome = await executeSafePrMerge({
+        throttle: this.githubThrottle,
         prRef,
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
-        ownerConfirmed: true,
         config: this.config,
         ghBin: this.config.bins?.gh ?? "gh",
         run: this.deps.run ?? runCommand
@@ -4198,7 +4644,11 @@ export class FleetSupervisor {
         threadKey: question.threadKey ?? null,
         status: "blocked",
         by: "owner",
-        reason: mergeOutcome.detail
+        reason: mergeOutcome.detail,
+        // policy (GitHub's rules confirmed a block), transient (GitHub had
+        // not decided), refused, or unknown: the card says which.
+        ...(mergeOutcome.haltClass ? { outcome: mergeOutcome.haltClass } : {}),
+        ...(mergeOutcome.reason ? { haltReason: mergeOutcome.reason } : {})
       });
       this.emitFleet("pr-merge-halted");
       return { ok: false, kind: "merge", ...mergeOutcome };
@@ -4759,7 +5209,7 @@ export class FleetSupervisor {
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     // Deliver any queued owner Paseo messages as soon as their target sessions
     // are idle, before autonomous nudges run.
-    try { await this.drainQueuedOwnerMessages({ byKey, started }); } catch { /* never break a tick */ }
+    try { await this.drainQueuedOwnerMessages({ byKey, started, unknownPrefixes }); } catch { /* never break a tick */ }
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, unknownPrefixes, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, unknownPrefixes, mode, now: started, deferred });
 
@@ -5227,7 +5677,7 @@ export class FleetSupervisor {
     const list = [...jobs.values()];
     await mapLimit(list, BRANCH_LOOKUP_CONCURRENCY, async (job) => {
       try {
-        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd })), 20_000, "pr lookup")) ?? null;
+        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd, throttle: this.githubThrottle })), 20_000, "pr lookup")) ?? null;
         job.ok = true;
       } catch (error) {
         job.error = error;
@@ -5262,7 +5712,7 @@ export class FleetSupervisor {
     if (wanted.length) {
       try {
         const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
       } catch {
         for (const thread of several) if (conductorOwn(thread)) keepConductorPr(thread, this.conductorPicks.get(thread.key));
         return;
@@ -5299,7 +5749,7 @@ export class FleetSupervisor {
     let fresh;
     try {
       const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand })), PRE_SEND_PR_MS, "github"))?.get(ref);
+      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand, throttle: this.githubThrottle })), PRE_SEND_PR_MS, "github"))?.get(ref);
     } catch {
       return null;
     }
@@ -5317,9 +5767,17 @@ export class FleetSupervisor {
     if (this.skip.github) return new Map();
     const refs = [...new Set([...inScope.map((thread) => thread.prRefs?.[0]), ...extraRefs].filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
+    // GitHub's limit is used up (or nearly): this scan does not ask, and says
+    // so, instead of failing each PR one by one. Last settled reads stand.
+    const cooling = this.githubThrottle.blocking({ background: true });
+    if (cooling) {
+      sourceErrors.github = clampText(cooling.message, 200);
+      for (const ref of refs) unread.add(ref);
+      return new Map();
+    }
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
-      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
     } catch (error) {
       sourceErrors.github = clampText(error?.message, 200);
       for (const ref of refs) unread.add(ref);
@@ -6274,6 +6732,7 @@ export class FleetSupervisor {
               ci: pr.ci,
               unresolvedThreads: pr.unresolvedThreads,
               mergeState: pr.mergeState,
+              reviewDecision: pr.reviewDecision ?? null,
               head: String(pr.headOid ?? "").slice(0, 10)
             }
           : (thread.prRefs?.[0] ? { ref: thread.prRefs[0], url: null, state: null } : null),
@@ -6291,6 +6750,10 @@ export class FleetSupervisor {
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null, message: SENDING.has(decision.action) && decision.message ? clampText(decision.message, 500) : null } : null,
         lastAgentAt: thread.lastAgentAt ?? null,
         lastOwnerAt: ownerSpokeAt(thread),
+        lastOwnerBy: ownerAttribution(thread),
+        // When the supervisor itself last wrote there (a time, no text), so
+        // a remote approval check can tell its own message from the owner's.
+        lastSupervisorAt: thread.meta?.lastSupervisorAt ?? null,
         requiresAttention: Boolean(thread.meta?.requiresAttention),
         attentionReason: thread.meta?.attentionReason ?? null,
         // What opens this exact chat (contracts openChatFor).
@@ -6356,7 +6819,8 @@ export class FleetSupervisor {
       infraDecisions,
       storage,
       paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: null } : null,
-      sourceErrors
+      sourceErrors,
+      ...(unknownPrefixes.length ? { unknownPrefixes: [...unknownPrefixes] } : {})
     };
   }
 }

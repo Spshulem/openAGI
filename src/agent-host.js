@@ -836,7 +836,16 @@ export class AgentHost {
     if (executed?.cancelled) return stoppedFirst;
     if (sameChat && executed?.invokeResult?.ok) store.continuationNotNeeded?.(action.id);
     const invoked = executed?.invokeResult;
-    if (!invoked) return { ...receipt, status: `not run: ${String(executed?.body?.error ?? "unavailable").slice(0, 200)}` };
+    if (!invoked) {
+      const reraised = executed?.body?.reraised ?? null;
+      return {
+        ...receipt,
+        status: `not run: ${String(executed?.body?.error ?? "unavailable").slice(0, 400)}`,
+        // Nothing was sent or started: never report this as delivered or running.
+        delivered: false,
+        ...(reraised ? { reraised } : {})
+      };
+    }
     return {
       ...receipt,
       status: invoked.ok ? "done" : "failed",

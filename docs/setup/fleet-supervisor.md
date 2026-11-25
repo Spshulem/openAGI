@@ -164,6 +164,62 @@ To keep these files in version control, make `~/.openagi/skills` its own private
   first for anything not clearly regenerable.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
 
+## Merge and Admin Merge
+
+A card's **Merge** (and Merge & Deploy) checks the PR live first: open, not a
+draft, the reviewed head, no conflicts, checks green. It never bypasses a
+branch rule. A PR that GitHub holds only for its required review halts with
+`review_required` and points to Admin Merge.
+
+**Admin Merge** is a separate owner-only control on the `/fleet` page. It shows
+only on an open PR that GitHub reports as `BLOCKED` with `REVIEW_REQUIRED`. It
+waives exactly that required review through GitHub's own
+`gh pr merge --admin`, and only where the repo's rules and the signed-in `gh`
+identity already allow it.
+
+1. **Preview** (`POST /fleet/api/cards/:id/admin-merge` `{ "preview": true }`)
+   is read-only. It checks the PR live, then lists what would be waived, what
+   stays enforced, the GitHub login, and the exact command. It returns a
+   single-use consent bound to the card, repo, PR number, full head SHA, base
+   branch and the `admin_merge` action. The consent is valid for 5 minutes.
+2. **Confirm** (`{ "consent": … }`, exactly as the preview returned it) runs
+   every check again. It records the owner's intent, then makes one
+   `gh pr merge <n> --admin --squash --match-head-commit <sha>` call, and
+   records GitHub's answer on the same `pr-admin-merge` action.
+
+Before anything is merged, every one of these must hold. If any fails, the
+merge halts:
+
+- The PR is open and not a draft.
+- The head and base branch are unchanged since the preview. The head is also
+  unchanged since the reviewed commit if the card pinned one.
+- There are no conflicts, the PR is not behind its base, and GitHub knows
+  whether it can merge. When the branch requires being up to date, Admin
+  Merge compares base and head itself, because GitHub can report such a PR
+  as review-blocked instead of behind.
+- No check is failing or pending.
+- Every check the branch's rulesets and protection require has passed on that
+  exact head. Where a rule names the app that must post a check, the check must
+  come from that app. A required check that never reported stops the merge.
+- No changes were requested.
+- The base branch has no rule beyond review, status checks, linear history,
+  signatures, creation, deletion and non-fast-forward. Every page of its
+  rulesets is read. Any other rule (merge queue, deployments from a ruleset
+  or classic protection, push restrictions, `enforce_admins`, a locked
+  branch, a disallowed squash) stops it. If a classic protection setting
+  can't be read, the merge stops.
+- Required conversations are resolved.
+- If the branch requires signed commits, every commit on the PR has a
+  signature GitHub verified. GitHub signing the squash commit does not count.
+
+If GitHub refuses the bypass, the card shows GitHub's exact message and stays
+open. There is no retry, force push, auto-merge or fallback. Supervisor never
+changes rulesets, protection or credentials, and Admin Merge never triggers a
+deploy.
+
+Admin Merge is reachable only from the owner's session. Agent tools, batch
+actions, `cards/:id/act`, and paired-phone credentials cannot reach it.
+
 ## Antigravity
 
 Antigravity conversations show as `antigravity:<conversation id>` threads.
