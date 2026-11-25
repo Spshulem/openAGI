@@ -3360,7 +3360,9 @@ export class FleetSupervisor {
         if (typeof fetchFn === "function") {
           const endpoint = `${String(nodeConfig.remote).replace(/\/+$/, "")}/conversations/supervisor/append`;
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 10_000);
+          // The hub reviews proactive check-ins with an agent, one at a time,
+          // which can take well over ten seconds.
+          const timer = setTimeout(() => controller.abort(), proactive ? 60_000 : 10_000);
           timer.unref?.();
           try {
             const res = await fetchFn(endpoint, {
@@ -3394,6 +3396,12 @@ export class FleetSupervisor {
       } catch { /* fallback to local store if remote hub append fails */ }
     }
 
+    // A proactive check-in the hub did not confirm is not written locally:
+    // the hub may still post it, and a node-only copy shows the owner a
+    // message the hub never accepted. It stays pending for the next tick.
+    if (remoteRequired && proactive && !deliveredRemote) {
+      return { posted: false, reason: "hub-unconfirmed", deliveredRemote: false, deliveredLocal: false, remoteRequired, messageId: stableMsgId };
+    }
     if (!suppressedRemote && !deliveredLocal) {
       try {
         deliveredLocal = persistLocalPayload(sharedMsgPayload);
