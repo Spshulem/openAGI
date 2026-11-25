@@ -45,7 +45,7 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 
 ### P1-2. "Dismiss" means two different things on one card
 - **Before** (`img/duo-cover-supervisor-annotated.jpg` #3 and #4):
-  - **X** (SupervisorView.swift:2049): a 24×24 icon that sends `op: "dismiss"` straight away. No confirmation, no accessibility label.
+  - **X** (SupervisorView.swift:2049): a 24×24 icon that sends `op: "dismiss"` straight away, with no confirmation. It has a VoiceOver label ("Dismiss notification", SupervisorView.swift:2060), but no visible text, and it is below the 44pt target.
   - **Grey "Dismiss" text** (SupervisorView.swift:2330): sends `card.secondaryAction`, which defaults to `op: "defer"`, and relabels "Later" as "Dismiss".
   - **On the daemon, defer and dismiss are the same action today.** `src/fleet/supervisor.js:2826-2828` sends both `op: "defer"` and `op: "dismiss"` to `dismissQuestion()`. So both the X and the grey text dismiss the question for good; there is no reversible "Later".
   - **"Hide ▾"**: only collapses the deck on this device.
@@ -102,12 +102,12 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
   - The "1 watched" pill (#7, `activeSessionsPill`, SupervisorView.swift:732-743) is a status readout and a navigation button at once. Tapping it switches the workspace to the Sessions channel (in UI tests it opens the sessions sheet). It doesn't read as navigation, and the count is easy to mistake for plain status.
   - "daemon.example.com · Synced" repeats at the top of Today, Inbox and Tasks.
   - The Supervisor `topBannerStack` (SupervisorView.swift:850) can stack up to five rows above the chat: walkthrough, warning, autonomy, catch-up and status note. They mix actions (Retry, Back, Pause, Next) with plain information, all in the same small type.
-  - The status-note close button is an unlabeled `xmark`.
+  - The status-note close button is an `xmark` with no accessibility label (SupervisorView.swift:925). VoiceOver reads only the symbol.
 - **After:**
   - Status as plain text with an icon. Show the connection line only when it isn't synced, plus always in Settings.
   - Keep the watched pill's navigation. Either give it a clear label ("Sessions · 1 watched", with a disclosure) or move the action to the `#sessions` chip and leave the count as plain text. Sessions must stay reachable in one tap.
   - Fold the banners into one actionable row with the most urgent first (for example, can't reach → Retry). Put the rest behind "Details".
-  - Every icon button gets a text label (HIG 5.1, SwiftUI Pro accessibility).
+  - Give the controls that lack one a text label, starting with the status-note close button (HIG 5.1, SwiftUI Pro accessibility). Controls that already have one (card X, Copy, Share) keep it.
 
 ### P2-4. Touch targets and type
 - **Before:**
@@ -130,7 +130,7 @@ P1 means a decision could go wrong, or content is clipped. P2 is friction or a H
 ### P3
 - The thread sheet shows two titles: "Conversation" and "Demo workspace". Use the workspace as the title.
 - Today's "3 waiting on you" row looks passive but opens the Inbox. Give it a disclosure chevron or button styling.
-- Chat's Copy and Share icons under replies work but have no text. Add `Label` text with an icon-only style for VoiceOver.
+- Chat's Copy and Share icons under replies are already labeled for VoiceOver ("Copy reply" / "Share reply", ChatView.swift:1120-1125). They have no visible text; that's fine for this secondary row, so nothing is needed for accessibility.
 
 ## 3. Action parity map (every safeguard stays)
 
