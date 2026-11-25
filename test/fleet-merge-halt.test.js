@@ -126,3 +126,21 @@ test("merged by someone else at another head is not reported as this merge", asy
   assert.equal(out.mergeConfirmed, false);
   assert.match(out.detail, /not the reviewed head/);
 });
+
+// Review fix (#353): the merge timed out and the read meant to confirm it
+// answered HTTP 502. That read's halt was ignored and the merge reported as
+// refused; whether it merged is unknown, and nothing more is tried.
+test("a failed merge whose confirming read also fails is unknown, never refused, and not retried", async () => {
+  const stub = gh({
+    views: [CLEAN, () => ({ code: 1, stdout: "", stderr: "HTTP 502: Bad Gateway (https://api.github.com/graphql)" })],
+    merge: { code: 1, stdout: "", stderr: "context deadline exceeded" }
+  });
+  const { out } = await merge(stub);
+  assert.equal(out.status, "halted");
+  assert.equal(out.reason, "merge_unconfirmed");
+  assert.equal(out.haltClass, "unknown");
+  assert.equal(out.mergeConfirmed, false);
+  assert.match(out.detail, /could not be read back to confirm/);
+  assert.match(out.detail, /may have merged/);
+  assert.equal(stub.merges().length, 1, "no admin or second merge on top of an unknown outcome");
+});

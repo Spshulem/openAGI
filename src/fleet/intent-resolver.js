@@ -306,6 +306,19 @@ export async function executeSafePrMerge({
   // gh reported a failure: GitHub's own state says whether it merged anyway
   // (a lost reply) before anything else is tried.
   const after = await readPr();
+  // That read itself failed (unreachable, unparseable, or throttled): the
+  // merge may or may not have happened, so this is never a confirmed refusal,
+  // and nothing more (no admin retry) is tried on top of an unknown outcome.
+  if (after.halt) {
+    return {
+      status: "halted",
+      reason: "merge_unconfirmed",
+      haltClass: "unknown",
+      mergeConfirmed: false,
+      prRef,
+      detail: clampText(`gh reported the merge as failed, and GitHub could not be read back to confirm it (${redactSecrets(after.halt.detail ?? after.halt.reason ?? "no detail")}). ${prRef} may have merged: check it on GitHub before trying again.`, 320)
+    };
+  }
   if (after.view && String(after.view.state ?? "").toUpperCase() === "MERGED") {
     const mergedHead = String(after.view.headRefOid ?? "").trim();
     if (!liveSha || !mergedHead || mergedHead === liveSha) {
