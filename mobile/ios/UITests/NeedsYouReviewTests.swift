@@ -49,7 +49,8 @@ final class NeedsYouReviewTests: XCTestCase {
         tab(app, "Chat")
         tapButton(app, "chat-conversations")
         tapButton(app, "conversation-supervisor")
-        XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 10))
+        // The #needs-you chip, not the navigation title: at the largest
+        // accessibility sizes the bar's title is not exposed by name.
         tapButton(app, "supervisor-channel-needs-you")
     }
 
