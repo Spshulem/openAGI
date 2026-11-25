@@ -518,6 +518,10 @@ function handoffDelivery(entry) {
     return { status: "sent", route: "paseo-send", reconciled: true, actionId: entry.deliveredActionId ?? null, handoffKey: entry.key,
       detail: `already delivered for this approval at ${entry.deliveredAt ?? entry.updatedAt}; not sent again` };
   }
+  if (entry.status === "queued") {
+    return { status: "queued", queued: true, route: "paseo-queue", handoffKey: entry.key,
+      detail: entry.detail || "Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created)." };
+  }
   if (entry.status === "waiting") {
     return { status: "queued", route: "paseo-send", handoffKey: entry.key,
       detail: `${entry.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.` };
@@ -2553,7 +2557,18 @@ export class FleetSupervisor {
     const key = typeof idempotencyKey === "string" && idempotencyKey.trim() ? idempotencyKey.trim().slice(0, 160) : null;
     if (key && !resume) {
       const known = this.handoffs.get(key);
-      if (known) return { delivery: handoffDelivery(known) };
+      if (known) {
+        if (known.status === "queued") {
+          const stillQueued = this.store.queuedOwnerMessages().some(
+            (item) => item.idempotencyKey === key || (Array.isArray(item.idempotencyKeys) && item.idempotencyKeys.includes(key))
+          );
+          if (!stillQueued) {
+            const expired = handoffStaleReason(known, null, this.now()) || "queued message expired before delivery; approve again if it still applies.";
+            return { delivery: handoffDelivery(this.handoffs.update(key, { status: "stale", detail: expired })) };
+          }
+        }
+        return { delivery: handoffDelivery(known) };
+      }
       this._inFlightApprovals ??= new Map();
       const inFlight = this._inFlightApprovals.get(key);
       if (inFlight) return await inFlight;
@@ -2664,7 +2679,8 @@ export class FleetSupervisor {
         images,
         goalId,
         ownerChoice,
-        source: "owner-message"
+        source: "owner-message",
+        ...(key ? { idempotencyKey: key } : {})
       });
       if (!queued) {
         const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
@@ -2685,6 +2701,19 @@ export class FleetSupervisor {
         };
       }
       const detail = "Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).";
+      if (key && !resume && thread.kind === "paseo") {
+        this.handoffs.enqueue({
+          key,
+          threadKey: effectiveKey,
+          serverId: thread.meta?.serverId ?? null,
+          message: text,
+          images,
+          reason: detail,
+          createdAt: approvalStartedAt,
+          supersedeExisting: false,
+          status: "queued"
+        });
+      }
       const action = this.store.recordAction({
         threadKey: effectiveKey,
         playbook: "owner-message",
@@ -2698,6 +2727,7 @@ export class FleetSupervisor {
           status: "queued",
           queued: true,
           queueId: queued?.id ?? null,
+          ...(key ? { handoffKey: key } : {}),
           route: "paseo-queue",
           actionId: action?.id ?? null,
           detail,
@@ -2841,15 +2871,21 @@ export class FleetSupervisor {
     // Require a fresh Paseo scan before resuming waiting handoffs: if Paseo
     // discovery failed, cached threads can hide a newer owner cancellation.
     if (snapshot?.sourceErrors?.paseo) return null;
+    const unknownPrefixes = Array.isArray(snapshot?.unknownPrefixes) ? snapshot.unknownPrefixes : [];
     this.resumingHandoffs = (async () => {
       const now = this.now();
       for (const entry of this.handoffs.waiting()) {
         if ((Date.parse(entry.nextTryAt ?? "") || 0) > now) continue;
-        const thread = this.lastThreads.get(entry.threadKey) ?? this.knownThreads.get(entry.threadKey) ?? null;
+        const hostUnknown = unknownPrefixes.some((prefix) => String(entry.threadKey ?? "").startsWith(prefix));
+        const thread = hostUnknown ? null : (this.lastThreads.get(entry.threadKey) ?? this.knownThreads.get(entry.threadKey) ?? null);
         const stale = handoffStaleReason(entry, thread ? { archived: Boolean(thread.archived), ownerSpokeAt: ownerSpokeAt(thread) } : null, now);
         if (stale) {
           this.handoffs.update(entry.key, { status: "stale", detail: stale });
           this.store.recordAction({ threadKey: entry.threadKey, playbook: "owner-message", status: "blocked", route: "paseo-send", detail: `held handoff not sent: ${stale}` });
+          continue;
+        }
+        if (hostUnknown) {
+          this.handoffs.update(entry.key, { nextTryAt: new Date(now + HANDOFF_RETRY_MS).toISOString(), detail: `waiting: Paseo host ${entry.serverId ?? ""} inventory could not be refreshed` });
           continue;
         }
         // Not listed yet (host still offline, or the scan has not seen it
@@ -2945,7 +2981,7 @@ export class FleetSupervisor {
     this.queuedOwnerTimer.unref?.();
   }
 
-  async drainQueuedOwnerMessages({ byKey = null, started = this.now() } = {}) {
+  async drainQueuedOwnerMessages({ byKey = null, started = this.now(), unknownPrefixes = [] } = {}) {
     const queued = this.store.queuedOwnerMessages();
     if (!queued.length) return [];
     const seenThreads = new Set();
@@ -2970,13 +3006,18 @@ export class FleetSupervisor {
       if (seenThreads.has(entry.threadKey) || seenThreads.has(effectiveKey)) continue;
       seenThreads.add(entry.threadKey);
       seenThreads.add(effectiveKey);
+      if (Array.isArray(unknownPrefixes) && unknownPrefixes.some((p) => String(effectiveKey).startsWith(p))) continue;
       const thread = byKey?.get(effectiveKey)
         ?? this.lastThreads.get(effectiveKey)
         ?? this.knownThreads.get(effectiveKey)
         ?? this.syntheticPaseoThread(effectiveKey, null);
       if (!thread) continue;
+      const approvalKeys = [...new Set([entry.idempotencyKey, ...(Array.isArray(entry.idempotencyKeys) ? entry.idempotencyKeys : [])].filter(Boolean))];
       if (thread.archived) {
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, { status: "stale", detail: "the target chat was archived; not sent." });
+        }
         this.store.recordAction({
           threadKey: effectiveKey,
           playbook: "owner-message",
@@ -3037,6 +3078,9 @@ export class FleetSupervisor {
       }
       if (delivery?.status === "sent") {
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
+        }
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
         results.push({ id: entry.id, threadKey: effectiveKey, ...(effectiveKey !== entry.threadKey ? { redirectedFrom: entry.threadKey } : {}), status: "sent", delivery });
@@ -3048,6 +3092,12 @@ export class FleetSupervisor {
         // send: remove from the retry queue and leave its durable receipt for
         // reconciliation without risking duplicate execution.
         this.store.removeQueuedOwnerMessage(entry.id);
+        for (const k of approvalKeys) {
+          this.handoffs.update(k, {
+            status: "unconfirmed",
+            detail: `${clampText(delivery?.detail || "Queued message reached Paseo but turn confirmation timed out", 160)}; not sent again so it cannot arrive twice`
+          });
+        }
         this.store.recordAction({
           threadKey: effectiveKey,
           playbook: "owner-message",
@@ -3060,7 +3110,12 @@ export class FleetSupervisor {
         });
         results.push({ id: entry.id, threadKey: effectiveKey, status: "unconfirmed", delivery });
       } else {
-        this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
+        const updated = this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
+        if (updated?.dropped) {
+          for (const k of approvalKeys) {
+            this.handoffs.update(k, { status: "blocked", detail: clampText(delivery?.detail ?? delivery?.status ?? "queued send failed", 200) });
+          }
+        }
         results.push({ id: entry.id, threadKey: effectiveKey, status: delivery?.status ?? "blocked", delivery });
       }
     }
@@ -4996,7 +5051,7 @@ export class FleetSupervisor {
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     // Deliver any queued owner Paseo messages as soon as their target sessions
     // are idle, before autonomous nudges run.
-    try { await this.drainQueuedOwnerMessages({ byKey, started }); } catch { /* never break a tick */ }
+    try { await this.drainQueuedOwnerMessages({ byKey, started, unknownPrefixes }); } catch { /* never break a tick */ }
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, unknownPrefixes, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown, deferred, threadFacts });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, unknownPrefixes, mode, now: started, deferred });
 
@@ -6605,7 +6660,8 @@ export class FleetSupervisor {
       infraDecisions,
       storage,
       paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: null } : null,
-      sourceErrors
+      sourceErrors,
+      ...(unknownPrefixes.length ? { unknownPrefixes: [...unknownPrefixes] } : {})
     };
   }
 }

@@ -354,6 +354,16 @@ export class RemoteFleetSupervisor {
       const handoffs = Array.isArray(this.state.handoffs) ? this.state.handoffs : [];
       const handoff = handoffs.find((entry) => entry?.key === idempotencyKey) ?? null;
       if (handoff) {
+        if (handoff.status === 'queued') {
+          return {
+            status: 'queued',
+            queued: true,
+            route: 'paseo-queue',
+            handoffKey: handoff.key,
+            detail: handoff.detail || 'Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).',
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
         if (handoff.status === 'waiting') {
           return {
             status: 'queued',

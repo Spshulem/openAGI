@@ -702,3 +702,68 @@ test("concurrent retries with the same approval key coalesce instead of supersed
   assert.equal(f.supervisor.handoffs.get("act_coalesce").status, "delivered");
   assert.equal(sends(f.delivered).length, 2, "one initial offline attempt plus one resumed delivery");
 });
+
+// Review fix (#361, Codex P2 round 5): partial-host discovery failure reported
+// through unknownThreadPrefixes must keep affected handoffs waiting instead of
+// resuming from stale cached thread state.
+test("partial-host scan failure via unknownThreadPrefixes keeps affected handoff waiting", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Ship once inventory is fresh.", { idempotencyKey: "act_partial_host" });
+  assert.equal(f.supervisor.handoffs.get("act_partial_host").status, "waiting");
+  assert.equal(sends(f.delivered).length, 1);
+  // Host delivery becomes reachable, but its Paseo discovery inventory failed
+  // partially and reported the host via unknownThreadPrefixes.
+  f.host.up = true;
+  const origList = f.supervisor.deps.listPaseoThreads;
+  let partialFail = true;
+  f.supervisor.deps.listPaseoThreads = async () => {
+    if (partialFail) {
+      const out = [];
+      Object.defineProperty(out, "unknownThreadPrefixes", { value: ["paseo:srv_mac."], enumerable: false });
+      return out;
+    }
+    return origList();
+  };
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_partial_host").status, "waiting");
+  assert.equal(sends(f.delivered).length, 1, "must not resume while host inventory is unrefreshed");
+  // Once fresh inventory arrives without unknownThreadPrefixes, it delivers once.
+  partialFail = false;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_partial_host").status, "delivered");
+  assert.equal(sends(f.delivered).length, 2);
+});
+
+// Review fix (#361, Codex P2 round 5): an initial keyed approval targeting a
+// running chat keeps its approval identity through the busy queue and after drain
+// so replaying the same approval never dispatches twice.
+test("initial keyed approval queued on a running chat preserves approval identity after drain", async (t) => {
+  const f = fixture(t);
+  f.host.up = true;
+  f.list[0].agentStatus = "running";
+  await f.supervisor.tick({ reason: "test" });
+  const first = await f.supervisor.sendOwnerMessage(KEY, "Deploy after this turn.", { idempotencyKey: "act_busy_init" });
+  assert.equal(first.delivery.status, "queued");
+  assert.equal(first.delivery.handoffKey, "act_busy_init");
+  assert.equal(f.supervisor.handoffs.get("act_busy_init").status, "queued");
+  assert.equal(sends(f.delivered).length, 0);
+  // Replay while still queued returns queued without duplicating.
+  const whileQueued = await f.supervisor.sendOwnerMessage(KEY, "Deploy after this turn.", { idempotencyKey: "act_busy_init" });
+  assert.equal(whileQueued.delivery.status, "queued");
+  assert.equal(f.supervisor.store.queuedOwnerMessages(KEY).length, 1);
+  // Chat goes idle and tick drains the queued approval once.
+  f.list[0].agentStatus = "idle";
+  f.now.value += MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.store.queuedOwnerMessages(KEY).length, 0);
+  assert.equal(f.supervisor.handoffs.get("act_busy_init").status, "delivered");
+  assert.equal(sends(f.delivered).length, 1);
+  // Replay after drain reconciles from durable handoff history without resending.
+  const replay = await f.supervisor.sendOwnerMessage(KEY, "Deploy after this turn.", { idempotencyKey: "act_busy_init" });
+  assert.equal(replay.delivery.status, "sent");
+  assert.equal(replay.delivery.reconciled, true);
+  assert.equal(sends(f.delivered).length, 1, "replaying a drained busy approval must never send twice");
+});

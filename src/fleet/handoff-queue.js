@@ -38,7 +38,7 @@ export class HandoffQueue {
   // A newer approved handoff to the same chat replaces one still waiting
   // there: the owner approved again, and the latest instruction wins, so
   // the chat never receives both.
-  enqueue({ key, threadKey, serverId = null, message, images = null, reason, createdAt = null, supersedeExisting = true }) {
+  enqueue({ key, threadKey, serverId = null, message, images = null, reason, createdAt = null, supersedeExisting = true, status = "waiting" }) {
     const existing = this.get(key);
     if (existing) return { entry: existing, created: false };
     const at = new Date(this.now()).toISOString();
@@ -55,7 +55,7 @@ export class HandoffQueue {
     const entry = {
       key, threadKey, serverId, message,
       ...(Array.isArray(images) && images.length ? { images } : {}),
-      status: "waiting", createdAt: created, updatedAt: at, attempts: 0, nextTryAt: at,
+      status, createdAt: created, updatedAt: at, attempts: 0, nextTryAt: at,
       detail: reason
     };
     this.entries.push(entry);
@@ -87,14 +87,14 @@ export class HandoffQueue {
     if (!entry) return null;
     Object.assign(entry, patch, { updatedAt: new Date(this.now()).toISOString() });
     // A finished handoff no longer needs its text or images on disk.
-    if (entry.status !== "waiting") { delete entry.images; }
+    if (!["waiting", "queued"].includes(entry.status)) { delete entry.images; }
     this.prune();
     this.save();
     return entry;
   }
 
   prune() {
-    const finished = this.entries.filter((entry) => entry.status !== "waiting");
+    const finished = this.entries.filter((entry) => !["waiting", "queued"].includes(entry.status));
     if (finished.length <= KEEP_FINISHED) return;
     const drop = new Set(finished.slice(0, finished.length - KEEP_FINISHED));
     this.entries = this.entries.filter((entry) => !drop.has(entry));
