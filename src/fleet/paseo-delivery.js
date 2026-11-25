@@ -805,7 +805,17 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
     return `Paseo chat stopped on ${kind && kind !== "other" ? `a ${kind} error` : "an error"}; only Supervisor error recovery resends`;
   }
   if (!ownerInitiated && !silentStuckRecovery && !errorRecovery && (agent.status !== "idle" || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
-  if (errorRecovery && (!["idle", "error"].includes(agent.status) || agent.activeTurn)) return "Paseo chat is active, closed, or unavailable";
+  // Error recovery accepts idle/error sessions, plus verified stuck-running
+  // sessions where a transient provider/system error terminated the turn
+  // (`!agent.activeTurn` and `thread.error.kind` set by the Paseo source).
+  const stuckRunningAfterError = Boolean(
+    agent.status === "running"
+    && !agent.activeTurn
+    && RESUMABLE_ERROR_KINDS.has(thread?.error?.kind)
+  );
+  if (errorRecovery && ((!["idle", "error"].includes(agent.status) && !stuckRunningAfterError) || agent.activeTurn)) {
+    return "Paseo chat is active, closed, or unavailable";
+  }
   if (silentStuckRecovery && !["idle", "running", "initializing"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (ownerInitiated && !["idle", "running", "initializing", "error", "closed"].includes(agent.status)) return "Paseo chat is active, closed, or unavailable";
   if (agent.pendingPermissions?.length) return "Paseo chat requires owner permission";
@@ -822,7 +832,17 @@ function ownerPermissionMode(store) {
   try { return normalizePermissionMode(store?.preferences?.()?.defaultPermissionMode); } catch { return "bypass"; }
 }
 
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true }) {
+const TRANSIENT_RUNTIME_ERROR_RE = /\b(?:at capacity|server_overloaded|overloaded|rate[- ]?limit|usage limit|session limit|too many requests|429|503|502|504|temporarily unavailable|retry[- ]?after|try again|timed?\s*out|timeout|network error|econnreset|etimedout)\b/i;
+const PERMANENT_DISCONNECT_ERROR_RE = /\b(?:acp agent disconnected|runtime disconnected|disconnected\s*\(exit code|exit code|process_exit|session not found|agent not found|closed unexpectedly|broken pipe|terminated)\b/i;
+
+export function isPermanentlyDisconnectedRuntimeError(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return false;
+  if (TRANSIENT_RUNTIME_ERROR_RE.test(text)) return false;
+  return PERMANENT_DISCONNECT_ERROR_RE.test(text);
+}
+
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, queue = false, holdOnPermission = false } = {}) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const silentStuckRecovery = !ownerInitiated
@@ -926,6 +946,16 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         return blocked("Paseo permission changed; scan again before sending");
       }
       if (ownerInitiated && agent && !agent.archivedAt && agent.status !== "closed" && livePerms.length > 0) {
+        if (holdOnPermission === true && ownerChoice == null) {
+          return {
+            status: "busy",
+            busy: true,
+            permissionRequired: true,
+            route: "paseo-send",
+            actionId,
+            detail: "Paseo session paused at a permission prompt; holding queued message until resolved."
+          };
+        }
         if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) {
           return blocked("Paseo chat changed; scan again before sending");
         }
@@ -981,6 +1011,25 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       const holdForCheck = reason => blocked(`Previous delivery has no confirmed turn; holding its one status check until the chat is idle (${reason}); no automatic resend`);
       const preflight = ineligibleAgent(agent, thread, eligibility);
       if (preflight) return statusCheckFor ? holdForCheck(preflight) : blocked(preflight);
+      // When the owner wants to queue behind a running turn (instead of
+      // steering/interrupting or spawning a duplicate agent), detect live
+      // mid-turn state right here and report `busy` so the supervisor queues
+      // it durably for this exact session. Do not treat a session paused for
+      // human input (async_question / permission) as mid-turn.
+      const pausedForHuman = Boolean(
+        agent?.requiresAttention === true
+        && ["async_question", "permission", "input"].includes(String(agent?.attentionReason ?? "").toLowerCase())
+      );
+      const isMidTurn = Boolean(agent && !agent.archivedAt && !pausedForHuman && (["running", "initializing"].includes(agent.status) || Boolean(agent.activeTurn)));
+      if (ownerInitiated && queue === true && !statusCheckFor && isMidTurn) {
+        return {
+          status: "busy",
+          busy: true,
+          route: "paseo-send",
+          actionId,
+          detail: "Paseo session is currently mid-turn; queue behind the active turn instead of interrupting."
+        };
+      }
       const baseline = await ref.timeline.refetch({ direction: "tail", limit: ownerInitiated ? 8 : 1 });
       signal.throwIfAborted();
       if (baseline.error) return blocked("Paseo timeline unavailable; scan again before sending");
@@ -1016,7 +1065,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         if (ownerInitiated) {
           writeJsonAtomic(file, { ...intent, pending: false });
           const errReason = clampText(redactSecrets(String(sendErr?.message ?? "runtime disconnected")), 120);
-          if (!recoverDisconnected) return blocked(`Paseo delivery failed: ${errReason}; existing session only`);
+          if (!recoverDisconnected || !isPermanentlyDisconnectedRuntimeError(errReason)) {
+            return blocked(`Paseo delivery failed: ${errReason}${recoverDisconnected ? "" : "; existing session only"}`);
+          }
           const recovered = await recoverDisconnectedPaseoSession({
             permissionMode: ownerPermissionMode(store),
             api,
@@ -1063,7 +1114,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       });
       if (turnOutcome.systemError) {
         writeJsonAtomic(file, { ...correlated, pending: false });
-        if (ownerInitiated && recoverDisconnected) {
+        if (ownerInitiated && recoverDisconnected && isPermanentlyDisconnectedRuntimeError(turnOutcome.systemError)) {
           const recovered = await recoverDisconnectedPaseoSession({
             permissionMode: ownerPermissionMode(store),
             api,
