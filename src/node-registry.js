@@ -274,6 +274,22 @@ export class NodeRegistry {
     return actual.length === hash.length && crypto.timingSafeEqual(actual, hash);
   }
 
+  // Rotate the separate owner-proxy credential after an explicit reconnect
+  // approval. The raw value is returned only to the reconnect manager so it
+  // can be delivered to the already-authenticated target node; only its hash
+  // is persisted. This never exposes the main owner token and revoke() removes
+  // the hash together with the operational credential.
+  grantOwnerProxyToken(nodeId) {
+    if (typeof nodeId !== "string" || !nodeId) return null;
+    const store = this._read();
+    const credential = store.credentials[nodeId];
+    if (!credential) return null;
+    const ownerProxyToken = crypto.randomBytes(32).toString("base64url");
+    credential.ownerProxyTokenHash = crypto.createHash("sha256").update(ownerProxyToken, "utf8").digest("hex");
+    writeJsonAtomic(this.storePath, store);
+    return ownerProxyToken;
+  }
+
   enrollmentForToken(token) {
     if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) return null;
     const actualHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");

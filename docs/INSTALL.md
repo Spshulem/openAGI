@@ -171,6 +171,7 @@ See the [first-use guide](GETTING_STARTED.md) for the six flows.
 | Agent cannot answer | Reopen Settings, check provider sign-in/key, model availability, balance, and limits. Saving a key is not a successful provider test. |
 | Phone cannot connect | A phone cannot use your computer's `localhost`. Use a reachable private address or authenticated HTTPS, then follow the pairing guide. |
 | Screen history but no computer input | Check the intended node, its advertised capabilities, current permissions, screen lock, and the separate Computer Use approval. |
+| Mac is visible but desktop says main authorization is missing | On that Mac run `openagi reconnect`, then approve the short-lived request from an already paired owner phone. This keeps the node and phone pairing; it does not use a phone code or export the main owner token. |
 
 ## Updates and data
 

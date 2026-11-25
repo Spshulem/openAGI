@@ -7,6 +7,13 @@ import { isMobileRouteAllowed } from "./mobile-node.js";
 // never a fallback for the main's workspace. Forward the client's credential
 // unchanged: the main, not the worker, decides what that client may access.
 export function isMainDataRoute(method, pathname, searchParams = null) {
+  // Reconnect is a main-owned operation. A worker forwards the node's
+  // already-scoped operational credential unchanged; it never substitutes a
+  // main owner token or a local workspace credential.
+  if (method === "POST" && pathname === "/nodes/reconnect/request") return true;
+  if (method === "GET" && (pathname === "/nodes/reconnect/requests"
+    || /^\/nodes\/reconnect\/requests\/[a-f0-9-]{36}$/.test(pathname))) return true;
+  if (method === "POST" && /^\/nodes\/reconnect\/requests\/[a-f0-9-]{36}\/(approve|deny|ack)$/.test(pathname)) return true;
   if (method === "POST" && pathname === "/nodes/enroll/exchange") return true;
   // Glasses enroll on main. A worker only relays the owner's request for a code.
   if (method === "POST" && pathname === G2_CODE_ROUTE) return true;
@@ -83,7 +90,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
       return true;
     }
     if (!token) {
-      failure(res, 502, "main-pairing-required", "This worker needs owner authorization from main for workspace access. Reconnect this worker to main using the main owner's pairing token; the phone pairing has been kept.");
+      failure(res, 502, "main-pairing-required", "This worker needs owner authorization from main. Run `openagi reconnect` on this Mac and approve the request from an already paired owner phone; phone pairing and saved work are kept.");
       return true;
     }
     if (token) headers.authorization = `Bearer ${token}`;
@@ -115,7 +122,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     }
     if (!exchange && [401, 403].includes(response.statusCode)) {
       response.resume();
-      failure(res, 502, "main-pairing-required", "This server is a worker. Its main has not authorized this client. Connect using the main's existing phone pairing; your current pairing has been kept.");
+      failure(res, 502, "main-pairing-required", "This worker is still connected at the node level, but main workspace authorization is missing. Run `openagi reconnect` and approve it from an already paired owner phone; your current pairing is kept.");
       return;
     }
     if (response.statusCode >= 300 && response.statusCode < 400 && response.statusCode !== 304) {

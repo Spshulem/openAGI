@@ -121,7 +121,7 @@ All JSON. Errors: `{ "error": "<code>" }`.
 - Limits: body ≤ 8 KB; per-pass rate limit 120 sends/hour via the Workers
   rate-limit binding; `register` limited per IP (20/hour).
 - Secrets: `APNS_KEY_P8`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `PASS_KEY`; var
-  `BUNDLE_ID` (default `sh.openagi.OpenAGI`). JWT ES256 via WebCrypto,
+  `BUNDLE_ID` (default `com.spencershulem.openagi`). JWT ES256 via WebCrypto,
   cached ≤ 50 min. No logging of bodies.
 
 ### Daemon route
