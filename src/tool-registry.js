@@ -404,6 +404,9 @@ export class ToolRegistry {
         approvedBy = `owner:${owner.via}:decisions`;
       }
     }
+    // A stop that landed while the decisions check was out: nothing is
+    // claimed, raised or retired for a turn that will not run the tool.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({
