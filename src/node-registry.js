@@ -199,7 +199,7 @@ export class NodeRegistry {
   }
 
   enroll(nodeId, token, {
-    now = Date.now(), platform = null, name = null, capabilities = [], ownerProxyToken = null
+    now = Date.now(), platform = null, name = null, capabilities = [], ownerProxyToken = null, enrolledVia = null
   } = {}) {
     if (typeof nodeId !== "string" || !/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
       throw new Error("nodeId is required and malformed");
@@ -248,7 +248,8 @@ export class NodeRegistry {
       createdAt: new Date(now).toISOString(),
       ...(normalizedPlatform ? { platform: normalizedPlatform } : {}),
       ...(normalizedName ? { name: normalizedName } : {}),
-      ...(normalizedPlatform ? { capabilities: sanitizeNodeCapabilities(capabilities) } : {})
+      ...(normalizedPlatform ? { capabilities: sanitizeNodeCapabilities(capabilities) } : {}),
+      ...(typeof enrolledVia === "string" && /^[a-zA-Z0-9:_-]{1,240}$/.test(enrolledVia) ? { enrolledVia } : {})
     };
     writeJsonAtomic(this.storePath, store);
     return { created: true };

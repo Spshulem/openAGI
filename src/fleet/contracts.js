@@ -20,6 +20,11 @@ export function isThreadKey(key) {
 }
 
 // Preserve self-exclusion when a native session is represented by a Paseo agent.
+// A session the owner listed as watch-only (OPENAGI_FLEET_SELF_SESSION_IDS).
+export function isWatchOnlyThread(thread, config) {
+  return isSelfThread(thread, { selfSessionIds: config?.watchOnlySessionIds ?? [] });
+}
+
 export function isSelfThread(thread, config) {
   const self = new Set(config?.selfSessionIds ?? []);
   const identities = [thread.id, thread.claudeSessionId, thread.key];
@@ -399,10 +404,12 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
   const mode = MODES.includes(overrides.mode) ? overrides.mode
     : MODES.includes(String(env.OPENAGI_FLEET_MODE ?? "").trim()) ? String(env.OPENAGI_FLEET_MODE).trim()
     : "observe";
-  // OPENAGI_FLEET_SELF_SESSION_IDS: more of the supervisor's own sessions
-  // (comma or space separated), for ones no prompt marker names.
-  const configuredSelf = String(env.OPENAGI_FLEET_SELF_SESSION_IDS ?? "").split(/[\s,]+/);
-  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...configuredSelf, ...(overrides.selfSessionIds ?? [])]
+  // OPENAGI_FLEET_SELF_SESSION_IDS: sessions the supervisor watches but
+  // never messages on its own (comma or space separated). They are scanned
+  // and shown like any chat, so their PRs get review cards and their state
+  // reaches diagnostics; only the owner's own messages are sent there.
+  const watchOnlySessionIds = String(env.OPENAGI_FLEET_SELF_SESSION_IDS ?? "").split(/[\s,]+/).filter(Boolean);
+  const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...(overrides.selfSessionIds ?? [])]
     .filter(Boolean);
   const enabled = overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR);
   return {
@@ -417,6 +424,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    watchOnlySessionIds: [...watchOnlySessionIds, ...(overrides.watchOnlySessionIds ?? [])],
     // The session this process runs inside, if any: a message to it would
     // loop back into the turn that sent it, whoever asked.
     hostSessionIds: [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, env.PASEO_AGENT_ID, ...(overrides.hostSessionIds ?? [])].filter(Boolean),
@@ -510,6 +518,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
         password: env.OPENAGI_PASEO_PASSWORD ?? localPaseo.password,
         serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),
         autoHosts: overrides.paseo?.autoHosts ?? !envOff(env.OPENAGI_PASEO_AUTO_HOSTS),
+        manageRemoteHosts: overrides.paseo?.manageRemoteHosts ?? envFlag(env.OPENAGI_PASEO_MANAGE_REMOTE),
         ...overrides.paseo
       };
     })(),

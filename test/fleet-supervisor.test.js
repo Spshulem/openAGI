@@ -1759,6 +1759,26 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.at(-1).queue, false);
 });
 
+test("a watch-only chat is scanned and reviewed like any other, but the supervisor never messages it", async (t) => {
+  // Its PR is red: a normal chat would get a nudge.
+  const thread = makeThread({ key: "codex:watched", id: "watched" });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], env: { OPENAGI_FLEET_SELF_SESSION_IDS: "watched" } });
+  const snapshot = await supervisor.tick();
+  const row = snapshot.threads.find((r) => r.key === "codex:watched");
+  assert.ok(row, "it is in the scan, not excluded as self");
+  assert.notEqual(row.state, "excluded");
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /watch-only chat: the supervisor never messages it/);
+  assert.equal(delivered.length, 0);
+  // The owner's own message still goes through.
+  assert.equal((await supervisor.sendOwnerMessage("codex:watched", "Take the review comments next.")).delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  // The same chat, not listed, is nudged.
+  const { supervisor: plain, delivered: nudged } = fixture(t, { mode: "auto", threads: [makeThread({ key: "codex:watched", id: "watched" })] });
+  await plain.tick();
+  assert.equal(nudged.length, 1);
+});
+
 test("an owner send that is refused always leaves a receipt saying why", async (t) => {
   const { supervisor } = fixture(t, { threads: [makeThread()] });
   await supervisor.tick();
@@ -5103,12 +5123,40 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   finally { release(); await tick; }
 });
 
-test("Paseo capacity failure produces a visible model question without sending to the chat", async (t) => {
+// Capacity is transient (2026-11-24: 18 of 27 scheduled turns on one model
+// got it, the other 9 succeeded), so it backs off and resumes, bounded; it
+// is never a switch-model question or a provider failover clone.
+test("Paseo capacity failure backs off without a question, a send or a failover clone", async (t) => {
   const thread = paseoThread({
     id: "failed", provider: "codex", status: "error", model: "test-model",
+    updatedAt: ago(2 * MIN), lastUserMessageAt: ago(30 * MIN)
+  }, "host", [{ timestamp: ago(2 * MIN), item: {
+    type: "error", message: "Selected model is at capacity. Please try a different model."
+  } }]);
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", review: { enabled: false },
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => supervisor.stop());
+  await supervisor.tick({ reason: "test" });
+  const state = supervisor.getState();
+  const row = state.snapshot.threads[0];
+  assert.equal(row.state, "infra-blocked");
+  assert.equal(row.error.kind, "overloaded");
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /overloaded; backing off 5m/);
+  assert.equal(state.questions.length, 0, "no switch-model question");
+  assert.equal(delivered.length, 0, "nothing sent inside the backoff");
+  assert.deepEqual(state.providerFailovers ?? {}, {}, "no failover clone for a transient error");
+});
+
+test("a per-model cap still asks to switch models without sending to the chat", async (t) => {
+  const thread = paseoThread({
+    id: "capped", provider: "claude", status: "error", model: "test-model",
     updatedAt: ago(5 * MIN), lastUserMessageAt: ago(30 * MIN)
   }, "host", [{ timestamp: ago(5 * MIN), item: {
-    type: "error", message: "Selected model is at capacity. Please try a different model."
+    type: "error", message: "You've reached your Fable limit. Switch to another model to continue."
   } }]);
   const { supervisor, delivered, notified } = fixture(t, {
     mode: "auto", review: { enabled: false },
@@ -5118,17 +5166,38 @@ test("Paseo capacity failure produces a visible model question without sending t
   t.after(() => supervisor.stop());
   await supervisor.tick({ reason: "test" });
   const state = supervisor.getState();
-  assert.equal(state.snapshot.threads[0].state, "infra-blocked");
-  assert.equal(state.snapshot.threads[0].health, "red");
   assert.equal(state.snapshot.threads[0].error.kind, "model-limit");
   assert.equal(state.questions.length, 1);
-  assert.match(state.questions[0].title, /test-model capped\. Switch model\?/);
+  assert.match(state.questions[0].title, /Fable capped\. Switch model\?/);
   assert.deepEqual(state.questions[0].options, ["switched", "wait"]);
   await supervisor.tick({ reason: "test" });
   assert.equal(supervisor.getState().questions.length, 1, "the same failure is deduplicated");
   assert.equal(new Set(notified.map(q => q.id)).size, 1);
   assert.equal(delivered.length, 0);
 });
+
+test("a transient failure's Retry-After hint holds the resume past the backoff step", async (t) => {
+  const thread = paseoThread({
+    id: "hinted", provider: "codex", status: "error", model: "test-model",
+    updatedAt: ago(6 * MIN), lastUserMessageAt: ago(30 * MIN)
+  }, "host", [{ timestamp: ago(6 * MIN), item: {
+    type: "error", message: "unexpected status 503 Service Unavailable. Retry-After: 900"
+  } }]);
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", review: { enabled: false },
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  t.after(() => supervisor.stop());
+  await supervisor.tick({ reason: "test" });
+  const row = supervisor.getState().snapshot.threads[0];
+  assert.equal(row.error.kind, "overloaded");
+  // The 5-minute step has passed, but the provider asked for 15.
+  assert.equal(row.decision.action, "wait");
+  assert.match(row.decision.reason, /the provider asked to retry at/);
+  assert.equal(delivered.length, 0);
+});
+
 
 // Live, 2026-11-21: a Paseo chat behind a model proxy with no Codex account
 // kept failing with this, and each scan read it as overloaded and resumed it.
@@ -5618,4 +5687,23 @@ test("a risky answer kept for typing keeps later sends to its thread typed-only"
   assert.equal(later.delivery.status, "blocked");
   assert.match(later.delivery.detail, /approve it in the chat/);
   assert.equal(delivered.length, 0, "no codex exec fallback");
+});
+
+// #329 review (Codex P2): a watch-only session is scanned, but its Codex
+// permission cards are never auto-approved; they stay the owner's to answer.
+test("auto-approve never clicks a watch-only session's card", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Allow this conversation", "Always allow", "Deny"], stateId: "0123456789abcdef" };
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["Fix billing", "Something else"] }),
+    inspect: async () => ({ status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }),
+    clickLabel: async (request) => { clicks.push(request); return { status: "sent", detail: "clicked" }; }
+  };
+  const thread = makeThread({ agentStatus: "running", prRefs: [], meta: { originator: "Codex Desktop" } });
+  const { supervisor } = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use",
+    env: { OPENAGI_FLEET_AUTO_APPROVE: "codex", OPENAGI_FLEET_SELF_SESSION_IDS: "t1" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.equal(clicks.length, 0);
+  assert.equal(supervisor.getState().actions.some((action) => action.playbook === "auto-approve" && action.status === "sent"), false);
 });

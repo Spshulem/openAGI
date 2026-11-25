@@ -9,7 +9,10 @@ const PROVIDER_AUTH = /\bauth_not_found\b|\bno auth available\b/i;
 
 const RULES = [
   // Order matters: the most specific signal wins.
-  { kind: "model-limit", pattern: /You've reached your \w[\w .-]* limit|Switch to another model|Selected model is at capacity|model is at capacity/i },
+  // A per-model cap ("You've reached your Fable limit"): resending on the
+  // same model fails until the owner switches. Capacity is not a cap: see
+  // "overloaded" below.
+  { kind: "model-limit", pattern: /You've reached your \w[\w .-]* limit|Switch to another model/i },
   { kind: "session-limit", pattern: /You've hit your (?:session|weekly|daily) limit/i },
   { kind: "usage-limit", pattern: /You've hit your usage limit|usage_limit_exceeded|usageLimitExceeded|out of usage credits|usage_limit_reached|You're out of extra usage/i },
   // Antigravity (Gemini) quota: "Individual quota reached. ... Resets in
@@ -25,7 +28,11 @@ const RULES = [
   { kind: "provider-auth", pattern: PROVIDER_AUTH },
   { kind: "disk-full", pattern: /ENOSPC|no space left on device/i },
   { kind: "lb", pattern: /No available accounts|degraded mode|session bridge is cooling down|Previous response owner account|Invalid [`']?previous_response_id|continuity sources conflict|CODEX_LB_API_KEY|100\.99\.3\.113:2455|Incorrect API key provided/i },
-  { kind: "overloaded", pattern: /\b529\b|Overloaded|MODEL_CAPACITY_EXHAUSTED|PREFILL_QUEUE_OVERLOADED|servers are experiencing high traffic|server_overloaded|serverOverloaded|\b50[0234]\b.*(?:error|Internal|Bad Gateway|Unavailable)|Internal server error|rate_limit_error|\b429\b/i },
+  // "Selected model is at capacity" is Codex's text for server_overloaded:
+  // the provider is short of capacity right now, not capped. On 2026-11-24 a
+  // 15-minute schedule on gpt-6.2-sol got it 18 times in 27 runs and the
+  // other 9 succeeded on the same model, so it backs off and retries.
+  { kind: "overloaded", pattern: /\b529\b|Overloaded|Selected model is at capacity|model is at capacity|MODEL_CAPACITY_EXHAUSTED|PREFILL_QUEUE_OVERLOADED|servers are experiencing high traffic|server_overloaded|serverOverloaded|\b50[0234]\b.*(?:error|Internal|Bad Gateway|Unavailable)|Internal server error|rate_limit_error|\b429\b/i },
   { kind: "network", pattern: /ENOTFOUND|ECONNRESET|ETIMEDOUT|Can't reach the API server|Unable to connect to API|Connection (?:failed|closed mid-response)|stream disconnected|request timed out|error sending request/i }
 ];
 
@@ -83,12 +90,30 @@ function plainQuotes(text) {
   return String(text ?? "").replace(/[\u2018\u2019\u02BC\u2032\uFF07]/g, "'");
 }
 
+// A transient failure's own "retry after" hint, as an ISO time, or null:
+// "Retry-After: 30", "retry after 45 seconds", "try again in 2 minutes".
+// A hint beyond RETRY_HINT_MAX_MS is not trusted (the backoff still runs).
+const TRANSIENT_KINDS = new Set(["overloaded", "network"]);
+const RETRY_HINT = /\bretry[- ]after:?\s*(\d{1,5}(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?)?\b|\btry again in\s+(\d{1,5}(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?)\b/i;
+const RETRY_HINT_MAX_MS = 60 * 60_000;
+
+export function retryHintAt(text, now = new Date()) {
+  const match = RETRY_HINT.exec(String(text ?? ""));
+  if (!match) return null;
+  const amount = Number(match[1] ?? match[3]);
+  const unit = String(match[2] ?? match[4] ?? "s").toLowerCase();
+  const ms = amount * (unit.startsWith("m") ? 60_000 : 1000);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > RETRY_HINT_MAX_MS) return null;
+  return new Date(new Date(now).getTime() + ms).toISOString();
+}
+
 export function classifyErrorText(text, now = new Date()) {
   const source = plainQuotes(text);
   if (!source.trim()) return null;
   for (const rule of RULES) {
     if (rule.pattern.test(source)) {
-      const resetAt = rule.kind === "session-limit" || rule.kind === "usage-limit" ? parseResetAt(source, now) : null;
+      const resetAt = rule.kind === "session-limit" || rule.kind === "usage-limit" ? parseResetAt(source, now)
+        : TRANSIENT_KINDS.has(rule.kind) ? retryHintAt(source, now) : null;
       return { kind: rule.kind, resetAt };
     }
   }
@@ -124,7 +149,7 @@ export function classifyCodexErrorCode(code, rawMessage, now = new Date()) {
   if (normalized === "usage_limit_exceeded" || normalized === "usagelimitexceeded") {
     return { kind: "usage-limit", resetAt: parseResetAt(message, now) };
   }
-  if (normalized === "server_overloaded" || normalized === "serveroverloaded") return { kind: "model-limit", resetAt: null };
+  if (normalized === "server_overloaded" || normalized === "serveroverloaded") return { kind: "overloaded", resetAt: retryHintAt(message, now) };
   if (normalized === "http_connection_failed" || normalized === "httpconnectionfailed") return { kind: "network", resetAt: null };
   return classifyErrorText(message, now) ?? (message ? { kind: "other", resetAt: null } : null);
 }

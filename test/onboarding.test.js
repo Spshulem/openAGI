@@ -10,7 +10,7 @@ test("fresh wizard generates a token and uses defaults", () => {
   const html = renderWizard({ existingEnv: {} });
   assert.match(html, /auto-generated a strong one/);
   assert.match(html, /value="claude-sonnet-4-6"/);
-  assert.match(html, /value="gpt-5"/);
+  assert.match(html, /value="gpt-6.2-sol"/);
   assert.ok(!html.includes("✓ saved"), "no saved markers on a fresh install");
 });
 
