@@ -56,11 +56,24 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
             object = ["preference": "on-device", "active": ["provider": "on-device", "model": "Apple Intelligence"],
                       "providers": ["anthropic": ["configured": false], "openai": ["configured": false],
                                     "chatgpt": ["signedIn": false]]]
+        case "/budget":
+            object = ["today": "2026-10-18", "dailyUsdLimit": 25.0, "bonusUsdToday": 0.0,
+                      "effectiveLimitUsd": 25.0, "spentUsd": 1.42, "remainingUsd": 23.58,
+                      "exceeded": false, "calls": 18]
         case "/workspace/persona":
             object = ["markdown": "# My agent\n\nHelp me make thoughtful plans and keep track of what matters.\nKeep answers clear and ask when you need my input."]
         case "/workspace/skills": object = ["skills": []]
         case "/workspace/jobs": object = ["jobs": []]
         case "/workspace/integrations": object = ["integrations": []]
+        // The iPad layout shows the conversation list beside the chat; without
+        // this it read "Conversation list unavailable" in the store image.
+        case "/conversations":
+            object = ["conversations": [
+                ["id": "main", "thread": "agent", "title": "Plan my morning",
+                 "preview": "Let's keep it simple", "updatedAt": Self.date, "messageCount": 2, "readOnly": false],
+                ["id": "main", "thread": "supervisor", "title": "Supervisor",
+                 "preview": "Start a conversation", "updatedAt": Self.date, "messageCount": 0, "readOnly": false]
+            ]]
         case let path where path.hasPrefix("/conversations/"):
             object = ["thread": "agent", "messages": [
                 ["id": "morning-question", "role": "user", "at": Self.date,

@@ -19,7 +19,7 @@ import readline from "node:readline";
 import { resolveDataDir } from "../src/data-dir.js";
 import {
   resolveTarget, resolveUpdateTarget, CliClient, runDoctor, writeNodeConfig, normalizeBase,
-  authorizeWorkerProxy, readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
+  authorizeWorkerProxy, reconnectWorker, readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
 } from "../src/cli-client.js";
 import { pinnedRemoteOrigin } from "../src/node-control.js";
 import { buildPairingUrl, assertPhoneReachable } from "../src/pair-phone.js";
@@ -51,6 +51,7 @@ function parseArgs(argv) {
     else if (a === "--trigger") flags.trigger = argv[++i];
     else if (a === "--days") flags.days = argv[++i];
     else if (a === "--limit") flags.limit = argv[++i];
+    else if (a === "--wait") flags.wait = argv[++i];
     else if (a === "-h" || a === "--help") flags.help = true;
     else positional.push(a);
   }
@@ -274,6 +275,33 @@ async function cmdPairPhone(flags) {
   return 0;
 }
 
+async function cmdReconnect(flags) {
+  const waitMs = flags.wait === undefined ? undefined : Math.max(1_000, Number(flags.wait) * 1_000);
+  const result = await reconnectWorker({
+    dataDir: resolveDataDir(),
+    allowInsecureRemote: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+      || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true",
+    waitMs
+  });
+  if (flags.json) {
+    const safe = { ...result, request: result.request ? { ...result.request, ownerProxyToken: undefined } : result.request };
+    console.log(JSON.stringify(safe, null, 2));
+    return result.ok ? 0 : 1;
+  }
+  if (!result.ok) {
+    console.error(c(result.code === "approval_pending" ? YELLOW : RED, `✗ ${result.message}`));
+    if (result.requestId) console.error(c(DIM, `  request: ${result.requestId}`));
+    if (result.code === "not-paired") console.error(c(DIM, "  This preserves the existing phone pairing; use the normal secure main pairing once to establish the node credential."));
+    return 1;
+  }
+  console.log(c(GREEN, "✓ owner approval received; scoped reconnect credential saved."));
+  console.log(c(DIM, `  request: ${result.requestId}`));
+  if (result.local?.restarted) console.log(c(DIM, "  local daemon accepted a supervised restart."));
+  else if (result.local?.running === false) console.log(c(DIM, "  local daemon is not running; it will load the saved credential on next start."));
+  else if (result.local && !result.local.applied) console.log(c(YELLOW, "  restart is still required before the running daemon can use the new authorization."));
+  return 0;
+}
+
 async function cmdUnpair(flags) {
   const allowInsecureRemote = process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
     || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true";
@@ -478,13 +506,30 @@ async function cmdUpdate(positional, flags) {
   if (!res.ok) { console.error(c(RED, `✗ ${res.error ?? "HTTP " + res.status}`)); return 1; }
   const r = res.json ?? {};
   if (checkOnly) {
-    if (r.updateAvailable) console.log(c(YELLOW, `↑ update available: ${r.current} → ${r.latest} (${r.behind} commit${r.behind === 1 ? "" : "s"} behind on ${r.branch})`));
-    else console.log(c(GREEN, `✓ up to date (${r.current} on ${r.branch ?? "?"})`) + (r.reason ? c(DIM, ` — ${r.reason}`) : ""));
+    if (r.ok === false) {
+      console.error(c(RED, `✗ ${r.reason ?? "update check failed"}`));
+      return 1;
+    }
+    if (r.updateAvailable) {
+      const detail = r.mode === "release-archive"
+        ? "release archive"
+        : `${r.behind} commit${r.behind === 1 ? "" : "s"} behind on ${r.branch}`;
+      console.log(c(YELLOW, `↑ update available: ${r.current} → ${r.latest} (${detail})`));
+    } else {
+      console.log(c(GREEN, `✓ up to date (${r.current} on ${r.branch ?? "?"})`) + (r.reason ? c(DIM, ` — ${r.reason}`) : ""));
+    }
     return 0;
   }
   if (r.updated) {
-    console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps reinstalled)") : ""));
-    console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps updated)") : ""));
+    if (r.restartRequired) {
+      console.log(c(YELLOW, `restart required: ${target.remote ? "main" : "the daemon"} is still running the old version; stop and start OpenAGI again to use it.`));
+    } else {
+      console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+    }
+  } else if (r.ok === false) {
+    console.error(c(RED, `✗ ${r.reason ?? "update failed"}`));
+    return 1;
   } else {
     console.log(c(GREEN, `✓ ${r.reason ?? "nothing to do"}`));
   }
@@ -546,6 +591,7 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
                                          enroll once, then retain only a
                                          revocable node-scoped credential
   openagi pair-phone --platform ios|android   pair a phone as a mobile node
+  openagi reconnect [--wait SECONDS]     request owner approval to reconnect this node
   openagi unpair [--force]               revoke its scoped credential, then forget it
   openagi imessage-bridge [opts]         (macOS) relay incoming iMessages to the
                                          main and text its replies back. Opts:
@@ -582,6 +628,7 @@ async function main() {
       case "setup": return await cmdSetup(flags);
       case "pair": return await cmdPair(positional, flags);
       case "pair-phone": return await cmdPairPhone(flags);
+      case "reconnect": return await cmdReconnect(flags);
       case "unpair": return await cmdUnpair(flags);
       case "update": return await cmdUpdate(positional, flags);
       case "migrate": return await cmdMigrate(positional, flags);

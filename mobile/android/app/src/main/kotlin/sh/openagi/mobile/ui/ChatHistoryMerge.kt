@@ -36,7 +36,9 @@ internal object ChatHistoryMerge {
             val entry = unsynced[index]
             if (entry is ChatEntry.User) {
                 val reply = unsynced.getOrNull(index + 1) as? ChatEntry.Assistant
-                val match = unclaimed.firstOrNull { it.text == entry.text }
+                // The turn's own id when both sides have it; otherwise the text.
+                val match = entry.requestId?.let { id -> unclaimed.firstOrNull { it.requestId == id } }
+                    ?: unclaimed.firstOrNull { it.text == entry.text }
                 if (match != null) unclaimed.remove(match)
                 val replyUnfinished = reply == null || reply.streaming || reply.failed
                 // Unconfirmed and unfinished: the daemon may never have seen it.
@@ -64,8 +66,8 @@ internal object ChatHistoryMerge {
         if (message.role == "user") {
             // Only another device is named; this phone's own lines need no label.
             val source = message.sourceName?.takeIf { message.sourceNodeId != null && message.sourceNodeId != ownNodeId }
-            ChatEntry.User(id, message.at, message.text, serverId = message.id, sourceName = source)
+            ChatEntry.User(id, message.at, message.text, serverId = message.id, sourceName = source, requestId = message.requestId)
         } else {
-            ChatEntry.Assistant(id, message.at, message.text, streaming = false, serverId = message.id)
+            ChatEntry.Assistant(id, message.at, message.text, streaming = false, serverId = message.id, requestId = message.requestId)
         }
 }

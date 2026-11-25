@@ -111,14 +111,13 @@ struct FleetOptionButtons: View {
 
   @ViewBuilder private var buttons: some View {
     ForEach(Array(options.enumerated()), id: \.offset) { index, option in
-      let button = Button { Task { await fleet.answer(question, option: option) } } label: {
+      WorkspaceActionButton(
+        prominent: index == 0 && !question.risky,
+        small: true
+      ) {
+        Task { await fleet.answer(question, option: option) }
+      } label: {
         Text(question.label(for: option)).lineLimit(1)
-      }
-      .controlSize(.small)
-      if index == 0 && !question.risky {
-        button.buttonStyle(.borderedProminent)
-      } else {
-        button.buttonStyle(.bordered)
       }
     }
   }

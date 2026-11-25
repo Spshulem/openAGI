@@ -1,3 +1,4 @@
+import { LiveCueContext, type LiveCue } from '../openagi/live-cues'
 import type { AudioSource } from '../even/audio-source'
 import { QuestionAudioBuffer } from '../buildbetter/question-audio'
 import { paginateText } from '../state/ask-state-machine'
@@ -10,11 +11,11 @@ import { LiveSpeech, SpeechStreamError, type SpeechModel, type SpeechCallbacks }
 import type { ConversationThread, HomeMode, OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer, LifelogHomeState } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
-import { G2ProactiveClient, type InboxItem, type MainConsent } from '../openagi/proactive'
+import { G2ProactiveClient, type InboxItem, type MainConsent, type SupervisorWalkthrough } from '../openagi/proactive'
 import type { SharedThreadMessage } from '../openagi/experience-client'
 import { G2VoiceSession, supervisorVoiceFocus, type VoiceCallbacks } from '../openagi/voice-session'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'cue' | 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'walkthrough' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 interface RecentEntry { question: string; reply: string; local?: number }
 
 const CONSENT_NEEDED = 'Lifelog needs your recording consent once. Check the consent box on this page; it stays on until you uncheck it.'
@@ -26,18 +27,74 @@ const CONSENT_NEEDED = 'Lifelog needs your recording consent once. Check the con
 // - Supervisor: the fleet supervisor's questions, thread status and chat.
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
+  private readonly cueContext = new LiveCueContext()
+  private cueController: AbortController | null = null
+  private activeCue: LiveCue | null = null
+  private cueTimer: ReturnType<typeof setTimeout> | null = null
+  private clearCue(): void {
+    this.activeCue = null
+    if (this.cueTimer) clearTimeout(this.cueTimer)
+    this.cueTimer = null
+  }
+  private stopCues(): void { this.cueController?.abort(); this.cueController = null; this.cueContext.clear(); this.renderer.liveTranscript?.(''); this.clearCue() }
+  async toggleTranscript(): Promise<void> {
+    const visible = !this.store.snapshot().transcriptVisible
+    await this.store.update({ transcriptVisible: visible })
+    this.renderer.transcriptVisible?.(visible); this.phone.transcriptVisible?.(visible)
+    if (this.mode === 'ambient' && !this.activeCue) this.listeningPulse(true)
+    this.phone.activity?.(visible ? 'Transcript shown on glasses. Listening unchanged.' : 'Transcript hidden on glasses. Listening unchanged.')
+  }
+  async configureLiveCues(enabled: boolean): Promise<void> {
+    await this.store.update({ liveCuesEnabled: enabled }); this.phone.liveCuesEnabled?.(enabled)
+    if (!enabled) { this.stopCues(); if (this.mode === 'cue') this.showHome(); else this.listeningPulse(true) }
+    this.phone.activity?.(enabled ? 'Live cues enabled. Start consented lifelog to get brief answers and context. Cues use your main model and read-only connected data; tasks remain suggestions.' : 'Live cues off.')
+  }
+  private async requestLiveCue(text: string): Promise<void> {
+    const consentId = this.proactive.consentId
+    if (!this.store.snapshot().liveCuesEnabled || !consentId || this.cueController || !this.ambientRunning || this.requestController
+      || this.mode !== 'ambient' || !this.foregroundActive || document.visibilityState === 'hidden' || this.exited || this.displaySleeping || this.noticeTimer) return
+    const context = this.cueContext.add(text); if (!context) return
+    const controller = new AbortController(); this.cueController = controller
+    if (!this.activeCue) this.renderer.checkingCue?.()
+    this.phone.cueStatus?.('Checking for a useful cue…')
+    try {
+      const result = await this.api.liveCue(context, consentId, AbortSignal.any([controller.signal, AbortSignal.timeout(28_000)]))
+      if (controller.signal.aborted || !this.store.snapshot().liveCuesEnabled || this.proactive.consentId !== consentId
+        || !this.foregroundActive || document.hidden || this.exited || this.mode !== 'ambient' || this.requestController) return
+      if (result.cue) {
+        const cue = result.cue; this.clearCue(); this.activeCue = cue
+        this.phone.cue?.(cue); this.renderer.cue?.(plainAnswer(cue.title), plainAnswer(cue.brief))
+        this.cueTimer = setTimeout(() => { this.cueTimer = null; this.activeCue = null; if (this.mode === 'ambient') this.listeningPulse(true) }, 30_000)
+      }
+      this.phone.cueStatus?.(result.cue ? 'New cue · tap to expand. Tasks are suggestions.' : 'Listening · no new cue needed.')
+    } catch (error) { if (!controller.signal.aborted) this.phone.cueStatus?.(`Cue unavailable: ${safeOpenAGIError(error)} Ask directly to retry.`) }
+    finally {
+      if (this.cueController === controller) this.cueController = null
+      if (this.mode === 'ambient' && !this.activeCue) this.listeningPulse(true)
+    }
+  }
+  private showCuePage(): void { this.renderer.cueDetail?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
   private inboxIndex = 0
   private inboxItems: InboxItem[] = []
   private noticeTimer: ReturnType<typeof setTimeout> | null = null
   private actionIndex = 0
   private actionTarget: InboxItem | null = null
+  private walkthroughActionOrigin = false
   private voiceTarget: InboxItem | null = null
-  private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null }
+  private lastPingedSupervisor: InboxItem | null = null
+  private supervisorWalkthrough: SupervisorWalkthrough | null = null
+  private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null; this.lastPingedSupervisor = null }
   private showNotice(item: InboxItem): void {
     this.clearNotice()
-    const label = item.supervisor ? 'Supervisor question' : item.reminder ? 'Reminder suggested' : /^Follow up:/i.test(item.title) ? 'Follow-up suggested' : item.category === 'memory' ? 'Action identified' : item.category === 'highlight' ? 'Lifelog' : 'Update from main'
-    this.renderer.notice?.(label, plainAnswer(item.title))
-    this.noticeTimer = setTimeout(() => { this.noticeTimer = null; if (['home', 'ambient'].includes(this.mode) && this.foregroundActive && !this.exited) this.showHome() }, 4500)
+    const isMergeNotice = item.cardKind === 'merge_ready' || item.cardKind === 'pr_ready'
+    const isBlockedNotice = item.cardKind === 'blocker' || item.cardKind === 'blocked'
+    const label = item.supervisor
+      ? (isMergeNotice ? 'PR ready · Supervisor' : isBlockedNotice ? 'Agent blocked · Supervisor' : item.cardKind === 'preference' ? 'Preference · Supervisor' : 'Supervisor question')
+      : item.reminder ? 'Reminder suggested' : /^Follow up:/i.test(item.title) ? 'Follow-up suggested' : item.category === 'memory' ? 'Action identified' : item.category === 'highlight' ? 'Lifelog' : 'Update from main'
+    const detail = item.supervisor && item.pmBrief ? `${plainAnswer(item.title)}\n${plainAnswer(item.pmBrief)}` : plainAnswer(item.title)
+    this.renderer.notice?.(label, detail)
+    if (item.supervisor) this.lastPingedSupervisor = { ...item }
+    this.noticeTimer = setTimeout(() => { this.noticeTimer = null; this.lastPingedSupervisor = null; if (['home', 'ambient'].includes(this.mode) && this.foregroundActive && !this.exited) this.showHome() }, 4500)
   }
   // Every ignored gesture gets visible feedback instead of silence.
   private flash(title: string, detail: string): void { this.renderer.flash?.(title, detail); this.phone.activity?.(`${title}: ${detail}`) }
@@ -146,6 +203,7 @@ export class OpenAGIG2App {
     else if (this.lifelogState === 'waiting') this.kickLifelog()
   }
   setForeground(active: boolean): void {
+    if (!active) this.stopCues()
     if (this.exited) return
     if (active) {
       const returning = !this.foregroundActive
@@ -231,6 +289,10 @@ export class OpenAGIG2App {
       saveStatus: text => phone.saveStatus?.(text),
       memoryStatus: (active, detail) => { phone.memoryStatus?.(active, detail); this.listeningPulse(true) },
       consentLost: () => { void this.consentLost() },
+      walkthrough: state => {
+        this.supervisorWalkthrough = state
+        if (this.mode === 'walkthrough') this.showSupervisorWalkthrough()
+      },
     },
     () => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
     item => this.showNotice(item))
@@ -242,9 +304,75 @@ export class OpenAGIG2App {
     if (!this.inboxItems.length) { this.flash('Inbox empty', 'Nothing from your main right now.'); this.phone.set('Inbox empty', 'Enable proactive updates on the phone, then Refresh.'); return }
     this.inboxIndex = Math.max(0, this.inboxItems.findIndex(i => i.id === id)); this.showInboxItem()
   }
+  private walkthroughIdentity(item: InboxItem): string { return item.cardId ?? item.questionId ?? item.id }
+  private walkthroughInboxItem(id: string | null): InboxItem | null {
+    if (!id) return null
+    const existing = this.proactive.items.find(item => this.walkthroughIdentity(item) === id || item.id === id)
+    if (existing) return existing
+    const current = this.supervisorWalkthrough?.current
+    if (!current || current.id !== id) return null
+    const cardId = current.cardId ?? (current.kind === 'card' ? current.id : null)
+    const questionId = current.questionId ?? (current.kind === 'question' ? current.id : null)
+    return {
+      id: cardId ? `card:${cardId}` : `question:${questionId ?? current.id}`,
+      title: current.title, summary: current.summary, category: 'approvals', important: true, seen: false,
+      action: cardId ? 'act-fleet-card' : 'answer-fleet', supervisor: true, walkthroughOnly: true,
+      ...(cardId ? { cardId } : {}), ...(questionId ? { questionId } : {}),
+      ...(current.threadKey ? { threadKey: current.threadKey } : {}),
+      ...(current.cardKind ? { cardKind: current.cardKind } : {}),
+      ...(current.primaryLabel ? { primaryLabel: current.primaryLabel } : {}),
+      ...(current.prRef ? { prRef: current.prRef } : {}),
+      ...(current.ciState ? { ciState: current.ciState } : {}),
+      ...(current.pmBrief ? { pmBrief: current.pmBrief } : {}),
+      ...(current.options?.length ? { options: current.options } : {})
+    }
+  }
+  async startSupervisorWalkthrough(): Promise<void> {
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy) return
+    await this.proactive.refresh()
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.mode === 'listening') return
+    try {
+      this.supervisorWalkthrough = await this.proactive.walkthrough('start')
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.currentMode === 'listening') return
+      this.showSupervisorWalkthrough()
+    } catch (error) { this.phone.set('Needs You unavailable', safeOpenAGIError(error)); this.flash('Needs You unavailable', safeOpenAGIError(error)) }
+  }
+  async supervisorWalkthroughAction(operation: 'next' | 'back' | 'skip' | 'pause' | 'resume'): Promise<void> {
+    const walkthroughResult = this.mode === 'message' && this.walkthroughActionOrigin
+    if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || (!['home', 'status', 'walkthrough'].includes(this.mode) && !walkthroughResult)) return
+    const current = this.supervisorWalkthrough?.currentId ?? undefined
+    try {
+      const walkthrough = await this.proactive.walkthrough(operation, current)
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || this.currentMode === 'listening') return
+      this.supervisorWalkthrough = walkthrough
+      this.showSupervisorWalkthrough()
+    } catch (error) {
+      if (this.homeMode !== 'supervisor' || this.exited || this.requestController || this.navigationBusy || this.microphoneOpening || this.askStarting || this.currentMode === 'listening') return
+      this.supervisorWalkthrough = await this.proactive.walkthrough('view').catch(() => null)
+      if (this.homeMode === 'supervisor' && !this.exited && !this.requestController && !this.navigationBusy && !this.isMode('listening') && this.supervisorWalkthrough?.active) this.showSupervisorWalkthrough()
+      this.phone.set('Needs You changed', `${safeOpenAGIError(error)} Refreshed the shared walkthrough.`)
+    }
+  }
+  private showSupervisorWalkthrough(): void {
+    const walkthrough = this.supervisorWalkthrough
+    const current = walkthrough?.current
+    if (!walkthrough?.active || !current || !walkthrough.total) {
+      this.mode = 'message'; this.renderer.message('Needs You', 'There are no live Supervisor cards waiting for you.'); this.phone.supervisorWalkthrough?.(walkthrough); return
+    }
+    this.mode = 'walkthrough'
+    const item = this.walkthroughInboxItem(current.id)
+    const index = Math.max(0, walkthrough.items.findIndex(candidate => candidate.id === current.id))
+    this.renderer.supervisorWalkthrough(current.title, current.summary, index + 1, walkthrough.total, walkthrough.paused)
+    this.phone.supervisorWalkthrough?.(walkthrough)
+    if (item) this.voiceTarget = { ...item }
+  }
+  private isMode(mode: Mode): boolean { return this.currentMode === mode }
   private showInboxItem(): void {
     const item = this.inboxItems[this.inboxIndex]; if (!item) return
-    this.mode = 'inbox'; this.pages = paginateText(plainAnswer(`${item.title}\n\n${item.summary}`), 220); this.page = 0
+    this.mode = 'inbox'
+    const body = item.supervisor && item.pmBrief && item.pmBrief !== item.summary ? `${item.pmBrief}\n\n${item.summary}` : item.summary
+    this.pages = paginateText(plainAnswer(`${item.title}\n\n${body}`), 220); this.page = 0
+    this.renderer.supervisorCard?.(item.supervisor && item.pmBrief ? plainAnswer(item.pmBrief) : null)
     this.renderer.inboxList?.(plainAnswer(item.title), this.inboxIndex + 1, this.inboxItems.length)
   }
   private showInboxPage(): void {
@@ -254,7 +382,7 @@ export class OpenAGIG2App {
     this.actionTarget = { id: '', title: 'Lifelog', summary: '', category: '', important: false, seen: true, action: '' }
     this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction()
   }
-  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer'; value?: string }[] {
+  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer' | 'act-card'; value?: string; cardOp?: 'primary' | 'fix_ci' | 'defer' }[] {
     const item = this.actionTarget
     // An empty target is the Lifelog controls list (swipe down in Lifelog).
     if (item && !item.id) {
@@ -262,13 +390,29 @@ export class OpenAGIG2App {
         this.ambientRunning && !this.lifelogUserPaused ? { label: 'Pause listening', op: 'pause' as const } : { label: 'Resume listening', op: 'resume' as const },
         { label: 'Recent answers', op: 'recent' }]
     }
+    const isMergeCard = item?.cardKind === 'merge_ready' || item?.cardKind === 'pr_ready'
+    const ciFailed = ['failing', 'failure', 'error'].includes((item?.ciState ?? '').toLowerCase())
+    const primaryIsFix = /fix ci|rebase/i.test(item?.primaryLabel ?? '')
+    const unsupportedPrimary = /^(?:answer question|review plan)$/i.test(item?.primaryLabel?.trim() ?? '')
+    const primaryCard = item?.supervisor && item.cardId && !unsupportedPrimary && (item.action === 'act-fleet-card' || isMergeCard || item.cardKind === 'preference')
+      ? [{ label: isMergeCard && !primaryIsFix ? `${item.primaryLabel || 'Merge PR'}${item.prRef ? ` (${item.prRef})` : ''}` : (item.primaryLabel || 'Approve'), op: 'act-card' as const, cardOp: 'primary' as const }]
+      : []
+    const fixCiCard = item?.supervisor && item.cardId && ciFailed && !primaryIsFix
+      ? [{ label: 'Have agent fix CI', op: 'act-card' as const, cardOp: 'fix_ci' as const }]
+      : []
+    const deferCard = item?.supervisor && item.cardId
+      ? [{ label: 'Hold off / Defer', op: 'act-card' as const, cardOp: 'defer' as const }]
+      : []
     // A supervisor question is answered with one of its own fixed choices.
-    const answers = item?.supervisor ? (item.options ?? []).map(value => ({ label: `Answer: ${value}`, op: 'answer' as const, value })) : []
-    return [...answers,
+    const answers = item?.supervisor
+      ? (item.options ?? []).filter(value => !primaryCard.length || value.toLowerCase() !== (item.primaryLabel ?? '').toLowerCase()).map(value => ({ label: `Answer: ${value}`, op: 'answer' as const, value }))
+      : []
+    return [...primaryCard, ...fixCiCard, ...answers,
       { label: 'Talk about this item', op: 'talk' },
+      ...deferCard,
       ...(item?.action === 'complete-task' ? [{ label: 'Complete task on main', op: 'complete-task' as const }] : []),
       ...(item?.action === 'accept-task' && !item.reminder ? [{ label: 'Add as my task', op: 'accept-task' as const }] : []),
-      ...(item?.id ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : [])]
+      ...(item?.id && !item.walkthroughOnly ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : [])]
   }
   private showInboxAction(): void {
     this.renderer.inboxAction?.(this.inboxActions()[this.actionIndex]?.label ?? '', plainAnswer(this.actionTarget?.title ?? ''), this.mode === 'inbox-confirm')
@@ -282,6 +426,14 @@ export class OpenAGIG2App {
     if (action.op === 'mark') { await this.markMoment(); return }
     if (this.mode !== 'inbox-confirm') { this.mode = 'inbox-confirm'; this.showInboxAction(); return }
     this.navigationBusy = true
+    if (action.op === 'act-card') {
+      try {
+        const result = await this.proactive.actCard(target.id, action.cardOp ?? 'primary')
+        if (this.exited || !this.foregroundActive) return
+        this.mode = 'message'; this.renderer.message(result.ok ? 'Done' : 'Action halted', result.detail || (result.ok ? action.label : 'Check PR or session state.'))
+      } finally { this.navigationBusy = false }
+      return
+    }
     if (action.op === 'answer') {
       try {
         const result = await this.proactive.answer(target.id, action.value ?? '')
@@ -311,7 +463,8 @@ export class OpenAGIG2App {
     if (!status) { this.mode = 'message'; this.renderer.message('Supervisor unavailable', 'Main could not read the supervisor. Check the Mac running it.'); return }
     const c = status.counts
     const lines = status.threads.map(t => `${t.health === 'red' ? '●' : '○'} ${t.name}: ${t.reason || t.state}`)
-    const text = `${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.needsYou} question${status.needsYou === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
+    const summaryLine = status.catchUpSummary ? `${status.catchUpSummary}\n` : ''
+    const text = `${summaryLine}${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.cardsCount ?? status.needsYou} item${(status.cardsCount ?? status.needsYou) === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
     this.pages = paginateText(plainAnswer(text), 220); this.page = 0; this.mode = 'status'
     this.renderer.fleetStatus(this.pages[0] ?? '', 0, this.pages.length)
   }
@@ -329,7 +482,7 @@ export class OpenAGIG2App {
     this.lifelogUserPaused = false; this.lifelogFailures = 0
     this.setLifelog(mode === 'lifelog' ? 'starting' : 'off')
     this.renderer.speaker?.(mode === 'supervisor' ? 'Supervisor' : 'Agent')
-    if (['home', 'status', 'ambient', 'recent', 'answer', 'message', 'reconnecting'].includes(this.mode) || this.mode.startsWith('inbox')) this.showHome()
+    if (['home', 'status', 'ambient', 'recent', 'answer', 'message', 'reconnecting', 'walkthrough'].includes(this.mode) || this.mode.startsWith('inbox')) this.showHome()
     await this.proactive.configure({ supervisorOnly: mode === 'supervisor' })
     if (mode === 'lifelog') await this.startLifelog()
   }
@@ -478,7 +631,7 @@ export class OpenAGIG2App {
     } catch (error) { if (request === this.lifelogRequest) this.phone.lifelogStatus?.(`Could not load lifelog: ${safeOpenAGIError(error)}`) }
   }
   private listeningPulse(force = false): void {
-    if (this.mode !== 'ambient' || this.noticeTimer || this.displaySleeping || this.requestController || !this.ambientRunning) return
+    if (this.mode !== 'ambient' || this.noticeTimer || this.activeCue || this.cueController || this.displaySleeping || this.requestController || !this.ambientRunning) return
     if (!force && Date.now() - this.lastListeningPulse < 2000) return
     this.lastListeningPulse = Date.now()
     this.renderer.passive?.(this.proactive.capturing)
@@ -488,6 +641,10 @@ export class OpenAGIG2App {
     document.addEventListener('visibilitychange', this.onVisibility)
     if (document.visibilityState === 'hidden') this.startAudioWatch()
     const stored = await this.store.load()
+    this.renderer.transcriptVisible?.(stored.transcriptVisible)
+    this.phone.transcriptVisible?.(stored.transcriptVisible)
+    this.phone.liveCuesEnabled?.(stored.liveCuesEnabled)
+    this.phone.savedServer?.(stored.agentOrigin ?? stored.lastAgentOrigin)
     this.phone.interfaceStyle?.(stored.interfaceStyle)
     this.phone.homeMode?.(stored.homeMode)
     this.phone.recordingConsent?.(stored.recordingConsent)
@@ -510,7 +667,7 @@ export class OpenAGIG2App {
         if (stored.homeMode === 'lifelog') { await this.startLifelog(); return }
         if (stored.homeMode === 'talk') {
           let index = -1
-          stored.history.forEach((entry, position) => { if (entry.conversationId === stored.conversationId) index = position })
+          stored.history.forEach((entry, position) => { if (entry.thread === 'agent' && entry.conversationId === stored.conversationId) index = position })
           if (index >= 0) await this.selectAnswer(index)
         }
         return
@@ -538,7 +695,11 @@ export class OpenAGIG2App {
     this.lastTapAt = Date.now()
     // Talk and Lifelog recordings follow the review setting.
     if (!this.askStarting && !this.microphoneOpening && this.mode !== 'listening') this.cancelHold()
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.clearNotice()
+    if (this.mode === 'ambient' && this.activeCue) {
+      const cue = this.activeCue; this.clearCue(); this.mode = 'cue'; this.pages = paginateText(plainAnswer(`${cue.title}\n\n${cue.detail}`), 260); this.page = 0; this.showCuePage(); return
+    }
     if (this.requestController) {
       if (this.cancelConfirmation) this.cancelRequest()
       else if (!this.preparingDraft) { this.activityView = !this.activityView; this.renderActiveProgress?.() }
@@ -546,6 +707,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') void this.sendDraft()
+    else if (this.mode === 'walkthrough') { const item = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null); if (item) { this.actionTarget = { ...item }; this.actionIndex = 0; this.walkthroughActionOrigin = true; this.mode = 'inbox-action'; this.showInboxAction() } }
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
@@ -561,8 +723,9 @@ export class OpenAGIG2App {
   // Supervisor: press and hold to talk to the supervisor, let go to
   // send (no review step). Anywhere else a hold stays a plain tap.
   holdStart(): boolean {
-    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
+    if (this.exited || this.exitDialogOpening || this.displaySleeping || this.homeMode !== 'supervisor' || !['home', 'status', 'answer', 'thinking', 'walkthrough', 'inbox', 'inbox-detail', 'inbox-action'].includes(this.mode)) return false
     if (this.navigationBusy || this.microphoneOpening || this.askStarting || this.requestController) return false
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.pushToTalk = true; this.releasePending = false; this.lastTapAt = Date.now(); this.clearNotice()
     void this.startAsk().then(() => { if (this.releasePending) { this.releasePending = false; void this.releaseToSend() } })
     return true
@@ -595,7 +758,10 @@ export class OpenAGIG2App {
     if (this.exited || this.displaySleeping) return
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }
     this.clearNotice()
-    if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
+    if (this.mode === 'cue') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showCuePage() }
+    else if (this.mode === 'walkthrough') void this.supervisorWalkthroughAction(direction < 0 ? 'next' : 'back')
+    else if (this.mode === 'message' && this.walkthroughActionOrigin) void this.supervisorWalkthroughAction(direction < 0 ? 'next' : 'back')
+    else if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
     else if (this.mode === 'inbox-detail') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showInboxPage() }
     else if (this.mode === 'inbox-action') { this.actionIndex = Math.max(0, Math.min(this.inboxActions().length - 1, this.actionIndex - direction)); this.showInboxAction() }
     else if (this.mode === 'review') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showDraftPage() }
@@ -655,6 +821,7 @@ export class OpenAGIG2App {
   private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length, this.draftRecovery) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
+    if (this.mode === 'cue') { this.clearCue(); this.showHome(); return }
     if (this.exited) return
     // These are the same root screen in different connection/listening states.
     // Do not tear down on dialog-open: only SYSTEM_EXIT/ABNORMAL_EXIT confirms exit.
@@ -698,9 +865,14 @@ export class OpenAGIG2App {
     }
     if (this.mode === 'review') { this.showHome(); this.phone.set('Draft kept', 'Tap to return to your question. Discard on the phone to delete it.'); return }
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); return }
-    if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
+    if (this.mode === 'inbox-action') {
+      if (!this.actionTarget?.id) this.showHome()
+      else if (this.walkthroughActionOrigin) { this.walkthroughActionOrigin = false; this.showSupervisorWalkthrough() }
+      else { this.mode = 'inbox-detail'; this.showInboxPage() }
+      return
+    }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
-    if (this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
+    if (this.mode === 'walkthrough' || this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
     this.navigationBusy = true
     try {
       if (this.mode === 'listening') { this.stopLiveSpeech(); await this.audio.stop(); this.audioBuffer = null }
@@ -722,7 +894,7 @@ export class OpenAGIG2App {
       } catch (error) { this.phone.activity?.(`Shared conversation unavailable: ${safeOpenAGIError(error)} Showing answers saved on this phone.`) }
       if (request !== this.recentRequest || this.mode !== from || this.exited) return
     }
-    this.recentEntries = entries ?? this.store.snapshot().history.map((entry, local) => ({ question: entry.question, reply: entry.reply, local }))
+    this.recentEntries = entries ?? this.store.snapshot().history.flatMap((entry, local) => entry.thread === this.thread ? [{ question: entry.question, reply: entry.reply, local }] : [])
     this.showRecent(this.recentEntries.length - 1)
   }
   private showRecent(index: number): void {
@@ -739,6 +911,7 @@ export class OpenAGIG2App {
     this.pages = paginateText(plainAnswer(entry.reply || 'No answer yet.'), 260); this.phone.preview?.(plainAnswer(entry.reply)); this.showAnswer(0)
   }
   async systemExit(): Promise<void> {
+    this.stopCues()
     this.stopAudioWatch()
     this.cancelSpeechRecovery()
     this.clearNotice()
@@ -835,6 +1008,13 @@ export class OpenAGIG2App {
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
     const entry = this.store.snapshot().history[index]
     if (!entry) return
+    if (entry.thread === 'supervisor') {
+      // Read-only: a supervisor reply never moves the agent chat.
+      this.pages = paginateText(plainAnswer(entry.reply), 260); this.phone.paired(true); this.showAnswer(0)
+      this.phone.preview?.(entry.reply)
+      this.phone.set('Supervisor answer', `${entry.question} — Switch to Supervisor to ask the supervisor a follow-up.`)
+      return
+    }
     await this.store.update({ conversationId: entry.conversationId, continuation: entry.continuation })
     this.pages = paginateText(plainAnswer(entry.reply), 260); this.phone.paired(true); this.showAnswer(0)
     this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(entry.reply)
@@ -871,6 +1051,7 @@ export class OpenAGIG2App {
     await this.resumeListening()
   }
   async startAsk(): Promise<void> {
+    this.stopCues()
     if (this.askStarting) { this.flash('Microphone opening', 'One moment…'); return }
     this.askStarting = true
     try { await this.beginAsk() } finally { this.askStarting = false }
@@ -878,11 +1059,18 @@ export class OpenAGIG2App {
   }
   private startSupervisorVoice(): void {
     if (!this.store.snapshot().nodeToken) return
+    if (this.noticeTimer && this.lastPingedSupervisor?.supervisor) this.voiceTarget = { ...this.lastPingedSupervisor }
     this.clearNotice()
     this.renderer.autoSend?.(true)
-    if (this.mode.startsWith('inbox')) {
+    if (this.mode === 'walkthrough') {
+      const selected = this.walkthroughInboxItem(this.supervisorWalkthrough?.currentId ?? null)
+      this.voiceTarget = selected?.id ? { ...selected } : null
+    } else if (this.mode.startsWith('inbox')) {
       const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]
       this.voiceTarget = selected?.id ? { ...selected } : null
+    } else if (!this.voiceTarget && this.mode === 'home') {
+      const lead = this.proactive.items.find(i => i.supervisor && i.cardId)
+      if (lead) this.voiceTarget = { ...lead }
     }
     if (!this.supervisorVoice) this.supervisorVoice = this.voiceFactory({
       state: state => {
@@ -1049,6 +1237,7 @@ export class OpenAGIG2App {
     try { await this.store.update({ savedDraft: '' }) }
     catch (error) { this.phone.set('Question not sent', `Could not save delivery state: ${safeOpenAGIError(error)}`); return }
     if (this.requestController || this.exited) return
+    this.stopCues()
     const originalInput = input
     const target = this.voiceTarget; this.voiceTarget = null
     if (target && typeof input === 'string') {
@@ -1063,8 +1252,10 @@ export class OpenAGIG2App {
     const conversationId = this.store.snapshot().conversationId
     if (!conversationId) { this.fail(new Error('Start a conversation before asking.')); return }
     // Talk and Lifelog share the owner's agent conversation across devices;
-    // Supervisor mode talks to the supervisor's own thread.
-    const thread = this.thread
+    // Supervisor mode talks to the supervisor's own thread. A resumed request
+    // keeps the thread it was sent on.
+    const thread = recovery?.resume ? (this.store.snapshot().pendingRequest?.thread ?? 'agent') : this.thread
+    const answerer = thread === 'supervisor' ? 'The supervisor' : 'The agent'
     const controller = new AbortController()
     this.requestController = controller; this.mode = 'thinking'; this.pages = []; this.page = 0
     this.cancelConfirmation = false; this.activityView = false; this.activityLines = []; this.activityOffset = 0
@@ -1118,7 +1309,7 @@ export class OpenAGIG2App {
       received = result
       await this.store.update({ savedDraft: '' })
       this.phone.pendingQuestion?.(null); this.phone.draft?.(null)
-      await this.store.remember(result.question, result.reply)
+      await this.store.remember(result.question, result.reply, thread)
       this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(plainAnswer(result.reply))
       this.pages = paginateText(plainAnswer(result.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
       this.phone.set('Answer ready', `${this.pages.length} page${this.pages.length === 1 ? '' : 's'} on G2`)
@@ -1130,11 +1321,11 @@ export class OpenAGIG2App {
         // discard the completed answer or offer to repeat completed actions.
         this.phone.preview?.(plainAnswer(received.reply))
         this.pages = paginateText(plainAnswer(received.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
-        this.phone.set('Answer received · local update failed', `${safeOpenAGIError(error)} The agent already completed this question. Do not resend to retry saving history.`)
+        this.phone.set('Answer received · local update failed', `${safeOpenAGIError(error)} ${answerer} already completed this question. Do not resend to retry saving history.`)
         this.phone.activity?.(`Answer received; local update failed: ${safeOpenAGIError(error)}`)
       } else if (rejected) this.fail(error)
       else if (partial) {
-        await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`).catch(() => undefined)
+        await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`, thread).catch(() => undefined)
         this.phone.history?.(this.store.snapshot().history)
         this.phone.preview?.(`Incomplete answer:\n${plainAnswer(partial)}`)
         this.pages = paginateText(`Incomplete answer:\n${plainAnswer(partial)}`, 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
@@ -1158,11 +1349,17 @@ export class OpenAGIG2App {
   private renderHome(items = this.proactive.items): void {
     const state = this.store.snapshot()
     this.renderer.autoSend?.(state.homeMode === 'supervisor' || state.autoSend)
-    if (state.homeMode === 'supervisor') this.renderer.supervisorHome(items.filter(i => i.supervisor).length)
+    if (state.homeMode === 'supervisor') {
+      const supItems = items.filter(i => i.supervisor)
+      const lead = supItems[0]
+      this.renderer.supervisorLead?.(lead?.pmBrief ? `${plainAnswer(lead.title)}\n${plainAnswer(lead.pmBrief)}` : null)
+      this.renderer.supervisorHome(supItems.length)
+    }
     else if (state.homeMode === 'lifelog') this.renderer.lifelogHome?.(this.lifelogState === 'off' ? 'starting' : this.lifelogState, this.lifelogDetail)
     else this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined))
   }
   private showHome(): void {
+    this.walkthroughActionOrigin = false
     this.phone.history?.(this.store.snapshot().history)
     const state = this.store.snapshot(); if (!state.nodeToken) { this.showUnpaired(); return }
     this.proactive.start()
@@ -1209,6 +1406,7 @@ export class OpenAGIG2App {
     } finally { this.microphoneOpening = false }
   }
   private async stopAmbient(reason?: string): Promise<void> {
+    this.stopCues()
     this.ambientEpoch++
     this.proactive.suspendMemory(reason)
     this.stopLiveSpeech()
@@ -1261,6 +1459,7 @@ export class OpenAGIG2App {
         if (this.liveSpeech !== speech || this.exited) return
         if (ambient) this.lastAmbientSpeechAt = Date.now()
         this.phone.transcript?.(text)
+        if (ambient) this.renderer.liveTranscript?.(text)
         this.phone.speechTiming?.(`${final ? 'Final segment' : 'Live words'} · audio backlog ~${lagMs}ms`)
         if (firstTranscript) { firstTranscript = false; this.phone.activity?.(`First speech text ${(Date.now() - started) / 1000}s after connecting`) }
         // Bound native display writes; don't steal pages from an answer or request.
@@ -1275,7 +1474,7 @@ export class OpenAGIG2App {
       },
       // Lifelog never turns overheard speech into a question: talking to the
       // agent is always an explicit tap.
-      utterance: () => undefined,
+      utterance: text => { if (ambient && this.ambientRunning && this.liveSpeech === speech && !this.exited) void this.requestLiveCue(text) },
       error: error => {
         if (this.liveSpeech !== speech || this.exited) return
         if (ambient && this.recoveringSpeech) { this.recoveryFailure = error; return }
@@ -1356,6 +1555,8 @@ export class OpenAGIG2App {
         this.phone.transcript?.(result.question)
         this.lastAmbientSpeechAt = Date.now()
         this.proactive.capture(result.question)
+        this.renderer.liveTranscript?.(result.question)
+        void this.requestLiveCue(result.question)
         this.listeningPulse()
       }
     } catch (error) { await this.pauseAmbientWithError(error) }

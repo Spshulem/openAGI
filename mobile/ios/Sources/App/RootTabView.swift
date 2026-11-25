@@ -97,18 +97,46 @@ struct RootTabView: View {
         }
         .task {
             if runsBackgroundServices { model.startEventStream() }
-            await model.refreshInboxCounts()
+            await model.refreshData()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
+            switch phase {
+            case .active:
+                // A `/events` socket iOS cut while suspended can look open for
+                // up to its hour-long timeout; reconnect, and its `hello`
+                // refreshes the open chats again.
+                if runsBackgroundServices { model.startEventStream() }
+                model.conversations.resumeOpenChats()
                 Task { await model.refreshData() }
+            case .background:
+                model.conversations.enterBackground()
+                model.stopEventStream()
+            default:
+                break
             }
         }
         .task { if runsBackgroundServices { await PushRegistrar.shared.start() } }
         .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in
             guard wants else { return }
-            model.selectedTab = .supervisor
+            if let qid = PushRouter.shared.pendingQuestionID {
+                model.requestedFocusCardID = qid
+                model.requestedOpenContextCardID = qid
+                PushRouter.shared.pendingQuestionID = nil
+            }
+            if let tk = PushRouter.shared.pendingThreadKey {
+                model.requestedOpenThreadKey = tk
+                PushRouter.shared.pendingThreadKey = nil
+            }
+            model.bumpFleetGeneration()
+            model.requestedChatThread = .supervisor
+            model.selectedTab = .chat
             PushRouter.shared.wantsSupervisor = false
+        }
+        .onChange(of: model.selectedTab, initial: true) { _, nextTab in
+            if nextTab == .supervisor {
+                model.requestedChatThread = .supervisor
+                model.selectedTab = .chat
+            }
         }
         .onChange(of: PushRouter.shared.wantsTab, initial: true) { _, tab in
             guard let tab else { return }
@@ -127,49 +155,51 @@ struct RootTabView: View {
         @Bindable var model = model
         return TabView(selection: $model.selectedTab) {
             Tab("Today", systemImage: "sun.max", value: AppTab.today) {
-                workspace { TodayView(onRevoked: onRevoked) }
+                withSupportingChat(TodayView(onRevoked: onRevoked))
             }
             Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) {
-                workspace { TasksView() }
+                withSupportingChat(TasksView())
             }
             Tab("Inbox", systemImage: "tray", value: AppTab.inbox) {
-                workspace { InboxView() }
+                withSupportingChat(InboxView())
             }.badge(model.inboxBadgeCount)
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) { ChatView() }
-            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
-                workspace { SupervisorView(showsInlineChat: false) }
-            }
         }
         // iOS 27.1 places the system tab and navigation bars around Duo's
         // status bar and camera. Keep this same hierarchy across every pose
         // so each destination retains its own NavigationStack and state.
     }
 
-    private func workspace<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        WorkspaceWithChat(chatPaneOpen: $chatPaneOpen, content: content())
+    // The supporting chat splits a tab's own content, never the TabView: the
+    // tab rail then always spans the window. Wrapping the whole TabView put
+    // it in the left page on Today/Tasks/Inbox and the full window on Chat
+    // and Supervisor, so on an unfolded Duo the rail jumped between the
+    // hinge and the edge as tabs changed. Chat and Supervisor have no pane:
+    // they are a conversation already.
+    private func withSupportingChat<Content: View>(_ content: Content) -> some View {
+        WorkspaceWithChat(chatPaneOpen: $chatPaneOpen, showsChatPane: true, content: content)
     }
 }
 
 private struct WorkspaceWithChat<Content: View>: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.layoutDirection) private var layoutDirection
     @Binding var chatPaneOpen: Bool
+    let showsChatPane: Bool
     let content: Content
 
-    private var supportsChatPane: Bool {
-        horizontalSizeClass == .regular && verticalSizeClass != .compact
-    }
-
     var body: some View {
-        HStack(spacing: 0) {
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .environment(\.workspaceChatToggle, supportsChatPane ? $chatPaneOpen : nil)
-            if supportsChatPane && chatPaneOpen {
-                Divider()
-                ChatView(onClose: { chatPaneOpen = false })
-                    .containerRelativeFrame(.horizontal) { width, _ in min(480, max(300, width * 0.4)) }
-                    .accessibilityIdentifier("supporting-chat-pane")
+        GeometryReader { geometry in
+            let division = DuoLayout.division(in: geometry, layoutDirection: layoutDirection)
+            let supportsChat = division != nil || (horizontalSizeClass == .regular && geometry.size.width >= 700)
+            WorkspaceLayout(division: division, rightToLeft: layoutDirection == .rightToLeft) {
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .environment(\.workspaceChatToggle, supportsChat ? $chatPaneOpen : nil)
+                if supportsChat && showsChatPane && chatPaneOpen {
+                    ChatView(onClose: { chatPaneOpen = false })
+                        .accessibilityIdentifier("supporting-chat-pane")
+                }
             }
         }
     }

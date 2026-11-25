@@ -70,6 +70,9 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let title: String?
   let workspace: String?
   let repo: String?
+  let project: String?
+  let host: String?
+  let cwd: String?
   let state: String?
   let prRef: String?
   let prURL: String?
@@ -90,23 +93,32 @@ struct FleetThread: Decodable, Equatable, Identifiable {
   let decision: FleetDecision?
   let pushPreview: FleetDecision?
   let pushing: Bool
+  let nextCheckAt: String?
+  let actorLabel: String?
+  let subchannel: String?
+  let labels: [String]
 
   var id: String { key }
 
   enum CodingKeys: String, CodingKey {
-    case key, title, workspace, repo, state, pr, lastActivityAt, lastAgentAt, watch
+    case key, title, workspace, repo, project, host, cwd, state, pr, lastActivityAt, lastAgentAt, watch
     case lastAgentText, lastOwnerAt, muted, openChat, decision, pushPreview, pushing
+    case nextCheckAt, actorLabel, subchannel, labels
   }
   private enum PRKeys: String, CodingKey { case ref, url }
 
-  init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, state: String? = nil,
+  init(key: String, title: String? = nil, workspace: String? = nil, repo: String? = nil, project: String? = nil, host: String? = nil, cwd: String? = nil, state: String? = nil,
        prRef: String? = nil, prURL: String? = nil, lastActivityAt: String? = nil, lastAgentAt: String? = nil,
        watch: FleetWatch?, pr: FleetPR? = nil, lastAgentText: String? = nil, lastOwnerAt: String? = nil,
-       muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil, pushPreview: FleetDecision? = nil, pushing: Bool = false) {
+       muted: String? = nil, openChat: FleetOpenChat? = nil, decision: FleetDecision? = nil, pushPreview: FleetDecision? = nil, pushing: Bool = false,
+       nextCheckAt: String? = nil, actorLabel: String? = nil, subchannel: String? = nil, labels: [String] = []) {
     self.key = key
     self.title = title
     self.workspace = workspace
     self.repo = repo
+    self.project = project
+    self.host = host
+    self.cwd = cwd
     self.state = state
     self.prRef = prRef
     self.prURL = prURL
@@ -121,6 +133,10 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     self.decision = decision
     self.pushPreview = pushPreview
     self.pushing = pushing
+    self.nextCheckAt = nextCheckAt
+    self.actorLabel = actorLabel
+    self.subchannel = subchannel
+    self.labels = labels
   }
 
   /// Only `key` is required. A daemon that sends no watch key at all predates
@@ -132,6 +148,9 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     title = try? c.decodeIfPresent(String.self, forKey: .title)
     workspace = try? c.decodeIfPresent(String.self, forKey: .workspace)
     repo = try? c.decodeIfPresent(String.self, forKey: .repo)
+    project = try? c.decodeIfPresent(String.self, forKey: .project)
+    host = try? c.decodeIfPresent(String.self, forKey: .host)
+    cwd = try? c.decodeIfPresent(String.self, forKey: .cwd)
     state = try? c.decodeIfPresent(String.self, forKey: .state)
     let prKeys = try? c.nestedContainer(keyedBy: PRKeys.self, forKey: .pr)
     prRef = (try? prKeys?.decodeIfPresent(String.self, forKey: .ref)) ?? nil
@@ -146,6 +165,10 @@ struct FleetThread: Decodable, Equatable, Identifiable {
     decision = try? c.decodeIfPresent(FleetDecision.self, forKey: .decision)
     pushPreview = try? c.decodeIfPresent(FleetDecision.self, forKey: .pushPreview)
     pushing = (try? c.decodeIfPresent(Bool.self, forKey: .pushing)) ?? false
+    nextCheckAt = try? c.decodeIfPresent(String.self, forKey: .nextCheckAt)
+    actorLabel = try? c.decodeIfPresent(String.self, forKey: .actorLabel)
+    subchannel = try? c.decodeIfPresent(String.self, forKey: .subchannel)
+    labels = (try? c.decodeIfPresent([String].self, forKey: .labels)) ?? []
     if c.contains(.watch), (try? c.decodeNil(forKey: .watch)) == true {
       watch = nil
     } else if let decoded = try? c.decodeIfPresent(FleetWatch.self, forKey: .watch) {

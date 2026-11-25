@@ -16,13 +16,15 @@ const playbooks = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR });
 const config = { mode: "auto", selfSessionIds: [], limits: { ...DEFAULTS } };
 
 function makeThread(overrides = {}) {
+  const { meta: providedMeta, ...rest } = overrides;
+  const meta = rest.kind === "codex" ? { source: "cli", ...(providedMeta ?? {}) } : (providedMeta ?? {});
   return {
     key: "conductor:s1", kind: "conductor", id: "s1", title: "Fix billing", cwd: "/work/madrid", repo: "acme/app",
     branch: "spencer/fix", workspace: "madrid", claudeSessionId: "c1", agentStatus: "idle",
     lastActivityAt: ago(30 * MIN), lastAgentText: "Pushed the fix.", lastAgentAt: ago(30 * MIN),
     lastUserText: "continue", lastUserAt: ago(60 * MIN), error: null, openTasks: [], prRefs: ["acme/app#6522"],
     live: { peerName: "madrid-1a", pid: 42, status: "idle" }, writerLocked: false, archived: false, excluded: null,
-    meta: {}, ...overrides
+    meta, ...rest
   };
 }
 
@@ -118,6 +120,45 @@ test("row: logged-out and disk-full ask the owner at once", () => {
     assert.equal(decision.message, null);
     assert.ok(decision.question.title.length <= 100);
   }
+});
+
+const AUTH_NOT_FOUND = "[System Error] unexpected status 503 Service Unavailable: auth_not_found: no auth available (providers=codex, model=gpt-6.2-sol)";
+
+test("row: provider-auth asks the owner and never resumes, however long or often it fails", () => {
+  const thread = makeThread({ agentStatus: "error", lastAgentAt: ago(2 * MIN), lastActivityAt: ago(2 * MIN), error: { kind: "provider-auth", text: AUTH_NOT_FOUND, resetAt: null } });
+  const mark = { head: HEAD, unresolved: 0 };
+  const ledgers = [{}, { lastNudgeAt: ago(20 * MIN), attemptsWithoutProgress: 1, lastProgressMark: mark, nudges: [] }, { lastNudgeAt: ago(90 * MIN), attemptsWithoutProgress: 3, lastProgressMark: mark, nudges: [] }];
+  const keys = new Set();
+  for (const now of [NOW, NOW + 6 * MIN, NOW + 40 * MIN, NOW + 6 * 60 * MIN]) {
+    for (const ledger of ledgers) {
+      const { classified, decision } = run(thread, { now, ledger });
+      assert.equal(classified.infraKind, "provider-auth");
+      assert.equal(decision.action, "ask-user");
+      assert.equal(decision.message, null, "nothing is sent to the chat");
+      assert.notEqual(decision.playbook, "resume");
+      assert.match(decision.reason, /provider auth missing \(providers=codex, model=gpt-6\.2-sol\)/);
+      keys.add(decision.question.dedupeKey);
+    }
+  }
+  assert.equal(keys.size, 1, "one question per distinct failure");
+  const { decision } = run(thread);
+  assert.deepEqual(decision.question.options, ["retry", "later"]);
+  assert.equal(decision.question.kind, "infra");
+  assert.match(decision.question.title, /no codex auth on the proxy/);
+  assert.ok(decision.question.title.length <= 100);
+  assert.match(decision.question.body, /gpt-6\.2-sol/);
+  assert.doesNotMatch(`${decision.question.title} ${decision.question.body}`, /System Error|503/);
+  // A different provider or model is a different failure.
+  const other = makeThread({ ...thread, error: { ...thread.error, text: AUTH_NOT_FOUND.replace("gpt-6.2-sol", "gpt-6-luna") } });
+  assert.notEqual(run(other).decision.question.dedupeKey, decision.question.dedupeKey);
+});
+
+test("row: a genuine 503 overload still backs off and resumes", () => {
+  const thread = makeThread({ agentStatus: "error", lastAgentAt: ago(2 * MIN), lastActivityAt: ago(2 * MIN), error: { kind: "overloaded", text: "unexpected status 503 Service Unavailable", resetAt: null } });
+  assert.equal(run(thread).decision.action, "wait");
+  const after = run(thread, { now: NOW + 4 * MIN }).decision;
+  assert.equal(after.action, "nudge");
+  assert.equal(after.playbook, "resume");
 });
 
 test("row: waiting-ci watches, then sends CI finished on the exact head", () => {
@@ -487,6 +528,22 @@ test("chooseRoute follows the delivery table", () => {
   assert.equal(chooseRoute({ ...codex, meta: { originator: "Codex Desktop" } }, "auto"), null);
   assert.equal(chooseRoute({ ...codex, meta: { originator: null, source: "vscode" } }, "auto"), null, "an older catalog row of the app's");
   assert.equal(chooseRoute({ ...codex, meta: { originator: "codex_exec", source: "exec" } }, "auto"), "codex-exec");
+  assert.equal(chooseRoute({ ...codex, meta: {} }, "auto"), null, "missing ownership metadata fails closed");
+  assert.equal(chooseRoute({ ...codex, meta: { originator: "codex_cli_rs", source: "vscode" } }, "auto"), null, "a CLI-like originator does not undo app protection");
+});
+
+test("unknown Codex ownership cannot fall back to exec when the app is unavailable", () => {
+  for (const meta of [undefined, null, {}, { source: null }, { source: "future-app" }, { originator: "codex_cli_rs" }]) {
+    const thread = { ...makeThread({ kind: "codex", id: "t1", live: null }), meta };
+    for (const delivery of [
+      "cli",
+      { mode: "computer-use-first", ready: false },
+      { mode: "computer-use-first", ready: true, apps: { "com.openai.codex": false } }
+    ]) {
+      assert.equal(chooseRoute(thread, "auto", delivery), null, JSON.stringify({ meta, delivery }));
+    }
+    assert.equal(chooseRoute(thread, "auto", { mode: "computer-use", ready: true }), "computer-use", "verified app delivery remains available");
+  }
 });
 
 test("chooseRoute honours OPENAGI_FLEET_DELIVERY: computer-use never picks a CLI route", () => {

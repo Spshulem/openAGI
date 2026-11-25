@@ -1,0 +1,22 @@
+{
+  "platform": "win32",
+  "release": "v0.0.66",
+  "checks": [
+    "Published CMD launcher boots with spaces in path and no Node/npm on PATH",
+    "Fresh Windows browser opens deterministic model wizard",
+    "Failed model connection remains recoverable and saves no configuration",
+    "Windows setup verifies Chat Completions fixture and saves configuration",
+    "Guided onboarding draft sends and displays fixture-backed chat reply",
+    "CMD restart preserves setup, browser access and saved conversation"
+  ],
+  "observations": [
+    {
+      "name": "390px chat width (outside Windows desktop acceptance)",
+      "viewport": 390,
+      "document": 394,
+      "overflow": true
+    }
+  ],
+  "fixtureRequests": 2,
+  "inference": "deterministic local HTTP fixture; not real model inference"
+}

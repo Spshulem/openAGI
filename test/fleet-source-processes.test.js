@@ -93,12 +93,12 @@ test("a laptop command naming bb-verify or bb-quick, or run under an ssh session
 test("findLocalHeavyVerification honours minAgeSec and scrubs secrets", async () => {
   const psOut = [
     "  10     1    00:10 pnpm verify:pr --base a",
-    "  11     1    05:00 GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 pnpm verify:pr --base a"
+    "  11     1    05:00 GITHUB_TOKEN=" + "ghp_" + "a".repeat(40) + " pnpm verify:pr --base a"
   ].join("\n");
   const { run } = fakeRun({ psOut });
   const found = await findLocalHeavyVerification(config, { run, minAgeSec: 60 });
   assert.deepEqual(found.map((row) => row.pid), [11]);
-  assert.doesNotMatch(found[0].command, /ghp_abcdefghijklmnop/);
+  assert.doesNotMatch(found[0].command, /ghp_a{40}/);
   const all = await findLocalHeavyVerification(config, { run, minAgeSec: 0 });
   assert.deepEqual(all.map((row) => row.pid).sort(), [10, 11]);
 });

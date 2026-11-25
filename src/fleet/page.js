@@ -4,13 +4,15 @@
 // literal), no inline on* handlers (CSP), and every piece of dynamic data is
 // rendered with textContent. Client code uses plain string concatenation.
 
+import { navigationLinks, shellStyles } from "../app-shell.js";
+import { codingSessionUi } from "../coding-session-ui.js";
 import { DEFAULTS } from "./contracts.js";
 
 export const fleetPage = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0e1411">
-<title>Fleet - OpenAGI</title>
+<title>Supervisor - OpenAGI</title>
 <style>
 :root{color-scheme:dark;--bg:#0e1411;--surface:#141d18;--raise:#1b2721;--line:#27372e;--text:#e6efe9;--soft:#c3d2c9;--muted:#8fa397;--accent:#6fe1b1;--ink:#05110b;--warn:#f0c36a;--hot:#ff8f7e}
 *{box-sizing:border-box}
@@ -83,40 +85,106 @@ details.thread>summary{padding:0}
 a.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text)}
 a.btn.primary{color:var(--ink)}
 .risk{margin:10px 0 0;font-size:14px;font-weight:650;color:var(--hot)}
+.admin{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.admin p{margin:6px 0 0;font-size:14px}.admin code{word-break:break-all}.btn.hot{border-color:var(--hot);color:var(--hot)}
 .chats{display:grid;gap:6px;margin-top:10px;font-size:14px;color:var(--soft)}
 .chats div{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
 .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .item .acts .btn{margin:0;width:auto;flex:1 1 auto}
 .ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
+.settings{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--raise)}
+.settings h4{margin:0 0 8px;font-size:15px}.settings label{display:block;margin-top:9px;font-size:13px;color:var(--muted)}
+.settings select{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+.settings .note{margin:8px 0 0}.settings .acts{margin-top:10px}
 .ask .t{display:block}
+.chat{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.chat .log{max-height:420px;overflow:auto}
+.said{margin-top:8px}
+.said.you .quote{border-left-color:var(--accent)}
+details.chatwrap{margin-top:14px}
+details.chatwrap>summary{display:flex;align-items:center;justify-content:center}
+textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--raise);color:var(--text);font:inherit;resize:vertical}
 @media (prefers-reduced-motion:no-preference){.card{transition:box-shadow .4s ease,border-color .4s ease}}
 @media (min-width:700px){.wrap{padding-top:32px}.opts{grid-template-columns:repeat(2,1fr)}.opts .btn.ghost{grid-column:1/-1}}
+/* SHARED_SHELL_STYLES */
+:root { --surface:var(--panel); --raise:var(--panel-2); --soft:var(--text); --ink:var(--primary-foreground); --hot:var(--err); }
+.fleet-shell { min-height:100dvh; }
+.fleet-shell .app-navigation { position:sticky; top:0; height:100dvh; }
+.fleet-workspace { display:block; }
+.fleet-workspace>.workspace-header { display:flex; align-items:center; border-bottom:1px solid var(--line); }
+.wrap { max-width:1050px; width:100%; padding:28px; }
+.wrap>.fleet-controls { padding:0; display:block; background:transparent; }
+.top h1 { font-size:24px; }
+.wrap h2 { font-size:19px; }
+.wrap .hint,.wrap .empty { font-size:14px; }
+#codingList { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+#codingList .card { margin:0; }
+#codingList details { margin:10px 0; padding:8px 0; border:0; }
+#codingDetail pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
+.infra-details { margin-top:28px; border-top:1px solid var(--line); padding-top:18px; }
+.infra-details summary { cursor:pointer; color:var(--muted); }
+@media(max-width:760px) { .fleet-shell .app-navigation { position:fixed; height:auto; } .wrap { padding:20px 16px; } }
 </style></head>
-<body><div class="wrap">
-<header>
-  <div class="top"><h1>Fleet</h1><button id="scan" class="btn primary" type="button">Scan now</button></div>
-  <div class="seg" role="group" aria-label="Mode">
+<body><div class="app fleet-shell">
+<!-- SHARED_NAVIGATION -->
+<div class="workspace fleet-workspace">
+<header class="workspace-header"><button type="button" id="menuToggle" aria-label="Toggle navigation" aria-controls="appNavigation" aria-expanded="false">☰</button><h1>Supervisor</h1></header>
+<div class="wrap coding-pane">
+<section class="fleet-controls" aria-label="Supervisor controls">
+  <div class="top"><button id="scan" class="btn primary" type="button">Scan now</button></div>
+  <p class="hint">Follow your coding work and review what needs you. Replies to managed sessions always require approval.</p>
+  <p id="lastError" class="lasterr"></p>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+  <a id="reconnect" href="/?tab=nodes" target="_blank" rel="noopener noreferrer" hidden>Connection settings</a>
+</section>
+<main>
+  <section aria-labelledby="managedH"><div class="top"><h2 id="managedH">Managed sessions</h2><a class="btn" href="/?tab=coding-agents">Coding setup →</a></div>
+    <p class="hint">Sessions you start through OpenAGI. Inspect a reply, or watch for the next response.</p>
+    <p id="codingStatus" role="status">Loading managed sessions…</p><div id="codingList"></div><section id="codingDetail" aria-label="Selected session"></section>
+  </section>
+  <section aria-labelledby="otherH"><h2 id="otherH">Other coding conversations</h2>
+    <p class="hint">Discover existing Codex, Claude Code and other supported app conversations on the supervisor computer.</p>
+  <div class="seg" role="group" aria-label="Mode for other coding conversations">
     <button id="mode-observe" type="button" data-mode="observe" aria-pressed="false">Observe</button>
     <button id="mode-propose" type="button" data-mode="propose" aria-pressed="false">Propose</button>
     <button id="mode-auto" type="button" data-mode="auto" aria-pressed="false">Auto</button>
   </div>
   <p id="modeHint" class="hint"></p>
   <div class="meta"><span id="scanned">Loading</span><span id="timer"></span><a href="/">Dashboard</a></div>
-  <p id="lastError" class="lasterr"></p>
-  <p id="status" class="status" role="status" aria-live="polite"></p>
-</header>
-<main>
+  <p class="hint"><a href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md" target="_blank" rel="noopener noreferrer">About automatic scans and supported apps ↗</a></p></section>
   <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div>
     <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
-  <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
-  <section aria-labelledby="fleetH"><h2 id="fleetH">Watching <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
-  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section>
+  <section aria-labelledby="fleetH"><h2 id="fleetH">In progress <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
+  <details class="infra-details"><summary>Advanced system diagnostics</summary><section aria-labelledby="infraH"><h2 id="infraH">System status</h2><div id="infraStrip" class="strip"></div></section>
+  <section aria-labelledby="fixesH"><h2 id="fixesH">Self-fixes</h2><div id="self-fixes"></div></section></details>
 </main>
-</div>
+</div></div></div>
 <script>
 (function () {
   'use strict';
+  /* SHARED_CODING_CONTROLS */
+  function fetchJson(path) { return api(path); }
+  function postJson(path, body) { return api(path, body); }
+  function switchTab(tab) { window.location.href = '/?tab=' + encodeURIComponent(tab); }
+  var managedSignature = null;
+  var managedLoading = false;
+  async function loadManagedSessions() {
+    if (managedLoading) return;
+    managedLoading = true;
+    try {
+      var snapshot = await api('/coding-agents');
+      var signature = JSON.stringify([snapshot.sessions || [], snapshot.watches || [], snapshot.error || null]);
+      if (signature !== managedSignature) {
+        managedSignature = signature;
+        renderCodingSessionCards(snapshot, loadManagedSessions);
+      }
+      $('codingStatus').textContent = snapshot.error || snapshot.warning || ((snapshot.sessions || []).length ? 'Replies and actions require your approval.' : 'No managed sessions yet. Open Coding setup to connect a CLI and choose a project.');
+    } catch (error) {
+      $('codingStatus').textContent = 'Managed sessions could not be loaded. ' + error.message;
+      managedSignature = null;
+      $('codingList').replaceChildren();
+    } finally { managedLoading = false; }
+  }
   var POLL_MS = 30000;
   var BUSY_POLL_MS = 5000;
   // Policy's limits, filled in from DEFAULTS below: an admitted run is slow
@@ -141,7 +209,7 @@ a.btn.primary{color:var(--ink)}
     done: 'dim', excluded: 'dim'
   };
   var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true, quiet: true };
-  // Watching: what the supervisor watches each thread for (snapshot watch.group).
+  // In progress: what the supervisor watches each thread for (snapshot watch.group).
   var WATCH_ORDER = ['you', 'working', 'waiting', 'push', 'blocked', 'quiet'];
   var WATCH_LABEL = {
     you: 'Waiting on you', working: 'Working', waiting: 'Waiting on CI or BuildBot3', push: 'Needs a push',
@@ -165,10 +233,16 @@ a.btn.primary{color:var(--ink)}
   var openThreads = new Set();
   var groupOpen = new Map();
   var cards = new Map();
+  // question id -> { plan, consent }: an Admin Merge preview the owner is
+  // reading. Polling re-renders keep showing it until Cancel, confirm, or
+  // the consent expires.
+  var adminPreviews = new Map();
   // Expanded rows: thread key -> { at, thread, error } from the detail route,
   // and the function that repaints that row once its detail arrives.
   var details = new Map();
   var detailLoading = new Set();
+  // Thread key -> the functions that repaint what shows its detail (its row,
+  // a question card's chat).
   var painters = new Map();
   var DETAIL_TTL_MS = 20000;
   var MUTE_HOURS = 24;
@@ -316,7 +390,7 @@ a.btn.primary{color:var(--ink)}
     var data = null;
     try { data = await res.json(); } catch (e) { data = null; }
     if (!res.ok) {
-      var message = res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
+      var message = data && data.error === 'main-pairing-required' ? 'Reconnect this desktop to your agent to see the same work as your phone. Your phone connection is unchanged.' : res.status === 401 ? 'Signed out. Reload to sign in.' : ((data && data.error) || ('Request failed (' + res.status + ').'));
       var err = new Error(message);
       err.status = res.status;
       err.data = data;
@@ -350,7 +424,9 @@ a.btn.primary{color:var(--ink)}
       b.setAttribute('aria-pressed', current && current.mode === m ? 'true' : 'false');
       b.disabled = modeBusy;
     });
-    $('modeHint').textContent = current ? (MODE_HINT[current.mode] || '') : '';
+    $('modeHint').textContent = !current ? ''
+      : current.modeConfirmed === false ? (current.mode ? 'Last reported mode. Waiting for the fleet computer.' : 'Waiting for the fleet computer.')
+      : (MODE_HINT[current.mode] || '');
   }
 
   function renderHeader(s) {
@@ -365,6 +441,7 @@ a.btn.primary{color:var(--ink)}
   // ─── needs you ───────────────────────────────────────────────────────────
 
   function renderNeeds(questions, byKey) {
+    questions = (questions || []).filter(function (q) { return q && q.needsYou !== false; });
     var box = $('needsList');
     box.replaceChildren();
     cards.clear();
@@ -374,7 +451,8 @@ a.btn.primary{color:var(--ink)}
       var card = el('article', 'card', null, box);
       card.dataset.id = q.id;
       cards.set(q.id, card);
-      el('h3', null, q.title || 'Question', card);
+      el('h3', null, q.decisionHeadline || q.title || 'Question', card);
+      if (q.decisionFact) el('p', 'note', q.decisionFact, card);
       var ctx = el('div', 'ctx', null, card);
       var t = q.threadKey ? byKey.get(q.threadKey) : null;
       // In which chat (workspace and app), else the thread's workspace.
@@ -393,11 +471,13 @@ a.btn.primary{color:var(--ink)}
       // Answered only in the agent's app: the way there comes first.
       if (inApp) openChatLink(q.openChat, 'btn primary', opts);
       answerButtons(q, opts, !inApp);
+      adminMergeOffer(q, t && t.pr, card);
       if (inApp) {
         el('p', 'note', appNote(q), card);
       } else if (q.kind === 'agent-ask') {
         el('p', 'note', 'Your answer goes to the agent.', card);
       }
+      cardChat(q, card);
     });
   }
 
@@ -405,6 +485,8 @@ a.btn.primary{color:var(--ink)}
   // so and shows all of it, the agent's own message too, before any button.
   function askText(q, parent) {
     if (q.risky) el('p', 'risk', 'Risky: read all of it before you answer.', parent);
+    // Its earlier reply never reached the agent (or was not confirmed).
+    if (q.deliveryNote) el('p', 'warn', q.deliveryNote, parent);
     if (q.body) el('p', null, q.body, parent);
     var plan = q.meta && q.meta.plan;
     if (plan) {
@@ -453,6 +535,79 @@ a.btn.primary{color:var(--ink)}
     });
     buttons.push(button('Dismiss', 'btn ghost', parent, function () { return decide(q, { dismiss: true }, buttons); }));
     return buttons;
+  }
+
+  // Admin Merge: offered only on an open PR GitHub reports as held by its
+  // required review. Ordinary answers never bypass anything; this is a
+  // separate, deliberate step. Preview (read-only) shows what would be
+  // waived and the exact repo, PR, and head; only then can the owner confirm.
+  function adminMergeOffer(q, pr, card) {
+    if (!q.prRef || !pr || String(q.prRef).toLowerCase() !== String(pr.ref || '').toLowerCase()) return;
+    var up = function (v) { return String(v || '').toUpperCase(); };
+    if (up(pr.state) !== 'OPEN' || pr.isDraft || up(pr.mergeState) !== 'BLOCKED' || up(pr.reviewDecision) !== 'REVIEW_REQUIRED') return;
+    var box = el('div', 'admin', null, card);
+    var open = adminPreviews.get(q.id);
+    if (open && Date.parse(open.consent.expiresAt) > Date.now()) { adminPlan(q, box, open.plan, open.consent); return; }
+    adminPreviews.delete(q.id);
+    el('p', 'note', 'GitHub holds this PR for a required review. Merge will not bypass that.', box);
+    var b = button('Admin Merge…', 'btn ghost', box, function () { return adminPreview(q, box, b); });
+  }
+
+  function adminPath(q) { return '/fleet/api/cards/' + encodeURIComponent(q.id) + '/admin-merge'; }
+
+  async function adminPreview(q, box, b) {
+    b.disabled = true;
+    try {
+      var r = await api(adminPath(q), { preview: true });
+      var res = r && r.result;
+      if (!res || !res.ok || !res.plan || !res.consent) {
+        b.disabled = false;
+        say('Admin Merge not available: ' + ((res && res.detail) || 'no preview returned.'), true);
+        return;
+      }
+      adminPreviews.set(q.id, { plan: res.plan, consent: res.consent });
+      adminPlan(q, box, res.plan, res.consent);
+    } catch (e) {
+      b.disabled = false;
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
+  }
+
+  function adminPlan(q, box, plan, consent) {
+    box.replaceChildren();
+    el('p', 'risk', 'Admin Merge uses your GitHub admin bypass. Read all of it before you confirm.', box);
+    var what = el('p', null, 'Squash-merge ' + plan.repo + '#' + plan.number + ' into ' + plan.baseRef + ' at head ', box);
+    el('code', null, plan.headSha, what);
+    if (plan.githubLogin) el('p', 'note', 'As GitHub user ' + plan.githubLogin + '.', box);
+    el('p', 'k', 'Waives only:', box);
+    (plan.waives || []).forEach(function (w) { el('p', null, '• ' + w.label + ': ' + w.detail, box); });
+    el('p', 'k', 'Still enforced:', box);
+    (plan.stillEnforced || []).forEach(function (line) { el('p', null, '• ' + line, box); });
+    el('p', 'note', 'GitHub decides whether your identity may bypass the review. If it refuses, you will see its exact answer. Nothing is deployed. Confirm before ' + when(consent.expiresAt) + '.', box);
+    var acts = el('div', 'opts', null, box);
+    var buttons = [];
+    buttons.push(button('Admin Merge ' + plan.repo + '#' + plan.number + ' at ' + plan.headSha.slice(0, 7), 'btn hot', acts, function () {
+      return adminConfirm(q, consent, buttons);
+    }));
+    buttons.push(button('Cancel', 'btn ghost', acts, function () { adminPreviews.delete(q.id); return load(); }));
+  }
+
+  async function adminConfirm(q, consent, buttons) {
+    buttons.forEach(function (b) { b.disabled = true; });
+    // The consent is single-use: whatever the answer, a new preview is needed.
+    adminPreviews.delete(q.id);
+    try {
+      var r = await api(adminPath(q), { consent: consent });
+      var res = r && r.result;
+      if (r && r.state) render(r.state); else await load();
+      if (res && res.ok) say(res.detail || 'Admin merged.');
+      else say((res && res.detail) || 'Admin Merge halted. Nothing was merged.', true);
+    } catch (e) {
+      buttons.forEach(function (b) { b.disabled = false; });
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
   }
 
   // Why the supervisor's review kept an open question (live), or the close
@@ -525,6 +680,237 @@ a.btn.primary{color:var(--ink)}
       buttons.forEach(function (b) { b.disabled = false; });
       say(e.message, true);
       if (e.status === 404 || e.status === 409) await load();
+    }
+  }
+
+  // ─── chat and reply ──────────────────────────────────────────────────────
+
+  var CHAT_MAX = 12;
+  var REPLY_MAX = 2000;
+  // Unsent words by reply target ('q:' + question id, 't:' + thread key),
+  // kept across repaints; open question chats; sends in flight.
+  var drafts = new Map();
+  var chatOpen = new Set();
+  var replying = new Set();
+
+  // The chat's recent messages, from the thread's detail.
+  function paintConversation(box, key) {
+    var entry = details.get(key);
+    if (!entry) { el('p', 'note', detailLoading.has(key) ? 'Loading the chat…' : 'The chat loads when you open it.', box); return; }
+    if (entry.error) { el('p', 'note', 'The chat could not load: ' + clip(entry.error, 160), box); return; }
+    var conv = entry.thread && entry.thread.conversation ? entry.thread.conversation : null;
+    var msgs = conv && Array.isArray(conv.messages) ? conv.messages : [];
+    if (conv && typeof conv.unavailableReason === 'string' && conv.unavailableReason) el('p', 'note', conv.unavailableReason, box);
+    if (!msgs.length) { el('p', 'note', 'No messages to show.', box); return; }
+    if (msgs.length > CHAT_MAX || conv.truncated) el('p', 'note', 'Earlier messages not shown.', box);
+    msgs.slice(-CHAT_MAX).forEach(function (m) {
+      var you = m.role === 'user';
+      var row = el('div', 'said ' + (you ? 'you' : 'agent'), null, box);
+      var who = el('div', 'sub', null, row);
+      el('span', 'k', you ? 'You' : 'Agent', who);
+      if (m.at) el('span', null, ago(m.at), who).title = when(m.at);
+      el('p', 'quote', m.text, row);
+    });
+  }
+
+  // A row's question the reply box answers: one that takes a typed reply,
+  // else one only the agent's app takes.
+  function rowQuestion(key) {
+    var asks = questionsFor(key);
+    var reply = asks.filter(function (q) { return q.canReply === true; })[0];
+    if (reply) return reply;
+    return asks.filter(function (q) { return q.kind === 'agent-card' || q.kind === 'prompt'; })[0] || null;
+  }
+
+  var settingsLoading = new Set();
+  var settingsOpen = new Set();
+
+  function currentSettingsOption(select, settings, name) {
+    var current = settings && settings.current ? settings.current[name] : null;
+    if (!current) return;
+    var option = document.createElement('option');
+    option.value = current;
+    option.textContent = current;
+    option.selected = true;
+    option.disabled = true;
+    select.append(option);
+  }
+
+  function renderPaseoSettings(parent, t) {
+    var box = el('div', 'settings', null, parent);
+    el('h4', null, 'Paseo session settings', box);
+    var status = el('p', 'note', 'Loading authoritative settings…', box);
+    if (settingsLoading.has(t.key)) return box;
+    settingsLoading.add(t.key);
+    api(threadPath(t.key) + '/settings').then(function (result) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      var settings = result && result.settings ? result.settings : null;
+      if (!settings) { el('p', 'note', 'Settings are unavailable until this Paseo host can be read safely.', box); return; }
+      var stateText = settings.status === 'pending'
+        ? 'A pending permission card is open. Answer that card; settings cannot approve or clear it.'
+        : settings.status === 'busy'
+          ? 'This session has an active turn. Settings take effect after it finishes; no restart is performed.'
+          : 'Changes are sent to this exact session and confirmed by a fresh readback.';
+      el('p', 'note', stateText, box);
+      var names = [['model', 'Model'], ['reasoningEffort', 'Reasoning effort'], ['permissions', 'Permissions']];
+      var changed = false;
+      names.forEach(function (pair) {
+        var name = pair[0], label = pair[1];
+        var options = Array.isArray(settings.supported && settings.supported[name]) ? settings.supported[name] : [];
+        var select = document.createElement('select');
+        var lab = el('label', null, label, box); lab.append(select);
+        var unavailable = settings.unavailable && settings.unavailable[name];
+        if (unavailable) { currentSettingsOption(select, settings, name); select.disabled = true; el('p', 'note', unavailable, box); return; }
+        if (!options.length) { select.disabled = true; el('p', 'note', 'Unavailable on this host/provider.', box); return; }
+        options.forEach(function (item) {
+          var option = document.createElement('option'); option.value = item.id; option.textContent = item.label;
+          option.disabled = item.selectable === false; option.selected = settings.current && settings.current[name] === item.id; select.append(option);
+        });
+        select.disabled = settings.status !== 'ready';
+        select.addEventListener('change', function () {
+          if (changed || select.disabled) return;
+          changed = true; select.disabled = true;
+          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function () {
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say('Paseo ' + label.toLowerCase() + ' change confirmed by readback.');
+          }).catch(function (error) {
+            // Never leave the rejected value displayed as current; reread the session.
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say(error.message || 'The setting was not changed.', true);
+          });
+        });
+      });
+    }).catch(function (error) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      el('p', 'note', error.message || 'Settings could not be read; nothing was changed.', box);
+    });
+    return box;
+  }
+
+  // Where the reply box sends: the question's own reply when it takes one,
+  // else a message to the thread. null: only the agent's app answers it.
+  function replyTarget(q, key) {
+    if (q && q.canReply === true) {
+      return { id: 'q:' + q.id, label: 'Send reply', hint: 'Reply to the agent', path: '/fleet/api/questions/' + encodeURIComponent(q.id),
+        body: function (text) { return { reply: text }; } };
+    }
+    if (q && (q.kind === 'agent-card' || q.kind === 'prompt')) return null;
+    if (!key) return null;
+    return { id: 't:' + key, label: 'Send to chat', hint: 'Message this chat', path: '/fleet/api/send',
+      body: function (text) { return { threadKey: key, message: text }; } };
+  }
+
+  // Chat and reply: the conversation, then a box for the owner's own words.
+  function chatBlock(parent, key, q, oc) {
+    var box = el('div', 'chat', null, parent);
+    el('p', 'k', 'Chat and reply', box);
+    var log = el('div', 'log', null, box);
+    var paint = function () {
+      log.replaceChildren();
+      paintConversation(log, key);
+    };
+    addPainter(key, paint);
+    paint();
+    replyBox(box, key, q, oc);
+    return box;
+  }
+
+  // A question card's chat opens on tap and loads the thread's detail.
+  function cardChat(q, card) {
+    var key = q.threadKey;
+    if (!key) return;
+    var id = 'q:' + q.id;
+    var d = el('details', 'chatwrap', null, card);
+    d.open = chatOpen.has(id);
+    el('summary', 'btn', 'Chat and reply', d);
+    var filled = false;
+    var fill = function () {
+      if (filled) return;
+      filled = true;
+      chatBlock(d, key, q, q.openChat);
+    };
+    d.addEventListener('toggle', function () {
+      if (!d.open) { chatOpen.delete(id); return; }
+      var fresh = !chatOpen.has(id);
+      chatOpen.add(id);
+      fill();
+      wantDetail(key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);
+    });
+    if (d.open) { fill(); wantDetail(key, DETAIL_TTL_MS); }
+  }
+
+  function replyBox(parent, key, q, oc) {
+    var target = replyTarget(q, key);
+    if (!target) {
+      var app = oc && APP_NAME[oc.app] ? APP_NAME[oc.app] : 'the app';
+      el('p', 'note', 'Answer it in ' + app + '.', parent);
+      openChatLink(oc, 'btn primary', parent);
+      return;
+    }
+    var area = el('textarea', 'reply', null, parent);
+    area.maxLength = REPLY_MAX;
+    area.rows = 3;
+    area.placeholder = target.hint;
+    area.value = drafts.get(target.id) || '';
+    area.dataset.reply = target.id;
+    area.setAttribute('aria-label', target.hint);
+    area.addEventListener('input', function () { drafts.set(target.id, area.value); });
+    if (q && q.risky && q.canReply === true) el('p', 'note', 'Risky ask: your reply is only typed into the agent app, never relayed.', parent);
+    var acts = el('div', 'acts', null, parent);
+    var send = button(target.label, 'btn primary', acts, function () { return sendReply(target, area, send, key); });
+    send.disabled = replying.has(target.id);
+  }
+
+  function replyNote(delivery) {
+    var status = delivery && delivery.status;
+    var detail = delivery && typeof delivery.detail === 'string' ? clip(delivery.detail, 160) : '';
+    var card = delivery && delivery.prompt && delivery.prompt.text ? ' The chat shows a card: ' + clip(delivery.prompt.text, 120) : '';
+    if (status === 'sent') return { text: 'Sent to the agent.', bad: false, done: true };
+    if (status === 'queued') return { text: detail || 'Saved. It goes to the agent once the Mac can type.', bad: false, done: true };
+    if (status === 'dry-run') return { text: 'Dry run, nothing sent.', bad: false, done: false };
+    if (status === 'blocked') return { text: 'Not sent' + (detail ? ': ' + detail : '.') + card, bad: true, done: false };
+    if (status === 'failed') return { text: 'Send failed' + (detail ? ': ' + detail : '.') + card, bad: true, done: false };
+    return { text: 'Sent.', bad: false, done: true };
+  }
+
+  async function sendReply(target, area, b, key) {
+    var text = String(area.value || '').trim();
+    if (!text) { say('Type a reply first.', true); return; }
+    if (text.length > REPLY_MAX) { say('Keep it within ' + REPLY_MAX + ' characters.', true); return; }
+    if (replying.has(target.id)) return;
+    replying.add(target.id);
+    b.disabled = true;
+    try {
+      var r = await api(target.path, target.body(text));
+      var note = replyNote(r && r.delivery);
+      // Words typed while it sent stay as the next draft.
+      var now = drafts.has(target.id) ? drafts.get(target.id) : area.value;
+      if (note.done && String(now || '').trim() === text) drafts.delete(target.id);
+      else drafts.set(target.id, now);
+      // The chat refetches with the new message in it.
+      details.delete(key);
+      replying.delete(target.id);
+      if (r && r.state) render(r.state); else await load();
+      say(note.text, note.bad);
+    } catch (e) {
+      replying.delete(target.id);
+      b.disabled = false;
+      if (e.status === 404 || e.status === 409) {
+        // Gone or closed: repaint even with the box focused, so a closed ask
+        // leaves the page. The draft is kept; the reason is said after the
+        // reload so it is not cleared by it.
+        drafts.set(target.id, area.value);
+        await load({ force: true });
+      }
+      say(e.message, true);
+    } finally {
+      replying.delete(target.id);
     }
   }
 
@@ -744,8 +1130,7 @@ a.btn.primary{color:var(--ink)}
     var have = details.get(key);
     if (detailLoading.has(key) || (have && Date.now() - have.at < maxAgeMs)) return;
     detailLoading.add(key);
-    var paint = painters.get(key);
-    if (paint) paint();
+    repaint(key);
     try {
       var r = await api(threadPath(key));
       details.set(key, { at: Date.now(), thread: r && r.thread ? r.thread : null, error: '' });
@@ -754,8 +1139,16 @@ a.btn.primary{color:var(--ink)}
     } finally {
       detailLoading.delete(key);
     }
-    paint = painters.get(key);
-    if (paint) paint();
+    repaint(key);
+  }
+
+  function addPainter(key, fn) {
+    if (!painters.has(key)) painters.set(key, []);
+    painters.get(key).push(fn);
+  }
+
+  function repaint(key) {
+    (painters.get(key) || []).forEach(function (fn) { fn(); });
   }
 
   // What the owner can do from the row: answer or dismiss the question it
@@ -798,6 +1191,15 @@ a.btn.primary{color:var(--ink)}
     } else {
       var mu = button('Mute ' + MUTE_HOURS + 'h', 'btn', acts, function () { return mute(t, true, mu); });
     }
+    if (t.kind === 'paseo') {
+      var settings = button('Session settings', 'btn', acts, function () {
+        settingsOpen.add(t.key);
+        settings.disabled = true;
+        renderPaseoSettings(parent, t);
+      });
+      settings.disabled = settingsOpen.has(t.key);
+      if (settingsOpen.has(t.key)) renderPaseoSettings(parent, t);
+    }
   }
 
   function renderThread(t, parent) {
@@ -822,17 +1224,18 @@ a.btn.primary{color:var(--ink)}
     if (top) el('div', 'blocker ' + (STATE_TONE[t.state] || 'dim'), clip(top, 160), s);
 
     rowActions(t, d);
+    chatBlock(d, t.key, rowQuestion(t.key), t.openChat);
     var more = el('div', 'more', null, d);
     var paint = function () {
       more.replaceChildren();
       paintMore(more, t, details.get(t.key));
     };
-    painters.set(t.key, paint);
+    addPainter(t.key, paint);
     paint();
     // A row the owner just opened wants fresh detail; one a re-render keeps
     // open (its toggle fires too) refetches only once the detail is stale.
     d.addEventListener('toggle', function () {
-      if (!d.open) { openThreads.delete(t.key); return; }
+      if (!d.open) { openThreads.delete(t.key); settingsOpen.delete(t.key); return; }
       var fresh = !openThreads.has(t.key);
       openThreads.add(t.key);
       wantDetail(t.key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);
@@ -887,13 +1290,15 @@ a.btn.primary{color:var(--ink)}
   function renderFleet(snap) {
     var box = $('fleetList');
     box.replaceChildren();
-    painters.clear();
     var threads = snap && Array.isArray(snap.threads) ? snap.threads : [];
     var counts = snap && snap.counts ? snap.counts : null;
     var inScope = counts && typeof counts.inScope === 'number' ? counts.inScope : threads.length;
     $('fleetCount').textContent = threads.length ? String(inScope) : '';
     if (!snap) { el('p', 'empty', 'No scan yet. Tap Scan now.', box); return; }
-    if (!threads.length) { el('p', 'empty', 'No recent coding threads.', box); return; }
+    if (!threads.length) {
+      el('p', 'empty', 'No recent coding threads. Start a conversation in a supported coding app on this computer, then choose Scan now. Sessions started through OpenAGI appear under Managed sessions above.', box);
+      var setup = el('a', '', 'Set up a coding tool →', box); setup.href = '/?tab=coding-agents'; return;
+    }
     // Grouped by what the supervisor watches each thread for; a snapshot from
     // before watch existed groups by state as it used to. Out of scope last.
     var byWatch = threads.some(function (t) { return t.watch; });
@@ -947,6 +1352,7 @@ a.btn.primary{color:var(--ink)}
     var byKey = new Map();
     (snap && Array.isArray(snap.threads) ? snap.threads : []).forEach(function (t) { byKey.set(t.key, t); });
     renderHeader(s);
+    painters.clear();
     var questions = Array.isArray(s.questions) ? s.questions : [];
     renderNeeds(questions, byKey);
     renderReviewed(Array.isArray(s.reviewClosed) ? s.reviewClosed : [], questions);
@@ -973,18 +1379,39 @@ a.btn.primary{color:var(--ink)}
     timer = setTimeout(load, current && current.running ? BUSY_POLL_MS : POLL_MS);
   }
 
-  async function load() {
+  // A reply box has the focus: a poll repaint would take it away mid-word.
+  function typing() {
+    var a = document.activeElement;
+    return Boolean(a && a.dataset && a.dataset.reply);
+  }
+
+  // force: repaint even while a reply box has the focus.
+  async function load(opts) {
+    void loadManagedSessions();
+    var force = Boolean(opts && opts.force === true);
     try {
-      render(await api('/fleet/api/state'));
+      var fresh = await api('/fleet/api/state');
+      if (force || !typing()) render(fresh);
       if (errorShown) say('');
     } catch (e) {
       say(e.status ? e.message : 'Cannot reach OpenAGI. Retrying.', true);
+      if (e.data && e.data.error === 'main-pairing-required') {
+        var link = document.getElementById('reconnect'); link.hidden = false;
+        try {
+          var roster = await api('/nodes');
+          var origin = new URL(roster.pairedTo);
+          if ((origin.protocol === 'https:' || origin.protocol === 'http:') && !origin.username && !origin.password) {
+            link.href = origin.origin; link.textContent = 'Open your connected agent';
+          }
+        } catch (_) { /* The connection settings link remains available. */ }
+      }
     } finally {
       schedule();
     }
   }
 
   async function scan() {
+    void loadManagedSessions();
     if (scanning) return;
     scanning = true;
     paintScan();
@@ -1018,6 +1445,14 @@ a.btn.primary{color:var(--ink)}
     }
   }
 
+  var menu = document.getElementById('menuToggle');
+  if (menu) menu.addEventListener('click', function () {
+    var nav = $('appNavigation');
+    var opened = nav.classList.toggle('open'); menu.setAttribute('aria-expanded', String(opened));
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && menu) { $('appNavigation').classList.remove('open'); menu.setAttribute('aria-expanded', 'false'); }
+  });
   $('scan').addEventListener('click', function () { return scan(); });
   MODES.forEach(function (m) {
     $('mode-' + m).addEventListener('click', function () { return setMode(m); });
@@ -1029,5 +1464,8 @@ a.btn.primary{color:var(--ink)}
 })();
 </script>
 </body></html>`
+  .replace("/* SHARED_SHELL_STYLES */", shellStyles)
+  .replace("<!-- SHARED_NAVIGATION -->", navigationLinks("supervisor"))
+  .replace("/* SHARED_CODING_CONTROLS */", codingSessionUi)
   .replace("FLEET_FULL_SLOW_SEC", String(DEFAULTS.fullRunSlowMs / 1000))
   .replace("FLEET_QUICK_SLOW_SEC", String(DEFAULTS.quickVerifyEscalateMs / 1000));

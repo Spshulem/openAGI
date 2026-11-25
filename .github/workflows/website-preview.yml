@@ -1,0 +1,85 @@
+name: Website preview
+
+on:
+  pull_request:
+    paths:
+      - 'companion-site/**'
+      - 'README.md'
+      - 'docs/plans/2026-11-21-onboarding-handoff.md'
+      - '.github/workflows/website-preview.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-preview:
+    name: Static preview checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the change
+        uses: actions/checkout@v4
+
+      - name: Check JavaScript syntax
+        run: node --check companion-site/dist/script.js
+
+      - name: Check local assets and anchors
+        run: |
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          root = Path("companion-site/dist")
+          class Page(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.ids = set()
+                  self.href = []
+                  self.src = []
+                  self.anchor_depth = 0
+                  self.nested_anchor = False
+
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == "a":
+                      if self.anchor_depth:
+                          self.nested_anchor = True
+                      self.anchor_depth += 1
+                  if "id" in attrs:
+                      self.ids.add(attrs["id"])
+                  if "href" in attrs:
+                      self.href.append(attrs["href"])
+                  if "src" in attrs:
+                      self.src.append(attrs["src"])
+
+              def handle_endtag(self, tag):
+                  if tag == "a":
+                      self.anchor_depth -= 1
+
+          page = Page()
+          page.feed((root / "index.html").read_text())
+          assert not page.nested_anchor, "nested anchors"
+          for src in page.src:
+              assert (root / src).exists(), f"missing local asset: {src}"
+          for href in page.href:
+              if href.startswith("#"):
+                  assert href[1:] in page.ids, f"missing local anchor: {href}"
+          print(f"checked {len(page.href)} links and {len(page.src)} local assets")
+          PY
+
+      - name: Serve and smoke-test the preview
+        run: |
+          python3 -m http.server 8789 --directory companion-site/dist >/tmp/openagi-site.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --show-error http://127.0.0.1:8789/ >/tmp/openagi-site.html; then
+              grep -q 'Your work' /tmp/openagi-site.html
+              grep -q 'Open the full Docker command' /tmp/openagi-site.html
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/openagi-site.log
+          exit 1

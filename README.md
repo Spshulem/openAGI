@@ -14,18 +14,22 @@ screen observation or approved computer interaction when you need them.
 **[First-use guide](docs/GETTING_STARTED.md)** ·
 **[Website](https://openagi.sh)**
 
+**[Review the current website preview](companion-site/README.md)** · The
+preview starts with the self-hosted project, links the current release and
+install paths, and labels shipped, historical, and planned behavior.
+
 ## Pick your install
 
 | Platform | Start here | Includes |
 | --- | --- | --- |
 | **macOS** | [Download the latest DMG](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
-| **Windows** | [Download source ZIP](https://github.com/Spshulem/openAGI/archive/refs/heads/main.zip), then [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; Node.js 22+ required for source installs |
-| **Linux / Raspberry Pi** | [Install guide](docs/INSTALL.md#linux-and-raspberry-pi) or [download source archive](https://github.com/Spshulem/openAGI/archive/refs/heads/main.tar.gz) | Browser dashboard, persistent runtime, optional systemd service; Linux x64/arm64 Docker image |
+| **Windows** | [Download the latest portable ZIP](https://github.com/Spshulem/openAGI/releases/latest), or [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; the published bundle includes Node.js |
+| **Linux / Raspberry Pi** | [Download the latest x64/arm64 bundle](https://github.com/Spshulem/openAGI/releases/latest), [use Docker](docs/INSTALL.md#docker), or [follow the install guide](docs/INSTALL.md#linux-and-raspberry-pi) | Browser dashboard, persistent runtime, optional systemd service; Raspberry Pi needs a compatible 64-bit arm64 OS |
 | **iPhone / Android** | [Companion app and pairing](mobile/README.md) | Mobile source with tasks, chat, approvals, and supervisor views; no public store download linked |
 
-The latest release currently has a Mac installer. Releases built with the new
-portable-download workflow also attach Windows x64 and Linux x64/arm64 bundles
-with Node included. See [download availability and launch instructions](docs/INSTALL.md#downloads).
+The latest release publishes the Mac DMG, Windows x64 ZIP, and Linux x64/arm64
+bundles with Node included, plus SHA-256 checksums. See [download availability
+and launch instructions](docs/INSTALL.md#downloads) and the [release page](https://github.com/Spshulem/openAGI/releases/latest).
 Source ZIP/archive links above track `main`; each GitHub release also offers its
 exact source under **Assets → Source code**.
 
@@ -100,12 +104,10 @@ using Computer Use and running repairs have their own controls. See the
 ## Availability
 
 This README describes the repository's current capabilities. Check the
-[release assets](https://github.com/Spshulem/openAGI/releases/latest) for the
-installers actually published. The latest Mac release is **v0.0.58**; newer
-source includes iOS phone-agent/offline-workspace work, additional messaging
-and Google integrations, and the latest provider, cost and approval fixes.
-The mobile apps are source/QA builds; no public store release is linked here.
-Windows/Linux portable downloads depend on a release publishing those assets.
+[latest release](https://github.com/Spshulem/openAGI/releases/latest) for the
+installers and portable downloads actually published. The mobile apps are
+source/QA builds; no public store release is linked here. Windows/Linux
+portable downloads appear when the release workflow publishes those assets.
 
 ## Why a persistent runtime helps
 
@@ -147,6 +149,7 @@ claim universal hardware support.
 - [Coding Agents](docs/setup/coding-supervisor.md) and [Fleet supervisor](docs/setup/fleet-supervisor.md)
 - [Computer Use readiness](docs/setup/computer-use-readiness.md) and [optional backend](docs/setup/open-computer-use.md)
 - [Mobile setup](mobile/README.md) and [mobile feature surface](mobile/FEATURES.md)
+- [Recover a paired Mac node](docs/setup/node-reconnect.md)
 - [Even G2](docs/setup/even-g2.md), [remote channels](docs/setup/remote-channels.md), and [integrations](docs/setup/partner-and-integrations.md)
 - [Architecture](docs/abi-architecture.md), [whitepaper](WHITEPAPER.md), and [release process](docs/RELEASE.md)
 
@@ -310,7 +313,9 @@ curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
 
 Tool discovery follows opaque `tools/list` continuation cursors over both HTTP and stdio, including empty intermediate pages. Refresh replaces the inventory only after all pages succeed; invalid or repeated cursors and listings exceeding 100 pages fail explicitly instead of publishing a partial inventory. Silent HTTP connection attempts remain non-interactive on every page.
 
-On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Streaming replies accept LF, CRLF, and CR line endings, including line endings split across transport chunks. Matching streaming tool errors are returned immediately and completed response streams are released.
+When an HTTP MCP server rejects an expired session with HTTP 404, OpenAGI discards that session and reconnects on the next call. The rejected request still fails and is never automatically replayed, since a tool action may have side effects. Other HTTP errors retain the session; a delayed rejection from an older session cannot invalidate a newer connection.
+
+On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. Concurrent first-use HTTP calls share one initialization and tool-discovery handshake; a failed handshake rejects its waiting callers and a later call can retry. Interactive callers waiting on a silent OAuth attempt can authorize after an authorization-required failure, without replaying tool actions. Closing a client cancels queued initialization and prevents late OAuth responses from reopening transport. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Streaming replies accept LF, CRLF, and CR line endings, including line endings split across transport chunks. Matching streaming tool errors are returned immediately and completed response streams are released.
 
 ---
 
@@ -596,6 +601,17 @@ without a bulk rewrite of existing data.
 No bulk migration runs automatically, and previously superseded memories are
 not restored.
 
+### Quick Ask attention badge
+
+The floating badge counts current brief items, pending approvals, Supervisor
+questions, and decision notifications from the last seven days. Shared source
+references count once. Informational notifications and digest summaries remain
+in Notifications without inflating the badge. Old or undated notification-only
+decisions remain there for review; canonical current queues and coding approvals
+never expire from the badge. No stored tasks, notifications, or approvals are
+changed by this presentation policy. Counts above 99 display as `99+`; the
+accessibility label and tooltip retain the exact count.
+
 The iMessage self-chat importer opens the Messages SQLite database strictly read-only,
 with a bounded lock wait. It reads committed WAL messages without checkpointing or
 creating the source database. Cursor checkpoints stay in OpenAGI's own data directory.
@@ -605,3 +621,59 @@ The self-chat task importer supports both plain `text` and modern Messages
 text takes precedence. Unreadable bodies and attachment-only rows advance the
 cursor without creating empty tasks; other chats remain excluded. First enable
 remains forward-only unless backfill is explicitly configured.
+
+### Task lifecycle and computer approvals
+
+Tasks are one-off work records; recurring jobs live separately under Cron. The agent pulse claims eligible agent work, prepares draft-only tasks for review, and waits on approvals or blockers rather than treating every visible row as executable. Backlog triage reviews suggestions and drafts; the task sweep handles task deduplication, routing and relevance.
+
+Task relevance checks include the current clock and each task's creation/due/scheduled dates, status and bounded description. Age alone does not prove completion. Sweep receipts distinguish full, partial, failed and unavailable model review from deterministic cleanup. Completion scans use existing activity evidence, check both pending and in-progress user tasks, and rotate bounded 30-task batches across the user queue so agent work and an unchanged first page cannot starve older tasks. Without evidence, the scan skips; it does not claim the work is finished.
+
+Computer approval grants permission for the displayed goal on one specific node. Readiness is refreshed at approval time before resolving that same node. A genuinely unavailable or permission-blocked node still fails closed; approval never switches computers or grants system permissions.
+### Agent task recovery
+
+Agent claims expire rather than reserving work forever. Deferred claims retain
+their attempt count; manually resuming one does not create a new timed lease.
+After the stale-work grace period, the queue recovers agent work with a missing
+or invalid lease expiry, preserving the retry budget and parking exhausted
+work as blocked. Fresh work, valid live leases, and tasks awaiting draft review
+remain protected. User-owned tasks retain their status. Recovery happens during
+normal queue sweeps, not when opening the store.
+
+
+### Desktop workspace
+
+Supervisor opens the same ongoing-work and questions view used by the companion
+clients. Coding CLI configuration is separate under Advanced → Coding setup;
+provider, model, and reasoning controls stay inside Advanced options. Connections
+holds integration setup; device and glasses tools are optional advanced views.
+Get started links to model setup before the optional introductory chat.
+
+Tasks and Today preserve request failures instead of showing zero tasks. A paired
+worker forwards Inbox reads, draft and suggestion actions, and backlog cleanup
+with its run-status polling to its main; it never substitutes a local queue when
+main denies workspace access. The main retains authority over every request.
+Recovery links open the connected agent for sign-in; no token is passed in the URL
+and no enrollment is changed automatically.
+
+Inbox shows the latest completed cleanup report: reviewed, retired, and awaiting
+model review counts, including reviews postponed by cadence, provider availability,
+budget, or the item cap. Inconclusive review annotations are shown separately
+because they can overlap unjudged items. Cleanup concerns suggestions and drafts, not automatic completion of user
+tasks. Old age alone is not proof that a task is finished. Background activity
+shows scheduled-run receipts and explicitly distinguishes inferred scores from
+user feedback and delivered work.
+
+Computer history loads older rows automatically near the bottom, using bounded
+pages with a fixed upper timestamp, with Load more retained as a fallback.
+Computer Use has an explicit enable action and permission guidance; enabling tools
+does not grant operating-system permissions or approve a control session.
+
+### Changes to queued scheduled jobs
+
+Scheduled jobs are checked again immediately before dispatch. Disabling,
+removing, rescheduling, or replacing a queued job while an earlier scheduled
+handler runs prevents its stale definition from executing in that tick.
+Already running handlers are not cancelled; changed jobs are reconsidered
+under their current schedule on the next tick. Scheduler ticks accept a `Date`,
+an ISO timestamp, or epoch milliseconds and use the same normalized time for
+selection, revalidation, and run timestamps.

@@ -363,6 +363,64 @@ final class DaemonClientExtendedTests: XCTestCase {
         XCTAssertNil(bodies.items[2]["thread"])
     }
 
+    // Turn recovery: the phone names each turn. A main older than that 400s
+    // the field during validation; resend once without it (keeping thread),
+    // and stop sending it.
+    func testSendMessageStreamingSendsTheTurnIdAndDropsItForAnOlderMain() async throws {
+        final class Bodies: @unchecked Sendable { var items: [[String: Any]] = [] }
+        let bodies = Bodies()
+        let raw = "event: final\ndata: {\"reply\":\"ok\"}\n\n"
+        StubProtocol.handler = { [self] request in
+            let body = (try? self.bodyJSON(of: request)) ?? [:]
+            bodies.items.append(body)
+            if body["requestId"] != nil {
+                return (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                        Data(#"{"error":"node message contains unsupported fields"}"#.utf8))
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(raw.utf8))
+        }
+        let client = makeClient()
+        let stream = try await client.sendMessageStreaming(text: "hello", thread: .agent, requestId: "ios-turn-1")
+        for try await _ in stream {}
+        XCTAssertEqual(bodies.items.count, 2)
+        XCTAssertEqual(bodies.items[0]["requestId"] as? String, "ios-turn-1")
+        XCTAssertNil(bodies.items[1]["requestId"])
+        XCTAssertEqual(bodies.items[1]["thread"] as? String, "agent", "thread support is not blamed")
+        let unsupported = await client.turnIdsUnsupported
+        XCTAssertTrue(unsupported)
+
+        let second = try await client.sendMessageStreaming(text: "again", thread: .agent, requestId: "ios-turn-2")
+        for try await _ in second {}
+        XCTAssertEqual(bodies.items.count, 3)
+        XCTAssertNil(bodies.items[2]["requestId"])
+    }
+
+    // An image turn to that older main must not read as "images unsupported".
+    func testATurnIdRejectionIsNotMistakenForMissingImageSupport() async throws {
+        final class Bodies: @unchecked Sendable { var items: [[String: Any]] = [] }
+        let bodies = Bodies()
+        StubProtocol.handler = { [self] request in
+            if request.url?.path == "/mobile/capabilities" {
+                return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!,
+                        Data(#"{"imageAttachments":true}"#.utf8))
+            }
+            let body = (try? self.bodyJSON(of: request)) ?? [:]
+            bodies.items.append(body)
+            if body["requestId"] != nil {
+                return (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                        Data(#"{"error":"node message contains unsupported fields"}"#.utf8))
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    Data("event: final\ndata: {\"reply\":\"seen\"}\n\n".utf8))
+        }
+        let image = ChatAttachment(id: "img-1", name: "a.jpg", data: "/9j/")
+        let stream = try await makeClient().sendMessageStreaming(text: "look", thread: .agent, attachments: [image], requestId: "ios-turn-3")
+        var reply: String?
+        for try await event in stream { if case .final(let frame) = event { reply = frame.reply } }
+        XCTAssertEqual(reply, "seen")
+        XCTAssertNotNil(bodies.items.last?["attachments"])
+    }
+
     // Any other 400 (bad text, say) is not a missing-thread-support signal:
     // no resend, and it surfaces as the plain server error.
     func testSendMessageStreamingDoesNotRetryOtherBadRequests() async {

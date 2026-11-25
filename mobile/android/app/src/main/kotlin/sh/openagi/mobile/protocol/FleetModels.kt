@@ -1,11 +1,13 @@
 package sh.openagi.mobile.protocol
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import java.time.Instant
 
 // GET /fleet/api/state and the three mutations that return it — the fleet
@@ -124,7 +126,50 @@ data class FleetThreadDetail(
     val questions: List<FleetQuestion> = emptyList(),
     val openChat: FleetOpenChat? = null,
     @Serializable(with = OptionalInstantSerializer::class) val scannedAt: Instant? = null,
-)
+    // The chat's recent history (src/fleet/conversation.js). Kept raw and
+    // read message by message, so one odd message, or a whole odd block,
+    // costs only itself and never the rest of the sheet.
+    @SerialName("conversation") val conversationJson: JsonElement? = null,
+) {
+    val conversation: FleetConversation? get() = FleetConversation.from(conversationJson)
+}
+
+// src/fleet/conversation.js boundConversation: the newest messages, oldest
+// first, role "user" (the owner) or "assistant" (the agent), secrets already
+// redacted. truncated: earlier messages exist outside this view.
+// unavailableReason: why only part (or none) of the chat could be read.
+data class FleetConversation(
+    val messages: List<FleetConversationMessage> = emptyList(),
+    val truncated: Boolean = false,
+    val unavailableReason: String? = null,
+) {
+    companion object {
+        // Null when the daemon sent no conversation at all (an older hub);
+        // otherwise every readable message, skipping the rest.
+        fun from(element: JsonElement?): FleetConversation? {
+            val obj = element as? JsonObject ?: return null
+            val messages = (obj["messages"] as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { item ->
+                runCatching { FleetJson.json.decodeFromJsonElement(FleetConversationMessage.serializer(), item) }.getOrNull()
+                    ?.takeIf { it.text.isNotBlank() }
+            }
+            return FleetConversation(
+                messages = messages,
+                truncated = (obj["truncated"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                unavailableReason = (obj["unavailableReason"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.takeIf { it.isNotBlank() },
+            )
+        }
+    }
+}
+
+@Serializable
+data class FleetConversationMessage(
+    val id: String = "",
+    val role: String = "",
+    val text: String = "",
+    @Serializable(with = OptionalInstantSerializer::class) val at: Instant? = null,
+) {
+    val fromOwner: Boolean get() = role == "user"
+}
 
 // The last 1200 characters, secrets already redacted by the daemon.
 @Serializable
@@ -215,6 +260,34 @@ data class FleetDecision(
 )
 
 @Serializable
+data class FleetDecisionSource(
+    val questionId: String? = null,
+    val threadKey: String? = null,
+    val threadKeys: List<String> = emptyList(),
+    val app: String? = null,
+    val cardId: String? = null,
+    val itemId: String? = null,
+)
+
+@Serializable
+data class FleetDecisionItem(
+    val itemId: String? = null,
+    val source: FleetDecisionSource? = null,
+    val headline: String = "Owner decision",
+    val options: List<String> = emptyList(),
+    val multiSelect: Boolean = false,
+    val freeText: Boolean = false,
+    val active: Boolean = false,
+)
+
+@Serializable
+data class FleetCardAction(
+    val op: String? = null,
+    val label: String? = null,
+    val value: String? = null,
+)
+
+@Serializable
 data class FleetQuestion(
     val id: String = "",
     val title: String? = null,
@@ -239,6 +312,17 @@ data class FleetQuestion(
     val risky: Boolean = false,
     // The agent message the ask came from.
     val askContext: String? = null,
+    // Whether POST /fleet/api/questions/:id takes a free-text { reply }.
+    // Absent (false) on a hub from before replies.
+    val canReply: Boolean = false,
+    val project: String? = null,
+    val needsYou: Boolean = true,
+    val decisionHeadline: String? = null,
+    val decisionFact: String? = null,
+    val decisionSource: FleetDecisionSource? = null,
+    val decisionAction: FleetCardAction? = null,
+    val remainingItemIds: List<String> = emptyList(),
+    val decisionItems: List<FleetDecisionItem> = emptyList(),
 ) {
     val answeredInAgentApp: Boolean get() = answerIn == "agent app" || (answerIn == null && "open thread" in options)
 }
@@ -301,6 +385,20 @@ data class FleetModeRequest(val mode: String)
 
 @Serializable
 data class FleetAnswerRequest(val answer: String)
+
+// POST /fleet/api/questions/:id with free text instead of an option.
+@Serializable
+data class FleetReplyRequest(val reply: String)
+
+// POST /fleet/api/send: the owner's own words to one thread.
+@Serializable
+data class FleetSendRequest(val threadKey: String, val message: String)
+
+@Serializable
+data class FleetSendResult(
+    val delivery: FleetDelivery? = null,
+    val state: FleetState? = null,
+)
 
 @Serializable
 data class FleetDismissRequest(val dismiss: Boolean = true)

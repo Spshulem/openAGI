@@ -36,6 +36,16 @@ function harness(t) {
   return { pendingActions, ran, turns, say, card, host };
 }
 
+test("image content taints an owner turn without becoming action authorization", async t => {
+  const h = harness(t);
+  const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
+  await h.host.handleMessage({ text: "Describe this image", sessionId: "image-chat", attachments: [{ id: "synthetic", mimeType: "image/png", data }] },
+    { principal: ownerPrincipal("phone", "synthetic-phone") });
+  assert.equal(h.turns.at(-1).context.__turn.untrusted, true);
+  assert.equal(h.turns.at(-1).context.__turn.intent, "Describe this image");
+  assert.equal(h.ran.length, 0);
+});
+
 test("a bare yes runs the one card this chat raised since the owner last spoke", async (t) => {
   const h = harness(t);
   await h.say("what does the openagi thread need?");
@@ -190,4 +200,161 @@ test("a computer session started mid-turn raises the provider's hop bound from t
     extendToolHops: () => (started ? 5 : undefined) });
   assert.equal(result.text, "Done.");
   assert.equal(calls, 6, "five tool rounds, then the final answer, instead of stopping after two");
+});
+
+test("conversational 'yes' after assistant question executes fleet_answer_question without 'yes NN' code even when tainted", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-yes-nontrivial-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pendingActions = new PendingActionStore({ dir });
+  const tools = new ToolRegistry();
+  tools.bindPendingActions(pendingActions);
+  const answered = [];
+  tools.register({
+    name: "fleet_status",
+    sideEffects: false,
+    handler: async () => ({ questions: [{ id: "q-1", title: "buildbetter #9797: continue Google Drive fix?" }] })
+  });
+  tools.register({
+    name: "fleet_answer_question",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    summarize: (args) => `Answer "${args.question}" with: ${args.answer}`,
+    handler: async (args, context) => {
+      answered.push({ args, approvedBy: context.__approvedBy });
+      return { ok: true };
+    }
+  });
+  const runtime = {
+    tools,
+    pendingActions,
+    memory: { remember: () => ({ id: "m" }) },
+    outcomes: null,
+    fleetSupervisor: { getState: () => ({ preferences: { autoApprove: true } }) },
+    processSignal: () => ({
+      id: "out",
+      scrutiny: { action: "act", score: 0.2, reasons: [], dimensions: { novelty: 0.2, risk: 0.2, repetition: 0.2 } },
+      customContext: [{ id: "m1", tier: "short", score: 0.9, content: "PR #9797 note" }],
+      propagation: {}
+    })
+  };
+  const host = new AgentHost({
+    runtime,
+    modelProvider: {
+      isConfigured: () => true,
+      model: "stub",
+      generate: async ({ input, toolRegistry, context }) => {
+        if (input === "whats waiting on me?") {
+          await toolRegistry.invoke("fleet_status", {}, context);
+          return {
+            text: "1. Continue the Google Drive fix?\nMy recommendation: Have the agent continue resolving the blockers.\nContinue, inspect the thread further, or skip?",
+            provider: "stub",
+            model: "stub",
+            toolCalls: []
+          };
+        }
+        const res = await toolRegistry.invoke("fleet_answer_question", { question: "continue Google Drive fix?", answer: "continue" }, context);
+        return { text: JSON.stringify(res), provider: "stub", model: "stub", toolCalls: [] };
+      }
+    }
+  });
+  const principal = ownerPrincipal("phone", "p-1");
+  await host.handleMessage({ text: "whats waiting on me?", sessionId: "sup-1", metadata: { thread: "supervisor" } }, { principal });
+  const turn2 = await host.handleMessage({ text: "yes", sessionId: "sup-1", metadata: { thread: "supervisor" } }, { principal });
+  assert.equal(answered.length, 1);
+  assert.equal(answered[0].args.answer, "continue");
+  assert.equal(answered[0].approvedBy, "owner:phone");
+  assert.doesNotMatch(turn2.reply, /awaiting_owner_confirmation|Say 'yes/i);
+});
+
+test("/v1/decisions owner clarity gate unlocks clear ambiguous replies and keeps blocking passive queries", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-decisions-clarity-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pendingActions = new PendingActionStore({ dir });
+  const tools = new ToolRegistry();
+  tools.bindPendingActions(pendingActions);
+  const ran = [];
+  tools.register({
+    name: "fleet_send_message",
+    needsConfirmation: true,
+    supervisorAutoApprove: false,
+    summarize: (args) => `Send "${args.text}" to Drive chat`,
+    handler: async (args, context) => {
+      ran.push({ text: args.text, approvedBy: context.__approvedBy });
+      return { ok: true };
+    }
+  });
+  const makeContext = (intent, prob) => ({
+    sessionId: "sup-decisions",
+    __owner: ownerPrincipal("phone", "p-1"),
+    __turn: { untrusted: true, intent, previousAssistantText: "Should I tell the Google Drive chat to continue with PR #9797?" },
+    runtime: {
+      fleetSupervisor: { config: { decisions: { apiKey: "sk-test-decisions-1234567890", model: "gpt-6-luna" } } }
+    },
+    decisionsFetch: async () => ({
+      ok: true,
+      json: async () => ({
+        model: "gpt-6-luna",
+        answers: [{ name: "owner_clearly_authorized", probability: prob }]
+      })
+    })
+  });
+
+  // Natural instruction phrasing ("do that drive thing") gets cleared when /v1/decisions returns 0.94
+  const approved = await tools.invoke(
+    "fleet_send_message",
+    { text: "continue with PR #9797" },
+    makeContext("do that drive thing right now please", 0.94)
+  );
+  assert.equal(approved.ok, true);
+  assert.equal(approved.result.ok, true);
+  assert.equal(ran.length, 1);
+  assert.equal(ran[0].approvedBy, "owner:phone:decisions");
+
+  // Passive read-only query gets blocked when /v1/decisions returns 0.08
+  const blocked = await tools.invoke(
+    "fleet_send_message",
+    { text: "continue with PR #9797" },
+    makeContext("summarize the drive pr status", 0.08)
+  );
+  assert.equal(blocked.ok, true);
+  assert.equal(blocked.result.status, "awaiting_owner_confirmation");
+  assert.equal(ran.length, 1);
+});
+
+test("a turn stopped while the decisions check runs leaves the chat's pending card pending and runs nothing", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-decisions-stop-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pendingActions = new PendingActionStore({ dir });
+  const tools = new ToolRegistry();
+  tools.bindPendingActions(pendingActions);
+  const ran = [];
+  tools.register({
+    name: "fleet_send_message", needsConfirmation: true, supervisorAutoApprove: false,
+    summarize: (args) => `Send "${args.text}" to Drive chat`,
+    handler: async (args) => { ran.push(args.text); return { ok: true }; }
+  });
+  const makeContext = (intent, decisionsFetch, signal) => ({
+    sessionId: "sup-decisions-stop",
+    __owner: ownerPrincipal("phone", "p-1"),
+    __turn: { untrusted: true, intent, previousAssistantText: "Should I tell the Google Drive chat to continue with PR #9797?" },
+    runtime: { fleetSupervisor: { config: { decisions: { apiKey: "sk-test-decisions-1234567890", model: "gpt-6-luna" } } } },
+    decisionsFetch,
+    ...(signal ? { signal } : {})
+  });
+  const answer = (probability) => ({ ok: true, json: async () => ({ model: "gpt-6-luna", answers: [{ name: "owner_clearly_authorized", probability }] }) });
+  // An earlier turn raised a code card for this message in this chat.
+  const raised = await tools.invoke("fleet_send_message", { text: "continue with PR #9797" },
+    makeContext("what is the drive pr status now", async () => answer(0.08)));
+  const cardId = raised.result.actionId;
+  assert.equal(pendingActions.get(cardId).status, "pending");
+  // The owner's next turn would clear it, but Send Now stops that turn while
+  // the decisions check is still out.
+  const stop = new AbortController();
+  const result = await tools.invoke("fleet_send_message", { text: "continue with PR #9797" },
+    makeContext("go ahead with the drive one now", async () => { stop.abort(); return answer(0.94); }, stop.signal));
+  assert.equal(result.ok, false);
+  assert.match(result.error, /cancelled/i);
+  assert.deepEqual(ran, [], "nothing ran");
+  assert.equal(pendingActions.get(cardId).status, "pending", "the card is still the owner's to approve");
+  assert.equal(pendingActions.list({ status: "approved" }).length, 0, "no approval was recorded");
 });

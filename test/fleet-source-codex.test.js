@@ -10,6 +10,7 @@ import {
   classifyLbError, cleanCodexUserText, listCodexThreads, parseCardReply, parseRolloutTail, readCodexLbErrors
 } from "../src/fleet/sources/codex.js";
 import { classifyThread } from "../src/fleet/classify.js";
+import { chooseRoute } from "../src/fleet/policy.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
 const MIN = 60_000;
@@ -114,6 +115,39 @@ function addThread(ctx, spec) {
 function byId(threads) {
   return Object.fromEntries(threads.map((thread) => [thread.id, thread]));
 }
+
+test("catalog ownership metadata controls background routing without guessing from originator", async (t) => {
+  const ctx = makeHome(t);
+  const rows = [
+    { id: "cli", source: "cli", originator: "codex_cli_rs", route: "codex-exec" },
+    { id: "missing", source: "", originator: null, route: null },
+    { id: "unknown", source: "future-app", originator: "future-client", route: null },
+    { id: "legacy-app", source: "vscode", originator: null, route: null },
+    { id: "resumed-app", source: "vscode", originator: "codex_cli_rs", route: null },
+    { id: "desktop", source: "cli", originator: "Codex Desktop", route: null },
+    { id: "conductor", source: "cli", originator: "codex_sdk_ts", route: null }
+  ];
+  try { for (const row of rows) addThread(ctx, row); }
+  finally { ctx.db.close(); }
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  for (const row of rows) {
+    assert.equal(map[row.id].meta.source, row.source || null);
+    assert.equal(map[row.id].meta.originator, row.originator);
+    assert.equal(chooseRoute(map[row.id], "auto"), row.route, row.id);
+  }
+});
+
+test("an old catalog without ownership columns cannot authorize background resume", async (t) => {
+  const ctx = makeHome(t);
+  try {
+    addThread(ctx, { id: "legacy", source: "cli" });
+    ctx.db.exec("ALTER TABLE threads DROP COLUMN source; ALTER TABLE threads DROP COLUMN originator");
+  } finally { ctx.db.close(); }
+  const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  assert.equal(thread.meta.source, null);
+  assert.equal(thread.meta.originator, null);
+  assert.equal(chooseRoute(thread, "auto"), null, "unknown catalog data cannot be resumed by a background writer");
+});
 
 test("a turn killed mid-tool stays stalled when reopening the thread writes settings rows", async (t) => {
   const ctx = makeHome(t);

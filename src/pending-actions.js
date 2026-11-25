@@ -31,6 +31,10 @@ export class PendingActionStore {
     // journaled): a confirmed card's follow-up steps are judged on them.
     this.ownerIntents = new Map();
     this.events = null;
+    // Called with each new card that waits on the owner, announced or not
+    // (a chat card stays off the SSE bus but still reaches the phone's
+    // notification). A re-raised card is the same card, so it never calls.
+    this.raiseListeners = new Set();
     // Recovery and expiry happen while the durable runtime is constructed,
     // before createHostedInterface owns/binds the live event bus. Hold those
     // resolutions until bindEvents() so the durable outreach copy is not left
@@ -53,6 +57,14 @@ export class PendingActionStore {
     }
   }
 
+  /// Returns the unsubscribe. Listeners must not throw; one that does is
+  /// ignored, never the enqueue.
+  watch(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.raiseListeners.add(listener);
+    return () => this.raiseListeners.delete(listener);
+  }
+
   list({ status } = {}) {
     this._expirePending();
     const all = [...this.actions.values()];
@@ -72,6 +84,10 @@ export class PendingActionStore {
   // owner's own instruction ran. Every card gets a short spoken code.
   enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, ownerIntent = null, _reuse = true }) {
     const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
+    const defaultChatTtlMs = 2 * 60 * 60 * 1000;
+    const effectiveTtlMs = (ttlMs === null || ttlMs === undefined) && cardMode === "chat"
+      ? defaultChatTtlMs
+      : ttlMs;
     const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
       ? dedupeKey.slice(0, 500)
       : cardMode === "chat" ? argsDigest(toolName, args, context?.sessionId) : null;
@@ -82,13 +98,30 @@ export class PendingActionStore {
       if (existing) {
         // The owner's latest words for the same request are the ones a confirm carries.
         if (existing.mode === "chat") this._noteOwnerIntent(existing.id, ownerIntent);
+        // Asked again in the same chat: the card belongs to this turn now.
+        // createdAt keeps its age; raisedAt is what "since your latest
+        // message" reads. A request from elsewhere changes neither.
+        if ((existing.context?.sessionId ?? null) === (context?.sessionId ?? null)) {
+          const nowMs = this.now();
+          existing.raisedAt = new Date(nowMs).toISOString();
+          // A fresh window only for the very same arguments. The card keeps
+          // its original args, and some carry their own age limit (a coding
+          // reply's preparedAt): renewing past it would leave a card that
+          // looks approvable but whose tool refuses to run.
+          const sameArgs = argsDigest(toolName, existing.args, null) === argsDigest(toolName, args ?? {}, null);
+          const ttl = Number.isFinite(Number(effectiveTtlMs)) && Number(effectiveTtlMs) > 0 ? Math.min(Math.trunc(Number(effectiveTtlMs)), 24 * 60 * 60 * 1000) : null;
+          if (sameArgs && ttl && existing.expiresAt && Date.parse(existing.expiresAt) < nowMs + ttl) {
+            existing.expiresAt = new Date(nowMs + ttl).toISOString();
+          }
+          this._appendJournal({ op: "raise", id: existing.id, raisedAt: existing.raisedAt, expiresAt: existing.expiresAt });
+        }
         return existing;
       }
     }
     const createdMs = this.now();
     const createdAt = new Date(createdMs).toISOString();
-    const boundedTtlMs = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0
-      ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000)
+    const boundedTtlMs = Number.isFinite(Number(effectiveTtlMs)) && Number(effectiveTtlMs) > 0
+      ? Math.min(Math.trunc(Number(effectiveTtlMs)), 24 * 60 * 60 * 1000)
       : null;
     const action = {
       id: createId("act"),
@@ -102,6 +135,7 @@ export class PendingActionStore {
       confirmCode: confirmCode === false ? null : this._newCode(typeof confirmCode === "string" ? confirmCode : null),
       status: "pending",
       createdAt,
+      raisedAt: createdAt,
       expiresAt: boundedTtlMs ? new Date(createdMs + boundedTtlMs).toISOString() : null,
       decidedAt: null,
       decidedBy: null,
@@ -120,6 +154,11 @@ export class PendingActionStore {
       code: action.confirmCode,
       createdAt: action.createdAt
     });
+    if (cardMode !== "owner") {
+      for (const listener of this.raiseListeners) {
+        try { listener(action); } catch { /* a notifier must never fail the enqueue */ }
+      }
+    }
     return action;
   }
 
@@ -156,7 +195,7 @@ export class PendingActionStore {
     const since = Date.parse(sinceIso ?? "");
     return this.list({ status: "pending" }).filter((action) => action.mode === "chat"
       && action.context?.sessionId === sessionId
-      && (!Number.isFinite(since) || Date.parse(action.createdAt) >= since));
+      && (!Number.isFinite(since) || Date.parse(action.raisedAt ?? action.createdAt) >= since));
   }
 
   _newCode(requested) {
@@ -218,9 +257,11 @@ export class PendingActionStore {
     return action;
   }
 
-  prepareContinuation(id, { requestId, sessionId, resetFailed = false } = {}) {
+  // allowFailedExecution: a scheduled run resumes to report an approved tool
+  // that failed (the tool is not rerun). A computer-use resume never does.
+  prepareContinuation(id, { requestId, sessionId, resetFailed = false, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
-    if (!action || action.status !== "approved" || action.error != null) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution)) return null;
     if (action.continuation?.status === "delivered") return action.continuation;
     if (action.continuation && !(resetFailed && action.continuation.status === "failed")) {
       return action.continuation;
@@ -238,10 +279,10 @@ export class PendingActionStore {
     return action.continuation;
   }
 
-  claimContinuation(id, { maxAttempts = 5 } = {}) {
+  claimContinuation(id, { maxAttempts = 5, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
     const continuation = action?.continuation;
-    if (!action || action.status !== "approved" || action.error != null || !continuation) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution) || !continuation) return null;
     if (!new Set(["pending", "failed"]).has(continuation.status)) return null;
     if (continuation.attempts >= maxAttempts) return null;
     const deliveryId = createId("delivery");
@@ -347,6 +388,12 @@ export class PendingActionStore {
           a.claimedBy = event.claimedBy;
           a.executionId = event.executionId;
         }
+      } else if (event.op === "raise" && event.id && typeof event.raisedAt === "string") {
+        const a = this.actions.get(event.id);
+        if (a) {
+          a.raisedAt = event.raisedAt;
+          if (typeof event.expiresAt === "string") a.expiresAt = event.expiresAt;
+        }
       } else if (event.op === "continuation" && event.id && event.continuation) {
         const a = this.actions.get(event.id);
         if (a) a.continuation = event.continuation;
@@ -356,6 +403,21 @@ export class PendingActionStore {
 
   _appendJournal(event) {
     appendJsonLine(this._journalPath(), event);
+  }
+
+  // Retires one pending card whose context no longer holds, with the reason.
+  expire(id, reason) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "pending") return null;
+    const decidedAt = new Date(this.now()).toISOString();
+    action.status = "expired";
+    this.ownerIntents.delete(action.id);
+    action.decidedAt = decidedAt;
+    action.decidedBy = "system";
+    action.error = String(reason ?? "Approval expired before it was used.").slice(0, 300);
+    this._appendJournal({ op: "decide", id: action.id, status: action.status, decidedAt, decidedBy: action.decidedBy, error: action.error });
+    this._emitResolution(action);
+    return action;
   }
 
   _expirePending() {
@@ -447,8 +509,35 @@ function serializableContext(ctx) {
     from: ctx.from ?? null,
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Lets an approval resume the scheduled run that raised it.
+    ...(typeof ctx.scheduledJobId === "string" ? { scheduledJobId: ctx.scheduledJobId.slice(0, 200) } : {}),
+    ...(typeof ctx.scheduledJobName === "string" ? { scheduledJobName: ctx.scheduledJobName.slice(0, 200) } : {}),
+    // Server-built record of how the run was allowed to act. A one-shot job
+    // is gone by the time its card is approved, so the resume reads it here.
+    ...(ctx.ownerSchedule === true ? { ownerSchedule: true } : {}),
     // Audit only: a replayed record is plain data and never owner authority.
-    authority: authorityRecord(ctx.__owner)
+    authority: authorityRecord(ctx.__owner),
+    // Grading provenance only (ids and numbers, no authority): lets work a
+    // replayed tool produces be linked to the turn that asked for it.
+    ...(ctx.__signal ? { __signal: signalRecord(ctx.__signal) } : {})
+  };
+}
+
+const SIGNAL_DIMENSIONS = ["environment", "company", "evidence", "memory", "uncertainty", "risk", "novelty", "repetition"];
+
+function signalRecord(signal) {
+  const text = (v, n) => (typeof v === "string" && v ? v.slice(0, n) : null);
+  const dims = {};
+  for (const key of SIGNAL_DIMENSIONS) {
+    const v = signal?.scrutinyDimensions?.[key];
+    if (typeof v === "number" && Number.isFinite(v)) dims[key] = v;
+  }
+  return {
+    id: text(signal?.id, 100),
+    scrutinyAction: text(signal?.scrutinyAction, 20),
+    scrutinyScore: typeof signal?.scrutinyScore === "number" && Number.isFinite(signal.scrutinyScore) ? signal.scrutinyScore : null,
+    scrutinyDimensions: Object.keys(dims).length ? dims : null,
+    specialistId: text(signal?.specialistId, 100)
   };
 }
 

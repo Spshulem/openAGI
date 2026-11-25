@@ -1,4 +1,6 @@
+import { STOPPED_TEXT } from "./message-turns.js";
 const PUBLIC_FAILURES = Object.freeze({
+  "image-input-unsupported": "This model cannot view images. Choose a vision-capable model in Model settings, then send the images again.",
   budget: "Daily budget exceeded",
   "provider-auth": "The model provider needs attention. Check its API key in Settings.",
   "provider-config": "This key belongs to OpenRouter. Set a Responses-compatible base URL and its model in setup, or use an OpenAI API key.",
@@ -7,8 +9,26 @@ const PUBLIC_FAILURES = Object.freeze({
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
+  "device-model-download-required": "Download Gemini Nano in Chat options before using the phone agent.",
+  "device-model-downloading": "Gemini Nano is still downloading. Open Chat options to see its progress.",
+  "device-model-unsupported": "The on-device model isn't available on this phone. Check for system updates or choose another model in Chat options.",
+  "device-model-foreground-required": "Keep OpenAGI open and your phone unlocked while Gemini Nano replies.",
+  "device-model-busy": "Gemini Nano is busy. Wait a moment and try again with OpenAGI open.",
+  "device-model-quota": "Android has temporarily limited Gemini Nano's battery usage. Try again later or choose another model.",
+  "device-model-system-update": "Gemini Nano needs an Android or Google AICore update. Check for updates, then reopen OpenAGI.",
+  "device-model-storage": "Gemini Nano needs more free storage on this phone. Free up space, then check the model in Chat options.",
+  "device-model-input-limit": "This conversation is too long for the on-device model. Start a new chat or send a shorter message.",
+  "device-model-rejected": "Gemini Nano couldn't answer that message. Try rephrasing it.",
+  "device-model-unavailable": "The phone's on-device model isn't ready. Check it in Chat options and keep OpenAGI open while it replies.",
+  "device-model-timeout": "The phone's on-device model took too long to reply. Keep OpenAGI open and try again.",
   "input-limit": "This request exceeds the configured input limit. Shorten your message, or increase OPENAGI_MAX_INPUT_TOKENS in your .env file and restart the daemon.",
-  "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
+  "agent-error": "The agent couldn't complete that request. Check the local daemon log for details.",
+  // Not a fault: the owner stopped the reply to send something else first.
+  // An action that was already running may have finished; none is undone.
+  stopped: STOPPED_TEXT,
+  // Taken out of the hub's conversation queue (by any device) before it ran.
+  removed: "Removed from the queue before it ran. Nothing was sent to the agent.",
+  "sender-unpaired": "Not run: the device that sent this was unpaired before its turn came."
 });
 
 const loggedFailures = new WeakSet();
@@ -17,10 +37,18 @@ const loggedFailures = new WeakSet();
 // public taxonomy before they reach chat history, HTTP responses, or browser
 // events; the detailed diagnostic belongs only in the daemon's local log.
 export function classifyAgentFailure(error) {
+  if (error?.code === "SENDER_UNPAIRED") return { code: "sender-unpaired", message: PUBLIC_FAILURES["sender-unpaired"] };
+  if (error?.code === "QUEUE_REMOVED") return { code: "removed", message: PUBLIC_FAILURES.removed };
+  if (error?.code === "OWNER_INTERRUPTED") return { code: "stopped", message: PUBLIC_FAILURES.stopped };
+  if (error?.code === "IMAGE_INPUT_UNSUPPORTED") return { code: "image-input-unsupported", message: PUBLIC_FAILURES["image-input-unsupported"] };
   const code = safeErrorField(error, "code");
   const name = safeErrorField(error, "name");
   const message = safeErrorMessage(error);
   const detail = `${code} ${name} ${message}`;
+
+  if (code.startsWith("device-model-") && Object.hasOwn(PUBLIC_FAILURES, code)) {
+    return { code, message: PUBLIC_FAILURES[code] };
+  }
 
   if (code === "INPUT_CONTEXT_TOO_LARGE") return { code: "input-limit", message: PUBLIC_FAILURES["input-limit"] };
   if (code === "PROVIDER_CONFIG_MISMATCH") return { code: "provider-config", message: PUBLIC_FAILURES["provider-config"] };
@@ -65,6 +93,13 @@ export function logAgentFailure(error, context = {}) {
   }
 
   const failure = classifyAgentFailure(error);
+  // The owner stopping a reply is not a fault: one line, no stack.
+  if (failure.code === "stopped" || failure.code === "removed") {
+    const note = { at: new Date().toISOString(), event: "agent-turn-interrupted", level: "info", component: "agent",
+      sessionId: boundedString(context.sessionId, 500) || null, requestId: boundedString(context.requestId, 200) || null };
+    try { process.stderr.write(`[openagi] ${JSON.stringify(note)}\n`); } catch { /* diagnostics are best-effort */ }
+    return;
+  }
   const diagnostic = redactFailureDiagnostic(safeErrorDiagnostic(error)).slice(0, 16_000);
   const record = {
     at: new Date().toISOString(),

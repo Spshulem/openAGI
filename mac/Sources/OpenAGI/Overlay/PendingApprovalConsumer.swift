@@ -1,4 +1,5 @@
 import Foundation
+import SupervisorChannelsKit
 
 /// The local daemon's durable human-approval queue.
 ///
@@ -13,7 +14,9 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
   let toolName: String
   let summary: String
   let status: String
+  let mode: String?
   let createdAt: String?
+  let raisedAt: String?
   let sourceSessionId: String?
   let codingReply: CodingReplyReview?
   let fleetMessage: FleetMessageReview?
@@ -59,7 +62,7 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
   }
 
   enum CodingKeys: String, CodingKey {
-    case id, toolName, summary, status, createdAt, context, args
+    case id, toolName, summary, status, mode, createdAt, raisedAt, context, args
   }
 
   init(from decoder: Decoder) throws {
@@ -68,7 +71,9 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     toolName = try c.decodeIfPresent(String.self, forKey: .toolName) ?? "agent_action"
     summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? "Agent action needs approval"
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+    mode = try? c.decodeIfPresent(String.self, forKey: .mode)
     createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+    raisedAt = try? c.decodeIfPresent(String.self, forKey: .raisedAt)
     sourceSessionId = try c.decodeIfPresent(Context.self, forKey: .context)?.sessionId
     codingReply = ["reply_to_coding_agent", "start_coding_agent"].contains(toolName)
       ? try? c.decode(CodingReplyReview.self, forKey: .args) : nil
@@ -100,6 +105,11 @@ final class PendingApprovalConsumer: ObservableObject {
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
   @Published private(set) var lastChatSessionId: String? = nil
+  @Published var overlayExpanded: Bool = false
+
+  func toggleOverlayExpanded() {
+    overlayExpanded.toggle()
+  }
 
   /// Only the newest reconciliation may publish. Refreshes arrive from panel
   /// appearance, SSE, and decisions, so response order is not request order.
@@ -113,16 +123,26 @@ final class PendingApprovalConsumer: ObservableObject {
       base: AppState.shared.baseURL,
       path: "/pending-actions?status=pending"))
     authed(&req)
+    req.setValue("overlay", forHTTPHeaderField: "X-OpenAGI-Surface")
     req.timeoutInterval = 4
     do {
       let (data, response) = try await URLSession.shared.data(for: req)
-      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-        throw URLError(.badServerResponse)
-      }
+      try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(PendingApprovalsResponse.self, from: data)
       guard generation == refreshGeneration else { return }
-      items = decoded.actions.filter { $0.status == "pending" }
+      items = decoded.actions.filter {
+        $0.status == "pending" &&
+          SupervisorChannelGrouping.shouldShowInOverlay(
+            mode: $0.mode,
+            raisedAtISO: $0.raisedAt,
+            createdAtISO: $0.createdAt
+          )
+      }
+      if items.isEmpty { overlayExpanded = false }
       lastError = nil
+    } catch let error as MainConnectionError {
+      guard generation == refreshGeneration else { return }
+      lastError = error.localizedDescription
     } catch {
       guard generation == refreshGeneration else { return }
       lastError = "Couldn't refresh approvals."
@@ -131,6 +151,49 @@ final class PendingApprovalConsumer: ObservableObject {
 
   func approve(_ id: String) async { await decide(id, decision: "approve") }
   func deny(_ id: String) async { await decide(id, decision: "deny") }
+
+  func dismissAll(mode: String? = nil, olderThanMs: Int? = nil) async {
+    var req = URLRequest(url: AppState.buildURL(
+      base: AppState.shared.baseURL,
+      path: "/pending-actions/dismiss-all"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    var payload: [String: Any] = ["reason": "dismissed all from overlay"]
+    if let mode { payload["mode"] = mode }
+    if let olderThanMs { payload["olderThanMs"] = olderThanMs }
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    authed(&req)
+    do {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      try AppState.ensureOK(response, data)
+      if let mode {
+        items.removeAll { $0.mode == mode }
+      } else {
+        items.removeAll()
+      }
+      lastOutcome = "Cleared stale requests."
+      lastError = nil
+      await refresh()
+    } catch {
+      let targets = items.filter { mode == nil || $0.mode == mode }
+      if !targets.isEmpty {
+        for item in targets {
+          await decide(item.id, decision: "deny")
+        }
+        await refresh()
+        if items.allSatisfy({ mode != nil && $0.mode != mode }) {
+          lastOutcome = "Cleared stale requests."
+          lastError = nil
+          return
+        }
+      }
+      if let mainErr = error as? MainConnectionError {
+        lastError = mainErr.localizedDescription
+      } else {
+        lastError = "Couldn't dismiss approvals."
+      }
+    }
+  }
 
   private func decide(_ id: String, decision: String) async {
     guard !inFlight.contains(id) else { return }
@@ -169,7 +232,7 @@ final class PendingApprovalConsumer: ObservableObject {
           lastError = terminalError
           return
         }
-        throw URLError(.badServerResponse)
+        try AppState.ensureOK(response, data)
       }
       items.removeAll { $0.id == id }
       let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
@@ -191,6 +254,8 @@ final class PendingApprovalConsumer: ObservableObject {
       }
       lastError = nil
       await refresh()
+    } catch let error as MainConnectionError {
+      lastError = error.localizedDescription
     } catch {
       lastError = decision == "approve" ? "Approval failed. Try again." : "Couldn't deny the request."
     }

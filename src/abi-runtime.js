@@ -44,6 +44,11 @@ import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
 import { ClarificationStore } from "./clarification-store.js";
 import { DraftStore } from "./draft-store.js";
+import { GroundedOutcomes } from "./learning/grounded-outcomes.js";
+import { ModelClient } from "./learning/model-client.js";
+import { LEARNED_HEADS, learnedModeFor } from "./learning/learned-scores.js";
+import { ClusterStats } from "./learning/cluster-stats.js";
+import { specialistExperimentVerdicts } from "./learning/specialist-experiment.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -53,6 +58,7 @@ import { SpecialistRouter } from "./specialist-router.js";
 import { TunnelWatcher } from "./tunnel-watcher.js";
 import { VectorStore } from "./vector-store.js";
 import { OutreachStore } from "./outreach-store.js";
+import { describeSchedule } from "./scheduled-prompt.js";
 import { OutreachMapper } from "./outreach-mapper.js";
 import { loadOutreachConfig } from "./outreach-config.js";
 import { surfaceStalledTasks } from "./outreach-stalled.js";
@@ -79,11 +85,12 @@ Do not invent work. Be conservative — fewer actions, higher signal.`;
 // Conservative on the empty path so we don't burn LLM cycles inventing
 // work. Users who want a different cadence can edit the cron job in
 // the dashboard; setting it to disabled turns the autopilot off entirely.
-const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue.
+const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue and advance active goals until their Definition of Done is genuinely met.
 
-1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do.
-2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, etc). When the task is done, call \`complete_task\` with the task id. If it's still in progress or needs to be deferred, call \`move_task\` to update its status / bucket / due date.
-   - DRAFT-ONLY tasks (tagged \`plan-action\`, or whose description says "produce a draft only"): prepare the artifact and leave it for the user — write the draft into your reply and/or save it, but do NOT send, publish, or schedule anything externally. Mark \`complete_task\` once the draft is ready for review.
+1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do (and check \`list_goals\` if multi-batch goals are active).
+2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, \`verify_goal_progress\`, etc).
+   - **CRITICAL CONTINUATION RULE (Never Stop After 10 Items):** If the user's goal covers an exhaustive set (e.g. "clean ALL my emails", "go through all 888 issues", "verify all 10 customer questions"), processing one batch of 5-20 items is NOT completion. Update progress via \`verify_goal_progress\` (recording \`cursor.processed\`, \`cursor.remaining\`, and \`cursor.lastCursorToken\`) or \`move_task\` so the next pulse automatically continues the next batch until \`remaining === 0\` and \`doneCriteria\` is verified. Only call \`complete_task\` once the ENTIRE goal is satisfied or blocked on a hard owner red line.
+   - DRAFT-ONLY & HARD RED LINES: Never merge PRs, deploy to production, send external emails/messages to customers, or spend money without explicit owner confirmation. Prepare drafts (\`save_draft\`) for human review when external sends are needed.
 3. If the queue is empty (\`{task: null}\`): you don't need to invent work. Glance at recent sessions only if something obviously needs a follow-up — otherwise reply "standing by" in one sentence and stop.
 
 The user is not in this conversation — the only output that matters is what you DO via tools, not what you say. Take no action if you have no committed work; do not summarize, do not editorialize.`;
@@ -162,6 +169,21 @@ export class AbiRuntime {
     });
     this.skills = options.skills ?? null;
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
+    // Optional local scoring service (src/learning/model-client.js). Inert, with
+    // no requests, files or timers, unless OPENAGI_MODEL_URL is set.
+    this.modelClient = options.modelClient ?? new ModelClient();
+    // Learned keep-scores for memory decay and eviction (shadow by default,
+    // nothing at all without the service). Set once the client exists.
+    const memoryMode = learnedModeFor("memory", this.modelClient);
+    if (memoryMode !== "off" && this.memory instanceof MemorySystem) {
+      this.memory.learnedMode = memoryMode;
+      this.memory.keepScoresUsable = () => this.modelClient.usable(LEARNED_HEADS.keep);
+    }
+    // Per-topic grades for need-based spawning; created on first use, and
+    // only while OPENAGI_LEARNED_PROPAGATION is not off (learnedClusterStats).
+    this.clusterStats = options.clusterStats ?? null;
+    this.learningDir = options.dataDir ? path.join(options.dataDir, "learning") : undefined;
+    this.modelUpgradeDir = options.dataDir ?? resolveDataDir();
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // FTS5 index over the agent's own chat transcripts, so search_sessions can
@@ -176,6 +198,13 @@ export class AbiRuntime {
       const specialistId = outcome.metadata?.specialistId;
       if (specialistId && typeof outcome.qualityScore === "number") {
         this.propagation.recordOutcomeQuality?.(specialistId, outcome.qualityScore);
+      }
+    };
+    // Grounded grades (what happened to the work) feed the specialist's quality.
+    this.outcomes.onGrounded = (outcome, previous) => {
+      const specialistId = outcome.metadata?.specialistId;
+      if (specialistId && typeof outcome.groundedScore === "number") {
+        this.propagation.recordGroundedQuality?.(specialistId, outcome.groundedScore, previous);
       }
     };
     this.outcomes.onFeedback = (outcome, previous) => {
@@ -231,6 +260,9 @@ export class AbiRuntime {
       runtime: this,
       dir: options.dataDir ? `${options.dataDir}/drafts` : undefined
     });
+    // Grades drafts, suggestions and agent-completed tasks by what the owner
+    // did with them (see src/learning/grounded-outcomes.js).
+    this.grounded = options.grounded ?? new GroundedOutcomes({ runtime: this });
     // Proactive outreach: store + mapper that turn existing runtime events
     // (drafts, suggestions, pending actions, clarifications) into a single
     // outreach feed. The event bus is late-bound by hosted-interface.js (this
@@ -281,19 +313,34 @@ export class AbiRuntime {
       // metered model the interval is the single biggest cost lever. Default
       // 30 min; set OPENAGI_AUTOPILOT_INTERVAL_MIN to slow it (e.g. 120 = 2h).
       const autopilotMin = Number(process.env.OPENAGI_AUTOPILOT_INTERVAL_MIN) || 30;
-      this.cron.addJob({
-        id: "agent-pulse",
-        name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
-        enabled: true,
-        task: "autopilot",
-        intervalMs: autopilotMin * 60 * 1000,
-        input: {
-          agentId: "main",
-          prompt: AGENT_PULSE_PROMPT,
-          // Only fire (spend a base-model call) when there's queued agent work.
-          requireQueuedWork: true
-        }
-      });
+      const existingPulse = this.cron.jobs?.get?.("agent-pulse") ?? null;
+      const upgradeLegacyPulse = Boolean(
+        existingPulse && !String(existingPulse.input?.prompt ?? "").includes("verify_goal_progress")
+      );
+      if (upgradeLegacyPulse && typeof this.cron.updateJob === "function") {
+        // Upgrade only the prompt: the owner's saved cadence, timeout, enabled
+        // state, and next run stay exactly as they were configured.
+        this.cron.updateJob("agent-pulse", {
+          input: { ...(existingPulse.input ?? {}), prompt: AGENT_PULSE_PROMPT, requireQueuedWork: true }
+        });
+      } else {
+        this.cron.addJob({
+          id: "agent-pulse",
+          name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
+          enabled: existingPulse ? existingPulse.enabled !== false : true,
+          replace: upgradeLegacyPulse,
+          task: "autopilot",
+          intervalMs: autopilotMin * 60 * 1000,
+          ...(existingPulse?.nextRunAt ? { nextRunAt: existingPulse.nextRunAt } : {}),
+          ...(existingPulse?.createdAt ? { createdAt: existingPulse.createdAt } : {}),
+          input: {
+            agentId: "main",
+            prompt: AGENT_PULSE_PROMPT,
+            // Only fire (spend a base-model call) when there's queued agent work.
+            requireQueuedWork: true
+          }
+        });
+      }
       this.cron.addJob({
         id: "weekly-harsh-review",
         name: "Weekly harsh review",
@@ -331,6 +378,44 @@ export class AbiRuntime {
       // reached 1.26 GiB of screen OCR. 05:15 is deliberately AFTER the 02:30
       // nightly miner (which reads a 28-day window) and off every other slot, so
       // retention never shares a tick with another job.
+      // Daily: list the models the owner's keys can reach and suggest newer
+      // ones (or flag a configured model that no longer exists). Read-only
+      // against the provider; never changes config.
+      this.cron.addJob({
+        id: "model-upgrade-check",
+        name: "Daily check for newer models (suggests, never switches)",
+        enabled: true,
+        task: "model-upgrade-check",
+        dailyAt: "05:35"
+      });
+      this.cron.addJob({
+        id: "grounded-sweep",
+        name: "Daily grading of drafts, suggestions and agent tasks by what happened",
+        enabled: true,
+        task: "grounded-sweep",
+        dailyAt: "04:45"
+      });
+      // Randomized specialist comparison: registered only while the router
+      // runs in experiment mode. Sets each specialist's experimentVerdict,
+      // which the retirement sweep acts on.
+      if (this.specialistRouter?.mode === "experiment") {
+        this.cron.addJob({
+          id: "specialist-experiment",
+          name: "Daily verdicts for the randomized specialist comparison",
+          enabled: true,
+          task: "specialist-experiment",
+          dailyAt: "04:55"
+        });
+      }
+      // Manual only: run it from the dashboard or POST /cron/grounded-backfill/run
+      // with input { apply: true }. Without apply it reports what it would grade.
+      this.cron.addJob({
+        id: "grounded-backfill",
+        name: "One-time grading of work resolved before grading existed (manual)",
+        enabled: false,
+        task: "grounded-backfill",
+        dailyAt: "04:50"
+      });
       this.cron.addJob({
         id: "observation-retention",
         name: "Daily observation retention — prune expired capture, reclaim disk",
@@ -629,16 +714,39 @@ export class AbiRuntime {
       limit: 6,
       scope
     });
+    // signal.learned (agent-host messageToSignal) exists only when a learned
+    // use is on. A learned scrutiny value is passed only when it may act: a
+    // live flag and a usable head. Otherwise the rule score stands.
+    const learned = signal.learned ?? null;
+    const learnedValue = learned?.mode === "live"
+      && learnedModeFor("scrutiny", this.modelClient) === "live"
+      && this.modelClient.usable(LEARNED_HEADS.value)
+      ? (learned.value ?? null)
+      : null;
     const scrutiny = this.scrutiny.evaluate({
       signal,
       workflow,
       memories: memoryHits,
       context: this.context,
-      overrides: signal.scrutinyOverrides ?? {}
+      overrides: learned?.mode
+        ? { ...(signal.scrutinyOverrides ?? {}), learnedValue }
+        : signal.scrutinyOverrides ?? {}
     });
+    if (learned?.mode) scrutiny.shadowLearnedValue = learned.value ?? null;
 
     const parentSpecialistId = options.parentSpecialistId ?? null;
-    const propagationDecision = this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId });
+    const propagationMode = learnedModeFor("propagation", this.modelClient);
+    const clusterId = learned?.cluster ?? null;
+    const propagationDecision = propagationMode === "off"
+      ? this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId })
+      : this.propagation.shouldPropagate({
+          signal,
+          scrutiny,
+          memoryHits,
+          parentSpecialistId,
+          clusterStats: clusterId !== null ? this.clusterStatsFor(clusterId) : null,
+          learnedMode: propagationMode
+        });
     const propagated =
       options.allowPropagation !== false && propagationDecision.decision && scrutiny.action !== "ignore"
         ? this.propagation.propagate({
@@ -668,7 +776,7 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else if (!options.ephemeral && !options.isolatedContext) {
+    } else if (!options.ephemeral && !options.isolatedContext && options.memoryWrite !== false) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
@@ -704,6 +812,7 @@ export class AbiRuntime {
           critical: signal.risk >= 0.85
         }
       );
+      if (memoryItem && learnedModeFor("memory", this.modelClient) !== "off") this.requestKeepScore(memoryItem);
     }
 
     const output = {
@@ -722,6 +831,16 @@ export class AbiRuntime {
         content: item.content
       }))
     };
+    // Shadow (or live) record of the need-based spawn rule beside the keyword rule.
+    if (propagationMode !== "off") {
+      output.learnedPropagation = {
+        mode: propagationMode,
+        clusterId,
+        explicitlyRequired: propagationDecision.explicitlyRequired === true,
+        ruleDecision: propagationMode === "live" ? propagationDecision.ruleDecision : propagationDecision.decision,
+        learnedDecision: propagationMode === "live" ? propagationDecision.decision : propagationDecision.learnedDecision
+      };
+    }
 
     // Ephemeral turns (setup-wizard connectivity test) leave NO trace — that
     // includes the in-memory outputs/feedback logs the dashboard reads, not
@@ -740,6 +859,72 @@ export class AbiRuntime {
     }
 
     return output;
+  }
+
+  // Ask the scoring service how likely this memory is to be recalled, and
+  // store the answer on the item. Never awaited: processSignal stays
+  // synchronous, and a missing answer leaves the item as it is.
+  requestKeepScore(item) {
+    try {
+      const memory = this.memory;
+      Promise.resolve(this.modelClient.keepScores([{
+        id: item.id,
+        text: item.content,
+        tier: item.tier,
+        kind: item.kind,
+        source: item.source,
+        novelty: item.novelty,
+        risk: item.risk,
+        repetition: item.repetition,
+        specificity: item.specificity,
+        strength: item.strength
+      }])).then((result) => {
+        if (result?.scores && Object.hasOwn(result.scores, item.id)) {
+          memory.setKeepScore?.(item.id, result.scores[item.id], result.version);
+        }
+      }).catch(() => {});
+    } catch { /* keep-scores are optional */ }
+  }
+
+  // ClusterStats while need-based spawning is on (shadow or live), else null.
+  learnedClusterStats() {
+    if (learnedModeFor("propagation", this.modelClient) === "off") return null;
+    if (!this.clusterStats) this.clusterStats = new ClusterStats({ dir: this.learningDir });
+    return this.clusterStats;
+  }
+
+  // { n, mean, overallMean } of the generalist's grounded grades for one
+  // topic over the last 30 days, for PropagationController.shouldPropagate.
+  clusterStatsFor(clusterId) {
+    try {
+      const stats = this.learnedClusterStats();
+      if (!stats || clusterId === null || clusterId === undefined) return null;
+      return { ...stats.stats(clusterId), overallMean: stats.overall().mean };
+    } catch {
+      return null;
+    }
+  }
+
+  // Daily job: verdicts of the randomized specialist comparison onto each
+  // specialist (experimentVerdict), for the retirement sweep to act on.
+  runSpecialistExperiment() {
+    const verdicts = specialistExperimentVerdicts([...(this.outcomes?.outcomes?.values?.() ?? [])]);
+    const summary = { specialists: 0, changed: 0, byVerdict: {} };
+    for (const sp of this.propagation?.list?.({ includeRetired: false }) ?? []) {
+      const result = verdicts.get(sp.id);
+      const verdict = result?.verdict ?? "undecided";
+      summary.specialists += 1;
+      summary.byVerdict[verdict] = (summary.byVerdict[verdict] ?? 0) + 1;
+      if (sp.experimentVerdict !== verdict) {
+        sp.experimentVerdict = verdict;
+        summary.changed += 1;
+      }
+      sp.experiment = result
+        ? { specialist: result.specialist, generalist: result.generalist, difference: result.difference, interval: result.interval }
+        : null;
+    }
+    if (summary.specialists > 0) this.propagation.save?.();
+    return summary;
   }
 
   async tick(now = new Date()) {
@@ -837,10 +1022,23 @@ export class AbiRuntime {
         this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
         // Respawn with the new code (systemd Restart=always / launchd
         // KeepAlive / Mac DaemonController bring it back). Defer so the
-        // tick result can flush first.
-        setTimeout(() => process.exit(0), 500);
+        // tick result can flush first. An unsupervised portable install
+        // reports restartRequired instead — exiting would never come back.
+        if (!result.restartRequired) setTimeout(() => process.exit(0), 500);
       }
       return result;
+    }
+    if (job.task === "model-upgrade-check") {
+      const { checkModelUpgrades } = await import("./model-upgrades.js");
+      // Outreach opt-out (OPENAGI_OUTREACH_DISABLED / outreach.json) silences
+      // the announcement; the read-only check and settings cache still run.
+      return checkModelUpgrades({ dataDir: this.modelUpgradeDir, outreach: this.outreachConfig?.enabled ? this.outreach : null, now });
+    }
+    if (job.task === "grounded-sweep") {
+      return this.grounded?.sweep({ now }) ?? { skipped: true, reason: "grading unavailable" };
+    }
+    if (job.task === "grounded-backfill") {
+      return this.grounded?.backfill({ apply: job.input?.apply === true }) ?? { skipped: true, reason: "grading unavailable" };
     }
     if (job.task === "observation-retention") {
       const { pruneObservations } = await import("./observation-retention.js");
@@ -869,6 +1067,9 @@ export class AbiRuntime {
         reclaimedBytes: result.reclaim?.reclaimedBytes ?? 0
       });
       return result;
+    }
+    if (job.task === "specialist-experiment") {
+      return this.runSpecialistExperiment();
     }
     if (job.task === "retirement-sweep") {
       const retired = this.propagation.retirementSweep?.() ?? [];
@@ -1331,31 +1532,97 @@ export class AbiRuntime {
     // Persist consumption before spending or delivering. A failed one-shot
     // stays paused for inspection, not retried forever as a recurring job.
     if (input.oneShot) this.cron.enableJob(job.id, false);
-    const result = await this.agentHost.handleMessage({
-      channel: input.channel ?? "cron",
-      from: input.target ?? "cron",
-      agentId: input.agentId ?? "main",
-      sessionId: input.sessionId,
-      text: input.prompt ?? "(empty scheduled prompt)",
-      metadata: { scheduledJobId: job.id, scheduledJobName: job.name },
-      origin: "cron"
-    });
-    if (this.channels && input.channel && input.target) {
-      try {
-        await this.channels.deliver({
-          channel: input.channel,
-          target: input.target,
-          text: result.reply
-        });
-        result.delivered = { channel: input.channel, target: input.target };
-      } catch (error) {
-        result.deliveryError = error.message;
-      }
+    // The model has no clock of its own, and the stored prompt alone reads
+    // like the owner typing it now. Say what this run is and when it fired.
+    const firedAt = new Date();
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const header = `[Scheduled run "${job.name}", ${describeSchedule(job)}. Now: ${firedAt.toLocaleString("en-US", { dateStyle: "full", timeStyle: "short" })} (${zone}). Do the task now and reply with the result.]`;
+    let result;
+    try {
+      result = await this.agentHost.handleMessage({
+        channel: input.channel ?? "cron",
+        from: input.target ?? "cron",
+        agentId: input.agentId ?? "main",
+        sessionId: input.sessionId,
+        text: `${header}\n\n${input.prompt ?? "(empty scheduled prompt)"}`,
+        metadata: { scheduledJobId: job.id, scheduledJobName: job.name },
+        origin: "cron"
+      }, {
+        // Set only from the stored job, which only an owner turn can mark
+        // (scheduled-prompt.js). It lifts the scrutiny throttle so the owner's
+        // routine can read and run skills; it is not owner authority, so
+        // approval-gated tools still queue for the owner.
+        ownerSchedule: input.createdBy === "owner"
+      });
+    } catch (error) {
+      this.noticeScheduledRun(job, `Scheduled run failed: ${error?.message ?? error}`);
+      throw error;
     }
+    await this.deliverScheduledResult(job, result);
     if (input.oneShot) {
       this.cron.removeJob(job.id);
     }
     return result;
+  }
+
+  // An approval card raised by a scheduled run gets approved later, after the
+  // run already replied. Run one more turn in the same session so the routine
+  // finishes and its report still goes out.
+  async resumeScheduledRun(action, invokeResult) {
+    if (!this.agentHost) return null;
+    const context = action.context ?? {};
+    const job = this.cron?.listJobs().find(row => row.id === context.scheduledJobId)
+      ?? { id: context.scheduledJobId, name: context.scheduledJobName ?? "Scheduled run", input: {} };
+    const input = { channel: context.channel, target: context.from, agentId: context.agentId ?? undefined, ...job.input };
+    const outcome = invokeResult?.ok
+      ? `It ran. Result: ${JSON.stringify(invokeResult.result ?? null).slice(0, 2000)}`
+      : `It failed: ${String(invokeResult?.error ?? "unknown error").slice(0, 500)}`;
+    const result = await this.agentHost.handleMessage({
+      channel: input.channel ?? "cron",
+      from: input.target ?? "cron",
+      agentId: input.agentId ?? "main",
+      sessionId: context.sessionId,
+      text: `[Scheduled run "${job.name}" update: the owner approved "${action.summary}". ${outcome}]\n\nFinish the scheduled task and reply with the result.`,
+      metadata: { scheduledJobId: job.id, scheduledJobName: job.name, approvalActionId: action.id },
+      origin: "cron"
+    }, { ownerSchedule: context.ownerSchedule === true || input.createdBy === "owner" });
+    await this.deliverScheduledResult({ ...job, input }, result);
+    return result;
+  }
+
+  async deliverScheduledResult(job, result) {
+    const input = job.input ?? {};
+    if (this.channels && input.channel && input.target) {
+      try {
+        const sent = await this.channels.deliver({
+          channel: input.channel,
+          target: input.target,
+          text: result.reply
+        });
+        // "local" and "cron" have no outbound transport and say so. Do not
+        // report those as delivered.
+        if (sent?.delivered === false) result.deliveryError = sent.reason ?? `channel ${input.channel} has no outbound transport`;
+        else result.delivered = { channel: input.channel, target: input.target };
+      } catch (error) {
+        result.deliveryError = error.message;
+      }
+    }
+    // Whatever could not be sent still reaches the owner's feed (Mac
+    // notification, phone), instead of sitting unread in a session.
+    if (!result.delivered) this.noticeScheduledRun(job, result.reply);
+  }
+
+  noticeScheduledRun(job, text) {
+    try {
+      this.outreach?.append({
+        type: "scheduled-run",
+        sourceRef: { kind: "cron", id: job.id },
+        title: job.name ?? "Scheduled run",
+        summary: String(text ?? "").slice(0, 2000),
+        // Without an action the overlay row has no control to clear it.
+        actions: ["dismiss"]
+      });
+    } catch { /* the run result stays in its session */ }
   }
 
   reconcilePrincipleVectors() {

@@ -29,4 +29,4 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: node --test test/open-computer-use.test.js test/ocu-transport.test.js test/computer-use-request-cancel.test.js test/computer-server.test.js test/computer-use-approval.test.js test/node-control.test.js test/g2-cancellation.test.js
+      - run: node --test test/open-computer-use.test.js test/ocu-transport.test.js test/computer-use-request-cancel.test.js test/computer-server.test.js test/computer-screenshot-recovery.test.js test/computer-use-approval.test.js test/node-control.test.js test/g2-cancellation.test.js

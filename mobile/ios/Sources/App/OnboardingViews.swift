@@ -6,8 +6,9 @@ import UIKit
 
 // First run: where should the agent run? This iPhone is the default and
 // needs nothing else; a server can be added now or later from Settings.
-struct WelcomeView: View {
+struct StepByStepWelcomeView: View {
     @Environment(AppSession.self) private var session
+    var showChat: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
@@ -21,21 +22,31 @@ struct WelcomeView: View {
                     Section { Text(error).foregroundStyle(.red) }
                 }
                 Section {
-                    Button("On this iPhone", systemImage: "iphone") { session.choosePhone() }
+                    Button("On this iPhone", systemImage: "apple.intelligence") { session.choosePhone() }
                         .disabled(!session.canRunOnPhone)
                         .accessibilityIdentifier("setup-on-phone")
                 } header: {
-                    Text("Start locally")
+                    Text("Start right now on this iPhone")
                 } footer: {
                     Text(session.canRunOnPhone
-                         ? "Use Apple Intelligence on a supported iPhone. No account, API key or server required. Cloud models and online integrations are optional."
+                         ? "Chat privately with Apple Intelligence on supported iPhones — manage tasks, voice notes, and memory with zero API keys or server setup. You can add Claude, OpenAI, or a Mac anytime."
                          : "This build doesn't include the on-phone runtime.")
                 }
                 Section {
-                    Button("Connect to a server", systemImage: "server.rack") { session.chooseServer() }
+                    Button("Connect to your Mac or server", systemImage: "macbook.and.iphone") { session.chooseServer() }
                         .accessibilityIdentifier("setup-server")
+                    ShareLink(
+                        item: URL(string: "https://github.com/Spshulem/openAGI/releases/latest")!,
+                        subject: Text("Download OpenAGI for Mac"),
+                        message: Text("Install OpenAGI on your Mac to unlock the Coding Supervisor (Claude Code, Codex, Cursor, Paseo) and Open Computer Use:")
+                    ) {
+                        Label("Don't have the Mac app yet? Send download link to yourself", systemImage: "paperplane")
+                    }
+                    .accessibilityIdentifier("setup-share-mac-link")
+                } header: {
+                    Text("Unlock Mac Supervisor & Computer Use")
                 } footer: {
-                    Text("Use an existing OpenAGI agent on your Mac or server. You can connect later in Settings.")
+                    Text("OpenAGI on your Mac supervises all your coding sessions, reviews PRs, and runs Open Computer Use — synced live with your iPhone.")
                 }
                 Section("Connecting your devices") {
                     Label("On the same Wi-Fi, Find servers looks for an announcement from the updated desktop app or daemon. Update and restart it first.", systemImage: "wifi")
@@ -53,6 +64,9 @@ struct WelcomeView: View {
             .accessibilityIdentifier("setup-welcome")
             .navigationTitle("OpenAGI")
             .toolbar {
+                if let showChat {
+                    ToolbarItem(placement: .primaryAction) { Button("Chat setup", action: showChat) }
+                }
                 if session.mode != nil {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Return to app") { session.goBack() }
@@ -82,15 +96,18 @@ struct PhoneSetupView: View {
     @State private var step: Step = .model
     @State private var modelStatus = OnDeviceModelStatus.current()
     @State private var credentials: Credentials?
-    @State private var name = ""
+    @State private var name = "OpenAGI"
     @State private var focus = ""
     @State private var isWorking = false
     @State private var errorText: String?
     @State private var showingModelSettings = false
+    @State private var startedAutomatically = false
+    @State private var usingLocalModel = false
 
     var body: some View {
         NavigationStack {
-            Form {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
                     switch step {
                     case .model: modelStep
                     case .starting: startingStep
@@ -99,11 +116,21 @@ struct PhoneSetupView: View {
                     case .brain: brainStep
                     case .notifications: notificationsStep
                     }
+                }
+                .padding(24)
+                .frame(maxWidth: 600)
+                .frame(maxWidth: .infinity)
             }
+            .textFieldStyle(.roundedBorder)
             .navigationTitle("Set up your agent")
             .navigationBarTitleDisplayMode(.inline)
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { modelStatus = OnDeviceModelStatus.current() }
+            }
+            .task {
+                guard !startedAutomatically else { return }
+                startedAutomatically = true
+                if modelStatus == .available { start() }
             }
             .toolbar {
                 if step != .starting {
@@ -266,6 +293,15 @@ struct PhoneSetupView: View {
         Task {
             do {
                 credentials = try await PhoneAgent.bringUp()
+                if let credentials, modelStatus == .available {
+                    let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+                    do {
+                        try await PhoneModelSetup.useLocal(client: client, availability: modelStatus)
+                        usingLocalModel = true
+                    } catch {
+                        errorText = error.localizedDescription
+                    }
+                }
                 step = .name
             } catch {
                 step = .startFailed(error.localizedDescription)
@@ -283,7 +319,7 @@ struct PhoneSetupView: View {
                     "name": name.trimmingCharacters(in: .whitespacesAndNewlines),
                     "focus": focus.trimmingCharacters(in: .whitespacesAndNewlines)
                 ])
-                step = .brain
+                step = usingLocalModel ? .notifications : .brain
             } catch {
                 errorText = "Couldn't save that. Try again."
             }

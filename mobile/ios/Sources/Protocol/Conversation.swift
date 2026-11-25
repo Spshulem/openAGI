@@ -10,6 +10,21 @@ public enum ConversationThread: String, Codable, Sendable, CaseIterable {
     case supervisor
 }
 
+public struct ConversationSummary: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let thread: ConversationThread
+    public let title: String
+    public let preview: String
+    public let updatedAt: Date
+    public let messageCount: Int
+    public let readOnly: Bool
+    public var key: String { "\(thread.rawValue):\(id)" }
+}
+
+public struct ConversationCatalog: Codable, Sendable {
+    public let conversations: [ConversationSummary]
+}
+
 // One stored turn, user or assistant text only -- the daemon never sends
 // tool calls on this route. `sourceName` is the device that sent a user turn
 // ("Spencer's G2"), so the phone can say where a message came from when it
@@ -25,14 +40,37 @@ public struct ConversationMessage: Codable, Sendable, Equatable, Identifiable {
     public let at: Date
     public let sourceNodeId: String?
     public let sourceName: String?
+    public let attachments: [ChatAttachment]?
+    // The turn this line belongs to (mobile/PROTOCOL.md §3.1, "Recovering a
+    // turn"): a phone matches its own send and the reply to it by this.
+    public let requestId: String?
+    // "failed" on the record main stores when a turn could not finish.
+    public let status: String?
 
-    public init(id: String, role: Role, text: String, at: Date, sourceNodeId: String? = nil, sourceName: String? = nil) {
+    public init(id: String, role: Role, text: String, at: Date, sourceNodeId: String? = nil, sourceName: String? = nil,
+                attachments: [ChatAttachment]? = nil, requestId: String? = nil, status: String? = nil) {
         self.id = id
         self.role = role
         self.text = text
         self.at = at
         self.sourceNodeId = sourceNodeId
         self.sourceName = sourceName
+        self.attachments = attachments
+        self.requestId = requestId
+        self.status = status
+    }
+}
+
+// A turn main is still running in this thread with no client attached.
+public struct InFlightTurn: Codable, Sendable, Equatable {
+    public let requestId: String
+    public let stage: String?
+    public let startedAt: Date?
+
+    public init(requestId: String, stage: String? = nil, startedAt: Date? = nil) {
+        self.requestId = requestId
+        self.stage = stage
+        self.startedAt = startedAt
     }
 }
 
@@ -44,14 +82,18 @@ public struct ConversationPage: Decodable, Sendable, Equatable {
     public let thread: String?
     public let messages: [ConversationMessage]
     public let nextBefore: String?
+    // Turns still running (newest page only). nil from a main older than
+    // turn recovery, which cannot say: the phone then waits for the reply.
+    public let inFlight: [InFlightTurn]?
 
-    public init(thread: String?, messages: [ConversationMessage], nextBefore: String?) {
+    public init(thread: String?, messages: [ConversationMessage], nextBefore: String?, inFlight: [InFlightTurn]? = nil) {
         self.thread = thread
         self.messages = messages
         self.nextBefore = nextBefore
+        self.inFlight = inFlight
     }
 
-    private enum CodingKeys: String, CodingKey { case thread, messages, nextBefore }
+    private enum CodingKeys: String, CodingKey { case thread, messages, nextBefore, inFlight }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -59,6 +101,7 @@ public struct ConversationPage: Decodable, Sendable, Equatable {
         nextBefore = try? container.decodeIfPresent(String.self, forKey: .nextBefore)
         let raw = (try? container.decodeIfPresent([Lenient<ConversationMessage>].self, forKey: .messages)) ?? []
         messages = raw.compactMap(\.value)
+        inFlight = (try? container.decodeIfPresent([Lenient<InFlightTurn>].self, forKey: .inFlight))?.compactMap(\.value)
     }
 }
 

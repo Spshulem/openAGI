@@ -21,6 +21,13 @@ data class SavedChatEntry(
     // thread, and the device that sent it when that was not this phone.
     val serverId: String? = null,
     val sourceName: String? = null,
+    // Turn recovery (all optional: older files decode unchanged). The turn
+    // id; a reply main accepted whose stream was lost (still recovering); a
+    // send never confirmed, to resend once; a turn main lost (retry is new).
+    val requestId: String? = null,
+    val detached: Boolean = false,
+    val autoRetry: Boolean = false,
+    val newRequestOnRetry: Boolean = false,
 )
 
 @Serializable

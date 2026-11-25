@@ -39,7 +39,7 @@ struct OverlayDragHandle: NSViewRepresentable {
 }
 
 final class OverlayDragView: NSView {
-  static let dragThreshold: CGFloat = 4
+  static let dragThreshold: CGFloat = 6
 
   var onClick: (() -> Void)?
   var onHover: ((Bool) -> Void)?

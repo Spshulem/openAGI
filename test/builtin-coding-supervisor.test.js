@@ -130,10 +130,18 @@ test("restart quarantines unknown process ownership without killing or auto-resu
   assert.equal(restarted.list().sessions[0].replyAvailable, false);
 });
 
-test("deadline escalates only the owned process and releases the workspace after confirmed exit", async t => {
+test("deadline escalates only the owned process and releases the workspace after confirmed exit", t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(t, { timeoutMs: 5, killGraceMs: 5 });
   f.supervisor.start(f.prepare());
-  await new Promise(resolve => setTimeout(resolve, 30));
+  t.mock.timers.tick(4);
+  assert.equal(f.children[0].killedWith, undefined);
+  t.mock.timers.tick(1);
+  assert.equal(f.children[0].killedWith, "SIGTERM");
+  assert.equal(f.supervisor.children.size, 1);
+  t.mock.timers.tick(4);
+  assert.equal(f.children[0].killedWith, "SIGTERM");
+  t.mock.timers.tick(1);
   assert.equal(f.children[0].killedWith, "SIGKILL");
   assert.equal(f.supervisor.children.size, 0);
   assert.equal(f.supervisor.list().sessions[0].status, "failed");

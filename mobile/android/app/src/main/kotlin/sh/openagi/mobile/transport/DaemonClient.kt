@@ -30,6 +30,9 @@ import sh.openagi.mobile.protocol.FleetMuteRequest
 import sh.openagi.mobile.protocol.FleetMuteResult
 import sh.openagi.mobile.protocol.FleetPushResult
 import sh.openagi.mobile.protocol.FleetQuestionResult
+import sh.openagi.mobile.protocol.FleetReplyRequest
+import sh.openagi.mobile.protocol.FleetSendRequest
+import sh.openagi.mobile.protocol.FleetSendResult
 import sh.openagi.mobile.protocol.FleetState
 import sh.openagi.mobile.protocol.FleetThreadDetailResult
 import sh.openagi.mobile.protocol.LifelogMoment
@@ -95,6 +98,9 @@ class DaemonClient(
     private val client: OkHttpClient = defaultClient,
     private val enforceAllowlist: Boolean = true,
 ) {
+    internal fun belongsTo(credentials: sh.openagi.mobile.store.Credentials): Boolean =
+        server == credentials.server && nodeId == credentials.nodeId && token == credentials.token
+
     // SSE reads can legitimately go 15+ seconds between bytes — PROTOCOL.md
     // §7's own ": ping" cadence is every 15s, and a chat reply can think for
     // longer than that between deltas. `client`'s ordinary read timeout
@@ -240,8 +246,8 @@ class DaemonClient(
     // closes the stream. `Accept: text/event-stream` is what selects this
     // richer streaming reply over the plain single-JSON-object response the
     // same route gives a caller that doesn't ask for it.
-    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null, thread: String? = null): Flow<SseFrame> {
-        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId, thread))
+    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null, thread: String? = null, requestId: String? = null): Flow<SseFrame> {
+        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId, thread, requestId))
         val request = authorized("/message")
             .header("Accept", "text/event-stream")
             .post(body.toRequestBody(JSON))
@@ -293,6 +299,30 @@ class DaemonClient(
         val body = ProtocolJson.json.encodeToString(FleetAnswerRequest.serializer(), FleetAnswerRequest(answer))
         val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
         return fleetCall(request, relayClient, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    // Free text to a question whose canReply is true: the hub types it into
+    // the question's chat and closes the question once it is sent or queued.
+    // The same long wait as an answer.
+    suspend fun fleetReply(id: String, reply: String): FleetQuestionResult {
+        val body = ProtocolJson.json.encodeToString(FleetReplyRequest.serializer(), FleetReplyRequest(reply))
+        val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
+        return fleetCall(request, relayClient, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    // The owner's own words to one thread, no question attached. 404 here is
+    // a hub without the route (every hub with it answers a bad key with 400),
+    // so it reads as Unauthorized: the same "update the hub" as a phone the
+    // route is not yet open to.
+    suspend fun fleetSendMessage(threadKey: String, message: String): FleetSendResult {
+        if (!THREAD_KEY.matches(threadKey)) throw DaemonException.NotFound()
+        val body = ProtocolJson.json.encodeToString(FleetSendRequest.serializer(), FleetSendRequest(threadKey, message))
+        val request = authorized("/fleet/api/send").post(body.toRequestBody(JSON)).build()
+        return try {
+            fleetCall(request, relayClient, FleetSendResult.serializer(), missingMeansUnavailable = false)
+        } catch (missing: DaemonException.NotFound) {
+            throw DaemonException.Unauthorized()
+        }
     }
 
     suspend fun fleetDismiss(id: String): FleetQuestionResult {
@@ -452,7 +482,7 @@ class DaemonClient(
     companion object {
         private val JSON = "application/json".toMediaType()
         // The fleet thread keys the daemon routes (src/mobile-node.js FLEET_THREAD).
-        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$""")
+        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$""")
 
         val defaultClient: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)

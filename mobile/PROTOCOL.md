@@ -213,6 +213,7 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| GET | `/mobile/capabilities` | authenticated image-upload support preflight |
 | POST | `/mobile/push` | iOS push registration, §7.1 |
 | DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
@@ -239,10 +240,16 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | GET | `/fleet/api/state` | fleet supervisor state, see "Fleet supervisor routes" below |
 | POST | `/fleet/api/scan` | no body; runs a scan and returns state (can take ~100s) |
 | POST | `/fleet/api/mode` | body `{"mode": "observe"\|"propose"\|"auto"}`; returns state |
-| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}` or `{"dismiss": true}` |
+| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}`, `{"reply": "<1-2000 chars>"}` (only when the question's `canReply` is true) or `{"dismiss": true}` |
+| POST | `/fleet/api/send` | body `{"threadKey": "<row key>", "message": "<1-2000 chars>", "queue"?: true}`; the owner's own message to one thread |
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| POST | `/conversations/agent/interrupt` | stop the running reply so a queued message goes first, §3.1 |
+| POST | `/conversations/supervisor/interrupt` | same, supervisor thread, §3.1 |
+| GET, POST | `/conversations/agent/queue`, `/conversations/supervisor/queue` | the hub's queue for the thread; add a message, §3.1 |
+| PATCH, DELETE | `/conversations/:thread/queue/:requestId` | edit/hold or remove one waiting message, §3.1 |
+| POST | `/conversations/:thread/queue/:requestId/send-now` | move one waiting message first and stop what runs now, §3.1 |
 | GET | `/lifelog/moments` | read-only G2 lifelog moments, §3.2 |
 
 `:id` above means a task/action id as minted by `createId()`:
@@ -270,6 +277,15 @@ listed path are refused with `401`. Shapes are the daemon's
   is `404` (`409` only when it closed during the request): treat both as
   "already closed" and refresh. An answer that relays to a live session can
   take up to ~190s.
+- A reply (`{"reply"}`) goes to the asking thread as `Owner says: <text>`.
+  `delivery.status` `sent` or `queued` (kept until the Mac can type) closes
+  the question; `blocked` or `failed` leaves it open with `delivery.detail`.
+  `409` when the question's `canReply` is false. `canReply` is true only for
+  a single-thread `agent-ask`, `stuck` or `ready` question. A `risky`
+  question's answer or reply is only typed into the agent's app, never
+  relayed or resumed; without a way to type it is `blocked` ("approve it in
+  the chat").
+- `POST /fleet/api/send` → `{delivery, state}`.
 - `POST /fleet/api/actions/:id/send` → `{action, delivery, state}`; `409` when
   the action is not a proposed one (for example after leaving propose mode),
   `404` when the id is unknown.
@@ -279,6 +295,36 @@ listed path are refused with `401`. Shapes are the daemon's
 Supervisor chat is the ordinary `POST /message` with `"thread": "supervisor"`
 (§3.1). The agent has two read-only tools for it, `fleet_status` and
 `fleet_thread`.
+
+### Image attachments
+
+`POST /message` also accepts `attachments` in both `agent` and `supervisor`
+threads. Each item is `{id, name, mimeType, data, thumbnail?}`: `data` is base64
+JPEG, PNG or WebP, and `thumbnail` is an optional base64 JPEG preview. No URLs
+or filesystem paths are accepted. Up to four images, 1 MiB each and 3 MiB total,
+fit within the 5 MiB JSON request limit. An empty text plus images is a valid turn.
+
+The iOS Photos and Files pickers downsample images off the main thread, normalize
+orientation, remove source metadata, and show removable previews before sending.
+Before uploading, iOS checks the authenticated `/mobile/capabilities` response
+for image support. A missing or unsupported endpoint shows update guidance and
+keeps the draft and its attachments available for retry.
+OpenAI/ChatGPT, Claude and compatible local vision models receive native image
+content blocks. Language-only on-device models explicitly report that a vision
+model is required. Old servers reject images with update guidance; the phone
+never retries an image turn as text alone.
+
+Full image data is retained in the agent session for subsequent model turns.
+Shared history returns only attachment identity/name and a bounded thumbnail;
+SSE does not echo the pixels. The phone caches only these small previews.
+
+Offline conversation mirrors carry validated full image attachments separately
+from bounded public message metadata. Pages and snapshots containing photos use
+mirror version 2; text-only payloads remain version 1. New readers accept both.
+Legacy readers reject version 2 before acknowledging an upload, so the phone
+retains unsent originals rather than replacing them with a text-only snapshot.
+Both import paths restore the validated pixels to message attachments without
+importing owner-authority metadata.
 
 ### 3.1 Chat threads
 
@@ -329,6 +375,127 @@ After every stored message in a shared thread (the user message, then the
 reply or its failure record), `/events` sends `conversation.updated` with
 `{"thread": "agent", "messageId": "msg_…"}` (§7). Reload the thread's newest
 page on it. The phone's local chat history is an offline cache only.
+
+#### Recovering a turn after the stream drops
+
+iOS suspends an app's sockets when it is backgrounded or locked, and networks
+drop. The turn itself does not depend on the stream: once main has the
+message it runs to the end and stores the reply (or a failure record) with no
+client attached. To find it again, and to send safely after a drop, a phone
+names each turn:
+
+- `"requestId"` on `POST /message`: 8-128 characters of `A-Z a-z 0-9 _ -`,
+  new for each turn (a UUID). Main stores it on the user message and on the
+  reply or failure record. Any other value is `400`. Mains older than this
+  field reject it as an unsupported field (`400`) before running anything,
+  so a client may resend without it.
+- The stream's `session` frame (it carries the same `requestId`) means main
+  has accepted the turn. Before it, nothing is known to have arrived; after
+  it, never treat the turn as lost.
+- Sending the same `requestId` again never runs the turn twice. While it is
+  running, the new request follows it: `session`, progress, then its `final`
+  (or `failure`); text deltas already sent are not repeated. After it ended,
+  the request replays the stored reply (`"replayed": true`) or failure. A turn
+  whose user message was stored but which never finished (main restarted)
+  fails with code `interrupted` rather than running again.
+- History messages carry `requestId` (when the turn had one) and a stored
+  failure record carries `"status": "failed"`. The newest page (no `before`)
+  also lists the thread's turns still running:
+  `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
+  A turn in `inFlight`, or whose reply is not there yet, is still working.
+
+#### Interrupting a reply (queued message "Send now")
+
+While a reply runs, a phone queues what the owner types and sends it, one at
+a time, after the reply ends. To send a queued message now instead, the
+client asks main to stop the running reply, then sends the message as the
+next turn in the same thread. No provider supports adding a message to a turn
+already running, so this is stop-then-send, never in-turn steering.
+
+`POST /conversations/:thread/interrupt` with
+`{"requestId": "<the running turn's id>", "conversationId"?: "…"}` (no other
+fields; `400` otherwise). Paired phones, owner proxies and the owner; not a
+G2 or other node. Main aborts that turn's signal: it stops before its next
+model call or tool call. A tool already running is not cancelled and nothing
+is rolled back. Main waits up to about 4 s for the turn to end, then answers
+`200` with one of:
+
+- `{"status": "interrupted"}`: the turn has stopped. Its stream ends with a
+  `failure` frame, code `stopped` (not `interrupted`, which still means
+  "main restarted"), and main stores the reply record "Stopped so your next
+  message could go first. Anything already under way may have finished;
+  nothing was undone." (`"status": "failed"`, code `stopped`).
+- `{"status": "stopping", "tool"?: "send_email"}`: asked to stop; it ends
+  after the action running now. The stream's `failure` frame follows.
+- `{"status": "finished", "outcome": "complete" | "failed" | "interrupted"}`:
+  it ended on its own first. Nothing was interrupted.
+- `{"status": "not_found"}`: main has no turn by that id in this thread (it
+  never arrived, or main restarted before storing it).
+
+Repeating the request (a double tap, a resend after a dropped response) is
+safe and reports the same state. A message sent after any answer runs after
+the old turn has fully ended: main runs one turn per thread at a time, and a
+turn still waiting behind another one is dropped without running. A main
+older than this route answers a phone's request with `401` (a heartbeat then
+succeeds) or the owner's with `404`: treat both as "this main can't
+interrupt", and say so; never report the reply as stopped.
+
+The owner's Mac sends `requestId` on its own `POST /message` with `thread`
+too, so its Supervisor chat can name and interrupt its turns the same way.
+
+#### The hub's queue (one per conversation, shared by every device)
+
+Every message a phone or the owner's Mac sends to a shared thread with a
+`requestId` joins the hub's queue for that conversation, whether it came on
+`POST /message` (a stream) or `POST /conversations/:thread/queue` (no stream;
+what a client uses when it knows something is running). The hub runs them one
+at a time in arrival order, each with the authority of the device that sent
+it. The queue is durable: messages not yet started survive a hub restart and
+run afterwards; one that was running when the hub stopped is not run again.
+
+- `POST /conversations/:thread/queue` `{text, requestId, attachments?,
+  focusedCardId?, conversationId?, from?, next?}` -> `202 {requestId,
+  duplicate, queue, sendNow?}`. Same validation as `/message`. The `202`
+  comes only after the message is saved to disk; if it can't be saved the
+  answer is `503 queue_unavailable` and nothing is queued. `next: true` is
+  "Send anyway": in the same request the message goes next (ahead of the other
+  waiting messages, which keep their order) and whatever runs now is stopped;
+  `sendNow` is what the hub confirmed, as for send-now below. Repeating a `requestId` keeps one
+  message (`duplicate: true`; after it ran, `outcome` says how it ended); the
+  same id with different text or images is `409 request_conflict`. More than
+  50 waiting is `429 queue_full`. A `/message` stream for a message that waits
+  says `status {stage: "queued"}` and a `session` frame (it is durably
+  accepted) and then streams its reply when it runs.
+- `GET /conversations/:thread/queue` and `queue` in the newest history page:
+  `{revision, items: [{requestId, text, attachmentCount, source: {device,
+  name, nodeId}, mine, state: "running" | "queued" | "held", heldBy?,
+  heldByMe?, position, revision}]}`. `mine` and `heldByMe` are relative to
+  the caller. Every change also emits `conversation.updated` with
+  `queueRevision`, so devices reload.
+- `PATCH .../queue/:requestId` `{hold?, text?, baseRevision?}`: `hold: true`
+  holds a waiting message for the caller's editor (a 90 s lease, renewed while
+  the editor is open; the queue waits at it, so the old text never runs and
+  nothing passes it). `text` requires the `baseRevision` the editor opened at
+  and releases the hold. Refusals are `409` with `error`: `held` (another
+  device is editing it; `message` names it), `conflict` (it changed since;
+  `item` is the current one), `already_sent`, `already_removed`.
+- `DELETE .../queue/:requestId?baseRevision=` removes a waiting message (same
+  refusals). A stream following it ends with failure code `removed`; a resend
+  of its id replays that, never re-queues it.
+- `POST .../queue/:requestId/send-now` moves it first and stops whatever runs
+  now, whichever device sent that: `{status, interrupted, item, queue}` with
+  `status` as for interrupt above, or `next` when nothing was running.
+
+Clients: while nothing runs, Send sends. While a reply runs, Send follows
+the device's Settings preference, "Queue message" (default) or "Send
+immediately" (`next: true`), and the composer offers the other choice for
+one message ("Send anyway" / "Queue instead").
+
+A hub without the queue answers these routes 404 (owner) or 401 (a phone;
+its heartbeat still succeeds) and its history has no `queue`: clients then
+keep their own queue as before. Messages without a `requestId` (older
+clients, G2 voice) do not join the queue; they still wait for the turn ahead
+of them, but no device can see, edit or reorder them.
 
 A G2 joins the same threads through `POST /nodes/g2/experience`: op
 `submit` accepts `"thread"` (beside or inside `question`; no
@@ -440,6 +607,14 @@ whole protocol:
 - `brief.headline` is one human-readable sentence assembled server-side
   ("2 things today, 1 overdue, 3 waiting on you").
 
+`taskReview` is optional (older servers omit it). It reports the latest
+relevance sweep as `{status, attemptedAt, lastReviewedAt}`. Status is `reviewed`,
+`no_tasks`, `unavailable` (no configured model), or `failed`. `lastReviewedAt`
+advances only after a complete valid review, or a sweep with no active tasks;
+a failed attempt retains the prior successful timestamp. Fetching the summary
+only syncs saved work; it does not trigger a relevance review. Age alone is
+not evidence that an unfinished task should be removed.
+
 ### ETag / 304
 
 The response carries an `ETag` header computed over the **entire payload
@@ -549,6 +724,7 @@ Response — verified live against the daemon:
       "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-20T01:40:25.625Z",
+      "raisedAt": "2026-09-20T01:40:25.625Z",
       "expiresAt": null,
       "decidedAt": null,
       "decidedBy": null,
@@ -563,6 +739,13 @@ Response — verified live against the daemon:
 OpenAGI chat). `mode` is `queue` (waits for an approval surface), `chat`
 (raised in the owner's own chat, which answers it by code) or `owner` (a
 record of a call the owner's own instruction ran; never pending).
+
+`raisedAt` is when the agent last asked for the card. A repeated request in
+the same chat reuses the pending card rather than making a new one: `createdAt`
+keeps its age, `raisedAt` moves to the new request, and `expiresAt` is renewed
+if the request carries an approval window. Use `raisedAt` for "raised since
+the owner's latest message"; fall back to `createdAt` when it is absent (mains
+older than the field).
 
 (`mobile/fixtures/pending-actions.json` pins the empty-list shape,
 `{"actions": []}`, because the fixture daemon has nothing pending; the object
@@ -674,6 +857,19 @@ X-OpenAGI-Node-ID: <nodeId>
   permission. `false` means no alerts are sent and no question is marked
   alerted, so turning it back on (re-POST, same pass is fine) alerts the
   questions still open.
+- `approvals` (optional boolean, default `false`): the app can show and act
+  on an approval alert. With it, every pending action that waits on the
+  owner (a queued approval or a chat card's code; never an owner-mode
+  record) is alerted once per card id: relay type `alert`, collapse id the
+  action id, envelope kind `approval` with plaintext
+  `{"actionId", "summary", "code"}`. A card the agent raises again with the
+  same arguments is the same card and is not alerted again. The phone's
+  Approve and Deny call `POST /pending-actions/<id>/approve` / `deny` with
+  its own credential, after checking the card is still pending.
+
+Question alerts (kind `alert`) also carry `canReply`: `true` when
+`POST /fleet/api/questions/<id>` takes `{"reply": "<text>"}` for that
+question, which is what the notification's Reply field sends.
 
 Response `{"ok": true, "renew": false}`; a bad body is `400 {"error": "..."}`.
 `renew: true` means the relay refused this same pass (`bad_pass`,
@@ -690,7 +886,8 @@ than starting a second one.
 `DELETE /mobile/push` (no body) removes it, and so does revoking the phone
 (§9). Envelope format, plaintexts and relay API:
 `docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`. The daemon
-sends only when it runs the fleet supervisor and `OPENAGI_PUSH` is not `0`;
+sends only when it runs the fleet supervisor or the approval queue and
+`OPENAGI_PUSH` is not `0`;
 `OPENAGI_PUSH_RELAY` overrides the relay URL (default
 `https://push.openagi.sh`).
 

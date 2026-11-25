@@ -30,7 +30,7 @@ it('shows partial output without a misleading tap-to-continue instruction', () =
   const show = vi.fn()
   const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve(), requestExit: () => Promise.resolve(true) })
   renderer.progress('Answer arriving', '12s elapsed', 'The answer so far')
-  expect(show).toHaveBeenCalledWith(expect.stringContaining('The answer so far'), false)
+  expect(show).toHaveBeenCalledWith(expect.stringContaining('The answer so far'), false, 'thinking')
   expect(show.mock.calls[0][0]).toContain('Cancel on phone')
   expect(show.mock.calls[0][0]).not.toContain('Tap to continue')
 })

@@ -27,6 +27,8 @@ struct OpenAGIApp: App {
                 #if DEBUG
                 if UITestProtocol.isEnabled {
                     UITestRoot()
+                } else if ProcessInfo.processInfo.arguments.contains("--mobile-recovery-acceptance") {
+                    MobileRecoveryAcceptanceView()
                 } else if ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") {
                     LocalAgentAcceptanceView()
                 } else {
@@ -36,10 +38,11 @@ struct OpenAGIApp: App {
                 sessionContent
                 #endif
             }
+            .modifier(AppAppearanceModifier())
             .environment(session)
             .onOpenURL { url in
                 #if DEBUG
-                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
+                if UITestProtocol.isEnabled || Self.isDeviceAcceptance { return }
                 #endif
                 if WebSignIn.handleCallback(url) { return }
                 // The Live Activity's tap target.
@@ -53,7 +56,7 @@ struct OpenAGIApp: App {
             }
             .onChange(of: scenePhase) { _, newPhase in
                 #if DEBUG
-                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
+                if UITestProtocol.isEnabled || Self.isDeviceAcceptance { return }
                 #endif
                 switch newPhase {
                 case .active:
@@ -65,6 +68,11 @@ struct OpenAGIApp: App {
                 }
             }
         }
+    }
+
+    private static var isDeviceAcceptance: Bool {
+        ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") ||
+        ProcessInfo.processInfo.arguments.contains("--mobile-recovery-acceptance")
     }
 
     @ViewBuilder
@@ -84,7 +92,7 @@ struct OpenAGIApp: App {
             // new deep link arrives; SwiftUI would otherwise keep the
             // already-appeared view's state and ignore a later prefill.
             PairingView(
-                prefillServer: pendingPairing?.serverURL,
+                prefillServer: pendingPairing?.serverURL ?? session.pairingServer,
                 prefillCode: pendingPairing?.code,
                 onCancel: { session.goBack() },
                 onPaired: {
@@ -95,7 +103,7 @@ struct OpenAGIApp: App {
                     session.paired()
                 }
             )
-            .id(pendingPairing)
+            .id(PairingViewKey(link: pendingPairing, discovered: session.pairingServer))
         case .ready(let credentials):
             RootTabView(
                 credentials: credentials,
@@ -197,4 +205,11 @@ final class BackgroundRefreshCompletion: @unchecked Sendable {
         }
         callback?(success)
     }
+}
+
+// Identity for the pairing screen: a new deep link or a newly selected
+// discovered server must rebuild it so the prefill is applied.
+private struct PairingViewKey: Hashable {
+    let link: PairingPayload?
+    let discovered: URL?
 }

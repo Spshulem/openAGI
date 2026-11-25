@@ -54,6 +54,12 @@ const DEFAULT_IDLE_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_ABSOLUTE_LEASE_MS = 15 * 60 * 1000;
 const DEFAULT_FRAME_TTL_MS = 30_000;
 const activeHelperChildren = new Set();
+export const SCREENSHOT_FOCUS_UNAVAILABLE = "computer-screenshot-focus-unavailable";
+const SCREENSHOT_FOCUS_HINT = "Focus the intended window on the main display and check Capture privacy settings before taking a new screenshot.";
+
+function screenshotFocusError() {
+  return Object.assign(new Error(SCREENSHOT_FOCUS_HINT), { code: SCREENSHOT_FOCUS_UNAVAILABLE });
+}
 
 export function createComputerExecutor({
   run = execFileAsync,
@@ -183,6 +189,7 @@ export function createComputerExecutor({
       }
       if (cached.error) {
         const failure = new Error(cached.error);
+        if (cached.code) failure.code = cached.code;
         failure.nodeSequenceConsumed = true;
         throw failure;
       }
@@ -213,9 +220,12 @@ export function createComputerExecutor({
       // A helper must never turn typed content into an HTTP/node-control error.
       const sensitiveOperation = ["type", "paste", "set_value", "select_text"].includes(operation);
       const message = sensitiveOperation ? `computer ${operation} action failed` : mapError(error);
-      lease.results.set(actionId, { sequence, operation, signature, error: message });
+      const code = operation === "screenshot" && error?.code === SCREENSHOT_FOCUS_UNAVAILABLE
+        ? SCREENSHOT_FOCUS_UNAVAILABLE : null;
+      lease.results.set(actionId, { sequence, operation, signature, error: message, code });
       trimResults(lease.results);
       const failure = new Error(message);
+      if (code) failure.code = code;
       failure.nodeSequenceConsumed = true;
       throw failure;
     } finally {
@@ -243,7 +253,13 @@ export function createComputerExecutor({
     if (operation === "session.end") return endLease(payload);
     return withLease(operation, payload, async (lease) => {
       if (operation === "screenshot") {
+        // A failed refresh must not leave an older frame usable in the same
+        // lease. Only a new, successful capture can restore input authority.
+        lease.frames.clear();
         const status = await inspect();
+        if (!status.screenshotReady && status.capturePrerequisitesReady && status.inputReady) {
+          throw screenshotFocusError();
+        }
         if (!status.screenshotReady) throw new Error(status.detail || "live screenshot is not currently available");
         const shot = await runForLease(lease, async (signal) => (
           screenshot
@@ -253,7 +269,6 @@ export function createComputerExecutor({
         const frameId = `cuframe_${crypto.randomUUID().replaceAll("-", "")}`;
         const focus = normalizePrivateFocus(shot.focus);
         const { focus: _privateFocus, elements: _privateElements, ...publicShot } = shot;
-        lease.frames.clear();
         lease.frames.set(frameId, {
           width: Number(shot.width), height: Number(shot.height), scale: Number(shot.scale) || 1,
           offsetX: Number(shot.offsetX) || 0, offsetY: Number(shot.offsetY) || 0,
@@ -359,6 +374,7 @@ export function createComputerServer({ token, executor = null, ...executorOption
       } catch (error) {
         return send(500, {
           error: mapError(error),
+          ...(error?.code === SCREENSHOT_FOCUS_UNAVAILABLE ? { code: SCREENSHOT_FOCUS_UNAVAILABLE } : {}),
           sequenceConsumed: error?.nodeSequenceConsumed === true
         });
       }
@@ -694,6 +710,7 @@ export function runComputerHelper(helperPath, operation, payload = null, {
       const err = Buffer.concat(stderr);
       if (terminationError) return finish(terminationError);
       if (code === 0) return finish(null, { stdout: out, stderr: err });
+      if (operation === "screenshot" && code === 75) return finish(screenshotFocusError());
       const failure = new Error(`computer helper failed (${signal || code || "unknown"})`);
       failure.stderr = err.toString("utf8").slice(0, maxStderrBytes);
       finish(failure);

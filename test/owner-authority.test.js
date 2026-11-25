@@ -3,8 +3,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  authorityRecord, intentCovers, intentFamilies, isOwnerPrincipal, matchConfirmation, ownerAuthorityEnabled,
-  ownerIntentText, ownerPrincipal
+  authorityRecord, intentCovers, intentFamilies, isConversationalAssentOrChoice,
+  isOwnerPrincipal, isSupervisorActionableDirective, matchConfirmation, matchConfirmations,
+  ownerAuthorityEnabled, ownerIntentText, ownerPrincipal
 } from "../src/owner-authority.js";
 
 test("only a minted principal passes; copies, JSON and replays never do", () => {
@@ -127,6 +128,123 @@ test("intent is the owner's own words only, never the previous assistant message
   assert.equal(ownerIntentText("restart conductor", messages), "restart conductor");
 });
 
+test("explicit forwarding and a recipient before the send instruction express message intent", () => {
+  for (const text of ["Forward this screenshot to the project chat", "Pass along the error to the coding agent",
+    "On the project mobile thread can you send it this screenshot of the error",
+    "In the project chat, please forward this report"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, text);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_click"), false, text);
+  }
+  for (const text of ["On the project thread can you summarize this?", "What did the agent forward to the project chat?",
+    "What does this screenshot say?", "Forward the screenshot to me", "Pass along the salt"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), false, text);
+  }
+});
+
 test("an acknowledgement is not assent", () => {
   for (const text of ["ok thanks", "ok thank you", "thanks", "yes thank you"]) assert.equal(matchConfirmation(text), null, text);
+});
+
+test("natural casual owner approvals like 'Sure sounds fine' cover card and question actions without code friction", () => {
+  for (const text of ["Sure sounds fine", "sounds fine", "looks fine", "fine with me", "works for me", "sure, do that", "merge and deploy"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_act_card"), true, text);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_answer_question"), true, text);
+  }
+  assert.deepEqual(matchConfirmation("Sure sounds fine"), { decision: "approve", code: null });
+  assert.deepEqual(matchConfirmation("Works for me"), { decision: "approve", code: null });
+});
+
+test("master coordinator phrases cover fleet messaging, session creation, and batch card triage without code walls", () => {
+  const coordPhrases = [
+    "can you cordinate with the bb-recorder workspace chats and see the status if all of them are done, whats left, and cutting a new release?",
+    "hey, go find this chat, go coordinate with the BB recorder, see what's left",
+    "I want you to take this workspace and I want you to coordinate together",
+    "check in with the recorder chats on whether verification passed",
+    "follow up with the amman workspace",
+    "have the bb-recorder chats report what still needs to be tested",
+    "start a new Paseo chat in the bb-recorder workspace to prep the release",
+    "spin up a fresh session in openAGI"
+  ];
+  for (const text of coordPhrases) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, `send: ${text}`);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_start_session"), true, `start: ${text}`);
+  }
+  for (const text of ["batch through these cards", "merge all green PRs", "defer all questions", "clear the approvals queue", "use the recommended option"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_batch_cards"), true, `batch: ${text}`);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_act_card"), true, `act: ${text}`);
+  }
+  // Passive reads still never authorize coordinator mutations.
+  for (const passive of ["what's the latest?", "what did codex say?", "tell me what amman is doing", "have the agent check the news"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_start_session"), false, passive);
+  }
+});
+
+test("matchConfirmations parses multi-code and batch confirmations while rejecting bystander text", () => {
+  assert.deepEqual(matchConfirmations("yes 60, yes 19, yes 78"), { decision: "approve", codes: ["60", "19", "78"], all: false });
+  assert.deepEqual(matchConfirmations("yes 60, 19 and 78"), { decision: "approve", codes: ["60", "19", "78"], all: false });
+  assert.deepEqual(matchConfirmations("approve 42 17"), { decision: "approve", codes: ["42", "17"], all: false });
+  assert.deepEqual(matchConfirmations("no 38, 51"), { decision: "deny", codes: ["38", "51"], all: false });
+  assert.deepEqual(matchConfirmations("yes all"), { decision: "approve", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("approve all of them"), { decision: "approve", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("yes both"), { decision: "approve", codes: [], all: true, count: 2 });
+  assert.deepEqual(matchConfirmations("yes both 60 and 19"), { decision: "approve", codes: ["60", "19"], all: false });
+  assert.equal(matchConfirmations("yes both 60 19 78"), null);
+  assert.equal(matchConfirmations("yes all both"), null);
+  assert.deepEqual(matchConfirmations("deny all"), { decision: "deny", codes: [], all: true });
+  assert.deepEqual(matchConfirmations("yes 42"), { decision: "approve", codes: ["42"], all: false });
+  // Single matchConfirmation keeps rejecting multi-code for voice safety.
+  assert.equal(matchConfirmation("yes 60, yes 19, yes 78"), null);
+  for (const bad of ["yes I think we should wait", "approve all the PRs on GitHub", "yes no 60 19", "ok thanks"]) {
+    assert.equal(matchConfirmations(bad), null, bad);
+  }
+});
+
+test("conversational assent 'yes' / 'continue' / 'skip' following a supervisor question is actionable without a code", () => {
+  const rec = "Your Needs You inbox has 14 open questions.\nMy recommendation: Have the agent continue resolving the blockers.\nContinue, inspect the thread further, or skip?";
+  for (const reply of ["yes", "Yes!", "continue", "skip", "option 1", "1", "ok do it"]) {
+    assert.equal(isConversationalAssentOrChoice(reply, rec), true, reply);
+    assert.equal(isSupervisorActionableDirective(reply, { previousAssistantText: rec }), true, reply);
+  }
+  for (const blocked of ["no", "wait", "don't", "yes but tell me what failed first", "what is its status?"]) {
+    assert.equal(isConversationalAssentOrChoice(blocked, rec), false, blocked);
+  }
+  // Without an assistant question/recommendation, bare "yes" or "continue" stays false.
+  assert.equal(isConversationalAssentOrChoice("yes", "BuildBot3 tests passed earlier today."), false);
+  assert.equal(intentCovers("continue", "fleet_answer_question"), true);
+});
+
+test("attach image follow-ups authorize fleet messaging while passive questions stay blocked", () => {
+  for (const text of ["can you attach it?", "please attach the screenshot", "attach this image", "attach it to the Bob chat"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["What did the agent attach?", "Did the user attach a photo?", "Send it", "Forward the screenshot to me"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
+  }
+});
+
+test("in-Paseo session creation follow-ups authorize fleet_start_session while passive questions stay blocked", () => {
+  for (const text of ["yes gpt 6.2 sol on medium effort in paseo", "run this with claude sonnet in paseo"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_start_session"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["what is running in paseo?", "what did the paseo session say?"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_start_session"), false, passive);
+    assert.equal(isSupervisorActionableDirective(passive), false, passive);
+  }
+});
+
+test("split phrasal verbs like 'kick a new chat off' and 'try again' after a dropped attempt authorize without code friction", () => {
+  const splitPhrase = "eh lets kick a new chat off INSIDE of that workspace BUT give it context of ai seo audit";
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_start_session"), true);
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_send_message"), true);
+  assert.equal(isSupervisorActionableDirective(splitPhrase), true);
+
+  const droppedMsg = "The computer-control session dropped before I could create the chat. No new chat was created or brief sent.";
+  assert.equal(isConversationalAssentOrChoice("try again", droppedMsg), true);
+  assert.equal(isConversationalAssentOrChoice("retry", droppedMsg), true);
+  assert.equal(isSupervisorActionableDirective("try again", { previousAssistantText: droppedMsg }), true);
+  // Passive reads stay blocked even after a dropped message.
+  assert.equal(isConversationalAssentOrChoice("what happened?", droppedMsg), false);
 });

@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
+import { isSuppressedByQuietCadence } from "./fleet/preferences.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./fleet/walkthrough.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -17,10 +19,11 @@ function reject(message, status = 400) { throw Object.assign(new Error(message),
 // Main-owned, bounded snapshots. No raw audio, model invocation, or execution
 // authority. Only explicit task acceptance crosses into the user task queue.
 export class G2Proactive {
-  constructor({ dir, runtime, now = Date.now } = {}) {
+  constructor({ dir, dataDir, runtime, now = Date.now } = {}) {
     this.file = path.join(dir ?? path.join(resolveDataDir(), "g2-proactive"), "state.json");
     this.runtime = runtime;
     this.now = now;
+    this.walkthrough = new SupervisorWalkthrough({ dataDir: dataDir ?? path.resolve(this.file, "..", ".."), now });
     this.reviewing = false; this.closed = false; this.reviewController = null;
     this.nodes = readJsonFile(this.file, { nodes: {} }).nodes;
     this.prune();
@@ -53,6 +56,14 @@ export class G2Proactive {
     if (!body || typeof body !== "object" || Array.isArray(body)) reject("Expected an object");
     this.prune();
     const n = this.node(nodeId);
+    if (body.op === "walkthrough") {
+      try {
+        return { walkthrough: this.walkthrough.mutate(body.command ?? body.operation ?? "view", body.expectedId, this.runtime?.fleetSupervisor?.getState?.()) };
+      } catch (error) {
+        if (error instanceof WalkthroughError) reject(error.message, error.status);
+        throw error;
+      }
+    }
     if (body.op === "lifelog-task") {
       const s = n.segments.find(s => s.id === body.segmentId);
       if (!s || body.confirm !== true || typeof body.title !== "string" || !body.title.trim() || body.title.length > 180) reject("Confirm a task with current transcript evidence");
@@ -249,26 +260,81 @@ export class G2Proactive {
     this.prune();
     const n = this.node(nodeId);
     const item = this.feed(n).find(i => i.id === body.id && i.supervisor);
-    if (!item) reject("Supervisor question not available", 404);
-    if (!item.options.includes(body.answer)) reject("Pick one of the question's choices");
-    const source = this.runtime?.outreach?.get?.(body.id);
+    // Walkthrough cards are main-owned and can remain actionable after their
+    // mirrored G2 alert is snoozed. Resolve that identity from the durable
+    // cursor, then use the same Supervisor answer gate as the inbox route.
+    const walkthroughItem = item ? null : this.walkthroughTarget(body.id);
+    if (!item && !walkthroughItem) reject("Supervisor question not available", 404);
+    const options = item?.options ?? walkthroughItem?.options ?? [];
+    if (!options.includes(body.answer)) reject("Pick one of the question's choices");
+    const questionId = item?.questionId
+      ?? walkthroughItem?.questionId
+      ?? (walkthroughItem?.kind === "question" ? walkthroughItem.id : null);
+    if (!questionId) reject("Supervisor question not available", 404);
+    const mirrored = this.runtime?.outreach?.list?.() ?? [];
+    const source = this.runtime?.outreach?.get?.(body.id)
+      ?? mirrored.find(i => i.sourceRef?.kind === "fleet" && i.sourceRef.id === questionId);
+    if (source && source.sourceRef?.kind !== "fleet") reject("Supervisor question not available", 404);
     const supervisor = this.runtime?.fleetSupervisor;
-    if (!source || source.sourceRef?.kind !== "fleet" || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
-    const result = await supervisor.answerQuestion(source.sourceRef.id, body.answer);
+    if ((!source && !walkthroughItem) || (source && source.sourceRef?.kind !== "fleet") || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
+    const result = await supervisor.answerQuestion(questionId, body.answer);
     if (!result) reject("Question already closed", 409);
     if (result.question?.status === "open") return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
-    try { this.runtime?.outreach?.resolve?.(body.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
+    if (source) {
+      try { this.runtime?.outreach?.resolve?.(source.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
+    }
     n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
     this.save();
     return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
+  }
+  // Acts on an enriched Supervisor card from the glasses (for example safe
+  // preflight PR merge, Have agent fix CI, defer, or progressive preference).
+  async actFleetCard(nodeId, body) {
+    const cardOp = typeof body?.cardOp === "string" ? body.cardOp : "primary";
+    if (typeof body?.id !== "string" || !["primary", "secondary", "defer", "fix_ci", "ship"].includes(cardOp)) reject("Invalid supervisor card action");
+    this.prune();
+    const n = this.node(nodeId);
+    const item = this.feed(n).find(i => i.id === body.id && i.supervisor && i.cardId);
+    const walkthroughItem = item ? null : this.walkthroughTarget(body.id);
+    const cardId = item?.cardId
+      ?? walkthroughItem?.cardId
+      ?? (walkthroughItem?.kind === "card" ? walkthroughItem.id : null);
+    if (!cardId) reject("Supervisor card not available", 404);
+    const supervisor = this.runtime?.fleetSupervisor;
+    if (!supervisor?.actCard) reject("Supervisor unavailable", 503);
+    const result = await supervisor.actCard(cardId, { op: cardOp, ...(typeof body.value === "string" && body.value.trim() ? { value: clean(body.value, 120) } : {}) });
+    if (!result) reject("Supervisor card already closed", 409);
+    if (result.ok === false) {
+      return { ok: false, status: clean(result.status ?? "blocked", 40), detail: clean(result.detail ?? "Action halted; check PR or session state", 220) };
+    }
+    if (!body.id.startsWith("card:")) {
+      try { this.runtime?.outreach?.resolve?.(body.id, { action: cardOp, by: "g2" }, { status: "acted" }); } catch { /* resolved on next refresh */ }
+    }
+    n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
+    this.save();
+    return { ok: true, status: clean(result.status ?? "done", 40), detail: clean(result.detail ?? result.summary ?? "Done", 220) };
+  }
+  walkthroughTarget(id) {
+    if (typeof id !== "string" || !id) return null;
+    const supervisorState = this.runtime?.fleetSupervisor?.getState?.();
+    const view = this.walkthrough.read(supervisorState);
+    const candidates = new Set([id]);
+    if (id.startsWith("card:")) candidates.add(id.slice(5));
+    if (id.startsWith("question:")) candidates.add(id.slice(9));
+    return view.items.find(item => candidates.has(item.id) || candidates.has(item.cardId) || candidates.has(item.questionId)) ?? null;
   }
   // Dismissing a supervisor question on the glasses closes it on the fleet
   // computer too, as the phone's dismiss does. Fire and forget: the glasses
   // keep their own dismissal, and one the offline computer missed reaches it
   // on the next refresh (replay).
   dismissFleet(id) {
-    const source = this.runtime?.outreach?.get?.(id);
     const supervisor = this.runtime?.fleetSupervisor;
+    if (typeof id === "string" && id.startsWith("card:")) {
+      if (!supervisor?.actCard) return;
+      try { Promise.resolve(supervisor.actCard(id.slice(5), { op: "defer" })).catch(() => {}); } catch { /* glasses mark stands */ }
+      return;
+    }
+    const source = this.runtime?.outreach?.get?.(id);
     if (source?.sourceRef?.kind !== "fleet" || !supervisor?.dismissQuestion) return;
     try { Promise.resolve(supervisor.dismissQuestion(source.sourceRef.id, { replay: true })).catch(() => {}); } catch { /* same: the glasses mark stands */ }
   }
@@ -283,7 +349,9 @@ export class G2Proactive {
     const threads = rows.filter(r => r?.health === "red" || r?.health === "yellow")
       .sort((a, b) => HEALTH_ORDER.indexOf(a.health) - HEALTH_ORDER.indexOf(b.health) || String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
       .slice(0, 20).map(r => ({ name: clean(r.workspace || r.title || r.key, 60), health: r.health, state: clean(r.state, 30), reason: clean(r.reason, 140) }));
-    return { mode: state.mode ?? null, lastTickAt: state.lastTickAt ?? null, needsYou: Array.isArray(state.questions) ? state.questions.length : 0, counts, threads };
+    const cardsCount = Array.isArray(state.cards) ? state.cards.length : (Array.isArray(state.questions) ? state.questions.length : 0);
+    return { mode: state.mode ?? null, lastTickAt: state.lastTickAt ?? null, needsYou: Array.isArray(state.questions) ? state.questions.length : 0,
+      cardsCount, ...(state.catchUpSummary ? { catchUpSummary: clean(state.catchUpSummary, 180) } : {}), counts, threads };
   }
   quiet(n) {
     const hour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: n.settings.timeZone, hour: "2-digit", hourCycle: "h23" }).format(this.now()));
@@ -300,7 +368,17 @@ export class G2Proactive {
       // question off the glasses. A supervisor question asked for days stays
       // while its source keeps it current (refreshedAt).
       const open = (this.runtime?.outreach?.list?.() ?? []).filter(i => ["unseen", "seen"].includes(i.status));
-      const questions = new Map((open.some(i => i.sourceRef?.kind === "fleet") ? this.runtime?.fleetSupervisor?.getState?.()?.questions ?? [] : []).map(q => [q.id, q]));
+      const fleetState = (open.some(i => i.sourceRef?.kind === "fleet") || n.settings.supervisorOnly) ? this.runtime?.fleetSupervisor?.getState?.() : null;
+      const questions = new Map((fleetState?.questions ?? []).map(q => [q.id, q]));
+      const cards = Array.isArray(fleetState?.cards) ? fleetState.cards : [];
+      const cardsByQuestion = new Map(cards.filter(c => c?.questionId).map(c => [c.questionId, c]));
+      const cardsById = new Map(cards.filter(c => c?.id).map(c => [c.id, c]));
+      const seenCardIds = new Set();
+      const formatPmBrief = (card) => clean([
+        card.summary,
+        card.recommendation ? `Rec: ${card.recommendation}` : "",
+        card.prRef ? `${card.prRef}${card.ciState ? ` (${card.ciState})` : ""}` : ""
+      ].filter(Boolean).join(" · "), 220);
       for (const i of open.slice(0, 200)) {
         if (Date.parse(i.refreshedAt ?? i.createdAt) < this.now() - 7 * DAY) continue;
         const kind = i.sourceRef?.kind === "draft"
@@ -308,7 +386,11 @@ export class G2Proactive {
           : i.sourceRef?.kind;
         const coding = kind === "coding-watch";
         const fleet = kind === "fleet";
-        const threadKey = fleet ? questions.get(i.sourceRef.id)?.threadKey : null;
+        const q = fleet ? questions.get(i.sourceRef.id) : null;
+        if (fleet && q && isSuppressedByQuietCadence(q, fleetState?.preferences)) continue;
+        const card = fleet ? (cardsByQuestion.get(i.sourceRef.id) ?? cardsById.get(i.sourceRef.id) ?? cardsById.get(`q:${i.sourceRef.id}`) ?? null) : null;
+        if (card?.id) seenCardIds.add(card.id);
+        const threadKey = fleet ? (q ? q.threadKey : (card?.threadKey ?? null)) : null;
         if (n.settings.supervisorOnly && !fleet) continue;
         const supervisor = this.runtime?.codingSupervisor;
         if (coding && (!supervisor?.configured || !supervisor.state.watches?.[i.sourceRef.id]
@@ -321,10 +403,45 @@ export class G2Proactive {
         // paths; glasses only support fixed choices that complete an answer.
         const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a
           && !["dismiss", "answer question", "review plan"].includes(a.toLowerCase())).map(a => clean(a, 40)).slice(0, 4) : [];
+        const cardFields = card ? {
+          cardId: clean(card.id, 120),
+          ...(card.kind ? { cardKind: clean(card.kind, 40) } : {}),
+          ...(formatPmBrief(card) ? { pmBrief: formatPmBrief(card) } : {}),
+          ...(card.primaryAction?.label ? { primaryLabel: clean(card.primaryAction.label, 40) } : {}),
+          ...(card.prRef ? { prRef: clean(card.prRef, 80) } : {}),
+          ...(card.ciState ? { ciState: clean(card.ciState, 24) } : {})
+        } : {};
         if (selected.has(category) || (fleet && n.settings.supervisorOnly)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
-          important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: fleet && options.length ? "answer-fleet" : "review-on-main",
-          ...(fleet ? { supervisor: true, options, questionId: i.sourceRef.id, ...(threadKey ? { threadKey } : {}) } : {}),
+          important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(),
+          action: fleet && options.length ? "answer-fleet" : (card?.primaryAction ? "act-fleet-card" : "review-on-main"),
+          ...(fleet ? { supervisor: true, options, questionId: i.sourceRef.id, ...(threadKey ? { threadKey } : {}), ...cardFields } : {}),
           ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
+      }
+      if (n.settings.supervisorOnly && cards.length) {
+        for (const card of cards.slice(0, 40)) {
+          if (!card?.id || seenCardIds.has(card.id)) continue;
+          seenCardIds.add(card.id);
+          const brief = formatPmBrief(card);
+          items.push({
+            id: `card:${clean(card.id, 120)}`,
+            title: clean(card.headline || card.title || "Supervisor update", 160),
+            summary: clean(card.summary || brief, 400),
+            category: "approvals",
+            important: card.kind !== "preference",
+            at: Date.parse(card.updatedAt ?? card.createdAt) || this.now(),
+            action: card.primaryAction ? "act-fleet-card" : "review-on-main",
+            supervisor: true,
+            options: [],
+            cardId: clean(card.id, 120),
+            ...(card.kind ? { cardKind: clean(card.kind, 40) } : {}),
+            ...(brief ? { pmBrief: brief } : {}),
+            ...(card.primaryAction?.label ? { primaryLabel: clean(card.primaryAction.label, 40) } : {}),
+            ...(card.questionId ? { questionId: clean(card.questionId, 80) } : {}),
+            ...(card.threadKey ? { threadKey: clean(card.threadKey, 120) } : {}),
+            ...(card.prRef ? { prRef: clean(card.prRef, 80) } : {}),
+            ...(card.ciState ? { ciState: clean(card.ciState, 24) } : {})
+          });
+        }
       }
       if (selected.has("tasks") && !n.settings.supervisorOnly) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
         const due = Date.parse(t.dueDate);

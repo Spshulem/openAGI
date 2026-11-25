@@ -23,4 +23,15 @@ final class ServerSentEventParserTests: XCTestCase {
     XCTAssertNil(parser.consume(line: "data: next"))
     XCTAssertEqual(parser.consume(line: ""), ServerSentEvent(name: "message", data: "next"))
   }
+
+  func testFinishFlushesTrailingEventAtEOF() {
+    var parser = ServerSentEventParser()
+    XCTAssertNil(parser.consume(line: "event: reply"))
+    XCTAssertNil(parser.consume(line: "data: {\"reply\":\"done\"}"))
+    XCTAssertEqual(
+      parser.finish(),
+      ServerSentEvent(name: "reply", data: "{\"reply\":\"done\"}")
+    )
+    XCTAssertNil(parser.finish())
+  }
 }

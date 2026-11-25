@@ -34,6 +34,7 @@ final class NotificationPresenter {
       cat("pending-action", [("do", "Do it"), ("dismiss", "Not now")]),
       cat("coding-approval", [("review", "Review instruction")]),
       cat("coding-agent", [("review", "Review session")]),
+      cat("scheduled-run", [("review", "Review")]),
       cat("clarification", [("yes", "Yes"), ("no", "No"), ("in_progress", "In progress")]),
       cat("draft", [("approve", "Approve"), ("dismiss", "Dismiss")]),
       cat("digest", [("review", "Review")])
@@ -60,8 +61,11 @@ final class NotificationPresenter {
   }
 
   static func shouldNotify(type: String, needsDecision: Bool, quiet: Bool) -> Bool {
-    if quiet && (needsDecision || type == "coding-agent") { return false }
-    return needsDecision || type == "digest" || type == "coding-agent"
+    // A scheduled run's report is something the owner asked for, so it shows
+    // like a coding-agent update. Held in quiet hours, it reaches the digest.
+    let live = type == "coding-agent" || type == "scheduled-run"
+    if quiet && (needsDecision || live) { return false }
+    return needsDecision || type == "digest" || live
   }
 
   static func reviewPath(type: String) -> String? {

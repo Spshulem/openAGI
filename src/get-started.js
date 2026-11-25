@@ -6,7 +6,7 @@ export const GET_STARTED_FLOWS = [
     description: "Tell your agent what you’re working on. Get one small, useful result and build from there.",
     steps: ["Connect your own model in Settings and save your dashboard login.", "Tell the agent what you want help with and how you prefer to work.", "Ask for one small result, then check the answer and model status."],
     link: "/setup", linkLabel: "Connect a model",
-    prompt: "Help me get started with OpenAGI. Ask what I’m working on and help me get one useful result, one step at a time."
+    prompt: "Help me get started with OpenAGI. Ask what I’m working on, then give me one small useful result in at most three short bullets. Offer a next step instead of a long tutorial."
   },
   {
     id: "memory", title: "Teach it how you work", time: "3 minutes",
@@ -18,9 +18,9 @@ export const GET_STARTED_FLOWS = [
   {
     id: "agents", title: "Monitor your coding agents", time: "5 minutes",
     description: "Follow coding sessions and see what needs your attention. Start with a read-only view.",
-    steps: ["Open Coding Agents to configure a supported CLI and select existing Git projects.", "Use Fleet to inspect recent sessions in observe mode. Available sources depend on the host and installed apps.", "Review a real session and its evidence. A reported status is not proof that code passed tests, merged, or shipped."],
+    steps: ["Open Supervisor. Sessions started through OpenAGI appear under Managed sessions; existing app conversations appear under Other coding conversations after Scan now.", "To start a managed session, open Coding setup, sign in to Codex CLI or Claude Code on that computer, and save an existing Git project folder. Review the start approval before running.", "Inspect a real reply and choose Watch session for response updates. Observe mode applies to other coding conversations. A status is not proof that code passed tests, merged, or shipped."],
     link: "/?tab=coding-agents", linkLabel: "Set up Coding Agents",
-    prompt: "Help me monitor my coding agents in read-only mode. First ask which coding app and computer I use."
+    prompt: "Help me monitor my coding agents. Use the documented Supervisor and Coding setup screens. First ask whether I want to follow an existing conversation or start a managed Codex CLI or Claude Code session. Give me one working setup link and one next step."
   },
   {
     id: "screen", title: "See your screen and take action", time: "5 minutes",
@@ -47,11 +47,12 @@ export const GET_STARTED_FLOWS = [
 
 export const GET_STARTED_GUIDANCE = `
 When the user asks to get started, learn OpenAGI, or follow a guided setup:
-- Start with their goal and operating system. Ask one question at a time, explain why the next step helps, and use one small verifiable result per step.
+- Start with their goal and operating system. Ask one question at a time, explain why the next step helps, and use one small verifiable result per step. Keep onboarding replies under 120 words unless they ask for more detail. Give the small result before offering commands or a longer tutorial.
 - Use available read-only tools to check current configuration. Say when you cannot check it. A configured key, discovered CLI, historical screenshot, or online node does not prove a working model, authenticated agent, live computer control, or completed work.
 - Keep credentials in Settings or the local CLI, never in chat. Model requests can send selected context to the configured provider; local storage does not mean all inference stays on-device.
 - Explain and guide first. Onboarding is not blanket authorization to capture screens, start computer control, connect accounts, send messages, run coding agents, or enable background automation. Retain the normal approval gates.
-- Offer to verify the user's result, help recover a failed step, or skip it. Do not claim a step completed from a link click or elapsed time. The dashboard's Get started checklist is self-reported learning progress, not a capability check.
+- Offer to verify the user's result, help recover a failed step, or skip it. Do not claim a step completed from a link click or elapsed time. Get started uses stored evidence: a configured model, an actual model reply, a saved preference explicitly recalled in another chat, and a completed managed coding session.
+- For coding setup, use these exact links and labels. [Supervisor](/fleet) has Managed sessions and Other coding conversations. [Coding setup](/?tab=coding-agents) has Git project folders and Start a coding session. There is no Connect Codex CLI button, machine picker, Projects subpage or read-only selector in Coding setup. Do not invent controls. Existing interactive CLI/app conversations are discovered by Supervisor; OpenAGI-managed sessions use their own session list and Watch session control. Watch does not send replies. CLI sign-in is separate from the chat API key; codex login or claude auth login runs on the supervisor computer. Codex history lives under its Codex home, not the project folder. Never ask for a key in chat.
 - Be concrete about the distinction: the persistent runtime can combine scheduled work, memory and corrections, optional observation, reviewed skills, and multiple scoped nodes. Benefits depend on the inputs, permissions, and models the user enables. Do not promise autonomous improvement or guaranteed results.
 Setup paths:
 ${GET_STARTED_FLOWS.map(flow => `${flow.title}: ${flow.steps.join(" ")} Open ${flow.link}.`).join("\n")}

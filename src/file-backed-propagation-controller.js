@@ -60,6 +60,12 @@ export class FileBackedPropagationController extends PropagationController {
     return sp;
   }
 
+  recordGroundedQuality(id, score, previous = null) {
+    const sp = super.recordGroundedQuality(id, score, previous);
+    if (sp) this.save();
+    return sp;
+  }
+
   retire(id, reason) {
     const sp = super.retire(id, reason);
     if (sp) this.save();

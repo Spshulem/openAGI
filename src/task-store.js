@@ -78,6 +78,61 @@ export const AGENT_STALE_IN_PROGRESS_MS = 7 * 24 * 60 * 60 * 1000;
 // DISCARDED draft frees the task for another attempt, because discarding is
 // the user saying "not this".
 const OPEN_DRAFT_STATUSES = new Set(["pending", "approved", "sent"]);
+const BOARD_LABEL_RE = /^[a-z0-9_-]{1,24}=[a-zA-Z0-9_./#-]{1,64}$/;
+
+function normalizeBoardLabels(labels) {
+  if (!labels) return [];
+  const rawList = Array.isArray(labels)
+    ? labels
+    : (typeof labels === "object" ? Object.entries(labels).map(([k, v]) => `${k}=${v}`) : []);
+  const out = [];
+  for (const item of rawList) {
+    if (typeof item !== "string") continue;
+    const clean = item.trim();
+    if (BOARD_LABEL_RE.test(clean)) out.push(clean);
+  }
+  return out;
+}
+
+function mergeBoardTags(existingTags = [], labels = null) {
+  const cleanExisting = Array.isArray(existingTags) ? existingTags.filter((t) => typeof t === "string") : [];
+  const incoming = normalizeBoardLabels(labels);
+  if (incoming.length === 0) return cleanExisting;
+  const incomingKeys = new Set(incoming.map((kv) => kv.split("=")[0].toLowerCase()));
+  const kept = cleanExisting.filter((t) => {
+    const idx = t.indexOf("=");
+    return idx <= 0 || !incomingKeys.has(t.slice(0, idx).toLowerCase());
+  });
+  return [...new Set([...kept, ...incoming])];
+}
+
+function mergeBoardSourceMeta(existingMeta = null, inputOrPatch = {}, { explicitPatch = false } = {}) {
+  const hasExplicitSourceMeta = inputOrPatch.sourceMeta !== undefined;
+  const base = hasExplicitSourceMeta
+    ? (inputOrPatch.sourceMeta && typeof inputOrPatch.sourceMeta === "object" && !Array.isArray(inputOrPatch.sourceMeta)
+      ? { ...inputOrPatch.sourceMeta }
+      : {})
+    : (existingMeta && typeof existingMeta === "object" && !Array.isArray(existingMeta)
+      ? { ...existingMeta }
+      : {});
+  const boardKeys = ["threadKey", "project", "subchannel", "actor", "blockedReason"];
+  let touched = false;
+  for (const key of boardKeys) {
+    if (key in inputOrPatch) {
+      touched = true;
+      const val = inputOrPatch[key];
+      if (val === null || val === undefined || String(val).trim() === "") {
+        delete base[key];
+      } else {
+        base[key] = String(val).trim().slice(0, key === "blockedReason" ? 240 : 160);
+      }
+    }
+  }
+  if (!touched && !hasExplicitSourceMeta) return existingMeta ?? null;
+  if (explicitPatch && inputOrPatch.sourceMeta === null && !touched) return null;
+  if (hasExplicitSourceMeta && !touched) return inputOrPatch.sourceMeta ?? null;
+  return Object.keys(base).length > 0 ? base : null;
+}
 
 export class TaskStore {
   constructor(options = {}) {
@@ -173,11 +228,11 @@ export class TaskStore {
       bucket: BUCKETS.includes(input.bucket) ? input.bucket : (autoBucket ?? "today"),
       priority: clamp(Number(input.priority ?? 50), 0, 100),
       category: input.category ?? null,
-      tags: Array.isArray(input.tags) ? input.tags : [],
+      tags: mergeBoardTags(Array.isArray(input.tags) ? input.tags : [], input.labels),
       source,
       sourceId: input.sourceId ?? null,
       sourceUrl: input.sourceUrl ?? null,
-      sourceMeta: input.sourceMeta ?? null,
+      sourceMeta: mergeBoardSourceMeta(null, input),
       status: STATUSES.includes(input.status) ? input.status : "pending",
       dueDate: input.dueDate ?? null,
       scheduledFor: input.scheduledFor ?? null,
@@ -220,6 +275,10 @@ export class TaskStore {
     if (patch.bucket !== undefined && BUCKETS.includes(patch.bucket)) next.bucket = patch.bucket;
     if (patch.priority !== undefined) next.priority = clamp(Number(patch.priority), 0, 100);
     if (patch.status !== undefined && STATUSES.includes(patch.status)) {
+      if (patch.status !== task.status) {
+        next.statusHistory = [...(task.statusHistory ?? []), { status: patch.status, at: nowIso(), via: patch.completedVia ?? null }].slice(-20);
+        if (task.status === "completed") next.reopenedAt = nowIso();
+      }
       next.status = patch.status;
       if (patch.status === "completed" && !next.completedAt) {
         next.completedAt = nowIso();
@@ -228,9 +287,10 @@ export class TaskStore {
       }
     }
     if (patch.tags !== undefined) next.tags = Array.isArray(patch.tags) ? patch.tags : [];
+    if (patch.labels !== undefined) next.tags = mergeBoardTags(next.tags, patch.labels);
     if (patch.dueDate !== undefined) next.dueDate = patch.dueDate;
     if (patch.scheduledFor !== undefined) next.scheduledFor = patch.scheduledFor;
-    if (patch.sourceMeta !== undefined) next.sourceMeta = patch.sourceMeta;
+    next.sourceMeta = mergeBoardSourceMeta(next.sourceMeta, patch, { explicitPatch: true });
     // Story 11: parentGoalId patches let linkTaskToGoal flip the link.
     // null is a meaningful value (unlink), so use 'in patch' rather than
     // an undefined check to allow explicit null.
@@ -247,11 +307,21 @@ export class TaskStore {
     this.appendEvent(next.queue, { op: "update", id, patch });
     this.snapshot();
     this.runtime?.events?.emit?.("task-updated", { op: "update", task: next });
+    if (task.status === "completed" && next.status !== "completed") this.runtime?.grounded?.onTaskReopened?.(next);
+    // Every route to completion (complete(), PATCH /tasks/:id, integrations)
+    // passes through here, so a suggestion's task finishing always grades it.
+    if (task.status !== "completed" && next.status === "completed" && next.sourceMeta?.suggestionId) {
+      this.runtime?.grounded?.onSuggestionTaskCompleted?.(next.sourceMeta.suggestionId);
+    }
     return next;
   }
 
-  complete(id, via = "manual") {
+  complete(id, via = "manual", { byAgent = false, signal = null } = {}) {
+    // Grading follows a real transition only: completing an already
+    // completed task must not credit the agent with someone else's work.
+    const wasCompleted = this.tasks.get(id)?.status === "completed";
     const next = this.update(id, { status: "completed", completedVia: via });
+    if (next && !wasCompleted && byAgent) this.runtime?.grounded?.onAgentTaskCompleted?.(next, signal);
     // Story 2: completing a task records an outcome with the lineage
     // back to the proactive-suggestion that proposed it (when present).
     // Aggregator can then report "this proposal led to N completed tasks".
@@ -342,7 +412,9 @@ export class TaskStore {
     let out = [...this.tasks.values()];
     if (queue) out = out.filter((t) => t.queue === queue);
     if (bucket) out = out.filter((t) => t.bucket === bucket);
-    if (status) out = out.filter((t) => t.status === status);
+    if (status === "active") out = out.filter((t) => !["completed", "cancelled"].includes(t.status));
+    else if (status === "terminal") out = out.filter((t) => ["completed", "cancelled"].includes(t.status));
+    else if (status) out = out.filter((t) => t.status === status);
     out.sort((a, b) => {
       // Sort by bucket order, then priority desc, then createdAt asc
       const ba = BUCKETS.indexOf(a.bucket);
@@ -356,6 +428,42 @@ export class TaskStore {
 
   get(id) {
     return this.tasks.get(id) ?? null;
+  }
+
+  /// Transitive open downstream tasks blocked by `taskId` or by open tasks
+  /// linked to `threadKey` via `sourceMeta.threadKey`.
+  blockingImpactFor({ taskId = null, threadKey = null } = {}) {
+    const seedIds = new Set();
+    if (typeof taskId === "string" && this.tasks.has(taskId)) {
+      const t = this.tasks.get(taskId);
+      if (t && !["completed", "cancelled"].includes(t.status)) seedIds.add(t.id);
+    }
+    if (typeof threadKey === "string" && threadKey.trim()) {
+      for (const t of this.tasks.values()) {
+        if (["completed", "cancelled"].includes(t.status)) continue;
+        if (t.sourceMeta?.threadKey === threadKey) seedIds.add(t.id);
+      }
+    }
+    if (seedIds.size === 0) return { count: 0, blockingTaskIds: [], blockingTitles: [] };
+    const visited = new Set();
+    const queue = [...seedIds];
+    while (queue.length > 0) {
+      const currentId = queue.shift();
+      for (const t of this.tasks.values()) {
+        if (["completed", "cancelled"].includes(t.status)) continue;
+        if (seedIds.has(t.id) || visited.has(t.id)) continue;
+        if (Array.isArray(t.dependsOn) && t.dependsOn.includes(currentId)) {
+          visited.add(t.id);
+          queue.push(t.id);
+        }
+      }
+    }
+    const blockingTasks = [...visited].map((id) => this.tasks.get(id)).filter(Boolean);
+    return {
+      count: blockingTasks.length,
+      blockingTaskIds: blockingTasks.map((t) => t.id),
+      blockingTitles: blockingTasks.slice(0, 4).map((t) => t.title)
+    };
   }
 
   // ─── Agent queue: peek, claim, sweep ──────────────────────────────────
@@ -471,7 +579,13 @@ export class TaskStore {
         ? Number.isFinite(Date.parse(lease.expiresAt)) && now >= Date.parse(lease.expiresAt)
         : false;
 
-      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired)) {
+      // A deferred claim keeps its attempt count but drops expiresAt. If
+      // resumed manually, it has no timed reservation; recover it after the
+      // same grace period as unleased work rather than wedging it forever.
+      const staleUnreserved = task.status === "in_progress"
+        && !Number.isFinite(Date.parse(lease?.expiresAt ?? ""))
+        && this._isStale(task, now);
+      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired || staleUnreserved)) {
         this._stall(task, attempts, now);
         report.stalled.push(task.id);
         continue;
@@ -482,11 +596,10 @@ export class TaskStore {
         report.requeued.push(task.id);
         continue;
       }
-      // No lease at all + long dead: pre-lease wreckage or an observer
-      // guess nobody acted on. Reclaim it — with attempts reset, since the
-      // queue never actually got a turn at it.
-      if (!lease && this._isStale(task, now)) {
-        this._requeue(task, "stale-in-progress", now, { resetAttempts: true });
+      // No valid reservation + long dead: recover abandoned work. Preserve
+      // recorded attempts; only pre-lease tasks get a fresh attempt budget.
+      if (staleUnreserved) {
+        this._requeue(task, "stale-in-progress", now, { resetAttempts: !lease });
         report.requeued.push(task.id);
       }
     }
@@ -615,14 +728,19 @@ export class TaskStore {
   // Roll up summary stats for dashboards / health.
   stats() {
     const out = {
-      user: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
-      agent: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
+      user: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
+      agent: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
     };
     for (const t of this.tasks.values()) {
       const slot = out[t.queue];
       if (!slot) continue;
       slot.total += 1;
-      if (slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      const terminal = ["completed", "cancelled"].includes(t.status);
+      if (!terminal) {
+        slot.active += 1;
+        if (t.bucket !== "done" && slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      } else if (t.status === "completed") slot.done += 1;
+      else slot.cancelled += 1;
       if (t.status === "pending") slot.pending += 1;
       if (t.status === "completed") slot.completed += 1;
     }

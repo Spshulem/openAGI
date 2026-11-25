@@ -8,7 +8,10 @@ const DEFAULT_THRESHOLD = 0.55;
 export class SpecialistRouter {
   constructor(options = {}) {
     this.threshold = options.threshold ?? Number.parseFloat(process.env.OPENAGI_ROUTING_THRESHOLD ?? String(DEFAULT_THRESHOLD));
-    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "live"; // live | shadow | off
+    this.mode = options.mode ?? process.env.OPENAGI_ROUTING_MODE ?? "shadow"; // live | shadow | experiment | off
+    // experiment: a matched turn goes to the specialist with probability
+    // 0.5, so its grounded results can be compared with the generalist's.
+    this.random = typeof options.random === "function" ? options.random : Math.random;
     this.minActivations = options.minActivations ?? 1;
     this.vectorStore = options.vectorStore ?? null;
     this.semanticWeight = options.semanticWeight ?? 0.4;
@@ -57,33 +60,49 @@ export class SpecialistRouter {
   }
 
   /**
-   * Decide whether to route. Returns { mode, route, candidate, all } where:
-   * - mode: 'live' | 'shadow' | 'off'
+   * Decide whether to route. Returns { mode, route, candidate, all, arm } where:
+   * - mode: 'live' | 'shadow' | 'experiment' | 'off'
    * - route: true if the agent should hand off
    * - candidate: top specialist (or null)
+   * - arm: 'specialist' | 'generalist', only when a candidate matched
+   *   (shadow always 'generalist', live always 'specialist', experiment at random)
    */
   async decide(signalText, signalTags, specialists) {
     if (this.mode === "off") return { mode: "off", route: false, candidate: null, all: [] };
     const all = await this.search(signalText, signalTags, specialists);
     const top = all[0] ?? null;
     const matched = Boolean(top && top.score >= this.threshold);
+    const arm = !matched ? null
+      : this.mode === "live" ? "specialist"
+        : this.mode === "experiment" ? (this.random() < 0.5 ? "specialist" : "generalist")
+          : "generalist";
     return {
       mode: this.mode,
-      route: this.mode === "live" && matched,
+      route: arm === "specialist",
       candidate: matched ? top : null,
       threshold: this.threshold,
-      all
+      all,
+      ...(arm ? { arm } : {})
     };
   }
 }
 
+// Tags every chat signal carries. They say nothing about what a specialist is
+// for, so they never count as a match.
+const GENERIC_TAGS = new Set([
+  "message", "signal", "main", "general", "adaptation-review", "specialization-candidate",
+  "local", "sms", "telegram", "g2", "overlay", "autopilot", "cron", "imessage", "email", "web", "voice"
+]);
+const informative = (tags) => new Set([...tags].map((t) => String(t).toLowerCase()).filter((t) => t && !GENERIC_TAGS.has(t)));
+
 function scoreMatch(text, tags, specialist) {
   const scopeText = `${specialist.boundedScope ?? ""} ${specialist.name ?? ""} ${specialist.parentGoal ?? ""}`;
-  const scopeTags = new Set([
+  const scopeTags = informative([
     specialist.metadata?.domain ?? "",
     specialist.metadata?.taskType ?? "",
     ...(specialist.metadata?.tags ?? [])
-  ].filter(Boolean).map((t) => t.toLowerCase()));
+  ]);
+  tags = informative(tags);
 
   const textScore = tokenOverlapScore(text, scopeText);
 
@@ -107,12 +126,15 @@ function scoreMatch(text, tags, specialist) {
   // quality moves routing — proven specialists attract more work, struggling
   // ones repel it before the retirement sweep catches them. ±0.15 swing.
   let qualityAdjust = 0;
-  if ((specialist.outcomeSamples ?? 0) >= 3 && typeof specialist.meanOutcomeQuality === "number") {
-    qualityAdjust = (specialist.meanOutcomeQuality - 0.5) * 0.3;
+  if ((specialist.groundedSamples ?? 0) >= 3 && typeof specialist.groundedMean === "number") {
+    qualityAdjust = (specialist.groundedMean - 0.5) * 0.3;
   }
 
   // Both signals weight equally; bonus when both fire (corroboration is itself a match signal).
-  const baseScore = textScore * 0.5 + tagScore * 0.5;
+  // With informative tags on both sides, text and tags weigh equally.
+  // Otherwise the scope text is the only evidence and carries the full weight.
+  const bothTagged = tags.size > 0 && scopeTags.size > 0;
+  const baseScore = bothTagged ? textScore * 0.5 + tagScore * 0.5 : textScore;
   const corroborationBonus = textScore > 0.1 && tagScore > 0.1 ? 0.1 : 0;
   const combined = baseScore + corroborationBonus + activationBoost + qualityAdjust - recencyPenalty;
 

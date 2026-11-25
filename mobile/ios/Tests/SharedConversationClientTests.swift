@@ -139,6 +139,19 @@ final class SharedConversationClientTests: XCTestCase {
         XCTAssertEqual(try request(path: "/fleet/api/actions/a1/send").httpMethod, "POST")
     }
 
+    func testSupervisorWalkthroughUsesTheSharedCursorAndIdentity() async throws {
+        let response = #"{"active":true,"paused":false,"currentId":"card-1","total":2,"items":[{"id":"card-1","kind":"card","title":"Review PR","summary":"CI is green","cardId":"card-1"},{"id":"q-2","kind":"question","title":"Choose a route","summary":"The agent is waiting","questionId":"q-2"}]}"#
+        stub(["/fleet/api/walkthrough": (200, response)])
+        let walkthrough = try await makeClient().fleetWalkthrough(operation: "next", expectedId: "card-1")
+        XCTAssertEqual(walkthrough.currentId, "card-1")
+        let sent = try request(path: "/fleet/api/walkthrough")
+        XCTAssertEqual(sent.httpMethod, "POST")
+        let json = try body(of: sent)
+        XCTAssertEqual(json["operation"] as? String, "next")
+        XCTAssertEqual(json["expectedId"] as? String, "card-1")
+        XCTAssertEqual(walkthrough.items.map(\.id), ["card-1", "q-2"])
+    }
+
     func testFleetOnADaemonWithoutASupervisorMapsToUnavailable() async {
         stub(["/fleet/api/state": (503, #"{"error":"fleet supervisor disabled"}"#)])
         do {
@@ -323,6 +336,77 @@ final class SharedConversationClientTests: XCTestCase {
                                          store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
         await relaunched.retry(try XCTUnwrap(relaunched.messages.last))
         XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1)
+    }
+
+    // Turn recovery (mobile/PROTOCOL.md §3.1): main accepted the turn (its
+    // `session` frame), then iOS cut the stream. The reply is found in
+    // history by its turn id, and the message is never sent again.
+    @MainActor
+    func testAnAcceptedTurnWhoseStreamDropsIsFoundInHistoryWithoutResending() async throws {
+        final class State: @unchecked Sendable { var turn = ""; var pages = 0 }
+        let state = State()
+        StubProtocol.handler = { [self] request in
+            Self.requests.append(request)
+            let ok = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path == "/message" {
+                state.turn = (try? self.body(of: request)["requestId"] as? String) ?? ""
+                return (ok, Data("event: session\ndata: {\"id\":\"devices:agent:main\",\"messageCount\":1}\n\n".utf8))
+            }
+            state.pages += 1
+            let user = #"{"id":"m1","role":"user","text":"plan my day","at":"2026-11-20T10:00:00.000Z","requestId":"\#(state.turn)"}"#
+            let reply = #"{"id":"m2","role":"assistant","text":"Planned.","at":"2026-11-20T10:00:05.000Z","requestId":"\#(state.turn)"}"#
+            let page = state.pages == 1
+                ? #"{"thread":"agent","messages":[\#(user)],"nextBefore":null,"inFlight":[{"requestId":"\#(state.turn)","stage":"model"}]}"#
+                : #"{"thread":"agent","messages":[\#(user),\#(reply)],"nextBefore":null,"inFlight":[]}"#
+            return (ok, Data(page.utf8))
+        }
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+                                            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
+        await conversation.send("plan my day")
+        XCTAssertTrue(state.turn.hasPrefix("ios-"), "each send names its turn")
+        let waiting = try XCTUnwrap(conversation.messages.last)
+        XCTAssertTrue(waiting.isStreaming && waiting.isDetached && !waiting.isFailed, "still working, not failed")
+        XCTAssertEqual(waiting.activity, ChatHistoryCodec.stillWorking)
+        await conversation.refresh()
+        XCTAssertEqual(conversation.messages.map(\.text), ["plan my day", "Planned."])
+        XCTAssertFalse(conversation.messages.contains(where: \.isDetached))
+        XCTAssertEqual(Self.requests.filter { $0.url?.path == "/message" }.count, 1, "never resent")
+        // The background poll found nothing left to recover and stops; none
+        // of its requests may outlive this test's stub.
+        conversation.pauseRecovery()
+    }
+
+    // Main never confirmed the send (the connection went first): offer it
+    // again, and resend once when the app is next active, with the same
+    // turn id so main replays or follows it rather than running it twice.
+    @MainActor
+    func testASendMainNeverConfirmedIsResentOnceWithTheSameTurnId() async throws {
+        final class State: @unchecked Sendable { var turns: [String] = [] }
+        let state = State()
+        StubProtocol.handler = { [self] request in
+            Self.requests.append(request)
+            let ok = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.url?.path == "/message" {
+                state.turns.append((try? self.body(of: request)["requestId"] as? String) ?? "")
+                if state.turns.count == 1 { return (ok, Data()) }
+                return (ok, Data("event: session\ndata: {\"id\":\"devices:agent:main\",\"messageCount\":1}\n\nevent: final\ndata: {\"reply\":\"Done.\"}\n\n".utf8))
+            }
+            return (ok, Data(#"{"thread":"agent","messages":[],"nextBefore":null,"inFlight":[]}"#.utf8))
+        }
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+                                            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:abc")
+        await conversation.send("hello")
+        let unconfirmed = try XCTUnwrap(conversation.messages.last)
+        XCTAssertTrue(unconfirmed.isFailed && unconfirmed.retrySafe && unconfirmed.autoRetry)
+        XCTAssertEqual(unconfirmed.text, ChatHistoryCodec.unconfirmedText)
+
+        await conversation.resume()
+        XCTAssertEqual(state.turns.count, 2)
+        XCTAssertEqual(state.turns[0], state.turns[1], "the same turn, so main cannot run it twice")
+        XCTAssertEqual(conversation.messages.last?.text, "Done.")
+        await conversation.resume()
+        XCTAssertEqual(state.turns.count, 2, "resent once, not on every return")
+        conversation.pauseRecovery()
     }
 
     @MainActor

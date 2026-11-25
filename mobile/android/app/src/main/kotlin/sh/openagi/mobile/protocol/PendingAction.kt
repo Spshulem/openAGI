@@ -19,11 +19,19 @@ data class PendingAction(
     val dedupeKey: String? = null,
     val status: String = "pending",
     @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
+    // When the agent last asked for it: a repeated request reuses the card,
+    // so this moves while createdAt keeps its age. Absent on older mains.
+    @Serializable(with = OptionalInstantSerializer::class) val raisedAt: Instant? = null,
     @Serializable(with = OptionalInstantSerializer::class) val expiresAt: Instant? = null,
     @Serializable(with = OptionalInstantSerializer::class) val decidedAt: Instant? = null,
     val decidedBy: String? = null,
     val result: JsonElement? = null,
     val error: String? = null,
+    // "queue", "chat" (waits on the owner's spoken code) or "owner" (already
+    // ran on the owner's word). Absent on older mains: a queued card.
+    val mode: String? = null,
+    // The spoken "yes NN" code, when the card has one.
+    val confirmCode: String? = null,
 )
 
 @Serializable

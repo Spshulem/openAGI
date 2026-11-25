@@ -1,8 +1,10 @@
 import SwiftUI
+import SupervisorChannelsKit
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.appCanvas) private var canvas
     let onRevoked: () -> Void
 
     @State private var path: [WorkspaceDestination] = []
@@ -11,10 +13,20 @@ struct SettingsView: View {
     @State private var switchError: String?
     @State private var showingFallback = false
     @State private var showingDiscovery = false
+    @State private var selectedDiscoveryServer: URL?
+    // Chat and Supervisor chat: what Send does while a reply runs.
+    @AppStorage(BusySendBehavior.defaultsKey) private var busySendBehavior = BusySendBehavior.default.rawValue
 
     var body: some View {
         NavigationStack(path: $path) {
             Form {
+                Section("App") {
+                    NavigationLink {
+                        AppearanceView()
+                    } label: {
+                        Label("Appearance", systemImage: "paintpalette")
+                    }
+                }
                 Section {
                     LabeledContent("Runs on", value: model.isOnPhone ? "This iPhone" : "Server")
                     if !model.isOnPhone {
@@ -35,6 +47,9 @@ struct SettingsView: View {
                     if let issue = model.mainConnectionIssue {
                         Text(issue.message).foregroundStyle(.secondary)
                     }
+                    if let issue = OfflineCopy.shared.syncIssue {
+                        Text(issue).font(.footnote).foregroundStyle(.secondary)
+                    }
                     if let fetchedAt = model.snapshot?.fetchedAt {
                         LabeledContent("Last synced") {
                             Text(fetchedAt, style: .relative)
@@ -52,6 +67,7 @@ struct SettingsView: View {
                     .disabled(isWorking)
                     if !model.isOnPhone {
                         Button("Find servers / check network", systemImage: "network") { showingDiscovery = true }
+                            .accessibilityIdentifier("settings-find-servers")
                     }
                 } header: {
                     Text("Connection")
@@ -75,6 +91,20 @@ struct SettingsView: View {
                     Text("Replay the welcome and setup screens. Your pairing, saved models and conversations are kept. Use Return to app to leave setup.")
                 }
 
+                // Below the existing rows so nothing above it moves.
+                Section {
+                    Picker("While a reply is running", selection: $busySendBehavior) {
+                        ForEach(BusySendBehavior.allCases) { behavior in
+                            Text(behavior.title).tag(behavior.rawValue)
+                        }
+                    }
+                    .accessibilityIdentifier("settings-busy-send")
+                } header: {
+                    Text("Chat")
+                } footer: {
+                    Text((BusySendBehavior(rawValue: busySendBehavior) ?? .default).detail
+                         + " You can choose the other way for one message from the composer.")
+                }
                 Section {
                     Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
                 } header: {
@@ -126,12 +156,15 @@ struct SettingsView: View {
                     }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(canvas)
             .accessibilityIdentifier("settings-form")
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: WorkspaceDestination.self) { destination in
                 switch destination {
                 case .model: ModelSettingsView()
+                case .budget: BudgetSettingsView()
                 case .instructions: InstructionsView()
                 case .integrations: IntegrationsView()
                 case .skills: SkillsView()
@@ -146,7 +179,9 @@ struct SettingsView: View {
             }
             .disabled(isWorking)
             .sheet(isPresented: $showingFallback) { FallbackChatView() }
-            .sheet(isPresented: $showingDiscovery) { ServerDiscoverySheet(server: model.credentials.server) }
+            .sheet(isPresented: $showingDiscovery, onDismiss: connectSelectedServer) {
+                ServerDiscoverySheet(server: model.credentials.server) { selectedDiscoveryServer = $0 }
+            }
             .alert("Couldn't switch agents", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -173,6 +208,14 @@ struct SettingsView: View {
         AppSession.shared.chooseServer()
     }
 
+    private func connectSelectedServer() {
+        guard let server = selectedDiscoveryServer else { return }
+        selectedDiscoveryServer = nil
+        dismiss()
+        AppSession.shared.restartOnboarding(from: model)
+        AppSession.shared.chooseServer(prefillServer: server)
+    }
+
     private func refresh() async {
         isWorking = true
         defer { isWorking = false }
@@ -183,9 +226,9 @@ struct SettingsView: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            _ = try await AppSession.shared.switchBackToServer(detaching: model)
+            try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            switchError = "Can't reach your server yet. Your work stays on this iPhone until it can."
+            switchError = ServerConnectionGuidance.savedPairingFailure(error, server: AppSession.shared.serverBackup?.server ?? model.credentials.server)
         }
     }
 

@@ -1,4 +1,5 @@
 import { THREAD_KIND_PATTERN } from "./fleet/contracts.js";
+import { isNodeReconnectMobileRoute } from "./node-reconnect.js";
 
 // The phone is a full client, so its credential is broader than the G2
 // wearable's. Breadth is only safe when it is explicit: this module is the
@@ -56,6 +57,7 @@ const FLEET_THREAD = `(?:${THREAD_KIND_PATTERN})(?::|%3A)[A-Za-z0-9_.-]{1,120}`;
 
 const EXACT = new Set([
   "GET /mobile/summary",
+  "GET /mobile/capabilities",
   // The phone's own push registration (relay pass + envelope key).
   "POST /mobile/push",
   "DELETE /mobile/push",
@@ -63,6 +65,7 @@ const EXACT = new Set([
   "POST /tasks",
   "GET /tasks/clarifications",
   "GET /pending-actions",
+  "POST /pending-actions/dismiss-all",
   "POST /message",
   "GET /events",
   "GET /brief/today",
@@ -76,17 +79,52 @@ const EXACT = new Set([
   // The /fleet supervisor's JSON API only. The /fleet page itself and any
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
+  "GET /fleet/api/walkthrough",
   "GET /fleet/api/diagnose",
+  "GET /fleet/api/search",
+  "GET /fleet/api/workspaces",
+  "GET /fleet/api/hierarchy",
+  "GET /fleet/api/ask-supervisor",
+  "GET /fleet/api/active-work",
+  "POST /fleet/api/active-work",
+  "POST /fleet/api/active-work/scan",
+  "GET /fleet/api/projects",
+  "POST /fleet/api/projects",
+  "GET /fleet/api/repo-status",
   "GET /fleet/api/suggestions",
   "GET /fleet/api/fixes",
   "POST /fleet/api/scan",
+  "POST /fleet/api/reconcile",
   "POST /fleet/api/mode",
+  "POST /fleet/api/walkthrough",
+  "POST /fleet/api/preferences",
+  "POST /fleet/api/route",
+  "POST /fleet/api/dispatch",
+  "POST /fleet/api/themes/sync",
+  "POST /fleet/api/tasks/claim",
+  "POST /fleet/api/sessions/start",
+  "POST /fleet/api/cards/batch",
+  // The owner's own message to one fleet thread (its chat's reply box).
+  "POST /fleet/api/send",
   // Shared device threads and the read-only lifelog. Owner decision: paired
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  // Stop a running reply so a corrected message goes first.
+  "POST /conversations/agent/interrupt",
+  "POST /conversations/supervisor/interrupt",
+  // The hub's queue for a shared conversation: read it, add to it.
+  "GET /conversations/agent/queue",
+  "GET /conversations/supervisor/queue",
+  "POST /conversations/agent/queue",
+  "POST /conversations/supervisor/queue",
+  "POST /conversations/supervisor/append",
+  "GET /conversations",
+  "POST /conversations",
   "GET /lifelog/moments",
   // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+  "GET /budget",
+  "POST /budget",
   "GET /settings/models",
   "POST /settings/models",
   "POST /settings/models/test",
@@ -105,6 +143,10 @@ const EXACT = new Set([
 ]);
 
 const PATTERNS = [
+  // Edit/hold, remove, or send now one queued message (conversation-queue.js).
+  { method: "PATCH", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}$/ },
+  { method: "DELETE", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}$/ },
+  { method: "POST", re: /^\/conversations\/(agent|supervisor)\/queue\/[A-Za-z0-9_-]{8,128}\/send-now$/ },
   { method: "PUT", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
   { method: "DELETE", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
   { method: "POST", re: /^\/workspace\/integrations\/(linear|buildbetter)\/sync$/ },
@@ -122,16 +164,23 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
+  { method: "POST", re: /^\/fleet\/api\/cards\/[A-Za-z0-9:%_-]{1,160}\/act$/ },
+  { method: "POST", re: new RegExp(`^/fleet/api/active-work/${ID}/act$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/fixes/${ID}/(stop|revise)$`) },
-  // One fleet thread's detail, and the owner's Push now, Mute and Unmute.
-  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}$`) },
-  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute)$`) }
+  // One fleet thread's detail/transcript, and the owner's Push now, Mute, Unmute, and OpenAGI Project/Theme organization.
+  { method: "DELETE", re: /^\/fleet\/api\/projects\/[A-Za-z0-9_-]{1,80}$/ },
+  { method: "GET", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}(?:/transcript)?$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/threads/${FLEET_THREAD}/(?:push|mute|unmute|organize|archive|unarchive)$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {
   if (typeof method !== "string" || typeof pathname !== "string") return false;
   if (pathname.includes("..") || pathname.includes("//")) return false;
+  // A paired phone may approve a short-lived reconnect request, but it never
+  // receives a node credential. Keep the route shape in one place so the
+  // hosted auth gate and worker relay cannot accidentally broaden it.
+  if (isNodeReconnectMobileRoute(method, pathname)) return true;
   if (EXACT.has(`${method} ${pathname}`)) return true;
   // "GET /tasks/clarifications" is exact; the ID pattern must not swallow it.
   if (pathname === "/tasks/clarifications") return false;

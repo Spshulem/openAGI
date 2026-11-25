@@ -1,0 +1,1989 @@
+{
+  "scrutiny": {
+    "single": {
+      "action": "act",
+      "score": 0.548425,
+      "propagationPressure": 0.3,
+      "dimensions": {
+        "environment": 0.4475,
+        "company": 0.5599999999999999,
+        "evidence": 0.605,
+        "memory": 0.58,
+        "uncertainty": 0.37275,
+        "risk": 0.4,
+        "novelty": 0.5,
+        "repetition": 0.3
+      },
+      "reasons": [
+        "Selected act at scrutiny score 0.55.",
+        "Workflow: fixed.",
+        "Runtime context: fixed."
+      ]
+    },
+    "panel": {
+      "action": "act",
+      "score": 0.5016791666666667,
+      "propagationPressure": 0.3,
+      "dimensions": {
+        "environment": 0.4475,
+        "company": 0.5599999999999999,
+        "evidence": 0.605,
+        "memory": 0.58,
+        "uncertainty": 0.37275,
+        "risk": 0.4,
+        "novelty": 0.5,
+        "repetition": 0.3
+      },
+      "reasons": [
+        "Panel selected 'act' (majority).",
+        "Cautious=ask@0.57, Pragmatic=act@0.55, Aggressive=act@0.54.",
+        "Dissent: cautious judge picked 'ask' — Runtime context: fixed."
+      ],
+      "judges": {
+        "cautious": {
+          "action": "ask",
+          "score": 0.5668375,
+          "propagationPressure": 0.3,
+          "dimensions": {
+            "environment": 0.4475,
+            "company": 0.5599999999999999,
+            "evidence": 0.605,
+            "memory": 0.58,
+            "uncertainty": 0.37275,
+            "risk": 0.4,
+            "novelty": 0.5,
+            "repetition": 0.3
+          },
+          "reasons": [
+            "Selected ask at scrutiny score 0.57.",
+            "Workflow: fixed.",
+            "Runtime context: fixed."
+          ]
+        },
+        "pragmatic": {
+          "action": "act",
+          "score": 0.548425,
+          "propagationPressure": 0.3,
+          "dimensions": {
+            "environment": 0.4475,
+            "company": 0.5599999999999999,
+            "evidence": 0.605,
+            "memory": 0.58,
+            "uncertainty": 0.37275,
+            "risk": 0.4,
+            "novelty": 0.5,
+            "repetition": 0.3
+          },
+          "reasons": [
+            "Selected act at scrutiny score 0.55.",
+            "Workflow: fixed.",
+            "Runtime context: fixed."
+          ]
+        },
+        "aggressive": {
+          "action": "act",
+          "score": 0.539775,
+          "propagationPressure": 0.3,
+          "dimensions": {
+            "environment": 0.4475,
+            "company": 0.5599999999999999,
+            "evidence": 0.605,
+            "memory": 0.58,
+            "uncertainty": 0.37275,
+            "risk": 0.4,
+            "novelty": 0.5,
+            "repetition": 0.3
+          },
+          "reasons": [
+            "Selected act at scrutiny score 0.54.",
+            "Workflow: fixed.",
+            "Runtime context: fixed."
+          ]
+        }
+      },
+      "agreement": "majority"
+    }
+  },
+  "replies": [
+    {
+      "reply": "Done: draft a follow-up to the vendor about th",
+      "action": "ask",
+      "score": 0.36002083333333335
+    },
+    {
+      "reply": "Done: weekly acme pipeline follow-up email",
+      "action": "propagate",
+      "score": 0.5641177721028646
+    },
+    {
+      "reply": "Done: please finish the vendor folder task",
+      "action": "act",
+      "score": 0.5271574573048706
+    },
+    {
+      "reply": "Done: we should automate this with a specialis",
+      "action": "propagate",
+      "score": 0.6112625765069155
+    }
+  ],
+  "observed": {
+    "suggested": 1,
+    "skipped": false,
+    "reason": null
+  },
+  "suggestion": {
+    "id": "prop_<id>",
+    "proposedAt": "<ts>",
+    "source": "proactive-observer",
+    "category": "knowledge",
+    "title": "Save the vendor checklist",
+    "rationale": "It came up twice today.",
+    "mcpId": null,
+    "mcpRegister": null,
+    "draftBody": null,
+    "steps": null,
+    "taskQueue": "user",
+    "taskBucket": "today",
+    "taskIntent": null,
+    "context": {
+      "apps": [
+        {
+          "app": "Browser",
+          "n": 4
+        }
+      ],
+      "snippetCount": 2,
+      "mode": "default"
+    },
+    "status": "accepted",
+    "workOutcomeId": "out_<id>",
+    "resolvedAt": "<ts>"
+  },
+  "outputs": [
+    {
+      "id": "out_<id>",
+      "createdAt": "<ts>",
+      "signal": {
+        "id": "sig_<id>",
+        "source": "local",
+        "type": "message",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "summary": "draft a follow-up to the vendor about the checklist",
+        "content": "draft a follow-up to the vendor about the checklist",
+        "citations": [
+          "session:local:user:main",
+          "agent:main",
+          "from:user"
+        ],
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ],
+        "urgency": 0.45,
+        "impact": 0.39,
+        "externalPressure": 0.55,
+        "internalPressure": 0.5,
+        "novelty": 0.4,
+        "repetition": 0.2,
+        "risk": 0.35,
+        "ambiguity": 0.35,
+        "confidence": 0.7,
+        "specificity": 0.3,
+        "conflict": 0,
+        "goalAlignment": 0.75,
+        "strategicFit": 0.7,
+        "requiresSpecialist": false,
+        "scrutinyOverrides": null,
+        "receivedAt": "<ts>",
+        "metadata": {}
+      },
+      "workflow": {
+        "id": "adaptive-review",
+        "name": "Adaptive Review",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "goal": "Review recent pressure, memory candidates, and propagation opportunities.",
+        "goalAlignment": 0.9,
+        "strategicFit": 0.86,
+        "successMetric": "Review includes evidence, tension, memory decision, and propagation decision."
+      },
+      "action": "ask",
+      "scrutiny": {
+        "action": "ask",
+        "score": 0.36002083333333335,
+        "propagationPressure": 0.2,
+        "dimensions": {
+          "environment": 0.444,
+          "company": 0.7015,
+          "evidence": 0.575,
+          "memory": 0.2,
+          "uncertainty": 0.4962500000000001,
+          "risk": 0.35,
+          "novelty": 0.4,
+          "repetition": 0.2
+        },
+        "reasons": [
+          "Panel selected 'ask' (split).",
+          "Cautious=ask@0.52, Pragmatic=act@0.52, Aggressive=watch@0.49.",
+          "Judges disagreed completely — defaulting to 'ask' for human input."
+        ],
+        "judges": {
+          "cautious": {
+            "action": "ask",
+            "score": 0.5198125,
+            "propagationPressure": 0.2,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.2,
+              "uncertainty": 0.4962500000000001,
+              "risk": 0.35,
+              "novelty": 0.4,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected ask at scrutiny score 0.52.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "No strong memory match was found."
+            ]
+          },
+          "pragmatic": {
+            "action": "act",
+            "score": 0.519085,
+            "propagationPressure": 0.2,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.2,
+              "uncertainty": 0.4962500000000001,
+              "risk": 0.35,
+              "novelty": 0.4,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected act at scrutiny score 0.52.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "No strong memory match was found."
+            ]
+          },
+          "aggressive": {
+            "action": "watch",
+            "score": 0.491165,
+            "propagationPressure": 0.2,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.2,
+              "uncertainty": 0.4962500000000001,
+              "risk": 0.35,
+              "novelty": 0.4,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected watch at scrutiny score 0.49.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "No strong memory match was found."
+            ]
+          }
+        },
+        "agreement": "split"
+      },
+      "memory": {
+        "id": "mem_short_<id>",
+        "tier": "short",
+        "content": "draft a follow-up to the vendor about the checklist Decision: ask Reasons: Panel selected 'ask' (split). Cautious=ask@0.52, Pragmatic=act@0.52, Aggressive=watch@0.49. Judges disagreed completely — defaulting to 'ask' for human input.",
+        "rawContentHash": "2fca11ecc96bee9d6e7079530d2d01d12dd0421fb813a4c61e57fd3f6bee379f",
+        "tags": [
+          "signal",
+          "general",
+          "adaptation-review",
+          "message",
+          "local",
+          "main"
+        ],
+        "source": "local",
+        "scope": "main",
+        "createdAt": "<ts>",
+        "lastAccessedAt": "<ts>",
+        "lastObservedAt": "<ts>",
+        "lastDecayedAt": "<ts>",
+        "strength": 0.4500208333333334,
+        "fidelity": "normal",
+        "novelty": 0.4,
+        "risk": 0.35,
+        "specificity": 0.3,
+        "dangerLevel": 0.32999999999999996,
+        "repetition": 0.2,
+        "kind": "raw",
+        "locked": false,
+        "metadata": {
+          "signalId": "sig_<id>",
+          "workflowId": "adaptive-review",
+          "scrutiny": {
+            "environment": 0.444,
+            "company": 0.7015,
+            "evidence": 0.575,
+            "memory": 0.2,
+            "uncertainty": 0.4962500000000001,
+            "risk": 0.35,
+            "novelty": 0.4,
+            "repetition": 0.2
+          },
+          "recallCount": 3,
+          "lastRecalledAt": "<ts>",
+          "recallSources": {
+            "retrieve": 3
+          }
+        }
+      },
+      "propagation": {
+        "created": false,
+        "reason": "not-needed",
+        "specialist": null
+      },
+      "customContext": []
+    },
+    {
+      "id": "out_<id>",
+      "createdAt": "<ts>",
+      "signal": {
+        "id": "sig_<id>",
+        "source": "local",
+        "type": "message",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "summary": "weekly acme pipeline follow-up email",
+        "content": "weekly acme pipeline follow-up email",
+        "citations": [
+          "session:local:user:main",
+          "agent:main",
+          "from:user"
+        ],
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ],
+        "urgency": 0.45,
+        "impact": 0.39,
+        "externalPressure": 0.55,
+        "internalPressure": 0.7,
+        "novelty": 0.8,
+        "repetition": 0.82,
+        "risk": 0.35,
+        "ambiguity": 0.35,
+        "confidence": 0.7,
+        "specificity": 0.3,
+        "conflict": 0,
+        "goalAlignment": 0.75,
+        "strategicFit": 0.7,
+        "requiresSpecialist": true,
+        "scrutinyOverrides": null,
+        "receivedAt": "<ts>",
+        "metadata": {}
+      },
+      "workflow": {
+        "id": "adaptive-review",
+        "name": "Adaptive Review",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "goal": "Review recent pressure, memory candidates, and propagation opportunities.",
+        "goalAlignment": 0.9,
+        "strategicFit": 0.86,
+        "successMetric": "Review includes evidence, tension, memory decision, and propagation decision."
+      },
+      "action": "propagate",
+      "scrutiny": {
+        "action": "propagate",
+        "score": 0.5641177721028646,
+        "propagationPressure": 0.9,
+        "dimensions": {
+          "environment": 0.444,
+          "company": 0.7415,
+          "evidence": 0.575,
+          "memory": 0.46993128906250003,
+          "uncertainty": 0.428767177734375,
+          "risk": 0.35,
+          "novelty": 0.8,
+          "repetition": 0.82
+        },
+        "reasons": [
+          "Panel selected 'propagate' (unanimous).",
+          "Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55."
+        ],
+        "judges": {
+          "cautious": {
+            "action": "propagate",
+            "score": 0.5738259909179688,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7415,
+              "evidence": 0.575,
+              "memory": 0.46993128906250003,
+              "uncertainty": 0.428767177734375,
+              "risk": 0.35,
+              "novelty": 0.8,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.57.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          },
+          "pragmatic": {
+            "action": "propagate",
+            "score": 0.5686250369140625,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7415,
+              "evidence": 0.575,
+              "memory": 0.46993128906250003,
+              "uncertainty": 0.428767177734375,
+              "risk": 0.35,
+              "novelty": 0.8,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.57.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          },
+          "aggressive": {
+            "action": "propagate",
+            "score": 0.5499022884765625,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7415,
+              "evidence": 0.575,
+              "memory": 0.46993128906250003,
+              "uncertainty": 0.428767177734375,
+              "risk": 0.35,
+              "novelty": 0.8,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.55.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          }
+        },
+        "agreement": "unanimous"
+      },
+      "memory": {
+        "id": "mem_medium_<id>",
+        "tier": "medium",
+        "content": "weekly acme pipeline follow-up email Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55.",
+        "rawContentHash": "a12c2fe7aaa1673181da6c6128e41cebc9d6ab333d738eda6b6fa4db9e83cdab",
+        "tags": [
+          "signal",
+          "general",
+          "adaptation-review",
+          "message",
+          "local",
+          "main"
+        ],
+        "source": "local",
+        "scope": "main",
+        "createdAt": "<ts>",
+        "lastAccessedAt": "<ts>",
+        "lastObservedAt": "<ts>",
+        "lastDecayedAt": "<ts>",
+        "strength": 0.5941177721028646,
+        "fidelity": "normal",
+        "novelty": 0.8,
+        "risk": 0.35,
+        "specificity": 0.3,
+        "dangerLevel": 0.32999999999999996,
+        "repetition": 0.82,
+        "kind": "raw",
+        "locked": false,
+        "metadata": {
+          "signalId": "sig_<id>",
+          "workflowId": "adaptive-review",
+          "scrutiny": {
+            "environment": 0.444,
+            "company": 0.7415,
+            "evidence": 0.575,
+            "memory": 0.46993128906250003,
+            "uncertainty": 0.428767177734375,
+            "risk": 0.35,
+            "novelty": 0.8,
+            "repetition": 0.82
+          },
+          "recallCount": 2,
+          "lastRecalledAt": "<ts>",
+          "recallSources": {
+            "retrieve": 2
+          }
+        }
+      },
+      "propagation": {
+        "created": true,
+        "reason": "specialist-created",
+        "specialist": {
+          "id": "agent_<id>",
+          "signature": "9306a67eb4fa9ef0a0031728",
+          "name": "general-adaptation-review-specialist",
+          "parentGoal": "Review recent pressure, memory candidates, and propagation opportunities.",
+          "boundedScope": "weekly acme pipeline follow-up email",
+          "successMetric": "Review includes evidence, tension, memory decision, and propagation decision.",
+          "allowedTools": [],
+          "status": "available",
+          "createdAt": "<ts>",
+          "lastActivatedAt": "<ts>",
+          "activationCount": 1,
+          "reasons": [
+            "Panel selected 'propagate' (unanimous).",
+            "Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55."
+          ],
+          "meanOutcomeQuality": null,
+          "outcomeSamples": 0,
+          "retiredAt": null,
+          "retirementReason": null,
+          "seasonal": false,
+          "metadata": {
+            "domain": "general",
+            "taskType": "adaptation-review",
+            "tags": [
+              "message",
+              "local",
+              "main"
+            ]
+          },
+          "groundedMean": null,
+          "groundedSamples": 0,
+          "parentSpecialistId": null,
+          "depth": 0,
+          "workspaceDir": "<dataDir>/agents/workspaces/agent_<id>"
+        }
+      },
+      "customContext": [
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.3542071875,
+          "content": "draft a follow-up to the vendor about the checklist Decision: ask Reasons: Panel selected 'ask' (split). Cautious=ask@0.52, Pragmatic=act@0.52, Aggressive=watch@0.49. Judges disagreed completely — defaulting to 'ask' for human input."
+        },
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.265655390625,
+          "content": "Session local:user:main user asked: draft a follow-up to the vendor about the checklist Agent replied: Done: draft a follow-up to the vendor about th"
+        }
+      ]
+    },
+    {
+      "id": "out_<id>",
+      "createdAt": "<ts>",
+      "signal": {
+        "id": "sig_<id>",
+        "source": "local",
+        "type": "message",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "summary": "please finish the vendor folder task",
+        "content": "please finish the vendor folder task",
+        "citations": [
+          "session:local:user:main",
+          "agent:main",
+          "from:user"
+        ],
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ],
+        "urgency": 0.45,
+        "impact": 0.39,
+        "externalPressure": 0.55,
+        "internalPressure": 0.5,
+        "novelty": 0.6666666666666667,
+        "repetition": 0.2,
+        "risk": 0.35,
+        "ambiguity": 0.35,
+        "confidence": 0.7,
+        "specificity": 0.3,
+        "conflict": 0,
+        "goalAlignment": 0.75,
+        "strategicFit": 0.7,
+        "requiresSpecialist": false,
+        "scrutinyOverrides": null,
+        "receivedAt": "<ts>",
+        "metadata": {}
+      },
+      "workflow": {
+        "id": "adaptive-review",
+        "name": "Adaptive Review",
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "goal": "Review recent pressure, memory candidates, and propagation opportunities.",
+        "goalAlignment": 0.9,
+        "strategicFit": 0.86,
+        "successMetric": "Review includes evidence, tension, memory decision, and propagation decision."
+      },
+      "action": "act",
+      "scrutiny": {
+        "action": "act",
+        "score": 0.5271574573048706,
+        "propagationPressure": 0.23333333333333334,
+        "dimensions": {
+          "environment": 0.444,
+          "company": 0.7015,
+          "evidence": 0.575,
+          "memory": 0.604843963647461,
+          "uncertainty": 0.39503900908813483,
+          "risk": 0.35,
+          "novelty": 0.6666666666666667,
+          "repetition": 0.2
+        },
+        "reasons": [
+          "Panel selected 'act' (majority).",
+          "Cautious=ask@0.59, Pragmatic=act@0.58, Aggressive=act@0.57.",
+          "Dissent: cautious judge picked 'ask' — Runtime context: OpenAGI ABI."
+        ],
+        "judges": {
+          "cautious": {
+            "action": "ask",
+            "score": 0.5876238639109498,
+            "propagationPressure": 0.23333333333333334,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.604843963647461,
+              "uncertainty": 0.39503900908813483,
+              "risk": 0.35,
+              "novelty": 0.6666666666666667,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected ask at scrutiny score 0.59.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI."
+            ]
+          },
+          "pragmatic": {
+            "action": "act",
+            "score": 0.5777873747288819,
+            "propagationPressure": 0.23333333333333334,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.604843963647461,
+              "uncertainty": 0.39503900908813483,
+              "risk": 0.35,
+              "novelty": 0.6666666666666667,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected act at scrutiny score 0.58.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI."
+            ]
+          },
+          "aggressive": {
+            "action": "act",
+            "score": 0.5660611332747802,
+            "propagationPressure": 0.23333333333333334,
+            "dimensions": {
+              "environment": 0.444,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.604843963647461,
+              "uncertainty": 0.39503900908813483,
+              "risk": 0.35,
+              "novelty": 0.6666666666666667,
+              "repetition": 0.2
+            },
+            "reasons": [
+              "Selected act at scrutiny score 0.57.",
+              "Workflow: Adaptive Review.",
+              "Runtime context: OpenAGI ABI."
+            ]
+          }
+        },
+        "agreement": "majority"
+      },
+      "memory": {
+        "id": "mem_medium_<id>",
+        "tier": "medium",
+        "content": "please finish the vendor folder task Decision: act Reasons: Panel selected 'act' (majority). Cautious=ask@0.59, Pragmatic=act@0.58, Aggressive=act@0.57. Dissent: cautious judge picked 'ask' — Runtime context: OpenAGI ABI.",
+        "rawContentHash": "80ca67af95123af383b2b13e385528965e381a0bc61a1b8ebe3fef6201d93495",
+        "tags": [
+          "signal",
+          "general",
+          "adaptation-review",
+          "message",
+          "local",
+          "main"
+        ],
+        "source": "local",
+        "scope": "main",
+        "createdAt": "<ts>",
+        "lastAccessedAt": "<ts>",
+        "lastObservedAt": "<ts>",
+        "lastDecayedAt": "<ts>",
+        "strength": 0.5271574573048706,
+        "fidelity": "normal",
+        "novelty": 0.6666666666666667,
+        "risk": 0.35,
+        "specificity": 0.3,
+        "dangerLevel": 0.32999999999999996,
+        "repetition": 0.2,
+        "kind": "raw",
+        "locked": false,
+        "metadata": {
+          "signalId": "sig_<id>",
+          "workflowId": "adaptive-review",
+          "scrutiny": {
+            "environment": 0.444,
+            "company": 0.7015,
+            "evidence": 0.575,
+            "memory": 0.604843963647461,
+            "uncertainty": 0.39503900908813483,
+            "risk": 0.35,
+            "novelty": 0.6666666666666667,
+            "repetition": 0.2
+          },
+          "recallCount": 1,
+          "lastRecalledAt": "<ts>",
+          "recallSources": {
+            "retrieve": 1
+          }
+        }
+      },
+      "propagation": {
+        "created": false,
+        "reason": "not-needed",
+        "specialist": null
+      },
+      "customContext": [
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.4050635416666667,
+          "content": "draft a follow-up to the vendor about the checklist Decision: ask Reasons: Panel selected 'ask' (split). Cautious=ask@0.52, Pragmatic=act@0.52, Aggressive=watch@0.49. Judges disagreed completely — defaulting to 'ask' for human input."
+        },
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.32405083333333334,
+          "content": "Session local:user:main user asked: draft a follow-up to the vendor about the checklist Agent replied: Done: draft a follow-up to the vendor about th"
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.24615688775390626,
+          "content": "weekly acme pipeline follow-up email Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55."
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.1641045918359375,
+          "content": "Session local:user:main user asked: weekly acme pipeline follow-up email Agent replied: Done: weekly acme pipeline follow-up email"
+        }
+      ]
+    },
+    {
+      "id": "out_<id>",
+      "createdAt": "<ts>",
+      "signal": {
+        "id": "sig_<id>",
+        "source": "local",
+        "type": "message",
+        "domain": "general",
+        "taskType": "specialization-candidate",
+        "summary": "we should automate this with a specialist agent",
+        "content": "we should automate this with a specialist agent",
+        "citations": [
+          "session:local:user:main",
+          "agent:main",
+          "from:user"
+        ],
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ],
+        "urgency": 0.45,
+        "impact": 0.72,
+        "externalPressure": 0.55,
+        "internalPressure": 0.5,
+        "novelty": 0.75,
+        "repetition": 0.82,
+        "risk": 0.35,
+        "ambiguity": 0.35,
+        "confidence": 0.7,
+        "specificity": 0.3,
+        "conflict": 0,
+        "goalAlignment": 0.75,
+        "strategicFit": 0.7,
+        "requiresSpecialist": true,
+        "scrutinyOverrides": null,
+        "receivedAt": "<ts>",
+        "metadata": {}
+      },
+      "workflow": {
+        "id": "specialization-candidate",
+        "name": "Specialization Candidate",
+        "domain": "general",
+        "taskType": "specialization-candidate",
+        "goal": "Decide whether a repeated or high-risk novel task should become a specialist.",
+        "goalAlignment": 0.86,
+        "strategicFit": 0.78,
+        "successMetric": "Specialist is created only when its bounded scope reduces generalized burden."
+      },
+      "action": "propagate",
+      "scrutiny": {
+        "action": "propagate",
+        "score": 0.6112625765069155,
+        "propagationPressure": 0.9,
+        "dimensions": {
+          "environment": 0.5595,
+          "company": 0.7015,
+          "evidence": 0.575,
+          "memory": 0.6247743306949675,
+          "uncertainty": 0.3900564173262582,
+          "risk": 0.35,
+          "novelty": 0.75,
+          "repetition": 0.82
+        },
+        "reasons": [
+          "Panel selected 'propagate' (unanimous).",
+          "Cautious=propagate@0.61, Pragmatic=propagate@0.61, Aggressive=propagate@0.61."
+        ],
+        "judges": {
+          "cautious": {
+            "action": "propagate",
+            "score": 0.6117522003914071,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.5595,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.6247743306949675,
+              "uncertainty": 0.3900564173262582,
+              "risk": 0.35,
+              "novelty": 0.75,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.61.",
+              "Workflow: Specialization Candidate.",
+              "Runtime context: OpenAGI ABI.",
+              "High impact increased environmental pressure.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          },
+          "pragmatic": {
+            "action": "propagate",
+            "score": 0.6130172779507703,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.5595,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.6247743306949675,
+              "uncertainty": 0.3900564173262582,
+              "risk": 0.35,
+              "novelty": 0.75,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.61.",
+              "Workflow: Specialization Candidate.",
+              "Runtime context: OpenAGI ABI.",
+              "High impact increased environmental pressure.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          },
+          "aggressive": {
+            "action": "propagate",
+            "score": 0.609018251178569,
+            "propagationPressure": 0.9,
+            "dimensions": {
+              "environment": 0.5595,
+              "company": 0.7015,
+              "evidence": 0.575,
+              "memory": 0.6247743306949675,
+              "uncertainty": 0.3900564173262582,
+              "risk": 0.35,
+              "novelty": 0.75,
+              "repetition": 0.82
+            },
+            "reasons": [
+              "Selected propagate at scrutiny score 0.61.",
+              "Workflow: Specialization Candidate.",
+              "Runtime context: OpenAGI ABI.",
+              "High impact increased environmental pressure.",
+              "Repetition or high-risk novelty supports specialist propagation."
+            ]
+          }
+        },
+        "agreement": "unanimous"
+      },
+      "memory": {
+        "id": "mem_medium_<id>",
+        "tier": "medium",
+        "content": "we should automate this with a specialist agent Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.61, Pragmatic=propagate@0.61, Aggressive=propagate@0.61.",
+        "rawContentHash": "c8ccf2dad2073e064ab3cb8417625dc7cd4217c66e305cb88506c8182892692c",
+        "tags": [
+          "signal",
+          "general",
+          "specialization-candidate",
+          "message",
+          "local",
+          "main"
+        ],
+        "source": "local",
+        "scope": "main",
+        "createdAt": "<ts>",
+        "lastAccessedAt": "<ts>",
+        "lastObservedAt": "<ts>",
+        "lastDecayedAt": "<ts>",
+        "strength": 0.5812625765069155,
+        "fidelity": "normal",
+        "novelty": 0.75,
+        "risk": 0.35,
+        "specificity": 0.3,
+        "dangerLevel": 0.32999999999999996,
+        "repetition": 0.82,
+        "kind": "raw",
+        "locked": false,
+        "metadata": {
+          "signalId": "sig_<id>",
+          "workflowId": "specialization-candidate",
+          "scrutiny": {
+            "environment": 0.5595,
+            "company": 0.7015,
+            "evidence": 0.575,
+            "memory": 0.6247743306949675,
+            "uncertainty": 0.3900564173262582,
+            "risk": 0.35,
+            "novelty": 0.75,
+            "repetition": 0.82
+          }
+        }
+      },
+      "propagation": {
+        "created": true,
+        "reason": "specialist-created",
+        "specialist": {
+          "id": "agent_<id>",
+          "signature": "a7aedf83ad28358488701a04",
+          "name": "general-specialization-candidate-specialist",
+          "parentGoal": "Decide whether a repeated or high-risk novel task should become a specialist.",
+          "boundedScope": "we should automate this with a specialist agent",
+          "successMetric": "Specialist is created only when its bounded scope reduces generalized burden.",
+          "allowedTools": [],
+          "status": "available",
+          "createdAt": "<ts>",
+          "lastActivatedAt": "<ts>",
+          "activationCount": 1,
+          "reasons": [
+            "Panel selected 'propagate' (unanimous).",
+            "Cautious=propagate@0.61, Pragmatic=propagate@0.61, Aggressive=propagate@0.61."
+          ],
+          "meanOutcomeQuality": null,
+          "outcomeSamples": 0,
+          "retiredAt": null,
+          "retirementReason": null,
+          "seasonal": false,
+          "metadata": {
+            "domain": "general",
+            "taskType": "specialization-candidate",
+            "tags": [
+              "message",
+              "local",
+              "main"
+            ]
+          },
+          "groundedMean": null,
+          "groundedSamples": 0,
+          "parentSpecialistId": null,
+          "depth": 0,
+          "workspaceDir": "<dataDir>/agents/workspaces/agent_<id>"
+        }
+      },
+      "customContext": [
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.27265977272727276,
+          "content": "draft a follow-up to the vendor about the checklist Decision: ask Reasons: Panel selected 'ask' (split). Cautious=ask@0.52, Pragmatic=act@0.52, Aggressive=watch@0.49. Judges disagreed completely — defaulting to 'ask' for human input."
+        },
+        {
+          "id": "mem_short_<id>",
+          "tier": "short",
+          "score": 0.27265977272727276,
+          "content": "Session local:user:main user asked: draft a follow-up to the vendor about the checklist Agent replied: Done: draft a follow-up to the vendor about th"
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.20631018088955969,
+          "content": "weekly acme pipeline follow-up email Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55."
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.20631018088955969,
+          "content": "Session local:user:main user asked: weekly acme pipeline follow-up email Agent replied: Done: weekly acme pipeline follow-up email"
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.19535303846806973,
+          "content": "please finish the vendor folder task Decision: act Reasons: Panel selected 'act' (majority). Cautious=ask@0.59, Pragmatic=act@0.58, Aggressive=act@0.57. Dissent: cautious judge picked 'ask' — Runtime context: OpenAGI ABI."
+        },
+        {
+          "id": "mem_medium_<id>",
+          "tier": "medium",
+          "score": 0.19535303846806973,
+          "content": "Session local:user:main user asked: please finish the vendor folder task Agent replied: Done: please finish the vendor folder task"
+        }
+      ]
+    }
+  ],
+  "outcomes": [
+    {
+      "id": "out_<id>",
+      "kind": "work-draft",
+      "refId": "draft_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": null,
+      "agentId": "main",
+      "channel": null,
+      "scrutinyAction": "ask",
+      "scrutinyDimensions": {
+        "environment": 0.444,
+        "company": 0.7015,
+        "evidence": 0.575,
+        "memory": 0.2,
+        "uncertainty": 0.4962500000000001,
+        "risk": 0.35,
+        "novelty": 0.4,
+        "repetition": 0.2
+      },
+      "toolCalls": [],
+      "resolved": false,
+      "qualityScore": null,
+      "source": null,
+      "groundedScore": 1,
+      "groundedSource": "draft",
+      "groundedFate": "approved",
+      "groundedWeak": false,
+      "groundedAt": "<ts>",
+      "at": "<ts>",
+      "resolvedAt": null,
+      "metadata": {
+        "specialistId": null,
+        "scrutinyScore": 0.36002083333333335,
+        "qualityEligible": false
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "agent-reply",
+      "refId": "msg_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": "local:user:main",
+      "agentId": "main",
+      "channel": "local",
+      "scrutinyAction": "ask",
+      "scrutinyDimensions": {
+        "environment": 0.444,
+        "company": 0.7015,
+        "evidence": 0.575,
+        "memory": 0.2,
+        "uncertainty": 0.4962500000000001,
+        "risk": 0.35,
+        "novelty": 0.4,
+        "repetition": 0.2
+      },
+      "toolCalls": [
+        {
+          "name": "save_draft",
+          "ok": true
+        }
+      ],
+      "resolved": true,
+      "qualityScore": 0.6,
+      "source": "user-followup",
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": "<ts>",
+      "metadata": {
+        "qualityEligible": true,
+        "specialistId": null,
+        "signalSummary": "draft a follow-up to the vendor about the checklist",
+        "scrutinyScore": 0.36002083333333335,
+        "routing": {
+          "mode": "shadow",
+          "routed": false,
+          "candidateId": null,
+          "score": null,
+          "threshold": 0.55
+        },
+        "resolutionNote": "tone of next user message"
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "agent-reply",
+      "refId": "msg_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": "local:user:main",
+      "agentId": "main",
+      "channel": "local",
+      "scrutinyAction": "propagate",
+      "scrutinyDimensions": {
+        "environment": 0.444,
+        "company": 0.7415,
+        "evidence": 0.575,
+        "memory": 0.46993128906250003,
+        "uncertainty": 0.428767177734375,
+        "risk": 0.35,
+        "novelty": 0.8,
+        "repetition": 0.82
+      },
+      "toolCalls": [],
+      "resolved": true,
+      "qualityScore": 0.6,
+      "source": "user-followup",
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": "<ts>",
+      "metadata": {
+        "qualityEligible": true,
+        "specialistId": null,
+        "signalSummary": "weekly acme pipeline follow-up email",
+        "scrutinyScore": 0.5641177721028646,
+        "routing": {
+          "mode": "shadow",
+          "routed": false,
+          "candidateId": "agent_<id>",
+          "score": 0.8690055917499189,
+          "threshold": 0.55
+        },
+        "resolutionNote": "tone of next user message"
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "work-task",
+      "refId": "task_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": null,
+      "agentId": "main",
+      "channel": null,
+      "scrutinyAction": "act",
+      "scrutinyDimensions": {
+        "environment": 0.444,
+        "company": 0.7015,
+        "evidence": 0.575,
+        "memory": 0.604843963647461,
+        "uncertainty": 0.39503900908813483,
+        "risk": 0.35,
+        "novelty": 0.6666666666666667,
+        "repetition": 0.2
+      },
+      "toolCalls": [],
+      "resolved": false,
+      "qualityScore": null,
+      "source": null,
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": null,
+      "metadata": {
+        "byAgent": true,
+        "specialistId": null,
+        "scrutinyScore": 0.5271574573048706,
+        "qualityEligible": false
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "task-completed",
+      "refId": "task_<id>",
+      "signalId": null,
+      "sessionId": null,
+      "agentId": "main",
+      "channel": null,
+      "scrutinyAction": null,
+      "scrutinyDimensions": null,
+      "toolCalls": [],
+      "resolved": true,
+      "qualityScore": 0.7,
+      "source": "task-completed",
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": "<ts>",
+      "metadata": {
+        "task": "task_<id>",
+        "sourceSuggestionId": null,
+        "title": "Tidy the vendor folder",
+        "completedVia": "agent"
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "agent-reply",
+      "refId": "msg_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": "local:user:main",
+      "agentId": "main",
+      "channel": "local",
+      "scrutinyAction": "act",
+      "scrutinyDimensions": {
+        "environment": 0.444,
+        "company": 0.7015,
+        "evidence": 0.575,
+        "memory": 0.604843963647461,
+        "uncertainty": 0.39503900908813483,
+        "risk": 0.35,
+        "novelty": 0.6666666666666667,
+        "repetition": 0.2
+      },
+      "toolCalls": [
+        {
+          "name": "complete_task",
+          "ok": true
+        }
+      ],
+      "resolved": true,
+      "qualityScore": 0.6,
+      "source": "user-followup",
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": "<ts>",
+      "metadata": {
+        "qualityEligible": true,
+        "specialistId": null,
+        "signalSummary": "please finish the vendor folder task",
+        "scrutinyScore": 0.5271574573048706,
+        "routing": {
+          "mode": "shadow",
+          "routed": false,
+          "candidateId": null,
+          "score": null,
+          "threshold": 0.55
+        },
+        "resolutionNote": "tone of next user message"
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "agent-reply",
+      "refId": "msg_<id>",
+      "signalId": "sig_<id>",
+      "sessionId": "local:user:main",
+      "agentId": "main",
+      "channel": "local",
+      "scrutinyAction": "propagate",
+      "scrutinyDimensions": {
+        "environment": 0.5595,
+        "company": 0.7015,
+        "evidence": 0.575,
+        "memory": 0.6247743306949675,
+        "uncertainty": 0.3900564173262582,
+        "risk": 0.35,
+        "novelty": 0.75,
+        "repetition": 0.82
+      },
+      "toolCalls": [],
+      "resolved": false,
+      "qualityScore": null,
+      "source": null,
+      "groundedScore": null,
+      "groundedSource": null,
+      "groundedFate": null,
+      "groundedWeak": false,
+      "groundedAt": null,
+      "at": "<ts>",
+      "resolvedAt": null,
+      "metadata": {
+        "qualityEligible": true,
+        "specialistId": null,
+        "signalSummary": "we should automate this with a specialist agent",
+        "scrutinyScore": 0.6112625765069155,
+        "routing": {
+          "mode": "shadow",
+          "routed": false,
+          "candidateId": null,
+          "score": null,
+          "threshold": 0.55
+        }
+      }
+    },
+    {
+      "id": "out_<id>",
+      "kind": "work-suggestion",
+      "refId": "prop_<id>",
+      "signalId": null,
+      "sessionId": null,
+      "agentId": "main",
+      "channel": null,
+      "scrutinyAction": null,
+      "scrutinyDimensions": null,
+      "toolCalls": [],
+      "resolved": false,
+      "qualityScore": null,
+      "source": null,
+      "groundedScore": 0.7,
+      "groundedSource": "suggestion",
+      "groundedFate": "accepted",
+      "groundedWeak": false,
+      "groundedAt": "<ts>",
+      "at": "<ts>",
+      "resolvedAt": null,
+      "metadata": {
+        "specialistId": null,
+        "scrutinyScore": null,
+        "qualityEligible": false,
+        "groundedDetail": {
+          "acceptedAt": "<ts>"
+        }
+      }
+    }
+  ],
+  "memory": [
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "weekly acme pipeline follow-up email Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55.",
+      "rawContentHash": "a12c2fe7aaa1673181da6c6128e41cebc9d6ab333d738eda6b6fa4db9e83cdab",
+      "tags": [
+        "signal",
+        "general",
+        "adaptation-review",
+        "message",
+        "local",
+        "main"
+      ],
+      "source": "local",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5941177721028646,
+      "fidelity": "normal",
+      "novelty": 0.8,
+      "risk": 0.35,
+      "specificity": 0.3,
+      "dangerLevel": 0.32999999999999996,
+      "repetition": 0.82,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "signalId": "sig_<id>",
+        "workflowId": "adaptive-review",
+        "scrutiny": {
+          "environment": 0.444,
+          "company": 0.7415,
+          "evidence": 0.575,
+          "memory": 0.46993128906250003,
+          "uncertainty": 0.428767177734375,
+          "risk": 0.35,
+          "novelty": 0.8,
+          "repetition": 0.82
+        },
+        "recallCount": 2,
+        "lastRecalledAt": "<ts>",
+        "recallSources": {
+          "retrieve": 2
+        }
+      }
+    },
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "Session local:user:main user asked: weekly acme pipeline follow-up email Agent replied: Done: weekly acme pipeline follow-up email",
+      "rawContentHash": "2352477e1e0d9834fa4298316f4b4e4a50c832cbc7f8abe94b7c17d200922080",
+      "tags": [
+        "agent-turn",
+        "local",
+        "main"
+      ],
+      "source": "agent-host",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5941177721028646,
+      "fidelity": "normal",
+      "novelty": 0.8,
+      "risk": 0.35,
+      "specificity": 0.6,
+      "dangerLevel": 0.44999999999999996,
+      "repetition": 0.82,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "sessionId": "local:user:main",
+        "agentId": "main",
+        "outputId": "out_<id>",
+        "recallCount": 2,
+        "lastRecalledAt": "<ts>",
+        "recallSources": {
+          "retrieve": 2
+        }
+      }
+    },
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "please finish the vendor folder task Decision: act Reasons: Panel selected 'act' (majority). Cautious=ask@0.59, Pragmatic=act@0.58, Aggressive=act@0.57. Dissent: cautious judge picked 'ask' — Runtime context: OpenAGI ABI.",
+      "rawContentHash": "80ca67af95123af383b2b13e385528965e381a0bc61a1b8ebe3fef6201d93495",
+      "tags": [
+        "signal",
+        "general",
+        "adaptation-review",
+        "message",
+        "local",
+        "main"
+      ],
+      "source": "local",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5271574573048706,
+      "fidelity": "normal",
+      "novelty": 0.6666666666666667,
+      "risk": 0.35,
+      "specificity": 0.3,
+      "dangerLevel": 0.32999999999999996,
+      "repetition": 0.2,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "signalId": "sig_<id>",
+        "workflowId": "adaptive-review",
+        "scrutiny": {
+          "environment": 0.444,
+          "company": 0.7015,
+          "evidence": 0.575,
+          "memory": 0.604843963647461,
+          "uncertainty": 0.39503900908813483,
+          "risk": 0.35,
+          "novelty": 0.6666666666666667,
+          "repetition": 0.2
+        },
+        "recallCount": 1,
+        "lastRecalledAt": "<ts>",
+        "recallSources": {
+          "retrieve": 1
+        }
+      }
+    },
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "Session local:user:main user asked: please finish the vendor folder task Agent replied: Done: please finish the vendor folder task",
+      "rawContentHash": "54d34b51b11ab936913f1eb73f064d75854ec1b077364c62239d60cd84736857",
+      "tags": [
+        "agent-turn",
+        "local",
+        "main"
+      ],
+      "source": "agent-host",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5271574573048706,
+      "fidelity": "normal",
+      "novelty": 0.6666666666666667,
+      "risk": 0.35,
+      "specificity": 0.6,
+      "dangerLevel": 0.44999999999999996,
+      "repetition": 0.2,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "sessionId": "local:user:main",
+        "agentId": "main",
+        "outputId": "out_<id>",
+        "recallCount": 1,
+        "lastRecalledAt": "<ts>",
+        "recallSources": {
+          "retrieve": 1
+        }
+      }
+    },
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "we should automate this with a specialist agent Decision: propagate Reasons: Panel selected 'propagate' (unanimous). Cautious=propagate@0.61, Pragmatic=propagate@0.61, Aggressive=propagate@0.61.",
+      "rawContentHash": "c8ccf2dad2073e064ab3cb8417625dc7cd4217c66e305cb88506c8182892692c",
+      "tags": [
+        "signal",
+        "general",
+        "specialization-candidate",
+        "message",
+        "local",
+        "main"
+      ],
+      "source": "local",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5812625765069155,
+      "fidelity": "normal",
+      "novelty": 0.75,
+      "risk": 0.35,
+      "specificity": 0.3,
+      "dangerLevel": 0.32999999999999996,
+      "repetition": 0.82,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "signalId": "sig_<id>",
+        "workflowId": "specialization-candidate",
+        "scrutiny": {
+          "environment": 0.5595,
+          "company": 0.7015,
+          "evidence": 0.575,
+          "memory": 0.6247743306949675,
+          "uncertainty": 0.3900564173262582,
+          "risk": 0.35,
+          "novelty": 0.75,
+          "repetition": 0.82
+        }
+      }
+    },
+    {
+      "id": "mem_medium_<id>",
+      "tier": "medium",
+      "content": "Session local:user:main user asked: we should automate this with a specialist agent Agent replied: Done: we should automate this with a specialis",
+      "rawContentHash": "e3d074c4f8fe67e4d94b5b13e7dccf0c9b80b0311d379f68f20d47493a53fecd",
+      "tags": [
+        "agent-turn",
+        "local",
+        "main"
+      ],
+      "source": "agent-host",
+      "scope": "main",
+      "createdAt": "<ts>",
+      "lastAccessedAt": "<ts>",
+      "lastObservedAt": "<ts>",
+      "lastDecayedAt": "<ts>",
+      "strength": 0.5812625765069155,
+      "fidelity": "normal",
+      "novelty": 0.75,
+      "risk": 0.35,
+      "specificity": 0.6,
+      "dangerLevel": 0.44999999999999996,
+      "repetition": 0.82,
+      "kind": "raw",
+      "locked": false,
+      "metadata": {
+        "sessionId": "local:user:main",
+        "agentId": "main",
+        "outputId": "out_<id>"
+      }
+    }
+  ],
+  "decay": {
+    "removed": 2,
+    "promoted": 0,
+    "decayed": 6,
+    "initialized": 0,
+    "repaired": 0
+  },
+  "specialists": [
+    {
+      "id": "agent_<id>",
+      "signature": "a7aedf83ad28358488701a04",
+      "name": "general-specialization-candidate-specialist",
+      "parentGoal": "Decide whether a repeated or high-risk novel task should become a specialist.",
+      "boundedScope": "we should automate this with a specialist agent",
+      "successMetric": "Specialist is created only when its bounded scope reduces generalized burden.",
+      "allowedTools": [],
+      "status": "available",
+      "createdAt": "<ts>",
+      "lastActivatedAt": "<ts>",
+      "activationCount": 1,
+      "reasons": [
+        "Panel selected 'propagate' (unanimous).",
+        "Cautious=propagate@0.61, Pragmatic=propagate@0.61, Aggressive=propagate@0.61."
+      ],
+      "meanOutcomeQuality": null,
+      "outcomeSamples": 0,
+      "retiredAt": null,
+      "retirementReason": null,
+      "seasonal": false,
+      "metadata": {
+        "domain": "general",
+        "taskType": "specialization-candidate",
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ]
+      },
+      "groundedMean": null,
+      "groundedSamples": 0,
+      "parentSpecialistId": null,
+      "depth": 0,
+      "workspaceDir": "<dataDir>/agents/workspaces/agent_<id>"
+    },
+    {
+      "id": "agent_<id>",
+      "signature": "9306a67eb4fa9ef0a0031728",
+      "name": "general-adaptation-review-specialist",
+      "parentGoal": "Review recent pressure, memory candidates, and propagation opportunities.",
+      "boundedScope": "weekly acme pipeline follow-up email",
+      "successMetric": "Review includes evidence, tension, memory decision, and propagation decision.",
+      "allowedTools": [],
+      "status": "available",
+      "createdAt": "<ts>",
+      "lastActivatedAt": "<ts>",
+      "activationCount": 1,
+      "reasons": [
+        "Panel selected 'propagate' (unanimous).",
+        "Cautious=propagate@0.57, Pragmatic=propagate@0.57, Aggressive=propagate@0.55."
+      ],
+      "meanOutcomeQuality": null,
+      "outcomeSamples": 0,
+      "retiredAt": null,
+      "retirementReason": null,
+      "seasonal": false,
+      "metadata": {
+        "domain": "general",
+        "taskType": "adaptation-review",
+        "tags": [
+          "message",
+          "local",
+          "main"
+        ]
+      },
+      "groundedMean": null,
+      "groundedSamples": 0,
+      "parentSpecialistId": null,
+      "depth": 0,
+      "workspaceDir": "<dataDir>/agents/workspaces/agent_<id>"
+    },
+    {
+      "id": "agent_<id>",
+      "signature": "6bda3205bddef981c2cab058",
+      "name": "sales-follow-up-specialist",
+      "parentGoal": "Improve outcome from signal evidence.",
+      "boundedScope": "weekly acme pipeline follow-up email",
+      "successMetric": "Produces cited, actionable recommendations with lower repeated parent effort.",
+      "allowedTools": [],
+      "status": "available",
+      "createdAt": "<ts>",
+      "lastActivatedAt": "<ts>",
+      "activationCount": 1,
+      "reasons": [
+        "seeded"
+      ],
+      "meanOutcomeQuality": null,
+      "outcomeSamples": 0,
+      "retiredAt": null,
+      "retirementReason": null,
+      "seasonal": false,
+      "metadata": {
+        "domain": "sales",
+        "taskType": "follow-up",
+        "tags": [
+          "message",
+          "local",
+          "acme"
+        ]
+      },
+      "groundedMean": null,
+      "groundedSamples": 0,
+      "parentSpecialistId": null,
+      "depth": 0,
+      "workspaceDir": "<dataDir>/agents/workspaces/agent_<id>"
+    }
+  ],
+  "cron": [
+    {
+      "id": "agent-pulse",
+      "name": "Agent autopilot — drain agent queue every 30 min",
+      "enabled": true,
+      "task": "autopilot"
+    },
+    {
+      "id": "ambient-digest",
+      "name": "Hourly ambient observation digest",
+      "enabled": true,
+      "task": "ambient-digest"
+    },
+    {
+      "id": "backlog-triage",
+      "name": "Daily backlog hygiene — retire duplicates and review relevance",
+      "enabled": true,
+      "task": "backlog-triage"
+    },
+    {
+      "id": "buildbetter-task-sync",
+      "name": "BuildBetter call action items → tasks",
+      "enabled": true,
+      "task": "buildbetter-task-sync"
+    },
+    {
+      "id": "daily-adaptation-review",
+      "name": "Daily Adaptation Review",
+      "enabled": true,
+      "task": "daily-adaptation-review"
+    },
+    {
+      "id": "daily-memory-condense",
+      "name": "Daily memory condensation",
+      "enabled": true,
+      "task": "condense"
+    },
+    {
+      "id": "daily-plan-morning",
+      "name": "Daily morning plan — what you're going to do today",
+      "enabled": true,
+      "task": "daily-plan"
+    },
+    {
+      "id": "daily-recap-evening",
+      "name": "Daily evening recap — what did you get done today",
+      "enabled": true,
+      "task": "daily-recap"
+    },
+    {
+      "id": "daily-retirement-sweep",
+      "name": "Daily specialist retirement sweep",
+      "enabled": true,
+      "task": "retirement-sweep"
+    },
+    {
+      "id": "daily-task-digest",
+      "name": "Daily morning task digest",
+      "enabled": true,
+      "task": "task-digest"
+    },
+    {
+      "id": "grounded-backfill",
+      "name": "One-time grading of work resolved before grading existed (manual)",
+      "enabled": false,
+      "task": "grounded-backfill"
+    },
+    {
+      "id": "grounded-sweep",
+      "name": "Daily grading of drafts, suggestions and agent tasks by what happened",
+      "enabled": true,
+      "task": "grounded-sweep"
+    },
+    {
+      "id": "hourly-pattern-mine",
+      "name": "Continuous activity workflow miner every 60 min",
+      "enabled": true,
+      "task": "pattern-mine"
+    },
+    {
+      "id": "hourly-session-mine",
+      "name": "Hourly chat-session skill miner",
+      "enabled": true,
+      "task": "session-mine"
+    },
+    {
+      "id": "imessage-extract",
+      "name": "iMessage extraction — surface follow-ups/events/links every 15 min",
+      "enabled": true,
+      "task": "imessage-extract"
+    },
+    {
+      "id": "inbox-sweep",
+      "name": "Inbox folder watcher (drop .md/.txt files for tasks)",
+      "enabled": true,
+      "task": "inbox-sweep"
+    },
+    {
+      "id": "linear-task-sync",
+      "name": "Linear assigned-issues → tasks",
+      "enabled": true,
+      "task": "linear-task-sync"
+    },
+    {
+      "id": "model-upgrade-check",
+      "name": "Daily check for newer models (suggests, never switches)",
+      "enabled": true,
+      "task": "model-upgrade-check"
+    },
+    {
+      "id": "nightly-pattern-mine",
+      "name": "Nightly deep activity workflow miner",
+      "enabled": true,
+      "task": "pattern-mine"
+    },
+    {
+      "id": "nightly-session-mine",
+      "name": "Nightly chat-session skill miner",
+      "enabled": true,
+      "task": "session-mine"
+    },
+    {
+      "id": "observation-retention",
+      "name": "Daily observation retention — prune expired capture, reclaim disk",
+      "enabled": true,
+      "task": "observation-retention"
+    },
+    {
+      "id": "outreach-digest",
+      "name": "Outreach digest every 3h",
+      "enabled": true,
+      "task": "outreach-digest"
+    },
+    {
+      "id": "proactive-observer",
+      "name": "Proactive observer (continuous skill/MCP suggester)",
+      "enabled": true,
+      "task": "proactive-observe"
+    },
+    {
+      "id": "self-update",
+      "name": "Self-update (fast-forward + restart when a new version ships)",
+      "enabled": false,
+      "task": "self-update"
+    },
+    {
+      "id": "task-activity-scan",
+      "name": "Auto-detect task completion / progress from screen",
+      "enabled": true,
+      "task": "task-activity-scan"
+    },
+    {
+      "id": "task-reminders",
+      "name": "Due-date reminders for user tasks",
+      "enabled": true,
+      "task": "task-reminders"
+    },
+    {
+      "id": "task-sweep",
+      "name": "Task-list hygiene — dedupe / re-home / archive every 60 min",
+      "enabled": true,
+      "task": "task-sweep"
+    },
+    {
+      "id": "weekly-harsh-review",
+      "name": "Weekly harsh review",
+      "enabled": true,
+      "task": "autopilot"
+    },
+    {
+      "id": "weekly-project-scan",
+      "name": "Mid-horizon observer — 7-day project threads",
+      "enabled": true,
+      "task": "weekly-project-scan"
+    },
+    {
+      "id": "weekly-retrospective",
+      "name": "Weekly retrospective — roll up 7 daily retros",
+      "enabled": true,
+      "task": "weekly-retrospective"
+    },
+    {
+      "id": "weekly-scrutiny-fit",
+      "name": "Weekly scrutiny weight fit",
+      "enabled": true,
+      "task": "scrutiny-fit"
+    }
+  ],
+  "memoryEventOps": [
+    "remember",
+    "remember",
+    "recall",
+    "remember",
+    "remember",
+    "recall",
+    "remember",
+    "remember",
+    "recall",
+    "remember",
+    "remember",
+    "decay"
+  ],
+  "outcomeEventOps": [
+    "record",
+    "record",
+    "resolve",
+    "record",
+    "resolve",
+    "record",
+    "record",
+    "resolve",
+    "record",
+    "resolve",
+    "record",
+    "ground",
+    "record",
+    "ground"
+  ],
+  "files": [
+    "agent-host/agents.json",
+    "agent-host/session-index.db",
+    "agent-host/sessions/local_user_main.json",
+    "agents/specialists.json",
+    "agents/workspaces/agent_<id>/AGENTS.md",
+    "agents/workspaces/agent_<id>/specialist.json",
+    "agents/workspaces/agent_<id>/AGENTS.md",
+    "agents/workspaces/agent_<id>/specialist.json",
+    "agents/workspaces/agent_<id>/AGENTS.md",
+    "agents/workspaces/agent_<id>/specialist.json",
+    "cron/jobs.json",
+    "drafts/snapshot.json",
+    "memory/memory-events.jsonl",
+    "memory/memory-state.json",
+    "observations/index.db",
+    "outcomes/events.jsonl",
+    "outcomes/snapshot.json",
+    "proactive/suggestions/prop_<id>.json",
+    "tasks/agent.jsonl",
+    "tasks/snapshot.json",
+    "vectors/store.json"
+  ]
+}

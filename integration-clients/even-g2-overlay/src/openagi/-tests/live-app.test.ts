@@ -33,7 +33,7 @@ async function fixture(initial: Partial<Omit<OpenAGIState, 'version'>> = {}, res
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), snapshotText: vi.fn(() => ''), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn<OpenAGIApiClient['askText']>(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon', sessionId: 'fixture-session' })), ask: vi.fn(), listen: vi.fn() }
   if (restored?.proactive) Object.assign(api, { proactive: restored.proactive })
-  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), lifelogHome: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn(), supervisorHome: vi.fn(), fleetStatus: vi.fn(), recent: vi.fn(), flash: vi.fn(), speaker: vi.fn() }
+  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), lifelogHome: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn(), supervisorHome: vi.fn(), supervisorWalkthrough: vi.fn(), fleetStatus: vi.fn(), recent: vi.fn(), flash: vi.fn(), speaker: vi.fn() }
   const phone = { draft: vi.fn(), set: vi.fn(), paired: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn(), recordingConsent: vi.fn(), lifelogState: vi.fn(), memoryStatus: vi.fn(), homeMode: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
@@ -593,6 +593,65 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('walkthrough fallback keeps card action labels and returns to the card after backing out', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ homeMode: 'supervisor' })
+  try {
+    const state = {
+      active: true, paused: false, currentId: 'q:fq_walk', total: 1,
+      current: { id: 'q:fq_walk', kind: 'card' as const, title: 'PR ready', summary: 'CI is green', cardId: 'q:fq_walk', cardKind: 'merge_ready', prRef: 'acme/api#1', primaryLabel: 'Merge PR', ciState: 'passing', options: [] },
+      items: [{ id: 'q:fq_walk', kind: 'card' as const, title: 'PR ready', summary: 'CI is green', cardId: 'q:fq_walk', cardKind: 'merge_ready', prRef: 'acme/api#1', primaryLabel: 'Merge PR', ciState: 'passing', options: [] }],
+    }
+    const internal = f.app as unknown as { mode: string; supervisorWalkthrough: typeof state }
+    internal.supervisorWalkthrough = state; internal.mode = 'walkthrough'; f.app.proactive.items = []
+    vi.advanceTimersByTime(500); f.app.tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#1)', 'PR ready', false)
+    expect(internal.supervisorWalkthrough.currentId).toBe('q:fq_walk')
+    expect(internal.supervisorWalkthrough.active).toBe(true)
+    expect(internal.supervisorWalkthrough.total).toBe(1)
+    f.app.doubleTap(); await Promise.resolve()
+    expect(internal.mode).toBe('walkthrough')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('routes outreach-backed merge_ready cards through preflight actCard instead of raw answer', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  try {
+    const actCard = vi.spyOn(f.app.proactive, 'actCard').mockResolvedValue({ ok: true, status: 'merged', detail: 'Merged acme/api#88 via squash' })
+    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, detail: 'typed' })
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    Object.assign(f.renderer, { supervisorHome: vi.fn() })
+    f.app.proactive.items = [{
+      id: 'o-pr-88',
+      title: 'PR #88 ready',
+      summary: 'Auth token refresh fix',
+      category: 'approvals',
+      action: 'answer-fleet',
+      seen: false,
+      important: true,
+      supervisor: true,
+      options: ['merged', 'later'],
+      cardId: 'q:fq_pr',
+      cardKind: 'merge_ready',
+      primaryLabel: 'Merge PR',
+      prRef: 'acme/api#88',
+      ciState: 'passing',
+    }]
+    const tap = async () => { f.app.tap(); await vi.advanceTimersByTimeAsync(500) }
+    await f.app.configureHomeMode('supervisor')
+    f.app.scrollUp()
+    await tap(); await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#88)', 'PR #88 ready', false)
+    await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Merge PR (acme/api#88)', 'PR #88 ready', true)
+    await tap()
+    expect(actCard).toHaveBeenCalledWith('o-pr-88', 'primary')
+    expect(answer).not.toHaveBeenCalled()
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Done', 'Merged acme/api#88 via squash')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('keeps Supervisor home through inbox refreshes and shows status on its own page', async () => {
   const f = await fixture()
   try {
@@ -818,5 +877,42 @@ it('tap on a reopened recent answer follows that original thread, not a newer on
     await f.app.finishAsk()
     await f.app.sendDraft()
     expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', original, expect.any(Function), expect.any(AbortSignal), 'agent')
+  } finally { await f.app.systemExit() }
+})
+
+
+it('offers an opt-in brief cue, expands on tap, and toggles transcript without stopping capture', async () => {
+  const f = await lifelogFixture()
+  const cue = vi.fn(), cueDetail = vi.fn(), transcriptVisible = vi.fn()
+  Object.assign(f.renderer, { cue, cueDetail, transcriptVisible })
+  const liveCue = vi.fn(() => Promise.resolve({ cue: { id: 'cue-one', kind: 'answer', title: 'Tomorrow', brief: 'Two meetings.', detail: 'Your first meeting is at 10 AM.', at: Date.now() } }))
+  Object.assign(f.api, { liveCue })
+  try {
+    f.callbacks().utterance('Any meetings tomorrow?'); expect(liveCue).not.toHaveBeenCalled()
+    await f.app.configureLiveCues(true)
+    f.callbacks().utterance('Any meetings tomorrow?')
+    await vi.waitFor(() => expect(cue).toHaveBeenCalledWith('Tomorrow', 'Two meetings.'))
+    f.app.tap(); expect(cueDetail).toHaveBeenCalledWith(expect.stringContaining('10 AM'), 0, 1)
+    f.app.doubleTap()
+    const stops = f.audio.stop.mock.calls.length
+    await f.app.toggleTranscript(); expect(transcriptVisible).toHaveBeenLastCalledWith(true)
+    expect(f.audio.stop).toHaveBeenCalledTimes(stops); expect(f.store.snapshot().recordingConsent).toBe(true)
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
+it('drops an in-flight cue when the glasses leave the foreground', async () => {
+  const f = await lifelogFixture(), cue = vi.fn()
+  let finish!: (result: unknown) => void
+  const liveCue = vi.fn(() => new Promise(resolve => { finish = resolve }))
+  Object.assign(f.api, { liveCue }); Object.assign(f.renderer, { cue })
+  try {
+    await f.app.configureLiveCues(true); f.callbacks().utterance('Any meetings tomorrow?')
+    expect(liveCue).toHaveBeenCalledOnce()
+    f.app.setForeground(false)
+    finish({ cue: { id: 'stale', kind: 'answer', title: 'Stale', brief: 'Stale', detail: 'Stale', at: Date.now() } })
+    await Promise.resolve(); await Promise.resolve()
+    expect(cue).not.toHaveBeenCalled()
+    expect(liveCue.mock.calls[0]).toHaveLength(3)
   } finally { await f.app.systemExit() }
 })

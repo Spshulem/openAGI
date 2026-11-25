@@ -33,6 +33,10 @@ suspend fun <T> withAlertLock(block: suspend () -> T): T = checkLock.withLock { 
 // then would wrongly clear pings the owner has not acted on yet.
 suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient): AlertCheckResult = checkLock.withLock {
     val app = context.applicationContext
+    val credentials = Credentials.load(app) ?: return@withLock AlertCheckResult.Unauthorized
+    if (!client.belongsTo(credentials)) return@withLock AlertCheckResult.Unauthorized
+    if (credentials.isEmbedded) return@withLock AlertCheckResult.NoSupervisor
+    checkApprovals(app, client)
     val state = try {
         client.fleetState()
     } catch (cancellation: CancellationException) {
@@ -55,5 +59,23 @@ suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient): Alert
         // A notification-manager hiccup is not worth crashing the service or
         // failing the refresh worker over; the next check reconciles again.
         AlertCheckResult.Offline
+    }
+}
+
+// Pending approvals ride the same check, independent of the supervisor: a
+// daemon without one still queues approvals. Best-effort under the same
+// rule as questions: a failed fetch says nothing about what was decided, so
+// it changes nothing.
+private suspend fun checkApprovals(app: Context, client: DaemonClient) {
+    val pending = try {
+        client.pendingActions("pending")
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (error: Exception) {
+        return
+    }
+    if (Credentials.load(app) == null) return
+    runCatching {
+        SupervisorNotifier.syncApprovals(app, pending, NotifiedQuestionsStore(app.filesDir, NotifiedQuestionsStore.APPROVALS_FILE_NAME))
     }
 }

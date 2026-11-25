@@ -1,20 +1,31 @@
 // Owner-only persistent state for the fleet supervisor: mode, last snapshot,
 // per-thread nudge ledger, needs-you questions, escalations, and the action
 // log. One JSON file (0600) plus an append-only actions.jsonl journal.
-// Methods never throw on disk errors; the last one is kept in lastWriteError.
+// Ordinary writes retain disk errors in lastWriteError. Mode changes throw
+// and roll back on failure: an unsaved Auto choice must never be acknowledged.
 
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
 import { REMEDIES, suggestionPlan } from "./remedies.js";
-import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
+import { DEFAULTS, MODES, clampTail, clampText, clampTextLines, redactSecrets, shortHash } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
+import { defaultPreferences, normalizePreferences } from "./preferences.js";
 
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
+// Pending undelivered-reply recoveries kept: far above the owner-message
+// queue's 100, so none is dropped before its card is put back.
+const UNDELIVERED_REPLIES_MAX = 1000;
+
+// Every card a queued owner message answers (older entries: just questionId).
+export function questionLinksOf(item) {
+  if (Array.isArray(item?.questionLinks) && item.questionLinks.length) return item.questionLinks.filter((l) => l && typeof l.questionId === "string");
+  return item?.questionId ? [{ questionId: item.questionId, questionAnswer: item.questionAnswer ?? null }] : [];
+}
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
 const REOPEN_MS = 60 * 60 * 1000;
@@ -51,7 +62,11 @@ const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
 // The owner being active is no failure. A presence probe that keeps failing
 // ("front app unknown", "presence check too slow") is: it builds the streak
 // so the owner hears why nothing lands.
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on)/;
+// A chat stopped on a provider limit, a nudge found delivered (its turn
+// confirmed, answered, running, or failed), or one status check sent after
+// an unconfirmable delivery, is not a route failing either: the Supervisor
+// owns what comes next.
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|Provider (?:usage|session)-limit until |Previous nudge was delivered|Previous Paseo turn confirmed|Sent one status check)/;
 
 function emptyState() {
   return {
@@ -76,8 +91,217 @@ function emptyState() {
     diagnosis: {},
     fixLocks: {},
     fixCommands: {},
-    selfSessions: []
+    selfSessions: [],
+    preferences: defaultPreferences(),
+    organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
+    followThroughWatches: [],
+    queuedOwnerMessages: [],
+    undeliveredOwnerReplies: [],
+    supervisorChatNotices: {},
+    lastProactiveChatAt: null,
+    lastOwnerAckAt: null,
+    surfacedDecisions: {},
+    providerFailovers: {},
+    contextRequestLog: {}
   };
+}
+
+const SURFACED_DECISIONS_MAX = 500;
+
+function normalizeDecisionText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/\b\d+\s+(threads?|sessions?|chats?|items?|stuck|stopped)\b/g, "# $1")
+    .replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent)\s+)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function actionableDecisionKey(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  if (kind === "ready" && prRef) return `ready:${prRef}`;
+  if (question.mergeAsk === true && prRef) return `merge:${prRef}`;
+  const rawDedupe = String(question.dedupeKey ?? "").trim();
+  const groupBase = rawDedupe.replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(groupBase)) {
+    return `group:${groupBase}`;
+  }
+  if (question.threadKey) {
+    if (kind === "prompt") return `prompt:${question.threadKey}`;
+    if (kind === "agent-card" && rawDedupe) return `card:${question.threadKey}:${rawDedupe}`;
+    return `thread:${question.threadKey}:${kind}:${prRef}`;
+  }
+  if (groupBase) return `dedupe:${groupBase}`;
+  const rawTitle = normalizeDecisionText(question.askedAs?.title ?? question.title);
+  return `other:${kind}:${shortHash(rawTitle)}`;
+}
+
+export function actionableDecisionMaterialHash(question) {
+  if (!question || typeof question !== "object") return null;
+  const kind = String(question.kind ?? "ask").trim().toLowerCase();
+  const prRef = question.prRef ? String(question.prRef).trim().toLowerCase() : "";
+  const rawTitle = question.askedAs?.title ?? question.title ?? "";
+  const rawOptions = Array.isArray(question.askedAs?.options) && question.askedAs.options.length > 0
+    ? question.askedAs.options
+    : (Array.isArray(question.options) ? question.options : []);
+  const normOpts = rawOptions
+    .filter((opt) => typeof opt === "string" && opt.toLowerCase() !== "dismiss")
+    .map(normalizeDecisionText)
+    .filter(Boolean)
+    .sort();
+  if (kind === "ready" && prRef) {
+    return shortHash(JSON.stringify(["ready", prRef]));
+  }
+  // A merge decision is the PR at a head with its choices: an agent or the
+  // review rewording the ask is not a new decision; a new head is.
+  if (question.mergeAsk === true && prRef) {
+    return shortHash(JSON.stringify(["merge", prRef, String(question.askedHead ?? ""), normOpts]));
+  }
+  const rawDedupe = String(question.dedupeKey ?? "").trim().replace(/:\d+$/, "");
+  if (!question.threadKey && /^(?:limit:group|open:group|deliver:group|infra:)/.test(rawDedupe)) {
+    // Which sessions are affected is material (a different session's
+    // blocker is a different decision); how many scans saw it is not.
+    const members = (Array.isArray(question.threadKeys) ? question.threadKeys : []).map(String).sort();
+    return shortHash(JSON.stringify(["group", rawDedupe, normOpts, members]));
+  }
+  const normTitle = normalizeDecisionText(rawTitle);
+  // Generic titles (e.g. "Needs your decision" from the decisions-gate path)
+  // place the actual request in `question.body`, so include normalized body
+  // text there while keeping specific titles resilient to context-refresh prose.
+  const genericTitle = !normTitle || /^(?:needs?\s+(?:your\s+)?decision|decision\s+needed|owner\s+decision|waiting\s+on\s+(?:you|owner)|question|action\s+needed|input\s+needed|needs\s+you)$/i.test(normTitle);
+  const normBody = genericTitle ? normalizeDecisionText(question.body ?? "") : "";
+  return shortHash(JSON.stringify([
+    kind,
+    prRef,
+    Boolean(question.mergeAsk),
+    normTitle,
+    ...(normBody ? [normBody] : []),
+    normOpts
+  ]));
+}
+
+function normalizeSurfacedDecisions(raw, nowMs = Date.now()) {
+  if (!isObject(raw)) return {};
+  const out = {};
+  const entries = Object.entries(raw)
+    .filter(([key, val]) => Boolean(key) && isObject(val) && typeof val.materialHash === "string")
+    .filter(([, val]) => {
+      const seenMs = toMs(val.lastSeenAt ?? val.surfacedAt, 0);
+      return seenMs === 0 || nowMs - seenMs < QUESTION_TTL_MS;
+    })
+    .slice(-SURFACED_DECISIONS_MAX);
+  for (const [key, val] of entries) {
+    out[key] = {
+      materialHash: String(val.materialHash),
+      surfacedAt: typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs),
+      lastSeenAt: typeof val.lastSeenAt === "string" ? val.lastSeenAt : (typeof val.surfacedAt === "string" ? val.surfacedAt : iso(nowMs)),
+      questionId: typeof val.questionId === "string" ? val.questionId : null
+    };
+  }
+  return out;
+}
+
+function seedSurfacedDecisionsFromExisting(questions, notices, nowMs = Date.now()) {
+  const out = {};
+  for (const q of Array.isArray(questions) ? questions : []) {
+    if (!isObject(q) || q.status !== "open" || q.kind === "completed") continue;
+    // Only evidence that this question itself reached the owner counts; an
+    // unrelated chat notice does not prove it appeared in a check-in.
+    const alreadySurfaced = Boolean(q.outreachId || q.pushedAt);
+    if (!alreadySurfaced) continue;
+    const dKey = actionableDecisionKey(q);
+    const mHash = actionableDecisionMaterialHash(q);
+    if (!dKey || !mHash) continue;
+    const stamp = typeof q.updatedAt === "string" ? q.updatedAt : (typeof q.createdAt === "string" ? q.createdAt : iso(nowMs));
+    out[dKey] = {
+      materialHash: mHash,
+      surfacedAt: stamp,
+      lastSeenAt: stamp,
+      questionId: typeof q.id === "string" ? q.id : null
+    };
+  }
+  return out;
+}
+
+const ORG_PROJECTS_MAX = 60;
+const ORG_THEMES_MAX = 24;
+const ORG_ASSIGNMENTS_MAX = 400;
+const ORG_ALIASES_MAX = 120;
+const ORG_REVIEWED_MAX = 500;
+
+function slugifyOrgName(raw) {
+  return String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^#/, "")
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function normalizeOrganization(raw) {
+  const out = { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} };
+  if (!isObject(raw)) return out;
+  const seenProjects = new Set();
+  if (Array.isArray(raw.projects)) {
+    for (const item of raw.projects) {
+      if (!isObject(item)) continue;
+      const name = clampText(String(item.name ?? "").trim(), 80);
+      const id = slugifyOrgName(item.id || name);
+      if (!name || !id || id === "general" || seenProjects.has(id)) continue;
+      seenProjects.add(id);
+      const themes = [];
+      const seenThemes = new Set();
+      if (Array.isArray(item.themes)) {
+        for (const t of item.themes) {
+          const tName = clampText(String(isObject(t) ? t.name : t ?? "").trim(), 80);
+          const tId = slugifyOrgName(isObject(t) ? (t.id || tName) : tName);
+          if (!tName || !tId || tId === "general" || seenThemes.has(tId)) continue;
+          seenThemes.add(tId);
+          themes.push({ id: tId, name: tName });
+          if (themes.length >= ORG_THEMES_MAX) break;
+        }
+      }
+      out.projects.push({
+        id,
+        name,
+        themes,
+        createdAt: typeof item.createdAt === "string" ? item.createdAt : null,
+        updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : null
+      });
+      if (out.projects.length >= ORG_PROJECTS_MAX) break;
+    }
+  }
+  if (isObject(raw.threadAssignments)) {
+    for (const [key, entry] of Object.entries(raw.threadAssignments).slice(0, ORG_ASSIGNMENTS_MAX)) {
+      if (!key || !isObject(entry)) continue;
+      const project = clampText(String(entry.project ?? "").trim(), 80) || null;
+      const theme = clampText(String(entry.theme ?? "").trim(), 80) || null;
+      if (!project && !theme) continue;
+      out.threadAssignments[key] = {
+        project,
+        theme,
+        updatedAt: typeof entry.updatedAt === "string" ? entry.updatedAt : null
+      };
+    }
+  }
+  if (isObject(raw.projectAliases)) {
+    for (const [aliasKey, canonical] of Object.entries(raw.projectAliases).slice(0, ORG_ALIASES_MAX)) {
+      const cleanAlias = slugifyOrgName(aliasKey);
+      const cleanTarget = clampText(String(canonical ?? "").trim().replace(/^#/, ""), 80);
+      if (!cleanAlias || !cleanTarget || cleanAlias === "general") continue;
+      out.projectAliases[cleanAlias] = cleanTarget;
+    }
+  }
+  if (isObject(raw.reviewedCompletions)) {
+    for (const [tKey, stamp] of Object.entries(raw.reviewedCompletions).slice(-ORG_REVIEWED_MAX)) {
+      if (!tKey || typeof stamp !== "string" || !Number.isFinite(Date.parse(stamp))) continue;
+      out.reviewedCompletions[tKey] = stamp;
+    }
+  }
+  return out;
 }
 
 function isObject(value) {
@@ -88,7 +312,7 @@ function isObject(value) {
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
-  for (const [key, value] of Object.entries(meta).slice(0, 8)) {
+  for (const [key, value] of Object.entries(meta).slice(0, 12)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
   }
@@ -218,8 +442,13 @@ export class FleetStore {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    const previous = this.state.mode;
     this.state.mode = mode;
     this._save();
+    if (this.lastWriteError) {
+      this.state.mode = previous;
+      throw new Error("Supervisor mode could not be saved. Check available disk space and retry.");
+    }
     return mode;
   }
 
@@ -297,12 +526,38 @@ export class FleetStore {
   // An agent's own ask (agent-ask) also carries mergeAsk (it asks to merge,
   // so it holds until answered or merged) and askedBy ("judge" when the
   // judge raised it, which reads the chat only before a nudge).
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null } = {}) {
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null, baseKey = null, askedHead = null, mergeAsk = false, askedBy = null, card = null, contextSnapshot = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
     // while the ask stays open.
     const origin = { askContext: clampTail(redactSecrets(askContext), ASK_CONTEXT_MAX) || null, agentAskedAt: agentAskedAt ?? null };
+    const cleanContext = isObject(contextSnapshot) ? structuredClone(contextSnapshot) : null;
+    const mergeContext = (prev, next, expectedPrRef = null) => {
+      if (!next && !isObject(prev)) return undefined;
+      const keepPrevPr = isObject(prev?.pr)
+        && (!expectedPrRef || !prev.pr.ref || prev.pr.ref === expectedPrRef)
+        && (!next?.pr?.ref || !prev.pr.ref || prev.pr.ref === next.pr.ref);
+      if (!isObject(next)) {
+        if (!isObject(prev)) return undefined;
+        return keepPrevPr ? prev : { ...prev, pr: null };
+      }
+      if (!isObject(prev)) return next;
+      const nextClean = Object.fromEntries(
+        Object.entries(next).filter(([k, v]) => k !== "pr" && v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0))
+      );
+      const nextPrClean = isObject(next.pr)
+        ? Object.fromEntries(Object.entries(next.pr).filter(([, v]) => v !== null && v !== undefined && (!Array.isArray(v) || v.length > 0)))
+        : null;
+      const mergedPr = nextPrClean
+        ? { ...(keepPrevPr ? prev.pr : {}), ...nextPrClean }
+        : (keepPrevPr ? prev.pr : null);
+      return {
+        ...prev,
+        ...nextClean,
+        pr: mergedPr
+      };
+    };
     const fields = {
       ...(card ? { card: clampText(redactSecrets(card), this.limits.cardBodyMax) } : {}),
       threadKey: threadKey ?? null,
@@ -328,7 +583,8 @@ export class FleetStore {
       // scanAskedAt: only a scan asking it sets this (a reopen does not).
       // Asking again does not push its expiry back (liveSinceMs).
       Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now) });
-      if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
+      if (!existing.askContext && (origin.askContext || origin.agentAskedAt)) Object.assign(existing, origin);
+      if (cleanContext) existing.contextSnapshot = mergeContext(existing.contextSnapshot, cleanContext, fields.prRef);
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
@@ -358,13 +614,14 @@ export class FleetStore {
     // The agent asks again in a newer message while its last ask is still
     // open: one question per agent, so the open one takes the new ask in
     // place (same id, same outreach copy, no second push).
-    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now);
+    const superseded = this._supersedeAgentAsk(key, fields, origin, head, now, cleanContext, mergeContext);
     if (superseded) return superseded;
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
       keepReviewWording(resolved, fields);
-      Object.assign(resolved, fields, origin.askContext ? origin : {}, {
+      const mergedSnap = mergeContext(resolved.contextSnapshot, cleanContext, fields.prRef);
+      Object.assign(resolved, fields, (origin.askContext || origin.agentAskedAt) ? origin : {}, mergedSnap ? { contextSnapshot: mergedSnap } : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
         reopenHistory: [...(resolved.reopenHistory ?? []), iso(now)].filter((at) => now - Date.parse(at) <= 7 * DAY_MS),
         lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(liveSinceMs(resolved) + QUESTION_TTL_MS)
@@ -376,7 +633,8 @@ export class FleetStore {
       id: makeId("fq"),
       dedupeKey: key,
       ...fields,
-      ...(origin.askContext ? origin : {}),
+      ...((origin.askContext || origin.agentAskedAt) ? origin : {}),
+      ...(cleanContext ? { contextSnapshot: cleanContext } : {}),
       ...(head ? { askedHead: head } : {}),
       status: "open",
       answer: null,
@@ -398,6 +656,9 @@ export class FleetStore {
   answerQuestion(id, answer) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
+    // A new answer replaces whatever happened to the last one.
+    const question = this._findQuestion(id);
+    if (question?.deliveryNote) { delete question.deliveryNote; delete question.deliveryNoteAt; }
     return this._closeQuestion(id, "answered", text);
   }
 
@@ -414,10 +675,14 @@ export class FleetStore {
 
   // The owner answered, but the answer could not be typed yet: the question
   // is answered (off the owner's list) and its message waits to be sent.
-  queueAnswer(id, answer, message) {
+  // typedOnly: a risky ask's, sent only typed into the app. messageMax: an
+  // owner's reply keeps all its words. The kept message keeps its line
+  // breaks, as an immediate send would.
+  queueAnswer(id, answer, message, { typedOnly = false, messageMax = this.limits.bodyMax } = {}) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
-    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampTextLines(message, Math.max(this.limits.bodyMax, messageMax)), since: iso(this.now()),
+      ...(typedOnly ? { typedOnly: true } : {}) } });
   }
 
   queuedAnswers() {
@@ -450,6 +715,40 @@ export class FleetStore {
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer
   // from the owner is not undone.
+  // A queued reply to an owner's card that left the queue without reaching
+  // the agent (expired). Kept until the supervisor puts the card back.
+  _noteUndeliveredReply(item, reason) {
+    if (!item?.questionId) return;
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (list.some((entry) => entry.id === item.id)) return;
+    list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, questionLinks: questionLinksOf(item), threadKey: item.threadKey, reason, at: iso(this.now()) });
+    // Never evict one still waiting: each is a card that would stay closed.
+    // Bounded anyway: the queue holds 100 and every entry expires in a day.
+    this.state.undeliveredOwnerReplies = list.slice(-UNDELIVERED_REPLIES_MAX);
+  }
+
+  takeUndeliveredOwnerReplies() {
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (!list.length) return [];
+    this.state.undeliveredOwnerReplies = [];
+    this._save();
+    return list.map((entry) => ({ ...entry }));
+  }
+
+  // Puts an owner's card back after its reply never reached the agent, once,
+  // and only while that reply is still the card's answer (a newer, different
+  // answer from the owner stands). note: what happened, shown on the card.
+  reopenUndeliveredReply(questionId, { answer = null, threadKey = null, note = null } = {}) {
+    const question = this._findQuestion(questionId);
+    if (!question || question.status !== "answered") return null;
+    if (answer !== null && question.answer !== answer) return null;
+    const reopened = this.reopenQuestion(questionId, threadKey ? [threadKey] : [], { answer: question.answer, asked: true });
+    if (!reopened) return null;
+    const live = this._findQuestion(questionId);
+    if (live && note) { live.deliveryNote = clampText(note, 240); live.deliveryNoteAt = iso(this.now()); this._save(); }
+    return live ? { ...live } : reopened;
+  }
+
   reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
@@ -472,7 +771,7 @@ export class FleetStore {
   // The review kept an open question. A rewrite changes the same record
   // (same dedupeKey), so its outreach copy updates in place; askedAs keeps
   // the policy's wording so the next tick's ask does not undo it.
-  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null } = {}) {
+  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null, brief = null, recommendation = null, suggestedReplies = null } = {}) {
     const question = this._findQuestion(id);
     if (!question || question.status !== "open") return null;
     const now = iso(this.now());
@@ -488,9 +787,21 @@ export class FleetStore {
     }
     // Kept again with nothing changed: the supervisor checks it less often.
     const streak = fingerprint && fingerprint === question.reviewFingerprint ? (question.reviewStreak ?? 0) + 1 : 0;
+    const nextBrief = (brief && typeof brief === "object") || recommendation || (Array.isArray(suggestedReplies) && suggestedReplies.length)
+      ? {
+          context: brief?.context ? clampText(redactSecrets(brief.context), 240) : (question.reviewBrief?.context ?? null),
+          whatChanged: brief?.whatChanged ? clampText(redactSecrets(brief.whatChanged), 500) : (question.reviewBrief?.whatChanged ?? null),
+          decision: brief?.decision ? clampText(redactSecrets(brief.decision), 260) : (question.reviewBrief?.decision ?? null),
+          recommendation: recommendation ? clampText(redactSecrets(recommendation), 200) : (question.reviewBrief?.recommendation ?? null),
+          suggestedReplies: Array.isArray(suggestedReplies) && suggestedReplies.length
+            ? suggestedReplies.slice(0, 4).map((item) => clampText(redactSecrets(item), 120)).filter(Boolean)
+            : (question.reviewBrief?.suggestedReplies ?? [])
+        }
+      : (question.reviewBrief ?? null);
     Object.assign(question, {
       reviewedAt: now, reviewFingerprint: fingerprint, reviewReason: clampText(reason, 160) || null, reviewCategory: category ?? null,
-      reviewStreak: streak
+      reviewStreak: streak,
+      ...(nextBrief ? { reviewBrief: nextBrief } : {})
     });
     this._save();
     return { ...question };
@@ -553,6 +864,22 @@ export class FleetStore {
     if (!question) return null;
     if (outreachId) question.outreachId = outreachId;
     if (pushedAt) question.pushedAt = iso(toMs(pushedAt, this.now()));
+    this._save();
+    return { ...question };
+  }
+
+  // The owning agent was asked to supply the decision context this ask lacks.
+  // One request per distinct set of gaps; `sent` says whether it reached the agent.
+  markContextRequested(id, { at = this.now(), missing = [], sent = false, reason = null, attempts = 1 } = {}) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.contextRequest = {
+      at: iso(toMs(at, this.now())),
+      missing: Array.isArray(missing) ? missing.slice(0, 8).map(String) : [],
+      sent: Boolean(sent),
+      attempts: Math.max(1, Math.min(10, Number(attempts) || 1)),
+      ...(reason ? { reason: clampText(String(reason), 120) } : {})
+    };
     this._save();
     return { ...question };
   }
@@ -663,6 +990,16 @@ export class FleetStore {
   saveDiagnosis(patch) {
     Object.assign(this.state.diagnosis, patch);
     this._save();
+  }
+
+  preferences() {
+    return normalizePreferences(this.state.preferences);
+  }
+
+  savePreferences(next) {
+    this.state.preferences = normalizePreferences(next);
+    this._save();
+    return this.preferences();
   }
 
   // ─── infra escalations and outages ──────────────────────────────────────
@@ -1013,7 +1350,7 @@ export class FleetStore {
   // PR) keeps its push and its expiry; a different one is put to the owner
   // anew, with its own day and push (milan: a new decision 23 h into an old
   // ask would expire an hour later, never pushed, then stay quiet a day).
-  _supersedeAgentAsk(key, fields, origin, head, now) {
+  _supersedeAgentAsk(key, fields, origin, head, now, contextSnapshot = null, mergeContext = null) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return null;
     const askedAt = toMs(origin.agentAskedAt, null);
     if (askedAt === null) return null;
@@ -1029,8 +1366,12 @@ export class FleetStore {
     const body = norm(fields.body);
     const restated = samePr && ((older.mergeAsk && fields.mergeAsk)
       || (body ? norm(older.body) === body : !norm(older.body) && norm(older.title) === norm(fields.title)));
+    const mergedSnap = typeof mergeContext === "function"
+      ? mergeContext(older.contextSnapshot, contextSnapshot, fields.prRef)
+      : (contextSnapshot ?? older.contextSnapshot);
     Object.assign(older, fields, origin, {
-      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0,
+      ...(mergedSnap ? { contextSnapshot: mergedSnap } : {}),
+      dedupeKey: key, askedAs: null, pinned: false, reviewedAt: null, reviewFingerprint: null, reviewReason: null, reviewCategory: null, reviewStreak: 0, reviewBrief: null,
       supersededAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), scanAskedAt: iso(now), ...(head ? { askedHead: head } : {}),
       ...(restated ? {} : { liveSince: iso(now), expiresAt: iso(now + QUESTION_TTL_MS), pushedAt: null })
     });
@@ -1115,6 +1456,22 @@ export class FleetStore {
     return latest;
   }
 
+  hasPriorUnansweredPush(question, now = this.now()) {
+    const nowMs = toMs(now, this.now());
+    const dKey = actionableDecisionKey(question);
+    const mHash = actionableDecisionMaterialHash(question);
+    if (!dKey || !mHash) return false;
+    for (const q of this.state.questions) {
+      if (!q || q.id === question.id) continue;
+      if (OWNER_CLOSED.has(q.status) || isReviewClosed(q)) continue;
+      if (!q.pushedAt) continue;
+      const pushedMs = toMs(q.pushedAt, 0);
+      if (!pushedMs || nowMs - pushedMs >= QUESTION_TTL_MS) continue;
+      if (actionableDecisionKey(q) === dKey && actionableDecisionMaterialHash(q) === mHash) return true;
+    }
+    return false;
+  }
+
   _closeQuestion(id, status, answer, extra = {}) {
     const now = this.now();
     this._expireQuestions(now);
@@ -1125,6 +1482,13 @@ export class FleetStore {
     question.answeredAt = iso(now);
     question.updatedAt = iso(now);
     Object.assign(question, extra);
+    // If the owner explicitly answered or dismissed the decision, clear its surfaced
+    // ledger slot so a genuinely new future ask after the owner hold ends can surface;
+    // automatic supervisor resolves retain the slot across transient close/reissue churn.
+    if (OWNER_CLOSED.has(status) && isObject(this.state.surfacedDecisions)) {
+      const dKey = actionableDecisionKey(question);
+      if (dKey) delete this.state.surfacedDecisions[dKey];
+    }
     this._save();
     return { ...question };
   }
@@ -1149,7 +1513,14 @@ export class FleetStore {
   _pruneQuestions() {
     // Least recently asked first, so a close still holding back an ask stays.
     // An answer still waiting to be typed is the only copy: never pruned.
-    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery).sort((a, b) => lastAskMs(a) - lastAskMs(b));
+    // A card whose reply is still queued, or waiting to be put back after it
+    // never reached the agent, is kept too: without it there is nothing to
+    // reopen and the owner never learns the reply went nowhere.
+    const awaited = new Set([
+      ...(Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : []),
+      ...(Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [])
+    ].flatMap((item) => questionLinksOf(item).map((link) => link.questionId)));
+    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery && !awaited.has(q.id)).sort((a, b) => lastAskMs(a) - lastAskMs(b));
     if (closed.length <= CLOSED_QUESTIONS_KEPT) return;
     const drop = new Set(closed.slice(0, closed.length - CLOSED_QUESTIONS_KEPT));
     this.state.questions = this.state.questions.filter((q) => !drop.has(q));
@@ -1188,8 +1559,530 @@ export class FleetStore {
       fixes: Array.isArray(raw.fixes) ? raw.fixes.filter(isObject) : [],
       suggestions: Array.isArray(raw.suggestions) ? raw.suggestions.filter(isObject) : [],
       diagnosis: isObject(raw.diagnosis) ? raw.diagnosis : {},
-      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : []
+      selfSessions: Array.isArray(raw.selfSessions) ? raw.selfSessions.filter((s) => isObject(s) && typeof s.id === "string") : [],
+      preferences: normalizePreferences(raw.preferences),
+      organization: normalizeOrganization(raw.organization),
+      followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
+      queuedOwnerMessages: Array.isArray(raw.queuedOwnerMessages)
+        ? raw.queuedOwnerMessages.filter((q) => isObject(q) && typeof q.id === "string" && typeof q.threadKey === "string" && typeof q.message === "string").slice(-100)
+        : [],
+      // Cards whose queued reply expired undelivered, waiting to be put back:
+      // the queued message is already gone, so a restart must keep these.
+      undeliveredOwnerReplies: Array.isArray(raw.undeliveredOwnerReplies)
+        ? raw.undeliveredOwnerReplies.filter((u) => isObject(u) && typeof u.id === "string" && typeof u.questionId === "string").slice(-UNDELIVERED_REPLIES_MAX)
+        : [],
+      supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
+      lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,
+      lastOwnerAckAt: typeof raw.lastOwnerAckAt === "string" && Number.isFinite(Date.parse(raw.lastOwnerAckAt)) ? raw.lastOwnerAckAt : null,
+      surfacedDecisions: isObject(raw.surfacedDecisions)
+        ? normalizeSurfacedDecisions(raw.surfacedDecisions, this.now())
+        : seedSurfacedDecisionsFromExisting(raw.questions, raw.supervisorChatNotices, this.now()),
+      providerFailovers: isObject(raw.providerFailovers) ? raw.providerFailovers : {},
+      contextRequestLog: isObject(raw.contextRequestLog) ? raw.contextRequestLog : {}
     };
+  }
+
+  organization() {
+    const org = normalizeOrganization(this.state.organization);
+    return {
+      projects: org.projects.map((p) => ({ ...p, themes: p.themes.map((t) => ({ ...t })) })),
+      threadAssignments: Object.fromEntries(
+        Object.entries(org.threadAssignments).map(([k, v]) => [k, { ...v }])
+      ),
+      projectAliases: { ...org.projectAliases },
+      reviewedCompletions: { ...org.reviewedCompletions }
+    };
+  }
+
+  projectAliases() {
+    return { ...(this.state.organization?.projectAliases ?? {}) };
+  }
+
+  projectAlias(rawName) {
+    const slug = slugifyOrgName(rawName);
+    if (!slug) return null;
+    return this.state.organization?.projectAliases?.[slug] ?? null;
+  }
+
+  setProjectAlias(aliasName, canonicalName) {
+    const aliasSlug = slugifyOrgName(aliasName);
+    if (!aliasSlug || aliasSlug === "general") throw new Error("Pass a valid project alias.");
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const cleanTarget = clampText(String(canonicalName ?? "").trim().replace(/^#/, ""), 80);
+    if (!cleanTarget || slugifyOrgName(cleanTarget) === aliasSlug) {
+      delete this.state.organization.projectAliases[aliasSlug];
+      this._save();
+      return null;
+    }
+    this.state.organization.projectAliases[aliasSlug] = cleanTarget;
+    const keys = Object.keys(this.state.organization.projectAliases);
+    if (keys.length > ORG_ALIASES_MAX) {
+      delete this.state.organization.projectAliases[keys[0]];
+    }
+    try {
+      this.upsertProject({ name: cleanTarget });
+    } catch {
+      this._save();
+    }
+    return { alias: aliasSlug, target: cleanTarget };
+  }
+
+  reviewedCompletionAt(threadKey) {
+    if (!threadKey) return 0;
+    const stamp = this.state.organization?.reviewedCompletions?.[threadKey];
+    return stamp ? toMs(stamp, 0) : 0;
+  }
+
+  markCompletionReviewed(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const stamp = iso(toMs(at, this.now()));
+    this.state.organization.reviewedCompletions[key] = stamp;
+    const keys = Object.keys(this.state.organization.reviewedCompletions);
+    if (keys.length > ORG_REVIEWED_MAX) {
+      delete this.state.organization.reviewedCompletions[keys[0]];
+    }
+    this._save();
+    return stamp;
+  }
+
+  threadAssignment(threadKey) {
+    if (!threadKey) return null;
+    const entry = this.state.organization?.threadAssignments?.[threadKey];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  upsertProject({ name, theme = null } = {}) {
+    const cleanName = clampText(String(name ?? "").trim().replace(/^#/, ""), 80);
+    const id = slugifyOrgName(cleanName);
+    if (!cleanName || !id || id === "general") {
+      throw new Error("Project name must be 1-80 characters and cannot be 'general'.");
+    }
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const nowIso = iso(this.now());
+    let project = this.state.organization.projects.find((p) => p.id === id);
+    if (!project) {
+      if (this.state.organization.projects.length >= ORG_PROJECTS_MAX) {
+        throw new Error(`Maximum of ${ORG_PROJECTS_MAX} custom projects reached.`);
+      }
+      project = { id, name: cleanName, themes: [], createdAt: nowIso, updatedAt: nowIso };
+      this.state.organization.projects.push(project);
+    } else {
+      project.name = cleanName;
+      project.updatedAt = nowIso;
+    }
+    const cleanTheme = clampText(String(theme ?? "").trim().replace(/^[/#]+/, ""), 80);
+    if (cleanTheme) {
+      const themeId = slugifyOrgName(cleanTheme);
+      if (themeId && themeId !== "general" && themeId !== id) {
+        const existingTheme = project.themes.find((t) => t.id === themeId);
+        if (existingTheme) {
+          existingTheme.name = cleanTheme;
+        } else if (project.themes.length < ORG_THEMES_MAX) {
+          project.themes.push({ id: themeId, name: cleanTheme });
+        }
+      }
+    }
+    this._save();
+    return { ...project, themes: project.themes.map((t) => ({ ...t })) };
+  }
+
+  deleteProject(projectIdOrName) {
+    const id = slugifyOrgName(projectIdOrName);
+    if (!id) return false;
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const before = this.state.organization.projects.length;
+    this.state.organization.projects = this.state.organization.projects.filter((p) => p.id !== id);
+    if (this.state.organization.projects.length === before) return false;
+    this._save();
+    return true;
+  }
+
+  assignThread(threadKey, { project = null, theme = null } = {}) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) throw new Error("Pass a valid thread key.");
+    this.state.organization = normalizeOrganization(this.state.organization);
+    const cleanProject = clampText(String(project ?? "").trim().replace(/^#/, ""), 80) || null;
+    const cleanTheme = clampText(String(theme ?? "").trim().replace(/^[/#]+/, ""), 80) || null;
+    if (!cleanProject && !cleanTheme) {
+      delete this.state.organization.threadAssignments[key];
+      this._save();
+      return null;
+    }
+    const nowIso = iso(this.now());
+    const assignment = { project: cleanProject, theme: cleanTheme, updatedAt: nowIso };
+    this.state.organization.threadAssignments[key] = assignment;
+    const keys = Object.keys(this.state.organization.threadAssignments);
+    if (keys.length > ORG_ASSIGNMENTS_MAX) {
+      delete this.state.organization.threadAssignments[keys[0]];
+    }
+    if (cleanProject && slugifyOrgName(cleanProject) !== "general") {
+      try {
+        this.upsertProject({ name: cleanProject, theme: cleanTheme });
+      } catch {
+        this._save();
+      }
+    } else {
+      this._save();
+    }
+    return { ...assignment };
+  }
+
+  openFollowThroughWatches() {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    return list.filter((w) => w?.status === "watching").map((w) => ({ ...w }));
+  }
+
+  upsertFollowThroughWatch(input = {}) {
+    const threadKey = String(input.threadKey ?? "").trim();
+    if (!threadKey) return null;
+    const nowIso = iso(this.now());
+    this.state.followThroughWatches = (this.state.followThroughWatches ?? []).map((w) => (
+      w?.threadKey === threadKey && w.status === "watching"
+        ? { ...w, status: "superseded", resolvedAt: nowIso }
+        : w
+    ));
+    const watch = {
+      id: makeId("ftw"),
+      status: "watching",
+      threadKey,
+      title: clampText(redactSecrets(String(input.title ?? threadKey)), 120),
+      goalId: input.goalId ? clampText(String(input.goalId), 80) : null,
+      directiveSummary: clampText(redactSecrets(String(input.directiveSummary ?? "")), 240),
+      source: clampText(String(input.source ?? "owner-message"), 40),
+      sentAt: typeof input.sentAt === "string" && Number.isFinite(Date.parse(input.sentAt)) ? input.sentAt : nowIso,
+      baselineAgentAt: typeof input.baselineAgentAt === "string" ? input.baselineAgentAt : null,
+      baselineActivityAt: typeof input.baselineActivityAt === "string" ? input.baselineActivityAt : null,
+      createdAt: nowIso
+    };
+    this.state.followThroughWatches = [...this.state.followThroughWatches, watch].slice(-60);
+    this._save();
+    return { ...watch };
+  }
+
+  resolveFollowThroughWatch(id, { outcome = "settled", detail = null } = {}) {
+    const list = Array.isArray(this.state.followThroughWatches) ? this.state.followThroughWatches : [];
+    const match = list.find((w) => w?.id === id);
+    if (!match) return null;
+    match.status = "resolved";
+    match.outcome = clampText(String(outcome), 40);
+    match.detail = detail ? clampText(redactSecrets(String(detail)), 300) : null;
+    match.resolvedAt = iso(this.now());
+    this._save();
+    return { ...match };
+  }
+
+  lastSupervisorChatNotice(dedupeKey) {
+    if (!dedupeKey) return null;
+    const entry = this.state.supervisorChatNotices?.[dedupeKey];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  lastProactiveChatAt() {
+    const stamp = this.state.lastProactiveChatAt;
+    return typeof stamp === "string" && Number.isFinite(Date.parse(stamp)) ? stamp : null;
+  }
+
+  recordProactiveChatAt(at = this.now()) {
+    const stamp = iso(toMs(at, this.now()));
+    this.state.lastProactiveChatAt = stamp;
+    this._save();
+    return stamp;
+  }
+
+  lastOwnerAckAt() {
+    const stamp = this.state.lastOwnerAckAt;
+    return typeof stamp === "string" && Number.isFinite(Date.parse(stamp)) ? stamp : null;
+  }
+
+  recordOwnerAck(at = this.now()) {
+    const nextMs = toMs(at, this.now());
+    const prevMs = Date.parse(this.state.lastOwnerAckAt ?? "");
+    const stamp = iso(Number.isFinite(prevMs) && prevMs > nextMs ? prevMs : nextMs);
+    this.state.lastOwnerAckAt = stamp;
+    this._save();
+    return stamp;
+  }
+
+  resolvedDecisionKeys() {
+    const openKeys = new Set();
+    const resolvedKeys = new Set();
+    for (const q of this.state.questions ?? []) {
+      const key = actionableDecisionKey(q);
+      if (!key) continue;
+      if (q.status === "open") openKeys.add(key);
+      else resolvedKeys.add(key);
+    }
+    for (const key of openKeys) resolvedKeys.delete(key);
+    return resolvedKeys;
+  }
+
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null } = {}) {
+    const cleanKey = String(threadKey ?? "").trim();
+    const cleanMsg = String(message ?? "").trim();
+    // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
+    // chars with acceptance criteria appended at the end) rather than silently
+    // truncating trailing requirements. Reject genuinely oversized payloads.
+    if (!cleanKey || !cleanMsg || cleanMsg.length > 24_000) return null;
+    const cleanIdempotencyKey = typeof idempotencyKey === "string" && idempotencyKey.trim()
+      ? idempotencyKey.trim().slice(0, 160)
+      : null;
+    const nowMs = this.now();
+    const nowIso = iso(nowMs);
+    this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])
+      .filter((item) => {
+        const createdMs = toMs(item?.createdAt, 0);
+        const live = createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+        if (!live) this._noteUndeliveredReply(item, "expired");
+        return live;
+      });
+    const normalizedImages = Array.isArray(images) && images.length > 0 ? images.slice(0, 4) : null;
+    const imageSig = (imgs) => (Array.isArray(imgs) && imgs.length > 0 ? JSON.stringify(imgs) : "");
+    const nextImgSig = imageSig(normalizedImages);
+    const existing = this.state.queuedOwnerMessages.find(
+      (item) => (cleanIdempotencyKey && (item.idempotencyKey === cleanIdempotencyKey || (Array.isArray(item.idempotencyKeys) && item.idempotencyKeys.includes(cleanIdempotencyKey))))
+        || (item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig)
+    );
+    if (existing) {
+      // The same words to the same chat from another card: one message, but
+      // every card it answers stays linked, so each comes back if it fails.
+      if (questionId) {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const links = questionLinksOf(existing);
+        if (!links.some((l) => l.questionId === link.questionId)) {
+          existing.questionLinks = [...links, link].slice(-20);
+          existing.questionId ??= link.questionId;
+          existing.questionAnswer ??= link.questionAnswer;
+          this._save();
+        }
+      }
+      if (cleanIdempotencyKey) {
+        const keys = [...new Set([existing.idempotencyKey, ...(Array.isArray(existing.idempotencyKeys) ? existing.idempotencyKeys : []), cleanIdempotencyKey].filter(Boolean))];
+        if (!existing.idempotencyKey || !Array.isArray(existing.idempotencyKeys) || existing.idempotencyKeys.length !== keys.length) {
+          existing.idempotencyKey ??= cleanIdempotencyKey;
+          existing.idempotencyKeys = keys;
+          this._save();
+        }
+      }
+      return { ...existing, deduped: true };
+    }
+    const entry = {
+      id: makeId("qmsg"),
+      threadKey: cleanKey,
+      message: cleanMsg,
+      ...(normalizedImages ? { images: normalizedImages } : {}),
+      ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
+      // The owner's card this message answers: if it never reaches the agent,
+      // the card is put back instead of staying closed as answered.
+      ...(questionId ? (() => {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        return { questionId: link.questionId, questionAnswer: link.questionAnswer, questionLinks: [link] };
+      })() : {}),
+      ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
+      ...(cleanIdempotencyKey ? { idempotencyKey: cleanIdempotencyKey, idempotencyKeys: [cleanIdempotencyKey] } : {}),
+      source: clampText(String(source || "owner-message"), 40),
+      createdAt: nowIso,
+      attempts: 0,
+      lastAttemptAt: null,
+      lastDetail: null
+    };
+    const prevQueue = this.state.queuedOwnerMessages;
+    // Reject overflow cleanly instead of silently evicting an already-accepted
+    // undelivered directive for another session.
+    if (prevQueue.length >= 100) return null;
+    this.state.queuedOwnerMessages = [...prevQueue, entry];
+    this._save();
+    if (this.lastWriteError) {
+      this.state.queuedOwnerMessages = prevQueue;
+      return null;
+    }
+    return { ...entry, deduped: false };
+  }
+
+  queuedOwnerMessages(threadKey = null) {
+    const nowMs = this.now();
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const active = list.filter((item) => {
+      if (!item?.id || !item?.threadKey || !item?.message) return false;
+      const createdMs = toMs(item.createdAt, 0);
+      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) {
+        this._noteUndeliveredReply(item, "expired");
+        return false;
+      }
+      return true;
+    });
+    if (active.length !== list.length) {
+      this.state.queuedOwnerMessages = active;
+      this._save();
+    }
+    const filterKey = threadKey ? String(threadKey).trim() : null;
+    return (filterKey ? active.filter((item) => item.threadKey === filterKey) : active).map((item) => ({ ...item }));
+  }
+
+  removeQueuedOwnerMessage(id) {
+    const cleanId = String(id ?? "").trim();
+    if (!cleanId) return false;
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const next = list.filter((item) => item?.id !== cleanId);
+    if (next.length === list.length) return false;
+    this.state.queuedOwnerMessages = next;
+    this._save();
+    return true;
+  }
+
+  noteQueuedOwnerMessageAttempt(id, detail = null, { maxAttempts = 20 } = {}) {
+    const cleanId = String(id ?? "").trim();
+    if (!cleanId) return null;
+    const list = Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [];
+    const idx = list.findIndex((item) => item?.id === cleanId);
+    if (idx < 0) return null;
+    const item = list[idx];
+    item.attempts = (Number(item.attempts) || 0) + 1;
+    item.lastAttemptAt = iso(this.now());
+    item.lastDetail = detail ? clampText(redactSecrets(String(detail)), 200) : item.lastDetail;
+    let dropped = false;
+    if (item.attempts >= maxAttempts) {
+      list.splice(idx, 1);
+      dropped = true;
+    }
+    this.state.queuedOwnerMessages = list;
+    this._save();
+    return { ...item, dropped };
+  }
+
+  recordSupervisorChatNotice(dedupeKey, summary = "") {
+    const key = String(dedupeKey ?? "").trim().slice(0, 120);
+    if (!key) return null;
+    this.state.supervisorChatNotices ??= {};
+    const entry = {
+      at: iso(this.now()),
+      summary: clampText(redactSecrets(String(summary ?? "")), 220)
+    };
+    this.state.supervisorChatNotices[key] = entry;
+    const keys = Object.keys(this.state.supervisorChatNotices);
+    if (keys.length > 100) {
+      delete this.state.supervisorChatNotices[keys[0]];
+    }
+    this._save();
+    return { ...entry };
+  }
+
+  surfacedDecisions() {
+    const nowMs = this.now();
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    return structuredClone(this.state.surfacedDecisions);
+  }
+
+  // Computes only genuinely new or materially changed actionable decisions relative to
+  // the persistent surfacedDecisions ledger, refreshing lastSeenAt on unchanged open
+  // items while keeping all open items untouched in Needs You.
+  diffSurfacedDecisions(openQuestions = [], { now = this.now() } = {}) {
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    const ledger = this.state.surfacedDecisions;
+
+    const deltas = [];
+    const seenKeys = new Set();
+    let unchangedCount = 0;
+    let touchedSeen = false;
+
+    for (const q of Array.isArray(openQuestions) ? openQuestions : []) {
+      if (!q || q.status !== "open" || q.kind === "completed") continue;
+      const decisionKey = actionableDecisionKey(q);
+      const materialHash = actionableDecisionMaterialHash(q);
+      if (!decisionKey || !materialHash || seenKeys.has(decisionKey)) continue;
+      seenKeys.add(decisionKey);
+
+      const existing = ledger[decisionKey] ?? null;
+      if (existing && existing.materialHash === materialHash) {
+        unchangedCount += 1;
+        if (existing.lastSeenAt !== nowIso || existing.questionId !== q.id) {
+          existing.lastSeenAt = nowIso;
+          existing.questionId = q.id;
+          touchedSeen = true;
+        }
+        continue;
+      }
+      deltas.push({
+        question: q,
+        decisionKey,
+        materialHash,
+        change: existing ? "updated" : "new",
+        previousHash: existing?.materialHash ?? null
+      });
+    }
+
+    if (touchedSeen) this._save();
+    return { deltas, unchangedCount };
+  }
+
+  commitSurfacedDecisions(deltas = [], { now = this.now() } = {}) {
+    if (!Array.isArray(deltas) || deltas.length === 0) return 0;
+    const nowMs = toMs(now, this.now());
+    const nowIso = iso(nowMs);
+    this.state.surfacedDecisions = normalizeSurfacedDecisions(this.state.surfacedDecisions, nowMs);
+    let committed = 0;
+    for (const entry of deltas) {
+      const decisionKey = entry?.decisionKey ?? actionableDecisionKey(entry?.question ?? entry);
+      const materialHash = entry?.materialHash ?? actionableDecisionMaterialHash(entry?.question ?? entry);
+      const questionId = entry?.question?.id ?? entry?.questionId ?? null;
+      if (!decisionKey || !materialHash) continue;
+      this.state.surfacedDecisions[decisionKey] = {
+        materialHash,
+        surfacedAt: nowIso,
+        lastSeenAt: nowIso,
+        questionId
+      };
+      committed += 1;
+    }
+    const keys = Object.keys(this.state.surfacedDecisions);
+    if (keys.length > SURFACED_DECISIONS_MAX) {
+      for (const k of keys.slice(0, keys.length - SURFACED_DECISIONS_MAX)) {
+        delete this.state.surfacedDecisions[k];
+      }
+    }
+    if (committed > 0) this._save();
+    return committed;
+  }
+
+  // Which replacement session took over a failed one, for which failure. A
+  // later scan seeing the same failure on the old session must not fail it
+  // over again; a different failure (or a resumed session) may.
+  recordProviderFailover(oldKey, { newKey, failureSig } = {}) {
+    const key = String(oldKey ?? "").trim();
+    if (!key || !newKey) return null;
+    this.state.providerFailovers ??= {};
+    const entry = { newKey: String(newKey), failureSig: String(failureSig ?? ""), at: iso(this.now()) };
+    this.state.providerFailovers[key] = entry;
+    const keys = Object.keys(this.state.providerFailovers);
+    if (keys.length > 300) delete this.state.providerFailovers[keys[0]];
+    this._save();
+    return { ...entry };
+  }
+
+  // When a session was last asked for decision context. An agent that
+  // restates its ask creates a new question id; this cap is per session.
+  recordThreadContextRequest(threadKey, at = this.now()) {
+    const key = String(threadKey ?? "").trim();
+    if (!key) return null;
+    this.state.contextRequestLog ??= {};
+    this.state.contextRequestLog[key] = { at: iso(toMs(at, this.now())) };
+    const keys = Object.keys(this.state.contextRequestLog);
+    if (keys.length > 500) delete this.state.contextRequestLog[keys[0]];
+    this._save();
+    return { ...this.state.contextRequestLog[key] };
+  }
+
+  lastThreadContextRequest(threadKey) {
+    const entry = this.state.contextRequestLog?.[String(threadKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
+  }
+
+  providerFailoverFor(oldKey) {
+    const entry = this.state.providerFailovers?.[String(oldKey ?? "")];
+    return entry && isObject(entry) ? { ...entry } : null;
   }
 
   _save() {

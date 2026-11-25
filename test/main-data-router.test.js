@@ -231,6 +231,12 @@ test("only shared workspace routes forward, with their allowed methods", () => {
   }
   assert.equal(isMainDataRoute("DELETE", "/message"), false);
   assert.equal(isMainDataRoute("POST", "/brief/focus/dismiss"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/request"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/ack"), true);
+  assert.equal(isMainDataRoute("POST", "/nodes/reconnect/requests/123e4567-e89b-12d3-a456-426614174000/approve"), true);
+  assert.equal(isMainDataRoute("GET", "/nodes/reconnect/requests/not-a-request"), false);
 });
 
 
@@ -246,4 +252,209 @@ test("forwarded fleet and transcript operations outlive the workspace read timeo
     assert.equal(response.status, 200, route);
   }
   assert.equal((await fetch(proxy.url + "/tasks", { headers: auth(PHONE) })).status, 502, "ordinary reads remain bounded");
+});
+
+test("desktop Inbox reads main with owner authority and never substitutes local review items", async t => {
+  const { main, worker } = await pair(t);
+  main.runtime.tasks.add({ queue: "user", title: "Main inbox task", bucket: "today" });
+  worker.runtime.tasks.add({ queue: "user", title: "Decoy worker task", bucket: "today" });
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  const response = await fetch(worker.url + '/review-queue', { headers: { authorization: `Bearer ${OWNER}` } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-openagi-data-source'), 'main');
+  const page = await response.json();
+  assert.ok(page.items.some(x => x.title === 'Main inbox task'));
+  assert.ok(!page.items.some(x => x.title === 'Decoy worker task'));
+  writeNodeConfig({ remote: main.url, token: null }, worker.dataDir);
+  const denied = await fetch(worker.url + '/review-queue', { headers: { authorization: `Bearer ${OWNER}` } });
+  assert.equal(denied.status, 502);
+  assert.equal((await denied.json()).error, 'main-pairing-required');
+});
+
+test("Inbox draft and suggestion destinations read and update main's records", async t => {
+  const { main, worker } = await pair(t);
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  const draft = main.runtime.drafts.add({ title: "Main draft", body: "Main body" });
+  worker.runtime.drafts.items.set(draft.id, { ...draft, title: "Worker draft" });
+  for (const instance of [main, worker]) {
+    const dir = path.join(instance.dataDir, "proactive", "suggestions");
+    fs.mkdirSync(dir, { recursive: true });
+    instance.runtime.proactiveObserver = { dataDir: instance.dataDir };
+    fs.writeFileSync(path.join(dir, "prop_shared.json"), JSON.stringify({
+      id: "prop_shared", title: instance === main ? "Main suggestion" : "Worker suggestion",
+      status: "pending", category: "knowledge", proposedAt: new Date().toISOString()
+    }));
+  }
+  const request = (route, init = {}) => fetch(worker.url + route, {
+    ...init, headers: { authorization: `Bearer ${OWNER}`, "content-type": "application/json" }
+  });
+  const drafts = await request("/drafts?status=pending");
+  assert.equal(drafts.headers.get("x-openagi-data-source"), "main");
+  assert.equal((await drafts.json())[0].title, "Main draft");
+  const suggestions = await request("/proactive/suggestions?id=prop_shared");
+  assert.equal((await suggestions.json())[0].title, "Main suggestion");
+  assert.equal((await request(`/drafts/${draft.id}`, { method: "PATCH", body: '{"body":"Edited on main"}' })).status, 200);
+  assert.equal(main.runtime.drafts.get(draft.id).body, "Edited on main");
+  assert.equal((await request(`/drafts/${draft.id}/discard`, { method: "POST" })).status, 200);
+  assert.equal(main.runtime.drafts.get(draft.id).status, "discarded");
+  assert.equal(worker.runtime.drafts.get(draft.id).status, "pending");
+  assert.equal(worker.runtime.drafts.get(draft.id).body, "Main body");
+  assert.equal((await request("/proactive/suggestions/prop_shared/dismiss", { method: "POST" })).status, 200);
+  const read = instance => JSON.parse(fs.readFileSync(path.join(instance.dataDir, "proactive", "suggestions", "prop_shared.json")));
+  assert.equal(read(main).status, "dismissed");
+  assert.equal(read(worker).status, "pending");
+});
+
+test("Inbox cleanup and run status target main, preserving scope and origin checks", async t => {
+  const { main, worker, request } = await pair(t);
+  const calls = [];
+  for (const [name, instance] of [["main", main], ["worker", worker]]) {
+    instance.runtime.cron.listJobs = () => [{ id: "backlog-triage" }];
+    instance.runtime.cron.runJobNow = (_handler, id) => {
+      calls.push([name, id]);
+      return { started: true, runId: "fixture-run", promise: Promise.resolve({ status: "ok", runId: "fixture-run", result: { source: name } }) };
+    };
+    instance.runtime.cron.getRun = () => ({ runId: "fixture-run", status: "ok", result: { source: name } });
+  }
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  const headers = { authorization: `Bearer ${OWNER}`, "content-type": "application/json" };
+  const run = await fetch(worker.url + "/cron/backlog-triage/run", { method: "POST", headers, body: "{}" });
+  assert.equal(run.status, 200);
+  assert.equal((await run.json()).result.source, "main");
+  main.runtime.cron.runJobNow = () => ({ started: true, runId: "fixture-run", promise: new Promise(() => {}) });
+  const accepted = await fetch(worker.url + "/cron/backlog-triage/run?wait=0", { method: "POST", headers, body: "{}" });
+  assert.equal(accepted.status, 202);
+  const acceptedBody = await accepted.json();
+  assert.equal(acceptedBody.poll, "/cron/runs/fixture-run?source=main");
+  const poll = await fetch(worker.url + acceptedBody.poll, { headers });
+  assert.equal(poll.headers.get("x-openagi-data-source"), "main");
+  assert.equal((await poll.json()).result.source, "main");
+  const localPoll = await fetch(worker.url + "/cron/runs/fixture-run", { headers });
+  assert.equal((await localPoll.json()).result.source, "worker", "ordinary worker cron polling stays local");
+  for (const route of ["/review-queue", "/drafts", "/proactive/suggestions", "/cron/runs/fixture-run?source=main"]) {
+    assert.equal((await request(route, {}, WORKER)).status, 502, route);
+  }
+  assert.equal((await request("/cron/backlog-triage/run", { method: "POST", body: "{}" }, WORKER)).status, 502);
+  assert.equal((await fetch(worker.url + "/cron/backlog-triage/run", {
+    method: "POST", headers: { ...headers, origin: "https://other.example" }, body: "{}"
+  })).status, 403);
+  assert.deepEqual(calls, [["main", "backlog-triage"]]);
+});
+
+test("Inbox forwarding is restricted to supported routes and methods", () => {
+  for (const [method, route] of [
+    ["GET", "/drafts"], ["PATCH", "/drafts/draft-1"],
+    ...["approve", "discard", "stop-asking", "send"].map(action => ["POST", `/drafts/draft-1/${action}`]),
+    ["GET", "/proactive/suggestions"], ["GET", "/proactive/suggestions/prop-1/outcome"],
+    ...["accept", "reject", "dismiss"].map(action => ["POST", `/proactive/suggestions/prop-1/${action}`]),
+    ["POST", "/cron/backlog-triage/run"]
+  ]) assert.equal(isMainDataRoute(method, route), true, `${method} ${route}`);
+  for (const [method, route] of [
+    ["POST", "/drafts"], ["DELETE", "/drafts/draft-1"], ["POST", "/drafts/draft-1/unknown"],
+    ["POST", "/proactive/observe"], ["POST", "/proactive/suggestions/prop-1/unknown"],
+    ["POST", "/cron/other/run"], ["POST", "/cron/runs/run-1"], ["GET", "/cron/runs"], ["GET", "/cron/runs/run-1"]
+  ]) assert.equal(isMainDataRoute(method, route), false, `${method} ${route}`);
+  assert.equal(isMainDataRoute("GET", "/cron/runs/run-1", new URLSearchParams("source=main")), true);
+});
+
+test("draft delivery capabilities come from main while channel setup stays local", async t => {
+  const previous = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = OWNER;
+  t.after(() => {
+    if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = previous;
+  });
+  const { main, worker, request } = await pair(t);
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  main.runtime.channels.telegram.status = () => ({ configured: true });
+  worker.runtime.channels.telegram.status = () => ({ configured: false });
+  const headers = { authorization: `Bearer ${OWNER}` };
+  const remote = await fetch(worker.url + "/channels?source=main", { headers });
+  assert.equal(remote.status, 200);
+  assert.equal(remote.headers.get("x-openagi-data-source"), "main");
+  assert.equal((await remote.json()).telegram.configured, true);
+  const local = await fetch(worker.url + "/channels", { headers });
+  assert.equal((await local.json()).telegram.configured, false);
+  assert.equal((await request("/channels?source=main", {}, WORKER)).status, 502,
+    "routing never grants worker credentials owner channel access");
+  const dashboard = await fetch(worker.url + "/", { headers });
+  assert.match(await dashboard.text(), /isTodayView \? fetchJson\("\/channels\?source=main"\)/);
+  assert.equal(isMainDataRoute("POST", "/channels", new URLSearchParams("source=main")), false);
+  assert.equal(isMainDataRoute("GET", "/channels/telegram/pairing-code", new URLSearchParams("source=main")), false);
+});
+
+test("Mac supervisor workspace /message payload passes main's worker proxy allowlist and persists attachments", async (t) => {
+  const clientSwift = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../mac/Sources/OpenAGI/Workspace/SharedSupervisorClient.swift"),
+    "utf8"
+  );
+  const buildBlock = clientSwift.match(/static func buildMessagePayload\([\s\S]*?\n  \}/)?.[0] ?? "";
+  assert.ok(buildBlock.length > 0, "SharedSupervisorClient.buildMessagePayload must exist");
+  assert.match(buildBlock, /"thread"\s*\]\s*=\s*"supervisor"/);
+  assert.doesNotMatch(buildBlock, /"metadata"\s*[:\]]|"channel"\s*[:\]]|"agentId"\s*[:\]]/);
+
+  const prevToken = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = OWNER;
+  t.after(() => {
+    if (prevToken === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = prevToken;
+  });
+
+  const { main, worker } = await pair(t);
+  const identity = readOrCreateIdentity(worker.dataDir);
+  const proxyToken = "m".repeat(43);
+  main.nodeRegistry.enroll(identity.nodeId, WORKER.token, {
+    platform: "openagi",
+    name: "Spencer Mac",
+    ownerProxyToken: proxyToken
+  });
+  writeNodeConfig({
+    remote: main.url,
+    token: null,
+    nodeToken: WORKER.token,
+    nodeEnrollmentConfirmed: true,
+    ownerProxyToken: proxyToken
+  }, worker.dataDir);
+
+  const sampleJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0xd9]).toString("base64");
+  const ownerHeaders = { authorization: `Bearer ${OWNER}`, "content-type": "application/json" };
+
+  // Any client-supplied metadata/channel/agentId is rejected by main's requestNodeId gate.
+  const rejected = await fetch(worker.url + "/message", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ text: "Bad", thread: "supervisor", metadata: { sourceName: "Mac" } })
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error, "node message contains unsupported fields");
+
+  // Allowlisted Mac payload (text, from, thread, attachments) succeeds and lands in devices:supervisor:main.
+  const sent = await fetch(worker.url + "/message", {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({
+      text: "Check screenshot",
+      from: "mac-supervisor",
+      thread: "supervisor",
+      attachments: [{
+        id: "img_test123",
+        name: "screen.jpg",
+        mimeType: "image/jpeg",
+        data: sampleJpeg,
+        thumbnail: sampleJpeg
+      }]
+    })
+  });
+  assert.equal(sent.status, 200);
+  assert.equal((await sent.json()).reply, "Main's reply");
+
+  const historyRes = await fetch(worker.url + "/conversations/supervisor/messages?limit=10", {
+    headers: { authorization: `Bearer ${OWNER}` }
+  });
+  assert.equal(historyRes.status, 200);
+  const history = await historyRes.json();
+  const userTurn = history.messages.find((m) => m.role === "user");
+  assert.equal(userTurn?.text, "Check screenshot");
+  assert.equal(userTurn?.attachments?.[0]?.id, "img_test123");
+  assert.equal(userTurn?.attachments?.[0]?.thumbnail, sampleJpeg);
 });

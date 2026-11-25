@@ -199,7 +199,7 @@ export class NodeRegistry {
   }
 
   enroll(nodeId, token, {
-    now = Date.now(), platform = null, name = null, capabilities = [], ownerProxyToken = null
+    now = Date.now(), platform = null, name = null, capabilities = [], ownerProxyToken = null, enrolledVia = null
   } = {}) {
     if (typeof nodeId !== "string" || !/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
       throw new Error("nodeId is required and malformed");
@@ -248,7 +248,8 @@ export class NodeRegistry {
       createdAt: new Date(now).toISOString(),
       ...(normalizedPlatform ? { platform: normalizedPlatform } : {}),
       ...(normalizedName ? { name: normalizedName } : {}),
-      ...(normalizedPlatform ? { capabilities: sanitizeNodeCapabilities(capabilities) } : {})
+      ...(normalizedPlatform ? { capabilities: sanitizeNodeCapabilities(capabilities) } : {}),
+      ...(typeof enrolledVia === "string" && /^[a-zA-Z0-9:_-]{1,240}$/.test(enrolledVia) ? { enrolledVia } : {})
     };
     writeJsonAtomic(this.storePath, store);
     return { created: true };
@@ -271,6 +272,29 @@ export class NodeRegistry {
     const actual = crypto.createHash("sha256").update(token, "utf8").digest();
     const hash = Buffer.from(expected, "hex");
     return actual.length === hash.length && crypto.timingSafeEqual(actual, hash);
+  }
+
+  // Whether this node still holds an owner-proxy grant (it was not revoked
+  // or re-enrolled without one), without needing its credential.
+  hasOwnerProxyGrant(nodeId) {
+    if (typeof nodeId !== "string") return false;
+    return typeof this._read().credentials[nodeId]?.ownerProxyTokenHash === "string";
+  }
+
+  // Rotate the separate owner-proxy credential after an explicit reconnect
+  // approval. The raw value is returned only to the reconnect manager so it
+  // can be delivered to the already-authenticated target node; only its hash
+  // is persisted. This never exposes the main owner token and revoke() removes
+  // the hash together with the operational credential.
+  grantOwnerProxyToken(nodeId) {
+    if (typeof nodeId !== "string" || !nodeId) return null;
+    const store = this._read();
+    const credential = store.credentials[nodeId];
+    if (!credential) return null;
+    const ownerProxyToken = crypto.randomBytes(32).toString("base64url");
+    credential.ownerProxyTokenHash = crypto.createHash("sha256").update(ownerProxyToken, "utf8").digest("hex");
+    writeJsonAtomic(this.storePath, store);
+    return ownerProxyToken;
   }
 
   enrollmentForToken(token) {

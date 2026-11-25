@@ -2,14 +2,59 @@ import SwiftUI
 
 struct TodayView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.appCanvas) private var canvas
     var onRevoked: () -> Void = {}
     @State private var settingsShown = false
+
+    private var isUITesting: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing")
+    }
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
                     AgentConnectionRow()
+                }
+                if !model.isOnPhone && !isUITesting {
+                    Section("OpenAGI Workspace") {
+                        let cardsCount = model.latestFleetState.map { SupervisorFormat.resolvedCards($0).count } ?? 0
+                        let runningCount = model.latestFleetState?.activeSummary?.running ?? 0
+                        let inboxCount = model.inboxBadgeCount
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Coding Supervisor")
+                                    .font(.subheadline.weight(.semibold))
+                                Text(cardsCount > 0
+                                     ? "\(cardsCount) coding decision\(cardsCount == 1 ? "" : "s") · \(runningCount) running"
+                                     : "\(runningCount) active coding session\(runningCount == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(cardsCount > 0 ? "Review (\(cardsCount))" : "Open") {
+                                model.workspaceChannel = cardsCount > 0 ? .needsYou : .general
+                                model.requestedChatThread = .supervisor
+                                model.selectedTab = .chat
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                        if inboxCount > 0 {
+                            Button {
+                                model.selectedTab = .inbox
+                            } label: {
+                                HStack {
+                                    Label("\(inboxCount) agent approval\(inboxCount == 1 ? "" : "s") & question\(inboxCount == 1 ? "" : "s") in Inbox", systemImage: "tray.full")
+                                        .font(.caption.weight(.medium))
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
                 }
                 if let issue = model.mainConnectionIssue {
                     Section {
@@ -24,6 +69,21 @@ struct TodayView: View {
                 if let headline = model.snapshot?.summary.brief.headline, !headline.isEmpty {
                     Section {
                         Text(headline).font(.headline)
+                    }
+                }
+                if let review = model.snapshot?.summary.taskReview {
+                    Section {
+                        if review.status == "reviewed" || review.status == "no_tasks", let date = review.lastReviewedAt {
+                            LabeledContent("Task relevance reviewed") { Text(date, style: .relative) }
+                        } else {
+                            Label(review.status == "unavailable" ? "Task review needs a model" : "Task review couldn't finish",
+                                  systemImage: "exclamationmark.clock")
+                            Text("Saved tasks remain visible. Refresh syncs the list; it doesn't reassess tasks.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if let date = review.lastReviewedAt {
+                                LabeledContent("Last successful review") { Text(date, style: .relative) }
+                            }
+                        }
                     }
                 }
                 let visible = model.snapshot?.visibleToday ?? []
@@ -53,7 +113,12 @@ struct TodayView: View {
                     }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(canvas)
+            .listRowSpacing(4)
             .navigationTitle("Today")
+            .navigationBarTitleDisplayMode(.inline)
             .refreshable { await model.refreshData() }
             .task { await model.refreshToday() }
             .toolbar {
@@ -101,13 +166,15 @@ struct TodayView: View {
             // when an earlier snapshot has real tasks to keep displaying.
             EmptyView()
         } else if model.snapshot == nil && model.refreshFailed {
-            ContentUnavailableView {
-                Label("Couldn't load Today", systemImage: "wifi.exclamationmark")
-            } description: {
-                Text("Your agent couldn't be reached.")
-            } actions: {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Agent unavailable", systemImage: "wifi.exclamationmark")
+                Text("Reconnect to load Today. Saved tasks stay available.")
+                    .font(.footnote).foregroundStyle(.secondary)
                 Button("Retry") { Task { await model.refreshData() } }
+                    .frame(minHeight: 44)
             }
+            .padding(.vertical, 8)
+            .listRowBackground(Color.clear)
         } else {
             ContentUnavailableView {
                 Label("No tasks scheduled today", systemImage: "sun.max")

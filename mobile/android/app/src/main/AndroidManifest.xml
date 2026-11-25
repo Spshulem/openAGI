@@ -27,7 +27,9 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="OpenAGI"
+        android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:usesCleartextTraffic="true">
@@ -70,6 +72,10 @@
              PendingIntents reach it. -->
         <receiver
             android:name=".sync.SupervisorAnswerReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".sync.ApprovalActionReceiver"
             android:exported="false" />
 
         <receiver

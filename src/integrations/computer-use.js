@@ -31,6 +31,7 @@
 import crypto from "node:crypto";
 import { pinnedRemoteOrigin } from "../node-control.js";
 import { isOwnerPrincipal } from "../owner-authority.js";
+import { SCREENSHOT_FOCUS_UNAVAILABLE } from "./computer-server.js";
 
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
@@ -303,6 +304,9 @@ async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, op
   if (!res.ok) {
     const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
     const error = new Error(publicError);
+    if (json?.code === SCREENSHOT_FOCUS_UNAVAILABLE && json.sequenceConsumed === true) {
+      error.code = SCREENSHOT_FOCUS_UNAVAILABLE;
+    }
     error.nodeAcknowledged = true;
     // Current nodes state this explicitly. Older compatible node services used
     // 5xx for executor failures after entering a lease, so retain that legacy
@@ -541,7 +545,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
 
   registry.register({
     name: "start_computer_use_session",
-    description: "Open a computer-use session for a user-stated goal. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise call it once: on the owner's own instruction it starts the session at once; from anyone else it creates ONE approval request with a code (the owner approves by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab) and approval resumes the chat. Subsequent computer_* actions in the session won't re-prompt. To type into, click in, open, quit or restart a Conductor or Codex chat the fleet supervisor watches, use fleet_send_message, fleet_click or fleet_app instead. " + SAFETY_NOTE,
+    description: "Open a computer-use session for a user-stated GUI goal outside coding chats. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise call it once: on the owner's own instruction it starts the session at once; from anyone else it creates ONE approval request with a code (the owner approves by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab) and approval resumes the chat. Subsequent computer_* actions in the session won't re-prompt. NEVER use this tool to inspect, create, or message a Paseo, Conductor, Claude, or Codex chat—use fleet_start_session (with fromThreadKey to match an existing chat's workspace), fleet_send_message, fleet_dispatch_goal, fleet_click, or fleet_app instead. " + SAFETY_NOTE,
     parameters: {
       type: "object",
       properties: {
@@ -609,6 +613,9 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           note: "The approved computer-use session is already active. Continue with computer_screenshot / computer_click / etc; do not request approval again."
         };
       }
+      // The approval may outlive a cached local readiness check. Refresh
+      // before resolving its immutable target; never substitute another node.
+      await runtime.nodeCapabilities?.refresh?.();
       const explicit = explicitComputerNode();
       const selected = explicit?.kind === "http" && explicit.id === args.nodeId
         ? explicit
@@ -688,7 +695,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const node = computerNode(runtime, session);
       if (node) {
         try {
-          const shot = await invokeCancellableNodeAction(node, session, action, "screenshot", {}, context.signal);
+          const shot = await invokeCancellableNodeAction(node, session, action, "screenshot", {}, context.actionSignal ?? context.signal);
           runtime.computerUseLog.markActionResult(action.id, {
             status: "executed",
             result: { width: shot.width, height: shot.height, bytes: shot.bytes }
@@ -704,6 +711,21 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
             note: "Live screenshot and fresh Accessibility state from the computer-use node. Element indices are valid only for this frameId."
           };
         } catch (error) {
+          // The local executor and the authenticated relay/HTTP transport
+          // identify a completed, read-only refusal. Keep the same lease and
+          // target; the node has already invalidated its previous frame.
+          if (!(context.actionSignal ?? context.signal)?.aborted && runtime.computerUseLog.getSession(session.id)?.status === "active"
+              && error?.nodeSequenceConsumed === true
+              && (error.code === SCREENSHOT_FOCUS_UNAVAILABLE
+                || (error.nodeAcknowledged === true && error.message === SCREENSHOT_FOCUS_UNAVAILABLE))) {
+            runtime.computerUseLog.markActionResult(action.id, { status: "error", error: SCREENSHOT_FOCUS_UNAVAILABLE });
+            return {
+              actionId: action.id,
+              ok: false,
+              error: SCREENSHOT_FOCUS_UNAVAILABLE,
+              note: "No screenshot was captured. The current approval is still active on this node. If the intended app is not focused, activate it if available, or ask the user to focus its allowed window on the main display. Then take a fresh screenshot before input. Do not retry repeatedly with the same focus, use an older frame, or request another approval while this one is active."
+            };
+          }
           runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
           await abortSession(session, "computer-use node action failed; approval must be renewed", "aborted");
           throw new Error(`computer-use node screenshot failed: ${error.message}`);
@@ -773,7 +795,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           throw new Error(EXECUTION_UNAVAILABLE);
         }
         try {
-          const nodeResult = await invokeCancellableNodeAction(node, session, action, nodePath, payloadOf(actionArgs), context.signal);
+          const nodeResult = await invokeCancellableNodeAction(node, session, action, nodePath, payloadOf(actionArgs), context.actionSignal ?? context.signal);
           if (runtime.computerUseLog.getSession(session.id)?.status !== "active") {
             runtime.computerUseLog.markActionResult(action.id, { status: "aborted", error: "session-stopped" });
             throw Object.assign(new Error("computer-use session was stopped before the action result was accepted"), {

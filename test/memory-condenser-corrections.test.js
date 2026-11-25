@@ -113,6 +113,46 @@ for (const mode of ["id", "query"]) {
   });
 }
 
+test("a stronger protected principle leads a query correction to its matching saved source", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-saved-principle-correction-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const memory = new FileBackedMemorySystem({ dir });
+  const stale = memory.remember({ content: "Acme meeting time is 3pm.", tags: ["tool:remember", "acme", "meeting"] }, { tier: "medium" });
+  const notes = memory.remember({ content: "Acme meeting notes should be short.", tags: ["tool:remember", "acme", "meeting"] }, { tier: "medium" });
+  memory.remember({ content: "Acme meeting materials are ready.", tags: ["acme", "meeting"] }, { tier: "medium" });
+  const condenser = new MemoryCondenser({ runtime: { memory } });
+  condenser.distill = async () => ({ text: "Acme weekly meeting time is 3pm.", confidence: "high" });
+  const result = await condenser.condense();
+  assert.equal(result.principles, 1);
+  const principle = memory.items.get(result.items[0].id);
+  assert.ok(principle.tags.includes("tool:remember"), "condensation inherits the protected source tag");
+  assert.ok(principle.metadata.sources.includes(stale.id));
+  assert.ok(principle.metadata.sources.includes(notes.id), "the principle has an unrelated saved source too");
+
+  const corrected = memory.correct({ query: "Acme weekly meeting time", content: "Acme weekly meeting time is 4pm." });
+  assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set([stale.id, principle.id]));
+  assert.equal(notes.metadata.supersededBy, undefined);
+  const restored = new FileBackedMemorySystem({ dir });
+  const recalled = restored.retrieve("Acme weekly meeting time", { limit: 20 });
+  assert.ok(recalled.some(({ item }) => item.id === corrected.item.id));
+  assert.ok(recalled.some(({ item }) => item.id === notes.id));
+  assert.ok(!recalled.some(({ item }) => [stale.id, principle.id].includes(item.id)), "neither stale source nor principle survives a restart");
+});
+
+test("principle source lookup follows same-scope lineage safely through cycles", () => {
+  const memory = new MemorySystem();
+  const stale = memory.remember({ content: "Acme meeting time is 3pm.", tags: ["tool:remember"] });
+  const peer = memory.remember({ content: stale.content, tags: stale.tags, scope: "specialist:peer" });
+  const first = memory.remember({ content: stale.content, kind: "principle", tags: stale.tags,
+    metadata: { sources: [stale.id, peer.id] } }, { tier: "long" });
+  const second = memory.remember({ content: "Acme weekly meeting time is 3pm.", kind: "principle", tags: stale.tags,
+    metadata: { sources: [first.id] } }, { tier: "long" });
+  first.metadata.sources.push(second.id);
+  const corrected = memory.correct({ query: "Acme weekly meeting time", content: "Acme weekly meeting time is 4pm." });
+  assert.deepEqual(new Set(corrected.superseded.map(item => item.id)), new Set([stale.id, first.id, second.id]));
+  assert.equal(peer.metadata.supersededBy, undefined);
+});
+
 test("derived invalidation follows same-scope lineage without mutating peer memory", () => {
   const memory = new MemorySystem();
   const source = memory.remember({ scope: "specialist:planner", content: "Review at nine" });

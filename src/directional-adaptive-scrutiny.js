@@ -30,13 +30,20 @@ export class DirectionalAdaptiveScrutiny {
     const novelty = clamp(signal.novelty ?? 0);
     const repetition = clamp(signal.repetition ?? 0);
 
-    const score = clamp(
+    const ruleScore = clamp(
       environmentScore * this.weights.environment +
         companyScore * this.weights.company +
         evidenceScore * this.weights.evidence +
         memoryScore * this.weights.memory +
         uncertaintyScore * this.weights.uncertainty
     );
+    // A learned score, when the caller supplies one, replaces the weighted
+    // sum. The caller decides whether it should be used; this class knows
+    // nothing about modes. Every risk rule in selectAction still applies.
+    const learnedValue = typeof overrides?.learnedValue === "number" && Number.isFinite(overrides.learnedValue)
+      ? clamp(overrides.learnedValue)
+      : null;
+    const score = learnedValue ?? ruleScore;
 
     const propagationPressure = clamp(Math.max(repetition, risk * novelty, signal.requiresSpecialist ? 0.9 : 0));
     // Per-signal threshold override (B3 harsh review): overrides.act raises
@@ -45,9 +52,13 @@ export class DirectionalAdaptiveScrutiny {
     const actThresholdOverride = typeof overrides.act === "number" ? overrides.act : null;
     const action = this.selectAction({ score, risk, novelty, propagationPressure, memories, signal, actThresholdOverride });
 
+    const reasons = this.reasons({ signal, workflow, context, score, action, propagationPressure, memories });
+    if (learnedValue !== null) reasons.push(`Learned score ${score.toFixed(2)} used in place of rule score ${ruleScore.toFixed(2)}.`);
+
     return {
       action,
       score,
+      ...(learnedValue !== null ? { ruleScore } : {}),
       propagationPressure,
       dimensions: {
         environment: environmentScore,
@@ -59,7 +70,7 @@ export class DirectionalAdaptiveScrutiny {
         novelty,
         repetition
       },
-      reasons: this.reasons({ signal, workflow, context, score, action, propagationPressure, memories })
+      reasons
     };
   }
 

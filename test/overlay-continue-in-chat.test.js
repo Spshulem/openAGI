@@ -232,6 +232,36 @@ test("the chat tab resolves the ?session= the popover deep-links to", async () =
   assert.equal(deepLinkSessionId("?tab=chat&session=local%3Abrowser-17%3Amain"), "local:browser-17:main");
 });
 
+test("chat composer submits only unmodified Return and preserves multiline IME input", async () => {
+  const { script } = await boot();
+  const shouldSubmitComposerKey = new Function(
+    `${extractFunction(script, "shouldSubmitComposerKey")}; return shouldSubmitComposerKey;`
+  )();
+  const key = (overrides = {}) => ({
+    key: "Enter",
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    isComposing: false,
+    keyCode: 13,
+    ...overrides
+  });
+
+  assert.equal(shouldSubmitComposerKey(key()), true, "plain Return submits");
+  assert.equal(shouldSubmitComposerKey(key({ shiftKey: true })), false, "Shift+Return inserts a newline");
+  assert.equal(shouldSubmitComposerKey(key({ ctrlKey: true })), false, "Control+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ altKey: true })), false, "Option+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ metaKey: true })), false, "Command+Return does not submit");
+  assert.equal(shouldSubmitComposerKey(key({ isComposing: true })), false, "active IME composition is preserved");
+  assert.equal(shouldSubmitComposerKey(key({ keyCode: 229 })), false, "IME keyCode 229 is preserved");
+
+  // A second Return after a send reaches submit with an empty draft; the
+  // shipped submit guard must keep it from issuing another request.
+  assert.match(script, /const text = input\.value\.trim\(\);\n    if \(!text\) return;/);
+  assert.match(script, /input\.value = "";/);
+});
+
 test("no ?session= means no deep link (plain /?tab=chat still opens a fresh chat)", async () => {
   const { script } = await boot();
   const deepLinkSessionId = new Function(
@@ -536,7 +566,11 @@ test("Mac Quick Ask has a Supervisor tab backed by the local fleet API", () => {
   assert.match(consumer, /path: "\/fleet\/api\/state"/);
   assert.match(consumer, /path: "\/fleet\/api\/questions\/\\\(id\)"/);
   assert.match(consumer, /path: "\/fleet\/api\/scan"/);
-  assert.doesNotMatch(consumer, /fleet\/api\/send/, "the overlay never sends free text to an agent thread");
+  // Free text reaches an agent thread only as the owner's own typed reply
+  // (Supervisor detail, #275): one /send call, inside sendReply's .thread case.
+  assert.equal(consumer.match(/fleet\/api\/send/g)?.length, 1, "one free-text route");
+  assert.match(consumer, /func sendReply\(_ item: FleetOpenItem\) async \{[\s\S]*?case let \.thread\(key\):\s*path = "\/fleet\/api\/send"/,
+    "free text goes to a thread only from the owner's typed reply");
   assert.match(consumer, /guard mine == generation else \{ return \}/);
 
   // Height watchers: the new state has to resize the manually sized panel.
