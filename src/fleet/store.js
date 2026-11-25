@@ -17,6 +17,15 @@ import { defaultPreferences, normalizePreferences } from "./preferences.js";
 // A question lives this long from when it was first put to the owner, asked
 // again or not; then it expires, and the same ask stays quiet as long again.
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
+// Pending undelivered-reply recoveries kept: far above the owner-message
+// queue's 100, so none is dropped before its card is put back.
+const UNDELIVERED_REPLIES_MAX = 1000;
+
+// Every card a queued owner message answers (older entries: just questionId).
+export function questionLinksOf(item) {
+  if (Array.isArray(item?.questionLinks) && item.questionLinks.length) return item.questionLinks.filter((l) => l && typeof l.questionId === "string");
+  return item?.questionId ? [{ questionId: item.questionId, questionAnswer: item.questionAnswer ?? null }] : [];
+}
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
 const REOPEN_MS = 60 * 60 * 1000;
@@ -87,6 +96,7 @@ function emptyState() {
     organization: { projects: [], threadAssignments: {}, projectAliases: {}, reviewedCompletions: {} },
     followThroughWatches: [],
     queuedOwnerMessages: [],
+    undeliveredOwnerReplies: [],
     supervisorChatNotices: {},
     lastProactiveChatAt: null,
     lastOwnerAckAt: null,
@@ -646,6 +656,9 @@ export class FleetStore {
   answerQuestion(id, answer) {
     const text = clampText(answer, this.limits.bodyMax);
     if (!text) return null;
+    // A new answer replaces whatever happened to the last one.
+    const question = this._findQuestion(id);
+    if (question?.deliveryNote) { delete question.deliveryNote; delete question.deliveryNoteAt; }
     return this._closeQuestion(id, "answered", text);
   }
 
@@ -702,6 +715,40 @@ export class FleetStore {
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer
   // from the owner is not undone.
+  // A queued reply to an owner's card that left the queue without reaching
+  // the agent (expired). Kept until the supervisor puts the card back.
+  _noteUndeliveredReply(item, reason) {
+    if (!item?.questionId) return;
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (list.some((entry) => entry.id === item.id)) return;
+    list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, questionLinks: questionLinksOf(item), threadKey: item.threadKey, reason, at: iso(this.now()) });
+    // Never evict one still waiting: each is a card that would stay closed.
+    // Bounded anyway: the queue holds 100 and every entry expires in a day.
+    this.state.undeliveredOwnerReplies = list.slice(-UNDELIVERED_REPLIES_MAX);
+  }
+
+  takeUndeliveredOwnerReplies() {
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (!list.length) return [];
+    this.state.undeliveredOwnerReplies = [];
+    this._save();
+    return list.map((entry) => ({ ...entry }));
+  }
+
+  // Puts an owner's card back after its reply never reached the agent, once,
+  // and only while that reply is still the card's answer (a newer, different
+  // answer from the owner stands). note: what happened, shown on the card.
+  reopenUndeliveredReply(questionId, { answer = null, threadKey = null, note = null } = {}) {
+    const question = this._findQuestion(questionId);
+    if (!question || question.status !== "answered") return null;
+    if (answer !== null && question.answer !== answer) return null;
+    const reopened = this.reopenQuestion(questionId, threadKey ? [threadKey] : [], { answer: question.answer, asked: true });
+    if (!reopened) return null;
+    const live = this._findQuestion(questionId);
+    if (live && note) { live.deliveryNote = clampText(note, 240); live.deliveryNoteAt = iso(this.now()); this._save(); }
+    return live ? { ...live } : reopened;
+  }
+
   reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
@@ -1466,7 +1513,14 @@ export class FleetStore {
   _pruneQuestions() {
     // Least recently asked first, so a close still holding back an ask stays.
     // An answer still waiting to be typed is the only copy: never pruned.
-    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery).sort((a, b) => lastAskMs(a) - lastAskMs(b));
+    // A card whose reply is still queued, or waiting to be put back after it
+    // never reached the agent, is kept too: without it there is nothing to
+    // reopen and the owner never learns the reply went nowhere.
+    const awaited = new Set([
+      ...(Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : []),
+      ...(Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [])
+    ].flatMap((item) => questionLinksOf(item).map((link) => link.questionId)));
+    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery && !awaited.has(q.id)).sort((a, b) => lastAskMs(a) - lastAskMs(b));
     if (closed.length <= CLOSED_QUESTIONS_KEPT) return;
     const drop = new Set(closed.slice(0, closed.length - CLOSED_QUESTIONS_KEPT));
     this.state.questions = this.state.questions.filter((q) => !drop.has(q));
@@ -1511,6 +1565,11 @@ export class FleetStore {
       followThroughWatches: Array.isArray(raw.followThroughWatches) ? raw.followThroughWatches.filter((w) => isObject(w) && typeof w.id === "string" && typeof w.threadKey === "string") : [],
       queuedOwnerMessages: Array.isArray(raw.queuedOwnerMessages)
         ? raw.queuedOwnerMessages.filter((q) => isObject(q) && typeof q.id === "string" && typeof q.threadKey === "string" && typeof q.message === "string").slice(-100)
+        : [],
+      // Cards whose queued reply expired undelivered, waiting to be put back:
+      // the queued message is already gone, so a restart must keep these.
+      undeliveredOwnerReplies: Array.isArray(raw.undeliveredOwnerReplies)
+        ? raw.undeliveredOwnerReplies.filter((u) => isObject(u) && typeof u.id === "string" && typeof u.questionId === "string").slice(-UNDELIVERED_REPLIES_MAX)
         : [],
       supervisorChatNotices: isObject(raw.supervisorChatNotices) ? raw.supervisorChatNotices : {},
       lastProactiveChatAt: typeof raw.lastProactiveChatAt === "string" && Number.isFinite(Date.parse(raw.lastProactiveChatAt)) ? raw.lastProactiveChatAt : null,
@@ -1759,7 +1818,7 @@ export class FleetStore {
     return resolvedKeys;
   }
 
-  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null } = {}) {
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null } = {}) {
     const cleanKey = String(threadKey ?? "").trim();
     const cleanMsg = String(message ?? "").trim();
     // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
@@ -1774,7 +1833,9 @@ export class FleetStore {
     this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])
       .filter((item) => {
         const createdMs = toMs(item?.createdAt, 0);
-        return createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+        const live = createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+        if (!live) this._noteUndeliveredReply(item, "expired");
+        return live;
       });
     const normalizedImages = Array.isArray(images) && images.length > 0 ? images.slice(0, 4) : null;
     const imageSig = (imgs) => (Array.isArray(imgs) && imgs.length > 0 ? JSON.stringify(imgs) : "");
@@ -1784,6 +1845,18 @@ export class FleetStore {
         || (item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig)
     );
     if (existing) {
+      // The same words to the same chat from another card: one message, but
+      // every card it answers stays linked, so each comes back if it fails.
+      if (questionId) {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const links = questionLinksOf(existing);
+        if (!links.some((l) => l.questionId === link.questionId)) {
+          existing.questionLinks = [...links, link].slice(-20);
+          existing.questionId ??= link.questionId;
+          existing.questionAnswer ??= link.questionAnswer;
+          this._save();
+        }
+      }
       if (cleanIdempotencyKey) {
         const keys = [...new Set([existing.idempotencyKey, ...(Array.isArray(existing.idempotencyKeys) ? existing.idempotencyKeys : []), cleanIdempotencyKey].filter(Boolean))];
         if (!existing.idempotencyKey || !Array.isArray(existing.idempotencyKeys) || existing.idempotencyKeys.length !== keys.length) {
@@ -1800,6 +1873,12 @@ export class FleetStore {
       message: cleanMsg,
       ...(normalizedImages ? { images: normalizedImages } : {}),
       ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
+      // The owner's card this message answers: if it never reaches the agent,
+      // the card is put back instead of staying closed as answered.
+      ...(questionId ? (() => {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        return { questionId: link.questionId, questionAnswer: link.questionAnswer, questionLinks: [link] };
+      })() : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
       ...(cleanIdempotencyKey ? { idempotencyKey: cleanIdempotencyKey, idempotencyKeys: [cleanIdempotencyKey] } : {}),
       source: clampText(String(source || "owner-message"), 40),
@@ -1827,7 +1906,10 @@ export class FleetStore {
     const active = list.filter((item) => {
       if (!item?.id || !item?.threadKey || !item?.message) return false;
       const createdMs = toMs(item.createdAt, 0);
-      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) return false;
+      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) {
+        this._noteUndeliveredReply(item, "expired");
+        return false;
+      }
       return true;
     });
     if (active.length !== list.length) {

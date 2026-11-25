@@ -485,6 +485,8 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   // so and shows all of it, the agent's own message too, before any button.
   function askText(q, parent) {
     if (q.risky) el('p', 'risk', 'Risky: read all of it before you answer.', parent);
+    // Its earlier reply never reached the agent (or was not confirmed).
+    if (q.deliveryNote) el('p', 'warn', q.deliveryNote, parent);
     if (q.body) el('p', null, q.body, parent);
     var plan = q.meta && q.meta.plan;
     if (plan) {
