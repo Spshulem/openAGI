@@ -15,7 +15,7 @@ import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
 import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
-import { g2ConnectPage } from "./g2-connect-page.js";
+import { renderG2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
@@ -28,6 +28,7 @@ import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
 import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
+import { createHubProactiveGuard, isProactiveSupervisorText } from "./fleet/proactive-gate.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
@@ -52,6 +53,7 @@ import { ChannelManager } from "./channels.js";
 import { createCompanionRoutes, connectionsPage } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, renderAdvancedWizard, saveEnv } from "./setup-wizard.js";
+import { readModelUpgradeCache } from "./model-upgrades.js";
 import {
   NodeRegistry,
   readOrCreateIdentity,
@@ -89,7 +91,7 @@ import {
   EVEN_G2_PLATFORM,
   G2ChannelError
 } from "./integrations/g2-channel.js";
-import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { DELEGATED_ENROLLMENT_CODE_TTL_MS, NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
@@ -158,7 +160,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })(),
         claudeCli: claudeCliStatus(),
         codexCli: codexCliStatus()
-      }
+      },
+      // Last daily model check (model-upgrades.js): newer models the keys can
+      // use, or configured models that are gone. Suggestions only.
+      upgrades: (() => { try { const c = readModelUpgradeCache(dataDir); return c ? { checkedAt: c.checkedAt, suggestions: c.suggestions ?? [], errors: c.errors ?? {} } : null; } catch { return null; } })()
     };
   };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
@@ -261,6 +266,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
+  const hubProactiveGuard = createHubProactiveGuard({
+    getPreferences: () => runtime.fleetSupervisor?.getState?.()?.preferences ?? {},
+    getRecentMessages: () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [],
+    getModelProvider: () => runtime.agentHost?.modelProvider ?? channels?.agentHost?.modelProvider ?? null,
+    getLastPostedAtMs: () => Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
+    onPosted: (atMs) => {
+      try { runtime.fleetSupervisor?.store?.recordProactiveChatAt?.(atMs); } catch { /* best-effort */ }
+    },
+    judgeProactiveUpdate: options.judgeProactiveUpdate ?? null
+  });
+  runtime.hubProactiveGuard = hubProactiveGuard;
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
   const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
@@ -1021,6 +1037,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         && isMobileRouteAllowed(method, pathname);
       const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
         && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
+      // A paired computer may ask main for a G2 code only with the owner-proxy
+      // grant main recorded at owner-authenticated pairing. Its operational
+      // token, a phone, or a pair of glasses never qualifies.
+      const g2CodeRequest = method === "POST" && pathname === "/nodes/g2/enrollment-code";
+      const g2CodeIssuer = g2CodeRequest && Boolean(requestNodeId)
+        && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -1086,6 +1109,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : g2CodeRequest && requestNodeId
+            ? { ok: g2CodeIssuer, reason: "this computer is not authorized by the main owner to request glasses codes" }
           : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
@@ -1395,13 +1420,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
         const issued = nodeEnrollment.issue(platform);
-        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code issued (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
           ...(platform === EVEN_G2_PLATFORM
             ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
             : {})
+        });
+      }
+      if (g2CodeRequest) {
+        res.setHeader("cache-control", "no-store");
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "not_main", message: "This computer is not the main. Request the code from the main OpenAGI." });
+        }
+        const body = await readJsonLimited(req, 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+          return sendJson(res, 400, { error: "invalid_request", message: "This request takes no options." });
+        }
+        let origin;
+        try {
+          const configured = new URL(getPublicUrl());
+          if (configured.protocol !== "https:" || configured.username || configured.password
+              || configured.pathname !== "/" || configured.search || configured.hash) throw new Error("invalid");
+          origin = configured.origin;
+        } catch {
+          return sendJson(res, 409, {
+            error: "main_public_url_required",
+            message: "Your main has no exact HTTPS public address, so glasses could not reach it. Set OPENAGI_PUBLIC_URL on the main, then try again."
+          });
+        }
+        const issuedVia = requestNodeId ?? null;
+        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM, { ttlMs: DELEGATED_ENROLLMENT_CODE_TTL_MS, issuedVia });
+        const via = issuedVia ? nodeRegistry.enrollment(issuedVia)?.name ?? issuedVia : "the owner";
+        console.log(`[openagi] Even G2 enrollment code issued for ${via} (valid 10 min, single use)`);
+        return sendJson(res, 200, {
+          code: issued.code,
+          platform: EVEN_G2_PLATFORM,
+          expiresAt: issued.expiresAt,
+          publicUrl: origin,
+          main: { name: localIdentity.name ?? null },
+          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1522,7 +1581,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         nodeRegistry.enroll(nodeId, nodeToken, {
           platform,
           name,
-          capabilities: capabilitiesForPlatform(platform)
+          capabilities: capabilitiesForPlatform(platform),
+          enrolledVia: consumed.issuedVia
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
@@ -2043,9 +2103,99 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: "invalid_messages" });
         }
         try {
+          const conversationId = typeof body.conversationId === "string" ? body.conversationId : "main";
+          const rawMessages = Array.isArray(body.messages) ? body.messages : body.messages;
+          let filteredMessages = rawMessages;
+          let suppressedCount = 0;
+          let deferredCount = 0;
+          let lastSuppressReason = null;
+          if (conversationId === "main" && Array.isArray(rawMessages)) {
+            const sourceName = typeof body.sourceName === "string" ? body.sourceName : null;
+            const sourceNodeId = typeof body.sourceNodeId === "string" ? body.sourceNodeId : null;
+            const nonProactive = [];
+            const appendedAll = [];
+            let lastAppendPayload = null;
+            for (const item of rawMessages) {
+              const text = typeof item?.text === "string" ? item.text : (typeof item?.content === "string" ? item.content : "");
+              const isProactive = item?.role === "assistant" && (item?.proactive === true || isProactiveSupervisorText(text));
+              if (!isProactive) {
+                nonProactive.push(item);
+                continue;
+              }
+              if (nonProactive.length > 0) {
+                const resPart = appendSharedThreadMessages(store, "supervisor", {
+                  conversationId,
+                  messages: nonProactive.splice(0, nonProactive.length),
+                  sourceName,
+                  sourceNodeId
+                });
+                lastAppendPayload = resPart;
+                if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
+              }
+              const verdict = await hubProactiveGuard.evaluate({
+                text,
+                kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
+                decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
+                decisionTokens: Array.isArray(item?.proactiveMeta?.decisionTokens) ? item.proactiveMeta.decisionTokens : [],
+                alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true,
+                persist: async (finalText, { agentReviewed }) => {
+                  const resPart = appendSharedThreadMessages(store, "supervisor", {
+                    conversationId,
+                    messages: [{
+                      ...item,
+                      text: finalText,
+                      proactive: true,
+                      proactiveMeta: {
+                        ...(item?.proactiveMeta && typeof item.proactiveMeta === "object" ? item.proactiveMeta : {}),
+                        agentReviewed: agentReviewed === true
+                      }
+                    }],
+                    sourceName,
+                    sourceNodeId
+                  });
+                  return resPart;
+                }
+              });
+              if (!verdict.send) {
+                if (verdict.error) throw verdict.error;
+                suppressedCount += 1;
+                if (verdict.deferred === true) deferredCount += 1;
+                lastSuppressReason = verdict.reason ?? "suppressed";
+                continue;
+              }
+              if (verdict.persistResult) {
+                lastAppendPayload = verdict.persistResult;
+                if (Array.isArray(verdict.persistResult?.appended)) appendedAll.push(...verdict.persistResult.appended);
+              }
+            }
+            if (nonProactive.length > 0) {
+              const resPart = appendSharedThreadMessages(store, "supervisor", {
+                conversationId,
+                messages: nonProactive,
+                sourceName,
+                sourceNodeId
+              });
+              lastAppendPayload = resPart;
+              if (Array.isArray(resPart?.appended)) appendedAll.push(...resPart.appended);
+            }
+            if (!lastAppendPayload && suppressedCount > 0) {
+              return sendJson(res, 200, {
+                ok: true,
+                thread: "supervisor",
+                conversationId,
+                appended: [],
+                suppressed: true,
+                deferred: deferredCount > 0 && deferredCount === suppressedCount,
+                reason: lastSuppressReason
+              });
+            }
+            if (lastAppendPayload) {
+              return sendJson(res, 200, { ...lastAppendPayload, appended: appendedAll });
+            }
+          }
           return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
-            conversationId: typeof body.conversationId === "string" ? body.conversationId : "main",
-            messages: body.messages,
+            conversationId,
+            messages: filteredMessages,
             sourceName: typeof body.sourceName === "string" ? body.sourceName : null,
             sourceNodeId: typeof body.sourceNodeId === "string" ? body.sourceNodeId : null
           }));
@@ -2092,7 +2242,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/g2/connect") {
         res.setHeader("Cache-Control", "no-store");
         res.setHeader("Referrer-Policy", "no-referrer");
-        return sendHtml(res, 200, g2ConnectPage);
+        const pairedRemote = mobileProfile ? null : readNodeConfig(dataDir)?.remote;
+        let mainOrigin = null;
+        if (pairedRemote) {
+          try { mainOrigin = pinnedRemoteOrigin(pairedRemote, { allowInsecureRemote: allowInsecureNodeRelay }); }
+          catch { mainOrigin = String(pairedRemote); }
+        }
+        return sendHtml(res, 200, renderG2ConnectPage({ mainOrigin }));
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -2755,6 +2911,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           await rebuildModelProvider();
         }
         return sendJson(res, 200, modelSettings());
+      }
+      // Re-run the newer-model check now (same as the daily job).
+      if (method === "POST" && pathname === "/settings/models/upgrades/check") {
+        const { checkModelUpgrades } = await import("./model-upgrades.js");
+        const result = await checkModelUpgrades({ dataDir, outreach: runtime.outreachConfig?.enabled ? runtime.outreach : null });
+        return sendJson(res, 200, { checkedAt: result.checkedAt, checked: result.checked, errors: result.errors, suggestions: result.suggestions });
       }
       // A one-line round trip through the active model, so the settings
       // screen can say "works" or show why not.

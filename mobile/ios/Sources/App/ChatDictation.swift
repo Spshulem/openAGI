@@ -13,6 +13,10 @@ struct DictationTranscript: Equatable {
     let base: String
     private(set) var finished: [String] = []
     private(set) var live = ""
+    // Utterances iOS ended (speech metadata) inside the current recognition
+    // request. Only these can come back repeated in a cumulative result; a
+    // fresh request (after a final result) starts from nothing.
+    private(set) var requestCommitted: [String] = []
 
     init(base: String) { self.base = base }
 
@@ -21,8 +25,6 @@ struct DictationTranscript: Equatable {
         return ChatDictation.merging(draft: base, transcript: heard)
     }
 
-    // startsNewUtterance: the recognizer began a new utterance without first
-    // marking the last one final; keep what was heard rather than drop it.
     // Whether a result begins a new utterance the recognizer did not mark
     // final. Only real, advancing timing counts: on-device partial results
     // often carry zero timestamps and durations, and an ordinary revision
@@ -30,10 +32,17 @@ struct DictationTranscript: Equatable {
     // Segments are (start, end) in seconds; previousEnd is where the last
     // result's speech ended.
     static let utteranceGap: TimeInterval = 0.3
+    // Without word timing, a restart also needs a real silence: no result for
+    // at least this long. A correction ("some thing" -> "something") arrives
+    // while the person is still speaking, well inside it.
+    static let pauseGap: TimeInterval = 0.6
     nonisolated static func startsNewUtterance(previousEnd: TimeInterval?, segments: [(TimeInterval, TimeInterval)],
-                                               live: String, text: String) -> Bool {
+                                               live: String, text: String, sinceLastResult: TimeInterval? = nil) -> Bool {
         guard let previousEnd, previousEnd > 0, let first = segments.first,
-              first.0 > 0, first.1 > first.0 else { return false }
+              first.0 > 0, first.1 > first.0 else {
+            guard let sinceLastResult, sinceLastResult >= pauseGap else { return false }
+            return restartsWithoutTiming(live: live, text: text)
+        }
         guard first.0 >= previousEnd + utteranceGap else { return false }
         // Only text that extends everything already live is a continuation;
         // two utterances may share a first word ("I need milk", "I also need
@@ -44,17 +53,62 @@ struct DictationTranscript: Equatable {
         return liveText.isEmpty || !normalize(text).hasPrefix(liveText)
     }
 
+    // On device, a pause often ends an utterance with neither isFinal nor
+    // timing: the next partial simply restarts from empty ("Before the
+    // pause" -> "After"). Read that from the words. A revision rewrites the
+    // live words in place, so it keeps the same first word or extends them;
+    // a restart is shorter and begins differently.
+    nonisolated static func restartsWithoutTiming(live: String, text: String) -> Bool {
+        let liveWords = words(live), textWords = words(text)
+        guard liveWords.count >= 2, !textWords.isEmpty, textWords.count < liveWords.count,
+              textWords.first != liveWords.first else { return false }
+        return !liveWords.starts(with: textWords)
+    }
+
+    nonisolated static func words(_ value: String) -> [String] {
+        value.lowercased().split(separator: " ").map { $0.filter { $0.isLetter || $0.isNumber } }.filter { !$0.isEmpty }
+    }
+
     // The end of the speech in a result, if its timing is set.
     nonisolated static func speechEnd(of segments: [(TimeInterval, TimeInterval)]) -> TimeInterval? {
         guard let end = segments.last?.1, end > 0 else { return nil }
         return end
     }
 
-    mutating func receive(_ text: String, isFinal: Bool, startsNewUtterance: Bool = false) -> String {
-        if startsNewUtterance, !live.isEmpty { finished.append(live); live = "" }
-        live = text
-        if isFinal { finished.append(live); live = "" }
+    // The request failed (after a long silence iOS reports "no speech"): keep
+    // what it heard; the next request starts a fresh segment. Its results are
+    // not cumulative with the failed request's, so the utterances that
+    // request ended are no longer repeats to strip (as after a final result).
+    mutating func endSegment() -> String {
+        if !live.isEmpty { finished.append(live); live = "" }
+        requestCommitted = []
         return draft
+    }
+
+    // endsUtterance: iOS marked this result as the end of an utterance
+    // (speech metadata) without finishing the request; the next result
+    // starts the next utterance.
+    mutating func receive(_ text: String, isFinal: Bool, startsNewUtterance: Bool = false, endsUtterance: Bool = false) -> String {
+        if startsNewUtterance, !live.isEmpty { finished.append(live); live = "" }
+        live = Self.droppingRepeat(of: requestCommitted.joined(separator: " "), from: text)
+        if isFinal {
+            finished.append(live); live = ""
+            requestCommitted = []
+        } else if endsUtterance {
+            finished.append(live); requestCommitted.append(live); live = ""
+        }
+        return draft
+    }
+
+    // A result that repeats the utterance already kept ("Before the pause.
+    // After") keeps only what is new, so nothing appears twice.
+    nonisolated static func droppingRepeat(of kept: String, from text: String) -> String {
+        let keptWords = words(kept)
+        guard !keptWords.isEmpty else { return text }
+        let tokens = text.split(separator: " ", omittingEmptySubsequences: true)
+        let normalized = tokens.map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
+        guard normalized.count >= keptWords.count, Array(normalized.prefix(keptWords.count)) == keptWords else { return text }
+        return tokens.dropFirst(keptWords.count).joined(separator: " ")
     }
 }
 
@@ -84,9 +138,14 @@ final class ChatDictation {
     @ObservationIgnored private var recognizer: SFSpeechRecognizer?
     @ObservationIgnored private let requestBox = DictationRequestBox()
     @ObservationIgnored private var lastSegmentEnd: TimeInterval?
+    // When the last result arrived; the silence before a result is evidence
+    // of a pause when the recognizer gives no timing.
+    @ObservationIgnored private var lastResultAt: Date?
     // The recognition request whose results count; a finalized segment or a
     // new session replaces it, and late results from the old one are ignored.
     @ObservationIgnored private var recognitionID = UUID()
+    @ObservationIgnored private var requestStartedAt = Date()
+    @ObservationIgnored private var quickFailures = 0
 
     func start(draft: String, update: @escaping (String) -> Void) async {
         guard !isListening, !isStarting else { return }
@@ -97,6 +156,8 @@ final class ChatDictation {
         defer { if self.generation == generation { isStarting = false } }
         transcript = DictationTranscript(base: draft)
         lastSegmentEnd = nil
+        requestStartedAt = Date()
+        quickFailures = 0
         #if DEBUG
         // The owner's report: dictate, pause about a second (iOS marks that
         // segment final), then keep talking. Replayed through the same
@@ -104,14 +165,36 @@ final class ChatDictation {
         if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-pause-fixture") {
             self.updateDraft = update
             isListening = true
+            // With --ui-dictation-silence, a long silence follows: the waiting
+            // request fails with no text ("no speech"), then speech resumes.
+            let silence = ProcessInfo.processInfo.arguments.contains("--ui-dictation-silence")
             Task {
-                let script: [(String, Bool, Int)] = [
-                    ("Before the pause", false, 200), ("Before the pause.", true, 200),
-                    ("After", false, 1200), ("After the pause it continues.", false, 200)
+                var script: [(String?, Bool, Bool, Int)] = [
+                    ("Before the pause", false, false, 200), ("Before the pause.", true, false, 200),
+                    ("After", false, false, 1200), ("After the pause it continues.", false, false, 200)
                 ]
-                for (text, isFinal, delay) in script {
+                if silence { script += [(nil, false, true, 2500), ("Still here.", false, false, 300)] }
+                for (text, isFinal, failed, delay) in script {
                     try? await Task.sleep(for: .milliseconds(delay))
-                    handle(text: text, isFinal: isFinal, failed: false, generation: generation)
+                    handle(text: text, isFinal: isFinal, failed: failed, generation: generation)
+                }
+            }
+            return
+        }
+        // The same report on device: the pause ends the utterance without
+        // isFinal or timing, and the next partial restarts from empty.
+        if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-restart-fixture") {
+            self.updateDraft = update
+            isListening = true
+            Task {
+                let script: [(String, Int)] = [
+                    ("Before", 200), ("Before the pause", 200), ("After", 1200), ("After the pause it continues.", 200)
+                ]
+                for (text, delay) in script {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    let fresh = DictationTranscript.startsNewUtterance(previousEnd: nil, segments: [], live: transcript.live, text: text,
+                                                                       sinceLastResult: Double(delay) / 1000)
+                    handle(text: text, isFinal: false, failed: false, startsNewUtterance: fresh, generation: generation)
                 }
             }
             return
@@ -174,6 +257,7 @@ final class ChatDictation {
     // One recognition request on the running microphone. A finalized segment
     // starts the next one; the microphone and audio session stay on.
     private func beginRecognition(generation: UUID) {
+        requestStartedAt = Date()
         guard let recognizer else { return }
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.requiresOnDeviceRecognition = true
@@ -182,6 +266,7 @@ final class ChatDictation {
         self.request = request
         requestBox.set(request)
         lastSegmentEnd = nil
+        lastResultAt = nil
         let recognitionID = UUID()
         self.recognitionID = recognitionID
         task = recognizer.recognitionTask(with: request) { @Sendable [weak self] result, failure in
@@ -189,6 +274,10 @@ final class ChatDictation {
             let finished = result?.isFinal == true
             let failed = failure != nil
             let segments = result?.bestTranscription.segments.map { ($0.timestamp, $0.timestamp + $0.duration) } ?? []
+            // iOS 17+ attaches speech metadata to the last result of an
+            // utterance, final or not.
+            let utteranceEnded = result?.speechRecognitionMetadata != nil
+            let arrivedAt = Date()
             Task { @MainActor [weak self] in
                 // Before touching any state, timing included: a late result from
                 // a stopped session or a replaced request must change nothing.
@@ -196,9 +285,12 @@ final class ChatDictation {
                 // A result that begins after everything heard so far ended is a
                 // new utterance, even if iOS did not mark the last one final.
                 let newUtterance = DictationTranscript.startsNewUtterance(
-                    previousEnd: self.lastSegmentEnd, segments: segments, live: self.transcript.live, text: text ?? "")
+                    previousEnd: self.lastSegmentEnd, segments: segments, live: self.transcript.live, text: text ?? "",
+                    sinceLastResult: self.lastResultAt.map { arrivedAt.timeIntervalSince($0) })
+                self.lastResultAt = arrivedAt
                 if let end = DictationTranscript.speechEnd(of: segments) { self.lastSegmentEnd = end }
-                self.handle(text: text, isFinal: finished, failed: failed, startsNewUtterance: newUtterance, generation: generation)
+                self.handle(text: text, isFinal: finished, failed: failed, startsNewUtterance: newUtterance,
+                            endsUtterance: utteranceEnded, generation: generation)
             }
         }
     }
@@ -206,12 +298,38 @@ final class ChatDictation {
     // One recognizer result, real or replayed by a UI test fixture. A pause
     // finalizes a segment; that is never the end of dictation: only Stop (or
     // a real failure) ends it, and nothing is ever sent automatically.
-    private func handle(text: String?, isFinal: Bool, failed: Bool, startsNewUtterance: Bool = false, generation: UUID) {
+    private func handle(text: String?, isFinal: Bool, failed: Bool, startsNewUtterance: Bool = false,
+                        endsUtterance: Bool = false, generation: UUID) {
         guard self.generation == generation else { return }
-        if let text { updateDraft?(transcript.receive(text, isFinal: isFinal, startsNewUtterance: startsNewUtterance)) }
+        if let text {
+            updateDraft?(transcript.receive(text, isFinal: isFinal, startsNewUtterance: startsNewUtterance, endsUtterance: endsUtterance))
+            if !text.isEmpty { quickFailures = 0 }
+        }
         if failed {
-            stop()
-            if text == nil { error = "Dictation stopped. Your draft is saved; tap the microphone to try again." }
+            let decision = Self.failureEndsDictation(listenedFor: Date().timeIntervalSince(requestStartedAt),
+                                                     quickFailures: quickFailures,
+                                                     microphoneRunning: engine.map { $0.isRunning } ?? true)
+            quickFailures = decision.quickFailures
+            if decision.ends {
+                stop()
+                error = "Dictation stopped. Your draft is saved; tap the microphone to try again."
+                return
+            }
+            updateDraft?(transcript.endSegment())
+            task = nil
+            request = nil
+            requestBox.set(nil)
+            // Retire the failed request now, not when the retry starts: a
+            // callback it already queued must not reach the draft or retry.
+            recognitionID = UUID()
+            guard decision.quickFailures > 0 else { return beginRecognition(generation: generation) }
+            // Give a recognizer that just failed a moment before the next try.
+            let delay = Self.retryDelay(afterQuickFailures: decision.quickFailures)
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(delay))
+                guard let self, self.generation == generation, self.isListening else { return }
+                self.beginRecognition(generation: generation)
+            }
         } else if isFinal {
             task = nil
             request = nil
@@ -244,6 +362,19 @@ final class ChatDictation {
         ownsAudioSession = false
         isListening = false
     }
+
+    // A failed request after a long silence ("no speech") is replaced on the
+    // running microphone. Dictation ends only if the microphone stopped or
+    // requests keep failing as soon as they start.
+    nonisolated static let quickFailure: TimeInterval = 1.5
+    nonisolated static let quickFailureLimit = 3
+    nonisolated static func failureEndsDictation(listenedFor elapsed: TimeInterval, quickFailures: Int,
+                                                 microphoneRunning: Bool) -> (ends: Bool, quickFailures: Int) {
+        let count = elapsed < quickFailure ? quickFailures + 1 : 0
+        return (!microphoneRunning || count >= quickFailureLimit, count)
+    }
+
+    nonisolated static func retryDelay(afterQuickFailures count: Int) -> Int { 250 * max(1, count) }
 
     nonisolated static func merging(draft: String, transcript: String) -> String {
         guard !draft.isEmpty, !transcript.isEmpty else { return draft + transcript }

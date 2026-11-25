@@ -111,19 +111,25 @@ test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlie
       at: new Date().toISOString(),
       detail: "Paseo message and turn confirmed"
     };
+    const actions = [earlier];
+    let landsDuringSend = null;
     const runtime = {
       events: { emit() {} },
       nodeCapabilities: {
         async dispatch(_nodeId, _cap, _op, payload) {
-          if (payload.path === "/fleet/api/send") throw sendError;
+          if (payload.path === "/fleet/api/send") {
+            // The computer journals this send's receipt, then its reply is lost.
+            if (landsDuringSend) { actions.push(landsDuringSend); landsDuringSend = null; }
+            throw sendError;
+          }
           if (payload.path === "/fleet/api/state") {
-            return { state: { mode: "auto", questions: [], actions: [earlier], settings: {} }, response: { status: 200, body: { ok: true } } };
+            return { state: { mode: "auto", questions: [], actions: [...actions], settings: {} }, response: { status: 200, body: { ok: true } } };
           }
           throw new Error("unexpected");
         }
       }
     };
-    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir });
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir, sendRetryDelaysMs: [0, 0] });
 
     // A different message timing out must not borrow the earlier receipt.
     await assert.rejects(() => remote.sendOwnerMessage(threadKey, "Second instruction"), (err) => err.reached === false);
@@ -133,11 +139,17 @@ test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlie
     sendError = new Error("Node is offline");
     await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
 
-    // The same message timing out is reconciled to its own receipt.
+    // The same text sent again on purpose: the receipt that already existed
+    // is the earlier send's and is never borrowed (#350 review).
     sendError = new Error("Node command timed out after 300s");
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
+
+    // The same message timing out is reconciled to its own receipt: the one
+    // the computer journaled while handling this request.
+    landsDuringSend = { ...earlier, id: "act_this_send", at: new Date().toISOString() };
     const res = await remote.sendOwnerMessage(threadKey, "First instruction");
     assert.equal(res.reconciledAfterTimeout, true);
-    assert.equal(res.delivery.actionId, "act_earlier");
+    assert.equal(res.delivery.actionId, "act_this_send");
   });
 });
 
@@ -834,5 +846,67 @@ test("upsert_goal cursor-only update keeps the saved owner, cadence and nudge po
     // A brand-new goal still gets the creation defaults.
     const fresh = await upsert.handler({ project: "BuildBetter", goal: "A different goal", doneCriteria: "done" });
     assert.equal(fresh.activeWorkItem.permittedNudges, "resume_owner");
+  });
+});
+
+test("owner send recovered into a replacement session watches the replacement, not the disconnected original", async () => {
+  await withTempDir(async (dir) => {
+    const original = {
+      key: "paseo:srv_mac.old_owner",
+      kind: "paseo",
+      id: "old_owner",
+      title: "Unified Work view",
+      workspace: "openagi",
+      repo: "acme/openagi",
+      agentStatus: "idle",
+      archived: false,
+      excluded: null,
+      lastActivityAt: "2026-11-22T17:00:00Z",
+      lastAgentAt: "2026-11-22T17:00:00Z",
+      lastAgentText: "Earlier unrelated work finished.",
+      lastAgentFull: "Earlier unrelated work finished.",
+      prRefs: [],
+      meta: { serverId: "srv_mac", provider: "codex", historyKnown: true, conversation: [] }
+    };
+    const sup = new FleetSupervisor({
+      dataDir: dir,
+      env: {
+        OPENAGI_FLEET_ENABLED: "1",
+        OPENAGI_FLEET_MODE: "auto",
+        OPENAGI_PASEO_ONLY: "1",
+        OPENAGI_FLEET_REVIEW: "0"
+      },
+      deps: {
+        now: () => Date.parse("2026-11-22T17:12:00Z"),
+        listPaseoThreads: async () => [original],
+        fetchPrs: async () => new Map(),
+        executor: {
+          async deliver() {
+            return {
+              status: "sent",
+              route: "paseo-send",
+              actionId: "act_recovered",
+              recoveredSession: { key: "paseo:srv_mac.new_owner", title: "Unified Work view (resumed)", workspace: "openagi", cwd: "/tmp/openagi" },
+              detail: "Session runtime disconnected; started fresh Paseo session and delivered message"
+            };
+          }
+        }
+      }
+    });
+    const tracked = sup.activeWork.trackWork({
+      project: "openagi",
+      goal: "Ship the unified Work view",
+      threadKey: original.key,
+      permittedNudges: "resume_owner"
+    });
+    await sup._tick("test");
+
+    const sent = await sup.sendOwnerMessage(original.key, "Ship the unified Work view");
+    assert.equal(sent.delivery.status, "sent");
+    assert.equal(sent.delivery.recoveredSession.key, "paseo:srv_mac.new_owner");
+    const watches = sup.store.openFollowThroughWatches();
+    assert.equal(watches.length, 1);
+    assert.equal(watches[0].threadKey, "paseo:srv_mac.new_owner", "verification follows the session that received the directive");
+    assert.equal(watches[0].goalId, tracked.item.id, "the watch stays bound to the goal tracked on the original owner");
   });
 });

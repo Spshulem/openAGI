@@ -1,5 +1,6 @@
 import path from "node:path";
 import { PebbleWebhook } from "./integrations/pebble.js";
+import { PebblePeriReceiver, PEBBLE_PERI_MAX_BODY_BYTES, WEBHOOK_PATH as PEBBLE_PERI_PATH } from "./integrations/pebble-peri.js";
 import { saveEnv } from "./setup-wizard.js";
 import { MESSAGING_CONFIG_KEYS, MESSAGING_PROVIDERS } from "./integrations/messaging-config.js";
 
@@ -22,15 +23,52 @@ async function bodyJson(req) {
   throw Object.assign(new Error("Expected a JSON object."), { status: 400 });
 }
 
-export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin, env = process.env, pebble } = {}) {
+// Index 01 transcripts travel only over HTTPS. The configured public origin
+// must be https, and the request must arrive over TLS or from a loopback
+// TLS-terminating proxy (cloudflared, tailscale serve) that did not report
+// plain http. Proxy headers grant no other trust.
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+export function pebbleTransportSecure(req, origin) {
+  if (!String(origin ?? "").startsWith("https://")) return false;
+  if (req.socket?.encrypted) return true;
+  const proto = req.headers["x-forwarded-proto"];
+  return LOOPBACK.has(req.socket?.remoteAddress) && (proto === undefined || proto === "https");
+}
+
+export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin, env = process.env, pebble, pebblePeri } = {}) {
   const index = pebble ?? new PebbleWebhook({ runtime, dir: path.join(dataDir, "pebble"), env });
+  const peri = pebblePeri ?? new PebblePeriReceiver({ runtime, dir: path.join(dataDir, "pebble"),
+    getAgentHost: () => runtime.agentHost ?? getChannels()?.agentHost ?? null });
   if (runtime.google) runtime.google.saveCredentials = values => saveEnv({ dataDir, values });
   return async (req, res, url) => {
     const { pathname } = url, method = req.method;
     const known = ["/connections/config", "/sharing/contacts", "/sharing/groups", "/sharing/revoke", "/sharing/retry", "/integrations/google/connect", "/integrations/google/callback", "/integrations/google/disconnect", "/channels/sendblue/webhook", ...WEBHOOKS.keys(), "/webhooks/pebble"];
-    if (!known.includes(pathname)) return false;
+    const periWebhook = PEBBLE_PERI_PATH.exec(pathname);
+    const periOwnerRoutes = ["/pebble/peri/devices", "/pebble/peri/devices/rotate", "/pebble/peri/devices/revoke", "/pebble/peri/notes"];
+    if (!known.includes(pathname) && !periWebhook && !periOwnerRoutes.includes(pathname)) return false;
     const channels = getChannels();
     try {
+      if (periWebhook) {
+        if (method !== "POST") { json(res, 405, { error: "method_not_allowed" }); return true; }
+        if (!pebbleTransportSecure(req, getOrigin())) { json(res, 403, { error: "https_required" }); return true; }
+        const declared = Number(req.headers["content-length"]);
+        if (Number.isFinite(declared) && declared > PEBBLE_PERI_MAX_BODY_BYTES) { json(res, 413, { error: "payload_too_large" }); return true; }
+        const result = await peri.handle(periWebhook[1], req.headers, await rawBody(req, PEBBLE_PERI_MAX_BODY_BYTES));
+        json(res, result.status, result.body); return true;
+      }
+      if (periOwnerRoutes.includes(pathname)) {
+        res.setHeader("referrer-policy", "no-referrer");
+        if (pathname === "/pebble/peri/devices" && method === "GET") { json(res, 200, peri.status(getOrigin())); return true; }
+        if (pathname === "/pebble/peri/notes" && method === "GET") { json(res, 200, { notes: peri.notes() }); return true; }
+        if (method !== "POST") { json(res, 405, { error: "method_not_allowed" }); return true; }
+        const body = await bodyJson(req);
+        if (pathname === "/pebble/peri/devices") {
+          if (!String(getOrigin()).startsWith("https://")) { json(res, 409, { error: "https_public_url_required", message: "Set OPENAGI_PUBLIC_URL to an https:// origin first. Index 01 transcripts are only accepted over HTTPS." }); return true; }
+          json(res, 201, peri.provision({ label: body.label }, getOrigin())); return true;
+        }
+        if (typeof body.id !== "string") throw Object.assign(new Error("Choose a Pebble device."), { status: 400 });
+        json(res, 200, pathname.endsWith("/rotate") ? peri.rotate(body.id, getOrigin()) : peri.revoke(body.id)); return true;
+      }
       if (WEBHOOKS.has(pathname) && method === "POST") {
         const provider = WEBHOOKS.get(pathname), channel = channels?.[provider];
         if (!channel) { json(res, 503, { error: "sharing_unavailable" }); return true; }
@@ -69,7 +107,7 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
         res.writeHead(303, { location: "/connections", "cache-control": "no-store", "referrer-policy": "no-referrer" }); res.end(); return true;
       }
       if (pathname === "/connections/config" && method === "GET") {
-        json(res, 200, { configured: Object.fromEntries(CONFIG_KEYS.map(key => [key, Boolean(env[key])])), google: runtime.google?.status() ?? { configured: false }, sendblue: channels?.sendblue?.status() ?? { configured: false }, ...Object.fromEntries(MESSAGING_PROVIDERS.map(({ id }) => [id, channels?.[id]?.status() ?? { configured: false }])), pebble: index.status(), sharing: channels?.sharing?.status() ?? { contacts: [], groups: [] }, origin: getOrigin() }); return true;
+        json(res, 200, { configured: Object.fromEntries(CONFIG_KEYS.map(key => [key, Boolean(env[key])])), google: runtime.google?.status() ?? { configured: false }, sendblue: channels?.sendblue?.status() ?? { configured: false }, ...Object.fromEntries(MESSAGING_PROVIDERS.map(({ id }) => [id, channels?.[id]?.status() ?? { configured: false }])), pebble: index.status(), pebblePeri: peri.status(getOrigin()), sharing: channels?.sharing?.status() ?? { contacts: [], groups: [] }, origin: getOrigin() }); return true;
       }
       if (pathname === "/connections/config" && method === "POST") {
         const body = await bodyJson(req);
@@ -101,7 +139,7 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
       }
       json(res, 405, { error: "method_not_allowed" }); return true;
     } catch (error) {
-      const webhook = WEBHOOKS.has(pathname) || ["/channels/sendblue/webhook", "/webhooks/pebble"].includes(pathname);
+      const webhook = WEBHOOKS.has(pathname) || ["/channels/sendblue/webhook", "/webhooks/pebble"].includes(pathname) || Boolean(periWebhook);
       // Provider webhooks never receive model errors, private content or keys.
       json(res, error.status ?? (webhook ? 503 : 400), { error: webhook ? "webhook_failed" : error.message }); return true;
     }
@@ -119,7 +157,8 @@ ${providerForms}
 <form id="contact"><label>Partner name<input name="name" required maxlength="100"></label><label>Partner phone number<input name="number" required placeholder="+15555550101"></label><button>Approve contact</button></form><ul id="contacts"></ul>
 <details><summary>Approve an existing group</summary><p>Add the agent number to an iMessage group, then copy its group/chat ID from Sendblue or Linq. Approve every participant’s phone number. Linq checks current membership before reading group memory and again before sending.</p><form id="group"><label>Provider<select name="provider"><option value="sendblue">Sendblue</option><option value="linq">Linq</option></select></label><label>Group name<input name="name" required></label><label>Group / chat ID<input name="groupId" required></label><button>Approve group</button></form><ul id="groups"></ul></details></section>
 <section><h2>Gmail &amp; Google Calendar</h2><p>Create a Web application OAuth client in <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud</a>. Enable Gmail API and Google Calendar API, configure the consent screen, add your account as a test user, and allow this redirect URI: <code data-url="/integrations/google/callback"></code>.</p><form id="google"><label>OAuth client ID<input name="GOOGLE_CLIENT_ID" autocomplete="off"></label><label>OAuth client secret<input name="GOOGLE_CLIENT_SECRET" type="password" autocomplete="off"></label><button>Save Google client</button></form><button id="connect-google" type="button">Connect Google</button><button id="disconnect-google" type="button">Disconnect Google</button><p>Try “Find unread emails from my accountant” or “Draft an email to…” after connecting. Email sends and event invitations require your authorization.</p></section>
-<section><h2>Pebble Index</h2><p>In Index 01 → Webhook, use <code data-url="/webhooks/pebble"></code>, choose <b>Transcription only</b> or <b>Both</b>, and enable <b>Sign requests</b> with the secret below. Tap <b>Send test event</b>, then save. Voice memos go to memory; “remind me to…” also creates a task. Imported tasks do not schedule notifications.</p><form id="pebble"><label>Signing secret<input name="PEBBLE_WEBHOOK_SECRET" type="password" autocomplete="off"></label><button>Save Pebble</button></form></section>
+<section><h2>Pebble Index (memo import)</h2><p>In Index 01 → Webhook, use <code data-url="/webhooks/pebble"></code>, choose <b>Transcription only</b> or <b>Both</b>, and enable <b>Sign requests</b> with the secret below. Tap <b>Send test event</b>, then save. Voice memos go to memory; “remind me to…” also creates a task. Imported tasks do not schedule notifications.</p><form id="pebble"><label>Signing secret<input name="PEBBLE_WEBHOOK_SECRET" type="password" autocomplete="off"></label><button>Save Pebble</button></form></section>
+<section><h2>Pebble Index 01 → Peri</h2><p>Talk to Peri with <b>Double click &amp; hold</b>. <b>Hold &amp; talk</b> stays in Pebble notes, so do not configure it here. Each ring gets its own signed HTTPS webhook and a private chat in the iPhone app’s Agent list. Start a recording with “keep this note” to save a private note, or “remember this” to save to private memory. Anything else gets a reply in the chat and is not saved. Recordings cannot approve, run tools or act for you.</p><p>Requires an <code>https://</code> OPENAGI_PUBLIC_URL. The secret is shown once: copy it straight into the Pebble app. Never paste it into a chat.</p><form id="pebble-peri"><label>Ring name<input name="label" maxlength="60" placeholder="Pebble Index 01"></label><button>Add Index 01</button></form><div id="pebble-peri-secret" hidden><p><b>Shown once.</b> In the Pebble app: Index 01 → Webhooks → Double click &amp; hold.</p><label>URL<input id="pebble-peri-url" readonly></label><label>Signing secret<input id="pebble-peri-key" type="password" readonly></label><button type="button" id="pebble-peri-copy-url">Copy URL</button><button type="button" id="pebble-peri-copy-key">Copy secret</button><button type="button" id="pebble-peri-done">Done</button></div><ul id="pebble-peri-devices"></ul><p><a href="/pebble/peri/notes">Pebble notes (JSON)</a></p></section>
 <section><h2>Daily routines &amp; subagents</h2><p>Try “Every day at 9am, search my inbox for invoices, run my invoice-review skill, and summarize what needs my attention.” Review the resulting schedule under Cron. It runs in the daemon’s timezone while the daemon is running. Scheduled actions still use the approval queue.</p><p>Try “Use a subagent to research these three options and return the sources.” Subagents use selected read-only tools and share your daily model budget.</p></section>
 <script>
 const status=document.querySelector('#status');
@@ -131,6 +170,14 @@ for(const [id,url]of [['contact','/sharing/contacts'],['group','/sharing/groups'
 document.getElementById('connect-google').onclick=()=>call('/integrations/google/connect',{}).then(d=>location.assign(d.url)).catch(error);
 document.getElementById('disconnect-google').onclick=()=>call('/integrations/google/disconnect',{}).then(refresh).catch(error);
 document.getElementById('retry-messaging').onclick=()=>call('/sharing/retry',{}).then(refresh).catch(error);
+const periBox=document.getElementById('pebble-peri-secret');
+function showPeri(d){document.getElementById('pebble-peri-url').value=d.device.url;document.getElementById('pebble-peri-key').value=d.secret;periBox.hidden=false;}
+document.getElementById('pebble-peri-copy-url').onclick=()=>navigator.clipboard.writeText(document.getElementById('pebble-peri-url').value).catch(error);
+document.getElementById('pebble-peri-copy-key').onclick=()=>navigator.clipboard.writeText(document.getElementById('pebble-peri-key').value).catch(error);
+document.getElementById('pebble-peri-done').onclick=()=>{document.getElementById('pebble-peri-key').value='';document.getElementById('pebble-peri-url').value='';periBox.hidden=true;};
+document.getElementById('pebble-peri').onsubmit=async e=>{e.preventDefault();try{showPeri(await call('/pebble/peri/devices',Object.fromEntries(new FormData(e.target))));e.target.reset();await refreshPeri();}catch(e){error(e);}};
+async function refreshPeri(){const d=await call('/pebble/peri/devices');const list=document.getElementById('pebble-peri-devices');list.replaceChildren();for(const item of d.devices){const li=document.createElement('li');li.textContent=item.label+' · test '+(item.lastTestAt?'verified '+item.lastTestAt:'not yet received')+' · last recording '+(item.lastDeliveryAt||'none')+(item.ignoredHoldAndTalk?' · '+item.ignoredHoldAndTalk+' Hold & talk deliveries ignored':'')+' ';for(const [label,url,show]of [['Rotate secret','/pebble/peri/devices/rotate',true],['Revoke','/pebble/peri/devices/revoke',false]]){const b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=()=>call(url,{id:item.id}).then(r=>{if(show)showPeri(r);return refreshPeri();}).catch(error);li.append(b);}list.append(li);}}
+refreshPeri().catch(error);
 refresh().catch(error);
 </script></html>`;
 }

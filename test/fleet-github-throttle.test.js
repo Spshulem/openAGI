@@ -230,3 +230,173 @@ test("a delayed same-window response never lifts a newer cooldown; a later windo
   throttle.observe(answer(4900, "2026-11-22T22:00:37Z"));
   assert.equal(throttle.current(), null, "a new window lifts it");
 });
+
+// Review fix (#351): the fleet query reads PR bodies and comments. A PR that
+// discusses rate limits is repository content, not GitHub refusing a call.
+test("a successful answer that mentions a rate limit in PR text starts no cooldown", () => {
+  const throttle = new GithubThrottle({ now: () => T0 });
+  const body = JSON.stringify({ data: {
+    rateLimit: { remaining: 4200, resetAt: RESET },
+    r0: { p1: { title: "Handle the secondary rate limit", body: "GraphQL: API rate limit already exceeded; abuse detection; retry-after: 120" } }
+  } });
+  assert.equal(throttle.observe({ code: 0, stdout: body, stderr: "" }), null);
+  assert.equal(throttle.current(), null);
+  // The same words as GitHub's own structured error do start one.
+  assert.equal(throttle.observe({ code: 1, stdout: JSON.stringify({ errors: [{ type: "RATE_LIMIT", message: "API rate limit already exceeded" }] }), stderr: "" })?.kind, "primary");
+  // A timeout is a failure: its stderr may name the throttle.
+  const timedOut = new GithubThrottle({ now: () => T0 });
+  assert.equal(timedOut.observe({ code: null, timedOut: true, stdout: "", stderr: "You have exceeded a secondary rate limit" })?.kind, "secondary");
+});
+
+// Review fix (#351): 90 points left, then 0 with the same reset, used to
+// stay a background-only low-budget hold, so owner merges kept calling.
+test("a used-up budget upgrades a low-budget hold so owner actions stop too", () => {
+  const throttle = new GithubThrottle({ now: () => T0 });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: RESET } } }) });
+  assert.equal(throttle.current()?.kind, "low-budget");
+  assert.equal(throttle.blocking({ background: false }), null, "low budget leaves owner actions alone");
+  throttle.observe({ code: 1, stdout: PRIMARY_JSON, stderr: PRIMARY_TEXT });
+  assert.equal(throttle.current()?.kind, "primary");
+  assert.notEqual(throttle.blocking({ background: false }), null, "a used-up budget stops owner actions");
+  assert.equal(Date.parse(throttle.current().until) >= Date.parse(RESET), true, "the later deadline is kept");
+  assert.equal(throttle.needsProbe(), false, "the reset is already known: no probe spent");
+  // A primary error with no reset of its own also upgrades, keeping the window.
+  const vague = new GithubThrottle({ now: () => T0 });
+  vague.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: RESET } } }) });
+  vague.observe({ code: 1, stdout: "", stderr: PRIMARY_TEXT });
+  assert.equal(vague.current()?.kind, "primary");
+  assert.equal(vague.current().windowResetAt, new Date(Date.parse(RESET)).toISOString());
+  assert.notEqual(vague.blocking({ background: false }), null);
+});
+
+// Review fix (#351): a secondary limit (retry-after 120) and then a low-budget
+// answer (90 points, reset 30 minutes away) from a concurrent read used to
+// turn the hold into low-budget, letting owner merges call GitHub during its
+// explicit Retry-After. The stronger hold stays; the weaker one follows it.
+test("a weaker, longer observation never replaces a stronger hold; it follows it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  assert.equal(throttle.current().kind, "secondary");
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  assert.equal(throttle.current().kind, "secondary", "the stronger hold stays");
+  assert.notEqual(throttle.blocking({ background: false }), null, "owner actions stay stopped through Retry-After");
+  // After GitHub's retry-after, the low budget still holds background polling.
+  c.now.value = T0 + 121_000;
+  assert.equal(throttle.current()?.kind, "low-budget");
+  assert.equal(throttle.blocking({ background: false }), null, "owner actions may run again");
+  assert.notEqual(throttle.blocking({ background: true }), null, "background polling still waits");
+  // After the window resets, nothing holds.
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(throttle.current(), null);
+  // A weaker observation that ends sooner than the stronger hold is dropped.
+  const short = new GithubThrottle({ now: () => T0 });
+  short.observe({ code: 1, stderr: PRIMARY_TEXT, stdout: JSON.stringify({ errors: [{ type: "RATE_LIMIT", message: "API rate limit already exceeded" }], data: { rateLimit: { remaining: 0, resetAt: RESET } } }) });
+  const held = short.current();
+  short.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: new Date(T0 + 60_000).toISOString() } } }) });
+  assert.equal(short.current().kind, held.kind);
+  assert.equal(short.current().then, undefined);
+});
+
+// Review fix (#351): secondary (120 s), then low budget with a later reset,
+// then another secondary extending the hold to 240 s used to drop the queued
+// low-budget hold, so background polling resumed after four minutes despite
+// the known low budget.
+test("extending a hold keeps the weaker hold queued to follow it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  throttle.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  assert.equal(throttle.current().kind, "secondary");
+  const slowUntil = Date.parse(throttle.current().until);
+  assert.equal(slowUntil > T0 + 120_000, true, "the second secondary extends the hold");
+  c.now.value = slowUntil + 1000;
+  assert.equal(throttle.current()?.kind, "low-budget", "background polling still waits for the reset");
+  assert.notEqual(throttle.blocking({ background: true }), null);
+  assert.equal(throttle.blocking({ background: false }), null);
+});
+
+// Review fix (#351): a 15-minute secondary hold, then a low budget resetting
+// in 30 minutes, then a used-up budget with no reset time: once the slow-down
+// ends, owner actions must still wait for that window's reset.
+test("a used-up budget seen during a slow-down still stops owner actions after it", () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  throttle.enter("secondary", { retryAfterSec: 900 });
+  throttle.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  throttle.observe({ code: 1, stdout: "", stderr: PRIMARY_TEXT });
+  assert.equal(throttle.needsProbe(), false, "no probe while GitHub asked to slow down");
+  c.now.value = T0 + 15 * 60_000 + 1000;
+  const held = throttle.blocking({ background: false });
+  assert.notEqual(held, null, "owner actions stay stopped: the budget is used up");
+  assert.equal(held.kind, "primary");
+  assert.equal(Date.parse(held.until) >= Date.parse(laterReset), true, "until that window's known reset");
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(throttle.blocking({ background: false }), null);
+  assert.equal(throttle.current(), null);
+});
+
+// The single-hold file an earlier version wrote still loads.
+test("a hold saved in the earlier single-hold format is read after an upgrade", (t) => {
+  const file = path.join(tmp(t), "github-throttle.json");
+  const until = new Date(T0 + 10 * 60_000).toISOString();
+  fs.writeFileSync(file, JSON.stringify({ kind: "primary", until, since: new Date(T0).toISOString(), resetKnown: true, windowResetAt: until }));
+  const throttle = new GithubThrottle({ now: () => T0 + 60_000, file });
+  assert.equal(throttle.blocking({ background: false })?.kind, "primary");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).version ?? null, null, "untouched until the next change");
+});
+
+
+// Review fix (#351): a restart after the active hold ended but while its
+// queued hold still ran used to drop both, so background polling resumed in
+// a known low-budget window.
+test("a restart keeps a queued hold that is still running", (t) => {
+  const dir = tmp(t);
+  const file = path.join(dir, "github-throttle.json");
+  const c = clock();
+  const laterReset = new Date(T0 + 30 * 60_000).toISOString();
+  const before = new GithubThrottle({ now: c.fn, file });
+  before.observe({ code: 1, stderr: "You have exceeded a secondary rate limit\nretry-after: 120" });
+  before.observe({ code: 0, stdout: JSON.stringify({ data: { rateLimit: { remaining: 90, resetAt: laterReset } } }) });
+  c.now.value = T0 + 121_000;
+  const after = new GithubThrottle({ now: c.fn, file });
+  assert.equal(after.current()?.kind, "low-budget", "the queued hold took over across the restart");
+  assert.notEqual(after.blocking({ background: true }), null);
+  assert.equal(after.blocking({ background: false }), null);
+  // After the queued hold ends too, a restart starts clean.
+  c.now.value = Date.parse(laterReset) + 10_000;
+  assert.equal(new GithubThrottle({ now: c.fn, file }).current(), null);
+});
+
+// Review fix (#351): the reset probe itself can be refused with a secondary
+// limit (retry-after 900). Its error was dropped, leaving only the estimated
+// 5-minute primary hold, so owner actions resumed inside GitHub's slow-down.
+test("a secondary limit on the reset probe itself is kept, with no second probe", async () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  let probes = 0;
+  const run = async (_bin, args) => {
+    if (String(args.join(" ")).includes("rateLimit")) {
+      probes += 1;
+      return { code: 1, stdout: "", stderr: "You have exceeded a secondary rate limit\nretry-after: 900" };
+    }
+    return { code: 1, stdout: "", stderr: PRIMARY_TEXT };
+  };
+  const first = await throttledGh(run, "gh", ["api", "graphql", "-f", "query={ viewer { login } }"], {}, { throttle, background: false });
+  assert.equal(first.throttled, true);
+  assert.equal(probes, 1, "the used-up budget with no reset probed once");
+  // Past the estimated 5-minute primary hold, GitHub's 15-minute slow-down
+  // from the probe still stops owner actions.
+  c.now.value = T0 + 6 * 60_000;
+  const held = throttle.blocking({ background: false });
+  assert.notEqual(held, null);
+  assert.equal(held.kind, "secondary");
+  assert.equal(throttle.needsProbe(), false, "never probes again while slowed down");
+  c.now.value = T0 + 15 * 60_000 + 1000;
+  assert.equal(throttle.blocking({ background: false }), null);
+  assert.equal(probes, 1);
+});

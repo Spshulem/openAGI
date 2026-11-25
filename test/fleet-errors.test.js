@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyCodexErrorCode, classifyErrorText, parseResetAt, providerAuthDetail } from "../src/fleet/errors.js";
+import { classifyCodexErrorCode, classifyErrorText, parseResetAt, providerAuthDetail, retryHintAt } from "../src/fleet/errors.js";
 
 const now = new Date(2026, 8, 26, 1, 0, 0); // Sep 26 2026 01:00 local
 
@@ -26,7 +26,10 @@ test("classifies real Codex and codex-lb error strings", () => {
   assert.equal(classifyErrorText("unexpected status 502 Bad Gateway: Previous response owner account is unavailable; retry later.", now).kind, "lb");
   assert.equal(classifyErrorText("{\"message\":\"Invalid `previous_response_id`.\"}", now).kind, "lb");
   assert.equal(classifyErrorText("Missing environment variable: `CODEX_LB_API_KEY`.", now).kind, "lb");
-  assert.equal(classifyErrorText("Selected model is at capacity. Please try a different model.", now).kind, "model-limit");
+  // Capacity is transient (Codex's server_overloaded text), not a cap.
+  assert.equal(classifyErrorText("Selected model is at capacity. Please try a different model.", now).kind, "overloaded");
+  // A per-model cap still asks the owner to switch.
+  assert.equal(classifyErrorText("You've reached your Fable limit. Switch to another model to continue.", now).kind, "model-limit");
   assert.equal(classifyErrorText("stream disconnected before completion: stream closed before response.completed", now).kind, "network");
   const usage = classifyErrorText("You've hit your usage limit. Try again at Sep 27th, 2026 6:22 PM.", now);
   assert.equal(usage.kind, "usage-limit");
@@ -42,7 +45,7 @@ test("parseResetAt handles bare times rolling to tomorrow", () => {
 
 test("classifyCodexErrorCode maps codes and falls back to text", () => {
   assert.equal(classifyCodexErrorCode("usage_limit_exceeded", "You've hit your usage limit. Try again at 1:11 AM.", now).kind, "usage-limit");
-  assert.equal(classifyCodexErrorCode("server_overloaded", "Selected model is at capacity", now).kind, "model-limit");
+  assert.equal(classifyCodexErrorCode("server_overloaded", "Selected model is at capacity", now).kind, "overloaded");
   assert.equal(classifyCodexErrorCode("other", "unexpected status 503 Service Unavailable: No available accounts", now).kind, "lb");
   assert.equal(classifyCodexErrorCode("other", "weird thing", now).kind, "other");
   assert.equal(classifyCodexErrorCode(null, "", now), null);
@@ -88,7 +91,7 @@ test("explicit auth_not_found is provider-auth, never a generic 503 overload", (
   assert.equal(classifyErrorText("unexpected status 503 Service Unavailable", now).kind, "overloaded");
   assert.equal(classifyErrorText("unexpected status 503 Service Unavailable: server is overloaded", now).kind, "overloaded");
   assert.equal(classifyErrorText("unexpected status 503 Service Unavailable: No available accounts", now).kind, "lb");
-  assert.equal(classifyCodexErrorCode("server_overloaded", "Selected model is at capacity", now).kind, "model-limit");
+  assert.equal(classifyCodexErrorCode("server_overloaded", "Selected model is at capacity", now).kind, "overloaded");
   // Prose that merely talks about auth is not the structured code.
   assert.equal(classifyErrorText("Fixed the auth not found page in the login flow.", now), null);
 });
@@ -101,4 +104,19 @@ test("providerAuthDetail keeps only the provider and model names", () => {
   const noisy = providerAuthDetail("auth_not_found: no auth available (providers=codex, model=gpt-6.2-sol) Authorization: Bearer sk-live-abcdef0123456789 account=owner@example.com");
   assert.deepEqual(noisy, { providers: ["codex"], model: "gpt-6.2-sol" });
   assert.doesNotMatch(JSON.stringify(noisy), /sk-live|Bearer|example\.com/);
+});
+
+test("a transient failure's own retry hint becomes its reset time, bounded to an hour", () => {
+  const at = (text) => classifyErrorText(text, now);
+  assert.equal(at("unexpected status 503 Service Unavailable. Retry-After: 30").resetAt, new Date(now.getTime() + 30_000).toISOString());
+  assert.equal(at("429 Too Many Requests: try again in 2 minutes").resetAt, new Date(now.getTime() + 120_000).toISOString());
+  assert.equal(at("stream disconnected before completion; retry after 45 seconds").kind, "network");
+  assert.equal(at("stream disconnected before completion; retry after 45 seconds").resetAt, new Date(now.getTime() + 45_000).toISOString());
+  // No hint, an absurd one, or a zero: the policy's own backoff decides.
+  assert.equal(at("Selected model is at capacity. Please try a different model.").resetAt, null);
+  assert.equal(at("Overloaded. retry-after: 7200").resetAt, null);
+  assert.equal(at("Overloaded. retry-after: 0").resetAt, null);
+  assert.equal(retryHintAt("try again in 90 seconds", now), new Date(now.getTime() + 90_000).toISOString());
+  // A cap never takes a retry hint as its reset.
+  assert.equal(at("You've reached your Fable limit. Switch to another model. Try again in 5 minutes").resetAt, null);
 });

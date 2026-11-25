@@ -29,6 +29,8 @@ const SECONDARY_MAX_MS = 15 * 60_000;
 // A reset GitHub reports further out than its one-hour window is not trusted.
 const MAX_COOLDOWN_MS = 65 * 60_000;
 const PROBE_QUERY = "query={ rateLimit { remaining resetAt } }";
+// How much a hold stops: low budget pauses background polling only.
+const STRENGTH = { "low-budget": 1, primary: 2, secondary: 2 };
 const PROBE_TIMEOUT_MS = 15_000;
 
 // A gh failure's text -> { kind: "primary" | "secondary", retryAfterSec } or null.
@@ -38,6 +40,16 @@ export function classifyGithubThrottle(text) {
   if (SECONDARY.test(s)) return { kind: "secondary", retryAfterSec };
   if (PRIMARY.test(s)) return { kind: "primary", retryAfterSec };
   return null;
+}
+
+// The text of a GraphQL answer's own errors ("type", "code", "message"),
+// never its data: a PR body or comment that mentions a rate limit is
+// repository content, not GitHub refusing the request.
+export function graphqlErrorText(stdout) {
+  let body;
+  try { body = JSON.parse(String(stdout ?? "")); } catch { return ""; }
+  const errors = Array.isArray(body?.errors) ? body.errors : [];
+  return errors.map((e) => [e?.type, e?.code, e?.message].filter((v) => typeof v === "string").join(" ")).join("\n");
 }
 
 // The rateLimit block a GraphQL answer carries, or null.
@@ -54,44 +66,85 @@ function hhmm(ms) {
   return `${new Date(ms).toISOString().slice(11, 16)} UTC`;
 }
 
+// Two independent holds, so no order of concurrent answers can weaken one:
+// - slow: GitHub asked this account to slow down (secondary limit). It
+//   stops every caller until its own time.
+// - budget: the GraphQL budget window. "low-budget" pauses background
+//   polling only; "primary" (used up) stops everyone. Within a window it
+//   only ever upgrades; a later window clears it.
+// The effective hold for a caller is whichever of the two applies.
 export class GithubThrottle {
   constructor({ now = () => Date.now(), file = null, floor = BACKGROUND_FLOOR } = {}) {
     this.now = now;
     this.floor = floor;
-    this.cooldown = null;
+    this.slow = null;
+    this.budget = null;
     this.primaryStreak = 0;
     this.secondaryStreak = 0;
     this.inflight = new Map();
     this.configure({ file });
   }
 
-  // Where the cooldown survives a restart. A saved one already over is dropped.
+  // Where the holds survive a restart; one already over is dropped. The
+  // earlier single-hold file format is read as one slot or the other.
   configure({ file = null } = {}) {
     this.file = file;
     if (!file) return this;
     const saved = readJsonFile(file, null);
-    const until = Date.parse(saved?.until ?? "");
-    if (saved && Number.isFinite(until) && until > this.now()) this.cooldown = { ...saved };
+    if (saved?.version === 2) {
+      this.slow = saved.slow ?? null;
+      this.budget = saved.budget ?? null;
+    } else if (saved && saved.until) {
+      const { then, ...hold } = saved;
+      if (hold.kind === "secondary") {
+        this.slow = { until: hold.until, since: hold.since ?? null };
+        if (then && then.kind !== "secondary") this.budget = then;
+      } else {
+        this.budget = hold;
+      }
+    }
+    this.expire();
     return this;
   }
 
-  current() {
-    if (!this.cooldown) return null;
-    if (Date.parse(this.cooldown.until) <= this.now()) {
-      this.cooldown = null;
-      this.save();
-      return null;
-    }
-    return this.cooldown;
+  // Drops a hold whose time is over.
+  expire() {
+    const now = this.now();
+    let changed = false;
+    if (this.slow && !(Date.parse(this.slow.until) > now)) { this.slow = null; changed = true; }
+    if (this.budget && !(Date.parse(this.budget.until) > now)) { this.budget = null; changed = true; }
+    if (changed) this.save();
   }
 
-  // The cooldown this caller must respect, or null. A low budget stops only
+  slowView() {
+    return this.slow ? { kind: "secondary", until: this.slow.until, since: this.slow.since ?? null, resetKnown: true } : null;
+  }
+
+  // The hold that applies to background polling: the longer-blocking of the
+  // two, preferring one that also stops owner actions.
+  current() {
+    this.expire();
+    const slow = this.slowView();
+    const budget = this.budget;
+    if (!slow) return budget;
+    if (!budget) return slow;
+    if (budget.kind === "primary" && Date.parse(budget.until) > Date.parse(slow.until)) return budget;
+    return slow;
+  }
+
+  // The hold this caller must respect, or null. A low budget stops only
   // background polling; a used-up budget or a slow-down stops everyone.
   blocking({ background = true } = {}) {
-    const cooldown = this.current();
-    if (!cooldown) return null;
-    if (cooldown.kind === "low-budget" && !background) return null;
-    return { ...cooldown, message: this.describe(cooldown) };
+    this.expire();
+    let hold;
+    if (background) {
+      hold = this.current();
+    } else {
+      const slow = this.slowView();
+      const used = this.budget?.kind === "primary" ? this.budget : null;
+      hold = slow && used ? (Date.parse(used.until) > Date.parse(slow.until) ? used : slow) : slow ?? used;
+    }
+    return hold ? { ...hold, message: this.describe(hold) } : null;
   }
 
   describe(cooldown = this.current()) {
@@ -102,10 +155,15 @@ export class GithubThrottle {
     return `GitHub's GraphQL rate limit for this account is used up until ${until}${cooldown.resetKnown ? "" : " (estimated; GitHub gave no reset time)"}.`;
   }
 
-  // Reads one gh result: a throttle error starts or extends the cooldown, a
+  // Reads one gh result: a throttle error starts or extends a hold, a
   // rateLimit block sets the budget. Returns the throttle seen, or null.
   observe(result) {
-    const text = `${result?.stderr ?? ""}\n${result?.stdout ?? ""}\n${result?.error ?? ""}`;
+    // Only a failed call's own output, or GraphQL's structured errors, can
+    // say GitHub refused it. A successful answer's data is never searched.
+    // Success is an exit code of 0 with no error; a timeout (code null) or
+    // any other result is a failure whose output may name a throttle.
+    const failed = Boolean(result?.error) || result?.code !== 0;
+    const text = `${failed ? `${result?.stderr ?? ""}\n${result?.error ?? ""}\n` : ""}${graphqlErrorText(result?.stdout)}`;
     const throttled = classifyGithubThrottle(text);
     const rate = readRateLimit(result?.stdout);
     if (throttled) {
@@ -121,11 +179,12 @@ export class GithubThrottle {
       this.enter(remaining <= 0 ? "primary" : "low-budget", { resetAt, remaining });
       return;
     }
-    // A fresh window: whatever held polling back is over. Only a response
-    // from a later window counts: a delayed answer from the same window
-    // (two reads in flight) must not lift a newer cooldown.
-    if (remaining > this.floor && this.cooldown && this.cooldown.kind !== "secondary" && this.isNewerWindow(resetAt)) {
-      this.cooldown = null;
+    // A fresh window: the budget hold is over. Only a response from a later
+    // window counts: a delayed answer from the same window (two reads in
+    // flight) must not lift it. GitHub's slow-down is not budget: it stays.
+    this.expire();
+    if (remaining > this.floor && this.budget && this.isNewerWindow(resetAt)) {
+      this.budget = null;
       this.primaryStreak = 0;
       this.save();
     }
@@ -134,76 +193,99 @@ export class GithubThrottle {
   isNewerWindow(resetAt) {
     const reset = Date.parse(resetAt ?? "");
     if (!Number.isFinite(reset)) return false;
-    const held = Date.parse(this.cooldown?.windowResetAt ?? "");
-    // A cooldown with no known window (estimated) ends with any window
-    // that resets after it began.
-    if (!Number.isFinite(held)) return reset > (Date.parse(this.cooldown?.since ?? "") || 0);
+    const held = Date.parse(this.budget?.windowResetAt ?? "");
+    // A hold with no known window (estimated) ends with any window that
+    // resets after it began.
+    if (!Number.isFinite(held)) return reset > (Date.parse(this.budget?.since ?? "") || 0);
     return reset > held + 1000;
   }
 
   enter(kind, { resetAt = null, retryAfterSec = null, remaining = null } = {}) {
     const now = this.now();
-    let until;
-    let resetKnown = false;
+    this.expire();
     if (kind === "secondary") {
       this.secondaryStreak += 1;
       const base = Math.max(SECONDARY_MIN_MS, (retryAfterSec ?? 0) * 1000);
-      until = now + Math.min(SECONDARY_MAX_MS, base * 2 ** (this.secondaryStreak - 1));
-    } else {
-      const reset = Date.parse(resetAt ?? "");
-      if (Number.isFinite(reset) && reset > now && reset - now <= MAX_COOLDOWN_MS) {
-        until = reset + RESET_PAD_MS;
-        resetKnown = true;
-      } else if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
-        until = now + Math.min(MAX_COOLDOWN_MS, retryAfterSec * 1000);
-        resetKnown = true;
-      } else {
-        this.primaryStreak += 1;
-        until = now + PRIMARY_BACKOFF_MS[Math.min(PRIMARY_BACKOFF_MS.length - 1, this.primaryStreak - 1)];
+      const until = now + Math.min(SECONDARY_MAX_MS, base * 2 ** (this.secondaryStreak - 1));
+      // Never shortened by a later, shorter request to slow down.
+      if (!this.slow || Date.parse(this.slow.until) < until) {
+        this.slow = { until: new Date(until).toISOString(), since: this.slow?.since ?? new Date(now).toISOString() };
+        this.save();
       }
+      return this.current();
     }
-    const previous = this.current();
-    // Never shorten a stronger hold with a weaker or vaguer one.
-    if (previous && Date.parse(previous.until) >= until && !(resetKnown && !previous.resetKnown && kind === previous.kind)) return previous;
-    this.cooldown = {
-      kind,
-      until: new Date(until).toISOString(),
-      since: previous?.since ?? new Date(now).toISOString(),
-      resetKnown,
-      ...(kind !== "secondary" && Number.isFinite(Date.parse(resetAt ?? "")) ? { windowResetAt: new Date(Date.parse(resetAt)).toISOString() } : {}),
-      probed: previous?.probed === true && !resetKnown,
-      ...(Number.isFinite(remaining) ? { remaining } : {})
+    let until;
+    let resetKnown = false;
+    const reset = Date.parse(resetAt ?? "");
+    if (Number.isFinite(reset) && reset > now && reset - now <= MAX_COOLDOWN_MS) {
+      until = reset + RESET_PAD_MS;
+      resetKnown = true;
+    } else if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+      until = now + Math.min(MAX_COOLDOWN_MS, retryAfterSec * 1000);
+      resetKnown = true;
+    } else {
+      this.primaryStreak += 1;
+      until = now + PRIMARY_BACKOFF_MS[Math.min(PRIMARY_BACKOFF_MS.length - 1, this.primaryStreak - 1)];
+    }
+    const window = Number.isFinite(reset) ? new Date(reset).toISOString() : null;
+    const previous = this.budget;
+    if (!previous) {
+      this.budget = { kind, until: new Date(until).toISOString(), since: new Date(now).toISOString(), resetKnown, ...(window ? { windowResetAt: window } : {}), probed: false, ...(Number.isFinite(remaining) ? { remaining } : {}) };
+      this.save();
+      return this.current();
+    }
+    // Within a window the budget hold only upgrades (low → used up), never
+    // the other way, and never ends sooner, except that a known reset
+    // replaces an estimated one of the same kind.
+    const upgraded = STRENGTH[kind] > STRENGTH[previous.kind];
+    const keptKind = upgraded ? kind : previous.kind;
+    const sharper = resetKnown && !previous.resetKnown && kind === previous.kind;
+    const prevUntil = Date.parse(previous.until);
+    const nextUntil = sharper ? until : Math.max(prevUntil, until);
+    const nextResetKnown = sharper ? true : (resetKnown && until >= prevUntil) || previous.resetKnown === true;
+    if (!upgraded && !sharper && nextUntil === prevUntil) return this.current();
+    this.budget = {
+      ...previous,
+      kind: keptKind,
+      until: new Date(nextUntil).toISOString(),
+      resetKnown: nextResetKnown,
+      ...(window ? { windowResetAt: window } : {}),
+      probed: previous.probed === true && !nextResetKnown,
+      ...(Number.isFinite(remaining) && (upgraded || kind === keptKind) ? { remaining } : {})
     };
     this.save();
-    return this.cooldown;
+    return this.current();
   }
 
-  // A used-up budget with no reset time yet asks GitHub for it, once.
+  // A used-up budget with no reset time yet asks GitHub for it, once, and
+  // never while GitHub has asked this account to slow down.
   needsProbe() {
-    const cooldown = this.current();
-    return Boolean(cooldown && cooldown.kind === "primary" && !cooldown.resetKnown && !cooldown.probed);
+    this.expire();
+    return Boolean(!this.slow && this.budget && this.budget.kind === "primary" && !this.budget.resetKnown && !this.budget.probed);
   }
 
   async probe(run, ghBin = "gh") {
     if (!this.needsProbe()) return this.current();
-    this.cooldown.probed = true;
+    this.budget.probed = true;
     this.save();
     try {
       const result = await run(ghBin, ["api", "graphql", "-f", PROBE_QUERY], { timeoutMs: PROBE_TIMEOUT_MS });
-      const rate = readRateLimit(result?.stdout);
-      if (rate?.resetAt && rate.remaining <= this.floor) {
-        this.enter(rate.remaining <= 0 ? "primary" : "low-budget", { resetAt: rate.resetAt, remaining: rate.remaining });
-      } else if (rate) {
-        // Budget is back (a new window began): nothing to wait for.
-        this.noteBudget(rate);
-      }
-    } catch { /* keep the estimated cooldown */ }
+      // The probe's answer is read like any other when it says something new:
+      // a secondary limit with Retry-After is kept, and a rateLimit block
+      // sets the budget (a known reset, or a new window). The same "used up"
+      // with still no reset is not a second exhaustion: it changes nothing.
+      // observe() never probes, and this hold is already marked probed.
+      const failed = Boolean(result?.error) || result?.code !== 0;
+      const seen = classifyGithubThrottle(`${failed ? `${result?.stderr ?? ""}\n${result?.error ?? ""}\n` : ""}${graphqlErrorText(result?.stdout)}`);
+      const sameAgain = seen?.kind === "primary" && !readRateLimit(result?.stdout)?.resetAt && !seen.retryAfterSec;
+      if (!sameAgain) this.observe(result);
+    } catch { /* keep the estimated hold */ }
     return this.current();
   }
 
   save() {
     if (!this.file) return;
-    try { writeJsonAtomic(this.file, this.cooldown ?? { until: null }); } catch { /* memory still holds it */ }
+    try { writeJsonAtomic(this.file, { version: 2, slow: this.slow, budget: this.budget }); } catch { /* memory still holds it */ }
   }
 }
 

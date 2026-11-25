@@ -132,7 +132,7 @@ struct SupervisorWorkspaceView: View {
 
   @State private var showNewSessionCreator = false
   @State private var newSessionWorkspace = ""
-  @State private var newSessionModel = "gpt-5.4"
+  @State private var newSessionModel = "gpt-6.2-sol"
   @State private var newSessionEffort = "medium"
   @State private var newSessionTitle = ""
   @State private var newSessionPrompt = ""
@@ -795,7 +795,7 @@ struct SupervisorWorkspaceView: View {
                   await supervisor.selectModelPreference(
                     preference: "codex-cli",
                     modelField: "codexCliModel",
-                    modelId: "gpt-5.4"
+                    modelId: "gpt-6.2-sol"
                   )
                 }
               } label: {
@@ -1610,8 +1610,8 @@ struct SupervisorWorkspaceView: View {
 
           HStack(spacing: WorkspaceTheme.Spacing.x3) {
             Picker("Model", selection: $newSessionModel) {
-              Text("GPT-5.4").tag("gpt-5.4")
               Text("GPT-6.2 Sol").tag("gpt-6.2-sol")
+              Text("GPT-5.4").tag("gpt-5.4")
               Text("Claude Sonnet 4.6").tag("claude-sonnet-4-6")
               Text("Claude Opus 4.7").tag("claude-opus-4-7")
             }
