@@ -111,10 +111,13 @@ final class NeedsYouReviewTests: XCTestCase {
 
         // Updates sit apart, collapsed, and open on request.
         let updates = element(app, "needs-you-updates")
-        for _ in 0..<6 where !updates.isHittable { app.swipeUp() }
-        XCTAssertTrue(updates.exists)
+        for _ in 0..<8 where !(updates.exists && updates.isHittable) { app.swipeUp() }
+        XCTAssertTrue(updates.isHittable, "Updates toggle reachable")
+        XCTAssertEqual(updates.value as? String, "Collapsed")
         updates.tap()
-        XCTAssertTrue(element(app, "needs-you-row-fyi-docs").waitForExistence(timeout: 5))
+        let fyi = element(app, "needs-you-row-fyi-docs")
+        for _ in 0..<4 where !fyi.exists { app.swipeUp() }
+        XCTAssertTrue(fyi.waitForExistence(timeout: 5), "Updates open on request")
         capture("needs-you-updates-expanded-dark", app: app)
     }
 

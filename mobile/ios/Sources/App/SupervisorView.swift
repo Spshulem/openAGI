@@ -2721,16 +2721,31 @@ private struct BoardNeedsYouStage: View {
 
         if !updates.isEmpty {
             Section {
-                DisclosureGroup(isExpanded: $showUpdates) {
+                // One plain toggle row, then the updates as ordinary rows.
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { showUpdates.toggle() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("Updates · no decision needed (\(updates.count))")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Theme.muted)
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(Theme.muted)
+                            .rotationEffect(.degrees(showUpdates ? 90 : 0))
+                            .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showUpdates ? "Expanded" : "Collapsed")
+                .accessibilityIdentifier("needs-you-updates")
+                if showUpdates {
                     ForEach(updates) { card in
                         row(card, reason: nil, isWide: isWide, isUpdate: true)
                     }
-                } label: {
-                    Text("Updates · no decision needed (\(updates.count))")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(Theme.muted)
                 }
-                .accessibilityIdentifier("needs-you-updates")
             }
         }
     }
