@@ -476,3 +476,100 @@ test("Paseo running session with recent tool activity is not marked stalled", as
   assert.notEqual(thread.agentStatus, "stalled");
   assert.equal(thread.meta.silentStuck, undefined);
 });
+
+// Regression, 2026-11-25 (Paseo e3c3ce15, "Sales v1 PR review"): a recursive
+// Python glob over schema-use.json walked node_modules symlinks inside one
+// shell tool call from 05:21 to 16:05 UTC (10 h 44 m) with no other timeline
+// event, while Paseo kept refreshing agent.updatedAt. Both stall checks read
+// updatedAt as activity, so the chat stayed "running" / on_track.
+function liveButSilentFactory({ agent, entries, fail = false }) {
+  return () => ({
+    async connect() {},
+    async close() {},
+    hosts: { async list() { return { self: { serverId: "srv_local" }, hosts: [] }; } },
+    agents: {
+      async list() { return { entries: [{ agent }], pageInfo: { hasMore: false } }; },
+      ref() {
+        return {
+          async refresh() {},
+          current() { return agent; },
+          timeline: {
+            async refetch() {
+              if (fail) throw new Error("history unavailable");
+              return { agent, entries, epoch: "e1", endCursor: { seq: entries.length }, hasNewer: false };
+            }
+          }
+        };
+      }
+    }
+  });
+}
+
+function salesGlobAgent(now, extra = {}) {
+  return {
+    id: "e3c3ce15-f163-462c-80c3-ef221ea23dbd",
+    title: "Sales v1 PR review",
+    provider: "antigravity",
+    status: "running",
+    activeTurn: { turnId: "turn-glob", startedAt: new Date(now - 11 * HOUR).toISOString() },
+    cwd: "/home/dev/worktrees/sales-revops-delivery",
+    workspaceId: "sales",
+    // Paseo refreshed this a minute ago although nothing progressed.
+    updatedAt: new Date(now - 1 * MIN).toISOString(),
+    lastUserMessageAt: new Date(now - 11 * HOUR).toISOString(),
+    pendingPermissions: [],
+    ...extra
+  };
+}
+
+function salesGlobTimeline(now, lastEventAgoMs) {
+  const at = (ago) => new Date(now - ago).toISOString();
+  return [
+    { timestamp: at(11 * HOUR), item: { type: "user_message", messageId: "u1", text: "Finish the remaining schema-use entries." } },
+    { timestamp: at(lastEventAgoMs + 40_000), item: { type: "assistant_message", messageId: "a1", text: "Checking which schema-use.json files still miss the new tables." } },
+    // The glob call: started, never finished.
+    { timestamp: at(lastEventAgoMs), item: { type: "tool_call", status: "running", name: "shell", callId: "call_764285278",
+      detail: { type: "shell", command: "python3 - <<'PY'\nimport glob\nglob.glob('**/schema-use.json', recursive=True)\nPY" } } }
+  ];
+}
+
+test("a live-looking Paseo session with no timeline progress for hours is stalled (schema-use.json glob)", async (t) => {
+  const storeDir = makeTempDir(t, "paseo-glob-stall-");
+  const now = Date.now();
+  const agent = salesGlobAgent(now);
+  const cfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: storeDir });
+  const [thread] = await createPaseoSource({ factory: liveButSilentFactory({ agent, entries: salesGlobTimeline(now, (10 * 60 + 44) * MIN) }) })(cfg);
+  assert.equal(thread.agentStatus, "stalled", "a fresh updatedAt is liveness, not progress");
+  assert.equal(thread.meta.silentStuck, true);
+  assert.equal(Date.parse(thread.lastProgressAt), now - (10 * 60 + 44) * MIN);
+  const classified = classifyThread(thread);
+  assert.equal(classified.snag?.kind, "silent-turn");
+  assert.ok(classified.snag.silentMinutes >= 10 * 60, `silent for ${classified.snag.silentMinutes} min, not since the last updatedAt refresh`);
+  const checkIn = estimateExpectedCheckIn(thread, { classified, now });
+  assert.equal(checkIn.severelyStuck, true);
+  assert.equal(checkIn.status, "stuck");
+});
+
+test("the same live session is healthy while its timeline keeps progressing", async (t) => {
+  const storeDir = makeTempDir(t, "paseo-glob-healthy-");
+  const now = Date.now();
+  const cfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: storeDir });
+  const [thread] = await createPaseoSource({ factory: liveButSilentFactory({ agent: salesGlobAgent(now), entries: salesGlobTimeline(now, 4 * MIN) }) })(cfg);
+  assert.equal(thread.agentStatus, "running");
+  assert.equal(thread.meta.silentStuck, undefined);
+  const checkIn = estimateExpectedCheckIn(thread, { classified: classifyThread(thread), now });
+  assert.equal(checkIn.severelyStuck, false);
+});
+
+test("no stall is claimed without evidence: pending permission, or history that could not be read", async (t) => {
+  const now = Date.now();
+  const silent = salesGlobTimeline(now, (10 * 60 + 44) * MIN);
+  const permissionCfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: makeTempDir(t, "paseo-glob-perm-") });
+  const waiting = salesGlobAgent(now, { pendingPermissions: [{ id: "perm-1", title: "Run shell command" }] });
+  const [asking] = await createPaseoSource({ factory: liveButSilentFactory({ agent: waiting, entries: silent }) })(permissionCfg);
+  assert.notEqual(asking.agentStatus, "stalled", "waiting on a permission is not a stall");
+  const unreadCfg = resolveFleetConfig({ OPENAGI_FLEET_PASEO: "1" }, { home: makeTempDir(t, "paseo-glob-unread-") });
+  const [unread] = await createPaseoSource({ factory: liveButSilentFactory({ agent: salesGlobAgent(now), entries: silent, fail: true }) })(unreadCfg);
+  assert.notEqual(unread.agentStatus, "stalled", "no history read is no evidence of a stall");
+  assert.equal(unread.meta.silentStuck, undefined);
+});
