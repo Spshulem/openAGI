@@ -28,7 +28,9 @@ import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
 import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
-import { createHubProactiveGuard, isProactiveSupervisorText } from "./fleet/proactive-gate.js";
+import { createHubProactiveGuard, isProactiveSupervisorText, latestProactiveMessageAtMs } from "./fleet/proactive-gate.js";
+import { DEFAULTS as FLEET_DEFAULTS } from "./fleet/contracts.js";
+import { resolveQuietTimeZone } from "./fleet/notify.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
@@ -281,15 +283,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
+  const getSupervisorChatMessages = () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [];
+  const proactiveNow = typeof options.proactiveNow === "function" ? options.proactiveNow : () => Date.now();
   const hubProactiveGuard = createHubProactiveGuard({
     getPreferences: () => runtime.fleetSupervisor?.getState?.()?.preferences ?? {},
-    getRecentMessages: () => (runtime.agentHost?.store ?? channels?.agentHost?.store)?.getSession?.("devices:supervisor:main")?.messages ?? [],
+    getRecentMessages: getSupervisorChatMessages,
     getModelProvider: () => runtime.agentHost?.modelProvider ?? channels?.agentHost?.modelProvider ?? null,
-    getLastPostedAtMs: () => Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
+    getLastPostedAtMs: () => Math.max(
+      Date.parse(runtime.fleetSupervisor?.store?.lastProactiveChatAt?.() ?? "") || 0,
+      latestProactiveMessageAtMs(getSupervisorChatMessages(), { nowMs: proactiveNow() })
+    ),
+    getLastOwnerAckAtMs: () => Math.max(
+      Number(runtime.fleetSupervisor?.lastOwnerAckAtMs) || 0,
+      Date.parse(runtime.fleetSupervisor?.state?.lastOwnerAckAt ?? "") || 0,
+      Date.parse(runtime.fleetSupervisor?.store?.lastOwnerAckAt?.() ?? "") || 0
+    ),
+    getResolvedDecisionKeys: () => runtime.fleetSupervisor?.store?.resolvedDecisionKeys?.() ?? null,
+    getQuietHours: () => {
+      if (options.proactiveQuietHours !== undefined) return options.proactiveQuietHours;
+      if (String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() === "off") return null;
+      const sup = runtime.fleetSupervisor;
+      if (sup?.proactiveRespectQuietHours === false || sup?.config?.proactiveRespectQuietHours === false) return null;
+      const supQuiet = sup?.proactiveQuietHours ?? sup?.config?.notify?.quietHours;
+      if (supQuiet !== undefined && supQuiet !== null) return supQuiet;
+      return runtime.outreachConfig?.quietHours ?? sup?.config?.limits?.quietHours ?? FLEET_DEFAULTS.quietHours;
+    },
+    getTimeZone: () => options.proactiveTimeZone
+      ?? runtime.fleetSupervisor?.proactiveTimeZone
+      ?? resolveQuietTimeZone(runtime, runtime.fleetSupervisor?.config ?? null),
+    getMaxUnansweredProactive: (prefs) => {
+      if (options.maxUnansweredProactive !== undefined) return options.maxUnansweredProactive;
+      return prefs?.cadence === "detailed" ? 2 : 1;
+    },
+    failClosed: options.proactiveFailClosed ?? true,
     onPosted: (atMs) => {
       try { runtime.fleetSupervisor?.store?.recordProactiveChatAt?.(atMs); } catch { /* best-effort */ }
     },
-    judgeProactiveUpdate: options.judgeProactiveUpdate ?? null
+    judgeProactiveUpdate: options.judgeProactiveUpdate ?? null,
+    now: proactiveNow
   });
   runtime.hubProactiveGuard = hubProactiveGuard;
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
@@ -2239,6 +2270,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           let filteredMessages = rawMessages;
           let suppressedCount = 0;
           let deferredCount = 0;
+          let proactiveEvaluatedCount = 0;
           let lastSuppressReason = null;
           if (conversationId === "main" && Array.isArray(rawMessages)) {
             const sourceName = typeof body.sourceName === "string" ? body.sourceName : null;
@@ -2253,6 +2285,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 nonProactive.push(item);
                 continue;
               }
+              proactiveEvaluatedCount += 1;
               if (nonProactive.length > 0) {
                 const resPart = appendSharedThreadMessages(store, "supervisor", {
                   conversationId,
@@ -2268,6 +2301,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: item?.proactiveMeta?.kind ?? "proactive_supervisor_delta",
                 decisionKeys: Array.isArray(item?.proactiveMeta?.decisionKeys) ? item.proactiveMeta.decisionKeys : [],
                 decisionTokens: Array.isArray(item?.proactiveMeta?.decisionTokens) ? item.proactiveMeta.decisionTokens : [],
+                decisionKinds: Array.isArray(item?.proactiveMeta?.decisionKinds) ? item.proactiveMeta.decisionKinds : [],
                 alreadyAgentReviewed: item?.proactiveMeta?.agentReviewed === true,
                 persist: async (finalText, { agentReviewed }) => {
                   const resPart = appendSharedThreadMessages(store, "supervisor", {
@@ -2317,11 +2351,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 appended: [],
                 suppressed: true,
                 deferred: deferredCount > 0 && deferredCount === suppressedCount,
-                reason: lastSuppressReason
+                reason: lastSuppressReason,
+                proactiveGuarded: true
               });
             }
             if (lastAppendPayload) {
-              return sendJson(res, 200, { ...lastAppendPayload, appended: appendedAll });
+              return sendJson(res, 200, {
+                ...lastAppendPayload,
+                appended: appendedAll,
+                ...(proactiveEvaluatedCount > 0 ? { proactiveGuarded: true } : {})
+              });
             }
           }
           return sendJson(res, 200, appendSharedThreadMessages(store, "supervisor", {
@@ -3677,6 +3716,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (applied?.pendingAction) {
             queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
           }
+          hubProactiveGuard.noteOwnerActivity(proactiveNow());
           if (applied?.nonResolving) return sendJson(res, 200, { item: runtime.outreach.get(id), plan: applied.plan, nonResolving: true });
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });

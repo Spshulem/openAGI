@@ -7,13 +7,17 @@
 
 import { clampText, redactSecrets, shortHash } from "./contracts.js";
 import { effectiveCheckinCooldownMs } from "./preferences.js";
+import { isQuietHour } from "./notify.js";
 
 const LEGACY_PROACTIVE_PREFIX_RE = /^\s*\*\*(?:Supervisor check-in|Post-send verification)\b/i;
+const FOLLOW_THROUGH_PREFIX_RE = /^\s*\*\*Post-send verification\b/i;
+const CRITICAL_DECISION_KINDS = new Set(["ready", "merge", "risky", "prompt", "infra", "storage", "self-fix"]);
 const CLOSED_OR_NO_ACTION_RE = /\b(?:the\s+goal\s+is\s+already\s+closed|goal\s+is\s+(?:already\s+)?closed|did\s+no\s+new\s+work\s+this\s+turn|no\s+new\s+work\s+this\s+turn|no\s+owner\s+action\s+(?:is\s+)?required|nothing\s+left\s+to\s+do|already\s+shipped\s+and\s+verified)\b/i;
 const ALREADY_MERGED_RE = /\balready\s+merged\s+into\s+(?:main|master)\b/i;
 const MERGE_DECISION_RE = /\b(?:merge|land)\b/i;
 const POST_MERGE_ACTION_RE = /\b(?:deploy|release|roll\s*out|publish|ship\s+to\s+prod|production|staging|restart|upgrade|verify\s+live|submit\s+for\s+review)\b/i;
 const HUB_DEDUPE_TTL_MS = 4 * 60 * 60_000;
+const REVIEW_ERROR_BACKOFF_MS = 5 * 60_000;
 const MAX_TRACKED_KEYS = 400;
 
 export function isProactiveSupervisorText(text) {
@@ -25,6 +29,52 @@ export function isProactiveSupervisorMessage(message) {
   if (message.metadata?.proactive === true || message.proactive === true) return true;
   if (message.role !== "assistant") return false;
   return isProactiveSupervisorText(message.content ?? message.text ?? "");
+}
+
+export function isProactiveCheckinMessage(message) {
+  if (!isProactiveSupervisorMessage(message)) return false;
+  const kind = message.metadata?.proactiveMeta?.kind ?? message.proactiveMeta?.kind ?? null;
+  if (kind === "follow_through_verification") return false;
+  if (FOLLOW_THROUGH_PREFIX_RE.test(String(message.content ?? message.text ?? ""))) return false;
+  return true;
+}
+
+export function latestProactiveMessageAtMs(messages = [], { nowMs = Date.now() } = {}) {
+  if (!Array.isArray(messages) || !messages.length) return 0;
+  let latest = 0;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (!isProactiveCheckinMessage(m)) continue;
+    const ts = Date.parse(String(m.createdAt ?? m.at ?? m.timestamp ?? ""));
+    if (Number.isFinite(ts) && ts <= nowMs + 60_000 && ts > latest) {
+      latest = ts;
+    }
+  }
+  return latest;
+}
+
+export function countUnansweredProactiveMessages(messages = [], { lastOwnerAckAtMs = 0, resolvedDecisionKeys = null } = {}) {
+  if (!Array.isArray(messages) || !messages.length) return 0;
+  const ackMs = Number.isFinite(Number(lastOwnerAckAtMs)) && Number(lastOwnerAckAtMs) > 0 ? Number(lastOwnerAckAtMs) : 0;
+  const resolvedSet = resolvedDecisionKeys instanceof Set ? resolvedDecisionKeys : null;
+  let count = 0;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "user") break;
+    if (ackMs > 0) {
+      const ts = Date.parse(String(m.createdAt ?? m.at ?? m.timestamp ?? ""));
+      if (Number.isFinite(ts) && ts <= ackMs) break;
+    }
+    if (isProactiveCheckinMessage(m)) {
+      const dKeys = m.metadata?.proactiveMeta?.decisionKeys ?? m.proactiveMeta?.decisionKeys;
+      if (resolvedSet && Array.isArray(dKeys) && dKeys.length > 0 && dKeys.every((k) => resolvedSet.has(k))) {
+        continue;
+      }
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function normalizeIdentityText(raw) {
@@ -139,24 +189,41 @@ export async function reviewProactiveUpdateWithAgent({
   recentMessages = [],
   preferences = {},
   modelProvider = null,
-  judgeFn = null
+  judgeFn = null,
+  failClosed = false
 } = {}) {
   const cleanCandidate = String(candidateText ?? "").trim();
   if (!cleanCandidate) return { send: false, reason: "empty", agentReviewed: false };
+  const isFollowThrough = kind === "follow_through_verification";
+  const strictFailClosed = Boolean(failClosed) && !isFollowThrough;
 
   if (typeof judgeFn === "function") {
-    const verdict = await judgeFn({
-      candidateText: cleanCandidate,
-      kind,
-      decisionKeys,
-      recentMessages,
-      preferences
-    });
+    let verdict;
+    try {
+      verdict = await judgeFn({
+        candidateText: cleanCandidate,
+        kind,
+        decisionKeys,
+        recentMessages,
+        preferences
+      });
+    } catch {
+      return isFollowThrough
+        ? { send: true, text: cleanCandidate, reason: "judge_error_fallback", agentReviewed: false }
+        : { send: false, deferred: true, reason: "agent_review_error", agentReviewed: false };
+    }
     if (!verdict || typeof verdict !== "object") {
-      return { send: true, text: cleanCandidate, reason: "judge_default", agentReviewed: true };
+      return strictFailClosed
+        ? { send: false, deferred: true, reason: "unparseable_agent_verdict", agentReviewed: false }
+        : { send: true, text: cleanCandidate, reason: "judge_default", agentReviewed: true };
     }
     if (verdict.send === false) {
-      return { send: false, reason: clampText(String(verdict.reason ?? "suppressed_by_agent"), 180), agentReviewed: true };
+      return {
+        send: false,
+        ...(verdict.deferred === true ? { deferred: true } : {}),
+        reason: clampText(String(verdict.reason ?? "suppressed_by_agent"), 180),
+        agentReviewed: true
+      };
     }
     const composed = typeof verdict.message === "string" && verdict.message.trim()
       ? clampText(redactSecrets(verdict.message.trim()), 6000)
@@ -170,6 +237,9 @@ export async function reviewProactiveUpdateWithAgent({
   }
 
   if (!isRealConfiguredProvider(modelProvider)) {
+    if (strictFailClosed) {
+      return { send: false, deferred: true, reason: "no_live_model_provider", agentReviewed: false };
+    }
     return { send: true, text: cleanCandidate, reason: "no_live_model_provider", agentReviewed: false };
   }
 
@@ -188,11 +258,14 @@ export async function reviewProactiveUpdateWithAgent({
     "3. The candidate contradicts itself (e.g. says the goal is already closed/done/merged while asking for a decision, or reports a normal finished turn as an owner blocker).",
     "4. It adds no actionable new information that warrants interrupting Spencer right now.",
     "Approve (`\"send\": true`) ONLY if there is a genuinely new, concrete, actionable decision or real failure Spencer needs to know about right now.",
+    cadence === "quiet_until_ready"
+      ? "Cadence is quiet_until_ready: include ONLY merge-ready PRs, tool permission prompts, or hard infra/storage blockers — drop routine check-ins, and suppress if nothing critical remains."
+      : null,
     formatPref
       ? `When sending, strictly follow Spencer's saved update format preference: ${formatPref}`
       : "When sending, write a crisp, context-aware update (remove any duplicate items, keep every real option and recommendation intact, include Goal, Where it stands, and exact Decision needed; never dump raw mechanical boilerplate).",
     "Respond with ONLY valid JSON: {\"send\": true|false, \"reason\": \"short explanation\", \"message\": \"final markdown message when send is true\"}."
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   const input = [
     `Current cadence preference: ${cadence}`,
@@ -216,6 +289,9 @@ export async function reviewProactiveUpdateWithAgent({
     });
     const parsed = extractJsonObject(result?.text ?? "");
     if (!parsed || typeof parsed.send !== "boolean") {
+      if (!isFollowThrough) {
+        return { send: false, deferred: true, reason: "unparseable_agent_verdict", agentReviewed: false };
+      }
       return { send: true, text: cleanCandidate, reason: "unparseable_agent_verdict", agentReviewed: false };
     }
     if (!parsed.send) {
@@ -235,6 +311,9 @@ export async function reviewProactiveUpdateWithAgent({
       agentReviewed: true
     };
   } catch {
+    if (!isFollowThrough) {
+      return { send: false, deferred: true, reason: "agent_review_error", agentReviewed: false };
+    }
     return { send: true, text: cleanCandidate, reason: "agent_review_error_fallback", agentReviewed: false };
   }
 }
@@ -260,10 +339,18 @@ export function createHubProactiveGuard({
   getModelProvider = () => null,
   judgeProactiveUpdate = null,
   getLastPostedAtMs = null,
+  getLastOwnerAckAtMs = null,
+  getResolvedDecisionKeys = null,
+  getQuietHours = null,
+  getTimeZone = null,
+  getMaxUnansweredProactive = null,
+  failClosed = false,
   onPosted = null,
   now = () => Date.now()
 } = {}) {
   let lastPostedAtMs = 0;
+  let lastOwnerAckAtMs = 0;
+  let lastReviewFailureAtMs = 0;
   let evalChain = Promise.resolve();
   const recentFingerprints = new Map();
   const recentDecisionTokens = new Map();
@@ -283,7 +370,17 @@ export function createHubProactiveGuard({
     }
   };
 
-  const evaluateSerialized = async ({ text, kind = "proactive_supervisor_delta", decisionKeys = [], decisionTokens = [], alreadyAgentReviewed = false, skipCooldown = false, judgeFn = null, persist = null } = {}) => {
+  const evaluateSerialized = async ({
+    text,
+    kind = "proactive_supervisor_delta",
+    decisionKeys = [],
+    decisionTokens = [],
+    decisionKinds = [],
+    alreadyAgentReviewed = false,
+    skipCooldown = false,
+    judgeFn = null,
+    persist = null
+  } = {}) => {
     const cleanText = String(text ?? "").trim();
     if (!cleanText) return { send: false, reason: "empty" };
     const nowMs = now();
@@ -291,6 +388,53 @@ export function createHubProactiveGuard({
     const prefs = getPreferences?.() ?? {};
     if (prefs?.cadence === "off") {
       return { send: false, reason: "cadence_off" };
+    }
+
+    // Post-send verification failure notices on owner-directed watches are
+    // one-shot truth reports (resolved once the watch settles), so exempt them
+    // from check-in cadence/quiet-hours/cooldown/unanswered caps.
+    const bypassCooldown = skipCooldown === true || kind === "follow_through_verification";
+
+    // Enforce the hub's authoritative quiet_until_ready cadence even when a
+    // paired node still has a diverged local cadence (e.g. "balanced").
+    const cleanKinds = Array.isArray(decisionKinds)
+      ? decisionKinds.map((k) => String(k ?? "").trim().toLowerCase()).filter(Boolean)
+      : [];
+    if (!bypassCooldown && prefs?.cadence === "quiet_until_ready" && cleanKinds.length > 0) {
+      const hasCritical = cleanKinds.some((k) => CRITICAL_DECISION_KINDS.has(k));
+      if (!hasCritical) {
+        return { send: false, reason: "cadence_quiet_until_ready" };
+      }
+    }
+
+    // Quiet hours check (timezone-aware): defer check-ins until quiet hours end
+    // without permanently suppressing them.
+    if (!bypassCooldown && typeof getQuietHours === "function") {
+      const quiet = getQuietHours(prefs);
+      if (quiet && isQuietHour(new Date(nowMs), quiet, getTimeZone?.() ?? null)) {
+        return { send: false, deferred: true, reason: "quiet_hours" };
+      }
+    }
+
+    const recentMessages = getRecentMessages?.() ?? [];
+
+    // Stop dripping check-ins when prior proactive check-in(s) are still
+    // unanswered by the owner (e.g. overnight or while away). Answering a
+    // Needs You card or resolving every referenced decision clears the cap.
+    if (!bypassCooldown && typeof getMaxUnansweredProactive === "function") {
+      const cap = Number(getMaxUnansweredProactive(prefs));
+      if (Number.isFinite(cap) && cap > 0) {
+        const externalAckMs = Number(getLastOwnerAckAtMs?.()) || 0;
+        const effectiveAckMs = Math.max(lastOwnerAckAtMs, externalAckMs);
+        const resolvedDecisionKeys = typeof getResolvedDecisionKeys === "function" ? getResolvedDecisionKeys() : null;
+        const unanswered = countUnansweredProactiveMessages(recentMessages, {
+          lastOwnerAckAtMs: effectiveAckMs,
+          resolvedDecisionKeys
+        });
+        if (unanswered >= cap) {
+          return { send: false, deferred: true, reason: "awaiting_owner_reply" };
+        }
+      }
     }
 
     const fp = contentFingerprint(cleanText);
@@ -310,10 +454,6 @@ export function createHubProactiveGuard({
       return { send: false, reason: "hub_decisions_deduped" };
     }
 
-    // Post-send verification failure notices on owner-directed watches are
-    // one-shot truth reports (resolved once the watch settles), so exempt them
-    // from global check-in cooldown rather than silently dropping them.
-    const bypassCooldown = skipCooldown === true || kind === "follow_through_verification";
     const externalLastPosted = Number(getLastPostedAtMs?.()) || 0;
     const effectiveLastPostedAtMs = Math.max(lastPostedAtMs, externalLastPosted);
     const cooldownMs = effectiveCheckinCooldownMs(prefs);
@@ -324,21 +464,33 @@ export function createHubProactiveGuard({
     let finalText = cleanText;
     let agentReviewed = Boolean(alreadyAgentReviewed);
     if (!alreadyAgentReviewed) {
+      if (!bypassCooldown && lastReviewFailureAtMs > 0 && nowMs - lastReviewFailureAtMs < REVIEW_ERROR_BACKOFF_MS) {
+        return { send: false, deferred: true, reason: "agent_review_backoff", agentReviewed: false };
+      }
       const verdict = await reviewProactiveUpdateWithAgent({
         candidateText: cleanText,
         kind,
         decisionKeys: cleanKeys,
-        recentMessages: getRecentMessages?.() ?? [],
+        recentMessages,
         preferences: prefs,
         modelProvider: getModelProvider?.() ?? null,
-        judgeFn: judgeFn ?? judgeProactiveUpdate
+        judgeFn: judgeFn ?? judgeProactiveUpdate,
+        failClosed: Boolean(failClosed) && !bypassCooldown
       });
       agentReviewed = verdict.agentReviewed;
       if (!verdict.send) {
+        if (verdict.deferred === true) {
+          if (verdict.reason === "agent_review_error" || verdict.reason === "unparseable_agent_verdict") {
+            lastReviewFailureAtMs = nowMs;
+          }
+          return { send: false, deferred: true, reason: verdict.reason, agentReviewed };
+        }
+        lastReviewFailureAtMs = 0;
         recentFingerprints.set(fp, nowMs);
         for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);
         return { send: false, reason: verdict.reason, agentReviewed };
       }
+      lastReviewFailureAtMs = 0;
       finalText = verdict.text || cleanText;
     }
 
@@ -357,8 +509,10 @@ export function createHubProactiveGuard({
       }
     }
 
-    lastPostedAtMs = nowMs;
-    try { onPosted?.(nowMs); } catch { /* best-effort */ }
+    if (kind !== "follow_through_verification") {
+      lastPostedAtMs = nowMs;
+      try { onPosted?.(nowMs); } catch { /* best-effort */ }
+    }
     recentFingerprints.set(fp, nowMs);
     recentFingerprints.set(contentFingerprint(finalText), nowMs);
     for (const t of cleanTokens) recentDecisionTokens.set(t, nowMs);
@@ -374,8 +528,17 @@ export function createHubProactiveGuard({
       evalChain = next.catch(() => {});
       return next;
     },
+    noteOwnerActivity(atMs = now()) {
+      const ts = Number(atMs);
+      if (Number.isFinite(ts) && ts > lastOwnerAckAtMs) {
+        lastOwnerAckAtMs = ts;
+      }
+      return lastOwnerAckAtMs;
+    },
     reset() {
       lastPostedAtMs = 0;
+      lastOwnerAckAtMs = 0;
+      lastReviewFailureAtMs = 0;
       recentFingerprints.clear();
       recentDecisionTokens.clear();
     }

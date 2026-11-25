@@ -1632,6 +1632,8 @@ export function buildSupervisorDeck(
     preferences: {
       mergePolicy: prefs.mergePolicy,
       cadence: prefs.cadence,
+      checkinCooldownMinutes: prefs.checkinCooldownMinutes,
+      checkinFormat: prefs.checkinFormat,
       autoSlices: { ...prefs.autoSlices }
     },
     autonomy,

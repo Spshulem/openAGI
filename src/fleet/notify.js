@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { DEFAULTS, clampText } from "./contracts.js";
 import { isSuppressedByQuietCadence } from "./preferences.js";
 import { classifyAsk, decisionSummary, isGenericAsk, stripInternalIds } from "./decision-context.js";
+import { resolveBudgetTimeZone } from "../budget-guard.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const PUSH_TIMEOUT_MS = 5_000;
@@ -13,13 +14,76 @@ const PUSH_TIMEOUT_MS = 5_000;
 const PUSH_BODY_MAX = 180;
 // Outreach copies carry the full four-part context.
 const CONTEXT_SUMMARY_MAX = 1400;
+const QUIET_HOUR_FORMATTERS = new Map();
 
-export function isQuietHour(date, quietHours = DEFAULTS.quietHours) {
-  const hour = date.getHours();
-  const { start, end } = quietHours ?? DEFAULTS.quietHours;
-  if (start === end) return false;
-  // Overnight windows (22 -> 8) wrap past midnight.
-  return start > end ? hour >= start || hour < end : hour >= start && hour < end;
+function parseQuietMinutes(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const wrapped = ((value % 24) + 24) % 24;
+    return Math.round(wrapped * 60) % (24 * 60);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    const match = /^(\d{1,2})(?::(\d{2}))?$/.exec(trimmed);
+    if (!match) return null;
+    const h = Number(match[1]);
+    const m = match[2] !== undefined ? Number(match[2]) : 0;
+    if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || h > 24 || m < 0 || m > 59) return null;
+    return ((h % 24) * 60) + m;
+  }
+  return null;
+}
+
+function minutesOfDayInTimeZone(date, timeZone) {
+  const zone = resolveBudgetTimeZone(timeZone);
+  if (!zone) return date.getHours() * 60 + date.getMinutes();
+  try {
+    let formatter = QUIET_HOUR_FORMATTERS.get(zone);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: zone,
+        hour: "numeric",
+        minute: "numeric",
+        hourCycle: "h23"
+      });
+      QUIET_HOUR_FORMATTERS.set(zone, formatter);
+    }
+    const parts = formatter.formatToParts(date);
+    const hour = Number(parts.find((p) => p.type === "hour")?.value);
+    const minute = Number(parts.find((p) => p.type === "minute")?.value);
+    if (Number.isFinite(hour) && Number.isFinite(minute)) {
+      return ((hour % 24) * 60) + minute;
+    }
+  } catch { /* fallback to local clock */ }
+  return date.getHours() * 60 + date.getMinutes();
+}
+
+export function resolveQuietTimeZone(runtime = null, config = null, env = process.env) {
+  const candidates = [
+    config?.notify?.timeZone,
+    config?.timeZone,
+    runtime?.budget?.timeZone,
+    env?.OPENAGI_TIMEZONE,
+    env?.OPENAGI_TIME_ZONE
+  ];
+  for (const candidate of candidates) {
+    const resolved = resolveBudgetTimeZone(candidate);
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+export function isQuietHour(date, quietHours = DEFAULTS.quietHours, timeZone = null) {
+  if (quietHours === false || quietHours?.enabled === false) return false;
+  const resolved = quietHours ?? DEFAULTS.quietHours;
+  if (!resolved || typeof resolved !== "object" || Array.isArray(resolved)) return false;
+  const start = parseQuietMinutes(resolved.start);
+  const end = parseQuietMinutes(resolved.end);
+  if (start === null || end === null || start === end) return false;
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return false;
+  const nowMinutes = minutesOfDayInTimeZone(d, timeZone);
+  // Overnight windows (22:00 -> 08:00) wrap past midnight.
+  return start > end ? nowMinutes >= start || nowMinutes < end : nowMinutes >= start && nowMinutes < end;
 }
 
 export function outreachActions(options) {
@@ -55,7 +119,8 @@ export function createNotifier({
   };
   const skip = (reason) => ({ pushed: false, skipped: reason });
 
-  const isQuietHours = (date = current()) => isQuietHour(date, limits.quietHours);
+  const isQuietHours = (date = current(), timeZone = resolveQuietTimeZone(runtime, config)) =>
+    isQuietHour(date, config?.notify?.quietHours ?? limits.quietHours, timeZone);
 
   const readEndpoint = () => {
     try {

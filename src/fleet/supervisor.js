@@ -21,7 +21,7 @@ import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, thr
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
-import { createNotifier } from "./notify.js";
+import { createNotifier, isQuietHour, resolveQuietTimeZone } from "./notify.js";
 import { buildContextRequestMessage, classifyAsk, decisionContextFromQuestion, groupItemName, renderDecisionContext, shouldHoldForContext, stripInternalIds } from "./decision-context.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
@@ -832,7 +832,10 @@ export class FleetSupervisor {
     this.deps = deps ?? {};
     this.skip = { bb3: false, github: false, ...skip };
     this.proactiveSupervisorChat = config?.proactiveSupervisorChat === true;
-    this.proactiveRespectQuietHours = config?.proactiveRespectQuietHours === true;
+    this.proactiveRespectQuietHours = config?.proactiveRespectQuietHours !== false;
+    this.proactiveQuietHoursExplicit = config?.proactiveRespectQuietHours === true || config?.notify?.quietHours !== undefined;
+    this.proactiveQuietHours = config?.notify?.quietHours ?? null;
+    this.proactiveTimeZone = config?.notify?.timeZone ?? config?.timeZone ?? null;
     this.config = config?.paths && config?.limits ? config : resolveFleetConfig(process.env, config ?? {});
     this._store = null;
     this._executor = null;
@@ -1345,7 +1348,7 @@ export class FleetSupervisor {
       total: this.precedentMemory.list().length,
       recentApplications: this.precedentMemory.applications(5)
     };
-    return { ...baseState, ...deck, watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
+    return { ...baseState, ...deck, lastOwnerAckAt: store.lastOwnerAckAt(), watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
   }
 
     buildWatchdogSummary(snapshot) {
@@ -1660,11 +1663,17 @@ export class FleetSupervisor {
     return saved;
   }
 
+  recordOwnerActivity(at = this.now()) {
+    try { this.store.recordOwnerAck(at); } catch { /* best-effort */ }
+    try { this.runtime?.hubProactiveGuard?.noteOwnerActivity?.(at); } catch { /* best-effort */ }
+  }
+
   dismissQuestion(id) {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
     if (question.kind === "suggestion") {
       this.respondSuggestion(question.meta?.suggestionId, "Not now").catch(() => {});
+      this.recordOwnerActivity();
       this.emitFleet("question-dismissed");
       return this.store.question(id);
     }
@@ -1673,6 +1682,7 @@ export class FleetSupervisor {
     if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
       this.resolveOutreach(question, "Later", "acted");
       const closed = this.store.answerQuestion(id, "Later");
+      this.recordOwnerActivity();
       this.emitFleet("question-dismissed");
       return closed;
     }
@@ -1686,6 +1696,7 @@ export class FleetSupervisor {
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     const dismissed = this.store.dismissQuestion(id);
+    this.recordOwnerActivity();
     this.emitFleet("question-dismissed");
     return dismissed;
   }
@@ -2374,6 +2385,7 @@ export class FleetSupervisor {
         if (sent.queued) {
           this.resolveOutreach(question, answer, "acted");
           this.applyOverride(question, answer);
+          this.recordOwnerActivity();
           return { question: sent.queued, delivery: sent.delivery };
         }
         delivery = sent.delivery;
@@ -2394,6 +2406,7 @@ export class FleetSupervisor {
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
+      this.recordOwnerActivity();
       this.store.savePreferences(recordPreferenceSignal(this.store.preferences(), { type: "answer", question, answer, now: this.now() }));
       try {
         this.precedentMemory.recordOwnerDecision({
@@ -2508,12 +2521,14 @@ export class FleetSupervisor {
       // thread must not mute it).
       if (sent.queued) {
         this.resolveOutreach(question, "reply", "acted");
+        this.recordOwnerActivity();
         return { question: sent.queued, delivery: sent.delivery };
       }
       if (sent.delivery.status !== "sent") {
         return { question: this.store.question(id), delivery: sent.delivery };
       }
       const answered = this.store.answerQuestion(id, text);
+      this.recordOwnerActivity();
       try {
         this.precedentMemory.recordOwnerDecision({
           question,
@@ -3206,6 +3221,7 @@ export class FleetSupervisor {
             kind: typeof metadata?.kind === "string" ? metadata.kind : "proactive_supervisor",
             ...(Array.isArray(metadata?.decisionKeys) ? { decisionKeys: metadata.decisionKeys } : {}),
             ...(Array.isArray(metadata?.decisionTokens) ? { decisionTokens: metadata.decisionTokens } : {}),
+            ...(Array.isArray(metadata?.decisionKinds) ? { decisionKinds: metadata.decisionKinds } : {}),
             ...(reviewedFlag ? { agentReviewed: true } : {})
           }
         : null;
@@ -3248,6 +3264,7 @@ export class FleetSupervisor {
         kind: metadata?.kind ?? "proactive_supervisor_delta",
         decisionKeys: Array.isArray(metadata?.decisionKeys) ? metadata.decisionKeys : [],
         decisionTokens: Array.isArray(metadata?.decisionTokens) ? metadata.decisionTokens : [],
+        decisionKinds: Array.isArray(metadata?.decisionKinds) ? metadata.decisionKinds : [],
         alreadyAgentReviewed: false,
         judgeFn: this.deps.judgeProactiveUpdate ?? null,
         persist: async (finalText, { agentReviewed: reviewedFlag }) => {
@@ -3287,8 +3304,9 @@ export class FleetSupervisor {
       });
       agentReviewed = verdict.agentReviewed === true;
       if (!verdict.send) {
-        if (dedupeKey) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
-        return { posted: false, suppressed: true, agentReviewed, reason: verdict.reason || "suppressed_by_agent" };
+        const isDeferred = verdict.deferred === true;
+        if (dedupeKey && !isDeferred) this.store.recordSupervisorChatNotice(dedupeKey, `suppressed: ${verdict.reason}`);
+        return { posted: false, suppressed: true, deferred: isDeferred, agentReviewed, reason: verdict.reason || "suppressed_by_agent" };
       }
       if (verdict.text) {
         cleanContent = clampTailLines(redactSecrets(String(verdict.text).trim()), Math.max(200, Math.min(8000, Number(maxChars) || 1600)));
@@ -3498,15 +3516,23 @@ export class FleetSupervisor {
   async maybePostProactiveSupervisorDigest({ started, snapshot = null }) {
     const enabled = Boolean(this.timer) || this.proactiveSupervisorChat || this.config?.proactiveSupervisorChat === true;
     if (!enabled) return null;
-    const quiet = this.config?.notify?.quietHours ?? null;
-    if (quiet && Number.isInteger(quiet.start) && Number.isInteger(quiet.end)) {
-      const hour = new Date(started).getHours();
-      const inQuiet = quiet.start <= quiet.end
-        ? (hour >= quiet.start && hour < quiet.end)
-        : (hour >= quiet.start || hour < quiet.end);
-      if (inQuiet) return null;
-    } else if ((this.proactiveRespectQuietHours || this.config?.proactiveRespectQuietHours === true) && this.notifier?.isQuietHours?.(new Date(started))) {
-      return null;
+    const nodeConfig = this.dataDir ? readNodeConfig(this.dataDir) : null;
+    const remoteHubManaged = Boolean(nodeConfig?.remote && nodeConfig?.ownerProxyToken);
+    const explicitQuietConfig = this.proactiveQuietHoursExplicit
+      || this.config?.notify?.quietHours !== undefined
+      || this.config?.proactiveRespectQuietHours === true;
+    // Paired worker nodes (e.g. a UTC Linux worker forwarding to a hub in the
+    // owner's timezone) defer quiet-hours enforcement to the hub's authoritative
+    // hubProactiveGuard unless quiet hours were explicitly configured locally.
+    const enforceQuietHours = this.proactiveRespectQuietHours !== false
+      && (explicitQuietConfig || (Boolean(this.timer) && !remoteHubManaged))
+      && String(process.env.OPENAGI_PROACTIVE_QUIET_HOURS ?? "").trim().toLowerCase() !== "off";
+    if (enforceQuietHours) {
+      const quiet = this.proactiveQuietHours ?? this.config?.notify?.quietHours ?? this.config?.limits?.quietHours ?? DEFAULTS.quietHours;
+      const tz = this.proactiveTimeZone ?? resolveQuietTimeZone(this.runtime, this.config);
+      if (isQuietHour(new Date(started), quiet, tz)) {
+        return { posted: false, deferred: true, reason: "quiet_hours" };
+      }
     }
 
     const notifyPrefs = this.store.preferences();
@@ -3625,7 +3651,10 @@ export class FleetSupervisor {
         kind: "proactive_supervisor_delta",
         deltaCount: shownDeltas.length,
         decisionKeys: shownDeltas.map((d) => d.decisionKey),
-        decisionTokens: shownDeltas.map((d) => `${d.decisionKey}:${d.materialHash || ""}`)
+        decisionTokens: shownDeltas.map((d) => `${d.decisionKey}:${d.materialHash || ""}`),
+        decisionKinds: shownDeltas.map((d) => (d.question?.mergeAsk || d.question?.kind === "ready"
+          ? "ready"
+          : (d.question?.risky ? "risky" : String(d.question?.kind ?? "agent-ask"))))
       }
     });
     // Only what was shown, and only once it reached the owner's copy (or was
@@ -4579,6 +4608,7 @@ export class FleetSupervisor {
           this.store.resolveQuestion(question.id, `merged ${prRef}`);
         }
         this.resolveOutreach(question, "merged", "acted");
+        this.recordOwnerActivity();
         this.store.recordAction({
           kind: "pr-merge",
           playbook: effectiveOp === "merge_and_deploy" ? "owner-merge-deploy" : "owner-merge",
@@ -4698,6 +4728,7 @@ export class FleetSupervisor {
       if (deliveredOk) {
         this.store.answerQuestion(question.id, replyText);
         this.resolveOutreach(question, "reply", "acted");
+        this.recordOwnerActivity();
         this.emitFleet("card-replied");
       }
       return {

@@ -182,10 +182,26 @@ export class RemoteFleetSupervisor {
     this.intervalMs = intervalMs;
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
     this.modeFile = dataDir ? path.join(dataDir, "fleet-remote-mode.json") : null;
+    this.preferencesFile = dataDir ? path.join(dataDir, "fleet-remote-preferences.json") : null;
     // Only the fleet computer knows its mode. Until it answers, this is the
     // last mode it reported (kept across restarts), or none: never a guess.
     this.reportedMode = this.lastReportedMode();
-    this.state = { mode: this.reportedMode, enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
+    const cachedPrefsState = this.lastReportedPreferencesState();
+    this.reportedPreferences = cachedPrefsState.preferences;
+    this.lastOwnerAckAtMs = cachedPrefsState.lastOwnerAckAtMs;
+    this.state = {
+      mode: this.reportedMode,
+      ...(this.reportedPreferences ? { preferences: this.reportedPreferences } : {}),
+      ...(this.lastOwnerAckAtMs > 0 ? { lastOwnerAckAt: new Date(this.lastOwnerAckAtMs).toISOString() } : {}),
+      enabled: true,
+      running: false,
+      lastTickAt: null,
+      lastError: 'Waiting for the fleet computer',
+      snapshot: null,
+      questions: [],
+      actions: [],
+      settings: { remoteNode: nodeId }
+    };
     this.refreshing = null;
     this.questionsAuthoritative = false;
     this.timer = null;
@@ -220,6 +236,47 @@ export class RemoteFleetSupervisor {
       if (this.modeFile) writeJsonAtomic(this.modeFile, { nodeId: this.nodeId, mode });
       this.reportedMode = mode;
     } catch { /* unsaved: the next report writes it */ }
+  }
+  lastReportedPreferencesState() {
+    if (!this.preferencesFile) return { preferences: null, lastOwnerAckAtMs: 0 };
+    try {
+      const saved = readJsonFile(this.preferencesFile, null);
+      if (saved?.nodeId !== this.nodeId) return { preferences: null, lastOwnerAckAtMs: 0 };
+      const preferences = saved?.preferences && typeof saved.preferences === "object"
+        ? normalizePreferences(saved.preferences)
+        : null;
+      const ackMs = Date.parse(String(saved?.lastOwnerAckAt ?? ""));
+      return { preferences, lastOwnerAckAtMs: Number.isFinite(ackMs) && ackMs > 0 ? ackMs : 0 };
+    } catch {
+      return { preferences: null, lastOwnerAckAtMs: 0 };
+    }
+  }
+  _savePreferencesCache() {
+    if (!this.preferencesFile) return;
+    try {
+      writeJsonAtomic(this.preferencesFile, {
+        nodeId: this.nodeId,
+        ...(this.reportedPreferences ? { preferences: this.reportedPreferences } : {}),
+        ...(this.lastOwnerAckAtMs > 0 ? { lastOwnerAckAt: new Date(this.lastOwnerAckAtMs).toISOString() } : {})
+      });
+    } catch { /* unsaved: the next report writes it */ }
+  }
+  noteReportedPreferences(prefs) {
+    if (!prefs || typeof prefs !== "object") return;
+    const normalized = normalizePreferences(prefs);
+    if (this.reportedPreferences && JSON.stringify(normalized) === JSON.stringify(this.reportedPreferences)) return;
+    this.reportedPreferences = normalized;
+    this._savePreferencesCache();
+  }
+  noteOwnerAck(atMs = Date.now()) {
+    const ts = typeof atMs === "string" ? Date.parse(atMs) : Number(atMs);
+    if (!Number.isFinite(ts) || ts <= 0) return;
+    if (ts > this.lastOwnerAckAtMs) {
+      this.lastOwnerAckAtMs = ts;
+      this.state.lastOwnerAckAt = new Date(ts).toISOString();
+      this._savePreferencesCache();
+    }
+    this.runtime?.hubProactiveGuard?.noteOwnerActivity?.(this.lastOwnerAckAtMs);
   }
   getState() {
     const state = structuredClone(this.state);
@@ -277,6 +334,12 @@ export class RemoteFleetSupervisor {
         this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
+        this.noteReportedPreferences(this.state.preferences);
+        if (this.state.lastOwnerAckAt) this.noteOwnerAck(this.state.lastOwnerAckAt);
+        if (this.lastOwnerAckAtMs > 0) {
+          const curAck = Date.parse(String(this.state.lastOwnerAckAt ?? "")) || 0;
+          if (this.lastOwnerAckAtMs > curAck) this.state.lastOwnerAckAt = new Date(this.lastOwnerAckAtMs).toISOString();
+        }
         this.mirrorQuestions();
         this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();
@@ -437,21 +500,33 @@ export class RemoteFleetSupervisor {
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
   async answerQuestion(id, answer, { clarification = null } = {}) {
-    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer);
+    if (this.selfFixHub?.store.question(id)) {
+      const out = this.selfFixHub.answer(id, answer);
+      this.noteOwnerAck();
+      return out;
+    }
     const card = this.state.questions.find(q => q.id === id);
     if (this.selfFixHub && card?.kind === 'suggestion' && answer === 'Fix it' && (card.options ?? []).includes(answer)) {
       const result = await this.respondSuggestion(card.meta?.suggestionId, answer);
+      this.noteOwnerAck();
       return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
     }
-    return this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    const res = await this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    this.noteOwnerAck();
+    return res;
   }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
   async dismissQuestion(id, { replay = false } = {}) {
-    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.store.dismissQuestion(id);
+    if (this.selfFixHub?.store.question(id)) {
+      const out = this.selfFixHub.store.dismissQuestion(id);
+      this.noteOwnerAck();
+      return out;
+    }
     try {
       const body = await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true });
       this.pendingDismissals.delete(id);
+      this.noteOwnerAck();
       return body.question;
     } catch (error) {
       if (replay && !error.reached) this.pendingDismissals.add(id);
@@ -467,7 +542,11 @@ export class RemoteFleetSupervisor {
     }
   }
   // Brings back a question the computer's review closed.
-  async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
+  async replyQuestion(id, reply) {
+    const res = await this.request('POST', `/fleet/api/questions/${id}`, { reply });
+    this.noteOwnerAck();
+    return res;
+  }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
   // The owner's message to one thread. A request the computer never received
@@ -752,7 +831,9 @@ export class RemoteFleetSupervisor {
     const { cardOp, explicitIds } = normalizeBatchCardsInput(input);
     const openLocalQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
     if (openLocalQuestions.length === 0) {
-      return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+      const res = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+      if (res?.succeeded > 0) this.noteOwnerAck();
+      return res;
     }
 
     const localById = new Map();
@@ -835,7 +916,9 @@ export class RemoteFleetSupervisor {
           )
         : null;
       if (localRes?.total > 0) this.emitIfChanged();
-      return combineBatchResults(remoteRes, localRes, explicitIds);
+      const combined = combineBatchResults(remoteRes, localRes, explicitIds);
+      if (combined?.succeeded > 0) this.noteOwnerAck();
+      return combined;
     }
 
     const remoteRes = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
@@ -851,7 +934,9 @@ export class RemoteFleetSupervisor {
       }
     }
     if (localRes?.total > 0) this.emitIfChanged();
-    return combineBatchResults(remoteRes, localRes);
+    const combined = combineBatchResults(remoteRes, localRes);
+    if (combined?.succeeded > 0) this.noteOwnerAck();
+    return combined;
   }
   async readChatTranscript({ key, limit = 20 } = {}) {
     const cleanKey = typeof key === 'string' ? key.trim() : '';
@@ -927,7 +1012,9 @@ export class RemoteFleetSupervisor {
         const effectiveValue = explicitValue ?? resolvedAction?.value ?? null;
 
         if (effectiveOp === 'defer' || effectiveOp === 'dismiss' || effectiveValue === 'dismiss') {
-          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(qid), delivery: null };
+          const dismissed = this.selfFixHub.store.dismissQuestion(qid);
+          this.noteOwnerAck();
+          return { ok: true, kind: 'defer', status: 'dismissed', question: dismissed, delivery: null };
         }
         if (effectiveOp === 'merge' || effectiveOp === 'fix_ci') {
           return { ok: false, kind: effectiveOp, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
@@ -936,11 +1023,14 @@ export class RemoteFleetSupervisor {
         const answer = effectiveValue ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
         if (!answer) return null;
         const res = await this.selfFixHub.answer(qid, answer);
+        if (res) this.noteOwnerAck();
         return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;
       }
     }
     try {
-      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+      const res = (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+      if (res?.ok !== false) this.noteOwnerAck();
+      return res;
     } catch (error) {
       const legacyRouteMissing = Boolean(error.unsupportedRoute) || /unknown fleet route|unsupported fleet request/i.test(String(error?.message ?? ''));
       if (error.status === 404 && !legacyRouteMissing) return null;
