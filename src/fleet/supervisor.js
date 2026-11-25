@@ -2602,7 +2602,7 @@ export class FleetSupervisor {
     return await this._deliverOwnerMessage(threadKey, text, { ...opts, key });
   }
 
-  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false } = {}) {
+  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false, questionId = null, questionAnswer = null } = {}) {
     const startedAt = Date.now();
     // Capture the approval/send-start boundary before awaiting delivery so any
     // owner cancellation written while the initial attempt is in flight makes
@@ -2719,7 +2719,8 @@ export class FleetSupervisor {
         goalId,
         ownerChoice,
         source: "owner-message",
-        ...(key ? { idempotencyKey: key } : {})
+        ...(key ? { idempotencyKey: key } : {}),
+        ...(questionId ? { questionId, questionAnswer } : {})
       });
       if (!queued) {
         const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
@@ -3020,8 +3021,31 @@ export class FleetSupervisor {
     this.queuedOwnerTimer.unref?.();
   }
 
+  // A queued reply to an owner's card that never reached the agent puts the
+  // card back, once, with what happened, instead of leaving it closed as
+  // answered. Nothing is re-sent: "unconfirmed" may have landed, so the
+  // owner checks the chat first; the others reached nothing.
+  reopenUndeliveredReply(entry, reason, detail = null) {
+    if (!entry?.questionId) return null;
+    const notes = {
+      expired: "Your reply waited 24 h behind the agent's running turn and was never sent. Nothing reached the agent.",
+      archived: "The chat was archived before your queued reply was sent. Nothing reached the agent.",
+      failed: `Your queued reply could not be sent${detail ? ` (${clampText(detail, 120)})` : ""}. Nothing reached the agent.`,
+      unconfirmed: "Your queued reply may have reached the agent, but delivery was not confirmed. Check the chat before sending it again."
+    };
+    const note = notes[reason] ?? notes.failed;
+    const reopened = this.store.reopenUndeliveredReply(entry.questionId, { answer: entry.questionAnswer ?? null, threadKey: entry.threadKey ?? null, note });
+    if (!reopened) return null;
+    this.store.recordAction({ threadKey: entry.threadKey ?? null, playbook: "owner-message", status: "blocked", route: "paseo-queue",
+      detail: clampText(`Reply to card ${entry.questionId} not delivered (${reason}); card reopened. ${note}`, 240) });
+    this.emitFleet("card-reply-undelivered");
+    return reopened;
+  }
+
   async drainQueuedOwnerMessages({ byKey = null, started = this.now(), unknownPrefixes = [] } = {}) {
     const queued = this.store.queuedOwnerMessages();
+    // Queued replies that expired before reaching the agent: their cards go back.
+    for (const expired of this.store.takeUndeliveredOwnerReplies()) this.reopenUndeliveredReply(expired, expired.reason ?? "expired");
     if (!queued.length) return [];
     const seenThreads = new Set();
     const results = [];
@@ -3064,6 +3088,7 @@ export class FleetSupervisor {
           route: "paseo-queue",
           detail: "Queued message dropped: target Paseo session was archived."
         });
+        this.reopenUndeliveredReply(entry, "archived");
         results.push({ id: entry.id, threadKey: effectiveKey, status: "dropped-archived" });
         continue;
       }
@@ -3147,6 +3172,7 @@ export class FleetSupervisor {
             240
           )
         });
+        this.reopenUndeliveredReply(entry, "unconfirmed");
         results.push({ id: entry.id, threadKey: effectiveKey, status: "unconfirmed", delivery });
       } else {
         const updated = this.store.noteQueuedOwnerMessageAttempt(entry.id, delivery?.detail ?? delivery?.status ?? "blocked");
@@ -3154,6 +3180,7 @@ export class FleetSupervisor {
           for (const k of approvalKeys) {
             this.handoffs.update(k, { status: "blocked", detail: clampText(delivery?.detail ?? delivery?.status ?? "queued send failed", 200) });
           }
+          this.reopenUndeliveredReply(entry, "failed", delivery?.detail ?? delivery?.status ?? null);
         }
         results.push({ id: entry.id, threadKey: effectiveKey, status: delivery?.status ?? "blocked", delivery });
       }
@@ -4723,7 +4750,9 @@ export class FleetSupervisor {
       }
       const targetKey = card?.threadKey ?? question.threadKey ?? null;
       if (!targetKey) return { ok: false, kind: "reply", status: "blocked", detail: "No coding session is linked to this card." };
-      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt, ...(hasImages ? { images } : {}) });
+      // A reply that only queues behind a running turn stays linked to this
+      // card: if it never reaches the agent, the card is put back.
+      const sent = await this.sendOwnerMessage(targetKey, replyText, { deadlineAt, questionId: question.id, questionAnswer: replyText, ...(hasImages ? { images } : {}) });
       const deliveredOk = ["sent", "queued"].includes(sent?.delivery?.status);
       if (deliveredOk) {
         this.store.answerQuestion(question.id, replyText);

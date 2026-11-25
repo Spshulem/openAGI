@@ -702,6 +702,38 @@ export class FleetStore {
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer
   // from the owner is not undone.
+  // A queued reply to an owner's card that left the queue without reaching
+  // the agent (expired). Kept until the supervisor puts the card back.
+  _noteUndeliveredReply(item, reason) {
+    if (!item?.questionId) return;
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (list.some((entry) => entry.id === item.id)) return;
+    list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, threadKey: item.threadKey, reason, at: iso(this.now()) });
+    this.state.undeliveredOwnerReplies = list.slice(-50);
+  }
+
+  takeUndeliveredOwnerReplies() {
+    const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
+    if (!list.length) return [];
+    this.state.undeliveredOwnerReplies = [];
+    this._save();
+    return list.map((entry) => ({ ...entry }));
+  }
+
+  // Puts an owner's card back after its reply never reached the agent, once,
+  // and only while that reply is still the card's answer (a newer, different
+  // answer from the owner stands). note: what happened, shown on the card.
+  reopenUndeliveredReply(questionId, { answer = null, threadKey = null, note = null } = {}) {
+    const question = this._findQuestion(questionId);
+    if (!question || question.status !== "answered") return null;
+    if (answer !== null && question.answer !== answer) return null;
+    const reopened = this.reopenQuestion(questionId, threadKey ? [threadKey] : [], { answer: question.answer, asked: true });
+    if (!reopened) return null;
+    const live = this._findQuestion(questionId);
+    if (live && note) { live.deliveryNote = clampText(note, 240); live.deliveryNoteAt = iso(this.now()); this._save(); }
+    return live ? { ...live } : reopened;
+  }
+
   reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
@@ -1759,7 +1791,7 @@ export class FleetStore {
     return resolvedKeys;
   }
 
-  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null } = {}) {
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null } = {}) {
     const cleanKey = String(threadKey ?? "").trim();
     const cleanMsg = String(message ?? "").trim();
     // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
@@ -1774,7 +1806,9 @@ export class FleetStore {
     this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])
       .filter((item) => {
         const createdMs = toMs(item?.createdAt, 0);
-        return createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+        const live = createdMs === 0 || nowMs - createdMs < QUESTION_TTL_MS;
+        if (!live) this._noteUndeliveredReply(item, "expired");
+        return live;
       });
     const normalizedImages = Array.isArray(images) && images.length > 0 ? images.slice(0, 4) : null;
     const imageSig = (imgs) => (Array.isArray(imgs) && imgs.length > 0 ? JSON.stringify(imgs) : "");
@@ -1784,6 +1818,11 @@ export class FleetStore {
         || (item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig)
     );
     if (existing) {
+      if (questionId && !existing.questionId) {
+        existing.questionId = String(questionId).slice(0, 80);
+        existing.questionAnswer = clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax);
+        this._save();
+      }
       if (cleanIdempotencyKey) {
         const keys = [...new Set([existing.idempotencyKey, ...(Array.isArray(existing.idempotencyKeys) ? existing.idempotencyKeys : []), cleanIdempotencyKey].filter(Boolean))];
         if (!existing.idempotencyKey || !Array.isArray(existing.idempotencyKeys) || existing.idempotencyKeys.length !== keys.length) {
@@ -1800,6 +1839,9 @@ export class FleetStore {
       message: cleanMsg,
       ...(normalizedImages ? { images: normalizedImages } : {}),
       ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
+      // The owner's card this message answers: if it never reaches the agent,
+      // the card is put back instead of staying closed as answered.
+      ...(questionId ? { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) } : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
       ...(cleanIdempotencyKey ? { idempotencyKey: cleanIdempotencyKey, idempotencyKeys: [cleanIdempotencyKey] } : {}),
       source: clampText(String(source || "owner-message"), 40),
@@ -1827,7 +1869,10 @@ export class FleetStore {
     const active = list.filter((item) => {
       if (!item?.id || !item?.threadKey || !item?.message) return false;
       const createdMs = toMs(item.createdAt, 0);
-      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) return false;
+      if (createdMs > 0 && nowMs - createdMs >= QUESTION_TTL_MS) {
+        this._noteUndeliveredReply(item, "expired");
+        return false;
+      }
       return true;
     });
     if (active.length !== list.length) {
