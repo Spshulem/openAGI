@@ -130,6 +130,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             deliver(status: 200, data: Data(stream.utf8), contentType: "text/event-stream")
             return
         }
+        // Send Now in a fixture chat: the running tool hop has to finish
+        // first, as main answers while a tool runs.
+        if url.path == "/conversations/agent/interrupt" || url.path == "/conversations/supervisor/interrupt" {
+            let requestId = Self.body(request).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["requestId"] as? String ?? ""
+            finish(status: 200, object: ["status": "stopping", "tool": "fleet_status", "requestId": requestId])
+            return
+        }
         let empty = ProcessInfo.processInfo.arguments.contains("--ui-empty-today")
         let tasks = [Self.task(id: "demo-one", title: "Plan a synthetic demo"),
                      Self.task(id: "demo-two", title: "Review a synthetic demo")]

@@ -695,7 +695,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const node = computerNode(runtime, session);
       if (node) {
         try {
-          const shot = await invokeCancellableNodeAction(node, session, action, "screenshot", {}, context.signal);
+          const shot = await invokeCancellableNodeAction(node, session, action, "screenshot", {}, context.actionSignal ?? context.signal);
           runtime.computerUseLog.markActionResult(action.id, {
             status: "executed",
             result: { width: shot.width, height: shot.height, bytes: shot.bytes }
@@ -714,7 +714,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           // The local executor and the authenticated relay/HTTP transport
           // identify a completed, read-only refusal. Keep the same lease and
           // target; the node has already invalidated its previous frame.
-          if (!context.signal?.aborted && runtime.computerUseLog.getSession(session.id)?.status === "active"
+          if (!(context.actionSignal ?? context.signal)?.aborted && runtime.computerUseLog.getSession(session.id)?.status === "active"
               && error?.nodeSequenceConsumed === true
               && (error.code === SCREENSHOT_FOCUS_UNAVAILABLE
                 || (error.nodeAcknowledged === true && error.message === SCREENSHOT_FOCUS_UNAVAILABLE))) {
@@ -795,7 +795,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           throw new Error(EXECUTION_UNAVAILABLE);
         }
         try {
-          const nodeResult = await invokeCancellableNodeAction(node, session, action, nodePath, payloadOf(actionArgs), context.signal);
+          const nodeResult = await invokeCancellableNodeAction(node, session, action, nodePath, payloadOf(actionArgs), context.actionSignal ?? context.signal);
           if (runtime.computerUseLog.getSession(session.id)?.status !== "active") {
             runtime.computerUseLog.markActionResult(action.id, { status: "aborted", error: "session-stopped" });
             throw Object.assign(new Error("computer-use session was stopped before the action result was accepted"), {

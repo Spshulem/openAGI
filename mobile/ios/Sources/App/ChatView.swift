@@ -1,4 +1,5 @@
 import SwiftUI
+import SupervisorChannelsKit
 import PhotosUI
 import UIKit
 import UniformTypeIdentifiers
@@ -200,6 +201,7 @@ struct ChatConversationView: View {
     @State private var pendingVoiceStart: UUID?
     @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
+    @FocusState private var queuedEditFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -782,59 +784,140 @@ struct ChatConversationView: View {
         .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
     }
 
+    // Messages sent while a reply runs. Each row: Edit (inline; Save never
+    // sends), Send now (interrupts the running reply, then sends this next)
+    // and Remove. The status line says only what main confirmed.
     private var queuedSubmissionsTray: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Queued (\(conversation.queuedSubmissions.count))")
+        let items = conversation.queuedSubmissions
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(conversation.editingQueuedID != nil && items.first?.id == conversation.editingQueuedID
+                 ? "Queued (\(items.count)) · waiting for your edit" : "Queued (\(items.count))")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.muted)
-            ForEach(conversation.queuedSubmissions) { item in
-                HStack(spacing: 8) {
-                    Image(systemName: "clock")
-                        .font(.caption2)
-                        .foregroundStyle(Theme.live)
-                    Text(item.text)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.ink)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if !item.attachments.isEmpty {
-                        Text("\(item.attachments.count) img")
-                            .font(.caption2)
-                            .foregroundStyle(Theme.muted)
-                    }
-                    Button("Edit") {
-                        guard let popped = conversation.popQueuedSubmissionForEdit(id: item.id) else { return }
-                        if conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            conversation.draft = popped.text
-                        } else {
-                            conversation.draft += "\n" + popped.text
-                        }
-                        if !popped.attachments.isEmpty {
-                            let available = max(0, ChatAttachment.maximumCount - conversation.draftAttachments.count)
-                            conversation.draftAttachments.append(contentsOf: popped.attachments.prefix(available))
-                        }
-                        composerFocused = true
-                    }
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Theme.live)
-                    .buttonStyle(.plain)
-                    Button {
-                        conversation.removeQueuedSubmission(id: item.id)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(Theme.muted)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Remove queued message")
+                .accessibilityAddTraits(.isHeader)
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                if conversation.editingQueuedID == item.id {
+                    queuedEditor(item)
+                } else {
+                    queuedRow(item, position: index + 1, of: items.count)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
             }
         }
         .padding(.horizontal, 14)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-queue")
+    }
+
+    private func queuedRow(_ item: QueuedChatSubmission, position: Int, of total: Int) -> some View {
+        let canSendNow = conversation.canSendQueuedNow(id: item.id)
+        let sendNowLabel = conversation.isSending ? "Interrupt & send" : "Send now"
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Group {
+                    if item.sendNow == .requesting { ProgressView().controlSize(.mini) }
+                    else { Image(systemName: item.sendNow == nil ? "clock" : "arrow.up.to.line") }
+                }
+                .font(.caption2)
+                .foregroundStyle(Theme.live)
+                .accessibilityHidden(true)
+                Text(item.text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
+                    .accessibilityIdentifier("chat-queued-text")
+                if !item.attachments.isEmpty {
+                    Text("\(item.attachments.count) img")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                }
+                Button("Edit") {
+                    if conversation.beginEditingQueued(id: item.id) { queuedEditFocused = true }
+                }
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Theme.live)
+                .buttonStyle(.plain)
+                .disabled(conversation.editingQueuedID != nil)
+                .accessibilityLabel("Edit queued message")
+                .accessibilityIdentifier("chat-queued-edit")
+                Button {
+                    Task { await conversation.sendQueuedNow(id: item.id) }
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill").font(.body)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(canSendNow ? Theme.live : Theme.muted)
+                .disabled(!canSendNow)
+                .accessibilityLabel(conversation.isSending ? "Interrupt reply and send this now" : "Send this next")
+                .accessibilityIdentifier("chat-queued-send-now")
+                .help(sendNowLabel)
+                Button {
+                    conversation.removeQueuedSubmission(id: item.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Theme.muted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove queued message")
+                .accessibilityIdentifier("chat-queued-remove")
+            }
+            if let state = item.sendNow {
+                Text(state.label)
+                    .font(.caption2)
+                    .foregroundStyle(state.isError ? Theme.caution : Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("chat-queued-status")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
+        // Each control stays its own element, so VoiceOver, Voice Control
+        // ("Tap Edit") and Full Keyboard Access reach every one.
+        .accessibilityElement(children: .contain)
+    }
+
+    // Inline editor. Return adds a line; only Save changes the message, and
+    // Save never sends it -- the queue continues by itself afterwards.
+    private func queuedEditor(_ item: QueuedChatSubmission) -> some View {
+        @Bindable var conversation = conversation
+        return VStack(alignment: .leading, spacing: 6) {
+            TextField("Queued message", text: $conversation.queuedEditDraft, axis: .vertical)
+                .font(Theme.Typography.caption)
+                .lineLimit(1...6)
+                .focused($queuedEditFocused)
+                .accessibilityLabel("Edit queued message")
+                .accessibilityIdentifier("chat-queued-edit-field")
+            HStack {
+                Text("The queue waits here until you save.")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                Spacer()
+                Button("Cancel", role: .cancel) {
+                    conversation.cancelQueuedEdit()
+                    queuedEditFocused = false
+                }
+                .font(.caption.weight(.semibold))
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("chat-queued-cancel")
+                Button("Save") {
+                    if conversation.saveQueuedEdit() { queuedEditFocused = false }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.live)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(conversation.queuedEditDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && item.attachments.isEmpty)
+                .accessibilityHint("Saves the change. It does not send.")
+                .accessibilityIdentifier("chat-queued-save")
+            }
+        }
+        .padding(10)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.6), lineWidth: 1))
     }
 
     private var attachmentStrip: some View {

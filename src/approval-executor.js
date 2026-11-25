@@ -7,7 +7,11 @@
 // computer-use resume a dashboard approval schedules.
 // Returns { status, body, action, invokeResult }: status is the HTTP status
 // the approve route sends; body is its JSON.
-export async function executeApprovedAction(runtime, id, { decidedBy = "user", claimedBy = decidedBy, continuation = null } = {}) {
+// signal: the owner's turn that approved it in chat. A stop that lands
+// while the approval is still being validated means nothing runs and the
+// card stays pending (`cancelled`). It is never passed to the tool: a
+// handler that has started finishes.
+export async function executeApprovedAction(runtime, id, { decidedBy = "user", claimedBy = decidedBy, continuation = null, signal = null } = {}) {
   let action = runtime.pendingActions?.get?.(id) ?? null;
   if (!action) return { status: 404, body: { error: "unknown pending action" } };
   if (action.status === "expired") return { status: 410, body: { error: "approval expired; request it again" } };
@@ -41,6 +45,7 @@ export async function executeApprovedAction(runtime, id, { decidedBy = "user", c
       action: runtime.pendingActions.get(id) ?? action
     };
   }
+  if (signal?.aborted) return { status: 409, body: { error: "stopped before it ran; still waiting for approval" }, action, cancelled: true };
   const claim = runtime.pendingActions.claimForExecution?.(id, { claimedBy });
   if (!claim) {
     action = runtime.pendingActions.get(id);

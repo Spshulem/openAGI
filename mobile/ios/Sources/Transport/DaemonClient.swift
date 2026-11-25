@@ -1,4 +1,5 @@
 import Foundation
+import SupervisorChannelsKit
 
 public enum MainConnectionIssue: String, Sendable, Equatable {
     case authorizationRequired = "main-pairing-required"
@@ -462,6 +463,36 @@ public actor DaemonClient {
         let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(ConversationPage.self, from: data)
+    }
+
+    private struct InterruptAnswer: Decodable { let status: String?; let tool: String? }
+
+    // `POST /conversations/:thread/interrupt` -- ask main to stop the reply
+    // named `requestId` so a queued message can go first. Never throws: the
+    // answer is what main confirmed, and a request with no answer is
+    // `.unreachable` (it may or may not have stopped), never a success. An
+    // older main without the route reads as `.unsupported`: it answers a
+    // phone's unknown route with 401, which `performConversationRequest`
+    // tells apart from a lost pairing with a heartbeat.
+    public func interruptTurn(thread: ConversationThread, requestId: String, conversationId: String = "main") async -> TurnInterruptOutcome {
+        if sharedThreadsUnsupported || turnIdsUnsupported { return .unsupported }
+        var body: [String: Any] = ["requestId": requestId]
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        do {
+            var request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/interrupt", method: "POST")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            // Main waits up to ~4s for the reply to stop before answering.
+            request.timeoutInterval = 20
+            let (data, http) = try await performConversationRequest(request)
+            try Self.requireConversationJSON(data: data, response: http)
+            let answer = try Self.decodeJSON(InterruptAnswer.self, from: data)
+            return TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool)
+        } catch DaemonError.notFound {
+            return .unsupported
+        } catch {
+            return .unreachable
+        }
     }
 
     public func conversations() async throws -> [ConversationSummary] {

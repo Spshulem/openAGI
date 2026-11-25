@@ -393,6 +393,46 @@ final class NativeNavigationTests: XCTestCase {
         capture("redesign-chat-working", app: app)
     }
 
+    func testQueuedMessagesEditInPlaceAndSendNowSaysWhatMainConfirmed() {
+        let app = launch(["--ui-chat-working"])
+        tab(app, "Chat")
+        // The running reply keeps its working indicator animating, so the app
+        // is never idle and every UI query waits on it. Keep queries few and
+        // narrow: one direct tap on Send per message (no separate existence
+        // and hit-test queries), and let the first queued row (which only
+        // exists while a reply runs) stand for "a reply is running".
+        let composer = app.textFields["chat-composer"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        let send = app.buttons["chat-send"]
+        for text in ["Check my agents", "Draft the update for Tuesday", "Also invite Sam"] {
+            composer.tap()
+            composer.typeText(text)
+            send.tap()
+        }
+        let firstQueued = app.staticTexts.matching(identifier: "chat-queued-text").firstMatch
+        XCTAssertTrue(firstQueued.waitForExistence(timeout: 15))
+        XCTAssertTrue(firstQueued.label.contains("Draft the update for Tuesday"), firstQueued.label)
+        capture("queue-tray", app: app)
+
+        // Edit in place: Save changes the text and keeps its position.
+        app.buttons.matching(identifier: "chat-queued-edit").firstMatch.tap()
+        let field = app.textFields["chat-queued-edit-field"].exists ? app.textFields["chat-queued-edit-field"] : app.textViews["chat-queued-edit-field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.typeText(", make it Wednesday")
+        capture("queue-editing", app: app)
+        app.buttons["chat-queued-save"].tap()
+        XCTAssertTrue(app.staticTexts.matching(identifier: "chat-queued-text").firstMatch.label.contains("make it Wednesday"))
+
+        // Send now on the second message: it moves first, and the row says
+        // main is stopping after the running tool, which won't be undone.
+        app.buttons.matching(identifier: "chat-queued-send-now").element(boundBy: 1).tap()
+        let status = app.staticTexts.matching(identifier: "chat-queued-status").firstMatch
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertTrue(status.label.contains("won't be undone"), status.label)
+        XCTAssertTrue(app.staticTexts.matching(identifier: "chat-queued-text").firstMatch.label.contains("Also invite Sam"))
+        capture("queue-send-now-stopping", app: app)
+    }
+
     func testShortBubblesStayCompactAndLongMarkdownWrapsWithoutClipping() {
         let app = launch(["--ui-long-chat"])
         tab(app, "Chat")
