@@ -29,7 +29,10 @@ quiet, excluded, and supervisor-nudge queues are not called running.
   session identity and select a screen; they never execute agent commands.
 - Lifecycle: existing iOS idle end/retry/token-rotation behavior is retained;
   Android service/notification permission and its Settings switch remain
-  authoritative. A removed session leads to the overview, not another chat.
+  authoritative. A removed session never opens a different session. Android
+  shows the overview. iOS links use the same deep-link path as notification
+  taps: after one refresh, a session that no longer appears opens a detail
+  sheet for that key.
 
 ## Boundaries
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import OpenAGI
@@ -232,5 +233,163 @@ final class FleetOverlayTests: XCTestCase {
     XCTAssertEqual(AppState.overlayTasksSessionId, "overlay:user:main")
     XCTAssertEqual(AppState.overlaySupervisorSessionId, "overlay:supervisor:main")
     XCTAssertNotEqual(AppState.overlayTasksSessionId, AppState.overlaySupervisorSessionId)
+  }
+
+  func testSharedSupervisorPayloadExcludesUnsupportedNodeFields() {
+    let allowed: Set<String> = ["text", "from", "sessionId", "thread", "conversationId", "attachments", "focusedCardId"]
+
+    let plain = SharedSupervisorClient.buildMessagePayload(text: "Hello")
+    XCTAssertTrue(Set(plain.keys).isSubset(of: allowed))
+    XCTAssertNil(plain["metadata"])
+    XCTAssertNil(plain["channel"])
+    XCTAssertNil(plain["agentId"])
+    XCTAssertEqual(plain["thread"] as? String, "supervisor")
+    XCTAssertEqual(plain["from"] as? String, "mac-supervisor")
+
+    let img = NSImage(size: NSSize(width: 24, height: 24), flipped: false) { rect in
+      NSColor.systemBlue.setFill()
+      rect.fill()
+      return true
+    }
+    let att = WorkspaceImageAttachment.encode(img, name: "snap.png")
+    XCTAssertNotNil(att)
+
+    let withCardAndPhoto = SharedSupervisorClient.buildMessagePayload(
+      text: "Inspect",
+      focusedCardId: "card:paseo_1",
+      attachments: att.map { [$0] } ?? []
+    )
+    XCTAssertTrue(Set(withCardAndPhoto.keys).isSubset(of: allowed))
+    XCTAssertEqual(withCardAndPhoto["focusedCardId"] as? String, "card:paseo_1")
+    XCTAssertEqual((withCardAndPhoto["attachments"] as? [[String: Any]])?.count, 1)
+
+    let badCard = SharedSupervisorClient.buildMessagePayload(text: "Hi", focusedCardId: "bad id with spaces")
+    XCTAssertNil(badCard["focusedCardId"])
+
+    let fallback = SharedSupervisorClient.buildMessagePayload(
+      text: "Hi",
+      focusedCardId: "card_1",
+      includeThread: false,
+      includeFocusedCard: false
+    )
+    XCTAssertNil(fallback["thread"])
+    XCTAssertNil(fallback["focusedCardId"])
+  }
+
+  func testAppStateExtractErrorMessageAndWorkerFallbackPayload() {
+    let errData = Data(#"{"error":"node message contains unsupported fields"}"#.utf8)
+    XCTAssertEqual(AppState.extractErrorMessage(errData), "node message contains unsupported fields")
+
+    let msgData = Data(#"{"error":"invalid_images","message":"Use JPEG, PNG or WebP images."}"#.utf8)
+    XCTAssertEqual(AppState.extractErrorMessage(msgData), "Use JPEG, PNG or WebP images.")
+
+    let fallback = AppState.workerFallbackOverlayPayload(
+      text: "What's on screen?",
+      sessionId: AppState.overlayTasksSessionId,
+      screenContext: ScreenContext(app: "Xcode", window: "OpenAGI.swift", text: "build succeeded"),
+      briefContext: nil
+    )
+    XCTAssertEqual(fallback["thread"] as? String, "agent")
+    XCTAssertEqual(fallback["from"] as? String, "mac-overlay")
+    XCTAssertNil(fallback["metadata"])
+    XCTAssertNil(fallback["channel"])
+    XCTAssertTrue((fallback["text"] as? String ?? "").contains("Xcode"))
+  }
+
+  func testSyncedSupervisorMessageDecodesServerAttachmentThumbnail() throws {
+    let thumbBytes = Data([0xff, 0xd8, 0xff, 0xd9])
+    let json = """
+      {
+        "id": "m1",
+        "role": "user",
+        "text": "See screenshot",
+        "at": "2026-11-18T22:00:00Z",
+        "sourceName": "Mac",
+        "sourceNodeId": null,
+        "attachments": [{"id": "a1", "name": "snap.jpg", "mimeType": "image/jpeg", "thumbnail": "\(thumbBytes.base64EncodedString())"}]
+      }
+      """
+    let decoded = try JSONDecoder().decode(SyncedSupervisorMessage.self, from: Data(json.utf8))
+    XCTAssertEqual(decoded.thumbnailImageData, [thumbBytes])
+  }
+
+  func testWorkspaceMarkdownParserAndModelOptionsAndDockDefault() throws {
+    let md = """
+      # Status Summary
+      All **tests** passed cleanly.
+      - Item one
+      - Item two
+      1. First step
+      2. Second step
+      ```swift
+      print("ok")
+      ```
+      """
+    let blocks = WorkspaceMarkdownParser.parse(md)
+    XCTAssertEqual(blocks.count, 5)
+    XCTAssertEqual(blocks[0], .heading(level: 1, text: "Status Summary"))
+    XCTAssertEqual(blocks[1], .paragraph("All **tests** passed cleanly."))
+    XCTAssertEqual(blocks[2], .bulletList(["Item one", "Item two"]))
+    XCTAssertEqual(blocks[3], .numberedList(["First step", "Second step"]))
+    XCTAssertEqual(blocks[4], .codeBlock(language: "swift", code: "print(\"ok\")"))
+
+    XCTAssertEqual(MacModelOption.displayName(for: "gpt-6.2-sol"), "GPT-6.2 Sol")
+    XCTAssertEqual(MacModelOption.displayName(for: "custom-model"), "custom-model")
+    XCTAssertEqual(MacModelOption.displayName(for: nil), "Model")
+
+    let suiteName = "FleetOverlayTests.dock.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    XCTAssertTrue(AppState.defaultShowsInDock(defaults: defaults))
+    defaults.set(false, forKey: AppState.showsInDockDefaultsKey)
+    XCTAssertFalse(AppState.defaultShowsInDock(defaults: defaults))
+  }
+
+  func testFleetSingleCardPagerAndWatchingCollapsedByDefault() throws {
+    let fleet = FleetConsumer()
+    XCTAssertFalse(fleet.watchingExpanded)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+    fleet.stepQuestion(1)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+
+    let threeQuestions = try JSONDecoder().decode(FleetState.self, from: Data("""
+      {
+        "mode": "propose",
+        "enabled": true,
+        "running": false,
+        "questions": [
+          {"id": "q1", "title": "First", "body": "", "options": ["yes"]},
+          {"id": "q2", "title": "Second", "body": "", "options": ["yes"]},
+          {"id": "q3", "title": "Third", "body": "", "options": ["yes"]}
+        ]
+      }
+      """.utf8))
+    fleet.apply(threeQuestions)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+    fleet.stepQuestion(1)
+    XCTAssertEqual(fleet.currentQuestionIndex, 1)
+    fleet.stepQuestion(-2)
+    XCTAssertEqual(fleet.currentQuestionIndex, 2)
+
+    let oneQuestion = try JSONDecoder().decode(FleetState.self, from: Data("""
+      {
+        "mode": "propose",
+        "enabled": true,
+        "running": false,
+        "questions": [{"id": "q1", "title": "Only", "body": "", "options": ["yes"]}]
+      }
+      """.utf8))
+    fleet.apply(oneQuestion)
+    XCTAssertEqual(fleet.currentQuestionIndex, 0)
+
+    fleet.toggleWatchingExpanded()
+    XCTAssertTrue(fleet.watchingExpanded)
+    fleet.supervisorTabLeft()
+    XCTAssertFalse(fleet.watchingExpanded)
+
+    let approvals = PendingApprovalConsumer()
+    XCTAssertFalse(approvals.overlayExpanded)
+    approvals.toggleOverlayExpanded()
+    XCTAssertTrue(approvals.overlayExpanded)
   }
 }

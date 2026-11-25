@@ -70,6 +70,68 @@ export async function authorizeWorkerProxy({ dataDir, remote, token, allowInsecu
   return { ok: true, status: result.status };
 }
 
+// Request a fresh owner-proxy grant without ever sending the main owner token
+// from this node. The node proves its identity with its existing operational
+// credential; an enrolled owner phone must approve the short-lived request.
+// The raw proxy credential is persisted only after it is returned to this
+// exact node, then the request is acknowledged so it cannot be replayed.
+export async function reconnectWorker({
+  dataDir = resolveDataDir(),
+  allowInsecureRemote = false,
+  fetchImpl = globalThis.fetch,
+  pollMs = 2_000,
+  waitMs = 5 * 60_000,
+  restart = true
+} = {}) {
+  const existing = readNodeConfig(dataDir);
+  const nodeId = readStoredNodeId(dataDir);
+  if (!existing?.remote || existing.nodeEnrollmentConfirmed !== true || !existing.nodeToken || !nodeId) {
+    return { ok: false, code: "not-paired", message: "This device has no confirmed node pairing. Re-pair it once with the main owner to establish a scoped node credential." };
+  }
+  let url;
+  try { url = pinnedRemoteOrigin(normalizeBase(existing.remote), { allowInsecureRemote }); }
+  catch (error) { return { ok: false, code: "invalid-main", message: error.message }; }
+  const client = new CliClient({ url, token: existing.nodeToken, nodeId }, { fetchImpl, timeoutMs: 15_000 });
+  const created = await client.request("POST", "/nodes/reconnect/request", {});
+  if (!created.ok) {
+    return { ok: false, code: created.status === 0 ? "main_offline" : (created.json?.error ?? `http-${created.status}`), status: created.status, message: created.status === 0 ? "The main is unreachable; no reconnect request was created." : (created.json?.message ?? created.json?.error ?? `Main rejected the reconnect request (${created.status}).`) };
+  }
+  const request = created.json ?? {};
+  const requestId = request.requestId;
+  if (typeof requestId !== "string") return { ok: false, code: "invalid-response", message: "The main returned no reconnect request id." };
+  const deadline = Math.min(Date.now() + Math.max(1_000, Number(waitMs) || 5 * 60_000), Date.parse(request.expiresAt) || Date.now() + 5 * 60_000);
+  let last = request;
+  while (Date.now() < deadline) {
+    if (last.status === "approved" && typeof last.ownerProxyToken === "string") break;
+    if (["denied", "expired", "consumed"].includes(last.status)) {
+      return { ok: false, code: `request_${last.status}`, requestId, request: last, message: last.status === "denied" ? "The owner phone denied this reconnect request." : `The reconnect request is ${last.status}.` };
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.max(250, Number(pollMs) || 2_000)));
+    const status = await client.request("GET", `/nodes/reconnect/requests/${encodeURIComponent(requestId)}`);
+    if (!status.ok) {
+      if (status.status === 404 || status.status === 410) return { ok: false, code: "request_expired", requestId, message: "The reconnect request expired or is no longer available." };
+      if (status.status === 0) return { ok: false, code: "main_offline", requestId, message: "The main became unreachable while waiting for owner approval." };
+      return { ok: false, code: status.json?.error ?? `http-${status.status}`, requestId, message: status.json?.message ?? `Could not read reconnect status (${status.status}).` };
+    }
+    last = status.json ?? {};
+  }
+  if (last.status !== "approved" || typeof last.ownerProxyToken !== "string") {
+    return { ok: false, code: "approval_pending", requestId, request: last, message: "Approval is still pending. Re-run `openagi reconnect` before the request expires to resume it." };
+  }
+  const ownerProxyToken = last.ownerProxyToken;
+  writeNodeConfig({ remote: existing.remote, token: null, nodeToken: existing.nodeToken, ownerProxyToken, nodeEnrollmentConfirmed: true }, dataDir);
+  const acknowledged = await client.request("POST", `/nodes/reconnect/requests/${encodeURIComponent(requestId)}/ack`, {});
+  const local = restart ? await restartLocalDaemon({ dataDir, fetchImpl }) : null;
+  return {
+    ok: true,
+    requestId,
+    request: { ...last, ownerProxyToken: undefined },
+    acknowledged: acknowledged.ok,
+    local,
+    message: acknowledged.ok ? "Owner authorization received and saved as a scoped node credential." : "Owner authorization received and saved; acknowledgement will be retried on the next reconnect."
+  };
+}
+
 export function clearNodeConfig(dataDir = resolveDataDir()) {
   try { fs.rmSync(nodeConfigPath(dataDir)); return true; } catch { return false; }
 }

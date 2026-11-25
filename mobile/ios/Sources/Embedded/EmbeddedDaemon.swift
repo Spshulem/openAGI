@@ -84,7 +84,24 @@ final class EmbeddedDaemon {
 
     fileprivate func nodeExited(code: Int32) {
         EmbeddedLoopback.port = nil
-        state = .failed("OpenAGI stopped (exit \(code)). Close and reopen the app to restart it.")
+        let diag = Self.recentLogSnippet()
+        let suffix = diag.map { " (\($0))" } ?? ""
+        state = .failed("OpenAGI stopped (exit \(code))\(suffix). Close and reopen the app to restart it.")
+    }
+
+    nonisolated private static func recentLogSnippet() -> String? {
+        let candidates = [
+            dataDirectory.appendingPathComponent("daemon.log"),
+            dataDirectory.appendingPathComponent("logs/daemon.log")
+        ]
+        for url in candidates {
+            if let raw = try? String(contentsOf: url, encoding: .utf8) {
+                let lines = raw.split(whereSeparator: \.isNewline).suffix(3).map(String.init)
+                let joined = lines.joined(separator: " | ").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !joined.isEmpty { return String(joined.prefix(240)) }
+            }
+        }
+        return nil
     }
 
     private static func launch() async throws -> Int {

@@ -24,7 +24,9 @@ export const PUSH_TIMING = Object.freeze({
   staleAfterMs: 30 * 60_000
 });
 
-const EVENTS = ["fleet", "outreach", "outreach-resolved"];
+// The pending-action pair covers queued approvals; a chat card is announced
+// to nobody, so PendingActionStore.watch reports it instead.
+const EVENTS = ["fleet", "outreach", "outreach-resolved", "pending-action", "pending-action-resolved"];
 // Attention first; a blocked session must not disappear from the overview.
 const GROUPS = ["you", "blocked", "working", "waiting"];
 const ROWS_MAX = 3;
@@ -37,9 +39,11 @@ const ALERT_FALLBACK_TITLE = "Needs you";
 // Same as Android's SupervisorAlerts.MAX_POSTS_PER_CHECK: a backlog drains
 // over the following passes instead of five-plus pings at once.
 const ALERTS_PER_PASS = 5;
-// Same filter as Android: "dismiss" is the separate dismissal, and "open
-// thread" asks for the agent's own app, so posting either answers nothing.
-const NON_ACTIONS = new Set(["dismiss", "open thread"]);
+// Same filter as Android: "dismiss" is the separate dismissal, "open thread"
+// asks for the agent's own app, and "answer question" needs typed text (the
+// Reply field), so posting any of them as a button answers nothing.
+const NON_ACTIONS = new Set(["dismiss", "open thread", "answer question"]);
+const APPROVAL_SUMMARY_MAX = 220;
 // A backlog over the cap drains on a follow-up pass this long after.
 const ALERT_BACKLOG_MS = 30_000;
 const RETRY_MS = 30_000;
@@ -109,8 +113,17 @@ export function alertOptions(options) {
   return [...new Set(kept)].slice(0, ALERT_OPTIONS_MAX);
 }
 
+/// Whether POST /fleet/api/questions/:id takes { reply } for this question
+/// (src/fleet/routes.js): the agent's own ask, or a suggestion whose "Answer
+/// question" carries the text as its clarification.
+export function acceptsReply(question) {
+  if (question?.canReply === true) return true;
+  return question?.kind === "suggestion" && Array.isArray(question.options) && question.options.includes("Answer question");
+}
+
 /// The alert plaintext (kind "alert") for one open question. Options pass
 /// through untouched: the answer route accepts only an exact option string.
+/// canReply asks the phone for a Reply text field.
 export function buildAlert(question) {
   const title = typeof question?.title === "string" ? question.title.trim() : "";
   const body = typeof question?.body === "string" ? question.body.trim() : "";
@@ -119,7 +132,27 @@ export function buildAlert(question) {
     title: capText(title || ALERT_FALLBACK_TITLE, ALERT_TITLE_MAX),
     body: capText(body, ALERT_BODY_MAX),
     options: alertOptions(question.options),
-    threadKey: typeof question.threadKey === "string" ? question.threadKey : null
+    threadKey: typeof question.threadKey === "string" ? question.threadKey : null,
+    canReply: acceptsReply(question)
+  };
+}
+
+/// A pending action the owner has to decide: a queued approval or a chat
+/// card's spoken code. An owner-mode record already ran on the owner's word.
+export function approvalNeedsOwner(action) {
+  return typeof action?.id === "string" && Boolean(action.id) && action.status === "pending" && action.mode !== "owner";
+}
+
+/// The approval plaintext (kind "approval"). The phone shows it with Approve
+/// and Deny, and both go through the same authenticated approve/deny routes
+/// as its Inbox; nothing in here authorizes anything.
+export function buildApproval(action) {
+  const summary = typeof action?.summary === "string" ? action.summary.trim() : "";
+  const tool = typeof action?.toolName === "string" && action.toolName ? action.toolName : "a tool";
+  return {
+    actionId: action.id,
+    summary: capText(summary || `Run ${tool}`, APPROVAL_SUMMARY_MAX),
+    code: typeof action.confirmCode === "string" && action.confirmCode ? action.confirmCode : null
   };
 }
 
@@ -132,7 +165,8 @@ const activeCount = (activity) => Object.values(activity.counts).reduce((sum, co
 export class MobilePush {
   constructor({
     store,
-    supervisor,
+    supervisor = null,
+    pendingActions = null,
     events = null,
     relayUrl = PUSH_RELAY_DEFAULT,
     fetch = globalThis.fetch,
@@ -143,6 +177,7 @@ export class MobilePush {
   }) {
     this.store = store;
     this.supervisor = supervisor;
+    this.pendingActions = pendingActions;
     this.events = events;
     this.relayUrl = String(relayUrl || PUSH_RELAY_DEFAULT).replace(/\/+$/, "");
     this.fetch = fetch;
@@ -158,6 +193,7 @@ export class MobilePush {
     this.reported = new Set();
     this.listener = () => this.changed();
     this.subscribed = false;
+    this.unwatch = null;
     this.stopped = false;
     this.debounceTimer = null;
     this.wakeTimer = null;
@@ -167,6 +203,7 @@ export class MobilePush {
 
   start() {
     this.stopped = false;
+    if (!this.unwatch && typeof this.pendingActions?.watch === "function") this.unwatch = this.pendingActions.watch(this.listener);
     if (this.subscribed || !this.events?.on) return;
     for (const name of EVENTS) this.events.on(name, this.listener);
     this.subscribed = true;
@@ -174,6 +211,8 @@ export class MobilePush {
 
   stop() {
     this.stopped = true;
+    this.unwatch?.();
+    this.unwatch = null;
     if (this.subscribed) {
       for (const name of EVENTS) this.events.off?.(name, this.listener);
       this.subscribed = false;
@@ -191,7 +230,7 @@ export class MobilePush {
       // otherwise collapse into a snapshot that still contains the same ID.
       let questions;
       try {
-        const state = this.supervisor.getState();
+        const state = this.supervisor?.getState();
         if (state?.questionsAuthoritative !== false) questions = state?.questions;
       }
       catch (error) { this.report(`could not read supervisor state: ${error?.message ?? error}`); }
@@ -272,15 +311,22 @@ export class MobilePush {
       this.clearTimer("wakeTimer");
       return;
     }
-    let state;
-    try {
-      state = this.supervisor.getState();
-    } catch (error) {
-      this.report(`could not read supervisor state: ${error?.message ?? error}`);
-      return;
+    // A supervisor that cannot be read (or whose questions are not
+    // authoritative) skips its alerts and activity, never the approvals.
+    let state = null;
+    let fleet = Boolean(this.supervisor);
+    if (fleet) {
+      try {
+        state = this.supervisor.getState();
+      } catch (error) {
+        this.report(`could not read supervisor state: ${error?.message ?? error}`);
+        fleet = false;
+      }
     }
+    if (state?.questionsAuthoritative === false) fleet = false;
+    const approvals = this.readApprovals();
+    if (!fleet && !approvals) return;
     const now = this.now();
-    if (state?.questionsAuthoritative === false) return;
     const activity = buildActivity(state, new Date(now));
     const questions = Array.isArray(state?.questions)
       ? state.questions.filter((q) => typeof q?.id === "string" && q.id && (q.status ?? "open") === "open")
@@ -302,6 +348,9 @@ export class MobilePush {
         this.live.delete(registration.nodeId);
         continue;
       }
+      const asks = await this.sendApprovals(registration, approvals, isCurrent);
+      if (asks.backlog) wakeBy(now + ALERT_BACKLOG_MS);
+      if (asks.stop || !fleet) continue;
       const alerts = await this.sendAlerts(registration, questions, isCurrent);
       if (alerts.backlog) wakeBy(now + ALERT_BACKLOG_MS);
       if (alerts.stop) continue;
@@ -339,6 +388,44 @@ export class MobilePush {
       if (latest?.questions?.some((q) => q.id === question.id && (q.status ?? "open") === "open")) {
         this.store.setNotified(registration.nodeId, [...new Set([...current, question.id])]);
       }
+      sent += 1;
+    }
+    return { stop: false, backlog: unsent.length > sent };
+  }
+
+  // Pending actions waiting on the owner, oldest first, or null when they
+  // cannot be read (that says nothing about which were decided).
+  readApprovals() {
+    if (typeof this.pendingActions?.list !== "function") return null;
+    try {
+      return this.pendingActions.list({ status: "pending" }).filter(approvalNeedsOwner).reverse();
+    } catch (error) {
+      this.report(`could not read pending actions: ${error?.message ?? error}`);
+      return null;
+    }
+  }
+
+  // The approval twin of sendAlerts. One alert per card id: a card the agent
+  // raises again with the same arguments is the same card (enqueue reuses
+  // it), so it is never alerted twice.
+  async sendApprovals(registration, approvals, isCurrent) {
+    if (!isCurrent()) return { stop: true, backlog: false };
+    if (!approvals) return { stop: false, backlog: false };
+    const pending = new Set(approvals.map((a) => a.id));
+    const notified = this.store.get(registration.nodeId).approvalsNotified.filter((id) => pending.has(id));
+    this.store.setApprovalsNotified(registration.nodeId, notified);
+    if (registration.alerts === false || registration.approvals !== true) return { stop: false, backlog: false };
+    const unsent = [...new Map(approvals.filter((a) => !notified.includes(a.id)).map((a) => [a.id, a])).values()];
+    const fresh = unsent.slice(0, ALERTS_PER_PASS);
+    let sent = 0;
+    for (const action of fresh) {
+      const result = await this.send(registration, { type: "alert", sealed: this.sealApproval(registration.key, action), collapseId: action.id });
+      if (!isCurrent()) return { stop: true, backlog: false };
+      if (result === "gone" || result === "renew") return { stop: true, backlog: false };
+      if (result !== "ok") break;
+      // A card decided while the relay answered is pruned on the next pass.
+      const current = this.store.get(registration.nodeId).approvalsNotified;
+      this.store.setApprovalsNotified(registration.nodeId, [...current, action.id]);
       sent += 1;
     }
     return { stop: false, backlog: unsent.length > sent };
@@ -445,6 +532,10 @@ export class MobilePush {
     // Title and body are capped; only many long options can overflow. The
     // alert still says the supervisor needs the owner, and a tap opens it.
     return sealed.length > SEALED_MAX ? sealPushEnvelope(key, "alert", { ...plain, options: [] }) : sealed;
+  }
+
+  sealApproval(key, action) {
+    return sealPushEnvelope(key, "approval", buildApproval(action));
   }
 
   // "ok" | "gone" | "renew" | "error". Never throws, never logs a body.

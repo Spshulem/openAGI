@@ -111,6 +111,7 @@ struct OverlayView: View {
     .onChange(of: approvals.lastOutcome) { _, _ in onContentChange() }
     .onChange(of: approvals.lastError) { _, _ in onContentChange() }
     .onChange(of: approvals.lastChatSessionId) { _, _ in onContentChange() }
+    .onChange(of: approvals.overlayExpanded) { _, _ in onContentChange() }
   }
 
   private func briefWatchers<V: View>(_ content: V) -> some View {
@@ -160,6 +161,7 @@ struct OverlayView: View {
     .onChange(of: fleet.available) { _, _ in onContentChange() }
     // The status line's text and the "Last scan failed" row.
     .onChange(of: fleet.status) { _, _ in onContentChange() }
+    .onChange(of: fleet.currentQuestionIndex) { _, _ in onContentChange() }
   }
 
   private func fleetActionWatchers<V: View>(_ content: V) -> some View {
@@ -181,6 +183,7 @@ struct OverlayView: View {
     content
     .onChange(of: fleet.threads) { _, _ in onContentChange() }
     .onChange(of: fleet.openWatchGroups) { _, _ in onContentChange() }
+    .onChange(of: fleet.watchingExpanded) { _, _ in onContentChange() }
   }
 
   // The detail screen of a question or In progress thread: its chat lands, its Push now
@@ -230,7 +233,7 @@ struct OverlayView: View {
   // the hover scale never changes the hit area.
   private var pill: some View {
     ZStack {
-      Circle().fill(Color.accentColor).frame(width: 18, height: 18)
+      Circle().fill(WorkspaceTheme.live).frame(width: 18, height: 18)
       if pillBadgeCount > 0 {
         Text(AttentionBadge.label(pillBadgeCount))
           .lineLimit(1)
@@ -239,7 +242,13 @@ struct OverlayView: View {
       }
     }
     .padding(9)
-    .background(.ultraThinMaterial, in: Circle())
+    .background {
+      if #available(macOS 26.0, *) {
+        Color.clear.glassEffect(.regular, in: Circle())
+      } else {
+        Circle().fill(.ultraThinMaterial)
+      }
+    }
     .overlay(Circle().strokeBorder(.white.opacity(pillHovered ? 0.25 : 0.1), lineWidth: 1))
     .scaleEffect(pillHovered ? 1.08 : 1.0)
     .animation(.easeOut(duration: 0.12), value: pillHovered)
@@ -263,10 +272,13 @@ struct OverlayView: View {
   }
 
   private var expandedPanel: some View {
-    VStack(alignment: .leading, spacing: 8) {
+    let hasDraft = !state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let showExpandedApprovals = approvals.overlayExpanded || (state.tab == .tasks && approvals.items.count == 1)
+
+    return VStack(alignment: .leading, spacing: 8) {
       HStack {
         // Not hit-testable, so a press on the title reaches the drag handle.
-        Text("Ask OpenAGI").font(.caption).foregroundStyle(.secondary)
+        Text("OpenAGI").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
           .allowsHitTesting(false)
         if fleet.available {
           Picker("View", selection: Binding(get: { state.tab }, set: { state.selectTab($0) })) {
@@ -308,14 +320,21 @@ struct OverlayView: View {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
       }
       if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
-        Divider()
-        HStack {
+        HStack(spacing: 6) {
           Text(approvals.items.isEmpty
                ? "Computer Use"
                : approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
-            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            .font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.secondary)
           Spacer()
           if !approvals.items.isEmpty {
+            if !(state.tab == .tasks && approvals.items.count == 1) {
+              Button(approvals.overlayExpanded ? "Hide" : "Review") {
+                approvals.toggleOverlayExpanded()
+              }
+              .buttonStyle(.plain)
+              .font(.system(size: 10, weight: .medium))
+              .foregroundStyle(WorkspaceTheme.live)
+            }
             Button("Dismiss all") {
               Task { await approvals.dismissAll() }
             }
@@ -326,9 +345,12 @@ struct OverlayView: View {
               .font(.system(size: 9, weight: .bold))
               .foregroundStyle(.white)
               .padding(.horizontal, 6).padding(.vertical, 2)
-              .background(Capsule().fill(Color.accentColor))
+              .background(Capsule().fill(WorkspaceTheme.live))
           }
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(WorkspaceTheme.surfaceFill.opacity(0.65), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         if let outcome = approvals.lastOutcome {
           HStack(spacing: 6) {
             Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
@@ -353,7 +375,7 @@ struct OverlayView: View {
               .buttonStyle(.borderless).font(.system(size: 10))
           }
         }
-        if !approvals.items.isEmpty {
+        if !approvals.items.isEmpty && showExpandedApprovals {
           ScrollView {
             VStack(alignment: .leading, spacing: 7) {
               ForEach(approvals.items) { approval in
@@ -371,7 +393,6 @@ struct OverlayView: View {
         }
       }
       if state.tab == .supervisor {
-        Divider()
         SupervisorSection()
       } else {
         let needsYou = visibleOutreach
@@ -397,7 +418,6 @@ struct OverlayView: View {
           BriefSection()
         }
       }
-      Divider()
       if let selected = state.activeContext {
         HStack(spacing: 5) {
           Text("About: \(selected.title)")
@@ -412,7 +432,7 @@ struct OverlayView: View {
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
+        .background(RoundedRectangle(cornerRadius: 6).fill(WorkspaceTheme.live.opacity(0.12)))
       }
       if let note = state.contextNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary)
@@ -498,29 +518,39 @@ struct OverlayView: View {
         }
       }
       HStack(spacing: 6) {
-        Text(state.tab == .supervisor ? "Target: #supervisor · Synced" : "Target: Quick Ask")
-          .font(.system(size: 9))
-          .foregroundStyle(.secondary)
-        Spacer()
-        if state.tab == .supervisor {
-          Button("Workspace ⤢") {
-            SupervisorWindowController.shared.show()
-          }
-          .buttonStyle(.plain)
-          .font(.system(size: 9, weight: .medium))
-          .foregroundStyle(.blue)
+        TextField(askPlaceholder, text: $state.question)
+          .textFieldStyle(.plain)
+          .font(.system(size: 12.5))
+          .focused($fieldFocused)
+          .disabled(app.status == .down || state.isLoading || state.isDetached)
+          .onSubmit { Task { await state.ask() } }
+        Button {
+          Task { await state.ask() }
+        } label: {
+          Image(systemName: "arrow.up")
+            .font(.system(size: 10.5, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 22, height: 22)
+            .background(hasDraft ? WorkspaceTheme.live : WorkspaceTheme.muted.opacity(0.32), in: Circle())
         }
+        .buttonStyle(.plain)
+        .disabled(!hasDraft || app.status == .down || state.isLoading || state.isDetached)
       }
-      TextField(askPlaceholder, text: $state.question)
-        .textFieldStyle(.roundedBorder)
-        .focused($fieldFocused)
-        .disabled(app.status == .down || state.isLoading || state.isDetached)
-        .onSubmit { Task { await state.ask() } }
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
+      .workspaceGlassCapsule(cornerRadius: 18, focused: fieldFocused)
     }
     .padding(12)
     .frame(width: 320)
-    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
+    .background {
+      let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+      if #available(macOS 26.0, *) {
+        Color.clear.glassEffect(.regular, in: shape)
+      } else {
+        shape.fill(.ultraThinMaterial)
+      }
+    }
+    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.white.opacity(0.14), lineWidth: 1))
     .onAppear {
       fieldFocused = true
       // In parallel: the Supervisor picker must not wait on the brief and

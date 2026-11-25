@@ -17,6 +17,10 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var openQuestionIDs: Set<String> = []
   /// The last scan's threads, for the Watching list under the questions.
   @Published private(set) var threads: [FleetThread] = []
+  /// The hub's decision brief for each open question, by question id.
+  @Published private(set) var cardBriefs: [String: FleetCardBrief] = [:]
+  @Published private(set) var activityEvents: [FleetActivityEvent] = []
+  @Published private(set) var nextTickAt: String? = nil
   /// Watching groups the owner opened that start collapsed (Quiet).
   @Published private(set) var openWatchGroups: Set<String> = []
   @Published private(set) var status: FleetStatus? = nil
@@ -42,6 +46,8 @@ final class FleetConsumer: ObservableObject {
   /// Typed replies not sent yet, by FleetOpenItem.key. Kept across Back and
   /// a failed send; cleared once the hub takes it.
   @Published private(set) var drafts: [String: String] = [:]
+  /// Optional image payloads attached to a workspace reply, keyed by FleetOpenItem.key.
+  @Published var pendingReplyImages: [String: [[String: Any]]] = [:]
   /// FleetOpenItem keys with a reply in flight.
   @Published private(set) var replyInFlight: Set<String> = []
   /// Each item's last reply result, under its reply box.
@@ -53,6 +59,12 @@ final class FleetConsumer: ObservableObject {
   @Published private(set) var threadInFlight: Set<String> = []
   /// Each thread's last Push now, Mute or Unmute result, in its row.
   @Published private(set) var threadNotes: [String: FleetNote] = [:]
+  @Published private(set) var workspaces: [FleetWorkspaceEntry] = []
+  @Published private(set) var hierarchyProjects: [FleetHierarchyProject] = []
+  /// Active index in the compact overlay single-card deck.
+  @Published var currentQuestionIndex: Int = 0
+  /// Whether the collapsible session list in the overlay is expanded.
+  @Published var watchingExpanded: Bool = false
 
   /// Bumped by every refresh start and every apply. A refresh publishes only
   /// if nothing newer started or landed meanwhile, so a slow GET can never
@@ -249,6 +261,232 @@ final class FleetConsumer: ObservableObject {
     drafts[item.key] = text.isEmpty ? nil : text
   }
 
+  /// Routes workspace thread/question replies through the single `sendReply`
+  /// path (preserving Quick Ask / Supervisor Workspace image & text invariants).
+  func sendWorkspaceThreadReply(threadKey: String, message: String, images: [[String: Any]] = []) async -> FleetNote {
+    await sendWorkspaceReply(for: .thread(threadKey), message: message, images: images)
+  }
+
+  /// Reply to a Needs-You card with optional photo attachments via `sendReply`.
+  func sendWorkspaceQuestionReply(_ question: FleetQuestion, message: String, images: [[String: Any]] = []) async -> FleetNote {
+    if question.isClarificationQuestion {
+      return await answerClarification(question, clarification: message)
+    }
+    return await sendWorkspaceReply(for: .question(question.id), message: message, images: images)
+  }
+
+  /// Answers a `suggestion` clarification card via `/fleet/api/questions/:id` with `{ answer: "Answer question", clarification }`.
+  func answerClarification(_ question: FleetQuestion, clarification: String) async -> FleetNote {
+    let trimmed = String(clarification.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2000))
+    guard !trimmed.isEmpty else {
+      return FleetNote(text: "Enter an answer first.", isError: true)
+    }
+    let id = question.id
+    guard !inFlight.contains(id) else {
+      return FleetNote(text: "Already sending an answer for this question.", isError: false)
+    }
+    inFlight.insert(id)
+    defer { inFlight.remove(id) }
+    notes[id] = nil
+
+    var req = request(path: "/fleet/api/questions/\(id)", method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "answer": "Answer question",
+      "clarification": trimmed
+    ])
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      if (200..<300).contains(code) {
+        if let decoded = try? JSONDecoder().decode(FleetQuestionResponse.self, from: data),
+           let state = decoded.state {
+          apply(state)
+        } else {
+          await refresh()
+        }
+        let note = FleetNote(text: "Clarification saved to plan.", isError: false)
+        report(question, note.text, isError: false)
+        return note
+      }
+      await refresh()
+      let msg = Self.serverError(data) ?? "Couldn't save clarification."
+      let note = FleetNote(text: msg, isError: true)
+      report(question, msg, isError: true)
+      return note
+    } catch {
+      let msg = "Couldn't reach the supervisor. Try again."
+      report(question, msg, isError: true)
+      return FleetNote(text: msg, isError: true)
+    }
+  }
+
+  func loadWorkspaces() async {
+    let req = request(path: "/fleet/api/workspaces?limit=40", method: "GET", timeout: 15)
+    do {
+      let (data, response) = try await fetchDetail(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return }
+      struct WorkspacesResp: Decodable { let workspaces: [FleetWorkspaceEntry]? }
+      if let decoded = try? JSONDecoder().decode(WorkspacesResp.self, from: data),
+         let list = decoded.workspaces {
+        workspaces = list
+      }
+    } catch {
+      // Non-fatal: manual workspace or auto-resolve still works.
+    }
+  }
+
+  func loadHierarchy(limit: Int = 60) async {
+    let clamped = max(1, min(60, limit))
+    let req = request(path: "/fleet/api/hierarchy?limit=\(clamped)", method: "GET", timeout: 20)
+    do {
+      let (data, response) = try await fetchDetail(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return }
+      if let decoded = try? JSONDecoder().decode(FleetHierarchyResponse.self, from: data) {
+        hierarchyProjects = decoded.projects
+      }
+    } catch {
+      // Non-fatal: sidebar degrades cleanly to live watched threads.
+    }
+  }
+
+  @discardableResult
+  func upsertProject(name: String, theme: String? = nil, alias: String? = nil) async -> Bool {
+    let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanName.isEmpty else { return false }
+    var payload: [String: Any] = ["name": cleanName]
+    if let cleanTheme = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanTheme.isEmpty {
+      payload["theme"] = cleanTheme
+    }
+    if let cleanAlias = alias?.trimmingCharacters(in: .whitespacesAndNewlines), !cleanAlias.isEmpty {
+      payload["alias"] = cleanAlias
+    }
+    var req = request(path: "/fleet/api/projects", method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (_, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return false }
+      await loadHierarchy()
+      await refresh()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  @discardableResult
+  func organizeThread(key: String, project: String?, theme: String? = nil) async -> Bool {
+    guard let encoded = key.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return false }
+    var payload: [String: Any] = [:]
+    if let p = project?.trimmingCharacters(in: .whitespacesAndNewlines), !p.isEmpty {
+      payload["project"] = p
+    }
+    if let t = theme?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+      payload["theme"] = t
+    }
+    var req = request(path: "/fleet/api/threads/\(encoded)/organize", method: "POST", timeout: 15)
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (_, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else { return false }
+      await loadHierarchy()
+      await refresh()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  func startWorkspaceSession(
+    workspace: String?,
+    cwd: String?,
+    serverId: String? = nil,
+    title: String?,
+    model: String?,
+    effort: String?,
+    prompt: String,
+    images: [[String: Any]] = []
+  ) async -> (ok: Bool, threadKey: String?, message: String) {
+    let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    let effectivePrompt = trimmedPrompt.isEmpty && !images.isEmpty ? "Please inspect the attached image(s)." : trimmedPrompt
+    guard !effectivePrompt.isEmpty else {
+      return (false, nil, "Enter a starting prompt first.")
+    }
+    var payload: [String: Any] = ["prompt": effectivePrompt]
+    if let ws = workspace?.trimmingCharacters(in: .whitespacesAndNewlines), !ws.isEmpty {
+      payload["workspace"] = ws
+    }
+    if let c = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !c.isEmpty {
+      payload["cwd"] = c
+    }
+    if let srv = serverId?.trimmingCharacters(in: .whitespacesAndNewlines), !srv.isEmpty {
+      payload["serverId"] = srv
+    }
+    if let t = title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+      payload["title"] = t
+    }
+    if let m = model?.trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty {
+      payload["model"] = m
+    }
+    if let e = effort?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty {
+      payload["effort"] = e
+    }
+    if !images.isEmpty {
+      payload["images"] = images
+    }
+    var req = request(path: "/fleet/api/sessions/start", method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(code) else {
+        return (false, nil, Self.serverError(data) ?? "Couldn't start Paseo session.")
+      }
+      struct SessionObj: Decodable { let threadKey: String? }
+      struct StartResp: Decodable { let session: SessionObj?; let state: FleetState? }
+      let decoded = try? JSONDecoder().decode(StartResp.self, from: data)
+      if let state = decoded?.state {
+        apply(state)
+      } else {
+        await refresh()
+      }
+      if let tk = decoded?.session?.threadKey {
+        await loadDetail(tk)
+      }
+      return (true, decoded?.session?.threadKey, "Started Paseo session.")
+    } catch {
+      return (false, nil, "Couldn't reach the supervisor. Try again.")
+    }
+  }
+
+  private func sendWorkspaceReply(for item: FleetOpenItem, message: String, images: [[String: Any]]) async -> FleetNote {
+    let targetItem: FleetOpenItem
+    if case let .question(id) = item, !images.isEmpty, let tk = question(id)?.threadKey {
+      targetItem = .thread(tk)
+    } else {
+      targetItem = item
+    }
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    let effective = trimmed.isEmpty && !images.isEmpty ? "Please inspect the attached image(s)." : trimmed
+    guard FleetReplyTarget.message(effective) != nil else {
+      return FleetNote(text: "Enter a message or attach a photo first.", isError: true)
+    }
+    let slot = targetItem.key
+    drafts[slot] = effective
+    pendingReplyImages[slot] = images.isEmpty ? nil : images
+    await sendReply(targetItem)
+    if let note = replyNotes[slot] { return note }
+    if !replyInFlight.contains(slot), drafts[slot] == nil {
+      return FleetNote(text: "Sent to the agent.", isError: false)
+    }
+    return FleetNote(text: "Couldn't send reply.", isError: true)
+  }
+
   func clearReplyNote(_ item: FleetOpenItem) {
     replyNotes[item.key] = nil
   }
@@ -258,16 +496,31 @@ final class FleetConsumer: ObservableObject {
   func sendReply(_ item: FleetOpenItem) async {
     let slot = item.key
     guard !replyInFlight.contains(slot), let submitted = drafts[slot], let message = FleetReplyTarget.message(submitted) else { return }
-    let target = replyTarget(item)
+    let attachedImages = pendingReplyImages[slot] ?? []
+    var target = replyTarget(item)
+    if case let .question(id) = item, !attachedImages.isEmpty {
+      if let tk = question(id)?.threadKey {
+        target = .thread(key: tk)
+      } else {
+        replyNotes[slot] = FleetNote(text: "This question isn't linked to a coding thread for image attachments.", isError: true)
+        return
+      }
+    }
     let path: String
-    let body: [String: Any]
+    var body: [String: Any]
     switch target {
     case let .question(id):
-      path = "/fleet/api/questions/\(id)"
-      body = ["reply": message]
+      if let q = question(id), q.isClarificationQuestion {
+        path = "/fleet/api/questions/\(id)"
+        body = ["answer": "Answer question", "clarification": message]
+      } else {
+        path = "/fleet/api/questions/\(id)"
+        body = ["reply": message]
+      }
     case let .thread(key):
       path = "/fleet/api/send"
       body = ["threadKey": key, "message": message]
+      if !attachedImages.isEmpty { body["images"] = attachedImages }
     case let .none(why):
       replyNotes[slot] = FleetNote(text: why, isError: true)
       return
@@ -285,7 +538,10 @@ final class FleetConsumer: ObservableObject {
       let (data, response) = try await send(req)
       let code = (response as? HTTPURLResponse)?.statusCode ?? 0
       let note = Self.replyNote(code: code, data: data, target: target)
-      if note.taken { drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted) }
+      if note.taken {
+        drafts[slot] = Self.unsentRest(drafts[slot], submitted: submitted)
+        pendingReplyImages[slot] = nil
+      }
       replyNotes[slot] = note.note
       if (200..<300).contains(code) {
         if let state = (try? JSONDecoder().decode(FleetQuestionResponse.self, from: data))?.state {
@@ -495,6 +751,18 @@ final class FleetConsumer: ObservableObject {
     if openWatchGroups.contains(group) { openWatchGroups.remove(group) } else { openWatchGroups.insert(group) }
   }
 
+  func stepQuestion(_ delta: Int) {
+    guard !questions.isEmpty else {
+      currentQuestionIndex = 0
+      return
+    }
+    currentQuestionIndex = (currentQuestionIndex + delta % questions.count + questions.count) % questions.count
+  }
+
+  func toggleWatchingExpanded() {
+    watchingExpanded.toggle()
+  }
+
   func clearNote(_ id: String) {
     notes[id] = nil
   }
@@ -546,7 +814,7 @@ final class FleetConsumer: ObservableObject {
 
   // MARK: - State
 
-  private func apply(_ state: FleetState) {
+  func apply(_ state: FleetState) {
     generation &+= 1
     let open = Set(state.questions.map(\.id))
     // A timed-out answer whose question has since closed: say so, since its
@@ -559,8 +827,14 @@ final class FleetConsumer: ObservableObject {
     notes = notes.filter { open.contains($0.key) }
     let oldQuestions = questions
     questions = state.questions
+    if currentQuestionIndex >= questions.count {
+      currentQuestionIndex = max(0, questions.count - 1)
+    }
     openQuestionIDs = Set(state.questions.map(\.id))
+    cardBriefs = Dictionary(state.cards.map { ($0.questionKey, $0) }, uniquingKeysWith: { first, _ in first })
     threads = state.threads
+    activityEvents = state.activityEvents
+    nextTickAt = state.nextTickAt
     status = state.status
     // The detail screen stays while its question or thread does; a closed
     // question falls back to its thread.
@@ -617,18 +891,24 @@ final class FleetConsumer: ObservableObject {
     generation &+= 1
     questions = []
     openQuestionIDs = []
+    cardBriefs = [:]
     threads = []
+    activityEvents = []
+    nextTickAt = nil
     status = nil
     notes = [:]
     stillSending = []
     sendingDeadline = [:]
     openItem = nil
     drafts = [:]
+    pendingReplyImages = [:]
     replyNotes = [:]
     details = [:]
     threadNotes = [:]
     hasSupervisor = false
     available = false
+    currentQuestionIndex = 0
+    watchingExpanded = false
     OverlayState.shared.selectTab(.tasks)
     OverlayState.shared.pruneFleetContext(openIDs: [])
     OverlayState.shared.pruneVoiceContext(openIDs: [], threadKeys: [])
@@ -637,6 +917,7 @@ final class FleetConsumer: ObservableObject {
   /// The owner switched to Tasks: a supervisor with nothing to show loses
   /// its tab now, not while they were reading it.
   func supervisorTabLeft() {
+    watchingExpanded = false
     if !hasSupervisor { available = false }
   }
 

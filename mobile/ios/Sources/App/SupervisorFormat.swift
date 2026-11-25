@@ -1,4 +1,5 @@
 import Foundation
+import SupervisorChannelsKit
 
 // Everything the Supervisor screen decides about words and order, kept pure
 // so it can be pinned by tests: health order, thread names, state labels in
@@ -316,10 +317,10 @@ enum SupervisorFormat {
     // synthesizes equivalent cards from `questions` + `snapshot.threads` when
     // connected to an older daemon or UI test fixture.
     static func resolvedCards(_ state: FleetState) -> [SupervisorCard] {
-        let cards = state.cards.filter { !$0.id.isEmpty }
+        let cards = state.cards.filter { !$0.id.isEmpty && SupervisorAttentionCounting.isActionable(needsYou: $0.needsYou) }
         if !cards.isEmpty { return cards }
         let threads = state.snapshot?.threads ?? []
-        return state.questions.filter { !$0.id.isEmpty }.map { question in
+        return state.questions.filter { !$0.id.isEmpty && SupervisorAttentionCounting.isActionable(needsYou: $0.needsYou) }.map { question in
             let keys = threadKeys(question)
             let primaryKey = question.threadKey ?? keys.first
             let thread = primaryKey.flatMap { key in threads.first(where: { $0.key == key }) }
@@ -332,12 +333,39 @@ enum SupervisorFormat {
             } else {
                 nil
             }
+            let cardID = "question:\(question.id)"
+            let cardKind = isReady ? "merge_ready" : "agent_decision"
+            let cardKindLabel = isReady ? "PR ready" : "Needs your decision"
+            let cardHeadline = nonBlank(question.decisionHeadline)
+                ?? nonBlank(question.title)
+                ?? thread.map(name)
+                ?? "Needs review"
+            let cardPRContext = thread?.pr.map { pr in
+                SupervisorPRContext(
+                    ref: pr.ref,
+                    url: pr.url,
+                    title: pr.title,
+                    bodySummary: pr.bodySummary,
+                    additions: pr.additions,
+                    deletions: pr.deletions,
+                    changedFiles: pr.changedFiles,
+                    files: pr.files,
+                    ciState: pr.ci?.state
+                )
+            }
             return SupervisorCard(
-                id: "question:\(question.id)",
+                id: cardID,
                 questionId: question.id,
-                kind: isReady ? "merge_ready" : "agent_decision",
-                kindLabel: isReady ? "PR ready" : "Needs your decision",
-                headline: nonBlank(question.title) ?? thread.map(name) ?? "Needs review",
+                kind: cardKind,
+                kindLabel: cardKindLabel,
+                headline: cardHeadline,
+                needsYou: question.needsYou,
+                decisionHeadline: question.decisionHeadline,
+                decisionFact: question.decisionFact,
+                decisionSource: question.decisionSource,
+                decisionAction: question.decisionAction,
+                remainingItemIds: question.remainingItemIds,
+                decisionItems: question.decisionItems,
                 sessionTitle: nonBlank(thread?.title),
                 summary: nonBlank(question.body),
                 agentSummary: nonBlank(thread?.lastAgentText),
@@ -353,19 +381,7 @@ enum SupervisorFormat {
                 options: options,
                 primaryAction: primary,
                 secondaryAction: SupervisorCardAction(op: "defer", label: "Later"),
-                prContext: thread?.pr.map {
-                    SupervisorPRContext(
-                        ref: $0.ref,
-                        url: $0.url,
-                        title: $0.title,
-                        bodySummary: $0.bodySummary,
-                        additions: $0.additions,
-                        deletions: $0.deletions,
-                        changedFiles: $0.changedFiles,
-                        files: $0.files,
-                        ciState: $0.ci?.state
-                    )
-                }
+                prContext: cardPRContext
             )
         }
     }
@@ -405,10 +421,14 @@ enum SupervisorFormat {
             return Note(text: message ?? "Merged pull request.", isAlert: false)
         case "watching_ci", "queued_when_green", "queued_auto_merge", "ci_pending_watch":
             return Note(text: message ?? "Watching CI — will ping when green.", isAlert: false)
-        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed":
+        case "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "closed", "confirmation_required":
             return Note(text: message ?? "Action halted safely — check PR or session status.", isAlert: true)
+        case "archived_session":
+            return Note(text: message ?? "Archived coding chat in Paseo.", isAlert: false)
+        case "unarchived_session":
+            return Note(text: message ?? "Restored coding chat in Paseo.", isAlert: false)
         case "deferred", "dismissed":
-            return Note(text: message ?? "Saved for later.", isAlert: false)
+            return Note(text: message ?? "Dismissed notification.", isAlert: false)
         case "updated", "preference_saved", "reverted":
             return Note(text: message ?? "Preference updated.", isAlert: false)
         default:

@@ -389,9 +389,13 @@ class MainActivity : ComponentActivity() {
         ) {
             pendingTabState.value = AppTab.SUPERVISOR
             pendingThreadState.value = intent.getStringExtra(SupervisorNotifier.EXTRA_THREAD_KEY)
+        } else if (intent.getStringExtra(SupervisorNotifier.EXTRA_TAB) == SupervisorNotifier.TAB_INBOX) {
+            // An approval notification, or the result that replaced one.
+            pendingTabState.value = AppTab.INBOX
         }
         intent.removeExtra(SupervisorNotifier.EXTRA_TAB)
         intent.removeExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+        intent.removeExtra(SupervisorNotifier.EXTRA_ACTION_ID)
         intent.removeExtra(SupervisorNotifier.EXTRA_THREAD_KEY)
     }
 

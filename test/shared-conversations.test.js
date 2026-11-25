@@ -241,7 +241,8 @@ test("history pages oldest-first with before/limit and projects text only", asyn
   const page = await latest.json();
   assert.equal(page.thread, "agent");
   assert.deepEqual(page.messages.map((m) => m.text), ["two", "echo: two", "three", "echo: three"]);
-  assert.deepEqual(Object.keys(page.messages[0]).sort(), ["at", "id", "role", "sourceName", "sourceNodeId", "text"]);
+  // requestId ties a line to its turn (see message-turn-recovery.test.js).
+  assert.deepEqual(Object.keys(page.messages[0]).sort(), ["at", "id", "requestId", "role", "sourceName", "sourceNodeId", "text"]);
   assert.equal(page.messages[0].sourceNodeId, PHONE_A.id);
   assert.equal(page.messages[0].sourceName, "Pixel");
   assert.equal(page.messages[1].sourceNodeId, null);
@@ -253,7 +254,7 @@ test("history pages oldest-first with before/limit and projects text only", asyn
   const all = await (await ctx.asOwner("/conversations/agent/messages")).json();
   assert.equal(all.messages.length, 6);
   const empty = await (await ctx.as(PHONE_A, "/conversations/supervisor/messages")).json();
-  assert.deepEqual(empty, { thread: "supervisor", messages: [], nextBefore: null });
+  assert.deepEqual(empty, { thread: "supervisor", messages: [], nextBefore: null, inFlight: [], queue: { revision: 0, items: [], ended: [] } });
   for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) {
     assert.equal((await ctx.as(PHONE_A, `/conversations/agent/messages?${query}`)).status, 400, query);
   }

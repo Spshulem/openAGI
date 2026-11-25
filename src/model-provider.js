@@ -1,10 +1,11 @@
 import { imageContent, imageHistory, unsupportedImageInput } from "./message-attachments.js";
 import { redactFailureDiagnostic } from "./agent-failure.js";
-import { ModelRouter } from "./model-router.js";
+import { DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL, ModelRouter, reasoningEffortsForModel } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
+import { ClaudeCliProvider, CodexCliProvider } from "./cli-subscription-providers.js";
 import { isMobileProfile } from "./mobile-profile.js";
 import { LocalModelProvider } from "./local-model-provider.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
@@ -82,7 +83,7 @@ export class DeterministicModelProvider {
 export class OpenAIResponsesProvider {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
-    this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-5";
+    this.model = options.model ?? process.env.OPENAI_MODEL ?? DEFAULT_OPENAI_MODEL;
     // Reasoning depth for models that support it. Left null unless configured,
     // because sending `reasoning` to a non-reasoning model is a 400 — an opt-in
     // key must never become a floor that breaks every other model in the table.
@@ -111,7 +112,24 @@ export class OpenAIResponsesProvider {
     return this.router.allowed?.(chosen) ?? chosen;
   }
 
-  async generate({ input, attachments = [], instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
+  // Reasoning effort is sent per request, so a single chat can ask for a
+  // different depth (session-reasoning-effort.js) without touching env.
+  // Options come from the model the chat turn resolves to, so an override the
+  // model would reject is neither accepted nor sent.
+  reasoningEffortSupport({ task = "chat" } = {}) {
+    const model = this.resolveModel({ task });
+    const options = reasoningEffortsForModel(model);
+    return {
+      supported: options.length > 0,
+      provider: this.name ?? "openai",
+      model,
+      options,
+      configuredDefault: this.router?.reasoningEffort?.(task) || this.reasoningEffort || null,
+      ...(options.length > 0 ? {} : { reason: `${model} does not take a reasoning-effort setting.` })
+    };
+  }
+
+  async generate({ input, attachments = [], instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, reasoningEffort: reasoningEffortOverride, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
     const model = this.resolveModel({ model: modelOverride, tier, task });
     let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
@@ -140,7 +158,8 @@ export class OpenAIResponsesProvider {
     const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
     const toolList = tools.length > 0 ? tools : toolRegistry?.toOpenAITools?.() ?? [];
     const fixedChars = baseInstructions.length + JSON.stringify(toolList).length;
-    const reasoningEffort = this.router?.reasoningEffort?.(task) || this.reasoningEffort;
+    const reasoningEffort = (reasoningEffortsForModel(model).includes(reasoningEffortOverride) ? reasoningEffortOverride : null)
+      || this.router?.reasoningEffort?.(task) || this.reasoningEffort;
     const toolCalls = [];
     const { turnSpend, toolContext } = shareTurnSpend(context);
     let overTurnLimit = false;
@@ -415,7 +434,7 @@ export class OpenAIResponsesProvider {
 export class AnthropicProvider {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    this.model = options.model ?? process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
+    this.model = options.model ?? process.env.ANTHROPIC_MODEL ?? DEFAULT_ANTHROPIC_MODEL;
     this.baseUrl = options.baseUrl ?? process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1";
     this.version = options.version ?? "2023-06-01";
     this.maxTokens = options.maxTokens ?? 4096;
@@ -768,7 +787,7 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | chatgpt | local | on-device | auto (default).
+  // Explicit preference wins. anthropic | claude-cli | openai | chatgpt | codex-cli | local | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
   // Phone-only mode (the daemon inside the phone app): with nothing
   // configured the agent thinks with the phone's own model, and a cloud model
@@ -781,6 +800,14 @@ export function createModelProvider(options = {}) {
   if (preference === "on-device") return onDevice();
   if (preference === "openai" && openai.isConfigured()) return cloud(openai);
   if (preference === "anthropic" && anthropic.isConfigured()) return cloud(anthropic);
+  if (preference === "claude-cli") {
+    const claudeCli = new ClaudeCliProvider({ ...(options.claudeCli ?? {}) });
+    if (claudeCli.isConfigured()) return cloud(claudeCli);
+  }
+  if (preference === "codex-cli") {
+    const codexCli = new CodexCliProvider({ ...(options.codexCli ?? {}) });
+    if (codexCli.isConfigured()) return cloud(codexCli);
+  }
   // Sign in with ChatGPT: billed to the owner's plan, so no budget guard.
   const chatgpt = new ChatGPTPlanProvider({ ...(options.chatgpt ?? {}) });
   if (preference === "chatgpt" && chatgpt.isConfigured()) return cloud(chatgpt);
@@ -1208,6 +1235,8 @@ function parseSseJson(data) {
   try { return JSON.parse(data); }
   catch { return null; }
 }
+
+export { ClaudeCliProvider, CodexCliProvider };
 
 async function maybeInvoke(toolRegistry, name, args, context) {
   if (!toolRegistry?.invoke) return null;

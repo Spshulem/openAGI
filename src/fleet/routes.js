@@ -5,6 +5,7 @@
 import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
 import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
+import { SupervisorWalkthrough, WalkthroughError } from "./walkthrough.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
@@ -22,7 +23,7 @@ const LABEL_MAX = 80;
 const THREAD_KEY = THREAD_KEY_PATTERN;
 const APPS = new Set(["conductor", "codex"]);
 const APP_ACTIONS = new Set(["open", "quit", "restart"]);
-const THREAD_ACTIONS = new Set(["push", "mute", "unmute"]);
+const THREAD_ACTIONS = new Set(["push", "mute", "unmute", "archive", "unarchive", "failover"]);
 const BATCH_OPS = new Set([
   "merge_green", "defer", "dismiss", "fix_ci", "primary", "secondary", "merge", "answer", "reply"
 ]);
@@ -43,6 +44,13 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function safeActiveWorkError(err, fallback) {
+  if (err?.code || err?.syscall || err?.path) {
+    return fail(503, "Active Work storage error. Check available disk space and daemon log.");
+  }
+  return fail(400, String(err?.message ?? fallback).slice(0, 220));
+}
+
 async function readObject(readBody) {
   try {
     const body = await readBody();
@@ -52,7 +60,8 @@ async function readObject(readBody) {
   }
 }
 
-export function createFleetRoute({ supervisor } = {}) {
+export function createFleetRoute({ supervisor, dataDir } = {}) {
+  const walkthrough = supervisor ? new SupervisorWalkthrough({ dataDir: dataDir ?? supervisor.dataDir }) : null;
   const state = () => supervisor.getState();
 
   async function handleQuestion(id, readBody, sendOptions) {
@@ -78,7 +87,23 @@ export function createFleetRoute({ supervisor } = {}) {
       const reply = typeof body.reply === "string" ? body.reply.trim() : "";
       if (!reply || reply.length > REPLY_MAX) return fail(400, `Reply must be 1-${REPLY_MAX} characters.`);
       if (!open) return fail(404, "No open question with that id.");
-      if (open.canReply !== true) return fail(409, "This question takes no typed reply. Pick an option, or answer it in its chat.");
+      if (open.canReply !== true) {
+        if (open.kind === "suggestion" && Array.isArray(open.options) && open.options.includes("Answer question")) {
+          if (typeof supervisor.answerQuestion !== "function") return fail(503, "Questions are not available.");
+          const result = await supervisor.answerQuestion(id, "Answer question", {
+            ...sendOptions,
+            clarification: reply.slice(0, 2000)
+          });
+          if (!result) return fail(409, "Question already closed.");
+          return ok({
+            question: result.question ?? null,
+            delivery: result.delivery ?? null,
+            ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}),
+            state: state()
+          });
+        }
+        return fail(409, "This question takes no typed reply. Pick an option, or answer it in its chat.");
+      }
       if (typeof supervisor.replyQuestion !== "function") return fail(503, "Replies are not available.");
       const result = await supervisor.replyQuestion(id, reply, sendOptions);
       if (!result) return fail(409, "Question already closed.");
@@ -124,6 +149,19 @@ export function createFleetRoute({ supervisor } = {}) {
         const area = url?.searchParams?.get("area") ?? null;
         if (!["24h", "7d"].includes(window) || (area && !FIX_AREAS.includes(area))) return fail(400, "Bad diagnose window or area.");
         return ok(await supervisor.diagnose({ window, area }));
+      }
+      if (parts.length === 1 && parts[0] === "walkthrough") {
+        if (!walkthrough) return fail(503, "Supervisor walkthrough is not available.");
+        if (method === "GET") return ok(walkthrough.read(state()));
+        if (method !== "POST") return fail(405, "Use GET or POST.");
+        const body = (await readObject(readBody)) ?? {};
+        const operation = typeof body.operation === "string" ? body.operation : body.op;
+        const expectedId = body.expectedId;
+        try { return ok(walkthrough.mutate(operation, expectedId, state())); }
+        catch (error) {
+          if (error instanceof WalkthroughError) return fail(error.status, error.message);
+          throw error;
+        }
       }
       if (parts[0] === "suggestions" && (parts.length === 1 || parts.length === 2)) {
         if (typeof supervisor.suggestions !== "function") return fail(503, "Suggestions are not available.");
@@ -179,6 +217,161 @@ export function createFleetRoute({ supervisor } = {}) {
         }
         return ok(await supervisor.getHierarchy({ project: project.trim() || null, includeArchived, limit }));
       }
+      if (parts.length === 1 && parts[0] === "ask-supervisor") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (typeof supervisor.getActiveWork !== "function") return fail(503, "Supervisor Work is not available.");
+        const project = url?.searchParams?.get("project") ?? "";
+        const limit = Number(url?.searchParams?.get("limit") ?? 50);
+        if (project.length > 160 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return fail(400, "Pass project up to 160 characters and a limit of 1-100.");
+        }
+        const work = await supervisor.getActiveWork({ project: project.trim() || null, limit });
+        return ok({
+          project: project.trim() || null,
+          work,
+          state: state(),
+          ask: {
+            prompt: project.trim()
+              ? `Ask Supervisor about ${project.trim()} work, blockers, owners, and next checks.`
+              : "Ask Supervisor about tracked work, blockers, owners, and next checks.",
+            source: "active-work",
+            unknownEtaIsExplicit: true
+          }
+        });
+      }
+      if (parts[0] === "active-work" && (parts.length === 1 || (parts.length === 2 && parts[1] === "scan") || (parts.length === 3 && (parts[2] === "act" || parts[2] === "verify")))) {
+        if (parts.length === 1 && method === "GET") {
+          if (typeof supervisor.getActiveWork !== "function") {
+            return fail(503, "Active Work tracking is not available.");
+          }
+          const project = url?.searchParams?.get("project") ?? "";
+          const theme = url?.searchParams?.get("theme") ?? "";
+          const includeSnoozed = ["true", "1"].includes(url?.searchParams?.get("includeSnoozed") ?? "");
+          const includeDone = ["true", "1"].includes(url?.searchParams?.get("includeDone") ?? "");
+          const limit = Number(url?.searchParams?.get("limit") ?? 50);
+          if (project.length > 160 || theme.length > 120 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+            return fail(400, "Pass project up to 160 chars, theme up to 120 chars, and limit of 1-100.");
+          }
+          return ok(await supervisor.getActiveWork({
+            project: project.trim() || null,
+            theme: theme.trim() || null,
+            includeSnoozed,
+            includeDone,
+            limit
+          }));
+        }
+        if (parts.length === 1 && method === "POST") {
+          if (typeof supervisor.trackWork !== "function") {
+            return fail(503, "Active Work tracking is not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body) return fail(400, "Send a JSON object describing the outcome, project, or customer to track.");
+          try {
+            const tracked = await supervisor.trackWork(body);
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ ...tracked, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not track Active Work.");
+          }
+        }
+        if (parts.length === 2 && parts[1] === "scan") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (typeof supervisor.scanActiveWork !== "function") {
+            return fail(503, "Active Work inventory scan is not available.");
+          }
+          const body = (await readObject(readBody)) ?? {};
+          try {
+            const pass = await supervisor.scanActiveWork({
+              ...(body.pageSize !== undefined ? { pageSize: Number(body.pageSize) } : {}),
+              ...(body.maxRepoChecks !== undefined ? { maxRepoChecks: Number(body.maxRepoChecks) } : {}),
+              ...(body.maxDecisionItems !== undefined ? { maxDecisionItems: Number(body.maxDecisionItems) } : {}),
+              ...(body.maxPromptsPerPass !== undefined ? { maxPromptsPerPass: Number(body.maxPromptsPerPass) } : {}),
+              resetCursor: body.resetCursor === true
+            });
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ pass, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Active Work inventory scan failed.");
+          }
+        }
+        if (parts.length === 3 && parts[2] === "verify") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad Active Work id.");
+          if (typeof supervisor.verifyGoalProgress !== "function") {
+            return fail(503, "Goal verification is not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body) return fail(400, "Send a JSON object with { evidenceSummary, cursor }.");
+          try {
+            const result = await supervisor.verifyGoalProgress({
+              id: parts[1],
+              evidenceSummary: typeof body.evidenceSummary === "string" ? body.evidenceSummary : "",
+              cursor: body.cursor && typeof body.cursor === "object" && !Array.isArray(body.cursor) ? body.cursor : null,
+              ownerConfirmedDone: body.ownerConfirmedDone === true
+            });
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ result, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not verify goal progress.");
+          }
+        }
+        if (parts.length === 3 && parts[2] === "act") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad Active Work id.");
+          if (typeof supervisor.actActiveWork !== "function") {
+            return fail(503, "Active Work actions are not available.");
+          }
+          const body = await readObject(readBody);
+          if (!body || typeof body.op !== "string" || !body.op.trim()) {
+            return fail(400, "Send a JSON object with { op }.");
+          }
+          try {
+            const result = await supervisor.actActiveWork(parts[1], body, sendOptions);
+            if (!result) return fail(404, "No Active Work item or proposal with that id.");
+            const activeWork = typeof supervisor.getActiveWork === "function" ? await supervisor.getActiveWork() : null;
+            return ok({ result, activeWork, state: state() });
+          } catch (err) {
+            return safeActiveWorkError(err, "Could not execute Active Work action.");
+          }
+        }
+        return fail(405, "Method not allowed.");
+      }
+      if (parts[0] === "projects" && (parts.length === 1 || parts.length === 2)) {
+        if (parts.length === 1 && method === "GET") {
+          if (typeof supervisor.getOrganization !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          return ok({ organization: await supervisor.getOrganization() });
+        }
+        if (parts.length === 1 && method === "POST") {
+          if (typeof supervisor.upsertProject !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          const body = await readObject(readBody);
+          const name = typeof body?.name === "string" ? body.name.trim() : "";
+          const theme = typeof body?.theme === "string" ? body.theme.trim() : null;
+          const alias = typeof body?.alias === "string" ? body.alias.trim() : null;
+          if (!name || name.length > 80) return fail(400, "Project name must be 1-80 characters.");
+          if (theme && theme.length > 80) return fail(400, "Theme name must be up to 80 characters.");
+          if (alias && alias.length > 80) return fail(400, "Alias must be up to 80 characters.");
+          try {
+            const res = await supervisor.upsertProject({ name, theme: theme || null, alias: alias || null });
+            return ok({ ...res, state: state() });
+          } catch (err) {
+            return fail(400, String(err?.message ?? "Could not save project.").slice(0, 200));
+          }
+        }
+        if (parts.length === 2 && method === "DELETE") {
+          if (typeof supervisor.deleteProject !== "function") {
+            return fail(503, "Project organization is not available.");
+          }
+          const projId = decodeURIComponent(parts[1]).trim();
+          if (!projId || projId.length > 80) return fail(400, "Bad project id.");
+          const res = await supervisor.deleteProject(projId);
+          return ok({ ...res, state: state() });
+        }
+        return fail(405, "Use GET, POST, or DELETE.");
+      }
       if (parts.length === 2 && parts[0] === "themes" && parts[1] === "sync") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (typeof supervisor.syncThemes !== "function") {
@@ -228,6 +421,8 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
             ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             ...sendOptions
           });
@@ -253,6 +448,45 @@ export function createFleetRoute({ supervisor } = {}) {
           return fail(400, String(err?.message ?? "Could not inspect repository.").slice(0, 200));
         }
       }
+      if (parts.length === 2 && parts[0] === "tasks" && parts[1] === "claim") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (typeof supervisor.claimTask !== "function") {
+          return fail(503, "Claiming tasks into coding sessions is not available.");
+        }
+        const body = await readObject(readBody);
+        const taskId = typeof body?.taskId === "string" ? body.taskId.trim() : "";
+        const title = typeof body?.title === "string" ? body.title.trim() : "";
+        if (!taskId && (!title || title.length > 300)) {
+          return fail(400, "Pass taskId or a title of 1-300 characters.");
+        }
+        if (taskId && !ID_PATTERN.test(taskId)) {
+          return fail(400, "Bad taskId.");
+        }
+        const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
+        if (prompt.length > 4000) return fail(400, "prompt must be up to 4000 characters.");
+        try {
+          const claimed = await supervisor.claimTask({
+            taskId: taskId || null,
+            title: title || null,
+            description: typeof body?.description === "string" ? body.description.trim().slice(0, 4000) : "",
+            workspace: typeof body?.workspace === "string" && body.workspace.trim() ? body.workspace.trim().slice(0, 160) : null,
+            cwd: typeof body?.cwd === "string" && body.cwd.trim() ? body.cwd.trim().slice(0, 400) : null,
+            serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
+            project: typeof body?.project === "string" && body.project.trim() ? body.project.trim().slice(0, 120) : null,
+            subchannel: typeof body?.subchannel === "string" && body.subchannel.trim() ? body.subchannel.trim().slice(0, 120) : null,
+            provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim().slice(0, 80) : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
+            labels: body?.labels ?? null,
+            dependsOn: Array.isArray(body?.dependsOn) ? body.dependsOn.filter((id) => typeof id === "string" && ID_PATTERN.test(id)).slice(0, 20) : null,
+            ...(Array.isArray(body?.images) ? { images: body.images } : {}),
+            prompt: prompt || null
+          });
+          return ok({ task: claimed.task, session: claimed.session, state: state() });
+        } catch (err) {
+          return fail(400, String(err?.message ?? "Could not claim task into Paseo session.").slice(0, 220));
+        }
+      }
       if (parts.length === 2 && parts[0] === "sessions" && parts[1] === "start") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (typeof supervisor.startPaseoSession !== "function") {
@@ -263,8 +497,8 @@ export function createFleetRoute({ supervisor } = {}) {
         const workspace = typeof body?.workspace === "string" ? body.workspace.trim() : "";
         const cwd = typeof body?.cwd === "string" ? body.cwd.trim() : "";
         if (!prompt || prompt.length > 4000) return fail(400, "prompt must be 1-4000 characters.");
-        if ((!workspace && !cwd) || workspace.length > 160 || cwd.length > 400) {
-          return fail(400, "Pass workspace or cwd.");
+        if (workspace.length > 160 || cwd.length > 400) {
+          return fail(400, "workspace or cwd is too long.");
         }
         try {
           const started = await supervisor.startPaseoSession({
@@ -273,6 +507,9 @@ export function createFleetRoute({ supervisor } = {}) {
             serverId: typeof body?.serverId === "string" && body.serverId.trim() ? body.serverId.trim() : null,
             title: typeof body?.title === "string" && body.title.trim() ? body.title.trim() : null,
             provider: typeof body?.provider === "string" && body.provider.trim() ? body.provider.trim() : null,
+            model: typeof body?.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : null,
+            effort: typeof body?.effort === "string" && body.effort.trim() ? body.effort.trim().slice(0, 40) : null,
+            modeId: typeof body?.modeId === "string" && body.modeId.trim() ? body.modeId.trim().slice(0, 60) : null,
             ...(Array.isArray(body?.images) ? { images: body.images } : {}),
             prompt
           });
@@ -360,10 +597,41 @@ export function createFleetRoute({ supervisor } = {}) {
         const outcome = await supervisor.actCard(cardId, {
           op,
           value,
+          confirmed: body.confirmed === true,
           clarification: typeof body.clarification === "string" ? body.clarification : null,
           instructions: typeof body.instructions === "string" ? body.instructions : null,
+          ...(Array.isArray(body.images) ? { images: body.images } : {}),
           ...sendOptions
         });
+        if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
+        return ok({ result: outcome, state: state() });
+      }
+      // The owner's Admin Merge: { preview: true } shows exactly what would
+      // be waived and returns a single-use consent; { consent } confirms that
+      // exact repo/PR/head SHA. Owner-only: no paired-phone allowlist entry,
+      // and no agent tool, batch, or card action leads here.
+      if (parts.length === 3 && parts[0] === "cards" && parts[2] === "admin-merge") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const cardId = pathCardId(parts[1]);
+        if (!cardId) return fail(400, "Bad card id.");
+        if (typeof supervisor.previewAdminMerge !== "function" || typeof supervisor.adminMergeCard !== "function") {
+          return fail(503, "Admin Merge is not available.");
+        }
+        const body = (await readObject(readBody)) ?? {};
+        let outcome;
+        if (body.preview === true) {
+          outcome = await supervisor.previewAdminMerge(cardId, { initiator: "owner" });
+        } else {
+          const c = isPlainObject(body.consent) ? body.consent : null;
+          const consent = c && typeof c.token === "string" && c.token.length <= 64
+            && typeof c.action === "string" && typeof c.repo === "string" && c.repo.length <= 200
+            && Number.isInteger(c.number) && typeof c.headSha === "string" && c.headSha.length <= 64
+            && typeof c.baseRef === "string" && c.baseRef.length <= 255
+            ? { token: c.token, action: c.action, repo: c.repo, number: c.number, headSha: c.headSha, baseRef: c.baseRef }
+            : null;
+          if (!consent) return fail(400, "Send { preview: true } first, then { consent } exactly as the preview returned it.");
+          outcome = await supervisor.adminMergeCard(cardId, { initiator: "owner", consent });
+        }
         if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });
         return ok({ result: outcome, state: state() });
       }
@@ -427,14 +695,18 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
-        const message = typeof body?.message === "string" ? body.message.trim() : "";
+        const images = Array.isArray(body?.images) ? body.images : null;
+        const rawMessage = typeof body?.message === "string" ? body.message.trim() : "";
+        const message = rawMessage || (images?.length ? "Please inspect the attached image(s)." : "");
         if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
+        const idempotencyKey = typeof body?.idempotencyKey === "string" && /^[A-Za-z0-9_.:-]{1,160}$/.test(body.idempotencyKey) ? body.idempotencyKey : null;
         const extraOpts = {
           ...sendOptions,
-          ...(body?.queue === true ? { queue: true } : {}),
-          ...(Array.isArray(body?.images) ? { images: body.images } : {})
+          ...(typeof body?.queue === "boolean" ? { queue: body.queue } : {}),
+          ...(images?.length ? { images } : {}),
+          ...(idempotencyKey ? { idempotencyKey } : {})
         };
         const result = await supervisor.sendOwnerMessage(threadKey, message, extraOpts);
         return ok({ delivery: result?.delivery ?? null, state: state() });
@@ -488,7 +760,8 @@ export function createFleetRoute({ supervisor } = {}) {
       // The owner's feedback (voice or typed): GET lists it, POST records one.
       if (parts.length === 1 && parts[0] === "feedback") {
         if (typeof supervisor.recordFeedback !== "function") return fail(503, "Feedback is not available.");
-        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 100 }) });
+        // Everything the store keeps: a status filter must see old open items.
+        if (method === "GET") return ok({ feedback: await supervisor.feedback({ limit: 500 }) });
         if (method !== "POST") return fail(405, "Use GET or POST.");
         const body = await readObject(readBody);
         if (!body) return fail(400, "Send a JSON object: { utterance, intent, target?, source? }.");
@@ -528,6 +801,34 @@ export function createFleetRoute({ supervisor } = {}) {
           const conversation = await supervisor.threadConversation?.(threadKey);
           return ok({ thread: conversation ? { ...thread, conversation } : thread });
         }
+        if (parts[2] === "settings") {
+          if (method === "GET") {
+            if (typeof supervisor.paseoSessionSettings !== "function") return fail(503, "Paseo session settings are not available.");
+            const result = await supervisor.paseoSessionSettings(threadKey);
+            if (result?.ok) return ok({ settings: result.settings });
+            const status = result?.status === "wrong-target" ? 409 : result?.status === "unavailable" ? 503 : 400;
+            return fail(status, result?.detail ?? "Paseo session settings could not be read.", { settings: result?.settings ?? null });
+          }
+          if (method !== "POST") return fail(405, "Use GET or POST.");
+          const body = (await readObject(readBody)) ?? {};
+          if (body.confirmed !== true) return fail(403, "An explicit owner confirmation is required.");
+          if (typeof supervisor.updatePaseoSessionSettings !== "function") return fail(503, "Paseo session settings are not available.");
+          const result = await supervisor.updatePaseoSessionSettings(threadKey, body, sendOptions);
+          if (result?.ok) return ok({ settings: result.settings, detail: result.detail });
+          const status = {
+            unauthorized: 403,
+            "wrong-target": 409,
+            "stale-target": 409,
+            pending: 409,
+            busy: 409,
+            unsupported: 422,
+            invalid: 400,
+            unavailable: 503,
+            failed: 502,
+            unconfirmed: 502
+          }[result?.status] ?? 400;
+          return fail(status, result?.detail ?? "Paseo session settings were not applied.", { settings: result?.settings ?? null });
+        }
         if (parts[2] === "transcript") {
           if (method !== "GET") return fail(405, "Use GET.");
           if (typeof supervisor.readChatTranscript !== "function") return fail(503, "Transcript reading is not available.");
@@ -544,12 +845,57 @@ export function createFleetRoute({ supervisor } = {}) {
             return fail(400, msg.slice(0, 200));
           }
         }
+        if (parts[2] === "organize") {
+          if (method !== "POST") return fail(405, "Use POST.");
+          if (typeof supervisor.organizeThread !== "function") {
+            return fail(503, "Thread organization is not available.");
+          }
+          const body = (await readObject(readBody)) ?? {};
+          const project = typeof body.project === "string" ? body.project.trim() : null;
+          const theme = typeof body.theme === "string" ? body.theme.trim() : null;
+          if (project && project.length > 80) return fail(400, "project must be up to 80 characters.");
+          if (theme && theme.length > 80) return fail(400, "theme must be up to 80 characters.");
+          try {
+            const res = await supervisor.organizeThread(threadKey, { project: project || null, theme: theme || null });
+            return ok({ ...res, state: state() });
+          } catch (err) {
+            return fail(400, String(err?.message ?? "Could not organize thread.").slice(0, 200));
+          }
+        }
         if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
         if (method !== "POST") return fail(405, "Use POST.");
         if (parts[2] === "push") {
           if (typeof supervisor.pushNow !== "function") return fail(503, "Push now is not available.");
           const result = await supervisor.pushNow(threadKey, sendOptions);
           return ok({ delivery: result?.delivery ?? null, action: result?.action ?? null, state: state() });
+        }
+        if (parts[2] === "failover") {
+          if (typeof supervisor.switchPaseoProvider !== "function") return fail(503, "Provider failover is not available.");
+          const body = (await readObject(readBody)) ?? {};
+          const preferredProviders = Array.isArray(body.preferredProviders)
+            ? body.preferredProviders.filter((p) => typeof p === "string").slice(0, 3)
+            : undefined;
+          const reason = typeof body.reason === "string" ? body.reason.slice(0, 240) : null;
+          const result = await supervisor.switchPaseoProvider(threadKey, { preferredProviders, reason });
+          if (!result?.ok) {
+            return fail(400, result?.detail ?? "Could not switch Paseo provider.", { status: result?.status ?? "blocked", state: state() });
+          }
+          return ok({ result, state: state() });
+        }
+        if (parts[2] === "archive") {
+          if (typeof supervisor.archiveThread !== "function") return fail(503, "Session archiving is not available.");
+          const body = (await readObject(readBody)) ?? {};
+          const result = await supervisor.archiveThread(threadKey, { confirmed: body.confirmed === true });
+          if (!result?.ok) {
+            return fail(result?.status === "confirmation_required" ? 409 : 400, result?.detail ?? "Could not archive coding session.", { status: result?.status ?? "blocked", state: state() });
+          }
+          return ok({ result, state: state() });
+        }
+        if (parts[2] === "unarchive") {
+          if (typeof supervisor.unarchiveThread !== "function") return fail(503, "Session restore is not available.");
+          const result = await supervisor.unarchiveThread(threadKey);
+          if (!result?.ok) return fail(400, result?.detail ?? "Could not restore coding session.", { state: state() });
+          return ok({ result, state: state() });
         }
         if (typeof supervisor.muteThread !== "function") return fail(503, "Muting is not available.");
         if (parts[2] === "unmute") return ok({ muted: (await supervisor.unmuteThread(threadKey))?.until ?? null, state: state() });

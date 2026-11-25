@@ -886,7 +886,7 @@ private fun NeedsYouSection(
     onVoiceFocus: (FleetQuestion) -> Unit,
     onOpenQuestion: (FleetQuestion) -> Unit,
 ) {
-    val allQuestions = state.questions.filter { it.id.isNotBlank() }
+    val allQuestions = state.questions.filter { it.id.isNotBlank() && it.needsYou }
     val threads = state.snapshot?.threads.orEmpty()
     val threadsByKey = threads.associateBy { it.key }
     fun projectOf(q: FleetQuestion): String {
@@ -1012,7 +1012,13 @@ private fun QuestionRow(
         if (question.risky) {
             Text("Read it all first: this one can't be undone easily.", style = OpenAGIType.caption, color = colors.alert)
         }
-        Text(question.title?.takeIf { it.isNotBlank() } ?: "Question", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+        Text(question.decisionHeadline?.takeIf { it.isNotBlank() } ?: question.title?.takeIf { it.isNotBlank() } ?: "Question", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+        question.decisionFact?.takeIf { it.isNotBlank() }?.let {
+            Text(it, style = OpenAGIType.caption, color = muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        if (question.remainingItemIds.isNotEmpty()) {
+            Text("More owner questions remain", style = OpenAGIType.caption, color = colors.live)
+        }
         if (context.isNotEmpty()) Text(context.joinToString(" · "), style = OpenAGIType.caption, color = muted)
         question.body?.takeIf { it.isNotBlank() }?.let { MarkdownView(it, textColor = muted, style = OpenAGIType.secondary) }
         if (askContext != null && (question.risky || expanded)) {

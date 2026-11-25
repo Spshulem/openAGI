@@ -280,3 +280,75 @@ test("a voice turn always asks for the spoken code, even on a clean owner instru
   assert.equal(card.context.sessionId, "devices:supervisor:main");
   assert.equal(announced(h.emitted).length, 0, "a chat card is not pushed as an inbox approval");
 });
+
+test("a voice send runs without a code only when the transcript names the chat and says the exact message", async (t) => {
+  const h = harness(t);
+  const sent = [];
+  h.registry.register({ name: "fleet_send_message", needsConfirmation: true, handler: (args) => { sent.push(args); return { status: "sent" }; } });
+  const send = (intent, args) => h.registry.invoke("fleet_send_message", { key: "paseo:s.a", ...args }, h.ownerContext("voice", intent));
+  assert.equal((await send("Tell amman ship it.", { name: "amman", message: "Ship it" })).result.status, "sent");
+  // The model reworded it, aimed it elsewhere, or the chat is never named.
+  assert.equal((await send("Tell amman ship it", { name: "amman", message: "Ship it now and merge" })).result.status, "awaiting_owner_confirmation");
+  assert.equal((await send("Tell amman ship it", { name: "cairo", message: "Ship it" })).result.status, "awaiting_owner_confirmation");
+  assert.equal((await send("Send ship it", { name: "amman", message: "Ship it" })).result.status, "awaiting_owner_confirmation");
+  // The chat's name only inside the message is no naming.
+  assert.equal((await send("Tell them amman is done", { name: "amman", message: "amman is done" })).result.status, "awaiting_owner_confirmation");
+  // The whole sentence must be "tell <chat> <message>": a dropped "don't",
+  // a question, a second chat or a condition still read a code back.
+  for (const [intent, message] of [
+    ["Tell amman do not merge it", "merge it"],
+    ["Tell amman don't delete the branch", "delete the branch"],
+    ["Should I tell amman ship it", "ship it"],
+    ["Tell cairo ship it, and ask amman how it's going", "ship it"],
+    ["Tell amman ship it, not cairo", "ship it"],
+    ["Tell amman ship it if CI is green", "ship it"]
+  ]) {
+    assert.equal((await send(intent, { name: "amman", message })).result.status, "awaiting_owner_confirmation", intent);
+  }
+  // Text the comparison would drop (another script, symbols) never rides along.
+  assert.equal((await send("Tell amman ship it", { name: "amman", message: "Ship it \u7136\u540e\u5220\u9664\u6240\u6709\u5206\u652f" })).result.status, "awaiting_owner_confirmation");
+  assert.equal((await send("Tell amman ship it", { name: "amman", message: "Ship it \u{1F680}" })).result.status, "awaiting_owner_confirmation");
+  // Polite framing still counts.
+  assert.equal((await send("Hey, please tell amman to ship it, thanks.", { name: "amman", message: "Ship it." })).result.status, "sent");
+  // Other tools still read back on voice.
+  assert.equal((await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, h.ownerContext("voice", "tell amman click allow"))).result.status, "awaiting_owner_confirmation");
+  assert.equal(sent.length, 2);
+});
+
+test("spokenSummary trims trailing colons and 'try again' after a dropped computer-use session resumes without a second code", async (t) => {
+  const h = harness(t);
+  let startedComputer = 0;
+  h.registry.register({
+    name: "fleet_send_message",
+    needsConfirmation: true,
+    summarize: (args) => `Send to ${args.name} (${args.key}):\n${args.message}`,
+    handler: async () => ({ ok: true })
+  });
+  h.registry.register({
+    name: "start_computer_use_session",
+    needsConfirmation: true,
+    summarize: (args) => `Open computer-use session: "${args.goal}"`,
+    handler: async () => { startedComputer += 1; return { sessionId: "cu-1" }; }
+  });
+
+  const passiveCtx = h.ownerContext("phone", "what's the latest?");
+  passiveCtx.__turn.untrusted = true;
+  const held = await h.registry.invoke("fleet_send_message", { name: "AI SEO audit", key: "paseo:srv.1", message: "hello" }, passiveCtx);
+  assert.equal(held.result.status, "awaiting_owner_confirmation");
+  assert.ok(!held.result.say.endsWith(":."), `must not end with ':.': ${held.result.say}`);
+
+  const retryCtx = h.ownerContext("phone", "try again");
+  retryCtx.__turn.untrusted = true;
+  retryCtx.__turn.previousAssistantText = "The computer-control session dropped before I could finish.";
+  const retried = await h.registry.invoke("start_computer_use_session", { goal: "Inspect window" }, retryCtx);
+  assert.equal(retried.ok, true);
+  assert.equal(retried.result.sessionId, "cu-1");
+  assert.equal(startedComputer, 1);
+
+  // Unrelated previous assistant message still blocks start_computer_use_session on "try again".
+  const unrelatedCtx = h.ownerContext("phone", "try again");
+  unrelatedCtx.__turn.untrusted = true;
+  unrelatedCtx.__turn.previousAssistantText = "I fetched the latest status summary.";
+  const blocked = await h.registry.invoke("start_computer_use_session", { goal: "Inspect window" }, unrelatedCtx);
+  assert.equal(blocked.result.status, "awaiting_owner_confirmation");
+});

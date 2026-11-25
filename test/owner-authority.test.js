@@ -3,7 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  authorityRecord, intentCovers, intentFamilies, isOwnerPrincipal, matchConfirmation, matchConfirmations,
+  authorityRecord, intentCovers, intentFamilies, isConversationalAssentOrChoice,
+  isOwnerPrincipal, isSupervisorActionableDirective, matchConfirmation, matchConfirmations,
   ownerAuthorityEnabled, ownerIntentText, ownerPrincipal
 } from "../src/owner-authority.js";
 
@@ -197,4 +198,53 @@ test("matchConfirmations parses multi-code and batch confirmations while rejecti
   for (const bad of ["yes I think we should wait", "approve all the PRs on GitHub", "yes no 60 19", "ok thanks"]) {
     assert.equal(matchConfirmations(bad), null, bad);
   }
+});
+
+test("conversational assent 'yes' / 'continue' / 'skip' following a supervisor question is actionable without a code", () => {
+  const rec = "Your Needs You inbox has 14 open questions.\nMy recommendation: Have the agent continue resolving the blockers.\nContinue, inspect the thread further, or skip?";
+  for (const reply of ["yes", "Yes!", "continue", "skip", "option 1", "1", "ok do it"]) {
+    assert.equal(isConversationalAssentOrChoice(reply, rec), true, reply);
+    assert.equal(isSupervisorActionableDirective(reply, { previousAssistantText: rec }), true, reply);
+  }
+  for (const blocked of ["no", "wait", "don't", "yes but tell me what failed first", "what is its status?"]) {
+    assert.equal(isConversationalAssentOrChoice(blocked, rec), false, blocked);
+  }
+  // Without an assistant question/recommendation, bare "yes" or "continue" stays false.
+  assert.equal(isConversationalAssentOrChoice("yes", "BuildBot3 tests passed earlier today."), false);
+  assert.equal(intentCovers("continue", "fleet_answer_question"), true);
+});
+
+test("attach image follow-ups authorize fleet messaging while passive questions stay blocked", () => {
+  for (const text of ["can you attach it?", "please attach the screenshot", "attach this image", "attach it to the Bob chat"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["What did the agent attach?", "Did the user attach a photo?", "Send it", "Forward the screenshot to me"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_send_message"), false, passive);
+  }
+});
+
+test("in-Paseo session creation follow-ups authorize fleet_start_session while passive questions stay blocked", () => {
+  for (const text of ["yes gpt 6.2 sol on medium effort in paseo", "run this with claude sonnet in paseo"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_start_session"), true, text);
+    assert.equal(isSupervisorActionableDirective(text), true, text);
+  }
+  for (const passive of ["what is running in paseo?", "what did the paseo session say?"]) {
+    assert.equal(intentCovers(ownerIntentText(passive), "fleet_start_session"), false, passive);
+    assert.equal(isSupervisorActionableDirective(passive), false, passive);
+  }
+});
+
+test("split phrasal verbs like 'kick a new chat off' and 'try again' after a dropped attempt authorize without code friction", () => {
+  const splitPhrase = "eh lets kick a new chat off INSIDE of that workspace BUT give it context of ai seo audit";
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_start_session"), true);
+  assert.equal(intentCovers(ownerIntentText(splitPhrase), "fleet_send_message"), true);
+  assert.equal(isSupervisorActionableDirective(splitPhrase), true);
+
+  const droppedMsg = "The computer-control session dropped before I could create the chat. No new chat was created or brief sent.";
+  assert.equal(isConversationalAssentOrChoice("try again", droppedMsg), true);
+  assert.equal(isConversationalAssentOrChoice("retry", droppedMsg), true);
+  assert.equal(isSupervisorActionableDirective("try again", { previousAssistantText: droppedMsg }), true);
+  // Passive reads stay blocked even after a dropped message.
+  assert.equal(isConversationalAssentOrChoice("what happened?", droppedMsg), false);
 });

@@ -105,6 +105,11 @@ final class PendingApprovalConsumer: ObservableObject {
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
   @Published private(set) var lastChatSessionId: String? = nil
+  @Published var overlayExpanded: Bool = false
+
+  func toggleOverlayExpanded() {
+    overlayExpanded.toggle()
+  }
 
   /// Only the newest reconciliation may publish. Refreshes arrive from panel
   /// appearance, SSE, and decisions, so response order is not request order.
@@ -133,6 +138,7 @@ final class PendingApprovalConsumer: ObservableObject {
             createdAtISO: $0.createdAt
           )
       }
+      if items.isEmpty { overlayExpanded = false }
       lastError = nil
     } catch let error as MainConnectionError {
       guard generation == refreshGeneration else { return }
@@ -168,10 +174,24 @@ final class PendingApprovalConsumer: ObservableObject {
       lastOutcome = "Cleared stale requests."
       lastError = nil
       await refresh()
-    } catch let error as MainConnectionError {
-      lastError = error.localizedDescription
     } catch {
-      lastError = "Couldn't dismiss approvals."
+      let targets = items.filter { mode == nil || $0.mode == mode }
+      if !targets.isEmpty {
+        for item in targets {
+          await decide(item.id, decision: "deny")
+        }
+        await refresh()
+        if items.allSatisfy({ mode != nil && $0.mode != mode }) {
+          lastOutcome = "Cleared stale requests."
+          lastError = nil
+          return
+        }
+      }
+      if let mainErr = error as? MainConnectionError {
+        lastError = mainErr.localizedDescription
+      } else {
+        lastError = "Couldn't dismiss approvals."
+      }
     }
   }
 

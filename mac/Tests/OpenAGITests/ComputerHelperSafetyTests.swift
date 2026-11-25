@@ -93,6 +93,13 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertEqual((imageX + globalOriginX / scale) * scale, 920.0, accuracy: 0.000_001)
   }
 
+  func testCaptureFrameEligibilityRequiresWindowOnMainDisplay() {
+    let main = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    XCTAssertTrue(ComputerScreenshot.isCapturableWindowFrame(CGRect(x: 20, y: 20, width: 700, height: 500), on: main))
+    XCTAssertFalse(ComputerScreenshot.isCapturableWindowFrame(CGRect(x: -800, y: 20, width: 700, height: 500), on: main))
+    XCTAssertFalse(ComputerScreenshot.isCapturableWindowFrame(CGRect(x: 20, y: 20, width: 31, height: 500), on: main))
+  }
+
   func testFocusedWindowResolutionRequiresOneExactFrameMatch() {
     let focused = ComputerWindowIdentity(
       processIdentifier: 42,

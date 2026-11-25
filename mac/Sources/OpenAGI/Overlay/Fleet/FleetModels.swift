@@ -14,6 +14,191 @@ private struct Lossy<T: Decodable>: Decodable {
 }
 
 /// One open "needs you" question from the coding-agent supervisor.
+struct FleetSuggestionIssueDraft: Decodable, Equatable {
+  let title: String?
+  let body: String?
+}
+
+struct FleetSuggestionPlan: Decodable, Equatable {
+  let remedy: String?
+  let label: String?
+  let nextAction: String?
+  let acceptance: String?
+  let issueDraft: FleetSuggestionIssueDraft?
+}
+
+struct FleetWorkspaceEntry: Decodable, Equatable, Identifiable {
+  struct Target: Decodable, Equatable {
+    let serverId: String?
+    let hostLabel: String?
+    let cwd: String?
+  }
+
+  let id: String
+  let name: String
+  let repo: String?
+  let defaultTarget: Target?
+}
+
+struct FleetHierarchySession: Decodable, Equatable, Identifiable {
+  let key: String
+  let title: String?
+  let host: String?
+  let cwd: String?
+  let state: String?
+  let lastActivityAt: String?
+  let theme: String?
+  let themeId: String?
+  var id: String { key }
+}
+
+struct FleetHierarchyTheme: Decodable, Equatable, Identifiable {
+  struct Counts: Decodable, Equatable {
+    let running: Int?
+    let idle: Int?
+    let sleeping: Int?
+    let total: Int?
+  }
+
+  let id: String
+  let name: String
+  let source: String?
+  let counts: Counts?
+  let needsYouCount: Int?
+  let sessions: [FleetHierarchySession]
+
+  enum CodingKeys: String, CodingKey { case id, name, source, counts, needsYouCount, sessions }
+
+  init(id: String, name: String, source: String? = nil, counts: Counts? = nil, needsYouCount: Int? = nil, sessions: [FleetHierarchySession] = []) {
+    self.id = id
+    self.name = name
+    self.source = source
+    self.counts = counts
+    self.needsYouCount = needsYouCount
+    self.sessions = sessions
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+    name = (try? c.decode(String.self, forKey: .name)) ?? id
+    source = try? c.decodeIfPresent(String.self, forKey: .source)
+    counts = try? c.decodeIfPresent(Counts.self, forKey: .counts)
+    needsYouCount = try? c.decodeIfPresent(Int.self, forKey: .needsYouCount)
+    sessions = ((try? c.decodeIfPresent([Lossy<FleetHierarchySession>].self, forKey: .sessions)) ?? []).compactMap(\.value)
+  }
+}
+
+struct FleetHierarchyProject: Decodable, Equatable, Identifiable {
+  struct Counts: Decodable, Equatable {
+    let running: Int?
+    let idle: Int?
+    let sleeping: Int?
+    let total: Int?
+  }
+
+  let id: String
+  let name: String
+  let repo: String?
+  let counts: Counts?
+  let needsYouCount: Int?
+  let themes: [FleetHierarchyTheme]
+
+  enum CodingKeys: String, CodingKey { case id, name, repo, counts, needsYouCount, themes }
+
+  init(id: String, name: String, repo: String? = nil, counts: Counts? = nil, needsYouCount: Int? = nil, themes: [FleetHierarchyTheme] = []) {
+    self.id = id
+    self.name = name
+    self.repo = repo
+    self.counts = counts
+    self.needsYouCount = needsYouCount
+    self.themes = themes
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+    name = (try? c.decode(String.self, forKey: .name)) ?? id
+    repo = try? c.decodeIfPresent(String.self, forKey: .repo)
+    counts = try? c.decodeIfPresent(Counts.self, forKey: .counts)
+    needsYouCount = try? c.decodeIfPresent(Int.self, forKey: .needsYouCount)
+    themes = ((try? c.decodeIfPresent([Lossy<FleetHierarchyTheme>].self, forKey: .themes)) ?? []).compactMap(\.value)
+  }
+}
+
+struct FleetHierarchyResponse: Decodable, Equatable {
+  let projects: [FleetHierarchyProject]
+
+  enum CodingKeys: String, CodingKey { case projects }
+
+  init(projects: [FleetHierarchyProject] = []) {
+    self.projects = projects
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    projects = ((try? c.decodeIfPresent([Lossy<FleetHierarchyProject>].self, forKey: .projects)) ?? []).compactMap(\.value)
+  }
+}
+
+struct FleetDecisionSource: Decodable, Equatable {
+  let questionId: String?
+  let threadKey: String?
+  let threadKeys: [String]
+  let app: String?
+  let cardId: String?
+  let itemId: String?
+
+  enum CodingKeys: String, CodingKey { case questionId, threadKey, threadKeys, app, cardId, itemId }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    questionId = try? c.decodeIfPresent(String.self, forKey: .questionId)
+    threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+    threadKeys = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .threadKeys)) ?? []).compactMap { $0.value }
+    app = try? c.decodeIfPresent(String.self, forKey: .app)
+    cardId = try? c.decodeIfPresent(String.self, forKey: .cardId)
+    itemId = try? c.decodeIfPresent(String.self, forKey: .itemId)
+  }
+}
+
+struct FleetCardAction: Decodable, Equatable {
+  let op: String?
+  let label: String?
+  let value: String?
+
+  enum CodingKeys: String, CodingKey { case op, label, value }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    op = try? c.decodeIfPresent(String.self, forKey: .op)
+    label = try? c.decodeIfPresent(String.self, forKey: .label)
+    value = try? c.decodeIfPresent(String.self, forKey: .value)
+  }
+}
+
+struct FleetDecisionItem: Decodable, Equatable, Identifiable {
+  let itemId: String?
+  let source: FleetDecisionSource?
+  let headline: String
+  let options: [String]
+  let multiSelect: Bool
+  let freeText: Bool
+  let active: Bool
+  var id: String { itemId ?? headline }
+
+  enum CodingKeys: String, CodingKey { case itemId, source, headline, options, multiSelect, freeText, active }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    itemId = try? c.decodeIfPresent(String.self, forKey: .itemId)
+    source = try? c.decodeIfPresent(FleetDecisionSource.self, forKey: .source)
+    headline = (try? c.decodeIfPresent(String.self, forKey: .headline)) ?? "Owner decision"
+    options = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .options)) ?? []).compactMap { $0.value }
+    multiSelect = (try? c.decodeIfPresent(Bool.self, forKey: .multiSelect)) ?? false
+    freeText = (try? c.decodeIfPresent(Bool.self, forKey: .freeText)) ?? false
+    active = (try? c.decodeIfPresent(Bool.self, forKey: .active)) ?? false
+  }
+}
+
 struct FleetQuestion: Decodable, Equatable, Identifiable {
   let id: String
   let kind: String?
@@ -29,6 +214,13 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let reviewCategory: String?
   let pinned: Bool
   let createdAt: String?
+  let needsYou: Bool
+  let decisionHeadline: String?
+  let decisionFact: String?
+  let decisionSource: FleetDecisionSource?
+  let decisionAction: FleetCardAction?
+  let remainingItemIds: [String]
+  let decisionItems: [FleetDecisionItem]
   /// When the agent asked, else when the supervisor first asked the owner.
   let askedAt: String?
   /// The chat it is about: "remote-dev · Remote dev setup (Conductor)".
@@ -47,11 +239,22 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   /// { reply }). False from a hub before it.
   var canReply: Bool = false
   let project: String?
+  let plan: FleetSuggestionPlan?
+  let clarificationAnswer: String?
+  let blockingCount: Int
+  let blockingSummary: String?
+  let actorLabel: String?
+  let subchannel: String?
+  let labels: [String]
 
   enum CodingKeys: String, CodingKey {
-    case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
-    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project
+    case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt, needsYou, decisionHeadline, decisionFact, decisionSource, decisionAction, remainingItemIds, decisionItems
+    case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext, canReply, project, meta
+    case blockingCount, blockingSummary, actorLabel, subchannel, labels
   }
+
+  private enum MetaKeys: String, CodingKey { case plan, clarification }
+  private enum ClarificationKeys: String, CodingKey { case answer }
 
   /// Why the supervisor's review kept it, or the close the owner overrode
   /// with Reopen. Same wording as the /fleet page.
@@ -69,6 +272,10 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
 extension FleetQuestion {
   /// Options the owner can tap. "open thread" is left out: the supervisor
   /// can't carry it to the agent and always hands it back.
+  var isClarificationQuestion: Bool {
+    kind == "suggestion" && options.contains("Answer question")
+  }
+
   var tappableOptions: [String] { options.filter { $0 != Self.openThread } }
 
   var displayAskContext: String? {
@@ -122,6 +329,13 @@ extension FleetQuestion {
     reviewCategory = try? c.decodeIfPresent(String.self, forKey: .reviewCategory)
     pinned = (try? c.decodeIfPresent(Bool.self, forKey: .pinned)) ?? false
     createdAt = try? c.decodeIfPresent(String.self, forKey: .createdAt)
+    needsYou = (try? c.decodeIfPresent(Bool.self, forKey: .needsYou)) ?? true
+    decisionHeadline = try? c.decodeIfPresent(String.self, forKey: .decisionHeadline)
+    decisionFact = try? c.decodeIfPresent(String.self, forKey: .decisionFact)
+    decisionSource = try? c.decodeIfPresent(FleetDecisionSource.self, forKey: .decisionSource)
+    decisionAction = try? c.decodeIfPresent(FleetCardAction.self, forKey: .decisionAction)
+    remainingItemIds = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .remainingItemIds)) ?? []).compactMap { $0.value }
+    decisionItems = ((try? c.decodeIfPresent([Lossy<FleetDecisionItem>].self, forKey: .decisionItems)) ?? []).compactMap { $0.value }
     askedAt = try? c.decodeIfPresent(String.self, forKey: .askedAt)
     chatLabel = try? c.decodeIfPresent(String.self, forKey: .chatLabel)
     answerIn = try? c.decodeIfPresent(String.self, forKey: .answerIn)
@@ -131,6 +345,22 @@ extension FleetQuestion {
     askContext = try? c.decodeIfPresent(String.self, forKey: .askContext)
     canReply = (try? c.decodeIfPresent(Bool.self, forKey: .canReply)) ?? false
     project = try? c.decodeIfPresent(String.self, forKey: .project)
+    if let mc = try? c.nestedContainer(keyedBy: MetaKeys.self, forKey: .meta) {
+      plan = try? mc.decodeIfPresent(FleetSuggestionPlan.self, forKey: .plan)
+      if let cc = try? mc.nestedContainer(keyedBy: ClarificationKeys.self, forKey: .clarification) {
+        clarificationAnswer = try? cc.decodeIfPresent(String.self, forKey: .answer)
+      } else {
+        clarificationAnswer = nil
+      }
+    } else {
+      plan = nil
+      clarificationAnswer = nil
+    }
+    blockingCount = (try? c.decodeIfPresent(Int.self, forKey: .blockingCount)) ?? 0
+    blockingSummary = try? c.decodeIfPresent(String.self, forKey: .blockingSummary)
+    actorLabel = try? c.decodeIfPresent(String.self, forKey: .actorLabel)
+    subchannel = try? c.decodeIfPresent(String.self, forKey: .subchannel)
+    labels = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .labels)) ?? []).compactMap { $0.value }
   }
 }
 
@@ -201,6 +431,58 @@ struct FleetOpenChat: Decodable, Equatable {
   }
 }
 
+struct FleetActivityEvent: Decodable, Equatable, Identifiable {
+  let id: String
+  let kind: String
+  let actor: String?
+  let project: String?
+  let subchannel: String?
+  let title: String
+  let detail: String?
+  let threadKey: String?
+  let taskId: String?
+  let prRef: String?
+  let labels: [String]
+  let at: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id, kind, actor, project, subchannel, title, detail, threadKey, taskId, prRef, labels, at
+  }
+
+  init(id: String, kind: String = "action", actor: String? = nil, project: String? = nil,
+       subchannel: String? = nil, title: String, detail: String? = nil, threadKey: String? = nil,
+       taskId: String? = nil, prRef: String? = nil, labels: [String] = [], at: String? = nil) {
+    self.id = id
+    self.kind = kind
+    self.actor = actor
+    self.project = project
+    self.subchannel = subchannel
+    self.title = title
+    self.detail = detail
+    self.threadKey = threadKey
+    self.taskId = taskId
+    self.prRef = prRef
+    self.labels = labels
+    self.at = at
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    kind = (try? c.decodeIfPresent(String.self, forKey: .kind)) ?? "action"
+    actor = try? c.decodeIfPresent(String.self, forKey: .actor)
+    project = try? c.decodeIfPresent(String.self, forKey: .project)
+    subchannel = try? c.decodeIfPresent(String.self, forKey: .subchannel)
+    title = (try? c.decodeIfPresent(String.self, forKey: .title)) ?? "Activity"
+    detail = try? c.decodeIfPresent(String.self, forKey: .detail)
+    threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+    taskId = try? c.decodeIfPresent(String.self, forKey: .taskId)
+    prRef = try? c.decodeIfPresent(String.self, forKey: .prRef)
+    labels = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .labels)) ?? []).compactMap { $0.value }
+    at = try? c.decodeIfPresent(String.self, forKey: .at)
+  }
+}
+
 /// The supervisor's health, without its questions. Equatable so the overlay
 /// can watch it for height changes (the "Last scan failed" row).
 struct FleetStatus: Equatable {
@@ -209,6 +491,16 @@ struct FleetStatus: Equatable {
   let running: Bool
   let lastTickAt: String?
   let lastError: String?
+  let nextTickAt: String?
+
+  init(mode: String, enabled: Bool, running: Bool, lastTickAt: String?, lastError: String?, nextTickAt: String? = nil) {
+    self.mode = mode
+    self.enabled = enabled
+    self.running = running
+    self.lastTickAt = lastTickAt
+    self.lastError = lastError
+    self.nextTickAt = nextTickAt
+  }
 }
 
 /// GET /fleet/api/state, trimmed to what the overlay shows.
@@ -217,16 +509,23 @@ struct FleetState: Decodable, Equatable {
   let enabled: Bool
   let running: Bool
   let lastTickAt: String?
+  let nextTickAt: String?
   let lastError: String?
   let questions: [FleetQuestion]
   /// snapshot.threads: the Watching list. Empty before the first scan.
   let threads: [FleetThread]
+  let activityEvents: [FleetActivityEvent]
+  /// The hub's decision cards (`cards`), trimmed to the brief the Needs You
+  /// detail shows. Empty from a hub before them.
+  var cards: [FleetCardBrief] = []
 
-  enum CodingKeys: String, CodingKey { case mode, enabled, running, lastTickAt, lastError, questions, snapshot }
+  enum CodingKeys: String, CodingKey {
+    case mode, enabled, running, lastTickAt, nextTickAt, lastError, questions, snapshot, activityEvents, cards
+  }
   private enum SnapshotKeys: String, CodingKey { case threads }
 
   var status: FleetStatus {
-    FleetStatus(mode: mode, enabled: enabled, running: running, lastTickAt: lastTickAt, lastError: lastError)
+    FleetStatus(mode: mode, enabled: enabled, running: running, lastTickAt: lastTickAt, lastError: lastError, nextTickAt: nextTickAt)
   }
 }
 
@@ -238,6 +537,7 @@ extension FleetState {
     enabled = (try? c.decodeIfPresent(Bool.self, forKey: .enabled)) ?? false
     running = (try? c.decodeIfPresent(Bool.self, forKey: .running)) ?? false
     lastTickAt = try? c.decodeIfPresent(String.self, forKey: .lastTickAt)
+    nextTickAt = try? c.decodeIfPresent(String.self, forKey: .nextTickAt)
     lastError = try? c.decodeIfPresent(String.self, forKey: .lastError)
     let raw = (try? c.decodeIfPresent([Lossy<FleetQuestion>].self, forKey: .questions)) ?? []
     questions = raw.compactMap { $0.value }
@@ -245,6 +545,74 @@ extension FleetState {
     let snapshot = try? c.nestedContainer(keyedBy: SnapshotKeys.self, forKey: .snapshot)
     let rawThreads = (try? snapshot?.decodeIfPresent([Lossy<FleetThread>].self, forKey: .threads)) ?? nil
     threads = (rawThreads ?? []).compactMap { $0.value }
+    activityEvents = ((try? c.decodeIfPresent([Lossy<FleetActivityEvent>].self, forKey: .activityEvents)) ?? []).compactMap { $0.value }
+    cards = ((try? c.decodeIfPresent([Lossy<FleetCardBrief>].self, forKey: .cards)) ?? []).compactMap { $0.value }
+  }
+}
+
+/// One hub decision card (src/fleet/cards.js buildSupervisorCard), only the
+/// parts the Needs You detail adds to its question: the goal / where it
+/// stands / decision brief, the recommendation, and the PR state.
+struct FleetCardBrief: Decodable, Equatable {
+  let id: String
+  let questionId: String?
+  let needsYou: Bool
+  let kind: String?
+  let context: String?
+  let currentState: String?
+  let whatChanged: String?
+  let decision: String?
+  let recommendation: String?
+  let prRef: String?
+  let prUrl: String?
+  let ciState: String?
+
+  /// The question this card is about.
+  var questionKey: String { questionId ?? id }
+
+  enum CodingKeys: String, CodingKey {
+    case id, questionId, needsYou, kind, brief, recommendation, prRef, prUrl, ciState
+  }
+  private enum BriefKeys: String, CodingKey { case context, currentState, whatChanged, decision }
+
+  init(id: String, questionId: String? = nil, needsYou: Bool = true, kind: String? = nil,
+       context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil,
+       recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil) {
+    self.id = id
+    self.questionId = questionId
+    self.needsYou = needsYou
+    self.kind = kind
+    self.context = context
+    self.currentState = currentState
+    self.whatChanged = whatChanged
+    self.decision = decision
+    self.recommendation = recommendation
+    self.prRef = prRef
+    self.prUrl = prUrl
+    self.ciState = ciState
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    questionId = try? c.decodeIfPresent(String.self, forKey: .questionId)
+    needsYou = (try? c.decodeIfPresent(Bool.self, forKey: .needsYou)) ?? true
+    kind = try? c.decodeIfPresent(String.self, forKey: .kind)
+    if let b = try? c.nestedContainer(keyedBy: BriefKeys.self, forKey: .brief) {
+      context = try? b.decodeIfPresent(String.self, forKey: .context)
+      currentState = try? b.decodeIfPresent(String.self, forKey: .currentState)
+      whatChanged = try? b.decodeIfPresent(String.self, forKey: .whatChanged)
+      decision = try? b.decodeIfPresent(String.self, forKey: .decision)
+    } else {
+      context = nil
+      currentState = nil
+      whatChanged = nil
+      decision = nil
+    }
+    recommendation = try? c.decodeIfPresent(String.self, forKey: .recommendation)
+    prRef = try? c.decodeIfPresent(String.self, forKey: .prRef)
+    prUrl = try? c.decodeIfPresent(String.self, forKey: .prUrl)
+    ciState = try? c.decodeIfPresent(String.self, forKey: .ciState)
   }
 }
 

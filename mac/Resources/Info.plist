@@ -27,7 +27,7 @@
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSUIElement</key>
-  <true/>
+  <false/>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -71,6 +71,13 @@
       <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
       <key>fe80::/10</key>
       <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <!-- Tailscale MagicDNS hostnames (e.g. main.tail1234.ts.net) for paired
+           hubs; NSAllowsLocalNetworking only covers unqualified/.local/IPs. -->
+      <key>ts.net</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
     </dict>
   </dict>
   <key>NSLocalNetworkUsageDescription</key>

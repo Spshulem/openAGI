@@ -11,6 +11,30 @@ nonisolated enum AppTab: Hashable, Sendable {
     case today, tasks, inbox, chat, supervisor
 }
 
+nonisolated enum iOSWorkspaceChannel: Hashable, Sendable {
+    case general
+    case needsYou
+    case tasks
+    case sessions
+    case activity
+    case project(String)
+    case subchannel(project: String, subchannel: String)
+
+    var title: String {
+        switch self {
+        case .general: return "#general"
+        case .needsYou: return "#needs-you"
+        case .tasks: return "#tasks"
+        case .sessions: return "#sessions"
+        case .activity: return "#activity"
+        case .project(let name): return "#\(name)"
+        case .subchannel(let project, let sub):
+            let clean = sub.hasPrefix("/") ? String(sub.dropFirst()) : sub
+            return "#\(project)/\(clean)"
+        }
+    }
+}
+
 // The one piece of shared state behind the tab bar: the paired credential,
 // the daemon client built from it, the locally-cached snapshot, and the
 // Inbox badge count. Every tab reads this rather than each building its own
@@ -45,6 +69,13 @@ final class AppModel {
     // Plain UI state, not persisted -- which tab RootTabView's `TabView` is
     // showing. Any view behind the tab bar can set this directly.
     var selectedTab: AppTab = .today
+    var requestedChatThread: ConversationThread? = nil
+    var requestedFocusCardID: String? = nil
+    var requestedOpenContextCardID: String? = nil
+    var requestedOpenThreadKey: String? = nil
+    var workspaceChannel: iOSWorkspaceChannel = .general
+    var latestFleetState: FleetState? = nil
+    var latestFleetHierarchy: FleetHierarchyResponse? = nil
 
     private(set) var pendingActionsCount = 0
     private(set) var clarificationsCount = 0
@@ -270,16 +301,32 @@ final class AppModel {
         workspace.tasksFetchedAt = [:]
         tasksGeneration += 1
     }
+
+    func claimTaskInPaseo(_ task: TaskRecord, workspace: String? = nil) async throws -> FleetTaskClaimResponse {
+        let res = try await client.fleetClaimTask(
+            taskId: task.id,
+            workspace: workspace ?? task.sourceMeta?.project,
+            project: task.sourceMeta?.project,
+            subchannel: task.sourceMeta?.subchannel
+        )
+        bumpTasksGeneration()
+        fleetGeneration += 1
+        return res
+    }
     func bumpInboxGeneration() {
         workspace.inboxFetchedAt = nil
         inboxGeneration += 1
         Task { await refreshInbox(force: true) }
     }
 
+    func bumpFleetGeneration() {
+        fleetGeneration += 1
+    }
+
     // MARK: - Live events
 
     func startEventStream() {
-        guard eventStream == nil else { return }
+        guard isActive, eventStream == nil else { return }
         let controller = EventStreamController(client: client)
         eventStream = controller
         Task { [weak self] in

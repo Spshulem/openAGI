@@ -37,13 +37,17 @@ final class SessionActivityTests: XCTestCase {
     @MainActor
     func testShortcutHandoffDoesNotLoseSessionOnColdLaunch() {
         let router = PushRouter()
-        router.openSupervisor(threadKey: "codex:exact")
+        router.openSupervisor(threadKey: SupervisorLink.threadKey(in: SupervisorLink.url(threadKey: "codex:exact")))
         XCTAssertTrue(router.wantsSupervisor)
-        XCTAssertEqual(router.threadKey, "codex:exact")
+        XCTAssertEqual(router.pendingThreadKey, "codex:exact", "the exact session waits for RootTabView to consume it")
+        XCTAssertTrue(router.dismissesSheets)
+        // RootTabView hands the key to Supervisor and Supervisor closes the sheet.
         router.wantsSupervisor = false
-        XCTAssertEqual(router.threadKey, "codex:exact", "tab routing must leave the session for Supervisor to consume")
+        router.pendingThreadKey = nil
+        router.dismissesSheets = false
         router.openSupervisor()
-        XCTAssertNil(router.threadKey)
-        XCTAssertEqual(router.supervisorRequest, 2, "overview requests must also dismiss an existing session")
+        XCTAssertTrue(router.wantsSupervisor)
+        XCTAssertNil(router.pendingThreadKey)
+        XCTAssertTrue(router.dismissesSheets, "overview requests must also dismiss an existing session")
     }
 }

@@ -1,8 +1,17 @@
+import { toolSignal } from "./message-turns.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
-import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
-import { intentCovers, isOwnerPrincipal, isSupervisorActionableDirective } from "./owner-authority.js";
+import { describeSchedule, parseScheduleDays, scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
+import {
+  intentCovers,
+  isConversationalAssentOrChoice,
+  isOwnerPrincipal,
+  isSupervisorActionableDirective,
+  spokenRequestNamesTarget
+} from "./owner-authority.js";
+import { evaluateOwnerIntentClarityWithDecisions } from "./fleet/decisions-gate.js";
 import { argsDigest } from "./pending-actions.js";
+import { applySessionReasoningEffort, describeSessionReasoningEffort, normalizeReasoningEffort } from "./session-reasoning-effort.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
 // caller's array (and the registry's own values) are never reordered underneath
@@ -52,6 +61,10 @@ export class ToolRegistry {
       approvalTtlMs: Number.isFinite(Number(tool.approvalTtlMs)) && Number(tool.approvalTtlMs) > 0
         ? Math.trunc(Number(tool.approvalTtlMs))
         : null,
+      // Checked again when an approval is used: null while the context it was
+      // asked in still holds, or why it no longer does. A tool with one keeps
+      // its card for as long as that context lasts, not a short fixed time.
+      approvalStillValid: typeof tool.approvalStillValid === "function" ? tool.approvalStillValid : null,
       // Short human-readable summary used in the approval UI when the args
       // alone don't describe the action well. Optional fn(args) -> string.
       summarize: typeof tool.summarize === "function" ? tool.summarize : null,
@@ -94,6 +107,32 @@ export class ToolRegistry {
 
   get(name) {
     return this.tools.get(name);
+  }
+
+  // Why a pending approval may no longer run (its chat is gone, the owner
+  // moved on), or null. An unreadable check counts as no longer valid.
+  async approvalStillValid(action) {
+    return (await this.approvalVerdict(action))?.reason ?? null;
+  }
+
+  // The same check with what to do next: { reason, reraise } or null. A
+  // tool's check returns a reason string (retire the card), or
+  // { reason, reraise: true } when the request itself still stands and only
+  // needs a fresh "yes" (its target is there; the owner said more since).
+  // A check that throws never re-raises: its target is gone or unreadable.
+  async approvalVerdict(action) {
+    const check = this.tools.get(action?.toolName)?.approvalStillValid;
+    if (!check) return null;
+    try {
+      const verdict = await check(action.args, action);
+      if (typeof verdict === "string" && verdict) return { reason: verdict, reraise: false };
+      if (verdict && typeof verdict === "object" && typeof verdict.reason === "string" && verdict.reason) {
+        return { reason: verdict.reason, reraise: verdict.reraise === true };
+      }
+      return null;
+    } catch (error) {
+      return { reason: error?.message || "The approval's target changed; ask again.", reraise: false };
+    }
   }
 
   list({ readOnly = false } = {}) {
@@ -269,8 +308,17 @@ export class ToolRegistry {
   }
 
   async runHandler(tool, args, context) {
+    // Checked again here, at the last moment: an owner check or approval
+    // step awaited since invoke() looked, and a stop may have landed then.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     try {
-      const result = await tool.handler(args, context);
+      // `signal` stays the turn's own signal, so a skill or subagent this
+      // tool runs stops its nested model calls and tools on an interrupt.
+      // `actionSignal` is for cancelling work already in progress (a
+      // computer action): an owner's interrupt never reaches it, so that
+      // action finishes; other aborts still do (message-turns.js toolSignal).
+      const handlerContext = context?.signal ? { ...context, actionSignal: toolSignal(context.signal) } : context;
+      const result = await tool.handler(args, handlerContext);
       // Tool results are data: they can only ever taint the turn, never
       // write any other part of the server-built context.
       taintTurn(tool, context);
@@ -288,16 +336,90 @@ export class ToolRegistry {
   // the spoken code instead only when the turn read untrusted text and the
   // owner's own words do not name this kind of action (an injected "click
   // Approve" must not ride on "what's the latest?"), or the tool insists.
-  // A voice turn always asks: the model heard the words, so it reads the
-  // action back and only the owner's own transcript ("yes 42") runs it.
+  // A voice turn asks too: the model heard the words, so it reads the action
+  // back and only the owner's own transcript ("yes 42") runs it. Except a
+  // message to a coding chat whose transcript names that chat and says the
+  // exact message: the words already are the approval.
   async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
     const owner = context.__owner;
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
-    const autoApproved = turn.supervisorAutoApprove === true
+    const prevAssistant = typeof turn.previousAssistantText === "string" ? turn.previousAssistantText : "";
+    const retryComputerSession = tool.name === "start_computer_use_session"
+      && /\b(?:computer[- ]?(?:use|control)|screenshot)\b/i.test(prevAssistant)
+      && /\b(?:dropped|failed|ended|timed out|could not|couldn['’]t)\b/i.test(prevAssistant)
+      && /^\s*(?:try again|retry|run it again|do it again)(?:\s*[.!])?\s*$/i.test(String(turn.intent ?? ""));
+    const isOwnerNonVoiceSupervisor = Boolean(
+      turn.supervisorAutoApprove === true
+      && owner.via !== "voice"
+    );
+    // Internal non-destructive Supervisor bookkeeping & notification-display
+    // preferences never need a spoken "yes <N>" gate on an authenticated
+    // non-voice owner turn. Security/autonomy-changing preference fields
+    // (defaultPermissionMode, mergePolicy, autoSlices, choice, etc.) and Hard
+    // Red Lines stay strictly subject to owner-intent / confirmation checks.
+    const SAFE_PREFERENCE_BOOKKEEPING_KEYS = new Set(["cadence", "checkinCooldownMinutes", "checkinFormat"]);
+    const SAFE_ACTIVE_WORK_BOOKKEEPING_OPS = new Set([
+      "scan_inventory",
+      "schedule_recheck",
+      "snooze",
+      "enroll_project",
+      "dismiss_proposal",
+      "assign_orphan"
+    ]);
+    const isSafePreferenceBookkeeping = tool.name === "fleet_preferences"
+      && args && typeof args === "object"
+      && Object.keys(args).length > 0
+      && Object.keys(args).every((k) => SAFE_PREFERENCE_BOOKKEEPING_KEYS.has(k));
+    const isSafeActiveWorkBookkeeping = tool.name === "fleet_act_active_work"
+      && SAFE_ACTIVE_WORK_BOOKKEEPING_OPS.has(String(args?.op ?? "").trim().toLowerCase());
+    const isNonDestructiveOwnerBookkeeping = isOwnerNonVoiceSupervisor && (
+      ["fleet_track_work", "fleet_organize_project", "fleet_sync_themes"].includes(tool.name)
+      || isSafePreferenceBookkeeping
+      || isSafeActiveWorkBookkeeping
+    );
+    const conversationalCover = ((
+      tool.supervisorAutoApprove === true
+      || intentCovers("approve", tool.name)
+      || tool.name === "fleet_send_message"
+      || tool.name === "reply_to_coding_agent"
+    ) && isConversationalAssentOrChoice(turn.intent ?? "", prevAssistant)) || retryComputerSession;
+    const autoApproved = isNonDestructiveOwnerBookkeeping || (
+      turn.supervisorAutoApprove === true
       && tool.supervisorAutoApprove === true
-      && isSupervisorActionableDirective(turn.intent ?? "");
-    const tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
-    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || owner.via === "voice";
+      && isSupervisorActionableDirective(turn.intent ?? "", { previousAssistantText: prevAssistant })
+    ) || conversationalCover;
+    let tainted = !autoApproved && turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
+    const spokenExactly = owner.via === "voice"
+      && ["fleet_send_message", "reply_to_coding_agent"].includes(tool.name)
+      && intentCovers(turn.intent ?? "", tool.name)
+      && spokenRequestNamesTarget(turn.intent ?? "", { names: [args?.name, args?.project], message: args?.message });
+    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context) || (owner.via === "voice" && !spokenExactly);
+    let approvedBy = `owner:${owner.via}`;
+    if (
+      tainted
+      && !insist
+      && String(process.env.OPENAGI_DECISIONS_OWNER_INTENT ?? "").trim().toLowerCase() !== "off"
+    ) {
+      const decisionsCfg = context?.runtime?.fleetSupervisor?.config?.decisions ?? {};
+      const decisionsKey = String(decisionsCfg.apiKey ?? process.env.OPENAI_API_KEY ?? "").trim();
+      const clarity = await evaluateOwnerIntentClarityWithDecisions({
+        ownerIntent: turn.intent ?? "",
+        previousAssistantText: prevAssistant,
+        toolName: tool.name,
+        actionSummary: summary,
+        apiKey: decisionsKey,
+        url: decisionsCfg.url,
+        model: decisionsCfg.model,
+        fetchImpl: context?.decisionsFetch ?? decisionsCfg.fetchImpl ?? globalThis.fetch
+      });
+      if (clarity.ok && clarity.clear) {
+        tainted = false;
+        approvedBy = `owner:${owner.via}:decisions`;
+      }
+    }
+    // A stop that landed while the decisions check was out: nothing is
+    // claimed, raised or retired for a turn that will not run the tool.
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({
@@ -319,7 +441,7 @@ export class ToolRegistry {
     }
     const claim = this.pendingActions.recordOwnerApproved({
       toolName: tool.name, args, context, summary, reason: context.__reason ?? null,
-      dedupeKey: chatKey, approvedBy: `owner:${owner.via}`
+      dedupeKey: chatKey, approvedBy
     });
     if (!claim) return { ok: false, error: "Could not record the owner's approval; nothing was run." };
     // The owner's instruction runs what an earlier code card in this chat
@@ -338,11 +460,11 @@ export class ToolRegistry {
       __turn: turn,
       __confirmed: true,
       __confirmationActionId: claim.action.id,
-      __approvedBy: `owner:${owner.via}`
+      __approvedBy: approvedBy
     });
     this.pendingActions.decide(claim.action.id, {
       decision: "approve",
-      decidedBy: `owner:${owner.via}`,
+      decidedBy: approvedBy,
       result: outcome.ok ? outcome.result : null,
       error: outcome.ok ? null : outcome.error,
       executionId: claim.executionId
@@ -366,7 +488,7 @@ function safeOwnerConfirm(fn, args, context) {
 }
 
 function spokenSummary(summary) {
-  const line = String(summary ?? "").split("\n")[0].trim();
+  const line = String(summary ?? "").split("\n")[0].trim().replace(/[:;.\s]+$/, "");
   return (line.length > 120 ? `${line.slice(0, 117)}...` : line) || "run it";
 }
 
@@ -390,6 +512,163 @@ function safeApprovalDedupeKey(fn, args, context) {
 }
 
 export function registerCoreTools(registry, runtime) {
+  registry.register({
+    name: "get_budget",
+    sideEffects: false,
+    trustedOutput: true,
+    description: "Inspect the current OpenAGI daily model spend budget, today's spend, remaining allowance, and any extra budget added for today.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    handler: async () => {
+      if (!runtime?.budget?.status) return { configured: false, error: "Budget guard is not configured on this runtime." };
+      return { configured: true, ...runtime.budget.status() };
+    }
+  });
+
+  // This chat's own reasoning effort ("set your reasoning effort to extra
+  // high"). Session-scoped: other chats, background work, env defaults and
+  // Paseo coding sessions are untouched. Reads are free; a change is owner-only.
+  registry.register({
+    name: "chat_reasoning_effort",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    trustedOutput: true,
+    description: "Read or change YOUR OWN reasoning effort for THIS chat session (how hard you think on the owner's next messages here). action=get reads the current setting and the provider's supported values; action=set with effort (none|minimal|low|medium|high|xhigh; 'extra high' = xhigh) changes it; action=clear returns to the configured default. Takes effect from the next message. Use this when the owner asks you (not a Paseo/coding session) to think harder or lighter; for a coding session use the Supervisor session settings instead.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "clear"] },
+        effort: { type: "string", maxLength: 24, description: "Required for set: none, minimal, low, medium, high, or xhigh (extra high)." }
+      },
+      required: ["action"],
+      additionalProperties: false
+    },
+    confirmationRequired: (args = {}) => args.action !== "get",
+    scrutinyConfirmationRequired: (args = {}) => args.action !== "get",
+    prepareApprovalArgs: (args = {}) => {
+      const action = ["get", "set", "clear"].includes(args.action) ? args.action : null;
+      if (!action) throw new Error("action must be get, set, or clear.");
+      if (action !== "set") return { action };
+      const effort = normalizeReasoningEffort(args.effort);
+      if (!effort) throw new Error(`"${String(args.effort ?? "").slice(0, 24)}" is not a reasoning effort (none, minimal, low, medium, high, xhigh).`);
+      return { action, effort };
+    },
+    summarize: (args = {}) => (args.action === "clear"
+      ? "Reset this chat's reasoning effort to the default"
+      : `Set this chat's reasoning effort to ${args.effort}`),
+    approvalDedupeKey: (args = {}, context = {}) => `chat-effort:${context?.sessionId ?? "none"}:${args.action}:${args.effort ?? ""}`,
+    handler: async (args = {}, context = {}) => {
+      const host = runtime?.agentHost;
+      if (!host?.store || !host?.modelProvider) throw new Error("Chat sessions are not available on this runtime.");
+      const sessionId = typeof context?.sessionId === "string" && context.sessionId ? context.sessionId : null;
+      if (!sessionId) throw new Error("No current chat session to read or change.");
+      const target = { store: host.store, provider: host.modelProvider, sessionId };
+      if (args.action === "get") return describeSessionReasoningEffort(target);
+      if (!isOwnerPrincipal(context?.__owner) && context?.__confirmed !== true) {
+        throw new Error("Only the owner can change this chat's reasoning effort.");
+      }
+      const effort = args.action === "clear" ? null : args.effort;
+      if (args.action === "set" && !effort) throw new Error("Provide effort for action=set.");
+      return applySessionReasoningEffort({ ...target, effort, setBy: context?.__owner?.via ? `owner:${context.__owner.via}` : "owner:approved" });
+    }
+  });
+
+  registry.register({
+    name: "update_budget",
+    needsConfirmation: true,
+    trustedOutput: true,
+    description: "Add extra spend headroom for today (addUsdToday), change the recurring daily USD budget limit (dailyUsdLimit), or reset today's extra top-up. Direct owner budget commands execute immediately; background or untrusted requests raise an inline budget approval card.",
+    parameters: {
+      type: "object",
+      properties: {
+        addUsdToday: {
+          type: "number",
+          minimum: 0.01,
+          maximum: 10000,
+          description: "Extra USD to add to today's budget only (e.g. 10 or 25) without changing future days' cap."
+        },
+        dailyUsdLimit: {
+          type: "number",
+          minimum: 0.5,
+          maximum: 10000,
+          description: "New recurring daily USD spend cap (persists OPENAGI_DAILY_USD_LIMIT)."
+        },
+        resetTodayBonus: {
+          type: "boolean",
+          description: "When true, clears any extra one-day top-up added earlier today."
+        },
+        reason: {
+          type: "string",
+          description: "Short note explaining why the budget change is requested."
+        }
+      },
+      additionalProperties: false
+    },
+    summarize: (args = {}) => {
+      const parts = [];
+      if (Number.isFinite(Number(args.addUsdToday)) && Number(args.addUsdToday) > 0) {
+        parts.push(`Add +$${Number(args.addUsdToday).toFixed(2)} to today's budget`);
+      }
+      if (Number.isFinite(Number(args.dailyUsdLimit)) && Number(args.dailyUsdLimit) >= 0.5) {
+        parts.push(`Set daily budget limit to $${Number(args.dailyUsdLimit).toFixed(2)}/day`);
+      }
+      if (args.resetTodayBonus === true) {
+        parts.push("Reset today's extra budget");
+      }
+      return parts.join(" and ") || "Update OpenAGI daily budget";
+    },
+    approvalDedupeKey: (args = {}, context = {}) => {
+      const add = Number.isFinite(Number(args.addUsdToday)) ? Number(args.addUsdToday).toFixed(2) : "0";
+      const lim = Number.isFinite(Number(args.dailyUsdLimit)) ? Number(args.dailyUsdLimit).toFixed(2) : "keep";
+      const rst = args.resetTodayBonus === true ? "1" : "0";
+      return `budget:${context?.sessionId ?? "global"}:${add}:${lim}:${rst}`;
+    },
+    handler: async (args = {}) => {
+      if (!runtime?.budget) throw new Error("Budget guard is not configured on this runtime.");
+      const hasLimit = args.dailyUsdLimit !== undefined && args.dailyUsdLimit !== null;
+      const hasBonus = args.addUsdToday !== undefined && args.addUsdToday !== null;
+      const hasReset = args.resetTodayBonus === true;
+      if (!hasLimit && !hasBonus && !hasReset) {
+        throw new Error("Provide addUsdToday, dailyUsdLimit, or resetTodayBonus.");
+      }
+      if (hasLimit) {
+        const parsed = Number(args.dailyUsdLimit);
+        if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 10000) {
+          throw new Error("Daily budget limit must be between $0.50 and $10,000.");
+        }
+      }
+      if (hasBonus) {
+        const parsedBonus = Number(args.addUsdToday);
+        if (!Number.isFinite(parsedBonus) || parsedBonus <= 0 || parsedBonus > 10000) {
+          throw new Error("Added budget for today must be between $0.01 and $10,000.");
+        }
+      }
+      if (hasLimit) {
+        runtime.budget.setDailyLimit(Number(args.dailyUsdLimit));
+        process.env.OPENAGI_DAILY_USD_LIMIT = String(runtime.budget.dailyUsdLimit);
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({
+            dataDir: runtime.dataDir ?? resolveDataDir(),
+            values: { OPENAGI_DAILY_USD_LIMIT: String(runtime.budget.dailyUsdLimit) }
+          });
+        } catch { /* in-memory budget limit already updated */ }
+      }
+      if (hasReset && typeof runtime.budget.clearBonusToday === "function") {
+        runtime.budget.clearBonusToday();
+      }
+      if (hasBonus) {
+        runtime.budget.addBonusToday(Number(args.addUsdToday));
+      }
+      const updated = runtime.budget.status();
+      runtime.events?.emit?.("budget-updated", updated);
+      return updated;
+    }
+  });
+
   registry.register({
     name: "remember",
     description: "Save a piece of information to long-lived memory so it can be recalled in future turns. Use when the user says 'remember', 'save', or shares a durable fact.",
@@ -507,14 +786,15 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "schedule_message",
-    description: "Schedule a future prompt. Choose exactly one timing field: delaySeconds for a one-time reminder, intervalSeconds for explicit recurrence (minimum 5 minutes), or dailyAt. Do not turn a one-time reminder into a recurring check-in. Identical schedules are reused. Scheduled reminders cannot create more schedules.",
+    description: "Schedule a future prompt. Choose exactly one timing field: delaySeconds for a one-time reminder, intervalSeconds for explicit recurrence (minimum 5 minutes), or dailyAt (add days for weekdays or specific days). Each run is a full agent turn with tools and skills, so the prompt can be a routine like 'search my inbox for invoices, run my triage skill, and summarize'. Do not turn a one-time reminder into a recurring check-in. Identical schedules are reused. Scheduled reminders cannot create more schedules. Tell the user the returned schedule and next run time.",
     parameters: {
       type: "object",
       properties: {
         prompt: { type: "string", description: "The prompt the agent should run when this fires." },
         delaySeconds: { type: "integer", minimum: 30, description: "One-shot: fire this many seconds from now." },
         intervalSeconds: { type: "integer", minimum: 300, description: "Recurring: fire every N seconds, only when the user requested recurrence." },
-        dailyAt: { type: "string", description: "Recurring HH:MM (24h) daily fire time, e.g. '09:00'." },
+        dailyAt: { type: "string", description: "Recurring HH:MM (24h) fire time in the daemon's local time zone, e.g. '09:00'." },
+        days: { type: "string", description: "With dailyAt only: weekdays, weekends, daily, or comma-separated day names like mon,wed,fri. Omit for every day." },
         channel: { type: "string", description: "Channel to deliver to: local, telegram. Defaults to the originating channel." },
         target: { type: "string", description: "Channel target (phone number, chat id, etc). Defaults to the originating sender." },
         name: { type: "string", description: "Optional human-readable name." }
@@ -526,8 +806,14 @@ export function registerCoreTools(registry, runtime) {
       if (!runtime.cron) throw new Error("Cron scheduler is not available.");
       const spec = scheduledPromptSpec(args, context);
       const existing = runtime.cron.listJobs().find(job => sameScheduledPrompt(job, spec));
-      if (existing) return { id: existing.id, name: existing.name, nextRunAt: existing.nextRunAt, task: existing.task,
-        reused: true, enabled: existing.enabled, note: existing.enabled ? 'This reminder already exists.' : 'This reminder is paused; it was not re-enabled.' };
+      if (existing && !existing.enabled && isScheduleOwner(context)) {
+        // The owner asking for the same schedule again is the clearest
+        // instruction to turn it back on.
+        const resumed = runtime.cron.enableJob(existing.id, true);
+        return scheduleSummary(resumed, { reused: true, note: "This schedule was paused; it is running again." });
+      }
+      if (existing) return scheduleSummary(existing, { reused: true,
+        note: existing.enabled ? "This schedule already exists." : "This schedule is paused; only the owner can resume it." });
       const job = {
         id: args.id ?? createId("job"),
         name: args.name ?? `prompt-${nowIso()}`,
@@ -537,7 +823,7 @@ export function registerCoreTools(registry, runtime) {
         ...spec
       };
       const created = runtime.cron.addJob(job);
-      return { id: created.id, name: created.name, nextRunAt: created.nextRunAt, task: created.task };
+      return scheduleSummary(created);
     }
   });
 
@@ -666,33 +952,91 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_skills",
     sideEffects: false,
-    description: "List the skills (named prompts) available to this agent.",
+    description: "List the skills (named prompts) available to this agent, including whether each is editable under ~/.openagi/skills/.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
-      const skills = runtime.skills?.list?.() ?? [];
-      return { count: skills.length, items: skills.map((s) => ({ name: s.name, description: s.description })) };
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { listSkills } = await import("./skill-files.js");
+      const items = runtime.skills?.skills ? listSkills(runtime.skills, dataDir) : (runtime.skills?.list?.() ?? []);
+      return { count: items.length, items };
+    }
+  });
+
+  registry.register({
+    name: "read_skill",
+    sideEffects: false,
+    description: "Read the full SKILL.md instructions and description of a named skill before running or editing it.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill slug (see list_skills)." }
+      },
+      required: ["name"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { readSkill } = await import("./skill-files.js");
+      const skill = readSkill(runtime.skills, dataDir, String(args.name ?? "").trim());
+      if (!skill) throw new Error(`Unknown skill: ${args.name}`);
+      return skill;
     }
   });
 
   registry.register({
     name: "create_skill",
-    description: "Save a reusable, agent-authored workflow as a SKILL.md in the user's OpenAGI skills directory and reload it immediately. Use when the user explicitly asks to create, program, or save a reusable capability. The instructions may compose any existing core/MCP tools and may use {{input}} plus {{args.field}} templates. Never include credentials or literal secret values. THIS REQUIRES USER APPROVAL so the user can inspect the complete instructions before they become durable.",
+    description: "Save or update a reusable, agent-authored workflow as an editable SKILL.md in the user's OpenAGI skills directory (~/.openagi/skills/<slug>/SKILL.md) and reload it immediately. Pass overwrite=true to update an existing user skill in place rather than creating a -2 copy. Never include credentials or literal secret values.",
     needsConfirmation: true,
+    supervisorAutoApprove: true,
     sideEffects: true,
-    summarize: (args) => `Create reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    summarize: (args) => `${args.overwrite ? "Save/update" : "Create"} reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
     parameters: {
       type: "object",
       properties: {
         name: { type: "string", description: "Short skill name. It is normalized to a lowercase filesystem-safe slug." },
         description: { type: "string", description: "One-sentence description shown in the skills list." },
-        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." }
+        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." },
+        overwrite: { type: "boolean", description: "When true, updates ~/.openagi/skills/<slug>/SKILL.md in place if it already exists." }
       },
       required: ["name", "description", "instructions"],
       additionalProperties: false
     },
     handler: async (args) => {
       if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
-      const { createSkillFromPrompt } = await import("./skill-materialize.js");
+      const { slugify } = await import("./skill-materialize.js");
+      const { readSkill, writeSkill } = await import("./skill-files.js");
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const slug = slugify(args.name);
+      if (args.overwrite === true) {
+        const existing = readSkill(runtime.skills, dataDir, slug);
+        if (existing && !existing.editable) {
+          throw new Error(`Built-in skill '${slug}' is read-only; write an override under a distinct slug or copy.`);
+        }
+        const savedPath = writeSkill(dataDir, slug, {
+          description: args.description,
+          instructions: args.instructions
+        });
+        runtime.skills.reload();
+        return {
+          name: slug,
+          path: savedPath,
+          updated: Boolean(existing),
+          note: "Skill saved in ~/.openagi/skills and reloaded immediately."
+        };
+      }
+      const { createSkillFromPrompt, pickUserSkillsDir } = await import("./skill-materialize.js");
+      if (!pickUserSkillsDir(runtime)) {
+        const savedPath = writeSkill(dataDir, slug, {
+          description: args.description,
+          instructions: args.instructions
+        });
+        runtime.skills.reload();
+        return {
+          name: slug,
+          path: savedPath,
+          note: "Skill created and loaded. It can now be run with run_skill, edited with update_skill, or scheduled with schedule_message."
+        };
+      }
       const result = createSkillFromPrompt({
         runtime,
         name: args.name,
@@ -703,7 +1047,45 @@ export function registerCoreTools(registry, runtime) {
       return {
         name: result.slug,
         path: result.path,
-        note: "Skill created and loaded. It can now be run with run_skill or scheduled with schedule_message."
+        note: "Skill created and loaded. It can now be run with run_skill, edited with update_skill, or scheduled with schedule_message."
+      };
+    }
+  });
+
+  registry.register({
+    name: "update_skill",
+    description: "Create or modify an editable SKILL.md in ~/.openagi/skills/<name>/SKILL.md and reload it immediately. Use when the owner asks to adjust how a project skill (like aiseo-daily-manager or customer-report-verifier) behaves.",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    sideEffects: true,
+    summarize: (args) => `Update skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Skill slug (lowercase letters, digits, dashes)." },
+        description: { type: "string", description: "Updated one-sentence description (omit to keep existing description)." },
+        instructions: { type: "string", description: "Complete updated SKILL.md markdown body (without frontmatter)." }
+      },
+      required: ["name", "instructions"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
+      const dataDir = runtime.dataDir ?? resolveDataDir();
+      const { slugify } = await import("./skill-materialize.js");
+      const { readSkill, writeSkill } = await import("./skill-files.js");
+      const slug = slugify(args.name);
+      const existing = readSkill(runtime.skills, dataDir, slug);
+      const savedPath = writeSkill(dataDir, slug, {
+        description: args.description ?? existing?.description ?? slug,
+        instructions: args.instructions
+      });
+      runtime.skills.reload();
+      return {
+        name: slug,
+        path: savedPath,
+        updated: Boolean(existing),
+        note: `Skill '${slug}' updated at ${savedPath} and reloaded.`
       };
     }
   });
@@ -756,11 +1138,54 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_mcp_tools",
     sideEffects: false,
-    description: "List tools exposed by connected MCP servers — INCLUDING ones not advertised directly as functions (large servers are capped to keep the tool list within provider limits). Use this to discover a tool, then call it with run_mcp_tool.",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-    handler: async () => {
-      const tools = runtime.mcp?.listTools?.() ?? [];
-      return { count: tools.length, items: tools };
+    description: "List tools exposed by connected MCP servers — INCLUDING ones not advertised directly as functions (large servers are capped to keep the tool list within provider limits). Returns compact summaries by default so output stays within size limits; pass { server, tool } to inspect a specific tool's full schema and instructions, or { query, server } to search.",
+    parameters: {
+      type: "object",
+      properties: {
+        server: { type: "string", description: "Optional MCP server name filter (case-insensitive)." },
+        tool: { type: "string", description: "Optional exact tool name; when provided, returns full description and inputSchema." },
+        query: { type: "string", description: "Optional substring filter matching server, tool name, or description." }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const all = runtime.mcp?.listTools?.() ?? [];
+      const serverFilter = typeof args?.server === "string" ? args.server.trim().toLowerCase() : "";
+      const toolFilter = typeof args?.tool === "string" ? args.tool.trim().toLowerCase() : "";
+      const queryFilter = typeof args?.query === "string" ? args.query.trim().toLowerCase() : "";
+      const matched = all.filter((item) => {
+        if (serverFilter && String(item?.server ?? "").toLowerCase() !== serverFilter) return false;
+        if (toolFilter && String(item?.name ?? "").toLowerCase() !== toolFilter) return false;
+        if (queryFilter) {
+          const hay = `${item?.server ?? ""} ${item?.name ?? ""} ${item?.description ?? ""}`.toLowerCase();
+          if (!hay.includes(queryFilter)) return false;
+        }
+        return true;
+      });
+      if (toolFilter) {
+        return { count: matched.length, totalCount: all.length, items: matched };
+      }
+      const items = matched.slice(0, 80).map((item) => {
+        const desc = String(item?.description ?? "").replace(/\s+/g, " ").trim();
+        const props = item?.inputSchema?.properties && typeof item.inputSchema.properties === "object"
+          ? Object.keys(item.inputSchema.properties).slice(0, 20)
+          : [];
+        const req = Array.isArray(item?.inputSchema?.required) ? item.inputSchema.required.slice(0, 20) : [];
+        return {
+          server: item?.server ?? null,
+          name: item?.name ?? null,
+          description: desc.length > 180 ? `${desc.slice(0, 179)}…` : desc,
+          ...(req.length ? { required: req } : {}),
+          ...(props.length ? { params: props } : {})
+        };
+      });
+      return {
+        count: matched.length,
+        totalCount: all.length,
+        compact: true,
+        hint: "Compact summary view. Pass { server, tool } to inspect a tool's full schema and instructions, or invoke with run_mcp_tool.",
+        items
+      };
     }
   });
 
@@ -870,21 +1295,77 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_cron_jobs",
     sideEffects: false,
-    description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks).",
+    description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks). Owner only.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
-    handler: async () => runtime.cron.listJobs()
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      return runtime.cron.listJobs().map(job => ({ ...job, schedule: describeSchedule(job) }));
+    }
   });
 
   registry.register({
     name: "cancel_cron_job",
-    description: "Remove a scheduled cron job by id. Use list_cron_jobs first to find the id.",
+    description: "Remove a scheduled cron job by id. Use list_cron_jobs first to find the id. Owner only; use update_cron_job to pause instead.",
     parameters: {
       type: "object",
       properties: { id: { type: "string" } },
       required: ["id"],
       additionalProperties: false
     },
-    handler: async (args) => ({ id: args.id, removed: runtime.cron.removeJob(args.id) })
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      return { id: args.id, removed: runtime.cron.removeJob(args.id) };
+    }
+  });
+
+  registry.register({
+    name: "update_cron_job",
+    description: "Pause, resume, or change a scheduled prompt by id: its prompt, dailyAt time, days, or interval. Use list_cron_jobs first to find the id. Owner only.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        enabled: { type: "boolean", description: "false pauses the schedule, true resumes it." },
+        prompt: { type: "string", description: "New prompt text for a scheduled prompt." },
+        dailyAt: { type: "string", description: "New HH:MM (24h) fire time." },
+        days: { type: "string", description: "weekdays, weekends, daily, or day names like mon,wed. Requires a dailyAt schedule." },
+        intervalSeconds: { type: "integer", minimum: 300, description: "New recurring interval for an interval schedule." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      requireScheduleOwner(context);
+      if (!runtime.cron) throw new Error("Cron scheduler is not available.");
+      const job = runtime.cron.listJobs().find(row => row.id === args.id);
+      if (!job) throw new Error(`Unknown cron job: ${args.id}`);
+      const patch = {};
+      if (args.prompt !== undefined) {
+        if (job.task !== "prompt") throw new Error("Only scheduled prompts have editable prompt text.");
+        const prompt = String(args.prompt).trim();
+        if (!prompt || prompt.length > 4000) throw new Error("Provide a prompt of 1-4000 characters.");
+        patch.input = { ...job.input, prompt };
+      }
+      if (args.dailyAt !== undefined) {
+        if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(args.dailyAt)) throw new Error("dailyAt must be HH:MM in 24-hour time.");
+        if (job.intervalMs) throw new Error("This is an interval schedule; change intervalSeconds instead.");
+        patch.dailyAt = args.dailyAt;
+      }
+      if (args.days !== undefined) {
+        if (!(patch.dailyAt ?? job.dailyAt)) throw new Error("days only applies to a dailyAt schedule.");
+        patch.days = parseScheduleDays(args.days);
+      }
+      if (args.intervalSeconds !== undefined) {
+        if (!job.intervalMs || job.input?.oneShot) throw new Error("Only recurring interval schedules have an interval.");
+        if (!Number.isSafeInteger(args.intervalSeconds) || args.intervalSeconds < 300 || args.intervalSeconds > 365 * 86400) {
+          throw new Error("Use a recurring interval of at least 5 minutes, up to one year.");
+        }
+        patch.intervalMs = args.intervalSeconds * 1000;
+      }
+      let updated = Object.keys(patch).length ? runtime.cron.updateJob(args.id, patch) : job;
+      if (args.enabled !== undefined) updated = runtime.cron.enableJob(args.id, args.enabled);
+      return scheduleSummary(updated);
+    }
   });
 
   registry.register({
@@ -906,30 +1387,296 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "set_provider",
-    description: "Switch the primary model provider live. 'auto' picks whichever has a key (Anthropic preferred), 'anthropic' forces Claude, 'openai' forces ChatGPT/GPT-5. Use this if the user wants to switch models mid-conversation or you detect repeated failures with the current one.",
+    trustedOutput: true,
+    description: "Inspect or change YOUR OWN active model provider, model ID, and/or reasoning effort live (persisted to .env and applied immediately for the next turn). Supports `preference` ('auto', 'anthropic', 'openai', 'chatgpt', 'codex-cli', 'claude-cli'), `model` (e.g. 'gpt-6.2-sol', 'claude-opus-5-5'), and `reasoningEffort` ('none'|'minimal'|'low'|'medium'|'high'|'xhigh'|'default'). Call with no arguments to inspect active provider/model/effort and which providers are configured. Refuses cleanly if asked to switch to an unconfigured provider.",
     parameters: {
       type: "object",
       properties: {
-        preference: { type: "string", enum: ["auto", "anthropic", "openai"] }
+        preference: { type: "string", enum: ["auto", "anthropic", "openai", "chatgpt", "codex-cli", "claude-cli"] },
+        model: { type: "string", maxLength: 120, description: "Optional model ID to set for the active/selected provider (e.g. 'gpt-6.2-sol', 'claude-opus-5-5')." },
+        reasoningEffort: { type: "string", maxLength: 24, description: "Optional reasoning effort ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'extra high', or 'default' to clear)." }
       },
-      required: ["preference"],
       additionalProperties: false
     },
-    handler: async (args) => {
-      process.env.OPENAGI_PROVIDER = args.preference;
-      const { createModelProvider } = await import("./model-provider.js");
-      if (runtime.agentHost) {
-        runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+    handler: async (args = {}, context = {}) => {
+      const { claudeCliStatus, codexCliStatus } = await import("./cli-subscription-providers.js");
+      const { status: chatgptStatus } = await import("./chatgpt-auth.js");
+      const resolvedDataDir = runtime?.dataDir ?? resolveDataDir();
+      const safeChatgptSignedIn = () => {
+        try { return Boolean(chatgptStatus?.({ dataDir: resolvedDataDir })?.signedIn); } catch { return false; }
+      };
+      const safeCliAvailable = (fn) => {
+        try { return Boolean(fn?.()?.available); } catch { return false; }
+      };
+      const configuredProviders = {
+        openai: Boolean(process.env.OPENAI_API_KEY),
+        anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+        chatgpt: safeChatgptSignedIn(),
+        codexCli: safeCliAvailable(codexCliStatus),
+        claudeCli: safeCliAvailable(claudeCliStatus)
+      };
+
+      const envUpdates = {};
+      const envClears = [];
+      const requestedPref = typeof args.preference === "string" && args.preference.trim()
+        ? args.preference.trim().toLowerCase()
+        : null;
+      const requestedModel = typeof args.model === "string" && args.model.trim()
+        ? args.model.trim().slice(0, 120)
+        : null;
+      const rawEffort = typeof args.reasoningEffort === "string" && args.reasoningEffort.trim()
+        ? args.reasoningEffort.trim().toLowerCase()
+        : null;
+
+      // Read-only inspection when called with no mutation fields.
+      if (!requestedPref && !requestedModel && !rawEffort) {
+        const provider = runtime.agentHost?.modelProvider;
+        const effortInfo = context.sessionId && runtime.agentHost?.store
+          ? describeSessionReasoningEffort({ store: runtime.agentHost.store, provider, sessionId: context.sessionId })
+          : null;
+        return {
+          preference: process.env.OPENAGI_PROVIDER ?? "auto",
+          current: provider?.constructor?.name ?? null,
+          model: provider?.resolveModel?.({ task: "chat" }) ?? provider?.model ?? null,
+          reasoningEffort: effortInfo?.effective ?? process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? process.env.OPENAI_REASONING_EFFORT ?? null,
+          supportedEfforts: effortInfo?.options ?? [],
+          configuredProviders
+        };
       }
-      // Persist
-      try {
-        const { saveEnv } = await import("./setup-wizard.js");
-        saveEnv({ values: { OPENAGI_PROVIDER: args.preference } });
-      } catch { /* ignore */ }
+
+      if (requestedPref === "anthropic" && !configuredProviders.anthropic) {
+        return {
+          ok: false,
+          error: "Anthropic API is not configured on this host (ANTHROPIC_API_KEY is unset).",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "openai" && !configuredProviders.openai) {
+        return {
+          ok: false,
+          error: "OpenAI API is not configured on this host (OPENAI_API_KEY is unset).",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "chatgpt" && !configuredProviders.chatgpt) {
+        return {
+          ok: false,
+          error: "ChatGPT plan is not signed in on this host.",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "claude-cli" && !configuredProviders.claudeCli) {
+        return {
+          ok: false,
+          error: "Claude CLI is not available on this host.",
+          configuredProviders
+        };
+      }
+      if (requestedPref === "codex-cli" && !configuredProviders.codexCli) {
+        return {
+          ok: false,
+          error: "Codex CLI is not available on this host.",
+          configuredProviders
+        };
+      }
+
+      let inferredPref = requestedPref;
+      if (!inferredPref && requestedModel) {
+        if (/^claude/i.test(requestedModel)) {
+          if (!configuredProviders.anthropic && !configuredProviders.claudeCli) {
+            return {
+              ok: false,
+              error: `Cannot switch to Claude model "${requestedModel}": neither Anthropic API nor Claude CLI is configured on this host.`,
+              configuredProviders
+            };
+          }
+          inferredPref = configuredProviders.anthropic ? "anthropic" : "claude-cli";
+        } else if (/^(?:gpt-|o[1-9](?:\b|-)|chatgpt|codex)/i.test(requestedModel)) {
+          const curClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
+          const alreadyOpenAIFamily = ["OpenAIResponsesProvider", "ChatGPTPlanProvider", "CodexCliProvider"].includes(curClass);
+          if (!configuredProviders.openai && !configuredProviders.chatgpt && !configuredProviders.codexCli && !alreadyOpenAIFamily) {
+            return {
+              ok: false,
+              error: `Cannot switch to OpenAI model "${requestedModel}": neither OpenAI API, ChatGPT plan, nor Codex CLI is configured on this host.`,
+              configuredProviders
+            };
+          }
+          const curPref = String(process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
+          if (!["openai", "chatgpt", "codex-cli"].includes(curPref) && (!alreadyOpenAIFamily || configuredProviders.anthropic)) {
+            if (curClass === "ChatGPTPlanProvider" && configuredProviders.chatgpt) inferredPref = "chatgpt";
+            else if (curClass === "CodexCliProvider" && configuredProviders.codexCli) inferredPref = "codex-cli";
+            else if (configuredProviders.openai) inferredPref = "openai";
+            else if (configuredProviders.chatgpt) inferredPref = "chatgpt";
+            else if (configuredProviders.codexCli) inferredPref = "codex-cli";
+          }
+        }
+      }
+
+      let normalizedEffort = null;
+      let clearedEffort = false;
+      if (rawEffort) {
+        if (["default", "clear", "reset", "auto"].includes(rawEffort)) {
+          clearedEffort = true;
+        } else {
+          normalizedEffort = normalizeReasoningEffort(rawEffort);
+          if (!normalizedEffort) {
+            return {
+              ok: false,
+              error: `Invalid reasoningEffort "${rawEffort}". Use one of: none, minimal, low, medium, high, xhigh (extra high), or default.`
+            };
+          }
+        }
+      }
+
+      const modelEnvKey = requestedModel
+        ? (() => {
+            const isClaude = /^claude/i.test(requestedModel) || inferredPref === "anthropic" || inferredPref === "claude-cli";
+            const effectivePref = String(inferredPref || process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
+            const currentClass = String(runtime.agentHost?.modelProvider?.constructor?.name ?? "");
+            if (effectivePref === "anthropic") return "ANTHROPIC_MODEL";
+            if (effectivePref === "claude-cli") return "CLAUDE_CLI_MODEL";
+            if (effectivePref === "openai") return "OPENAI_MODEL";
+            if (effectivePref === "chatgpt") return "CHATGPT_MODEL";
+            if (effectivePref === "codex-cli") return "CODEX_CLI_MODEL";
+            if (isClaude) {
+              if (currentClass === "ClaudeCliProvider") return "CLAUDE_CLI_MODEL";
+              return configuredProviders.anthropic ? "ANTHROPIC_MODEL" : "CLAUDE_CLI_MODEL";
+            }
+            if (currentClass === "ChatGPTPlanProvider") return "CHATGPT_MODEL";
+            if (currentClass === "CodexCliProvider") return "CODEX_CLI_MODEL";
+            if (currentClass === "OpenAIResponsesProvider") return "OPENAI_MODEL";
+            if (configuredProviders.openai) return "OPENAI_MODEL";
+            if (configuredProviders.chatgpt) return "CHATGPT_MODEL";
+            if (configuredProviders.codexCli) return "CODEX_CLI_MODEL";
+            return "OPENAI_MODEL";
+          })()
+        : null;
+
+      // If a task-level chat model pin exists for the chosen provider, update
+      // it too so `ModelRouter.resolve("chat")` actually switches to the
+      // requested model instead of staying stuck on the older pin.
+      const taskChatPinKey = modelEnvKey === "OPENAI_MODEL" || modelEnvKey === "CHATGPT_MODEL"
+        ? (process.env.OPENAI_MODEL_TASK_CHAT ? "OPENAI_MODEL_TASK_CHAT" : null)
+        : (modelEnvKey === "ANTHROPIC_MODEL" && process.env.ANTHROPIC_MODEL_TASK_CHAT ? "ANTHROPIC_MODEL_TASK_CHAT" : null);
+
+      // Snapshot affected env keys so validation failures roll back cleanly
+      // without leaking unsupported settings into process.env or .env.
+      const prevEnvSnapshot = {
+        OPENAGI_PROVIDER: process.env.OPENAGI_PROVIDER,
+        OPENAI_REASONING_EFFORT_TASK_CHAT: process.env.OPENAI_REASONING_EFFORT_TASK_CHAT,
+        ...(modelEnvKey ? { [modelEnvKey]: process.env[modelEnvKey] } : {}),
+        ...(taskChatPinKey ? { [taskChatPinKey]: process.env[taskChatPinKey] } : {})
+      };
+      const restoreEnvSnapshot = () => {
+        for (const [k, v] of Object.entries(prevEnvSnapshot)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      };
+
+      if (inferredPref) {
+        process.env.OPENAGI_PROVIDER = inferredPref;
+        envUpdates.OPENAGI_PROVIDER = inferredPref;
+      }
+      if (requestedModel && modelEnvKey) {
+        process.env[modelEnvKey] = requestedModel;
+        envUpdates[modelEnvKey] = requestedModel;
+        if (taskChatPinKey) {
+          process.env[taskChatPinKey] = requestedModel;
+          envUpdates[taskChatPinKey] = requestedModel;
+        }
+      }
+
+      const { createModelProvider } = await import("./model-provider.js");
+      const candidateProvider = createModelProvider({ budgetGuard: runtime.budget });
+      const candidateModel = candidateProvider?.resolveModel?.({ task: "chat" }) ?? candidateProvider?.model ?? null;
+
+      // Validate reasoningEffort against the selected provider & model BEFORE
+      // persisting to process.env / .env so unsupported efforts (e.g. xhigh on
+      // gpt-5) never break subsequent chat turns. On model-only changes, also
+      // revalidate and clear any previously saved incompatible task effort.
+      let clearedIncompatibleEffort = null;
+      const support = typeof candidateProvider?.reasoningEffortSupport === "function"
+        ? candidateProvider.reasoningEffortSupport({ task: "chat" })
+        : { supported: false, options: [], reason: "Active provider does not support reasoning effort." };
+      const allowedEfforts = Array.isArray(support?.options) ? support.options : [];
+      if (normalizedEffort) {
+        if (!support?.supported || !allowedEfforts.includes(normalizedEffort)) {
+          restoreEnvSnapshot();
+          return {
+            ok: false,
+            error: allowedEfforts.length > 0
+              ? `Reasoning effort "${normalizedEffort}" is not supported by ${candidateModel || candidateProvider?.constructor?.name || "the active model"}. Supported efforts: ${allowedEfforts.join(", ")}.`
+              : (support?.reason || `The active model (${candidateModel || candidateProvider?.constructor?.name || "unknown"}) does not support a reasoning effort setting.`),
+            model: candidateModel,
+            supportedEfforts: allowedEfforts,
+            configuredProviders
+          };
+        }
+        process.env.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+        envUpdates.OPENAI_REASONING_EFFORT_TASK_CHAT = normalizedEffort;
+      } else if (clearedEffort) {
+        delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+        envClears.push("OPENAI_REASONING_EFFORT_TASK_CHAT");
+      } else {
+        const existingTaskEffort = String(process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? "").trim().toLowerCase();
+        if (existingTaskEffort && (!support?.supported || !allowedEfforts.includes(existingTaskEffort))) {
+          clearedIncompatibleEffort = existingTaskEffort;
+          clearedEffort = true;
+          delete process.env.OPENAI_REASONING_EFFORT_TASK_CHAT;
+          envClears.push("OPENAI_REASONING_EFFORT_TASK_CHAT");
+        }
+      }
+
+      // Rebuild provider with the validated effort env var in place.
+      const finalProvider = (normalizedEffort || clearedEffort)
+        ? createModelProvider({ budgetGuard: runtime.budget })
+        : candidateProvider;
+      // Persist to .env BEFORE finalizing success so restart persistence is
+      // verified rather than silently dropped.
+      if (Object.keys(envUpdates).length > 0 || envClears.length > 0) {
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({ dataDir: runtime?.dataDir, values: envUpdates, clear: envClears });
+        } catch (err) {
+          restoreEnvSnapshot();
+          return {
+            ok: false,
+            error: `Failed to persist provider/model settings to .env: ${err?.message || "disk write error"}`,
+            configuredProviders
+          };
+        }
+      }
+      if (runtime.agentHost) {
+        runtime.agentHost.modelProvider = finalProvider;
+      }
+      // Also mirror reasoningEffort onto the current chat session override so
+      // per-session overrides never shadow a newly requested effort.
+      if (context.sessionId && runtime.agentHost?.store && (normalizedEffort || clearedEffort)) {
+        try {
+          applySessionReasoningEffort({
+            store: runtime.agentHost.store,
+            provider: runtime.agentHost.modelProvider,
+            sessionId: context.sessionId,
+            effort: clearedEffort ? null : normalizedEffort,
+            setBy: "owner:set_provider"
+          });
+        } catch { /* unsupported provider effort is already checked above */ }
+      }
+      const activeProvider = runtime.agentHost?.modelProvider;
+      const effortReadback = context.sessionId && runtime.agentHost?.store
+        ? describeSessionReasoningEffort({ store: runtime.agentHost.store, provider: activeProvider, sessionId: context.sessionId })
+        : null;
       return {
-        preference: args.preference,
-        current: runtime.agentHost?.modelProvider?.constructor?.name,
-        model: runtime.agentHost?.modelProvider?.model
+        ok: true,
+        preference: process.env.OPENAGI_PROVIDER ?? "auto",
+        current: activeProvider?.constructor?.name ?? null,
+        model: activeProvider?.resolveModel?.({ task: "chat" }) ?? activeProvider?.model ?? null,
+        reasoningEffort: effortReadback?.effective ?? process.env.OPENAI_REASONING_EFFORT_TASK_CHAT ?? process.env.OPENAI_REASONING_EFFORT ?? null,
+        ...(clearedIncompatibleEffort ? { clearedIncompatibleEffort } : {}),
+        supportedEfforts: effortReadback?.options ?? [],
+        configuredProviders,
+        takesEffect: "next_turn"
       };
     }
   });
@@ -1081,6 +1828,199 @@ export function registerCoreTools(registry, runtime) {
       additionalProperties: false
     },
     handler: async (args) => runtime.tasks.linkTaskToGoal(args.taskId, args.goalId)
+  });
+
+  registry.register({
+    name: "upsert_goal",
+    needsConfirmation: true,
+    supervisorAutoApprove: true,
+    description: "Create or update a persistent project/multi-batch Goal with explicit Definition of Done (`doneCriteria`), check-in `cadence` (`hourly`, `twice_daily`, `daily`, `weekly`, `quiet`), batch `cursor` (`processed`, `remaining`, `total`, `lastCursorToken`), and optional `linkedSkill`. Enrolls both Fleet Active Work (when Fleet Supervisor is present) and an agent continuation task when `remaining > 0`.",
+    summarize: (args) => `Track goal in ${args.project || "General"}: ${String(args.goal ?? args.title ?? "").slice(0, 120)}`,
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project or domain name (e.g. 'Sales', 'BB Recorder', 'AI SEO', 'Inbox')." },
+        theme: { type: "string", description: "Optional sub-theme or workstream." },
+        customer: { type: "string", description: "Optional customer name (e.g. 'AppFolio', 'Brex', 'StayVista')." },
+        goal: { type: "string", description: "Clear outcome statement." },
+        doneCriteria: { type: "string", description: "Concrete checklist that must be verified before this goal is considered done." },
+        cadence: { type: "string", enum: ["hourly", "twice_daily", "daily", "weekly", "quiet"] },
+        permittedNudges: { type: "string", enum: ["none", "propose_only", "resume_owner"] },
+        threadKey: { type: "string", description: "Optional Paseo/coding session key owning this goal." },
+        prRef: { type: "string", description: "Optional GitHub PR ref (owner/repo#number)." },
+        linkedSkill: { type: "string", description: "Optional skill slug (e.g. 'aiseo-daily-manager', 'customer-report-verifier', 'exhaustive-goal-loop')." },
+        enqueueContinuationTask: { type: "boolean", description: "When true, also ensures an active agent-queue continuation task exists so autopilot pulses keep working batches." },
+        cursor: {
+          type: "object",
+          properties: {
+            processed: { type: "integer", minimum: 0 },
+            remaining: { type: "integer", minimum: 0 },
+            total: { type: "integer", minimum: 0 },
+            lastCursorToken: { type: "string" },
+            batchSummary: { type: "string" }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ["goal", "doneCriteria"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const project = String(args.project || "General").trim();
+      let tracked = null;
+      if (typeof runtime.fleetSupervisor?.trackWork === "function") {
+        tracked = await runtime.fleetSupervisor.trackWork({
+          project,
+          theme: args.theme ?? null,
+          customer: args.customer ?? null,
+          goal: args.goal,
+          doneCriteria: args.doneCriteria,
+          // Only settings the caller gave: an update that advances the cursor
+          // must not reset the saved owner, cadence or nudge policy.
+          ...(args.cadence !== undefined ? { cadence: args.cadence } : {}),
+          ...(args.permittedNudges !== undefined ? { permittedNudges: args.permittedNudges } : {}),
+          ...(args.threadKey !== undefined ? { threadKey: args.threadKey } : {}),
+          ...(args.prRef !== undefined ? { prRef: args.prRef } : {}),
+          ...(args.linkedSkill !== undefined ? { linkedSkill: args.linkedSkill } : {}),
+          creationDefaults: { cadence: "daily", permittedNudges: "resume_owner" },
+          cursor: args.cursor ?? null,
+          ...(Number.isInteger(args.cursor?.remaining) ? { remainingCount: args.cursor.remaining } : {})
+        });
+      }
+      const activeWorkId = tracked?.item?.id ?? null;
+      const goalTitle = `${project}: ${args.goal}`.slice(0, 180);
+      const goalDescription = `Done criteria: ${args.doneCriteria}${args.linkedSkill ? ` | Skill: ${args.linkedSkill}` : ""}`;
+      // Re-upserting the same goal (a new batch cursor) updates the task goal
+      // and its open continuation instead of queuing a duplicate whose stale
+      // cursor autopilot would also work.
+      let existingContinuation = openGoalContinuations(runtime.tasks, { activeWorkId })[0] ?? null;
+      const continuationGoal = existingContinuation?.parentGoalId
+        ? runtime.tasks?.getGoal?.(existingContinuation.parentGoalId) ?? null
+        : null;
+      const existingGoal = (continuationGoal && !["completed", "cancelled"].includes(continuationGoal.status) ? continuationGoal : null)
+        ?? (runtime.tasks?.listGoals?.({ status: "active" }) ?? []).find((g) => g.title === goalTitle)
+        ?? null;
+      let taskGoal = null;
+      if (existingGoal) {
+        taskGoal = (existingGoal.description !== goalDescription && runtime.tasks?.updateGoal
+          ? runtime.tasks.updateGoal(existingGoal.id, { description: goalDescription })
+          : null) ?? existingGoal;
+      } else if (runtime.tasks?.addGoal) {
+        taskGoal = runtime.tasks.addGoal({ title: goalTitle, description: goalDescription });
+      }
+      existingContinuation ??= openGoalContinuations(runtime.tasks, { goalId: taskGoal?.id ?? null })[0] ?? null;
+      let continuationTask = null;
+      if ((args.enqueueContinuationTask === true || (Number.isInteger(args.cursor?.remaining) && args.cursor.remaining > 0)) && runtime.tasks?.add) {
+        const description = `Done criteria: ${args.doneCriteria}\nCursor: ${JSON.stringify(args.cursor ?? {})}`;
+        const sourceMeta = {
+          ...(existingContinuation?.sourceMeta ?? {}),
+          activeWorkId: activeWorkId ?? existingContinuation?.sourceMeta?.activeWorkId ?? null,
+          project,
+          linkedSkill: args.linkedSkill ?? null,
+          cursor: args.cursor ?? null
+        };
+        continuationTask = existingContinuation && runtime.tasks.update
+          ? runtime.tasks.update(existingContinuation.id, {
+              description,
+              sourceMeta,
+              ...(taskGoal?.id && existingContinuation.parentGoalId !== taskGoal.id ? { parentGoalId: taskGoal.id } : {})
+            })
+          : runtime.tasks.add(
+              {
+                title: `Continue goal until done: ${args.goal}`.slice(0, 180),
+                description,
+                bucket: "today",
+                priority: 80,
+                parentGoalId: taskGoal?.id ?? undefined,
+                sourceMeta
+              },
+              { source: "goal-ledger", queue: "agent" }
+            );
+      }
+      return {
+        ok: true,
+        activeWorkItem: tracked?.item ?? null,
+        taskGoalId: taskGoal?.id ?? null,
+        continuationTaskId: continuationTask?.id ?? null
+      };
+    }
+  });
+
+  registry.register({
+    name: "verify_goal_progress",
+    // Routine cursor/evidence updates run ungated. Recording the owner's
+    // sign-off (`ownerConfirmedDone`) closes the goal, so only the owner's
+    // own turn or an approved card may do it.
+    needsConfirmation: true,
+    confirmationRequired: (args) => args?.ownerConfirmedDone === true,
+    summarize: (args) => `Mark goal ${args.id} done (owner-confirmed): ${String(args.evidenceSummary ?? "").slice(0, 120)}`,
+    description: "Update batch cursor/evidence on a tracked Goal and evaluate via deterministic checks + OpenAI /v1/decisions whether `doneCriteria` is genuinely accomplished (>= 0.85). If `remaining > 0` or `goal_accomplished < 0.85`, keeps the goal active and ensures the next continuation batch stays scheduled in `queue: 'agent'` instead of stopping prematurely.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Active Work goal id ('tw_...') or task goal id." },
+        evidenceSummary: { type: "string", description: "What was verified or completed in this batch." },
+        ownerConfirmedDone: { type: "boolean", description: "True ONLY when the human owner explicitly confirmed the goal is done." },
+        cursor: {
+          type: "object",
+          properties: {
+            processed: { type: "integer", minimum: 0 },
+            remaining: { type: "integer", minimum: 0 },
+            total: { type: "integer", minimum: 0 },
+            lastCursorToken: { type: "string" },
+            batchSummary: { type: "string" }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ["id", "evidenceSummary"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      if (args.ownerConfirmedDone === true && context?.__confirmed !== true) {
+        throw new Error("Recording owner-confirmed completion requires the owner's approval.");
+      }
+      if (typeof runtime.fleetSupervisor?.verifyGoalProgress === "function" && String(args.id).startsWith("tw_")) {
+        const verdict = await runtime.fleetSupervisor.verifyGoalProgress(args);
+        if (verdict?.accomplished) {
+          retireGoalContinuations(runtime.tasks, { activeWorkId: args.id });
+        } else if (runtime.tasks?.add) {
+          const existing = openGoalContinuations(runtime.tasks, { activeWorkId: args.id })[0] ?? null;
+          if (existing) {
+            runtime.tasks.update(existing.id, {
+              status: "pending",
+              description: `Continue next batch. Done criteria: ${verdict?.item?.doneCriteria ?? ""}\nLatest batch: ${args.evidenceSummary}\nCursor: ${JSON.stringify(args.cursor ?? verdict?.item?.cursor ?? {})}`,
+              sourceMeta: { ...(existing.sourceMeta ?? {}), cursor: args.cursor ?? verdict?.item?.cursor ?? null }
+            });
+          } else if (verdict?.item && !verdict.item.owner?.threadKey) {
+            runtime.tasks.add(
+              {
+                title: `Continue goal batch: ${verdict.item.goal}`.slice(0, 180),
+                description: `Done criteria: ${verdict.item.doneCriteria}\nLatest batch: ${args.evidenceSummary}\nCursor: ${JSON.stringify(args.cursor ?? verdict.item.cursor ?? {})}`,
+                bucket: "today",
+                priority: 80,
+                sourceMeta: { activeWorkId: args.id, project: verdict.item.project, cursor: args.cursor ?? null }
+              },
+              { source: "goal-ledger", queue: "agent" }
+            );
+          }
+        }
+        return verdict;
+      }
+      const remaining = Number.isInteger(args.cursor?.remaining) ? args.cursor.remaining : null;
+      const accomplished = Boolean(args.ownerConfirmedDone === true || remaining === 0);
+      if (accomplished) retireGoalContinuations(runtime.tasks, { goalId: args.id });
+      return {
+        ok: true,
+        id: args.id,
+        accomplished,
+        continueRequired: !accomplished,
+        cursor: args.cursor ?? null,
+        note: accomplished
+          ? "Goal progress verified complete."
+          : `Goal still has remaining scope (${remaining ?? "unverified"}); keep continuing batches until doneCriteria is satisfied.`
+      };
+    }
   });
 
   registry.register({
@@ -1354,4 +2294,48 @@ export function summarizeRegisterMcpServer(args = {}) {
     return `Register http MCP '${name}' → ${args.url ?? "(no url)"} (auth=${auth})`;
   }
   return `Register MCP '${name}' (${transport})`;
+}
+
+// Open agent-queue continuation tasks for a tracked goal, linked either by
+// Active Work id or by the task goal they roll up to.
+function openGoalContinuations(tasks, { activeWorkId = null, goalId = null } = {}) {
+  if ((!activeWorkId && !goalId) || typeof tasks?.list !== "function") return [];
+  return (tasks.list({ queue: "agent", status: "active", limit: Infinity }) ?? []).filter((t) =>
+    !["completed", "cancelled"].includes(t.status)
+    && ((activeWorkId && t.sourceMeta?.activeWorkId === activeWorkId)
+      || (goalId && t.source === "goal-ledger" && t.parentGoalId === goalId)));
+}
+
+// A goal with nothing left to do retires its queued continuations so
+// autopilot does not pick finished work back up with a stale cursor.
+function retireGoalContinuations(tasks, link) {
+  const retired = [];
+  for (const task of openGoalContinuations(tasks, link)) {
+    const done = typeof tasks.complete === "function"
+      ? tasks.complete(task.id, "goal-verified")
+      : tasks.update?.(task.id, { status: "completed", completedVia: "goal-verified" });
+    if (done) retired.push(task.id);
+  }
+  return retired;
+}
+
+// Schedules hold the owner's routines, prompts and recipients. Only the
+// owner's own turn, or a card the owner approved, may read or change them.
+function isScheduleOwner(context) {
+  return isOwnerPrincipal(context?.__owner) || context?.__confirmed === true;
+}
+
+function requireScheduleOwner(context) {
+  if (!isScheduleOwner(context)) throw new Error("Only the owner can view or change schedules.");
+}
+
+function scheduleSummary(job, extra = {}) {
+  const next = job.nextRunAt ? new Date(job.nextRunAt) : null;
+  return {
+    id: job.id, name: job.name, task: job.task, enabled: job.enabled,
+    schedule: describeSchedule(job),
+    nextRunAt: job.nextRunAt,
+    ...(next ? { nextRunLocal: next.toLocaleString("en-US", { weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }) } : {}),
+    ...extra
+  };
 }

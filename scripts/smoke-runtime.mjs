@@ -37,7 +37,11 @@ export async function waitForRuntimeHealth(child, url, { timeoutMs = 30_000, pol
         await response.body?.cancel();
         ready = response.ok;
       } catch (error) {
-        lastProbe = error.cause?.code || error.code || error.name;
+        const code = error.cause?.code || error.code || error.name;
+        const isDeadlineTimeout = error.name === "TimeoutError" || error.name === "AbortError" || code === 23;
+        if (!(isDeadlineTimeout && typeof lastProbe === "string" && lastProbe.startsWith("HTTP "))) {
+          lastProbe = code;
+        }
       }
       checkChild();
       if (ready) return { elapsedMs: Math.round(performance.now() - started), attempts };

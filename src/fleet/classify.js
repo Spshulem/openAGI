@@ -2,7 +2,8 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampTailLines, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
+import { diagnoseAgentBlocker } from "./watchdog.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -93,7 +94,9 @@ const NEED_YOU_PATTERNS = [
   /\bwithout your (?:go|approval|ok|okay|confirmation|sign-?off)\b/i,
   /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
   /(?<!\b(?:not|no longer|never)\s+)\bstill need your\b/i,
-  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i
+  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i,
+  /\b(?:hit|click|tap)\s+proceed\b/i,
+  /\blet me know your preference\b/i
 ];
 
 // The agent ended its turn saying it will keep going ("Next: wire the
@@ -380,6 +383,10 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
   // stopped whatever its PR says. Its last words are mid-work, not a wait
   // or an ask, and a merged or missing PR does not mean the work is done.
   if (thread.agentStatus === "stalled" || (thread.agentStatus === "aborted" && !deliberateStop(thread))) {
+    const silentDiag = thread.meta?.silentStuck ? diagnoseAgentBlocker(thread, { pr, now, limits }) : null;
+    if (silentDiag) {
+      return result("stopped", `stuck: ${silentDiag.snagLabel}`, { snag: silentDiag });
+    }
     return result("stopped", thread.agentStatus === "aborted" ? "turn interrupted mid-work" : "turn stopped mid-work, no end written");
   }
 
@@ -409,7 +416,23 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
     });
   }
 
-  const ask = settled ? null : detectAsk(askText);
+  let ask = settled ? null : detectAsk(askText);
+  const proceedCall = !settled && Boolean(text) && (
+    thread.meta?.hasPlanArtifact === true
+    || /\b(?:hit|click|tap)\s+(?:\*\*)?proceed(?:\*\*)?\b/i.test(full)
+  );
+  if (!ask && proceedCall) {
+    ask = detectAsk(clampTailLines(full, 2600)) ?? {
+      kind: "needs-human",
+      topic: "decision",
+      options: ["Proceed", "later"],
+      text: clampText(stripMarkdown(closingSentences(full).at(-1) || "Plan ready — hit Proceed to execute."), 240)
+    };
+  }
+  if (ask && proceedCall && !(ask.options ?? []).some((opt) => /^proceed$/i.test(String(opt)))) {
+    const tailOpts = (ask.options ?? []).length ? ask.options : ["later"];
+    ask = { ...ask, options: ["Proceed", ...tailOpts].slice(0, 4) };
+  }
   // "Blocked on: your decision": the owner's, whatever else the list holds.
   // Its own answers beat a plain "your call" read from the same words; a
   // named topic (a merge, prod, creds) keeps the ask it came with.
@@ -429,6 +452,17 @@ function classifyRest(thread, { pr, infra, now, config, limits, readiness, resul
   // nothing.
   const prKnown = pr ? pr.state === "MERGED" : !thread.prRefs?.length && (!thread.branch || thread.prLookedUp === true);
   const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
+  if (!idle?.promised && !settled) {
+    const wall = diagnoseAgentBlocker(thread, { pr, now, limits });
+    if (wall?.kind === "owner-wall") {
+      return result("needs-human", `agent blocked: ${wall.snagLabel}`, {
+        ask: { topic: wall.topic ?? "credentials", options: wall.options ?? ["retry", "later"], text: wall.summary, wall: true }
+      });
+    }
+    if (wall?.kind === "agent-snag") {
+      return result("stopped", `stopped on ${wall.snagLabel}`, { snag: wall });
+    }
+  }
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
 }
@@ -662,18 +696,19 @@ const OWNER_BLOCKER = /\b(?:your|you|owner)\b[^.\n]{0,40}\b(?:decision|call|appr
 // Items GitHub or time clears: checks running, a review not in yet.
 const PASSIVE_BLOCKER = /\b(?:running|pending|queued|in progress|not (?:yet )?(?:reviewed|started|finished)|has(?:n't| not) reviewed|waiting (?:on|for))\b|^(?:CI|checks?|tests?|builds?)\W*$/i;
 const NO_BLOCKER = /^(?:nothing|none|n\/a|nope|no(?:thing)? (?:blockers?|else))\b/i;
-const BLOCKED_HEADER = /^[\s>#*_\-•]*blocked on\b[\s*_]*:?[\s*_]*(.*)$/i;
+const OWNER_ACTION_HEADER = /^[\s>#*_\-•]*(?:(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?|action\s+(?:needed|required)\s+from\s+(?:you|the\s+owner|spencer))\b[\s*_]*:?[\s*_]*(.*)$/i;
+const BLOCKED_HEADER = /^[\s>#*_\-•]*(?:blocked\s+on|(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?|action\s+(?:needed|required)\s+from\s+(?:you|the\s+owner|spencer))\b[\s*_]*:?[\s*_]*(.*)$/i;
+const INLINE_OWNER_ACTION_SPLIT = /\s+(?=(?:(?:single|smallest|one|next|required|exact|only|immediate)\s+owner\s+action|owner\s+action(?:\s+(?:needed|required))?)\s*:)/gi;
 const BULLET = /^(\s*)(?:[-*•+]|\d+[.)]|[a-c][.)])\s+(.*)$/i;
 
-// The agent's "Blocked on:" section: the header (any markdown) with what
-// follows it on its line, then its bullets up to a blank line or the next
-// header. Each item is tagged owner, passive or other; sub-bullets under an
-// item are its options. "Blocked on: nothing" holds no items. The last
-// header wins: an earlier one is often a quoted, older status.
+// The agent's "Blocked on:" or "Single/Exact owner action:" section: the header
+// (any markdown, even when preceded inline on the same line) with what follows
+// it, then its bullets up to a blank line or the next header.
 export function blockedOnSection(text) {
-  const lines = plainLines(text);
+  const lines = plainLines(text).flatMap((line) => line.split(INLINE_OWNER_ACTION_SPLIT));
   const start = lines.findLastIndex((line) => BLOCKED_HEADER.test(line));
   if (start < 0) return null;
+  const explicitOwnerHeader = OWNER_ACTION_HEADER.test(lines[start]);
   const items = [];
   const inline = BLOCKED_HEADER.exec(lines[start])[1].trim();
   if (inline) items.push({ text: inline, options: [] });
@@ -698,7 +733,12 @@ export function blockedOnSection(text) {
     else items.push({ text: bullet[2].trim(), options: [] });
   }
   const tagged = items.filter((item) => item.text && !NO_BLOCKER.test(item.text))
-    .map((item) => ({ ...item, tag: OWNER_BLOCKER.test(item.text) ? "owner" : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other" }));
+    .map((item) => ({
+      ...item,
+      tag: ((explicitOwnerHeader && !PASSIVE_BLOCKER.test(item.text)) || OWNER_BLOCKER.test(item.text))
+        ? "owner"
+        : PASSIVE_BLOCKER.test(item.text) ? "passive" : "other"
+    }));
   const of = (tag) => tagged.filter((item) => item.tag === tag);
   return {
     items: tagged, owner: of("owner"), passive: of("passive"), other: of("other"), mergeCalls: [], start,

@@ -1,6 +1,6 @@
 {
   "name": "openagi",
-  "version": "0.0.77",
+  "version": "0.0.89",
   "private": true,
   "type": "module",
   "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
@@ -30,7 +30,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@getpaseo/client": "0.15.0",
+    "@getpaseo/client": "0.16.2",
     "ws": "8.21.3"
   },
   "bin": {

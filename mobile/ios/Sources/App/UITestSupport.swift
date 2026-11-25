@@ -9,12 +9,18 @@ import os
 @MainActor
 struct UITestRoot: View {
     @State private var model = UITestProtocol.makeModel()
+    @State private var session = AppSession.shared
 
     var body: some View {
         Group {
-            if ProcessInfo.processInfo.arguments.contains("--ui-guided-setup") {
+            if session.phase == .pairing {
+                PairingView(prefillServer: session.pairingServer,
+                            onCancel: { session.goBack() }, onPaired: { session.paired() })
+            } else if ProcessInfo.processInfo.arguments.contains("--ui-guided-setup") {
                 WelcomeView(availability: .unsupported, prefersChat: true)
-            } else { RootTabView(testingModel: model) }
+            } else {
+                RootTabView(testingModel: model)
+            }
         }
         .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark") ? .dark : nil)
     }
@@ -25,7 +31,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         ProcessInfo.processInfo.arguments.contains("--ui-testing") || StoreScreenshotProtocol.isEnabled
     }
     private static let decidedActions = OSAllocatedUnfairLock(initialState: Set<String>())
+    private struct BudgetFixtureState: Sendable {
+        var dailyLimit: Double = 10.0
+        var bonusToday: Double = 0.0
+        var spent: Double = 2.5
+    }
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
+    private static let budgetState = OSAllocatedUnfairLock(initialState: BudgetFixtureState())
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private struct ChatLine: Sendable {
         let id: String
@@ -118,6 +130,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             deliver(status: 200, data: Data(stream.utf8), contentType: "text/event-stream")
             return
         }
+        // Send Now in a fixture chat: the running tool hop has to finish
+        // first, as main answers while a tool runs.
+        if url.path == "/conversations/agent/interrupt" || url.path == "/conversations/supervisor/interrupt" {
+            let requestId = Self.body(request).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["requestId"] as? String ?? ""
+            finish(status: 200, object: ["status": "stopping", "tool": "fleet_status", "requestId": requestId])
+            return
+        }
         let empty = ProcessInfo.processInfo.arguments.contains("--ui-empty-today")
         let tasks = [Self.task(id: "demo-one", title: "Plan a synthetic demo"),
                      Self.task(id: "demo-two", title: "Review a synthetic demo")]
@@ -180,6 +199,30 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                           "chatgpt": ["signedIn": false]]])
         case "/settings/models/test":
             finish(object: ["ok": true, "model": "demo-model"])
+        case "/budget":
+            if request.httpMethod == "POST", let body = Self.body(request),
+               let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                let limit = (payload["dailyUsdLimit"] as? NSNumber)?.doubleValue
+                let resetBonus = payload["resetTodayBonus"] as? Bool == true
+                let addBonus = (payload["addUsdToday"] as? NSNumber)?.doubleValue
+                Self.budgetState.withLock { state in
+                    if let limit { state.dailyLimit = limit }
+                    if resetBonus { state.bonusToday = 0 }
+                    if let addBonus { state.bonusToday += addBonus }
+                }
+            }
+            let current = Self.budgetState.withLock { $0 }
+            let effective = current.dailyLimit + current.bonusToday
+            finish(object: [
+                "today": "2026-10-18",
+                "dailyUsdLimit": current.dailyLimit,
+                "bonusUsdToday": current.bonusToday,
+                "effectiveLimitUsd": effective,
+                "spentUsd": current.spent,
+                "remainingUsd": effective - current.spent,
+                "exceeded": current.spent >= effective,
+                "calls": 14
+            ])
         case "/workspace/persona":
             finish(object: ["markdown": "Synthetic instructions for the UI test."])
         case "/workspace/skills": finish(object: ["skills": []])
@@ -192,6 +235,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                                "configured": saved, "apiKeySaved": saved]]])
         case "/workspace/integrations/linear/sync":
             finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
+        case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-needs-you-fixture"):
+            deliver(status: 200, data: Data(UITestNeedsYouFixture.stateJSON.utf8), contentType: "application/json")
         case "/fleet/api/state":
             finish(object: ["mode": "observe", "enabled": false, "running": false,
                             "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],

@@ -5,10 +5,121 @@
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { asksToMergePr } from "./policy.js";
+import { buildDecisionContext, groupItemName, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
 
 const SETTLED_PR = new Set(["MERGED", "CLOSED"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+const OWNER_BLOCKER_RE = /\b(?:you|your|owner)\b[^.?!\n]{0,80}\b(?:decision|call|approv\w*|authori[sz]\w*|sign[ -]?off|credentials?|sign[ -]?in|log[ -]?in|choice|pick|go[ -]?ahead)\b|\b(?:explicit|owner|your)\s+(?:release\s+)?(?:authorization|approval|sign[ -]?off)\b/i;
+const NO_ACTION_COMPLETION_RE = /\b(?:nothing|no action|all done|completed successfully|finished successfully|done)\b[^.?!\n]{0,80}\b(?:needed|required|left|else|more)\b/i;
+
+function cleanOwnerCopy(value, max = 220) {
+  return clampText(redactSecrets(cleanBriefProse(String(value ?? ""))), max) || null;
+}
+
+function firstUsefulSentence(value) {
+  const text = cleanOwnerCopy(value, 360);
+  if (!text) return null;
+  return (text.split(/(?<=[.!?])\s+/).find((part) => part.trim()) ?? text).trim();
+}
+
+function ownerActionHeadline(question, { kind = null } = {}) {
+  const title = cleanOwnerCopy(question?.title, 160);
+  const body = cleanOwnerCopy(question?.body, 360);
+  const activeItem = Array.isArray(question?.meta?.items) && question?.meta?.itemId != null
+    ? question.meta.items.find((item) => String(item?.itemId ?? "") === String(question.meta.itemId))
+    : null;
+  const source = cleanOwnerCopy(activeItem?.question, 360) || `${title ?? ""} ${body ?? ""}`.trim();
+  if (!source) return "Review this decision";
+  const signIn = /\b(?:browser\s+)?sign[ -]?ins?\b|\blog(?:ged)?[ -]?in\b|\bportals?\b/i.test(source);
+  if (signIn) return /\b(?:publisher|listing|submission)s?\b/i.test(source)
+    ? "Sign in to the publisher portals"
+    : "Sign in to the requested portals";
+  const release = /\b(?:release|deploy|cut)\b/i.test(source) && /\b(?:authori[sz]\w*|approv\w*|sign[ -]?off|owner)\b/i.test(source);
+  if (release) return "Authorize the production release";
+  const stripped = (title || firstUsefulSentence(body) || "Review this decision")
+    .replace(/^(?:please|can you|could you|would you)\s+/i, "")
+    .replace(/\s*\(\d+\s+open\)\s*$/i, "")
+    .replace(/^(?:question\s+\d+|needs? your (?:call|decision))[: -]*/i, "")
+    .trim();
+  return clampText(stripped || "Review this decision", 120);
+}
+
+function ownerDecisionFact(question, { kind = null, hasVerifiedOwnerBlocker = false } = {}) {
+  const body = cleanOwnerCopy(question?.body, 500);
+  const context = cleanOwnerCopy(question?.askContext, 500);
+  const source = body || context;
+  if (source) {
+    const sentences = source.split(/(?<=[.!?])\s+/).map((part) => part.trim()).filter(Boolean);
+    const consequence = sentences.find((part) => /\b(?:can't|cannot|won't|stops?|blocked|paused|waiting|until|requires?|needs?)\b/i.test(part));
+    if (consequence) return clampText(consequence, 220);
+    if (hasVerifiedOwnerBlocker) return "The session is waiting for your authorization before it can continue.";
+  }
+  if (kind === "prompt" || kind === "agent-card") return "The agent is paused on this permission card; your choice controls the next action.";
+  if (kind === "merge_ready") return "This decision changes the repository; the current checks and head are shown in Context.";
+  if (kind === "ci_failed") return "The pull request cannot move forward until the failing checks or rebase are resolved.";
+  if (kind === "session-error") return "The session reported an error and needs your direction before work can resume.";
+  if (kind === "completed") return "The session finished without a verified owner blocker.";
+  return "The agent is waiting for your answer before it can continue.";
+}
+
+function questionHasVerifiedOwnerBlocker(question, { kind = null } = {}) {
+  if (question?.meta?.ownerBlocker === true || question?.ownerBlocker === true) return true;
+  if (kind !== "completed") return false;
+  const source = [question?.title, question?.body, question?.askContext, question?.card].filter(Boolean).join(" ");
+  return OWNER_BLOCKER_RE.test(source) && !NO_ACTION_COMPLETION_RE.test(source);
+}
+
+export function needsOwnerDecision(question, { kind = question?.kind ?? null } = {}) {
+  if (!question || question.status && question.status !== "open") return false;
+  const verifiedBlocker = questionHasVerifiedOwnerBlocker(question, { kind });
+  if (kind === "completed" && !verifiedBlocker) return false;
+  if (kind === "suggestion" && question.meta?.plan?.nextAction == null) return false;
+  return true;
+}
+
+export function buildOwnerDecision(question, { kind = question?.kind ?? null, primaryAction = null } = {}) {
+  const verifiedBlocker = questionHasVerifiedOwnerBlocker(question, { kind: question?.kind ?? kind });
+  const needsYou = needsOwnerDecision(question, { kind });
+  const itemIds = Array.isArray(question?.meta?.itemIds) ? question.meta.itemIds.map(String) : [];
+  const activeItemId = question?.meta?.itemId ? String(question.meta.itemId) : null;
+  const source = {
+    questionId: question?.id ?? null,
+    threadKey: question?.threadKey ?? null,
+    threadKeys: Array.isArray(question?.threadKeys) ? question.threadKeys : [],
+    ...(question?.meta?.app ? { app: String(question.meta.app) } : {}),
+    ...(question?.meta?.cardId ? { cardId: String(question.meta.cardId) } : {}),
+    ...(activeItemId ? { itemId: activeItemId } : {})
+  };
+  const action = primaryAction ? {
+    op: primaryAction.op ?? null,
+    ...(primaryAction.value != null ? { value: primaryAction.value } : {}),
+    ...(primaryAction.label ? { label: primaryAction.label } : {})
+  } : null;
+  const remaining = itemIds.filter((id) => id !== activeItemId);
+  const decisionItems = Array.isArray(question?.meta?.items)
+    ? question.meta.items.map((item) => ({
+        itemId: item?.itemId ? String(item.itemId) : null,
+        source: item?.source && typeof item.source === "object" ? item.source : source,
+        headline: cleanOwnerCopy(item?.question, 180) || ownerActionHeadline(question, { kind }),
+        options: Array.isArray(item?.options) ? item.options.map((option) => String(option)).filter(Boolean) : [],
+        multiSelect: item?.multiSelect === true,
+        freeText: item?.freeText === true,
+        active: item?.itemId != null && String(item.itemId) === activeItemId
+      }))
+    : [];
+  return {
+    needsYou,
+    ownerBlocker: verifiedBlocker,
+    decisionHeadline: ownerActionHeadline(question, { kind }),
+    decisionFact: ownerDecisionFact(question, { kind, hasVerifiedOwnerBlocker: verifiedBlocker }),
+    decisionSource: source,
+    decisionAction: action,
+    ...(decisionItems.length ? { decisionItems } : {}),
+    ...(remaining.length ? { remainingItemIds: remaining } : {})
+  };
+}
 
 const OPTION_LABELS = Object.freeze({
   yes: "Approve",
@@ -25,6 +136,10 @@ const OPTION_LABELS = Object.freeze({
   retry: "Retry",
   restart: "Restart app",
   done: "Done",
+  "got it": "Got it",
+  "mark done": "Mark Done",
+  archive: "Archive",
+  proceed: "Proceed",
   opened: "Opened",
   "open thread": "Open chat",
   "keep going": "Keep going",
@@ -86,6 +201,18 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
   if (question.kind === "stuck" && (ciState === "FAILURE" || ciState === "ERROR")) {
     return { kind: "ci_failed", kindLabel: "CI Failed", rank: 1 };
   }
+  if (question.kind === "completed") {
+    if (questionHasVerifiedOwnerBlocker(question, { kind: "completed" })) {
+      return { kind: "blocker", kindLabel: "Owner blocker", rank: 0 };
+    }
+    return { kind: "completed", kindLabel: "Finished", rank: 2 };
+  }
+  if (question.kind === "session-error") {
+    return { kind: "blocker", kindLabel: "Session Error", rank: 0 };
+  }
+  if (question.meta?.hasPlanArtifact || (Array.isArray(question.options) && question.options.some((o) => /^proceed$/i.test(String(o))))) {
+    return { kind: "approval", kindLabel: "Plan Ready", rank: 0 };
+  }
   if (["prompt", "agent-ask", "agent-card", "self-fix"].includes(question.kind)) {
     return { kind: "approval", kindLabel: "Needs Decision", rank: 1 };
   }
@@ -100,7 +227,7 @@ function classifyCardKind(question, row = null, prRef = null, prMeta = null) {
 
 // Filters questions whose underlying condition resolved since the question
 // was opened, or routine updates suppressed by "quiet_until_ready" cadence.
-function isQuestionLiveForDeck(question, row, prefs) {
+export function isQuestionLiveForDeck(question, row, prefs) {
   if (!question || question.status !== "open") return false;
   if (row?.muted) return false;
   const prRef = question.prRef ?? row?.prRef ?? null;
@@ -118,7 +245,7 @@ function isQuestionLiveForDeck(question, row, prefs) {
   return true;
 }
 
-const OPAQUE_SESSION_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,})$/i;
+const OPAQUE_SESSION_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const LEADING_OPAQUE_PREFIX_RE = /^(?:wks_[0-9a-f]+|Paseo chat|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}):/i;
 
 function cleanWorkspaceName(workspace) {
@@ -173,6 +300,18 @@ function buildActionsForQuestion(question, row, prRef, prMeta = null) {
       primaryAction: { op: "open_chat", label: chatLabel, value: options.includes("open thread") ? "open thread" : "opened", destructive: false },
       secondaryAction: { op: "defer", label: "Later", value: "dismiss", destructive: false },
       extraActions: []
+    };
+  }
+
+  if (question.kind === "completed" || question.kind === "session-error") {
+    const isPaseo = Boolean(parsePaseoThreadKey(question.threadKey ?? row?.key));
+    const extraActions = isPaseo
+      ? [{ op: "archive_session", label: "Archive Chat…", value: "archive_session", destructive: true }]
+      : [];
+    return {
+      primaryAction: { op: "open_chat", label: "View Chat", value: "open thread", destructive: false },
+      secondaryAction: { op: "dismiss", label: "Dismiss", value: "dismiss", destructive: false },
+      extraActions
     };
   }
 
@@ -248,93 +387,277 @@ function activeReviewBrief(question) {
     : null;
 }
 
-function buildRecommendation(question, row, prRef, prefs, prMeta = null) {
+const TRIVIAL_CONTINUATION_USER_MSG_RE = /^(?:\[openagi supervisor\]|continue\b|resume(?:\s+working)?\.?$|yes\.?$|no\.?$|ok(?:ay)?\.?$|go ahead\.?$|proceed\.?$|status\??$|what(?:'s| is) the status\??$|done\.?$|got it\.?$|allow\.?$)/i;
+
+function extractSubstantiveGoalMessage(messages = []) {
+  const userMsgs = messages
+    .filter((m) => m && m.role === "user" && typeof m.text === "string" && m.text.trim())
+    .map((m) => cleanBriefProse(m.text))
+    .filter((txt) => txt && !/^The previous turn stopped because of a temporary provider/i.test(txt) && !TRIVIAL_CONTINUATION_USER_MSG_RE.test(txt.trim()));
+  if (!userMsgs.length) return null;
+  // Prefer the earliest substantive goal prompt in the window over short follow-ups.
+  const substantial = userMsgs.find((txt) => txt.length >= 28) ?? userMsgs[0];
+  return substantial || null;
+}
+
+function extractPermissionDetail(question, thread = null) {
+  const perm = thread?.meta?.pendingPermission;
+  const cmd = perm?.input?.command ?? perm?.command ?? question?.meta?.command ?? null;
+  const toolName = perm?.toolName ?? perm?.name ?? null;
+  if (typeof cmd === "string" && cmd.trim()) {
+    return {
+      toolName: toolName ? String(toolName) : "Bash",
+      command: clampText(redactSecrets(cmd.trim().replace(/\s+/g, " ")), 220)
+    };
+  }
+  const rawSource = String(question?.card || question?.body || "");
+  const backtickCmd = /`([^`\n]{4,220})`/.exec(rawSource)?.[1] ?? null;
+  if (backtickCmd) {
+    return {
+      toolName: toolName ? String(toolName) : null,
+      command: clampText(redactSecrets(backtickCmd.trim()), 220)
+    };
+  }
+  return toolName ? { toolName: String(toolName), command: null } : null;
+}
+
+function buildCurrentStateSummary(question, row, { kind, prMeta = null, thread = null } = {}) {
+  const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
+  const mergeState = prMeta?.mergeState ?? row?.pr?.mergeState ?? null;
+  const prLabel = prMeta?.ref ? (prMeta.ref.includes("#") ? `PR #${prMeta.ref.split("#").pop()}` : prMeta.ref) : null;
+  const diffStat = formatDiffSummary(prMeta);
+
+  if (kind === "merge_ready") {
+    if (ci === "PENDING" || ci === "IN_PROGRESS") {
+      return `${prLabel ?? "Pull request"} is open${diffStat ? ` (${diffStat})` : ""} · CI checks still running — waiting before merge.`;
+    }
+    const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
+    return `Code complete · ${prLabel ?? "PR"} open${diffStat ? ` (${diffStat})` : ""} · CI green${threads > 0 ? ` · ${threads} open review thread(s)` : ""} — paused at your merge gate.`;
+  }
+  if (kind === "ci_failed") {
+    if (mergeState === "DIRTY") {
+      return `${prLabel ?? "Pull request"} has merge conflicts against base — blocked until rebased and re-verified.`;
+    }
+    const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
+    return `${prLabel ?? "Pull request"} stopped with failing CI${failing ? ` (${failing})` : ""} — needs fix before merge.`;
+  }
+  if (question.kind === "prompt") {
+    const perm = extractPermissionDetail(question, thread);
+    const toolLabel = perm?.toolName || (/bash/i.test(String(question.title ?? "")) ? "shell command" : "tool");
+    return `Paused mid-task waiting for ${toolLabel} approval${prLabel ? ` (${prLabel})` : ""} — has not executed this step yet.`;
+  }
+  if (question.kind === "session-error") {
+    return `Stopped on a runtime/tool error${prLabel ? ` (${prLabel})` : ""} — waiting on recovery or your direction.`;
+  }
+  if (kind === "blocker" || ["stuck", "limit", "open", "deliver"].includes(String(question.kind ?? ""))) {
+    return `Blocked at an external/environment gate${prLabel ? ` (${prLabel})` : ""} — cannot advance without your unblock.`;
+  }
+  return `Paused at a decision checkpoint${prLabel ? ` (${prLabel})` : ""} — waiting for your call before continuing.`;
+}
+
+function buildRecommendation(question, row, prRef, prefs, prMeta = null, thread = null) {
   const ci = prMeta?.ciState ?? row?.pr?.ci?.state ?? null;
   const mergeDirty = prMeta?.mergeState === "DIRTY" || row?.pr?.mergeState === "DIRTY";
   const mergeReadyAsk = isMergeReadyQuestion(question, row, prRef, prMeta);
+  const prShort = prRef && String(prRef).includes("#") ? `PR #${String(prRef).split("#").pop()}` : (prRef || "this PR");
   if (mergeReadyAsk) {
     if (ci === "FAILURE" || ci === "ERROR") {
       const failing = (prMeta?.failingChecks ?? row?.pr?.ci?.failing ?? []).slice(0, 2).join(", ");
-      return `CI failed${failing ? ` (${failing})` : ""}. Send back to the coding session before merging.`;
+      return `Recommend: Do not merge yet — CI failed${failing ? ` (${failing})` : ""}; send back to the coding session first.`;
     }
     if (mergeDirty) {
-      return "Pull request has merge conflicts with the base branch. Have the coding session rebase before merging.";
+      return `Recommend: Do not merge yet — have the session rebase ${prShort} onto base and re-verify.`;
     }
     if (ci === "PENDING" || ci === "IN_PROGRESS") {
-      return "Checks are still running. Auto-merge is off by default; tap Watch CI to get pinged when green.";
+      return `Recommend: Hold merge while CI finishes — tap Watch CI to get notified once checks turn green.`;
     }
   }
   const rb = activeReviewBrief(question);
   if (rb?.recommendation) {
-    return clampText(redactSecrets(rb.recommendation), 220);
+    const cleanRec = clampText(redactSecrets(rb.recommendation), 220);
+    if (cleanRec && !/^reply right below\b/i.test(cleanRec) && !/^tap view chat\b/i.test(cleanRec)) {
+      return cleanRec;
+    }
   }
   if (mergeReadyAsk) {
     const threads = Number(prMeta?.unresolvedThreads ?? row?.pr?.unresolvedThreads ?? 0);
     const gatePass = Array.isArray(prMeta?.gates) && prMeta.gates.length > 0 && prMeta.gates.every((g) => g.state === "SUCCESS")
-      ? ` · ${prMeta.gates.map((g) => g.label).join(", ")} green`
+      ? ` (${prMeta.gates.map((g) => g.label).join(", ")} green)`
       : "";
-    return `CI green${gatePass}${threads === 0 ? " · 0 open threads" : ` · ${threads} review thread(s)`}. Ready for your merge confirmation.`;
+    if (threads > 0) {
+      return `Recommend: Inspect the ${threads} open review thread(s) on ${prShort} before merging; CI is green${gatePass}.`;
+    }
+    return `Recommend: Merge ${prShort} after a quick diff check — CI is green${gatePass} with 0 open review threads.`;
   }
-  if (parsePaseoThreadKey(question.threadKey ?? row?.key)) {
-    return "Reply right below to answer or steer this session directly without opening the chat.";
+  if (question.kind === "completed") {
+    return "Session finished — inspect the result or Dismiss.";
+  }
+  if (question.kind === "prompt") {
+    const perm = extractPermissionDetail(question, thread);
+    const cmd = perm?.command ?? "";
+    if (cmd && /\b(?:merge|push\s+--force|reset\s+--hard|rm\s+-rf|deploy|prod)/i.test(cmd)) {
+      return `Recommend: Inspect carefully before allowing — command touches merge/deploy/destructive state (\`${clampText(cmd, 90)}\`).`;
+    }
+    if (cmd) {
+      return `Recommend: Allow if \`${clampText(cmd, 90)}\` matches this task's scope, or Deny to steer another way.`;
+    }
+    return "Recommend: Allow if this local step matches the workspace goal above, or Deny with instructions.";
+  }
+  const bodyText = String(question?.card || question?.body || "");
+  const explicitRecLine = /(?:^|\n)\s*(?:[-*•]|\d+[.)])?\s*\*{0,2}([^*\n]{3,90}?)\s*\(recommended\)\*{0,2}/i.exec(bodyText)?.[1]?.trim();
+  if (explicitRecLine) {
+    return `Recommend: ${clampText(redactSecrets(explicitRecLine), 180)}.`;
+  }
+  const realOptions = (Array.isArray(question?.options) ? question.options : [])
+    .map((o) => String(o ?? "").trim())
+    .filter((o) => o && !["dismiss", "later", "open thread", "opened", "wait", "skip"].includes(o.toLowerCase()));
+  if (realOptions.length > 0) {
+    return `Recommend: "${humanOptionLabel(realOptions[0])}" if the caveats above look right — otherwise pick another option or reply below.`;
   }
   if (row?.reason && !/^agent asks:/i.test(row.reason)) {
-    return clampText(redactSecrets(row.reason), 200);
+    return `Recommend: Review blocker (${clampText(redactSecrets(row.reason), 140)}) and reply with the unblock step.`;
+  }
+  return "Recommend: Open details or reply below with your call on the blocker above.";
+}
+
+function extractUserStoryFromPrBody(bodySummary) {
+  const raw = String(bodySummary ?? "");
+  if (!raw.trim()) return null;
+  const match = /(?:^|\n)##+\s*(?:User\s+story|Why|Goal|Problem|Context)\s*\n+([\s\S]*?)(?=\n##+\s|\s*$)/i.exec(raw);
+  if (match?.[1]) {
+    const cleaned = cleanBriefProse(match[1]);
+    if (cleaned) return clampText(cleaned, 280);
   }
   return null;
 }
 
-function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [] } = {}) {
+function isProcessOnlyWhatChanged(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return true;
+  if (raw.length > 260) return false;
+  return /\b(?:verification\s+run|certificate\s+passed|open\s+review\s+threads|independent\s+human\s+review|no\s+later\s+merge)\b/i.test(raw)
+    && !/\b(?:adds?|fixes?|updates?|routes?|changes?|replaces?|introduces?|supports?)\b/i.test(raw);
+}
+
+function buildDecisionBrief(question, row, { kind, headline = "", sessionTitle = null, prMeta = null, agentSummary = null, recentMessages = [], activeGoal = null, thread = null } = {}) {
   const rb = activeReviewBrief(question);
-  const lastUserMsg = [...recentMessages].reverse().find((m) => m.role === "user" && m.text)?.text ?? null;
-  const fallbackContext = lastUserMsg
-    ? `You asked: "${clampText(cleanBriefProse(lastUserMsg), 170)}"`
-    : (sessionTitle && !String(headline).toLowerCase().includes(sessionTitle.toLowerCase())
-        ? `Session: ${sessionTitle}`
-        : null);
+  const substantiveUserGoal = extractSubstantiveGoalMessage(recentMessages);
+  const prUserStory = extractUserStoryFromPrBody(prMeta?.rawBody ?? prMeta?.bodySummary);
+  const goalStory = activeGoal?.goal
+    ? `${clampText(cleanBriefProse(activeGoal.goal), 200)}${activeGoal.doneCriteria ? ` (Done when: ${clampText(cleanBriefProse(activeGoal.doneCriteria), 140)})` : ""}`
+    : null;
+  const combinedGoalAndStory = [goalStory, prUserStory].filter(Boolean).join(" — ") || null;
+  const cleanRbContext = rb?.context && !TRIVIAL_CONTINUATION_USER_MSG_RE.test(String(rb.context).replace(/^You asked:\s*["']?|["']$/gi, "").trim())
+    ? cleanBriefProse(rb.context)
+    : null;
+  const fallbackContext = combinedGoalAndStory
+    || cleanRbContext
+    || (substantiveUserGoal ? clampText(substantiveUserGoal, 240) : null)
+    || (prMeta?.title ? `${clampText(cleanBriefProse(prMeta.title), 200)}` : null)
+    || (sessionTitle ? `${sessionTitle}` : null);
+
+  const currentState = buildCurrentStateSummary(question, row, { kind, prMeta, thread });
+  const permDetail = question.kind === "prompt" ? extractPermissionDetail(question, thread) : null;
+  const permPrefix = permDetail?.command
+    ? `Requested ${permDetail.toolName || "command"}: \`${permDetail.command}\``
+    : (permDetail?.toolName ? `Requested tool: ${permDetail.toolName}` : null);
 
   let fallbackWhatChanged = null;
   if (prMeta?.bodySummary) {
-    const cleanPr = clampTextLines(cleanBriefProse(prMeta.bodySummary), 420);
-    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 220) : "";
+    const cleanPr = clampTextLines(cleanBriefProse(prMeta.bodySummary), 520);
+    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 260) : "";
     fallbackWhatChanged = cleanAgent && !cleanPr.includes(cleanAgent.slice(0, 32))
-      ? clampTextLines(`${cleanPr}\n\nLatest status: ${cleanAgent}`, 520)
+      ? clampTextLines(`${cleanPr}\n\nLatest progress & caveats: ${cleanAgent}`, 780)
       : cleanPr;
+  } else if (prMeta?.title) {
+    const diffStat = formatDiffSummary(prMeta);
+    const header = [prMeta.title, diffStat].filter(Boolean).join(" · ");
+    const cleanAgent = agentSummary ? clampTailLines(cleanBriefProse(agentSummary), 420) : "";
+    fallbackWhatChanged = [header, cleanAgent].filter(Boolean).join("\n\n");
   } else if (agentSummary) {
-    fallbackWhatChanged = clampTailLines(cleanBriefProse(agentSummary), 440);
+    fallbackWhatChanged = clampTailLines(cleanBriefProse(agentSummary), 520);
+  } else if (question.body && !isMechanicalReadyBody(question.body)) {
+    fallbackWhatChanged = clampTextLines(cleanBriefProse(question.body), 480);
   }
+  if (permPrefix) {
+    fallbackWhatChanged = fallbackWhatChanged && !fallbackWhatChanged.includes(permDetail?.command ?? "___")
+      ? clampTextLines(`${permPrefix}\n\n${fallbackWhatChanged}`, 780)
+      : (fallbackWhatChanged || permPrefix);
+  }
+
+  const activeDecisionItem = Array.isArray(question?.meta?.items) && question.meta.items.length > 0
+    ? (question.meta.items.find((it) => String(it?.itemId ?? "") === String(question?.meta?.itemId ?? "")) ?? question.meta.items[0])
+    : null;
+  const fullChoicesBlock = Array.isArray(activeDecisionItem?.options) && activeDecisionItem.options.length > 0
+    ? [
+        activeDecisionItem.question,
+        ...activeDecisionItem.options.map((opt, idx) => (/^\d+[.)]\s/.test(String(opt)) ? String(opt) : `${idx + 1}. ${opt}`))
+      ].filter(Boolean).join("\n")
+    : null;
 
   let fallbackDecision = null;
   if (kind === "merge_ready") {
+    const reviewNote = prMeta?.mergeState === "BLOCKED" ? " (GitHub notes required reviewer approval)" : "";
     fallbackDecision = (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS")
       ? `Checks are still running on ${prMeta?.ref ?? "this PR"}. Tap Watch CI or wait before merging.`
-      : `Confirm whether to merge ${prMeta?.ref ?? "this PR"} now, merge & deploy, or reply with changes.`;
+      : `Approve & merge ${prMeta?.ref ?? "this PR"}${reviewNote} now, merge & deploy, or reply with changes.`;
   } else if (kind === "ci_failed") {
     fallbackDecision = prMeta?.mergeState === "DIRTY"
       ? `Have the session rebase ${prMeta?.ref ?? "this PR"} onto base and re-verify, or reply with guidance.`
       : `Have the session fix failing checks on ${prMeta?.ref ?? "this PR"}, or reply with specific instructions.`;
+  } else if (kind === "completed") {
+    fallbackDecision = "Session finished. Tap View Chat to read the result or reply, or Dismiss to clear this notification.";
+  } else if (question.kind === "suggestion" && question.meta?.plan?.nextAction) {
+    fallbackDecision = clampTextLines(cleanBriefProse(question.meta.plan.nextAction), 800);
+  } else if (fullChoicesBlock) {
+    fallbackDecision = clampTextLines(cleanBriefProse(fullChoicesBlock), 1100);
   } else if (question.card) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.card), 260);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.card), 900);
   } else if (question.body && !isMechanicalReadyBody(question.body)) {
-    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 260);
+    fallbackDecision = clampTextLines(cleanBriefProse(question.body), 1100);
   } else {
     fallbackDecision = headline;
   }
 
   const liveMergeBlocked = kind === "ci_failed"
     || (kind === "merge_ready" && (prMeta?.ciState === "PENDING" || prMeta?.ciState === "IN_PROGRESS"));
+  let resolvedWhatChanged = (rb?.whatChanged && !isProcessOnlyWhatChanged(rb.whatChanged))
+    ? (prMeta?.bodySummary && !String(rb.whatChanged).includes(prMeta.title ?? "___")
+        ? clampTextLines(`${cleanBriefProse(prMeta.bodySummary).slice(0, 420)}\n\nVerified status & caveats: ${rb.whatChanged}`, 840)
+        : clampTextLines(rb.whatChanged, 740))
+    : (fallbackWhatChanged
+        ? (rb?.whatChanged ? clampTextLines(`${fallbackWhatChanged}\n\nReview check: ${rb.whatChanged}`, 840) : fallbackWhatChanged)
+        : (rb?.whatChanged ?? null));
+  if (permPrefix && resolvedWhatChanged && !resolvedWhatChanged.includes(permDetail?.command ?? "___")) {
+    resolvedWhatChanged = clampTextLines(`${permPrefix}\n\n${resolvedWhatChanged}`, 860);
+  }
+
+  const resolvedDecision = (!liveMergeBlocked && rb?.decision && !fullChoicesBlock)
+    ? clampTextLines(rb.decision, 900)
+    : (fallbackDecision || "Needs your decision.");
+
+  const finalGoal = combinedGoalAndStory || cleanRbContext || fallbackContext;
   return {
-    context: rb?.context ? clampText(redactSecrets(rb.context), 240) : (fallbackContext ? redactSecrets(fallbackContext) : null),
-    whatChanged: rb?.whatChanged ? clampTextLines(redactSecrets(rb.whatChanged), 520) : (fallbackWhatChanged ? redactSecrets(fallbackWhatChanged) : null),
-    decision: (!liveMergeBlocked && rb?.decision) ? clampText(redactSecrets(rb.decision), 260) : redactSecrets(fallbackDecision || "Needs your decision.")
+    context: finalGoal ? clampText(redactSecrets(finalGoal), 420) : null,
+    currentState: currentState ? clampText(redactSecrets(currentState), 240) : null,
+    whatChanged: resolvedWhatChanged ? redactSecrets(resolvedWhatChanged) : null,
+    decision: redactSecrets(clampTextLines(resolvedDecision, 1100))
   };
 }
 
-function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
+function buildSuggestedReplies(question, { kind, canReply = false, recommendation = null } = {}) {
   if (!canReply || kind === "preference") return [];
+  const hasConcreteRec = Boolean(
+    recommendation
+    && !/^Session finished/i.test(recommendation)
+    && !/^Recommend:\s*Open details/i.test(recommendation)
+  );
   const rb = kind === "ci_failed" ? null : activeReviewBrief(question);
   if (Array.isArray(rb?.suggestedReplies) && rb.suggestedReplies.length > 0) {
-    return rb.suggestedReplies.slice(0, 4).map((s) => clampText(redactSecrets(s), 110)).filter(Boolean);
+    return rb.suggestedReplies
+      .slice(0, 4)
+      .map((s) => clampText(redactSecrets(s), 110))
+      .filter((s) => Boolean(s) && (hasConcreteRec || !/recommendation/i.test(s)));
   }
   if (kind === "merge_ready") {
     return [
@@ -352,13 +675,13 @@ function buildSuggestedReplies(question, { kind, canReply = false } = {}) {
   if (question.kind === "prompt") {
     return [
       "Allow",
-      "Skip that step and take a non-destructive approach"
+      "Skip that command and use a read-only / non-destructive path"
     ];
   }
   return [
-    "Go ahead with your recommendation",
-    "Approved — proceed with all items in scope",
-    "Hold off for now — let's adjust the plan"
+    ...(hasConcreteRec ? ["Proceed with the recommended option above"] : []),
+    "Approved — finish all remaining in-scope items",
+    "Hold off — tell me what's still unverified first"
   ];
 }
 
@@ -554,9 +877,41 @@ function buildResources(question, row, prRef, { openChat = null, sessionTitle = 
   return resources;
 }
 
+// Folds the decision context into the brief fields every client already
+// renders (Goal / state / what changed / decision), without dropping what the
+// brief already said, and exposes the structured parts beside them.
+function enrichBriefWithDecisionContext(brief, ctx) {
+  if (!brief || !ctx) return brief;
+  if (!brief.context && ctx.goal) brief.context = clampText(ctx.goal, 420);
+  // "Where it stands" is one short status; the longer source text moves to
+  // details for drill-down instead of being stacked into the summary.
+  const fullDetails = [brief.whatChanged, ctx.details].filter(Boolean).join("\n\n");
+  if (ctx.status) brief.whatChanged = ctx.status;
+  brief.details = fullDetails ? clampTextLines(fullDetails, 2000) : null;
+  // The recovered decision replaces a generic one ("Proceed?"): clients and
+  // the Fleet tool read brief.decision, not the context.
+  const briefFirstLine = String(brief.decision ?? "").split(/\n/)[0].trim();
+  if (ctx.decision && (ctx.agentSupplied || !briefFirstLine || isGenericAsk(briefFirstLine))) {
+    brief.decision = ctx.decision;
+  }
+  const withConsequence = ctx.options.filter((o) => o.consequence);
+  if (withConsequence.length && !/\bOptions:/.test(String(brief.decision ?? ""))) {
+    brief.decision = clampTextLines(`${brief.decision ?? ctx.decision ?? ""}\n\nOptions:\n${ctx.options.map((o) => `- ${o.label}${o.consequence ? ` — ${o.consequence}` : ""}`).join("\n")}`.trim(), 1400);
+  }
+  brief.goal = ctx.goal;
+  brief.assignment = ctx.assignment;
+  brief.whereItStands = ctx.status;
+  brief.verified = ctx.verified;
+  brief.blocked = ctx.blocked;
+  brief.options = ctx.options;
+  brief.sources = ctx.sources;
+  brief.missing = ctx.missing;
+  return brief;
+}
+
 export function buildSupervisorCard(
   question,
-  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null) } = {}
+  { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null, activeGoalResolver = null, now = Date.now() } = {}
 ) {
   const primaryKey = question.threadKey ?? question.threadKeys?.[0] ?? null;
   const row = primaryKey ? rowsByKey.get(primaryKey) ?? null : null;
@@ -577,7 +932,9 @@ export function buildSupervisorCard(
   const prTitle = hideSettledPr
     ? null
     : (clampText(redactSecrets(livePr?.title || rowPr?.title || snapPr?.title || ""), 180) || null);
-  const rawPrBody = hideSettledPr ? null : (livePr?.bodySummary ?? rowPr?.bodySummary ?? snapPr?.bodySummary ?? null);
+  const rawPrBody = hideSettledPr
+    ? null
+    : (livePr?.bodySummary ?? livePr?.body ?? rowPr?.bodySummary ?? rowPr?.body ?? snapPr?.bodySummary ?? snapPr?.body ?? null);
   const prBodySummary = rawPrBody ? clampTextLines(redactSecrets(cleanBriefProse(rawPrBody)), 2200) : null;
   const additions = hideSettledPr ? null : pickNum(livePr?.additions, rowPr?.additions, snapPr?.additions);
   const deletions = hideSettledPr ? null : pickNum(livePr?.deletions, rowPr?.deletions, snapPr?.deletions);
@@ -605,6 +962,7 @@ export function buildSupervisorCard(
   const prMeta = prRef ? {
     ref: prRef,
     title: prTitle,
+    rawBody: rawPrBody ? redactSecrets(String(rawPrBody)) : null,
     bodySummary: prBodySummary,
     isDraft,
     additions,
@@ -622,6 +980,7 @@ export function buildSupervisorCard(
 
   const { kind, kindLabel, rank } = classifyCardKind(question, row, prRef, prMeta);
   const { primaryAction, secondaryAction, extraActions } = buildActionsForQuestion(question, row, prRef, prMeta);
+  const ownerDecision = buildOwnerDecision(question, { kind, primaryAction });
   const distinctTitle = cleanSessionTitle(row?.title)
     || cleanSessionTitle(thread?.title)
     || cleanSessionTitle(snap?.threadTitle);
@@ -699,8 +1058,83 @@ export function buildSupervisorCard(
     && !["suggestion", "self-fix", "preference"].includes(String(question.kind ?? ""))
     && !((question.threadKeys ?? []).length > 1)
     && answerIn === "here";
-  const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages });
-  const suggestedReplies = buildSuggestedReplies(question, { kind, canReply });
+  const activeGoal = typeof activeGoalResolver === "function"
+    ? activeGoalResolver(primaryKey, prRef)
+    : null;
+  let recommendation = buildRecommendation(question, row, prRef, prefs, prMeta, thread);
+  const brief = buildDecisionBrief(question, row, { kind, headline, sessionTitle, prMeta, agentSummary, recentMessages, activeGoal, thread });
+  let suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
+  const rawPlan = question.meta?.plan && typeof question.meta.plan === "object" ? question.meta.plan : null;
+  const plan = rawPlan ? {
+    remedy: clampText(redactSecrets(String(rawPlan.remedy ?? "")), 40) || null,
+    label: clampText(redactSecrets(String(rawPlan.label ?? "")), 80) || null,
+    nextAction: clampTextLines(redactSecrets(String(rawPlan.nextAction ?? "")), 1200) || null,
+    acceptance: clampTextLines(redactSecrets(String(rawPlan.acceptance ?? "")), 1200) || null,
+    issueDraft: rawPlan.issueDraft
+      ? clampTextLines(redactSecrets(typeof rawPlan.issueDraft === "string" ? rawPlan.issueDraft : JSON.stringify(rawPlan.issueDraft, null, 2)), 2000) || null
+      : null
+  } : null;
+
+  const project = deriveCardProject(
+    { repo: row?.repo ?? thread?.repo ?? snap?.repo ?? parsedPr?.repo ?? null, workspace: row?.workspace ?? thread?.workspace ?? snap?.workspace ?? null, project: question?.project ?? row?.project ?? null, cwd: row?.cwd ?? null },
+    thread ?? row
+  );
+  const actorLabel = deriveActorLabel(row, thread);
+  const subchannel = deriveSubchannel(row, thread, project);
+  const blockingImpact = computeBlockingImpact({
+    threadKey: primaryKey,
+    prRef,
+    branch: row?.branch ?? thread?.branch ?? snap?.branch ?? livePr?.headRef ?? null,
+    rowsByKey,
+    blockingResolver
+  });
+  const labels = deriveBoardLabels({
+    row,
+    thread,
+    question,
+    prRef,
+    ciState,
+    subchannel,
+    blockingCount: blockingImpact.blockingCount
+  });
+
+  // The shared decision-ready standard: goal, assignment, verified/changed/
+  // blocked, and the decision with options, consequences and recommendation.
+  // A grouped question ("4 stopped") is not about its first member: no
+  // member's chat, title or goal is used as the group's context.
+  const groupedQuestion = !question.threadKey && Array.isArray(question.threadKeys) && question.threadKeys.length > 0;
+  const groupName = groupedQuestion
+    ? groupItemName(question, (k) => rowsByKey.get(k) ?? threadsByKey.get(k) ?? null)
+    : null;
+  const decisionContext = buildDecisionContext({
+    question,
+    itemName: groupName,
+    project: groupedQuestion ? null : (project && project !== "general" ? project : null),
+    sessionTitle: groupedQuestion ? null : sessionTitle,
+    prMeta: prMeta ? { ...prMeta, url: prUrl } : null,
+    recentMessages: groupedQuestion ? [] : recentMessages,
+    // The full latest reply, not the 700/1600-char excerpts: a long
+    // DECISION CONTEXT block must still be parsed from its marker.
+    agentSummary: groupedQuestion ? null : (thread?.lastAgentFull
+      ? redactSecrets(stripAttachmentMarkdown(thread.lastAgentFull))
+      : (snap?.agentSummary ? redactSecrets(String(snap.agentSummary)) : agentSummary)),
+    activeGoal: groupedQuestion ? null : activeGoal,
+    openChat,
+    currentState: brief.currentState,
+    recommendation,
+    reviewBrief: activeReviewBrief(question),
+    permission: question.kind === "prompt" ? extractPermissionDetail(question, thread) : null,
+    contextRequest: question.contextRequest ?? null,
+    now: Number(now) || Date.now()
+  });
+  enrichBriefWithDecisionContext(brief, decisionContext);
+  // The agent's own recommendation, recovered from its context reply, is the
+  // one clients show (they read card.recommendation, not the context).
+  if (decisionContext.agentSupplied && decisionContext.recommendation) {
+    recommendation = clampText(redactSecrets(decisionContext.recommendation), 240);
+    suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
+  }
+  const heldForContext = shouldHoldForContext(question, decisionContext, Number(now) || Date.now());
 
   return {
     id: question.id,
@@ -709,10 +1143,23 @@ export function buildSupervisorCard(
     kindLabel,
     rank,
     headline,
+    ...ownerDecision,
+    // Held for context, or Supervisor delivery recovery ("N stopped. Nudges
+    // can't get through"): neither waits on the owner, so no Done is needed.
+    ...(heldForContext || (question.kind === "deliver" && decisionContext.askType === "session_error") ? { needsYou: false } : {}),
+    askType: decisionContext.askType,
+    contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
+    decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },
     sessionTitle,
-    summary: buildSummary(question, row, { headline, prMeta, agentSummary }),
-    recommendation: buildRecommendation(question, row, prRef, prefs, prMeta),
+    // A reply that never reached the agent says so first, so the owner does
+    // not re-answer blind (an unconfirmed one may already have landed).
+    summary: question.deliveryNote
+      ? clampText(redactSecrets(`${question.deliveryNote} — ${buildSummary(question, row, { headline, prMeta, agentSummary })}`), 700)
+      : buildSummary(question, row, { headline, prMeta, agentSummary }),
+    ...(question.deliveryNote ? { deliveryNote: question.deliveryNote } : {}),
+    recommendation,
     brief,
+    ...(plan ? { plan } : {}),
     suggestedReplies,
     canReply,
     agentSummary,
@@ -738,7 +1185,13 @@ export function buildSupervisorCard(
     extraActions,
     timeline: buildTimeline(question, row, actions, prMeta),
     resources: buildResources(question, row, prRef, { openChat, sessionTitle, prUrlOverride: prUrl }),
-    openChat
+    openChat,
+    project,
+    actorLabel,
+    subchannel,
+    labels,
+    blockingCount: blockingImpact.blockingCount,
+    blockingSummary: blockingImpact.blockingSummary
   };
 }
 
@@ -780,7 +1233,11 @@ export function buildActiveSummary(snapshot, liveCards = []) {
         prRef: row.pr?.ref ?? null,
         ciState: row.pr?.ci?.state ?? null,
         lastActivityAt: row.lastActivityAt ?? null,
-        openChat: row.openChat ?? null
+        openChat: row.openChat ?? null,
+        actorLabel: row.actorLabel ?? null,
+        subchannel: row.subchannel ?? null,
+        labels: Array.isArray(row.labels) ? row.labels : [],
+        nextCheckAt: row.nextCheckAt ?? null
       });
     }
   }
@@ -877,26 +1334,272 @@ export function buildCatchUpSummary(cards = [], activeSummary = null) {
   return "All clear—no coding sessions need you right now.";
 }
 
-export function deriveCardProject(card = null, thread = null) {
-  const explicit = typeof card?.project === "string" ? card.project.trim() : "";
-  if (explicit && explicit !== "General") return explicit;
+const JUNK_PROJECT_NAMES = new Set([
+  "general", "workspace", "workspaces", "worktree", "worktrees", "codex-worktrees",
+  "imported-history", "imported history", "history", "tmp", "temp", "private", "var",
+  "folders", "outputs", "migrated", "mac", "users", "home", "dev", "documents",
+  "downloads", "desktop", "repos", "projects", "code", "src", "main", "master", "smoke"
+]);
+
+function isJunkProjectToken(token) {
+  const clean = String(token ?? "").trim();
+  if (!clean) return true;
+  const lower = clean.toLowerCase();
+  if (JUNK_PROJECT_NAMES.has(lower)) return true;
+  if (OPAQUE_SESSION_ID_RE.test(clean)) return true;
+  if (/^\d{3,8}$/.test(clean)) return true;
+  if (/^[0-9a-f]{4,16}$/i.test(clean)) return true;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) return true;
+  return false;
+}
+
+function applyProjectAlias(name, aliases = null) {
+  const clean = String(name ?? "").trim().replace(/^#/, "");
+  if (!clean) return "general";
+  if (aliases && typeof aliases === "object") {
+    const slug = clean.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (slug && typeof aliases[slug] === "string" && aliases[slug].trim()) {
+      return aliases[slug].trim();
+    }
+  }
+  return clean;
+}
+
+function extractProjectFromPath(rawPath) {
+  const clean = String(rawPath ?? "").trim().replace(/\/+$/, "");
+  if (!clean) return null;
+  const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/.exec(clean)
+    ?? /\/conductor\/workspaces\/([^/]+)\/([^/]+)/.exec(clean)
+    ?? /\/([^/]+)\/\.conductor\/([^/]+)/.exec(clean);
+  if (wtMatch?.[1] && !isJunkProjectToken(wtMatch[1])) return wtMatch[1];
+  const repoMatch = /\/conductor\/repos\/([^/]+)/.exec(clean)
+    ?? /\/codex-worktrees\/[0-9a-f_-]+\/([^/]+)/i.exec(clean)
+    ?? /(?:\/Users\/[^/]+|\/home\/[^/]+)\/(?:Dev|Developer|Code|Projects|Repos)\/([^/]+)/i.exec(clean);
+  if (repoMatch?.[1] && !isJunkProjectToken(repoMatch[1])) return repoMatch[1];
+  if (/\/imported[- ]history(?:\/|$)/i.test(clean)) return null;
+  const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
+  if (!base || isJunkProjectToken(base)) {
+    return null;
+  }
+  return base;
+}
+
+export function deriveCardProject(card = null, thread = null, orgOverride = null) {
+  const aliases = orgOverride?.projectAliases ?? null;
+  const overrideProj = typeof orgOverride?.project === "string" ? orgOverride.project.trim().replace(/^#/, "") : "";
+  if (overrideProj && overrideProj.toLowerCase() !== "general") return applyProjectAlias(overrideProj, aliases);
+  const explicit = typeof card?.project === "string" ? card.project.trim().replace(/^#/, "") : "";
+  if (explicit && !isJunkProjectToken(explicit)) return applyProjectAlias(explicit, aliases);
+  const rawLabels = Array.isArray(thread?.meta?.paseoLabels) ? thread.meta.paseoLabels : [];
+  for (const label of rawLabels) {
+    const slash = String(label ?? "").indexOf("/");
+    if (slash > 0) {
+      const prefix = String(label).slice(0, slash).trim();
+      if (prefix && !isJunkProjectToken(prefix) && prefix.toLowerCase() !== "infrastructure") {
+        return applyProjectAlias(prefix, aliases);
+      }
+    }
+  }
   const repo = String(card?.repo ?? thread?.repo ?? "").trim();
   if (repo) {
     const seg = repo.split("/").filter(Boolean).at(-1);
-    if (seg) return seg;
+    if (seg && !isJunkProjectToken(seg)) return applyProjectAlias(seg, aliases);
   }
-  const dir = String(thread?.cwd ?? card?.workspace ?? thread?.workspace ?? "").trim();
-  if (dir) {
-    const clean = dir.replace(/\/+$/, "");
-    const base = clean.includes("/") ? clean.split("/").filter(Boolean).at(-1) : clean;
-    if (base && base !== "Workspace" && base !== "workspace") return base;
+  const paseoProjectName = String(thread?.meta?.paseoProjectName ?? "").trim();
+  if (paseoProjectName && !isJunkProjectToken(paseoProjectName)) {
+    return applyProjectAlias(paseoProjectName, aliases);
+  }
+  const origCwd = thread?.meta?.agentLabels?.["migration.originalCwd"] ?? null;
+  for (const candidate of [thread?.cwd, thread?.meta?.paseoProjectRoot, thread?.meta?.paseoCwd, origCwd, card?.cwd, card?.workspace, thread?.workspace]) {
+    const extracted = extractProjectFromPath(candidate);
+    if (extracted) return applyProjectAlias(extracted, aliases);
+  }
+  const agentTheme = String(thread?.meta?.agentLabels?.theme ?? thread?.meta?.theme ?? "").trim();
+  if (agentTheme && !isJunkProjectToken(agentTheme) && agentTheme.toLowerCase() !== "misc") {
+    return applyProjectAlias(agentTheme, aliases);
   }
   return "general";
 }
 
+function cleanSubAreaSlug(raw) {
+  const clean = String(raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^#/, "")
+    .replace(/[^a-z0-9/_-]+/g, "-")
+    .replace(/\/{2,}/g, "/")
+    .replace(/^[-/]+|[-/]+$/g, "");
+  if (!clean || OPAQUE_SESSION_ID_RE.test(clean) || clean === "general" || clean === "workspace") return null;
+  return clean.slice(0, 32);
+}
+
+export function deriveActorLabel(row = null, thread = null) {
+  const rawKind = String(thread?.kind ?? row?.kind ?? parsePaseoThreadKey(row?.key ?? thread?.key)?.kind ?? "").trim().toLowerCase();
+  const isPaseo = rawKind === "paseo" || Boolean(parsePaseoThreadKey(row?.key ?? thread?.key));
+  const providerRaw = String(thread?.meta?.provider ?? row?.provider ?? rawKind).trim();
+  const providerLeaf = providerRaw.includes("/") ? providerRaw.split("/")[0] : providerRaw;
+  const engine = (providerLeaf && providerLeaf !== "paseo" ? providerLeaf : null)
+    ?? (thread?.openChat?.app && thread.openChat.app !== "paseo" ? thread.openChat.app : null)
+    ?? (isPaseo ? "paseo" : rawKind || null);
+  const model = clampText(String(thread?.meta?.model ?? row?.model ?? "").trim(), 48) || null;
+  const hostVia = isPaseo
+    ? "Paseo"
+    : (rawKind === "conductor"
+        ? "Conductor"
+        : (rawKind === "codex"
+            ? "Codex"
+            : (rawKind === "claude"
+                ? "Claude Code"
+                : (rawKind === "antigravity" ? "Antigravity" : null))));
+  const head = [engine, model && !engine?.includes(model) ? model : null].filter(Boolean).join(" · ");
+  if (!head) return hostVia ?? null;
+  if (hostVia && hostVia.toLowerCase() !== engine?.toLowerCase()) {
+    return `${head} via ${hostVia}`;
+  }
+  return head;
+}
+
+export function deriveSubchannel(row = null, thread = null, explicitProject = null, orgOverride = null) {
+  const proj = cleanSubAreaSlug(explicitProject || deriveCardProject(row, thread, orgOverride)) || "general";
+  if (typeof orgOverride?.theme === "string" && orgOverride.theme.trim()) {
+    const cleaned = cleanSubAreaSlug(orgOverride.theme);
+    if (cleaned && cleaned !== proj) {
+      return cleaned.includes("/") ? cleaned : `${proj}/${cleaned}`;
+    }
+  }
+  const explicitSub = typeof (row?.subchannel ?? thread?.meta?.subchannel) === "string"
+    ? row?.subchannel ?? thread?.meta?.subchannel
+    : null;
+  if (explicitSub) {
+    const cleaned = cleanSubAreaSlug(explicitSub);
+    if (cleaned) {
+      return cleaned.includes("/") ? cleaned : `${proj}/${cleaned}`;
+    }
+  }
+  const theme = cleanSubAreaSlug(row?.theme ?? thread?.theme ?? thread?.meta?.theme);
+  if (theme && theme !== proj) {
+    return theme.includes("/") ? theme : `${proj}/${theme}`;
+  }
+  const rawLabels = Array.isArray(thread?.meta?.paseoLabels) ? thread.meta.paseoLabels : [];
+  for (const label of rawLabels) {
+    const trimmed = String(label ?? "").trim();
+    const slash = trimmed.indexOf("/");
+    if (slash > 0) {
+      const leaf = cleanSubAreaSlug(trimmed.slice(slash + 1));
+      if (leaf && leaf !== proj) return `${proj}/${leaf}`;
+    }
+  }
+  const rawCwd = String(thread?.cwd ?? thread?.meta?.paseoCwd ?? row?.cwd ?? "").trim().replace(/\/+$/, "");
+  if (rawCwd) {
+    const wtMatch = /\/(?:\.paseo|paseo)\/worktrees\/([^/]+)\/([^/]+)/i.exec(rawCwd)
+      ?? /\/conductor\/workspaces\/([^/]+)\/([^/]+)/i.exec(rawCwd);
+    if (wtMatch?.[2]) {
+      const wt = cleanSubAreaSlug(wtMatch[2]);
+      if (wt && wt !== proj) return `${proj}/${wt}`;
+    }
+    const base = cleanSubAreaSlug(rawCwd.split("/").filter(Boolean).at(-1));
+    if (base && base !== proj && rawCwd.toLowerCase().includes(`/${proj}/`)) {
+      return `${proj}/${base}`;
+    }
+  }
+  return null;
+}
+
+export function deriveBoardLabels({
+  row = null,
+  thread = null,
+  question = null,
+  prRef = null,
+  ciState = null,
+  subchannel = null,
+  blockingCount = 0
+} = {}) {
+  const out = [];
+  const seen = new Set();
+  const push = (key, value) => {
+    const k = String(key ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    const v = String(value ?? "").trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_./#-]/g, "");
+    if (!k || !v) return;
+    const token = `${k}=${v}`.slice(0, 64);
+    if (seen.has(token)) return;
+    seen.add(token);
+    out.push(token);
+  };
+
+  const watchGroup = row?.watch?.group ?? null;
+  const rawState = String(row?.state ?? thread?.agentStatus ?? "").toLowerCase();
+  if (blockingCount > 0 || question?.kind === "blocked" || ciState === "FAILURE" || ciState === "ERROR" || row?.health === "red" || watchGroup === "blocked") {
+    push("state", "blocked");
+  } else if (watchGroup === "you" || question?.status === "open" || rawState === "waiting" || rawState === "needs-human") {
+    push("state", "waiting");
+  } else if (question?.kind === "ready" || rawState === "ready-needs-human") {
+    push("state", "ready");
+  } else if (row?.agentStatus === "running" || rawState === "running" || watchGroup === "working") {
+    push("state", "running");
+  } else if (rawState && rawState !== "unknown") {
+    push("state", rawState);
+  }
+
+  const providerRaw = String(thread?.meta?.provider ?? row?.provider ?? thread?.kind ?? row?.kind ?? "").trim();
+  const agentLeaf = providerRaw.includes("/") ? providerRaw.split("/")[0] : providerRaw;
+  if (agentLeaf) push("agent", agentLeaf);
+
+  const parsedPr = parsePrRef(prRef ?? row?.pr?.ref ?? thread?.prRefs?.[0]);
+  if (parsedPr?.number) push("pr", `#${parsedPr.number}`);
+
+  const ci = String(ciState ?? row?.pr?.ci?.state ?? "").toUpperCase();
+  if (ci === "SUCCESS") push("ci", "passing");
+  else if (ci === "FAILURE" || ci === "ERROR") push("ci", "failing");
+  else if (ci === "PENDING" || ci === "IN_PROGRESS") push("ci", "pending");
+
+  if (subchannel && subchannel.includes("/")) {
+    push("area", subchannel.split("/").slice(1).join("/"));
+  }
+  return out;
+}
+
+export function computeBlockingImpact({
+  threadKey = null,
+  prRef = null,
+  branch = null,
+  rowsByKey = new Map(),
+  blockingResolver = null
+} = {}) {
+  const taskImpact = typeof blockingResolver === "function" && threadKey
+    ? (blockingResolver(threadKey) ?? { count: 0, blockingTitles: [] })
+    : { count: 0, blockingTitles: [] };
+  const taskCount = Number.isFinite(taskImpact?.count) ? Math.max(0, taskImpact.count) : 0;
+  const titles = Array.isArray(taskImpact?.blockingTitles) ? taskImpact.blockingTitles.filter(Boolean) : [];
+
+  let peerWaitingCount = 0;
+  for (const [k, r] of rowsByKey ?? []) {
+    if (!k || !r || k === threadKey || r.muted) continue;
+    const samePr = Boolean(prRef && r.pr?.ref && r.pr.ref === prRef);
+    const sameBranch = Boolean(branch && r.branch && r.branch === branch);
+    if (!samePr && !sameBranch) continue;
+    const waitingLike = r.watch?.group === "waiting" || r.watch?.group === "blocked" || r.state === "waiting" || r.health === "red";
+    if (waitingLike) peerWaitingCount += 1;
+  }
+
+  const blockingCount = taskCount + peerWaitingCount;
+  if (blockingCount <= 0) return { blockingCount: 0, blockingSummary: null };
+  if (taskCount > 0) {
+    const sample = titles[0] ? ` (${clampText(titles[0], 42)})` : "";
+    return {
+      blockingCount,
+      blockingSummary: `Blocking ${blockingCount} downstream item${blockingCount === 1 ? "" : "s"}${sample}`
+    };
+  }
+  const target = prRef || branch || "downstream work";
+  return {
+    blockingCount,
+    blockingSummary: `Blocking ${peerWaitingCount} waiting session${peerWaitingCount === 1 ? "" : "s"} on ${target}`
+  };
+}
+
 export function buildSupervisorDeck(
   state,
-  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map() } = {}
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null, activeGoalResolver = null } = {}
 ) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
@@ -905,16 +1608,22 @@ export function buildSupervisorDeck(
   for (const r of snapshot?.threads ?? []) if (r?.key) rowsByKey.set(r.key, r);
   const actions = Array.isArray(state?.actions) ? state.actions : [];
   const questions = Array.isArray(state?.questions) ? state.questions : [];
+  const aliasOverride = projectAliases ? { projectAliases } : null;
 
-  const questionCards = questions
+  const allQuestionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs }))
+    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver, now }))
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
+  const questionCards = allQuestionCards.filter((card) => card.needsYou !== false);
 
   const prefCards = buildProgressivePreferenceCards(prefs, { now });
   const cards = [...questionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
     ...card,
-    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null)
+    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null, aliasOverride)
+  }));
+  const allCards = [...allQuestionCards, ...prefCards].map(({ rank: _rank, ...card }) => ({
+    ...card,
+    project: deriveCardProject(card, card.threadKey ? rowsByKey.get(card.threadKey) : null, aliasOverride)
   }));
 
   const activeSummary = buildActiveSummary(snapshot, cards);
@@ -922,10 +1631,14 @@ export function buildSupervisorDeck(
   const catchUpSummary = buildCatchUpSummary(cards, activeSummary);
 
   return {
-    cards,
+    // Keep non-actionable completion cards addressable for Context/Inspect and
+    // the explicit archive flow; clients filter them from Needs You by needsYou.
+    cards: allCards,
     preferences: {
       mergePolicy: prefs.mergePolicy,
       cadence: prefs.cadence,
+      checkinCooldownMinutes: prefs.checkinCooldownMinutes,
+      checkinFormat: prefs.checkinFormat,
       autoSlices: { ...prefs.autoSlices }
     },
     autonomy,

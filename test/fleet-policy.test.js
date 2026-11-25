@@ -122,6 +122,45 @@ test("row: logged-out and disk-full ask the owner at once", () => {
   }
 });
 
+const AUTH_NOT_FOUND = "[System Error] unexpected status 503 Service Unavailable: auth_not_found: no auth available (providers=codex, model=gpt-6.2-sol)";
+
+test("row: provider-auth asks the owner and never resumes, however long or often it fails", () => {
+  const thread = makeThread({ agentStatus: "error", lastAgentAt: ago(2 * MIN), lastActivityAt: ago(2 * MIN), error: { kind: "provider-auth", text: AUTH_NOT_FOUND, resetAt: null } });
+  const mark = { head: HEAD, unresolved: 0 };
+  const ledgers = [{}, { lastNudgeAt: ago(20 * MIN), attemptsWithoutProgress: 1, lastProgressMark: mark, nudges: [] }, { lastNudgeAt: ago(90 * MIN), attemptsWithoutProgress: 3, lastProgressMark: mark, nudges: [] }];
+  const keys = new Set();
+  for (const now of [NOW, NOW + 6 * MIN, NOW + 40 * MIN, NOW + 6 * 60 * MIN]) {
+    for (const ledger of ledgers) {
+      const { classified, decision } = run(thread, { now, ledger });
+      assert.equal(classified.infraKind, "provider-auth");
+      assert.equal(decision.action, "ask-user");
+      assert.equal(decision.message, null, "nothing is sent to the chat");
+      assert.notEqual(decision.playbook, "resume");
+      assert.match(decision.reason, /provider auth missing \(providers=codex, model=gpt-6\.2-sol\)/);
+      keys.add(decision.question.dedupeKey);
+    }
+  }
+  assert.equal(keys.size, 1, "one question per distinct failure");
+  const { decision } = run(thread);
+  assert.deepEqual(decision.question.options, ["retry", "later"]);
+  assert.equal(decision.question.kind, "infra");
+  assert.match(decision.question.title, /no codex auth on the proxy/);
+  assert.ok(decision.question.title.length <= 100);
+  assert.match(decision.question.body, /gpt-6\.2-sol/);
+  assert.doesNotMatch(`${decision.question.title} ${decision.question.body}`, /System Error|503/);
+  // A different provider or model is a different failure.
+  const other = makeThread({ ...thread, error: { ...thread.error, text: AUTH_NOT_FOUND.replace("gpt-6.2-sol", "gpt-6-luna") } });
+  assert.notEqual(run(other).decision.question.dedupeKey, decision.question.dedupeKey);
+});
+
+test("row: a genuine 503 overload still backs off and resumes", () => {
+  const thread = makeThread({ agentStatus: "error", lastAgentAt: ago(2 * MIN), lastActivityAt: ago(2 * MIN), error: { kind: "overloaded", text: "unexpected status 503 Service Unavailable", resetAt: null } });
+  assert.equal(run(thread).decision.action, "wait");
+  const after = run(thread, { now: NOW + 4 * MIN }).decision;
+  assert.equal(after.action, "nudge");
+  assert.equal(after.playbook, "resume");
+});
+
 test("row: waiting-ci watches, then sends CI finished on the exact head", () => {
   const thread = makeThread({ lastAgentText: "CI is running on aaaaaaaaaa. I'll report the verdict when it lands." });
   const pending = run(thread, { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;

@@ -327,7 +327,9 @@ export class OutcomeStore {
       if (o.kind === "agent-reply" && agentStore && o.sessionId) {
         const session = agentStore.getSession(o.sessionId);
         const idx = (session.messages ?? []).findIndex((m) => m.metadata?.outcomeId === o.id || m.id === o.refId);
-        const followups = idx >= 0 ? session.messages.slice(idx + 1).filter((m) => m.role === "user") : [];
+        // No-capture messages (e.g. a Pebble ring recording) are not the
+        // owner's feedback on this reply.
+        const followups = idx >= 0 ? session.messages.slice(idx + 1).filter((m) => m.role === "user" && m.metadata?.noCapture !== true) : [];
         if (followups.length > 0) {
           score = inferToneScore(followups[0].content);
           source = "user-followup";

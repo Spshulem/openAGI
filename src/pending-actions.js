@@ -31,6 +31,10 @@ export class PendingActionStore {
     // journaled): a confirmed card's follow-up steps are judged on them.
     this.ownerIntents = new Map();
     this.events = null;
+    // Called with each new card that waits on the owner, announced or not
+    // (a chat card stays off the SSE bus but still reaches the phone's
+    // notification). A re-raised card is the same card, so it never calls.
+    this.raiseListeners = new Set();
     // Recovery and expiry happen while the durable runtime is constructed,
     // before createHostedInterface owns/binds the live event bus. Hold those
     // resolutions until bindEvents() so the durable outreach copy is not left
@@ -51,6 +55,14 @@ export class PendingActionStore {
     for (const payload of deferred) {
       this.events?.emit?.("pending-action-resolved", payload);
     }
+  }
+
+  /// Returns the unsubscribe. Listeners must not throw; one that does is
+  /// ignored, never the enqueue.
+  watch(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.raiseListeners.add(listener);
+    return () => this.raiseListeners.delete(listener);
   }
 
   list({ status } = {}) {
@@ -142,6 +154,11 @@ export class PendingActionStore {
       code: action.confirmCode,
       createdAt: action.createdAt
     });
+    if (cardMode !== "owner") {
+      for (const listener of this.raiseListeners) {
+        try { listener(action); } catch { /* a notifier must never fail the enqueue */ }
+      }
+    }
     return action;
   }
 
@@ -240,9 +257,11 @@ export class PendingActionStore {
     return action;
   }
 
-  prepareContinuation(id, { requestId, sessionId, resetFailed = false } = {}) {
+  // allowFailedExecution: a scheduled run resumes to report an approved tool
+  // that failed (the tool is not rerun). A computer-use resume never does.
+  prepareContinuation(id, { requestId, sessionId, resetFailed = false, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
-    if (!action || action.status !== "approved" || action.error != null) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution)) return null;
     if (action.continuation?.status === "delivered") return action.continuation;
     if (action.continuation && !(resetFailed && action.continuation.status === "failed")) {
       return action.continuation;
@@ -260,10 +279,10 @@ export class PendingActionStore {
     return action.continuation;
   }
 
-  claimContinuation(id, { maxAttempts = 5 } = {}) {
+  claimContinuation(id, { maxAttempts = 5, allowFailedExecution = false } = {}) {
     const action = this.actions.get(id);
     const continuation = action?.continuation;
-    if (!action || action.status !== "approved" || action.error != null || !continuation) return null;
+    if (!action || action.status !== "approved" || (action.error != null && !allowFailedExecution) || !continuation) return null;
     if (!new Set(["pending", "failed"]).has(continuation.status)) return null;
     if (continuation.attempts >= maxAttempts) return null;
     const deliveryId = createId("delivery");
@@ -386,6 +405,21 @@ export class PendingActionStore {
     appendJsonLine(this._journalPath(), event);
   }
 
+  // Retires one pending card whose context no longer holds, with the reason.
+  expire(id, reason) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "pending") return null;
+    const decidedAt = new Date(this.now()).toISOString();
+    action.status = "expired";
+    this.ownerIntents.delete(action.id);
+    action.decidedAt = decidedAt;
+    action.decidedBy = "system";
+    action.error = String(reason ?? "Approval expired before it was used.").slice(0, 300);
+    this._appendJournal({ op: "decide", id: action.id, status: action.status, decidedAt, decidedBy: action.decidedBy, error: action.error });
+    this._emitResolution(action);
+    return action;
+  }
+
   _expirePending() {
     const atMs = this.now();
     const decidedAt = new Date(atMs).toISOString();
@@ -475,6 +509,12 @@ function serializableContext(ctx) {
     from: ctx.from ?? null,
     target: ctx.target ?? null,
     origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Lets an approval resume the scheduled run that raised it.
+    ...(typeof ctx.scheduledJobId === "string" ? { scheduledJobId: ctx.scheduledJobId.slice(0, 200) } : {}),
+    ...(typeof ctx.scheduledJobName === "string" ? { scheduledJobName: ctx.scheduledJobName.slice(0, 200) } : {}),
+    // Server-built record of how the run was allowed to act. A one-shot job
+    // is gone by the time its card is approved, so the resume reads it here.
+    ...(ctx.ownerSchedule === true ? { ownerSchedule: true } : {}),
     // Audit only: a replayed record is plain data and never owner authority.
     authority: authorityRecord(ctx.__owner),
     // Grading provenance only (ids and numbers, no authority): lets work a

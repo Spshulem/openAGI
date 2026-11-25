@@ -109,5 +109,9 @@ final class PendingActionDecodingTests: XCTestCase {
         let legacy = PendingAction.raised(in: actions, thread: .agent, conversationID: "main",
                                           since: asked, scopedToSession: false)
         XCTAssertEqual(legacy.map(\.id), ["other-1", "other-2", "other-3"])
+        // A hidden card frees its slot for the next one.
+        let afterHiding = PendingAction.raised(in: actions, thread: .agent, conversationID: "main",
+                                               since: asked, scopedToSession: false, excluding: ["other-1"])
+        XCTAssertEqual(afterHiding.map(\.id), ["other-2", "other-3", "no-context"])
     }
 }

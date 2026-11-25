@@ -14,6 +14,9 @@ data class SendMessageRequest(
     // "agent" or "supervisor": the shared thread every paired device talks
     // in (PROTOCOL.md §3.1). With it the daemon ignores from and sessionId.
     val thread: String? = null,
+    // This phone's own name for the turn (PROTOCOL.md §3.1 "Recovering a
+    // turn"): sending it again never runs the turn twice. Omitted when null.
+    val requestId: String? = null,
 )
 
 // GET /conversations/:thread/messages (PROTOCOL.md §3.1). Oldest first; user
@@ -27,7 +30,15 @@ data class ConversationMessage(
     @Serializable(with = InstantSerializer::class) val at: Instant,
     val sourceNodeId: String? = null,
     val sourceName: String? = null,
+    // The turn this line belongs to; a phone matches its own send and the
+    // reply to it by this. "failed" marks main's stored failure record.
+    val requestId: String? = null,
+    val status: String? = null,
 )
+
+// A turn main is still running in the thread with no client attached.
+@Serializable
+data class InFlightTurn(val requestId: String, val stage: String? = null, val startedAt: String? = null)
 
 @Serializable
 data class ConversationPage(
@@ -35,6 +46,9 @@ data class ConversationPage(
     val messages: List<ConversationMessage> = emptyList(),
     // The `before` cursor for the next older page; null at the thread's start.
     val nextBefore: String? = null,
+    // Turns still running (newest page only). Null from a main older than
+    // turn recovery, which cannot say.
+    val inFlight: List<InFlightTurn>? = null,
 )
 
 // The /events frame that says a shared thread has a new stored message.

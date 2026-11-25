@@ -7,8 +7,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "2132"
+    MARKETING_VERSION: "1.2"
+    CURRENT_PROJECT_VERSION: "2154"
     DEVELOPMENT_TEAM: ""
     # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
     # provisioning profile — it works on any Mac, headless or not) rather
@@ -39,7 +39,7 @@ settings:
     #
     # Supervisor push (APNs alerts + push-to-start Live Activities) needs a
     # real Apple Developer Team: set DEVELOPMENT_TEAM, enable Push
-    # Notifications on the sh.openagi.OpenAGI App ID, and sign with a profile.
+    # Notifications on the com.spencershulem.openagi App ID, and sign with a profile.
     # The aps-environment entitlement below is declared unconditionally:
     # ad-hoc ("-") Simulator builds still build and run with it, and without
     # a team the app simply never completes push registration (it fails
@@ -51,9 +51,9 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
     # App Group ids are global across Apple teams; a team that cannot
     # register this one overrides it (xcodebuild OPENAGI_APP_GROUP=...).
-    OPENAGI_APP_GROUP: group.sh.openagi.mobile
+    OPENAGI_APP_GROUP: group.com.spencershulem.openagi
     # Bundle ids are global too; the extensions derive theirs from it.
-    OPENAGI_BUNDLE_ID: sh.openagi.OpenAGI
+    OPENAGI_BUNDLE_ID: com.spencershulem.openagi
 packages:
   SupervisorChannelsKit:
     path: ../../shared/SupervisorChannelsKit
@@ -86,7 +86,7 @@ targets:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: true
         NSLocalNetworkUsageDescription: OpenAGI finds and connects to your OpenAGI servers on your local network.
-        NSMicrophoneUsageDescription: OpenAGI uses your microphone when you tap Dictate to write a message. You review it before sending.
+        NSMicrophoneUsageDescription: OpenAGI uses your microphone when you tap Dictate to write a message, or start a voice conversation with your Supervisor. Voice audio goes to your paired OpenAGI hub, which uses OpenAI to understand and answer it.
         NSSpeechRecognitionUsageDescription: OpenAGI transcribes your dictated messages on this iPhone. Audio is not sent to your agent or a cloud transcription service.
         NSBonjourServices: ["_openagi._tcp"]
         BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
@@ -184,6 +184,7 @@ targets:
       - path: Tests
     dependencies:
       - target: OpenAGI
+      - package: SupervisorChannelsKit
     settings:
       base:
         BUNDLE_LOADER: $(TEST_HOST)
@@ -196,6 +197,7 @@ targets:
       - path: UITests
     dependencies:
       - target: OpenAGI
+      - package: SupervisorChannelsKit
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

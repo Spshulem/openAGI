@@ -38,6 +38,7 @@ import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.snapshotFlow
@@ -73,6 +74,9 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -129,6 +133,8 @@ internal sealed interface ChatEntry {
         override val serverId: String? = null,
         // Set only when another paired device (a G2, another phone) sent it.
         val sourceName: String? = null,
+        // This phone's id for the turn (PROTOCOL.md §3.1).
+        val requestId: String? = null,
     ) : ChatEntry
 
     data class Assistant(
@@ -146,6 +152,16 @@ internal sealed interface ChatEntry {
         // stream's status frames. Shown only while streaming; never saved.
         val activity: String? = null,
         override val serverId: String? = null,
+        // Turn recovery (PROTOCOL.md §3.1, ChatTurnRecovery). The turn id;
+        // main accepted it (its `session` frame or any text); accepted and
+        // then the stream was lost, so it is found again in history, never
+        // resent; never confirmed, so resent once (same id) on next resume;
+        // main lost it, so a retry is a new turn.
+        val requestId: String? = null,
+        val accepted: Boolean = false,
+        val detached: Boolean = false,
+        val autoRetry: Boolean = false,
+        val newRequestOnRetry: Boolean = false,
     ) : ChatEntry
 }
 
@@ -221,6 +237,21 @@ class ChatConversationState(
 
     private var refreshJob: Job? = null
     private var refreshAgain = false
+    private var lastRefreshSucceeded = false
+
+    // A main without shared history (404) can't find a lost reply again:
+    // say so as before, with no automatic resend.
+    private fun historyMissing() {
+        if (messages.value.none { it is ChatEntry.Assistant && it.detached }) return
+        messages.value = messages.value.map { entry ->
+            if (entry is ChatEntry.Assistant && entry.detached) {
+                entry.copy(text = "Reply stopped early.", failureDetail = "Try again.", streaming = false, failed = true, detached = false, activity = null)
+            } else {
+                entry
+            }
+        }
+        persist()
+    }
 
     // Loads the thread's newest page and folds it in. Calls that arrive while
     // one is running collapse into one more run, so a burst of events costs
@@ -246,14 +277,17 @@ class ChatConversationState(
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (missing: DaemonException.NotFound) {
+                        historyMissing()
                         break
                     } catch (error: Exception) {
                         if (refreshAgain) break
                     }
                 }
                 if (page == null) continue
+                lastRefreshSucceeded = true
                 var id = nextId.value
-                messages.value = ChatHistoryMerge.merge(messages.value, page, nodeId) { id++ }
+                val merged = ChatHistoryMerge.merge(messages.value, page, nodeId) { id++ }
+                messages.value = ChatTurnRecovery.resolve(merged, page)
                 nextId.value = id
                 // When the page is the oldest line shown, it alone says whether
                 // anything older exists; older lines kept above it keep theirs.
@@ -308,15 +342,40 @@ class ChatConversationState(
         from: String?,
         sessionId: String?,
         send: (text: String, from: String?, sessionId: String?, thread: String?) -> Flow<SseFrame>,
+    ): Flow<SseFrame> = messageStream(text, from, sessionId, null) { t, f, s, th, _ -> send(t, f, s, th) }
+
+    // With a turn id, a 400 before any frame is first an older main refusing
+    // `requestId` (it validates before running anything): resent once
+    // without it, keeping the thread, and remembered for the pairing. Only
+    // if that is refused too is it the `thread` field.
+    internal fun messageStream(
+        text: String,
+        from: String?,
+        sessionId: String?,
+        requestId: String?,
+        send: (text: String, from: String?, sessionId: String?, thread: String?, requestId: String?) -> Flow<SseFrame>,
     ): Flow<SseFrame> = flow {
         val name = sharedThread
         if (name == null) {
-            emitAll(send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null))
+            emitAll(send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null, null))
             return@flow
         }
         var received = false
+        val turnId = requestId?.takeIf { threadSupport.turnIds }
+        if (turnId != null) {
+            try {
+                send(text, from, sessionId, name, turnId).collect { frame ->
+                    received = true
+                    emit(frame)
+                }
+                return@flow
+            } catch (error: DaemonException.Server) {
+                if (error.code != 400 || received) throw error
+            }
+        }
         try {
-            send(text, from, sessionId, name).collect { frame ->
+            send(text, from, sessionId, name, null).collect { frame ->
+                if (!received && turnId != null) threadSupport.turnIds = false
                 received = true
                 emit(frame)
             }
@@ -325,12 +384,206 @@ class ChatConversationState(
             if (error.code != 400 || received) throw error
         }
         var confirmed = false
-        send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null).collect { frame ->
+        send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null, null).collect { frame ->
             if (!confirmed) {
                 confirmed = true
                 threadSupport.supported = false
             }
             emit(frame)
+        }
+    }
+
+    // ─── One turn: send, stream, and what a lost stream means ──────────────
+
+    private fun assistant(id: Long): ChatEntry.Assistant? =
+        messages.value.firstOrNull { it is ChatEntry.Assistant && it.id == id } as? ChatEntry.Assistant
+
+    internal fun updateAssistant(id: Long, transform: (ChatEntry.Assistant) -> ChatEntry.Assistant) {
+        messages.value = messages.value.map { entry -> if (entry is ChatEntry.Assistant && entry.id == id) transform(entry) else entry }
+    }
+
+    internal fun applyFailure(id: Long, message: ErrorCopy.Message) {
+        updateAssistant(id) { current ->
+            current.copy(text = message.headline, failureDetail = message.detail, streaming = false, failed = true, detached = false, activity = null)
+        }
+    }
+
+    internal fun decodeFrame(assistantId: Long, frame: SseFrame) {
+        when (frame.event) {
+            "delta" -> {
+                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatDeltaPayload.serializer(), frame.data) }.getOrNull()
+                if (payload != null) {
+                    // Text means main is running the turn, whatever came first.
+                    updateAssistant(assistantId) { current ->
+                        val next = if (payload.reset) payload.text else current.text + payload.text
+                        current.copy(text = next, streaming = true, failed = false, failureDetail = null, accepted = true)
+                    }
+                }
+            }
+            "final" -> {
+                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatFinalPayload.serializer(), frame.data) }.getOrNull()
+                updateAssistant(assistantId) { current ->
+                    val text = payload?.reply?.takeIf { it.isNotBlank() } ?: current.text
+                    current.copy(text = text.ifBlank { "(no reply)" }, streaming = false, failed = false, failureDetail = null, activity = null)
+                }
+            }
+            "failure" -> {
+                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatFailurePayload.serializer(), frame.data) }.getOrNull()
+                applyFailure(
+                    assistantId,
+                    ErrorCopy.Message(payload?.error?.takeIf { it.isNotBlank() } ?: "OpenAGI couldn't reply.", "Try again."),
+                )
+            }
+            // heartbeat: PROTOCOL.md's every-15s keepalive during a long turn —
+            // never an empty reply. Anything else is a frame name this client
+            // doesn't know yet and is ignored the same way.
+            "status" -> {
+                val label = chatActivityLabel(frame.data)
+                if (label != null) updateAssistant(assistantId) { current -> if (current.streaming) current.copy(activity = label) else current }
+            }
+            // Main has stored the turn: from here on it is never lost.
+            "session" -> {
+                updateAssistant(assistantId) { it.copy(accepted = true) }
+                persist()
+            }
+            else -> Unit
+        }
+    }
+
+    // The stream went before `final`/`failure`. With turn ids main can say
+    // what happened: an accepted turn keeps working and is found again in
+    // history; one never confirmed is offered again (same id) and resent
+    // once on the next resume. A main without turn ids keeps the old copy.
+    private fun connectionLost(assistantId: Long, legacy: ErrorCopy.Message) {
+        val entry = assistant(assistantId) ?: return
+        if (entry.requestId == null || !threadSupport.turnIds || sharedThread == null) {
+            applyFailure(assistantId, legacy)
+        } else if (entry.accepted) {
+            updateAssistant(assistantId) { it.copy(streaming = true, detached = true, activity = ChatTurnRecovery.STILL_WORKING) }
+        } else {
+            updateAssistant(assistantId) {
+                it.copy(
+                    text = ChatTurnRecovery.NOT_SENT, failureDetail = ChatTurnRecovery.NOT_SENT_DETAIL,
+                    streaming = false, failed = true, activity = null, autoRetry = true,
+                )
+            }
+        }
+    }
+
+    internal suspend fun runExchange(assistantId: Long, text: String, transport: ChatTransport) {
+        isStreaming.value = true
+        try {
+            var receivedTerminal = false
+            messageStream(text, transport.from, transport.sessionId, assistant(assistantId)?.requestId, transport.send).collect { frame ->
+                if (frame.event == "final" || frame.event == "failure") receivedTerminal = true
+                decodeFrame(assistantId, frame)
+            }
+            if (!receivedTerminal) connectionLost(assistantId, ErrorCopy.Message("Reply stopped early.", "Try again."))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (lost: DaemonException.Transport) {
+            connectionLost(assistantId, transport.refusal(lost))
+        } catch (error: DaemonException) {
+            applyFailure(assistantId, transport.refusal(error))
+        } catch (error: Exception) {
+            connectionLost(assistantId, transport.unreachable)
+        } finally {
+            isStreaming.value = false
+            persist()
+            // The daemon's copy of this exchange replaces the local one.
+            requestRefresh(transport.fetch)
+            startRecovery(transport.fetch)
+        }
+    }
+
+    // A new turn: the user line and its reply placeholder, both named with a
+    // new turn id when the main can take one.
+    internal fun start(text: String, transport: ChatTransport): Boolean {
+        if (text.isEmpty() || isStreaming.value) return false
+        var id = nextId.value
+        val userId = id++
+        val assistantId = id++
+        nextId.value = id
+        val now = Instant.now()
+        val requestId = if (sharedThread != null && threadSupport.turnIds) ChatTurnRecovery.newRequestId() else null
+        messages.value = messages.value + ChatEntry.User(userId, now, text, requestId = requestId) +
+            ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text, requestId = requestId)
+        persist()
+        scope.launch { runExchange(assistantId, text, transport) }
+        return true
+    }
+
+    // The same id: if main did get the first try, it replays or follows that
+    // turn instead of running it again. A turn main lost is a new turn.
+    internal fun retry(entry: ChatEntry.Assistant, transport: ChatTransport) {
+        val text = entry.retryText
+        if (text == null || isStreaming.value) return
+        val canName = sharedThread != null && threadSupport.turnIds
+        val requestId = when {
+            !canName -> null
+            entry.newRequestOnRetry || entry.requestId == null -> ChatTurnRecovery.newRequestId()
+            else -> entry.requestId
+        }
+        val list = messages.value
+        val at = list.indexOfFirst { it is ChatEntry.Assistant && it.id == entry.id }
+        if (at < 0) return
+        val userAt = (at - 1 downTo 0).firstOrNull { list[it] is ChatEntry.User }
+        messages.value = list.mapIndexed { index, current ->
+            when {
+                index == at && current is ChatEntry.Assistant -> current.copy(
+                    text = "", streaming = true, failed = false, failureDetail = null, requestId = requestId,
+                    accepted = false, detached = false, autoRetry = false, newRequestOnRetry = false, activity = null,
+                )
+                index == userAt && current is ChatEntry.User && current.requestId != requestId && requestId != null -> current.copy(requestId = requestId)
+                else -> current
+            }
+        }
+        persist()
+        scope.launch { runExchange(entry.id, text, transport) }
+    }
+
+    // ─── Recovery while the screen is in front ─────────────────────────────
+
+    private var recoveryJob: Job? = null
+    private var resumed = false
+    internal var recoveryDelaysMs = listOf(2_000L, 4_000L, 8_000L, 15_000L)
+
+    // The screen came to the front (opened, app foregrounded, relaunched):
+    // catch up with main, keep finding replies whose stream was lost, and
+    // resend once (same id) a send main never confirmed.
+    internal fun resume(transport: ChatTransport): Job {
+        resumed = true
+        return scope.launch {
+            lastRefreshSucceeded = false
+            requestRefresh(transport.fetch)
+            refreshJob?.join()
+            startRecovery(transport.fetch)
+            if (!lastRefreshSucceeded || isStreaming.value) return@launch
+            val pending = messages.value.firstOrNull { it is ChatEntry.Assistant && it.failed && it.autoRetry && it.retryText != null } as? ChatEntry.Assistant
+                ?: return@launch
+            updateAssistant(pending.id) { it.copy(autoRetry = false) }
+            retry(pending.copy(autoRetry = false), transport)
+        }
+    }
+
+    // Away from the screen nothing polls; resume starts it again.
+    internal fun pause() {
+        resumed = false
+        recoveryJob?.cancel()
+        recoveryJob = null
+    }
+
+    private fun startRecovery(fetch: suspend (thread: String, before: String?) -> ConversationPage) {
+        if (!resumed || recoveryJob?.isActive == true || sharedThread == null) return
+        if (messages.value.none { it is ChatEntry.Assistant && it.detached }) return
+        recoveryJob = scope.launch {
+            var attempt = 0
+            while (isActive && messages.value.any { it is ChatEntry.Assistant && it.detached }) {
+                delay(recoveryDelaysMs[minOf(attempt, recoveryDelaysMs.size - 1)])
+                attempt += 1
+                requestRefresh(fetch)
+                refreshJob?.join()
+            }
         }
     }
 
@@ -352,25 +605,52 @@ class ChatConversationState(
 // per pairing, shared by Chat and the Supervisor; reset by restart or pairing.
 class SharedThreadSupport {
     @Volatile var supported: Boolean = true
+    // False once this pairing's main refused a turn id (older than turn
+    // recovery); sends then carry none, as before.
+    @Volatile var turnIds: Boolean = true
 }
 
-private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
-    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text, serverId = serverId, sourceName = sourceName)
-    // A still-streaming reply is saved as stopped: if the app dies now, the
-    // next launch must not show a reply that will never finish.
-    is ChatEntry.Assistant -> SavedChatEntry(
-        id, "assistant", timestamp, text,
-        failed = failed || streaming,
-        failureDetail = if (streaming && !failed) "Reply stopped when the app closed." else failureDetail,
-        retryText = retryText,
-        serverId = serverId,
+internal fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
+    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text, serverId = serverId, sourceName = sourceName, requestId = requestId)
+    is ChatEntry.Assistant -> when {
+        // Main has this turn: keep recovering it after a relaunch.
+        streaming && !failed && requestId != null && (accepted || detached) ->
+            SavedChatEntry(id, "assistant", timestamp, "", retryText = retryText, serverId = serverId, requestId = requestId, detached = true)
+        // Never confirmed: offer it again, and resend it once.
+        streaming && !failed && requestId != null ->
+            SavedChatEntry(
+                id, "assistant", timestamp, ChatTurnRecovery.NOT_SENT, failed = true,
+                failureDetail = ChatTurnRecovery.NOT_SENT_DETAIL, retryText = retryText, serverId = serverId,
+                requestId = requestId, autoRetry = true,
+            )
+        // A still-streaming reply with no turn id is saved as stopped: if the
+        // app dies now, the next launch must not show a reply that will never
+        // finish.
+        else -> SavedChatEntry(
+            id, "assistant", timestamp, text,
+            failed = failed || streaming,
+            failureDetail = if (streaming && !failed) "Reply stopped when the app closed." else failureDetail,
+            retryText = retryText,
+            serverId = serverId,
+            requestId = requestId,
+            autoRetry = autoRetry,
+            newRequestOnRetry = newRequestOnRetry,
+        )
+    }
+}
+
+internal fun SavedChatEntry.toEntry(): ChatEntry = if (role == "user") {
+    ChatEntry.User(id, at, text, serverId = serverId, sourceName = sourceName, requestId = requestId)
+} else if (detached && requestId != null) {
+    ChatEntry.Assistant(
+        id, at, text, streaming = true, retryText = retryText, serverId = serverId, requestId = requestId,
+        accepted = true, detached = true, activity = ChatTurnRecovery.STILL_WORKING,
     )
-}
-
-private fun SavedChatEntry.toEntry(): ChatEntry = if (role == "user") {
-    ChatEntry.User(id, at, text, serverId = serverId, sourceName = sourceName)
 } else {
-    ChatEntry.Assistant(id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText, serverId = serverId)
+    ChatEntry.Assistant(
+        id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText, serverId = serverId,
+        requestId = requestId, autoRetry = autoRetry, newRequestOnRetry = newRequestOnRetry,
+    )
 }
 
 // The Supervisor's "Ask supervisor" reuses this whole screen: the same
@@ -466,93 +746,22 @@ fun ChatScreen(
         scope.launch { listState.scrollToEnd() }
     }
 
-    fun newId(): Long { val id = nextId; nextId += 1; return id }
-
-    fun updateAssistant(id: Long, transform: (ChatEntry.Assistant) -> ChatEntry.Assistant) {
-        messages = messages.map { entry -> if (entry is ChatEntry.Assistant && entry.id == id) transform(entry) else entry }
-    }
-
-    fun applyFailure(id: Long, message: ErrorCopy.Message) {
-        updateAssistant(id) { current ->
-            current.copy(text = message.headline, failureDetail = message.detail, streaming = false, failed = true)
-        }
-    }
-
-    fun decodeFrame(assistantId: Long, frame: SseFrame) {
-        when (frame.event) {
-            "delta" -> {
-                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatDeltaPayload.serializer(), frame.data) }.getOrNull()
-                if (payload != null) {
-                    updateAssistant(assistantId) { current ->
-                        val next = if (payload.reset) payload.text else current.text + payload.text
-                        current.copy(text = next, streaming = true, failed = false, failureDetail = null)
-                    }
-                }
-            }
-            "final" -> {
-                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatFinalPayload.serializer(), frame.data) }.getOrNull()
-                updateAssistant(assistantId) { current ->
-                    val text = payload?.reply?.takeIf { it.isNotBlank() } ?: current.text
-                    current.copy(text = text.ifBlank { "(no reply)" }, streaming = false, failed = false, failureDetail = null)
-                }
-            }
-            "failure" -> {
-                val payload = runCatching { ProtocolJson.json.decodeFromString(ChatFailurePayload.serializer(), frame.data) }.getOrNull()
-                applyFailure(
-                    assistantId,
-                    ErrorCopy.Message(payload?.error?.takeIf { it.isNotBlank() } ?: "OpenAGI couldn't reply.", "Try again."),
-                )
-            }
-            // status/session: progress-only, nothing visible changes. heartbeat:
-            // PROTOCOL.md's every-15s keepalive during a long turn — it must
-            // never be mistaken for an empty reply. Anything else is a frame
-            // name this client doesn't know yet and is ignored the same way.
-            "status" -> {
-                val label = chatActivityLabel(frame.data)
-                if (label != null) updateAssistant(assistantId) { current -> if (current.streaming) current.copy(activity = label) else current }
-            }
-            "session", "heartbeat" -> Unit
-            else -> Unit
-        }
-    }
-
-    suspend fun runExchange(assistantId: Long, text: String) {
-        isStreaming = true
-        try {
-            var receivedTerminal = false
-            conversationState.messageStream(text, from, sessionId) { t, f, s, th -> client.sendMessageStream(t, from = f, sessionId = s, thread = th) }.collect { frame ->
-                if (frame.event == "final" || frame.event == "failure") receivedTerminal = true
-                decodeFrame(assistantId, frame)
-            }
-            if (!receivedTerminal) {
-                applyFailure(assistantId, ErrorCopy.Message("Reply stopped early.", "Try again."))
-            }
-        } catch (error: DaemonException) {
-            applyFailure(assistantId, chatErrorCopy(error, credentials.server))
-        } catch (error: Exception) {
-            applyFailure(
-                assistantId,
-                ErrorCopy.Message("Can't reach OpenAGI.", "Nothing is listening at ${credentials.server}. Is the daemon running?"),
-            )
-        } finally {
-            isStreaming = false
-            conversationState.persist()
-            // The daemon's copy of this exchange replaces the local one.
-            conversationState.requestRefresh(client)
-        }
+    val transport = remember(client, from, sessionId) {
+        ChatTransport(
+            send = { t, f, s, th, r -> client.sendMessageStream(t, from = f, sessionId = s, thread = th, requestId = r) },
+            fetch = { name, before -> client.conversationMessages(name, before) },
+            refusal = { error -> chatErrorCopy(error, credentials.server) },
+            unreachable = ErrorCopy.Message("Can't reach OpenAGI.", "Nothing is listening at ${credentials.server}. Is the daemon running?"),
+            from = from,
+            sessionId = sessionId,
+        )
     }
 
     fun start(text: String) {
         if (text.isEmpty() || isStreaming) return
         // Sending is a request to see the answer.
         userScrolledAway = false
-        val userId = newId()
-        val assistantId = newId()
-        val now = Instant.now()
-        messages = messages + ChatEntry.User(userId, now, text) +
-            ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text)
-        conversationState.persist()
-        conversationState.scope.launch { runExchange(assistantId, text) }
+        conversationState.start(text, transport)
     }
 
     fun send() {
@@ -562,23 +771,26 @@ fun ChatScreen(
         start(text)
     }
 
-    fun retry(entry: ChatEntry.Assistant) {
-        val text = entry.retryText
-        if (text == null || isStreaming) return
-        messages = messages.map { current ->
-            if (current is ChatEntry.Assistant && current.id == entry.id) {
-                current.copy(text = "", streaming = true, failed = false, failureDetail = null)
-            } else {
-                current
+    fun retry(entry: ChatEntry.Assistant) = conversationState.retry(entry, transport)
+
+    // Coming to the front (opening the screen, foregrounding the app, a
+    // relaunch) shows the shared thread as the daemon has it, finds replies
+    // whose stream was cut while away, and resends once a send main never
+    // confirmed. Away, nothing polls and no stream is kept open for it.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(conversationState, lifecycleOwner, transport) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> conversationState.resume(transport)
+                Lifecycle.Event.ON_PAUSE -> conversationState.pause()
+                else -> Unit
             }
         }
-        conversationState.scope.launch { runExchange(entry.id, text) }
-    }
-
-    // Opening the screen shows the shared thread as the daemon has it,
-    // including what other devices said while this one was away.
-    LaunchedEffect(conversationState) {
-        conversationState.requestRefresh(client)
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            conversationState.pause()
+        }
     }
 
     // Opening a chat, or coming back to one, shows the newest message: once
@@ -815,7 +1027,12 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                         }
                     } else {
                         val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
-                        MarkdownView(entry.text, textColor = textColor, style = OpenAGIType.chatBody, onCanvas = true)
+                        Column {
+                            MarkdownView(entry.text, textColor = textColor, style = OpenAGIType.chatBody, onCanvas = true)
+                            if (entry.detached) entry.activity?.let {
+                                Text("$it…", style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp))
+                            }
+                        }
                     }
                 }
                 if (entry.failed) {

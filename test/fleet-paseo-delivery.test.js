@@ -69,7 +69,10 @@ test('persists host correlation and accepts an exact returned turn without guess
   ? { epoch: 'epoch-1', endCursor: { epoch: 'epoch-1', seq: 10 }, agent: f.ref.current(), entries: [] }
   : { agent: { ...f.ref.current(), status: 'running', activeTurn: { turnId: 'turn-1', startedAt: '2026-01-01T00:00:01Z' } }, entries: [] };
  assert.equal((await deliverPaseo(f.args)).status, 'sent');
- assert.deepEqual(receipt(f), {
+ const saved = receipt(f);
+ assert.match(saved.sentAt, /^\d{4}-\d\d-\d\dT/);
+ delete saved.sentAt;
+ assert.deepEqual(saved, {
   messageId: f.sent[0].options.messageId,
   clientMessageId: f.sent[0].options.messageId,
   messageHash: 'hash',
@@ -304,4 +307,34 @@ test('owner-initiated Paseo sends steer active turns and wake unarchived sleepin
 
   const permLocked = setup(t, { pendingPermissions: [{}] });
   assert.equal((await deliverPaseo({ ...permLocked.args, base: { messageHash: 'owner-3', playbook: 'owner-message' } })).status, 'blocked');
+});
+
+test('owner-initiated steer into an already-running Paseo session confirms as soon as the exact message appears in timeline', async t => {
+  const f = setup(t, { status: 'running', activeTurn: { turnId: 'prior-in-flight-turn' }, updatedAt: '2026-01-02T00:00:00Z' });
+  f.ref.timeline.refetch = async () => ({
+    agent: f.ref.current(),
+    entries: f.sent.length
+      ? [{ item: { type: 'user_message', clientMessageId: f.sent[0].options.messageId }, turnId: 'queued-next-turn', timestamp: '2026-01-02T00:00:01Z', seqStart: 5, seqEnd: 5 }]
+      : []
+  });
+  const steered = await deliverPaseo({ ...f.args, base: { messageHash: 'owner-steer-1', playbook: 'owner-message' } });
+  assert.equal(steered.status, 'sent');
+  assert.equal(f.sent.length, 1);
+  assert.equal(receipt(f).pending, false);
+
+  // When an idle agent accepts the owner's message into the timeline but does
+  // not start a turn before timeout, report unconfirmed=true honestly instead
+  // of misreporting a hard block.
+  const slow = setup(t, { status: 'idle', updatedAt: '2026-01-02T00:00:00Z' });
+  slow.args.config.paseo.timeoutMs = 150;
+  slow.ref.timeline.refetch = async () => ({
+    agent: slow.ref.current(),
+    entries: slow.sent.length
+      ? [{ item: { type: 'user_message', clientMessageId: slow.sent[0].options.messageId }, timestamp: '2026-01-02T00:00:01Z', seqStart: 5, seqEnd: 5 }]
+      : []
+  });
+  const slowRes = await deliverPaseo({ ...slow.args, base: { messageHash: 'owner-slow-1', playbook: 'owner-message' } });
+  assert.equal(slowRes.status, 'blocked');
+  assert.equal(slowRes.unconfirmed, true);
+  assert.match(slowRes.detail, /Message accepted by Paseo and visible in timeline/);
 });

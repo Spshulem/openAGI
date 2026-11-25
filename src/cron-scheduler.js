@@ -90,6 +90,8 @@ export class CronScheduler {
       input: job.input ?? {},
       intervalMs: job.intervalMs ?? null,
       dailyAt: job.dailyAt ?? null,
+      // Days of week (0 = Sunday) a dailyAt job fires on. null = every day.
+      days: Array.isArray(job.days) && job.days.length ? job.days : null,
       // Per-job override of TIMEOUT_MS. null = use the global default.
       timeoutMs: Number.isFinite(job.timeoutMs) && job.timeoutMs > 0 ? job.timeoutMs : null,
       nextRunAt: job.nextRunAt ?? this.computeNextRun(job, new Date()).toISOString(),
@@ -250,10 +252,19 @@ export class CronScheduler {
   }
 
   async runDue(handler, now = new Date(), options = {}) {
+    // Snapshot a single clock value for selection, revalidation and receipts.
+    // Callers may supply a Date, ISO timestamp or epoch milliseconds.
+    const tickTime = new Date(now);
     const budgetMs = options.tickBudgetMs ?? resolveTickBudgetMs();
     const tickStartedMs = Date.now();
     const results = [];
-    for (const job of this.dueJobs(now)) {
+    for (const job of this.dueJobs(tickTime)) {
+      // Earlier handlers can await for minutes. Honor owner changes made
+      // during that wait instead of dispatching cancelled or stale work
+      // from the tick's initial snapshot. Reconsider changed definitions
+      // on the next tick; do not interrupt already executing work.
+      if (this.jobs.get(job.id) !== job || !job.enabled
+        || !job.nextRunAt || !(new Date(job.nextRunAt) <= tickTime)) continue;
       // Bounded fire: never pre-empt the first job (a lone slow job must still
       // get its full timeout), but past the budget stop STARTING new ones.
       // Their nextRunAt is untouched, so they are still due on the next tick.
@@ -278,7 +289,7 @@ export class CronScheduler {
         onTimeout: options.onTimeout,
         source: "cron"
       });
-      job.lastRunAt = (now instanceof Date ? now : new Date(now)).toISOString();
+      job.lastRunAt = tickTime.toISOString();
       job.nextRunAt = job.enabled ? this.computeNextRun(job, new Date(job.lastRunAt)).toISOString() : null;
       results.push({ job, result });
     }
@@ -341,7 +352,7 @@ export class CronScheduler {
     };
     if ("nextRunAt" in patch) {
       updated.nextRunAt = patch.nextRunAt;
-    } else if ("intervalMs" in patch || "dailyAt" in patch) {
+    } else if ("intervalMs" in patch || "dailyAt" in patch || "days" in patch) {
       updated.nextRunAt = this.computeNextRun(updated, new Date()).toISOString();
     }
     this.jobs.set(id, updated);
@@ -364,10 +375,14 @@ export class CronScheduler {
     if (job.intervalMs) return new Date(from.getTime() + job.intervalMs);
     if (job.dailyAt) {
       const [hour, minute] = job.dailyAt.split(":").map((part) => Number.parseInt(part, 10));
-      const next = new Date(from);
-      next.setHours(hour, minute ?? 0, 0, 0);
-      if (next <= from) next.setDate(next.getDate() + 1);
-      return next;
+      const days = Array.isArray(job.days) && job.days.length ? job.days : null;
+      // Build each candidate from the calendar date, so a skipped day whose
+      // wall-clock time does not exist (spring forward) cannot shift the hour
+      // of the day that actually runs.
+      for (let offset = 0; offset <= 8; offset += 1) {
+        const next = new Date(from.getFullYear(), from.getMonth(), from.getDate() + offset, hour, minute ?? 0, 0, 0);
+        if (next > from && (!days || days.includes(next.getDay()))) return next;
+      }
     }
     return new Date(from.getTime() + 1000 * 60 * 60 * 24);
   }

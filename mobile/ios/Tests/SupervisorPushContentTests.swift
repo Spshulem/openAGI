@@ -100,6 +100,22 @@ final class SupervisorPushContentTests: XCTestCase {
         XCTAssertEqual(SupervisorCategories.base().identifier, "SUPERVISOR_QUESTION")
     }
 
+    func testAReplyableQuestionGetsAReplyFieldThatNeedsAnUnlockedPhone() throws {
+        let userInfo = try sealedAlert(#"{"questionId":"fq1","title":"Which DB?","options":["Answer question","Skip"],"canReply":true}"#)
+        let alert = try XCTUnwrap(SupervisorPushContent.alert(userInfo: userInfo, key: key))
+        XCTAssertTrue(alert.canReply)
+        XCTAssertEqual(alert.options, ["Skip"], "typed text is the Reply field's job, never a button")
+        let category = SupervisorCategories.category(for: alert)
+        XCTAssertEqual(category.actions.map(\.identifier), ["answer.0", "reply", "dismiss"])
+        let reply = try XCTUnwrap(category.actions[1] as? UNTextInputNotificationAction)
+        XCTAssertEqual(reply.title, "Reply")
+        XCTAssertTrue(reply.options.contains(.authenticationRequired))
+        // A Reply field is part of the category: the same options without it
+        // must not share (and overwrite) its buttons.
+        XCTAssertNotEqual(alert.categoryIdentifier, SupervisorPushContent.categoryIdentifier(for: ["Skip"]))
+        XCTAssertFalse(try XCTUnwrap(SupervisorPushContent.alert(from: .init(questionId: "q", options: ["Skip"]))).canReply)
+    }
+
     func testCategoryMergeKeepsOthersAndPrunesUnusedQuestionCategories() {
         func category(_ id: String) -> UNNotificationCategory {
             UNNotificationCategory(identifier: id, actions: [], intentIdentifiers: [])
@@ -171,6 +187,70 @@ final class SupervisorPushContentTests: XCTestCase {
                        .dismiss(questionId: "fq123"))
         XCTAssertEqual(SupervisorAnswerAction.from(actionIdentifier: defaultID, defaultActionIdentifier: defaultID, userInfo: [:]),
                        .open)
+    }
+
+    func testReplyActionCarriesTheTrimmedTextAndIgnoresAnEmptyOne() {
+        let userInfo: [AnyHashable: Any] = ["questionId": "fq123", "options": ["Approve"]]
+        XCTAssertEqual(SupervisorAnswerAction.from(actionIdentifier: "reply", defaultActionIdentifier: defaultID, userInfo: userInfo,
+                                                   userText: " ship it after lunch\n"),
+                       .reply(questionId: "fq123", text: "ship it after lunch"))
+        XCTAssertNil(SupervisorAnswerAction.from(actionIdentifier: "reply", defaultActionIdentifier: defaultID, userInfo: userInfo, userText: "  "))
+        XCTAssertNil(SupervisorAnswerAction.from(actionIdentifier: "reply", defaultActionIdentifier: defaultID, userInfo: userInfo))
+    }
+
+    // MARK: - Approval alerts
+
+    private func sealedApproval(_ json: String) throws -> [AnyHashable: Any] {
+        let wire = try PushEnvelope.seal(Data(json.utf8), key: key, kind: .approval)
+        return ["aps": ["category": "SUPERVISOR_QUESTION"], "sealed": wire]
+    }
+
+    func testDecryptedApprovalShowsItsSummaryAndCode() throws {
+        let userInfo = try sealedApproval(#"{"actionId":"act_1","summary":"  Email Alex the notes ","code":"42"}"#)
+        let approval = try XCTUnwrap(ApprovalPushContent.approval(userInfo: userInfo, key: key))
+        XCTAssertEqual(approval.actionId, "act_1")
+        XCTAssertEqual(approval.title, "Approve? (code 42)")
+        XCTAssertEqual(approval.body, "Email Alex the notes")
+        XCTAssertEqual(approval.userInfo["actionId"] as? String, "act_1")
+        let bare = try XCTUnwrap(ApprovalPushContent.approval(from: .init(actionId: "act_2")))
+        XCTAssertEqual(bare.title, "Approve?")
+        XCTAssertFalse(bare.body.isEmpty)
+    }
+
+    func testApprovalAndQuestionEnvelopesNeverOpenAsEachOther() throws {
+        XCTAssertNil(SupervisorPushContent.alert(userInfo: try sealedApproval(#"{"actionId":"act_1","questionId":"q"}"#), key: key))
+        XCTAssertNil(ApprovalPushContent.approval(userInfo: try sealedAlert(#"{"questionId":"q","actionId":"act_1"}"#), key: key))
+        XCTAssertNil(ApprovalPushContent.approval(userInfo: try sealedApproval(#"{"actionId":"act_1"}"#), key: nil))
+        XCTAssertNil(ApprovalPushContent.approval(userInfo: try sealedApproval(#"{"actionId":"  "}"#), key: key))
+    }
+
+    func testApprovalCategoryNeedsAnUnlockedPhoneForBothButtons() {
+        let category = SupervisorCategories.approval()
+        XCTAssertEqual(category.identifier, "PENDING_APPROVAL")
+        XCTAssertEqual(category.actions.map(\.identifier), ["approval.approve", "approval.deny"])
+        XCTAssertEqual(category.actions.map(\.title), ["Approve", "Deny"])
+        XCTAssertTrue(category.actions.allSatisfy { $0.options.contains(.authenticationRequired) })
+    }
+
+    func testApprovalTapsMapToTheirAction() {
+        let userInfo: [AnyHashable: Any] = ["actionId": "act_1"]
+        XCTAssertEqual(ApprovalAction.from(actionIdentifier: "approval.approve", defaultActionIdentifier: defaultID, userInfo: userInfo),
+                       .approve(actionId: "act_1"))
+        XCTAssertEqual(ApprovalAction.from(actionIdentifier: "approval.deny", defaultActionIdentifier: defaultID, userInfo: userInfo),
+                       .deny(actionId: "act_1"))
+        XCTAssertEqual(ApprovalAction.from(actionIdentifier: defaultID, defaultActionIdentifier: defaultID, userInfo: userInfo), .open)
+        XCTAssertNil(ApprovalAction.from(actionIdentifier: "approval.approve", defaultActionIdentifier: defaultID, userInfo: ["questionId": "q"]),
+                     "a question alert is not an approval")
+        XCTAssertNil(ApprovalAction.from(actionIdentifier: "answer.0", defaultActionIdentifier: defaultID, userInfo: userInfo))
+    }
+
+    @MainActor
+    func testPushRouterPreservesQuestionAndThreadDeepLink() {
+        let router = PushRouter()
+        router.openSupervisor(questionID: " fq-demo-1 ", threadKey: " paseo:srv.demo-agent-1 ")
+        XCTAssertTrue(router.wantsSupervisor)
+        XCTAssertEqual(router.pendingQuestionID, "fq-demo-1")
+        XCTAssertEqual(router.pendingThreadKey, "paseo:srv.demo-agent-1")
     }
 
     func testUnknownOrIncompleteActionsDoNothing() {

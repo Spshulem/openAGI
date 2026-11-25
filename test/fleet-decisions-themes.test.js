@@ -46,7 +46,10 @@ test("decisions keep-alive gate suppresses completed chats, escalates owner bloc
   const decisionCalls = [];
   const decisionsFetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    decisionCalls.push({ url, body });
+    // The owner-precedent engine consults the same endpoint for owner asks;
+    // this test counts only keep-alive batches (they carry candidates).
+    if (body.input && Array.isArray(JSON.parse(body.input).candidates)) decisionCalls.push({ url, body });
+    else return { ok: true, status: 200, json: async () => ({ model: "gpt-6-luna-2026", answers: body.questions.map((q) => ({ type: "predicate", name: q.name, probability: 0.05 })), usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } }) };
     const answers = body.questions.map((q) => {
       const idxMatch = /^c(\d+)_(keep_alive|needs_owner)$/.exec(q.name);
       const idx = Number(idxMatch[1]);
@@ -518,6 +521,12 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(executedExisting.status, "routed_existing");
   assert.equal(sentToExisting.length, 1);
   assert.equal(sentToExisting[0].thread.key, "paseo:mac-laptop.seo-sleep-1");
+  const persistedExisting = supervisor.getActiveWork({ project: "AI-SEO" }).items
+    .find((item) => item.goal.includes("Steve strictly citation"));
+  assert.ok(persistedExisting, "dispatch persists one Work outcome before sending");
+  assert.equal(persistedExisting.originalAsk, persistedExisting.goal);
+  assert.equal(persistedExisting.owner.threadKey, "paseo:mac-laptop.seo-sleep-1");
+  assert.equal(persistedExisting.workflowStage, "implementing");
 
   // 4. Manager Goal Dispatch when NO existing chat matches (or in a 0-agent project): spawns a fresh Paseo session!
   const startedNew = await supervisor.dispatchGoal({
@@ -529,6 +538,10 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(createdAgents.length, 1);
   assert.equal(createdAgents[0].serverId, "mac-laptop");
   assert.equal(createdAgents[0].cwd, "/Users/dev/Dev/new-service");
+  const persistedNew = supervisor.getActiveWork({ project: "new-service" }).items
+    .find((item) => item.goal.includes("Stripe webhook"));
+  assert.ok(persistedNew, "new-session dispatch persists Work before starting Paseo");
+  assert.equal(persistedNew.workflowStage, "implementing");
 
   // 5. Verify HTTP routes, mobile allowlist, RemoteFleetSupervisor proxy, and fleet tools!
   assert.equal(isMobileRouteAllowed("GET", "/fleet/api/hierarchy"), true);
@@ -783,6 +796,22 @@ test("deliverPaseo recovers disconnected ACP sessions in-place, unblocks stale n
   assert.match(createdSessions[0].prompt, /Why is paseo broken/);
   assert.equal(imageFollowUps.length, 1);
   assert.equal(imageFollowUps[0].options.images.length, 1);
+
+  // Active Work resumes are existing-session-only: a disconnected runtime
+  // must be reported as blocked instead of creating a replacement session.
+  const noRecovery = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: paseoThread(initialBroken, "srv_mac"),
+    text: "[OpenAGI supervisor] Follow up in the existing session.",
+    store: { dir },
+    actionId: "act-no-recovery",
+    base: { messageHash: "owner-no-recovery", playbook: "owner-message" },
+    factory: factoryA,
+    recoverDisconnected: false
+  });
+  assert.equal(noRecovery.status, "blocked");
+  assert.match(noRecovery.detail, /existing session only/);
+  assert.equal(createdSessions.length, 1);
 
   // Case B: Turnless ACP/Claude provider confirms owner message + clears stale unconfirmed background receipt!
   const turnlessAgent = {
@@ -1147,4 +1176,415 @@ test("SupervisorCard.project is populated and G2 even-ai-native receives recent 
   await channel.ask({ text: "Status of recorder?", conversationId: "even-ai-native" }, "g2-node-1");
   assert.equal(captured.length, 1);
   assert.match(captured[0].options.extraTurnContext ?? "", /Deploy bb-recorder v2\.14/);
+});
+
+test("fleet image endpoints accept >32KB image payloads and paired Mac proxy records sourceName Mac", async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "unified-fleet-img-"));
+  const runtime = createDurableRuntime({ dataDir });
+  const store = new InMemoryAgentStore();
+  runtime.agentHost = {
+    store,
+    handleMessage: async (input) => {
+      store.appendMessage(input.sessionId, {
+        role: "user",
+        content: input.text,
+        metadata: input.metadata
+      });
+      return { reply: "ok", session: { id: input.sessionId } };
+    }
+  };
+  const calls = [];
+  runtime.fleetSupervisor = {
+    start: () => {},
+    stop: () => {},
+    getState: () => ({ mode: "propose", enabled: true, questions: [], cards: [], snapshot: { threads: [] } }),
+    sendOwnerMessage: async (threadKey, message, opts = {}) => {
+      calls.push({ kind: "send", threadKey, message, imageCount: opts.images?.length ?? 0 });
+      return { delivery: { status: "sent", attachedImages: opts.images?.length ?? 0 } };
+    },
+    actCard: async (cardId, opts = {}) => {
+      calls.push({ kind: "act", cardId, op: opts.op, value: opts.value, imageCount: opts.images?.length ?? 0 });
+      return { ok: true, kind: "reply", status: "sent" };
+    }
+  };
+  const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
+  nodeRegistry.enroll("mac-worker-1", "w".repeat(43), { ownerProxyToken: "p".repeat(43) });
+  const app = createHostedInterface(runtime, { dataDir, port: 0, authToken: "", nodeRegistry });
+  t.after(async () => { await app.close(); await runtime.observations?.close?.(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const { url } = await app.listen();
+
+  // >32KB base64 image must pass both /fleet/api/send and /fleet/api/cards/:id/act (previously failed 8KB cap)
+  const bigBase64 = Buffer.alloc(24 * 1024, 0xaa).toString("base64");
+  const bigImg = { id: "img_big", name: "CleanShot.png", mimeType: "image/jpeg", data: bigBase64 };
+  const sendRes = await fetch(`${url}/fleet/api/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ threadKey: "paseo:srv_1.ag_1", images: [bigImg] })
+  });
+  assert.equal(sendRes.status, 200);
+  const sendBody = await sendRes.json();
+  assert.equal(sendBody.delivery.status, "sent");
+  assert.equal(calls[0].kind, "send");
+  assert.equal(calls[0].message, "Please inspect the attached image(s).");
+  assert.equal(calls[0].imageCount, 1);
+
+  const actRes = await fetch(`${url}/fleet/api/cards/q_1/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: "reply", value: "See screenshot", images: [bigImg] })
+  });
+  assert.equal(actRes.status, 200);
+  assert.equal(calls[1].kind, "act");
+  assert.equal(calls[1].imageCount, 1);
+
+  // Paired Mac owner-proxy POST /message defaults sourceName to "Mac" instead of "Phone"
+  const proxyMsg = await fetch(`${url}/message`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${"p".repeat(43)}`,
+      "x-openagi-node-id": "mac-worker-1"
+    },
+    body: JSON.stringify({ text: "hello from mac", thread: "supervisor", from: "mac-supervisor" })
+  });
+  assert.equal(proxyMsg.status, 200);
+  const hist = sharedThreadHistory(store, "supervisor");
+  assert.equal(hist.messages.at(-1).sourceName, "Mac");
+});
+
+test("OpenAGI-native project/theme organization works without Paseo, preserves paseoCwd project names, and exposes routes", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-native-org-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const config = resolveFleetConfig({}, { dataDir: dir, paseo: { enabled: false } });
+  const fakeTaskStore = {
+    list: () => [{
+      id: "task-mkt-1",
+      title: "Draft launch post",
+      status: "pending",
+      sourceMeta: { project: "Marketing", subchannel: "Marketing/Launch" }
+    }]
+  };
+  const sup = new FleetSupervisor({ config, dataDir: dir, runtime: { tasks: fakeTaskStore } });
+
+  // Seed a Paseo thread (whose cwd is null and real path is in meta.paseoCwd)
+  // plus a standalone Codex thread with no Paseo setup at all.
+  const bilbaoThread = {
+    key: "paseo:srv_1.ag_bilbao",
+    kind: "paseo",
+    title: "Audio capture refactor",
+    cwd: null,
+    workspace: "bilbao",
+    repo: null,
+    agentStatus: "running",
+    meta: { paseoCwd: "/home/dev/paseo/worktrees/bb-recorder/bilbao", provider: "codex" }
+  };
+  const codexThread = {
+    key: "codex:local-1",
+    kind: "codex",
+    title: "Improve homepage SEO citations",
+    cwd: "/Users/me/Dev/website-app",
+    workspace: "website-app",
+    repo: null,
+    agentStatus: "idle",
+    meta: { provider: "codex" }
+  };
+  sup.lastThreads.set(bilbaoThread.key, bilbaoThread);
+  sup.lastThreads.set(codexThread.key, codexThread);
+  sup.store.recordSnapshot({
+    at: "2026-11-20T01:00:00Z",
+    threads: [
+      { key: bilbaoThread.key, title: bilbaoThread.title, workspace: "bilbao", state: "running" },
+      { key: codexThread.key, title: codexThread.title, workspace: "website-app", cwd: codexThread.cwd, state: "idle" }
+    ]
+  });
+
+  // 1. liveSnapshot must include derived `project` on every thread row AND map
+  //    worktree `bilbao` under `bb-recorder` (with subchannel `bb-recorder/bilbao`)!
+  const snapState = sup.getState();
+  const bilbaoRow = snapState.snapshot.threads.find((r) => r.key === bilbaoThread.key);
+  assert.equal(bilbaoRow.project, "bb-recorder");
+  assert.equal(bilbaoRow.subchannel, "bb-recorder/bilbao");
+
+  // 2. Routes + mobile allowlist for OpenAGI-side project/theme management
+  const route = createFleetRoute({ supervisor: sup });
+  assert.equal(isMobileRouteAllowed("GET", "/fleet/api/projects"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/projects"), true);
+  assert.equal(isMobileRouteAllowed("DELETE", "/fleet/api/projects/marketing"), true);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/threads/codex:local-1/organize"), true);
+
+  const createRes = await route("POST", "/fleet/api/projects", new URL("http://localhost/fleet/api/projects"), async () => ({
+    name: "Growth",
+    theme: "SEO"
+  }));
+  assert.equal(createRes.status, 200);
+  assert.equal(createRes.body.project.id, "growth");
+  assert.equal(createRes.body.project.themes[0].name, "SEO");
+
+  // 3. Reassign a standalone Codex thread into OpenAGI Project/Theme ("Growth" / "SEO")
+  const assignRes = await route(
+    "POST",
+    "/fleet/api/threads/codex:local-1/organize",
+    new URL("http://localhost/fleet/api/threads/codex:local-1/organize"),
+    async () => ({ project: "Growth", theme: "SEO" })
+  );
+  assert.equal(assignRes.status, 200);
+
+  // liveSnapshot now reflects the OpenAGI-side override!
+  const updatedState = sup.getState();
+  const updatedCodex = updatedState.snapshot.threads.find((r) => r.key === codexThread.key);
+  assert.equal(updatedCodex.project, "Growth");
+  assert.equal(updatedCodex.subchannel, "growth/seo");
+
+  // 4. buildFleetHierarchy works cleanly with paseo.enabled=false and includes:
+  //    - bb-recorder (from paseoCwd)
+  //    - Growth / SEO (OpenAGI custom project + reassigned Codex thread)
+  //    - Marketing / Launch (from OpenAGI task metadata)
+  const hierarchy = await sup.getHierarchy({ limit: 40 });
+  const names = hierarchy.projects.map((p) => p.name);
+  assert.ok(names.includes("bb-recorder"), `expected bb-recorder in ${names}`);
+  assert.ok(names.includes("Growth"), `expected Growth in ${names}`);
+  assert.ok(names.includes("Marketing"), `expected Marketing in ${names}`);
+  const growthProj = hierarchy.projects.find((p) => p.name === "Growth");
+  const seoTheme = growthProj.themes.find((th) => th.name === "SEO");
+  assert.ok(seoTheme, "Growth project should include OpenAGI SEO theme");
+  assert.equal(seoTheme.source, "openagi");
+  assert.ok(seoTheme.sessions.some((s) => s.key === codexThread.key));
+
+  // Delete custom project works cleanly
+  const delRes = await route("DELETE", "/fleet/api/projects/growth", new URL("http://localhost/fleet/api/projects/growth"), async () => ({}));
+  assert.equal(delRes.status, 200);
+  assert.equal(delRes.body.deleted, true);
+});
+
+test("completion & Proceed plan cards, oai-mem-citation cleanup, and junk-folder project aliasing", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-completion-ux-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  let archivedIds = [];
+  const fakePaseoFactory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "srv_bb3" }, hosts: [] }) },
+    agents: {
+      list: async () => ({
+        entries: [
+          {
+            agent: {
+              id: "plan-agent-1",
+              title: "Supervisor roadmap & audit",
+              provider: "antigravity",
+              status: "idle",
+              cwd: "/home/dev/paseo/worktrees/openAGI/amman",
+              workspaceId: "wks_f7143ae5747f958b",
+              requiresAttention: false,
+              lastUserMessageAt: "2026-11-20T03:56:00Z",
+              updatedAt: "2026-11-20T04:03:20Z"
+            }
+          },
+          {
+            agent: {
+              id: "done-agent-2",
+              title: "SEO skills audit",
+              provider: "codex",
+              status: "idle",
+              cwd: "/Volumes/Xtra/codex-worktrees/6baf",
+              workspaceId: "wks_6ff24b2c6fd8058f",
+              labels: { "migration.originalCwd": "/Users/owner/Dev/webapp-client", theme: "seo" },
+              requiresAttention: true,
+              attentionReason: "finished",
+              lastUserMessageAt: "2026-11-20T03:49:00Z",
+              updatedAt: "2026-11-20T03:52:26Z"
+            }
+          },
+          {
+            agent: {
+              id: "err-agent-3",
+              title: "YouTube content strategy",
+              provider: "claude",
+              status: "idle",
+              cwd: "/home/dev/.paseo/imported-history",
+              workspaceId: "wks_b382aa8ff3a3a9bf",
+              labels: { theme: "marketing" },
+              requiresAttention: true,
+              attentionReason: "error",
+              lastUserMessageAt: "2026-11-20T02:00:00Z",
+              updatedAt: "2026-11-20T02:05:00Z"
+            }
+          }
+        ],
+        pageInfo: { hasMore: false, nextCursor: null }
+      }),
+      ref: (id) => ({
+        archive: async () => { archivedIds.push(id); },
+        reload: async () => {
+          const idx = archivedIds.indexOf(id);
+          if (idx >= 0) archivedIds.splice(idx, 1);
+          return { agent: { id, archivedAt: null } };
+        },
+        timeline: {
+          refetch: async () => {
+            if (id === "plan-agent-1") {
+              const longAudit = Array.from({ length: 12 }, (_, i) => `Section ${i + 1}: Verified subsystem health and metrics across nodes.`).join("\n\n");
+              return {
+                agent: {
+                  id,
+                  title: "Supervisor roadmap & audit",
+                  provider: "antigravity",
+                  status: "idle",
+                  cwd: "/home/dev/paseo/worktrees/openAGI/amman",
+                  workspaceId: "wks_f7143ae5747f958b",
+                  updatedAt: "2026-11-20T04:03:20Z"
+                },
+                entries: [
+                  { timestamp: "2026-11-20T03:56:00Z", item: { type: "user_message", text: "What's left to build?" } },
+                  { timestamp: "2026-11-20T04:02:59Z", item: { type: "tool_call", name: "write_file", detail: { input: { Path: "/home/dev/.gemini/antigravity-cli/brain/abc-123/roadmap_plan.md" } } } },
+                  { timestamp: "2026-11-20T04:03:20Z", item: { type: "assistant_message", text: `${longAudit}\n\nHit **Proceed** on the plan and I'll build v0.0.82.` } }
+                ]
+              };
+            }
+            if (id === "done-agent-2") {
+              return {
+                agent: {
+                  id,
+                  title: "SEO skills audit",
+                  provider: "codex",
+                  status: "idle",
+                  cwd: "/Volumes/Xtra/codex-worktrees/6baf",
+                  workspaceId: "wks_6ff24b2c6fd8058f",
+                  labels: { "migration.originalCwd": "/Users/owner/Dev/webapp-client", theme: "seo" },
+                  requiresAttention: true,
+                  attentionReason: "finished",
+                  updatedAt: "2026-11-20T03:52:26Z"
+                },
+                entries: [
+                  { timestamp: "2026-11-20T03:49:00Z", item: { type: "user_message", text: "Check phone/SMS links" } },
+                  { timestamp: "2026-11-20T03:52:25Z", item: { type: "assistant_message", text: "Added call and SMS links throughout the footer.\n<oai-mem-citation> <citation_entries> rollout_summaries/secret.md </citation_entries> </oai-mem-citation>" } },
+                  { timestamp: "2026-11-20T03:52:26Z", item: { type: "assistant_message", text: "Added call and SMS links throughout the footer.\n<oai-mem-citation> <citation_entries> rollout_summaries/secret.md </citation_entries> </oai-mem-citation>" } }
+                ]
+              };
+            }
+            return {
+              agent: {
+                id,
+                title: "YouTube content strategy",
+                provider: "claude",
+                status: "idle",
+                cwd: "/home/dev/.paseo/imported-history",
+                workspaceId: "wks_b382aa8ff3a3a9bf",
+                labels: { theme: "marketing" },
+                requiresAttention: true,
+                attentionReason: "error",
+                updatedAt: "2026-11-20T02:05:00Z"
+              },
+              entries: [
+                { timestamp: "2026-11-20T02:00:00Z", item: { type: "user_message", text: "Generate outline" } },
+                { timestamp: "2026-11-20T02:05:00Z", item: { type: "error", message: "API Error 400: unknown model provider" } }
+              ]
+            };
+          }
+        }
+      })
+    }
+  });
+
+  const sup = new FleetSupervisor({
+    dataDir: tmpDir,
+    config: {
+      enabled: true,
+      mode: "observe",
+      paseo: { enabled: true, only: true, url: "ws://127.0.0.1:6767/ws", projectsDir: false }
+    },
+    deps: {
+      now: () => Date.parse("2026-11-20T04:05:00Z"),
+      paseoFactory: fakePaseoFactory
+    }
+  });
+
+  await sup.tick();
+  const state = sup.getState();
+
+  // 1. Plan Ready / Proceed card surfaced for Antigravity brain plan artifact!
+  const planCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.plan-agent-1");
+  assert.ok(planCard, "expected Plan Ready card for plan-agent-1");
+  assert.equal(planCard.kindLabel, "Plan Ready");
+  assert.equal(planCard.primaryAction.label, "Proceed");
+  assert.equal(planCard.project, "openAGI");
+
+  // 2. Finished session surfaced as "Finished" with safe "View Chat" + "Dismiss" (NEVER unconfirmed "Archive" in options!),
+  //    junk hash folder "6baf" ignored in favor of migration.originalCwd ("webapp-client"),
+  //    and <oai-mem-citation> + duplicate messages stripped!
+  const doneCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2");
+  assert.ok(doneCard, "expected Finished card for done-agent-2");
+  assert.equal(doneCard.kind, "completed");
+  assert.equal(doneCard.kindLabel, "Finished");
+  assert.equal(doneCard.headline, "SEO skills audit: finished");
+  assert.deepEqual(doneCard.options, ["Got it"], "push/card options must never include unconfirmed Archive");
+  assert.equal(doneCard.primaryAction.op, "open_chat");
+  assert.equal(doneCard.primaryAction.label, "View Chat");
+  assert.equal(doneCard.secondaryAction.op, "dismiss");
+  assert.equal(doneCard.secondaryAction.label, "Dismiss");
+  assert.equal(doneCard.extraActions[0]?.op, "archive_session");
+  assert.equal(doneCard.extraActions[0]?.destructive, true);
+  assert.equal(doneCard.project, "webapp-client");
+  assert.ok(!String(doneCard.agentSummary ?? "").includes("oai-mem-citation"), "oai-mem-citation must be stripped");
+  assert.equal(doneCard.recentMessages.filter((m) => m.role === "assistant").length, 1, "consecutive duplicate assistant messages must be deduplicated");
+
+  // 3. Error session surfaced as "Session Error" and "imported-history" ignored in favor of theme ("marketing")!
+  const errCard = state.cards.find((c) => c.threadKey === "paseo:srv_bb3.err-agent-3");
+  assert.ok(errCard, "expected Session Error card for err-agent-3");
+  assert.equal(errCard.kindLabel, "Session Error");
+  assert.equal(errCard.project, "marketing");
+
+  // 4. Aliasing "webapp-client" -> "MainProduct" updates card & thread project everywhere
+  sup.upsertProject({ name: "MainProduct", alias: "webapp-client" });
+  const aliasedState = sup.getState();
+  assert.equal(aliasedState.cards.find((c) => c.id === doneCard.id).project, "MainProduct");
+  assert.equal(aliasedState.snapshot.threads.find((r) => r.key === "paseo:srv_bb3.done-agent-2").project, "MainProduct");
+
+  // 5. Unconfirmed archive_session is rejected safely without touching Paseo!
+  const unconfirmedRes = await sup.actCard(doneCard.id, { op: "archive_session" });
+  assert.equal(unconfirmedRes.ok, false);
+  assert.equal(unconfirmedRes.status, "confirmation_required");
+  assert.deepEqual(archivedIds, [], "unconfirmed archive must never archive Paseo chat");
+
+  // 6. Dismissing errCard clears ONLY the notification in OpenAGI across ticks without archiving Paseo!
+  const dismissErrRes = await sup.actCard(errCard.id, { op: "dismiss" });
+  assert.equal(dismissErrRes.ok, true);
+  assert.deepEqual(archivedIds, [], "dismissing notification must never archive Paseo chat");
+
+  // 7. Confirmed archive_session archives in Paseo, marks completion reviewed, AND unarchiveThread restores it!
+  const actRes = await sup.actCard(doneCard.id, { op: "archive_session", confirmed: true });
+  assert.equal(actRes.ok, true);
+  assert.equal(actRes.status, "archived_session");
+  assert.deepEqual(archivedIds, ["done-agent-2"]);
+  await sup.tick();
+  assert.equal(sup.getState().cards.find((c) => c.threadKey === "paseo:srv_bb3.done-agent-2"), undefined, "reviewed completion stays closed on next scan");
+  assert.equal(sup.getState().cards.find((c) => c.threadKey === "paseo:srv_bb3.err-agent-3"), undefined, "dismissed error notification stays closed on next scan");
+
+  const undoRes = await sup.unarchiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(undoRes.ok, true);
+  assert.equal(undoRes.status, "unarchived_session");
+  assert.deepEqual(archivedIds, [], "unarchiveThread restores archived Paseo session");
+
+  // 8. Verify RemoteFleetSupervisor + createFleetCapability forward archive & unarchive across main relay!
+  const remoteCap = createFleetCapability(sup);
+  const remoteProxy = new RemoteFleetSupervisor({
+    nodeId: "mac-node",
+    dataDir: tmpDir,
+    runtime: {
+      nodeCapabilities: {
+        dispatch: async (_nodeId, _cap, op, payload) => remoteCap.invoke(op, payload)
+      }
+    }
+  });
+  const unconfRemote = await remoteProxy.archiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(unconfRemote.ok, false);
+  assert.equal(unconfRemote.status, "confirmation_required");
+  const confRemote = await remoteProxy.archiveThread("paseo:srv_bb3.done-agent-2", { confirmed: true });
+  assert.equal(confRemote.ok, true);
+  assert.deepEqual(archivedIds, ["done-agent-2"]);
+  const undoRemote = await remoteProxy.unarchiveThread("paseo:srv_bb3.done-agent-2");
+  assert.equal(undoRemote.ok, true);
+  assert.deepEqual(archivedIds, []);
 });

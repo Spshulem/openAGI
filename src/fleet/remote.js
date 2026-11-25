@@ -3,19 +3,21 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
-import { MODES, resolveFleetConfig } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, clampText, redactSecrets, resolveFleetConfig, shortHash } from "./contracts.js";
+import { flattenMessage } from "./ui-delivery.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
 import { outreachActions } from './notify.js';
+import { classifyAsk, decisionContextFromQuestion, decisionSummary, shouldHoldForContext } from './decision-context.js';
 import { buildActiveSummary, buildCatchUpSummary, buildSupervisorCard, buildSupervisorDeck } from './cards.js';
 import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|themes\/sync|dispatch|repo-status|preferences|route|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/(?:act|admin-merge)|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +51,17 @@ export function createFleetCapability(supervisor) {
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
+      if (payload.path === '/fleet/api/ask-supervisor') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
+        if (typeof payload.body?.theme === 'string') url.searchParams.set('theme', payload.body.theme);
+        if (payload.body?.includeSnoozed !== undefined) url.searchParams.set('includeSnoozed', String(Boolean(payload.body.includeSnoozed)));
+        if (payload.body?.includeDone !== undefined) url.searchParams.set('includeDone', String(Boolean(payload.body.includeDone)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
       if (payload.path === '/fleet/api/repo-status') {
         if (typeof payload.body?.repo === 'string') url.searchParams.set('repo', payload.body.repo);
         if (typeof payload.body?.workspace === 'string') url.searchParams.set('workspace', payload.body.workspace);
@@ -59,7 +72,11 @@ export function createFleetCapability(supervisor) {
       }
       const response = await route(payload.method, payload.path, url, async () => payload.body ?? {},
         { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
-      return { response, state: supervisor.getState() };
+      return {
+        response,
+        state: supervisor.getState(),
+        activeWork: typeof supervisor.getActiveWork === 'function' ? supervisor.getActiveWork() : null
+      };
     }
   };
 }
@@ -75,28 +92,133 @@ const REQUEST_TIMEOUT_MS = 120000;
 // answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 // A click waits for the card to go; an app quit or restart for the app.
-const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive|failover))$/;
+
+const FEEDBACK_OUTBOX_MAX = 200;
+const ATTEMPTS_MAX = 100;
+// The node-control broker's per-command ceiling (MAX_COMMAND_BYTES in
+// src/node-control.js), named here so a refused screenshot says why.
+const MAX_TRANSPORT_BYTES = 256 * 1024;
+// An owner message that never reached the computer: tried this many times in
+// all, waiting these between tries. Bounded so a tool call stays short.
+const SEND_ATTEMPTS = 3;
+const SEND_RETRY_DELAYS_MS = [1500, 5000];
+// A receipt journaled up to this long before the request started still
+// counts (clocks on the two computers differ slightly).
+const RECEIPT_SKEW_MS = 5000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function imageBytes(images) {
+  return images.reduce((sum, image) => sum + (typeof image?.data === 'string' ? image.data.length : 0), 0);
+}
+
+// The result a fleet computer's own receipt stands for. One that says the
+// send may or may not have landed (the executor journals it failed or sent,
+// unconfirmed) stays unconfirmed: never a plain failure, which could invite
+// a resend, and never a confirmed send.
+function fromReceipt(receipt, attempts, detail) {
+  const unconfirmed = receipt.unconfirmed === true;
+  const confirmed = receipt.status === 'sent' && !unconfirmed;
+  return { ...(confirmed ? { reconciledAfterTimeout: true } : {}),
+    delivery: { status: receipt.status, ...(unconfirmed ? { unconfirmed: true } : {}), route: receipt.route ?? null, detail,
+      ...(receipt.handoffKey ? { handoffKey: receipt.handoffKey } : {}),
+      actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true,
+      verifiedAt: unconfirmed ? null : (receipt.finishedAt ?? receipt.at ?? null), attempts } };
+}
+
+function attemptSummary(attempt, error) {
+  return error
+    ? { attempt, kind: error.kind ?? 'failed', retryable: error.retryable === true, uncertain: error.uncertain === true, detail: clampText(redactSecrets(String(error.message ?? '')), 200) }
+    : { attempt, kind: 'ok' };
+}
+
+// Why a request to the fleet computer failed, as one of four kinds, each
+// with its own next step:
+// - refused: the computer answered with its own error (a GitHub failure, a
+//   chat whose delivery is off). It is up; its words are the answer.
+// - too-large: the request is over the link's size limit. Never retried.
+// - uncertain: the computer took it but did not answer in time; it may have
+//   run, so it is reconciled against receipts, never blindly repeated.
+// - unreachable: it never got there (offline, queue full). Safe to retry.
+export function classifyFleetRequestError(error, { reached = false, status = null } = {}) {
+  const raw = clampText(redactSecrets(String(error?.message ?? '').trim()), 200);
+  if (reached) {
+    return { kind: 'refused', message: raw && raw !== 'Fleet request failed' ? raw : `The fleet computer refused the request (HTTP ${status ?? 'error'}).`, retryable: false, uncertain: false };
+  }
+  if (/exceeded the transport limit|not serializable/i.test(raw)) {
+    return { kind: 'too-large', message: `Not sent: the request is over the ${Math.round(MAX_TRANSPORT_BYTES / 1024)} KB limit of the link to the fleet computer. Retrying cannot help; send less (for example without images).`, retryable: false, uncertain: false };
+  }
+  // The computer took it, so it may have run (a timeout, or a failure it
+  // reported after executing, such as an oversized result): reconcile
+  // against its receipts, never send again.
+  if (error?.nodeAcknowledged === true) {
+    return { kind: 'uncertain', message: `The fleet computer took the request but ${/timed out/i.test(raw) ? 'did not answer in time' : 'reported a failure after taking it'}; it may still have run. Check its receipts before trying again.`, retryable: false, uncertain: true };
+  }
+  return { kind: 'unreachable', message: `Fleet computer unavailable${raw ? ` (${clampText(raw, 120)})` : ''}. Retry when it is online.`, retryable: true, uncertain: false };
+}
+
+// Hashes the fleet computer journals for an owner send of this message:
+// the route's text (an image-only send gets its default line), prefixed as
+// the executor types it, raw or flattened for computer-use.
+function ownerMessageHashes(message, images) {
+  const raw = String(message ?? '').trim();
+  const text = raw || (Array.isArray(images) && images.length ? 'Please inspect the attached image(s).' : '');
+  const prefixed = text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`;
+  return new Set([shortHash(prefixed), shortHash(flattenMessage(prefixed))]);
+}
+
+function queuedFeedback(entry) {
+  const input = entry.input ?? {};
+  return { id: entry.localId, status: 'queued', queued: true, createdAt: entry.at,
+    utterance: typeof input.utterance === 'string' ? input.utterance : null, intent: input.intent ?? null, target: input.target ?? null,
+    detail: 'Saved on this server; it goes to the fleet computer once that is reachable.' };
+}
 
 export class RemoteFleetSupervisor {
-  constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
+  constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null, sendRetryDelaysMs = SEND_RETRY_DELAYS_MS }) {
     this.runtime = runtime;
     this.nodeId = nodeId;
     this.intervalMs = intervalMs;
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
     this.modeFile = dataDir ? path.join(dataDir, "fleet-remote-mode.json") : null;
+    this.preferencesFile = dataDir ? path.join(dataDir, "fleet-remote-preferences.json") : null;
     // Only the fleet computer knows its mode. Until it answers, this is the
     // last mode it reported (kept across restarts), or none: never a guess.
     this.reportedMode = this.lastReportedMode();
-    this.state = { mode: this.reportedMode, enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
+    const cachedPrefsState = this.lastReportedPreferencesState();
+    this.reportedPreferences = cachedPrefsState.preferences;
+    this.lastOwnerAckAtMs = cachedPrefsState.lastOwnerAckAtMs;
+    this.state = {
+      mode: this.reportedMode,
+      ...(this.reportedPreferences ? { preferences: this.reportedPreferences } : {}),
+      ...(this.lastOwnerAckAtMs > 0 ? { lastOwnerAckAt: new Date(this.lastOwnerAckAtMs).toISOString() } : {}),
+      enabled: true,
+      running: false,
+      lastTickAt: null,
+      lastError: 'Waiting for the fleet computer',
+      snapshot: null,
+      questions: [],
+      actions: [],
+      settings: { remoteNode: nodeId }
+    };
     this.refreshing = null;
     this.questionsAuthoritative = false;
     this.timer = null;
     this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
+    // Feedback said while the computer was out of reach, kept here and sent
+    // on the next refresh that reaches it.
+    this.feedbackOutboxFile = dataDir ? path.join(dataDir, "fleet-feedback-outbox.json") : null;
+    this.feedbackOutbox = this.loadFeedbackOutbox();
     this.lastEmitted = null;
+    this.activeWorkSignature = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
+    this.attemptsFile = dataDir ? path.join(dataDir, "fleet-remote-attempts.json") : null;
+    this.attempts = this.loadAttempts();
+    this.sendRetryDelaysMs = sendRetryDelaysMs;
   }
   lastReportedMode() {
     if (!this.modeFile) return null;
@@ -114,6 +236,47 @@ export class RemoteFleetSupervisor {
       if (this.modeFile) writeJsonAtomic(this.modeFile, { nodeId: this.nodeId, mode });
       this.reportedMode = mode;
     } catch { /* unsaved: the next report writes it */ }
+  }
+  lastReportedPreferencesState() {
+    if (!this.preferencesFile) return { preferences: null, lastOwnerAckAtMs: 0 };
+    try {
+      const saved = readJsonFile(this.preferencesFile, null);
+      if (saved?.nodeId !== this.nodeId) return { preferences: null, lastOwnerAckAtMs: 0 };
+      const preferences = saved?.preferences && typeof saved.preferences === "object"
+        ? normalizePreferences(saved.preferences)
+        : null;
+      const ackMs = Date.parse(String(saved?.lastOwnerAckAt ?? ""));
+      return { preferences, lastOwnerAckAtMs: Number.isFinite(ackMs) && ackMs > 0 ? ackMs : 0 };
+    } catch {
+      return { preferences: null, lastOwnerAckAtMs: 0 };
+    }
+  }
+  _savePreferencesCache() {
+    if (!this.preferencesFile) return;
+    try {
+      writeJsonAtomic(this.preferencesFile, {
+        nodeId: this.nodeId,
+        ...(this.reportedPreferences ? { preferences: this.reportedPreferences } : {}),
+        ...(this.lastOwnerAckAtMs > 0 ? { lastOwnerAckAt: new Date(this.lastOwnerAckAtMs).toISOString() } : {})
+      });
+    } catch { /* unsaved: the next report writes it */ }
+  }
+  noteReportedPreferences(prefs) {
+    if (!prefs || typeof prefs !== "object") return;
+    const normalized = normalizePreferences(prefs);
+    if (this.reportedPreferences && JSON.stringify(normalized) === JSON.stringify(this.reportedPreferences)) return;
+    this.reportedPreferences = normalized;
+    this._savePreferencesCache();
+  }
+  noteOwnerAck(atMs = Date.now()) {
+    const ts = typeof atMs === "string" ? Date.parse(atMs) : Number(atMs);
+    if (!Number.isFinite(ts) || ts <= 0) return;
+    if (ts > this.lastOwnerAckAtMs) {
+      this.lastOwnerAckAtMs = ts;
+      this.state.lastOwnerAckAt = new Date(ts).toISOString();
+      this._savePreferencesCache();
+    }
+    this.runtime?.hubProactiveGuard?.noteOwnerActivity?.(this.lastOwnerAckAtMs);
   }
   getState() {
     const state = structuredClone(this.state);
@@ -162,7 +325,8 @@ export class RemoteFleetSupervisor {
     let reached = false;
     let status = null;
     try {
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: method === 'POST' && DELIVERING.test(path) ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
+      const isDelivering = method === 'POST' && (DELIVERING.test(path) || /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path));
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: isDelivering ? DELIVERY_TIMEOUT_MS : REQUEST_TIMEOUT_MS });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       if (sequence >= this.appliedSequence) {
@@ -170,7 +334,14 @@ export class RemoteFleetSupervisor {
         this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
         this.questionsAuthoritative = true;
         this.noteReportedMode(this.state.mode);
+        this.noteReportedPreferences(this.state.preferences);
+        if (this.state.lastOwnerAckAt) this.noteOwnerAck(this.state.lastOwnerAckAt);
+        if (this.lastOwnerAckAtMs > 0) {
+          const curAck = Date.parse(String(this.state.lastOwnerAckAt ?? "")) || 0;
+          if (this.lastOwnerAckAtMs > curAck) this.state.lastOwnerAckAt = new Date(this.lastOwnerAckAtMs).toISOString();
+        }
         this.mirrorQuestions();
+        this.mirrorActiveWork(result.activeWork ?? result.response?.body?.activeWork ?? null);
         this.emitIfChanged();
       }
       status = result.response?.status ?? null;
@@ -181,18 +352,126 @@ export class RemoteFleetSupervisor {
       const unsupportedRoute = (reached && status === 404 && /unknown fleet route/i.test(rawMsg))
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
-      const nonOutageError = missingThread || closedCard || unsupportedRoute;
-      if (!nonOutageError && sequence >= this.appliedSequence) this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
-      // Preserve the last snapshot/questions through connection outages.
-      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute });
+      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/(?:act|admin-merge)$/.test(path);
+      const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
+      const nonOutageError = missingThread || closedCard || missingActiveWork || unsupportedRoute;
+      const failure = nonOutageError
+        ? { kind: 'not-found', message: rawMsg, retryable: false, uncertain: false }
+        : classifyFleetRequestError(error, { reached, status });
+      // Only a computer that could not be reached is an outage. One that
+      // answered with its own error is up: its state was applied above.
+      if (failure.kind === 'unreachable' && sequence >= this.appliedSequence) this.state.lastError = failure.message;
+      // The 30 s state poll is left out: an outage would fill the log with it.
+      if (!nonOutageError && !(method === 'GET' && path === '/fleet/api/state')) this.recordAttempt({ method, path, status, reached, ...failure });
+      // Preserve the last snapshot/questions through connection outages, and never
+      // misreport an HTTP error from an online fleet computer as an offline outage.
+      const timedOut = !reached && /timed out|timeout|aborted/i.test(rawMsg);
+      throw Object.assign(new Error(failure.message), {
+        reached, status, unsupportedRoute, timedOut, kind: failure.kind, retryable: failure.retryable, uncertain: failure.uncertain,
+        nodeAcknowledged: error?.nodeAcknowledged === true
+      });
     }
+  }
+  // Failed requests to the fleet computer and every delivering request's
+  // outcome, newest last, kept across restarts: what went wrong on which
+  // attempt, without the payload (no message text, images or tokens).
+  recordAttempt({ method, path, status = null, reached = false, kind = 'ok', message = '', retryable = false, uncertain = false }) {
+    const entry = {
+      at: new Date().toISOString(),
+      method,
+      path: clampText(String(path ?? ''), 160),
+      status: Number.isInteger(status) ? status : null,
+      reached: reached === true,
+      kind,
+      retryable: retryable === true,
+      uncertain: uncertain === true,
+      detail: clampText(redactSecrets(String(message ?? '')), 240)
+    };
+    this.attempts.push(entry);
+    if (this.attempts.length > ATTEMPTS_MAX) this.attempts.splice(0, this.attempts.length - ATTEMPTS_MAX);
+    if (this.attemptsFile) {
+      try { writeJsonAtomic(this.attemptsFile, { nodeId: this.nodeId, attempts: this.attempts }); } catch { /* the in-memory copy still answers */ }
+    }
+    return entry;
+  }
+  recentAttempts(limit = 20) {
+    return this.attempts.slice(-Math.max(1, Math.min(ATTEMPTS_MAX, limit)));
+  }
+  loadAttempts() {
+    if (!this.attemptsFile) return [];
+    const saved = readJsonFile(this.attemptsFile, null);
+    return saved?.nodeId === this.nodeId && Array.isArray(saved.attempts) ? saved.attempts.slice(-ATTEMPTS_MAX) : [];
+  }
+  // The fleet computer's own receipt for an owner message sent since
+  // startedAt (its journal hashes the text as it went into the chat), or
+  // null. Refreshes first: after a lost reply the last state predates it.
+  // known: receipt ids that already existed when this request started. They
+  // belong to earlier sends (the same short text can be sent twice on
+  // purpose) and never count as this one's.
+  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null, idempotencyKey = null) {
+    try { await this.refresh(); } catch { /* still unreachable: judge on what is here */ }
+    // When an approval key was sent, reconcile against its persisted handoff
+    // outcome first: a held offline handoff sits in `handoffs` even when the
+    // executor's preliminary attempt journaled a `blocked` host-unavailable row.
+    if (idempotencyKey) {
+      const handoffs = Array.isArray(this.state.handoffs) ? this.state.handoffs : [];
+      const handoff = handoffs.find((entry) => entry?.key === idempotencyKey) ?? null;
+      if (handoff) {
+        if (handoff.status === 'queued') {
+          return {
+            status: 'queued',
+            queued: true,
+            route: 'paseo-queue',
+            handoffKey: handoff.key,
+            detail: handoff.detail || 'Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).',
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'waiting') {
+          return {
+            status: 'queued',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            detail: `${handoff.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.`,
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'delivered') {
+          return {
+            status: 'sent',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            id: handoff.deliveredActionId ?? null,
+            detail: handoff.detail ?? `already delivered for this approval at ${handoff.deliveredAt ?? handoff.updatedAt}; not sent again`,
+            at: handoff.deliveredAt ?? handoff.updatedAt ?? null
+          };
+        }
+        return {
+          status: 'blocked',
+          route: 'paseo-send',
+          handoffKey: handoff.key,
+          ...(handoff.status === 'unconfirmed' ? { unconfirmed: true } : {}),
+          detail: `approved handoff ${handoff.status}: ${handoff.detail}`,
+          at: handoff.updatedAt ?? null
+        };
+      }
+    }
+    // The executor journals the prefixed text it sent (flattened for
+    // computer-use): either form of this exact message counts.
+    const hashes = ownerMessageHashes(message, images);
+    const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+    return actions.findLast((action) => action?.threadKey === threadKey
+      && !known.has(action.id)
+      && action.playbook === 'owner-message'
+      && hashes.has(action.messageHash)
+      && (Date.parse(action.finishedAt ?? action.at ?? '') || 0) >= startedAt - RECEIPT_SKEW_MS) ?? null;
   }
   refresh() {
     if (!this.refreshing) {
       this.refreshing = this.request('GET', '/fleet/api/state')
         .then(async (body) => { await this.selfFixHub?.sync().catch(() => {}); return body; })
         .then(async (body) => { await this.replayDismissals(); return body; })
+        .then(async (body) => { await this.flushFeedback(); return body; })
         .then((body) => { this.emitIfChanged(); return body; })
         .finally(() => { this.refreshing = null; });
     }
@@ -208,6 +487,7 @@ export class RemoteFleetSupervisor {
         state.snapshot?.at ?? null,
         state.questions.map(q => q.id).sort(),
         (state.cards ?? []).map(c => c.id).sort(),
+        this.activeWorkSignature,
         state.preferences?.mergePolicy ?? null,
         state.preferences?.cadence ?? null,
         state.preferences?.autoSlices ?? null
@@ -220,21 +500,33 @@ export class RemoteFleetSupervisor {
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
   async answerQuestion(id, answer, { clarification = null } = {}) {
-    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer);
+    if (this.selfFixHub?.store.question(id)) {
+      const out = this.selfFixHub.answer(id, answer);
+      this.noteOwnerAck();
+      return out;
+    }
     const card = this.state.questions.find(q => q.id === id);
     if (this.selfFixHub && card?.kind === 'suggestion' && answer === 'Fix it' && (card.options ?? []).includes(answer)) {
       const result = await this.respondSuggestion(card.meta?.suggestionId, answer);
+      this.noteOwnerAck();
       return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
     }
-    return this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    const res = await this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    this.noteOwnerAck();
+    return res;
   }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
   async dismissQuestion(id, { replay = false } = {}) {
-    if (this.selfFixHub?.store.question(id)) return this.selfFixHub.store.dismissQuestion(id);
+    if (this.selfFixHub?.store.question(id)) {
+      const out = this.selfFixHub.store.dismissQuestion(id);
+      this.noteOwnerAck();
+      return out;
+    }
     try {
       const body = await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true });
       this.pendingDismissals.delete(id);
+      this.noteOwnerAck();
       return body.question;
     } catch (error) {
       if (replay && !error.reached) this.pendingDismissals.add(id);
@@ -250,10 +542,62 @@ export class RemoteFleetSupervisor {
     }
   }
   // Brings back a question the computer's review closed.
-  async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
+  async replyQuestion(id, reply) {
+    const res = await this.request('POST', `/fleet/api/questions/${id}`, { reply });
+    this.noteOwnerAck();
+    return res;
+  }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) { return this.request('POST', '/fleet/api/send', { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(Array.isArray(images) && images.length ? { images } : {}) }); }
+  // The owner's message to one thread. A request the computer never received
+  // (offline, its queue full) is sent again, at most SEND_ATTEMPTS times in
+  // all; one it received but did not answer may have gone out, so its own
+  // receipt decides, and with none it is reported unconfirmed, never sent
+  // and never sent twice. Every attempt is in the result.
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null, idempotencyKey = null } = {}) {
+    const hasImages = Array.isArray(images) && images.length > 0;
+    // The approval's key travels with every attempt: the fleet computer
+    // never carries out the same approval twice, and holds it while the
+    // chat's host is offline.
+    const body = { threadKey, message, ...(typeof queue === 'boolean' ? { queue } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
+    const startedAt = Date.now();
+    const known = new Set((Array.isArray(this.state.actions) ? this.state.actions : []).map((action) => action?.id).filter(Boolean));
+    const attempts = [];
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const result = await this.request('POST', '/fleet/api/send', body);
+        const delivery = result?.delivery ?? null;
+        this.recordAttempt({ method: 'POST', path: '/fleet/api/send', status: 200, reached: true, kind: delivery?.status === 'sent' ? 'ok' : 'delivery-' + String(delivery?.status ?? 'unknown'), message: delivery?.detail ?? '' });
+        return attempts.length && delivery ? { ...result, delivery: { ...delivery, attempts: [...attempts, attemptSummary(attempt, null)] } } : result;
+      } catch (error) {
+        attempts.push(attemptSummary(attempt, error));
+        if (error.uncertain) {
+          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 220)} (the fleet computer's receipt; its reply to this request was lost)`);
+          return { delivery: { status: 'unknown', unconfirmed: true, route: null,
+            detail: 'the fleet computer took the message but did not answer in time and has no receipt for it yet; not sent again so it cannot arrive twice. Check fleet_thread receipts before resending.',
+            attempts } };
+        }
+        if (error.kind === 'too-large' && hasImages) {
+          throw Object.assign(new Error(`Not sent: with its ${images.length} image(s) (about ${Math.round(imageBytes(images) / 1024)} KB) this message is over the ${Math.round(MAX_TRANSPORT_BYTES / 1024)} KB limit of the link to the fleet computer. Retrying cannot help: send it without the images (forwardImages: false) or attach a smaller screenshot.`),
+            { reached: false, status: null, kind: 'too-large', retryable: false, uncertain: false, attempts });
+        }
+        if (!error.retryable || attempt >= SEND_ATTEMPTS) {
+          error.attempts = attempts;
+          if (attempt > 1) error.message = `${error.message} (${attempt} attempts)`;
+          throw error;
+        }
+        // It never reached the computer, so nothing went out; but if an
+        // earlier reply was lost, its receipt says so before sending again.
+        await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
+        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+        // A send that may have landed (or was persisted as a held handoff) is not sent again either.
+        if (receipt && (receipt.status === 'sent' || receipt.status === 'queued' || receipt.unconfirmed === true)) {
+          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 220));
+        }
+      }
+    }
+  }
   async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
   async screenThread(threadKey) {
     const { state: _state, ...screen } = await this.request('POST', '/fleet/api/screen', { threadKey });
@@ -264,8 +608,50 @@ export class RemoteFleetSupervisor {
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
   }
   // Feedback and self-fix requests live with the fleet, on the computer.
-  async recordFeedback(input) { return (await this.request('POST', '/fleet/api/feedback', input)).feedback; }
-  async feedback() { return (await this.request('GET', '/fleet/api/feedback')).feedback ?? []; }
+  async recordFeedback(input) {
+    try {
+      return (await this.request('POST', '/fleet/api/feedback', input)).feedback;
+    } catch (error) {
+      // The computer answered and refused it: that is the answer. Out of
+      // reach: keep it here instead of losing the owner's words.
+      if (error.reached || !this.feedbackOutboxFile) throw error;
+      const entry = { localId: `fb_local_${randomUUID().replace(/-/g, '').slice(0, 16)}`, input, at: new Date().toISOString() };
+      this.feedbackOutbox = [...this.feedbackOutbox, entry].slice(-FEEDBACK_OUTBOX_MAX);
+      this.saveFeedbackOutbox();
+      return queuedFeedback(entry);
+    }
+  }
+  async feedback() {
+    const sent = (await this.request('GET', '/fleet/api/feedback')).feedback ?? [];
+    return [...this.feedbackOutbox.map(queuedFeedback).reverse(), ...sent];
+  }
+  loadFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return [];
+    try {
+      const saved = readJsonFile(this.feedbackOutboxFile, null);
+      return Array.isArray(saved?.entries) ? saved.entries.filter(e => e?.localId && e.input && typeof e.input === 'object') : [];
+    } catch {
+      return [];
+    }
+  }
+  saveFeedbackOutbox() {
+    if (!this.feedbackOutboxFile) return;
+    try { writeJsonAtomic(this.feedbackOutboxFile, { entries: this.feedbackOutbox }); } catch { /* kept in memory; the next save writes it */ }
+  }
+  // Oldest first; stops at the first one the computer cannot be reached for.
+  async flushFeedback() {
+    for (const entry of [...this.feedbackOutbox]) {
+      try {
+        await this.request('POST', '/fleet/api/feedback', entry.input);
+      } catch (error) {
+        // Kept for later unless the computer refused it as invalid (4xx):
+        // out of reach, or a 5xx, may work next time.
+        if (!error.reached || !(error.status >= 400 && error.status < 500)) break;
+      }
+      this.feedbackOutbox = this.feedbackOutbox.filter(e => e.localId !== entry.localId);
+      this.saveFeedbackOutbox();
+    }
+  }
   async diagnose(options = {}) { return this.request('GET', '/fleet/api/diagnose', options); }
   async searchThreads(options = {}) {
     const limit = Number.isInteger(options?.limit) ? options.limit : 20;
@@ -360,10 +746,84 @@ export class RemoteFleetSupervisor {
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async getSupervisorWork(input = {}) { return this.request('GET', '/fleet/api/ask-supervisor', input); }
+  async getOrganization() { return (await this.request('GET', '/fleet/api/projects')).organization; }
+  async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
+  async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
+  async organizeThread(threadKey, input = {}) { return this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/organize`, input); }
+  async paseoSessionSettings(threadKey) {
+    const body = await this.request('GET', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
+  async updatePaseoSessionSettings(threadKey, input = {}) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/settings`, input);
+    return { ok: true, settings: body?.settings ?? null, detail: body?.detail ?? null };
+  }
+  async switchPaseoProvider(threadKey, input = {}) {
+    const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/failover`, input);
+    return body?.result ?? { ok: false, detail: 'Provider failover returned no result.' };
+  }
+  // Same input ({ id, evidenceSummary, cursor, ownerConfirmedDone }) and
+  // result ({ accomplished, continueRequired, item, ... }) as the local
+  // ActiveWorkManager.verifyGoalProgress, run on the owning Fleet computer.
+  async verifyGoalProgress({ id, evidenceSummary = '', cursor = null, ownerConfirmedDone = false } = {}) {
+    const cleanId = String(id ?? '').trim();
+    if (!cleanId) throw new Error('Pass the tracked goal id.');
+    const body = {
+      evidenceSummary: String(evidenceSummary ?? ''),
+      ...(cursor && typeof cursor === 'object' ? { cursor } : {}),
+      ownerConfirmedDone: ownerConfirmedDone === true
+    };
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(cleanId)}/verify`, body)).result ?? null;
+    } catch (error) {
+      if (!error.unsupportedRoute) throw error;
+    }
+    // An older Fleet computer without the verify route: record owner-confirmed
+    // completion through confirm_done; otherwise report the cursor verdict.
+    if (ownerConfirmedDone === true) {
+      const acted = await this.actActiveWork(cleanId, { op: 'confirm_done', note: body.evidenceSummary || 'Verified via verify_goal_progress' });
+      if (!acted) throw new Error(`No tracked goal with id "${cleanId}".`);
+      const accomplished = Boolean(acted.ok);
+      return { ok: accomplished, id: cleanId, accomplished, continueRequired: !accomplished, confidence: accomplished ? 1 : 0, item: acted.item ?? null };
+    }
+    const active = await this.getActiveWork({ limit: 100, includeDone: true });
+    const item = (active?.items ?? []).find((it) => it.id === cleanId) ?? null;
+    if (!item) throw new Error(`No tracked goal with id "${cleanId}".`);
+    const remaining = Number.isInteger(cursor?.remaining) ? cursor.remaining : null;
+    const accomplished = remaining === 0 || item.outcomeVerified === true;
+    return {
+      ok: true,
+      id: cleanId,
+      accomplished,
+      continueRequired: !accomplished,
+      confidence: accomplished ? 1 : 0,
+      note: accomplished
+        ? 'All tracked batches satisfied; ready for owner verification (`confirm_done`).'
+        : 'Definition of Done is not yet satisfied; continue next batch.',
+      item
+    };
+  }
   async syncThemes(input = {}) { return (await this.request('POST', '/fleet/api/themes/sync', input)).result ?? null; }
   async dispatchGoal(input = {}) { return (await this.request('POST', '/fleet/api/dispatch', input)).result ?? null; }
   async inspectRepoStatus(input = {}) { return this.request('GET', '/fleet/api/repo-status', input); }
   async startPaseoSession(input = {}) { return (await this.request('POST', '/fleet/api/sessions/start', input)).session ?? null; }
+  async claimTask(input = {}) { return await this.request('POST', '/fleet/api/tasks/claim', input); }
+  async getActiveWork(input = {}) { return this.request('GET', '/fleet/api/active-work', input); }
+  async trackWork(input = {}) {
+    const { state: _state, activeWork: _aw, ...rest } = await this.request('POST', '/fleet/api/active-work', input);
+    return rest;
+  }
+  async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async scheduleActiveWorkRecheck(id, input = {}) { return this.actActiveWork(id, { ...input, op: 'schedule_recheck' }); }
+  async actActiveWork(id, input = {}) {
+    try {
+      return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      throw error;
+    }
+  }
   async batchActCards(input = {}) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
       throw new Error('Pass a JSON object body.');
@@ -371,7 +831,9 @@ export class RemoteFleetSupervisor {
     const { cardOp, explicitIds } = normalizeBatchCardsInput(input);
     const openLocalQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
     if (openLocalQuestions.length === 0) {
-      return (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+      const res = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
+      if (res?.succeeded > 0) this.noteOwnerAck();
+      return res;
     }
 
     const localById = new Map();
@@ -454,7 +916,9 @@ export class RemoteFleetSupervisor {
           )
         : null;
       if (localRes?.total > 0) this.emitIfChanged();
-      return combineBatchResults(remoteRes, localRes, explicitIds);
+      const combined = combineBatchResults(remoteRes, localRes, explicitIds);
+      if (combined?.succeeded > 0) this.noteOwnerAck();
+      return combined;
     }
 
     const remoteRes = (await this.request('POST', '/fleet/api/cards/batch', input)).result ?? null;
@@ -470,7 +934,9 @@ export class RemoteFleetSupervisor {
       }
     }
     if (localRes?.total > 0) this.emitIfChanged();
-    return combineBatchResults(remoteRes, localRes);
+    const combined = combineBatchResults(remoteRes, localRes);
+    if (combined?.succeeded > 0) this.noteOwnerAck();
+    return combined;
   }
   async readChatTranscript({ key, limit = 20 } = {}) {
     const cleanKey = typeof key === 'string' ? key.trim() : '';
@@ -504,6 +970,25 @@ export class RemoteFleetSupervisor {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
     return rest;
   }
+  // The owner's Admin Merge runs on the fleet computer, where its consent
+  // lives. Only the main's owner route calls these.
+  async previewAdminMerge(cardId, { initiator = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { preview: true });
+  }
+  async adminMergeCard(cardId, { initiator = null, consent = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { consent });
+  }
+  async adminMergeRequest(cardId, body) {
+    try {
+      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/admin-merge`, body)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      if (error.unsupportedRoute) return { ok: false, kind: 'admin_merge', status: 'unsupported', detail: 'The fleet computer runs an older OpenAGI without Admin Merge. Update it first.' };
+      throw error;
+    }
+  }
   async actCard(cardId, input = {}) {
     if (this.selfFixHub && typeof cardId === 'string') {
       const qid = cardId.replace(/^question:/, '');
@@ -527,7 +1012,9 @@ export class RemoteFleetSupervisor {
         const effectiveValue = explicitValue ?? resolvedAction?.value ?? null;
 
         if (effectiveOp === 'defer' || effectiveOp === 'dismiss' || effectiveValue === 'dismiss') {
-          return { ok: true, kind: 'defer', status: 'dismissed', question: this.selfFixHub.store.dismissQuestion(qid), delivery: null };
+          const dismissed = this.selfFixHub.store.dismissQuestion(qid);
+          this.noteOwnerAck();
+          return { ok: true, kind: 'defer', status: 'dismissed', question: dismissed, delivery: null };
         }
         if (effectiveOp === 'merge' || effectiveOp === 'fix_ci') {
           return { ok: false, kind: effectiveOp, status: 'unsupported', detail: 'Self-fix question card does not support PR actions.' };
@@ -536,11 +1023,14 @@ export class RemoteFleetSupervisor {
         const answer = effectiveValue ?? (localQuestion.options ?? []).find((opt) => opt !== 'dismiss') ?? null;
         if (!answer) return null;
         const res = await this.selfFixHub.answer(qid, answer);
+        if (res) this.noteOwnerAck();
         return res ? { ok: true, kind: 'answer', status: res.delivery?.status ?? 'done', ...res } : null;
       }
     }
     try {
-      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+      const res = (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
+      if (res?.ok !== false) this.noteOwnerAck();
+      return res;
     } catch (error) {
       const legacyRouteMissing = Boolean(error.unsupportedRoute) || /unknown fleet route|unsupported fleet request/i.test(String(error?.message ?? ''));
       if (error.status === 404 && !legacyRouteMissing) return null;
@@ -558,10 +1048,11 @@ export class RemoteFleetSupervisor {
         return { ok: true, kind: 'defer', status: 'dismissed', question, delivery: null };
       }
       if (op === 'reply') {
-        const replyText = typeof input?.value === 'string' ? input.value.trim() : '';
+        const hasImages = Array.isArray(input?.images) && input.images.length > 0;
+        const replyText = (typeof input?.value === 'string' ? input.value.trim() : '') || (hasImages ? 'Please inspect the attached image(s).' : '');
         if (!replyText) return { ok: false, kind: 'reply', status: 'blocked', detail: 'Enter a reply to send.' };
-        const eligibleForQuestionReply = openQ.canReply === true
-          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1));
+        const eligibleForQuestionReply = !hasImages && (openQ.canReply === true
+          || (openQ.canReply !== false && ['agent-ask', 'stuck', 'ready'].includes(openQ.kind) && Boolean(openQ.threadKey) && !((openQ.threadKeys ?? []).length > 1)));
         if (eligibleForQuestionReply) {
           const replied = await this.replyQuestion(qid, replyText);
           if (!replied) return { ok: false, kind: 'reply', status: 'closed', detail: 'Question already closed.' };
@@ -576,7 +1067,7 @@ export class RemoteFleetSupervisor {
         }
         const threadKey = card?.threadKey ?? openQ.threadKey ?? null;
         if (!threadKey) return { ok: false, kind: 'reply', status: 'blocked', detail: 'No coding session is linked to this card.' };
-        const sent = await this.sendOwnerMessage(threadKey, replyText);
+        const sent = await this.sendOwnerMessage(threadKey, replyText, { ...(hasImages ? { images: input.images } : {}) });
         return {
           ok: sent?.delivery?.status === 'sent',
           kind: 'reply',
@@ -648,6 +1139,25 @@ export class RemoteFleetSupervisor {
     await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unmute`);
     return { until: null };
   }
+  async archiveThread(threadKey, { confirmed = false } = {}) {
+    if (confirmed !== true) {
+      return { ok: false, status: 'confirmation_required', detail: 'Confirm archiving this coding chat first.' };
+    }
+    try {
+      const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/archive`, { confirmed: true });
+      return body.result ?? { ok: true, status: 'archived_session', threadKey, detail: 'Archived coding chat in Paseo.' };
+    } catch (error) {
+      return { ok: false, status: 'blocked', detail: String(error?.message ?? 'Could not archive coding chat.').slice(0, 200) };
+    }
+  }
+  async unarchiveThread(threadKey) {
+    try {
+      const body = await this.request('POST', `/fleet/api/threads/${encodeURIComponent(threadKey)}/unarchive`, {});
+      return body.result ?? { ok: true, status: 'unarchived_session', threadKey, detail: 'Restored coding chat in Paseo.' };
+    } catch (error) {
+      return { ok: false, status: 'blocked', detail: String(error?.message ?? 'Could not restore coding chat.').slice(0, 200) };
+    }
+  }
   async runningInApp(app) {
     return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
   }
@@ -675,20 +1185,99 @@ export class RemoteFleetSupervisor {
       }
     }
     const items = outreach.list();
+    const nowMs = Date.now();
     for (const q of liveQuestions) {
+      const ctx = q.kind === 'storage' ? null : decisionContextFromQuestion(q);
+      // Held on the coding node while its agent supplies context: the hub
+      // waits too, instead of posting the context-poor ask early.
+      if (ctx && shouldHoldForContext(q, ctx, nowMs)) continue;
       // Compact outreach clients cannot show the full deletion warning.
       // Keep storage decisions in the main app where that warning is visible.
       const shown = q.kind === 'storage'
         ? { title: q.title, summary: 'Storage cleanup can permanently delete files. Review the full warning and choose in the main app.', actions: ['dismiss'] }
-        : { title: q.title, summary: q.card || q.body, actions: outreachActions(q.options) };
+        : { title: q.title, summary: decisionSummary(ctx, q.card || q.body, { maxChars: 1400 }), actions: outreachActions(q.options) };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
       const item = (last && outreach.reopen?.(last.id))
         || outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
-          ...shown, needsDecision: true, dedupeOpen: true });
+          ...shown, needsDecision: classifyAsk(q) === 'decision', dedupeOpen: true });
       // A reworded question ("4 stuck" -> "5 stuck") updates that copy in place.
       if (item?.id) outreach.update?.(item.id, shown);
+    }
+  }
+
+  mirrorActiveWork(activeWork) {
+    const outreach = this.runtime?.outreach;
+    this.mirrorRecheckNotifications(activeWork?.recheckNotifications);
+    if (!activeWork || !Array.isArray(activeWork.prompts)) return;
+    const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
+    this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
+    if (!outreach) return;
+    const openIds = new Set(prompts.map((prompt) => String(prompt.id)));
+    for (const item of outreach.list()) {
+      if (item.sourceRef?.kind === 'active-work'
+          && item.sourceRef.nodeId === this.nodeId
+          && ['unseen', 'seen'].includes(item.status)
+          && !openIds.has(String(item.sourceRef.id))) {
+        outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
+      }
+    }
+    const existing = outreach.list();
+    for (const prompt of prompts) {
+      const sourceRef = { kind: 'active-work', id: prompt.id, nodeId: this.nodeId, mark: prompt.mark };
+      const shown = {
+        title: prompt.title,
+        summary: prompt.summary,
+        actions: Array.isArray(prompt.actions) && prompt.actions.length ? prompt.actions : ['dismiss']
+      };
+      const current = existing.find((item) => item.sourceRef?.kind === 'active-work'
+        && item.sourceRef.nodeId === this.nodeId
+        && String(item.sourceRef.id) === String(prompt.id));
+      const markChanged = Boolean(current && current.sourceRef?.mark !== prompt.mark);
+      const sourceReopened = Boolean(current
+        && current.status === 'dismissed'
+        && current.decision === 'resolved');
+      let item = (markChanged || sourceReopened) ? (outreach.reopen?.(current.id) ?? null) : current;
+      if (!item && current && ['unseen', 'seen'].includes(current.status)) item = current;
+      if (!item) {
+        item = outreach.append({
+          type: 'fleet-active-work',
+          sourceRef,
+          ...shown,
+          needsDecision: false,
+          // A dismissed record cannot be reopened for a changed mark. Do not
+          // let an open-record dedupe rule suppress the replacement notice.
+          dedupeOpen: !markChanged
+        });
+      }
+      if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
+    }
+  }
+
+  // A recheck's result is a one-time notice, not a live prompt: post each
+  // once, and never again once the owner has seen or dismissed it.
+  mirrorRecheckNotifications(notifications) {
+    const outreach = this.runtime?.outreach;
+    if (!outreach || !Array.isArray(notifications)) return;
+    const posted = new Set(outreach.list()
+      .filter((item) => item.sourceRef?.kind === 'active-work-recheck' && item.sourceRef.nodeId === this.nodeId)
+      .map((item) => String(item.sourceRef.id)));
+    for (const notice of notifications) {
+      if (!notice?.id || !notice.title || posted.has(String(notice.id))) continue;
+      // The coding node folded it into the item's open follow-through prompt,
+      // which mirrorActiveWork already carries here: a second entry would
+      // notify the owner twice about one blocker.
+      if (notice.reusedPrompt === true) continue;
+      outreach.append({
+        type: 'fleet-active-work-recheck',
+        sourceRef: { kind: 'active-work-recheck', id: notice.id, itemId: notice.itemId ?? null, nodeId: this.nodeId },
+        title: notice.title,
+        summary: notice.summary ?? '',
+        actions: ['dismiss'],
+        needsDecision: false
+      });
+      posted.add(String(notice.id));
     }
   }
 }

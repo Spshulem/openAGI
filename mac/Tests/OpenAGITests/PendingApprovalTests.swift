@@ -29,6 +29,8 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertTrue(NotificationPresenter.shouldNotify(type: "coding-agent", needsDecision: false, quiet: false))
     XCTAssertFalse(NotificationPresenter.shouldNotify(type: "coding-agent", needsDecision: false, quiet: true))
     XCTAssertFalse(NotificationPresenter.shouldNotify(type: "suggestion", needsDecision: false, quiet: false))
+    XCTAssertTrue(NotificationPresenter.shouldNotify(type: "scheduled-run", needsDecision: false, quiet: false))
+    XCTAssertFalse(NotificationPresenter.shouldNotify(type: "scheduled-run", needsDecision: false, quiet: true))
     XCTAssertEqual(NotificationPresenter.reviewPath(type: "coding-agent"), "/?tab=coding-agents")
     XCTAssertEqual(NotificationPresenter.reviewPath(type: "coding-approval"), "/?tab=approvals")
   }

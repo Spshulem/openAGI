@@ -241,7 +241,7 @@ Setup (owner, once):
 1. **Team.** Set `DEVELOPMENT_TEAM` in `mobile/ios/project.yml` and sign
    with a real profile (replace `CODE_SIGN_IDENTITY: "-"` for device
    builds). Bundle and App Group ids are global across Apple teams; if
-   `sh.openagi.OpenAGI` or `group.sh.openagi.mobile` belongs to another
+   `com.spencershulem.openagi` or `group.com.spencershulem.openagi` belongs to another
    team, set `OPENAGI_BUNDLE_ID` and `OPENAGI_APP_GROUP` (the extensions
    follow the bundle id). On developer.apple.com, enable Push Notifications,
    **Broadcast Push Notifications** (Live Activity updates use APNs

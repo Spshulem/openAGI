@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ToolRegistry } from "../src/tool-registry.js";
+import { ToolRegistry, registerCoreTools } from "../src/tool-registry.js";
 import { fleetScan, fleetStatus, fleetThread, registerFleetTools } from "../src/fleet/tools.js";
+import { resolvePaseoAgentConfig, startPaseoSession } from "../src/fleet/coordinator.js";
+import { buildSupervisorCard, buildSupervisorDeck } from "../src/fleet/cards.js";
 import { createDefaultRuntime } from "../src/index.js";
 
 function row(overrides = {}) {
@@ -44,6 +46,44 @@ test("fleet_status never reports a mode the fleet computer has not confirmed as 
   assert.equal(last.modeUnconfirmed, true);
   const live = fleetStatus({ getState: () => ({ ...base, mode: "auto", modeConfirmed: true }) });
   assert.equal(live.modeUnconfirmed, undefined);
+});
+
+test("Needs You hides no-action completions but keeps a verified owner blocker", () => {
+  const finished = {
+    id: "q_finished", status: "open", kind: "completed", title: "Publisher setup finished",
+    body: "Everything completed successfully; no action is needed.", options: ["Got it"], threadKey: "paseo:srv.done"
+  };
+  const blocked = {
+    id: "q_blocked", status: "open", kind: "completed", title: "Publisher setup finished",
+    body: "The agent drafted the listings, but needs your explicit release authorization before it can enter them.",
+    options: ["Got it"], threadKey: "paseo:srv.blocked"
+  };
+  const deck = buildSupervisorDeck({ questions: [finished, blocked], actions: [], snapshot: { threads: [] } });
+  assert.equal(deck.cards.find((card) => card.id === "q_finished").needsYou, false);
+  const visible = deck.cards.filter((card) => card.needsYou !== false);
+  assert.deepEqual(visible.map((card) => card.id), ["q_blocked"]);
+  assert.equal(visible[0].kind, "blocker");
+  assert.equal(visible[0].decisionHeadline, "Authorize the production release");
+  assert.match(visible[0].decisionFact, /drafted the listings/);
+});
+
+test("permission cards expose one active ask and preserve exact source/action mapping for the rest", () => {
+  const card = buildSupervisorCard({
+    id: "q_permission", status: "open", kind: "agent-card", title: "Please complete the browser sign-ins (2 open)",
+    body: "Sign in to the publisher listings in Cursor. 1. Allow. Also open: Sign in to Salesforce.",
+    options: ["Allow", "open thread"], threadKey: "paseo:srv.agent", meta: {
+      app: "paseo", cardId: "permission-1", itemId: "cursor", itemIds: ["cursor", "salesforce"],
+      items: [
+        { itemId: "cursor", source: { app: "paseo", cardId: "permission-1", itemId: "cursor", threadKey: "paseo:srv.agent" }, question: "Sign in to the publisher listings in Cursor", options: ["Allow"] },
+        { itemId: "salesforce", source: { app: "paseo", cardId: "permission-1", itemId: "salesforce", threadKey: "paseo:srv.agent" }, question: "Sign in to Salesforce", options: ["Allow"] }
+      ]
+    }
+  });
+  assert.equal(card.decisionHeadline, "Sign in to the publisher portals");
+  assert.equal(card.decisionItems.length, 2);
+  assert.equal(card.decisionItems.find((item) => item.active).itemId, "cursor");
+  assert.deepEqual(card.remainingItemIds, ["salesforce"]);
+  assert.equal(card.primaryAction.op, "open_chat");
 });
 
 test("past handoffs use target-specific journal evidence, including uncertain deliveries", () => {
@@ -277,7 +317,14 @@ test("the send and answer tools need approval and pin the exact target", async (
   assert.match(send.summarize(later), /queued behind its background tasks/);
   assert.notEqual(send.approvalDedupeKey(later, {}), send.approvalDedupeKey(target, {}));
   await assert.rejects(send.handler(target, {}), /approval/);
-  assert.deepEqual(await send.handler(target, { __confirmed: true }), { status: "sent", route: "computer-use", detail: "typed into Codex" });
+  // A sent message only proves delivery, never that the goal is done.
+  assert.deepEqual(await send.handler(target, { __confirmed: true }), {
+    status: "sent",
+    route: "computer-use",
+    detail: "typed into Codex",
+    outcomeVerified: false,
+    verificationNote: "Message delivery and turn start confirmed; target goal/submission is NOT complete until post-turn outcome is verified."
+  });
   assert.deepEqual(sent, [["codex:t1", "Rebase on main and push."]]);
   assert.throws(() => answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Enterprise" }), /one of: Starter, Business/);
   const pinned = answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Business" });
@@ -449,4 +496,166 @@ test("voice tools: walkthrough order, focus, real diagnosis dispatch, self-fix t
   // No queueFix on this supervisor: no start tool; and never a merge tool.
   assert.equal(tools.has("self_fix_start"), false);
   assert.ok(!tools.list().some((tool) => /merge|release|deploy/.test(tool.name)));
+});
+
+test("fleet_send_message forwards current-turn images and resolves prior-turn images on attach requests", async () => {
+  const deliveries = [];
+  const sampleImg = { id: "img_1", name: "CleanShot.png", mimeType: "image/jpeg", data: "/9j/4AAQSkZJRg==" };
+  const sessionStore = new Map([
+    ["devices:supervisor:main", {
+      id: "devices:supervisor:main",
+      messages: [
+        { role: "user", content: "Look at this bug screenshot", createdAt: new Date().toISOString(), metadata: { attachments: [sampleImg] } },
+        { role: "assistant", content: "I sent the message without the screenshot." },
+        { role: "user", content: "can you attach it?" }
+      ]
+    }]
+  ]);
+  const supervisor = {
+    ...fakeSupervisor({
+      snapshot: {
+        at: "2026-11-19T04:00:00.000Z",
+        counts: {},
+        threads: [row({ key: "paseo:srv_mac.ag_bob", kind: "paseo", title: "Bob unified chat" })],
+        infra: {},
+        sourceErrors: {}
+      }
+    }),
+    sendOwnerMessage: async (key, message, opts = {}) => {
+      deliveries.push({ key, message, opts });
+      return { delivery: { status: "sent", route: "paseo-send", attachedImages: opts.images?.length ?? 0, detail: "Paseo message, 1 image(s), and turn confirmed" } };
+    }
+  };
+  const tools = registry(supervisor);
+  const baseCtx = {
+    sessionId: "devices:supervisor:main",
+    __confirmed: true,
+    __turn: { untrusted: false, intent: "can you attach it?" },
+    runtime: { agentHost: { store: { getSession: (id) => sessionStore.get(id) } } }
+  };
+
+  // Explicit attachRecentImages: true pulls prior-turn images even when __attachments is empty
+  const recentRes = await tools.invoke("fleet_send_message", {
+    key: "paseo:srv_mac.ag_bob",
+    message: "Attaching screenshot from earlier turn.",
+    attachRecentImages: true
+  }, baseCtx);
+  assert.equal(recentRes.ok, true);
+  assert.equal(recentRes.result.attachedImages, 1);
+  assert.equal(deliveries[0].opts.images?.length, 1);
+  assert.equal(deliveries[0].opts.images?.[0].id, "img_1");
+
+  // Implicit intent match ("can you attach it?") also recovers recent images automatically
+  const intentRes = await tools.invoke("fleet_send_message", {
+    key: "paseo:srv_mac.ag_bob",
+    message: "Attaching screenshot."
+  }, baseCtx);
+  assert.equal(intentRes.ok, true);
+  assert.equal(deliveries.length, 2);
+  assert.equal(deliveries[1].opts.images?.length, 1);
+});
+
+test("list_mcp_tools returns compact inventory by default and full schema on targeted lookup", async () => {
+  const hugeDesc = "PostHog analytics query tool. " + "x".repeat(55_000);
+  const tools = new ToolRegistry();
+  registerCoreTools(tools, {
+    mcp: {
+      listTools: () => [
+        { server: "posthog", name: "run_query", description: hugeDesc, inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" } } } },
+        { server: "bb-staging", name: "search_calls", description: "Search recorded calls", inputSchema: { type: "object", properties: { q: { type: "string" } } } }
+      ]
+    }
+  });
+  const compact = await tools.invoke("list_mcp_tools", {}, {});
+  assert.equal(compact.ok, true);
+  assert.equal(compact.result.compact, true);
+  assert.equal(compact.result.count, 2);
+  assert.ok(JSON.stringify(compact.result).length < 4000);
+
+  const detailed = await tools.invoke("list_mcp_tools", { server: "posthog", tool: "run_query" }, {});
+  assert.equal(detailed.ok, true);
+  assert.equal(detailed.result.count, 1);
+  assert.equal(detailed.result.items[0].description.length, hugeDesc.length);
+});
+
+test("resolvePaseoAgentConfig, startPaseoSession auto-workspace, and fleet_start_session support model and effort", async () => {
+  let capturedCreate = null;
+  const api = {
+    projects: { list: async () => ({ projects: [] }) },
+    workspaces: { list: async () => ({ entries: [{ id: "wks_1", name: "BuildBetter", path: "/Users/dev/buildbetter", repo: "buildbetter-app/buildbetter" }], pageInfo: { hasMore: false } }) },
+    providers: {
+      waitForReady: async () => ({
+        entries: [{
+          provider: "codex",
+          status: "ready",
+          models: [{
+            id: "gpt-6.2-sol",
+            label: "GPT-6.2 Sol",
+            thinkingOptions: [{ id: "low", label: "Low" }, { id: "medium", label: "Medium" }, { id: "high", label: "High" }]
+          }]
+        }]
+      })
+    },
+    agents: {
+      list: async () => ({
+        entries: [{ agent: { id: "ag_1", cwd: "/Users/dev/buildbetter", status: "running", updatedAt: "2026-11-19T03:00:00Z", title: "Main chat" } }],
+        pageInfo: { hasMore: false }
+      }),
+      create: async (opts) => {
+        capturedCreate = opts;
+        return { id: "ag_new", current: () => ({ id: "ag_new", status: "running", cwd: opts.cwd, title: opts.title, provider: "codex", model: "gpt-6.2-sol" }) };
+      }
+    }
+  };
+  const cfg = await resolvePaseoAgentConfig(api, "/Users/dev/buildbetter", { model: "sol 6-2", effort: "medium" });
+  assert.equal(cfg.provider, "codex/gpt-6.2-sol");
+  assert.equal(cfg.model, "gpt-6.2-sol");
+  assert.equal(cfg.thinkingOptionId, "medium");
+
+  const factory = () => ({
+    ...api,
+    connect: async () => {},
+    close: async () => {},
+    hosts: {
+      list: async () => ({ self: { serverId: "srv_mac", label: "MacBook" }, hosts: [] }),
+      client: async () => api
+    }
+  });
+  const sup = {
+    config: { paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" } },
+    getState: () => ({ mode: "propose", enabled: true, questions: [], cards: [], actions: [], snapshot: { threads: [] } })
+  };
+  const started = await startPaseoSession(sup, {
+    prompt: "Scope existing integrations vs Enterpret and Unwrap.",
+    model: "gpt 6.2 sol",
+    effort: "medium",
+    factory
+  });
+  assert.equal(started.status, "started");
+  assert.equal(started.inferredWorkspace, true);
+  assert.equal(started.cwd, "/Users/dev/buildbetter");
+  assert.equal(started.model, "gpt-6.2-sol");
+  assert.equal(started.effort, "medium");
+  assert.equal(capturedCreate.config.model, "gpt-6.2-sol");
+  assert.equal(capturedCreate.config.thinkingOptionId, "medium");
+
+  // SupervisorCard exposes clarification question plan details
+  const card = buildSupervisorCard({
+    id: "fq_s1",
+    kind: "suggestion",
+    title: "Clarify reopened questions before changing code",
+    body: "200 of 209 questions closed unanswered.",
+    options: ["Answer question", "Review plan", "Not now", "Never"],
+    meta: {
+      suggestionId: "sg_1",
+      plan: {
+        remedy: "clarification",
+        label: "Ask a question",
+        nextAction: "Ask: Can you provide one representative reopened question history?",
+        acceptance: "Obtain one representative question history."
+      }
+    }
+  });
+  assert.equal(card.plan.nextAction, "Ask: Can you provide one representative reopened question history?");
+  assert.match(card.brief.decision, /representative reopened question history/);
 });

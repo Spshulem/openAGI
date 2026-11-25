@@ -2,7 +2,7 @@
 // Scoped Project Supervisor hierarchy, and Manager-Level Goal Dispatch
 // ("Go work on <feature> in <project>").
 
-import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets } from "./contracts.js";
+import { SUPERVISOR_PREFIX, clampText, isThreadKey, parsePaseoThreadKey, redactSecrets, shortHash } from "./contracts.js";
 import { listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
 import { DEFAULT_DECISIONS_MODEL, DEFAULT_DECISIONS_TIMEOUT_MS, DEFAULT_DECISIONS_URL, matchGoalWithDecisions } from "./decisions-gate.js";
 import { hostApi, isLocalPaseoUrl, withPaseo } from "./sources/paseo.js";
@@ -20,6 +20,18 @@ export const PASEO_LABEL_COLORS = Object.freeze([
   "blue",
   "red"
 ]);
+
+// trackWork clamps dedupe keys to 160 characters. Bound each readable slug so
+// the digest (which carries the full project/theme/goal/dispatch identity)
+// always survives: 9 + 60 + 1 + 60 + 1 + 16 = 147.
+const DISPATCH_KEY_SLUG_MAX = 60;
+
+export function dispatchDedupeKey(project, theme, goal, dispatchId = "") {
+  const slug = (value) => (String(value ?? "general").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "general")
+    .slice(0, DISPATCH_KEY_SLUG_MAX).replace(/-+$/g, "") || "general";
+  const digest = shortHash(JSON.stringify([String(project ?? ""), String(theme ?? ""), String(goal ?? ""), String(dispatchId ?? "")]));
+  return `dispatch:${slug(project)}:${slug(theme)}:${digest}`;
+}
 
 const THEME_RULES = [
   {
@@ -193,7 +205,9 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
   });
 
   const state = supervisor?.getState?.() ?? {};
-  const openCards = Array.isArray(state.cards) ? state.cards : [];
+  const org = supervisor?.store?.organization?.() ?? { projects: [], threadAssignments: {} };
+  const threadAssignments = org.threadAssignments ?? {};
+  const openCards = (Array.isArray(state.cards) ? state.cards : []).filter((c) => c?.needsYou !== false);
   const cardsByThread = new Map();
   const cardsByPr = new Map();
   for (const card of openCards) {
@@ -209,20 +223,134 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
     }
   }
 
+  // Merge auto-discovered workspaces with OpenAGI-native thread overrides,
+  // OpenAGI custom projects/themes, and OpenAGI task project metadata so users
+  // without Paseo (or without Paseo workspace labels) get full Project/Theme
+  // organization natively on the OpenAGI side.
+  const workspacesById = new Map();
+  const ensureWorkspaceBucket = (rawName, base = {}) => {
+    const cleanName = String(rawName ?? "").trim().replace(/^#/, "");
+    const id = slugify(cleanName || base.id || "general");
+    let ws = workspacesById.get(id);
+    if (!ws) {
+      ws = {
+        id,
+        name: cleanName || base.name || id,
+        repo: base.repo ?? null,
+        counts: { running: 0, idle: 0, sleeping: 0, archived: 0, total: 0 },
+        defaultTarget: base.defaultTarget ?? null,
+        hosts: Array.isArray(base.hosts) ? [...base.hosts] : [],
+        overlaps: Array.isArray(base.overlaps) ? [...base.overlaps] : [],
+        referencedPrs: Array.isArray(base.referencedPrs) ? [...base.referencedPrs] : [],
+        latestActivityAt: base.latestActivityAt ?? null,
+        recentChats: [],
+        customThemes: [],
+        source: base.source ?? "auto"
+      };
+      workspacesById.set(id, ws);
+    } else {
+      if (!ws.repo && base.repo) ws.repo = base.repo;
+      if (!ws.defaultTarget && base.defaultTarget) ws.defaultTarget = base.defaultTarget;
+      if (base.source === "openagi") ws.source = "openagi";
+    }
+    return ws;
+  };
+
+  for (const ws of wsResult.workspaces ?? []) {
+    const bucket = ensureWorkspaceBucket(ws.name, ws);
+    for (const session of ws.recentChats ?? []) {
+      const override = threadAssignments[session.key] ?? null;
+      const targetWs = override?.project && slugify(override.project) !== bucket.id
+        ? ensureWorkspaceBucket(override.project, { source: "openagi" })
+        : bucket;
+      targetWs.recentChats.push(
+        override ? { ...session, __openagiTheme: override.theme ?? null, __openagiProject: override.project ?? null } : session
+      );
+      targetWs.counts.total += 1;
+      if (session.state === "running" || session.state === "waiting") targetWs.counts.running += 1;
+      else if (session.state === "sleeping") targetWs.counts.sleeping += 1;
+      else if (session.state === "archived") targetWs.counts.archived += 1;
+      else targetWs.counts.idle += 1;
+      if (!targetWs.latestActivityAt || String(session.lastActivityAt ?? "") > targetWs.latestActivityAt) {
+        targetWs.latestActivityAt = session.lastActivityAt ?? targetWs.latestActivityAt;
+      }
+    }
+  }
+
+  for (const custom of org.projects ?? []) {
+    if (!custom?.name) continue;
+    if (project && slugify(project) !== slugify(custom.name) && !custom.name.toLowerCase().includes(String(project).trim().toLowerCase())) {
+      continue;
+    }
+    const bucket = ensureWorkspaceBucket(custom.name, { id: custom.id, source: "openagi" });
+    for (const t of custom.themes ?? []) {
+      if (t?.name && !bucket.customThemes.some((x) => slugify(x.name) === slugify(t.name))) {
+        bucket.customThemes.push({ id: t.id || slugify(t.name), name: t.name });
+      }
+    }
+  }
+
+  const taskStore = supervisor?.runtime?.tasks ?? supervisor?.deps?.taskStore ?? supervisor?.taskStore ?? null;
+  if (taskStore) {
+    try {
+      const openTasks = typeof taskStore.list === "function"
+        ? (taskStore.list({ includeCompleted: false }) ?? [])
+        : [...(taskStore.tasks?.values?.() ?? [])].filter((tk) => !["completed", "cancelled"].includes(String(tk?.status ?? "").toLowerCase()));
+      for (const tk of openTasks) {
+        const taskProj = String(tk?.sourceMeta?.project ?? "").trim().replace(/^#/, "");
+        if (!taskProj || taskProj.toLowerCase() === "general") continue;
+        if (project && slugify(project) !== slugify(taskProj) && !taskProj.toLowerCase().includes(String(project).trim().toLowerCase())) {
+          continue;
+        }
+        const bucket = ensureWorkspaceBucket(taskProj, { source: "openagi" });
+        const rawSub = String(tk?.sourceMeta?.subchannel ?? "").trim().replace(/^#/, "");
+        const subLeaf = rawSub.includes("/") ? rawSub.split("/").slice(1).join("/") : rawSub;
+        if (subLeaf && subLeaf.toLowerCase() !== "general" && !bucket.customThemes.some((x) => slugify(x.name) === slugify(subLeaf))) {
+          bucket.customThemes.push({ id: slugify(subLeaf), name: subLeaf });
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
   let totalThemes = 0;
   let totalRunning = 0;
   let totalOverlaps = 0;
   const projects = [];
 
-  for (const ws of wsResult.workspaces ?? []) {
+  for (const ws of workspacesById.values()) {
     totalRunning += ws.counts?.running ?? 0;
     totalOverlaps += (ws.overlaps ?? []).length;
 
     const themeBuckets = new Map();
     const projectCardMap = new Map();
 
+    for (const customTheme of ws.customThemes ?? []) {
+      const themeId = slugify(customTheme.name);
+      if (!themeBuckets.has(themeId)) {
+        themeBuckets.set(themeId, {
+          id: themeId,
+          name: customTheme.name,
+          color: deterministicColor(customTheme.name),
+          labelPath: `${displayProjectLabel(ws.name)}/${customTheme.name}`,
+          source: "openagi",
+          counts: { running: 0, idle: 0, sleeping: 0, archived: 0, total: 0 },
+          needsYouCount: 0,
+          prRefsSet: new Set(),
+          latestActivityAt: null,
+          sessions: []
+        });
+      }
+    }
+
     for (const session of ws.recentChats ?? []) {
-      const inferred = inferSessionTheme(session, ws.name);
+      const inferred = session.__openagiTheme
+        ? {
+            name: session.__openagiTheme,
+            color: deterministicColor(session.__openagiTheme),
+            source: "openagi",
+            rawLabel: `${displayProjectLabel(ws.name)}/${session.__openagiTheme}`
+          }
+        : inferSessionTheme(session, ws.name);
       const themeId = slugify(inferred.name);
       let bucket = themeBuckets.get(themeId);
       if (!bucket) {
@@ -239,7 +367,9 @@ export async function buildFleetHierarchy(supervisor, { project = null, includeA
           sessions: []
         };
         themeBuckets.set(themeId, bucket);
-      } else if (inferred.source === "paseo-label") {
+      } else if (inferred.source === "openagi") {
+        bucket.source = "openagi";
+      } else if (inferred.source === "paseo-label" && bucket.source !== "openagi") {
         bucket.source = "paseo-label";
       }
 
@@ -801,6 +931,9 @@ export async function dispatchManagerGoal(
     serverId = null,
     cwd = null,
     provider = null,
+    model = null,
+    effort = null,
+    modeId = null,
     images = null,
     factory = null,
     decisionsFetch = null,
@@ -818,6 +951,78 @@ export async function dispatchManagerGoal(
   const normalizedMode = ["preview", "auto", "execute", "force_new"].includes(String(mode ?? "auto").toLowerCase())
     ? String(mode ?? "auto").toLowerCase()
     : "auto";
+  // Each manager dispatch is a distinct execution, even when it repeats the
+  // same wording. The returned Work id is reused only for the post-start
+  // owner attachment, so no completed execution can hide a rerun.
+  const dispatchId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${shortHash(`${cleanGoal}:${project ?? ""}:${theme ?? ""}`)}`;
+
+  // A dispatch is never allowed to outrun its durable outcome contract.  This
+  // record is written before any message is sent or new Paseo session starts,
+  // so failed delivery, idle owners, and restarts still leave one truthful
+  // item for Work and project-scoped Ask Supervisor to reconcile.
+  const persistDispatchOutcome = ({ projectName = null, themeName = theme, threadKey = null, ownerLabel = null, workflowStage = "queued", nextAction = null } = {}) => {
+    if (normalizedMode === "preview") return null;
+    if (typeof supervisor?.trackWork !== "function") throw new Error("Cannot dispatch without durable Active Work tracking.");
+    const resolvedProject = projectName || project || "General";
+    return supervisor.trackWork({
+      project: resolvedProject,
+      theme: themeName || null,
+      goal: cleanGoal,
+      originalAsk: cleanGoal,
+      doneCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      acceptanceCriteria: "Owner evidence confirms the requested outcome and the owner check is verified.",
+      // A label-only pre-start record is intentionally unassigned. If Paseo
+      // returns a session key later, the follow-up update binds that same
+      // durable record to the actual owner; a timeout can still be auto-bound.
+      owner: threadKey
+        ? { threadKey, label: ownerLabel || threadKey }
+        : { kind: "unassigned", label: ownerLabel || "Assigned owner" },
+      currentStep: "Dispatch recorded; awaiting owner evidence",
+      nextMilestone: nextAction || "Owner evidence received and verified",
+      nextAction: nextAction || "Owner evidence received and verified",
+      nextActionOwner: ownerLabel || "Assigned owner",
+      workflowStage,
+      executionHealth: "unknown",
+      cadence: "hourly",
+      permittedNudges: "none",
+      dispatching: true,
+      resetVerification: true,
+      dedupeKey: dispatchDedupeKey(resolvedProject, themeName, cleanGoal, dispatchId)
+    });
+  };
+  const recordDeliveryFailure = (persisted, sent) => {
+    const item = persisted?.item;
+    if (!item || typeof supervisor?.trackWork !== "function") return;
+    const detail = clampText(sent?.delivery?.detail || "Owner delivery was blocked.", 240);
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      state: "blocked",
+      blocker: `Dispatch delivery blocked: ${detail}`,
+      currentStep: "Dispatch recorded, but the owner did not receive it",
+      nextAction: "Retry delivery to the existing owner",
+      workflowStage: item.workflowStage || "implementing",
+      permittedNudges: "none"
+    });
+  };
+  const recordRecoveredOwner = (persisted, sent) => {
+    const item = persisted?.item;
+    const recovered = sent?.delivery?.recoveredSession;
+    if (!item || !recovered?.key || typeof supervisor?.trackWork !== "function") return;
+    supervisor.trackWork({
+      id: item.id,
+      project: item.project,
+      theme: item.theme,
+      goal: item.goal,
+      threadKey: recovered.key,
+      owner: { threadKey: recovered.key, label: recovered.title || recovered.workspace || recovered.key },
+      currentStep: "Replacement owner session received the dispatch; awaiting fresh evidence",
+      nextAction: "Replacement owner evidence received and verified",
+      workflowStage: item.workflowStage || "implementing"
+    });
+  };
 
   // Explicit session override (e.g. confirming a previewed chat from UI).
   if (targetKey && normalizedMode !== "preview" && normalizedMode !== "force_new") {
@@ -828,19 +1033,23 @@ export async function dispatchManagerGoal(
     const known = supervisor?.lastThreads?.get?.(cleanKey) ?? supervisor?.knownThreads?.get?.(cleanKey) ?? null;
     const knownTitle = clampText(redactSecrets(known?.title || known?.workspace || cleanKey), 120);
     const knownState = known?.agentStatus ?? "running";
-    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, images });
-    const ok = sent?.delivery?.status === "sent";
+    const persisted = persistDispatchOutcome({ projectName: project || known?.workspace || "General", threadKey: cleanKey, ownerLabel: knownTitle, workflowStage: "implementing", nextAction: "Existing owner acknowledges the request" });
+    const sent = await supervisor.sendOwnerMessage(cleanKey, formatManagerDirective(cleanGoal, project || "Project"), { deadlineAt, queue: true, images, goalId: persisted?.item?.id ?? null });
+    const deliveryStatus = sent?.delivery?.status ?? "blocked";
+    const ok = deliveryStatus === "sent" || deliveryStatus === "queued";
+    if (!ok) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
       threadKey: cleanKey,
-      status: ok ? "sent" : "blocked",
+      status: ok ? deliveryStatus : "blocked",
       by: "owner",
       reason: clampText(`manager goal routed to ${cleanKey}: ${cleanGoal}`, 240)
     });
     return {
       ok,
-      status: ok ? "routed_existing" : "blocked",
+      status: deliveryStatus === "queued" ? "queued_existing" : (ok ? "routed_existing" : "blocked"),
       message: sent?.delivery?.detail ?? null,
       project: project ? { id: String(project).toLowerCase(), name: String(project) } : null,
       matchedSession: { key: cleanKey, title: knownTitle, state: knownState },
@@ -909,6 +1118,7 @@ export async function dispatchManagerGoal(
     await batchHydrateCandidateTranscripts(supervisor, preRanked.slice(0, 4), { factory });
   }
 
+  const goalPrNumbers = new Set([...cleanGoal.matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]));
   for (const entry of preRanked) {
     const combinedText = [
       entry.session.title,
@@ -917,7 +1127,12 @@ export async function dispatchManagerGoal(
       ...(entry.session.prRefs ?? []),
       entry.recentContext
     ].filter(Boolean).join("\n");
-    entry.lexicalScore = Math.max(entry.surfaceScore, lexicalSimilarity(cleanGoal, goalTerms, combinedText, entry.session));
+    const sessionPrNumbers = new Set([
+      ...[...String(entry.session.title ?? "").matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]),
+      ...(entry.session.prRefs ?? []).map((r) => String(r).split("#")[1]).filter(Boolean)
+    ]);
+    const prBoost = goalPrNumbers.size > 0 && [...goalPrNumbers].some((n) => sessionPrNumbers.has(n)) ? 0.85 : 0;
+    entry.lexicalScore = Math.max(entry.surfaceScore, lexicalSimilarity(cleanGoal, goalTerms, combinedText, entry.session), prBoost);
     entry.decisionProb = null;
   }
 
@@ -1025,20 +1240,31 @@ export async function dispatchManagerGoal(
     }
 
     const directive = formatManagerDirective(cleanGoal, targetProject.name);
-    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, images });
-    const delivered = sent?.delivery?.status === "sent";
+    const persisted = persistDispatchOutcome({
+      projectName: targetProject.name,
+      themeName: theme || inferredTheme.name,
+      threadKey: best.session.key,
+      ownerLabel: best.session.title || best.session.workspace,
+      workflowStage: "implementing",
+      nextAction: "Existing owner acknowledges the request"
+    });
+    const sent = await supervisor.sendOwnerMessage(best.session.key, directive, { deadlineAt, queue: true, images, goalId: persisted?.item?.id ?? null });
+    const deliveryStatus = sent?.delivery?.status ?? "blocked";
+    const delivered = deliveryStatus === "sent" || deliveryStatus === "queued";
+    if (!delivered) recordDeliveryFailure(persisted, sent);
+    else recordRecoveredOwner(persisted, sent);
     supervisor?.store?.recordAction?.({
       kind: "dispatch-goal",
       playbook: "manager-dispatch",
       threadKey: best.session.key,
-      status: delivered ? "sent" : "blocked",
+      status: delivered ? deliveryStatus : "blocked",
       by: "owner",
       reason: clampText(`routed manager goal to existing ${targetProject.name} session "${best.session.title}" (conf=${matchedSummary.confidence})`, 240)
     });
     supervisor?.emitFleet?.("goal-dispatched");
     return {
       ok: delivered,
-      status: delivered ? "routed_existing" : "blocked",
+      status: deliveryStatus === "queued" ? "queued_existing" : (delivered ? "routed_existing" : "blocked"),
       message: sent?.delivery?.detail ?? null,
       project: projectSummary,
       inferredTheme: best.session.theme || inferredTheme.name,
@@ -1062,6 +1288,13 @@ export async function dispatchManagerGoal(
     };
   }
 
+  const persisted = persistDispatchOutcome({
+    projectName: targetProject.name,
+    themeName: theme || inferredTheme.name,
+    ownerLabel: suggestedTitle,
+    workflowStage: "queued",
+    nextAction: "New owner session starts and acknowledges the request"
+  });
   const created = await (typeof supervisor?.startPaseoSession === "function"
     ? supervisor.startPaseoSession({
         workspace: targetProject.name,
@@ -1070,6 +1303,9 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        model,
+        effort,
+        modeId,
         images,
         factory
       })
@@ -1080,9 +1316,51 @@ export async function dispatchManagerGoal(
         title: suggestedTitle,
         prompt: cleanGoal,
         provider,
+        model,
+        effort,
+        modeId,
         images,
-        factory
-      }));
+      factory
+    }));
+
+  if (created?.status === "blocked") {
+    supervisor?.store?.recordAction?.({
+      kind: "dispatch-goal",
+      playbook: "manager-dispatch-new",
+      threadKey: created.key ?? null,
+      status: "blocked",
+      by: "owner",
+      reason: clampText(created?.delivery?.detail || `existing ${targetProject.name} session blocked delivery`, 240)
+    });
+    return {
+      ok: false,
+      status: "blocked",
+      project: projectSummary,
+      inferredTheme: inferredTheme.name,
+      candidatesChecked: allSessions.length,
+      createdSession: created,
+      delivery: created.delivery ?? null
+    };
+  }
+
+  if (created?.key && typeof supervisor?.trackWork === "function") {
+    supervisor.trackWork({
+      id: persisted?.item?.id,
+      project: targetProject.name,
+      theme: theme || inferredTheme.name,
+      goal: cleanGoal,
+      dedupeKey: persisted?.item?.dedupeKey ?? dispatchDedupeKey(targetProject.name, theme || inferredTheme.name, cleanGoal, dispatchId),
+      owner: { threadKey: created.key, label: created.title || suggestedTitle },
+      currentStep: "Owner session started; awaiting first meaningful evidence",
+      workflowStage: "implementing",
+      nextMilestone: "Owner evidence received and verified",
+      nextAction: "Owner evidence received and verified",
+      nextActionOwner: created.title || suggestedTitle,
+      permittedNudges: "none",
+      dispatching: true,
+      resetVerification: true
+    });
+  }
 
   supervisor?.store?.recordAction?.({
     kind: "dispatch-goal",

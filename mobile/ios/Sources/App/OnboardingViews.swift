@@ -22,21 +22,31 @@ struct StepByStepWelcomeView: View {
                     Section { Text(error).foregroundStyle(.red) }
                 }
                 Section {
-                    Button("On this iPhone", systemImage: "iphone") { session.choosePhone() }
+                    Button("On this iPhone", systemImage: "apple.intelligence") { session.choosePhone() }
                         .disabled(!session.canRunOnPhone)
                         .accessibilityIdentifier("setup-on-phone")
                 } header: {
-                    Text("Start locally")
+                    Text("Start right now on this iPhone")
                 } footer: {
                     Text(session.canRunOnPhone
-                         ? "Use Apple Intelligence on a supported iPhone. No account, API key or server required. Cloud models and online integrations are optional."
+                         ? "Chat privately with Apple Intelligence on supported iPhones — manage tasks, voice notes, and memory with zero API keys or server setup. You can add Claude, OpenAI, or a Mac anytime."
                          : "This build doesn't include the on-phone runtime.")
                 }
                 Section {
-                    Button("Connect to a server", systemImage: "server.rack") { session.chooseServer() }
+                    Button("Connect to your Mac or server", systemImage: "macbook.and.iphone") { session.chooseServer() }
                         .accessibilityIdentifier("setup-server")
+                    ShareLink(
+                        item: URL(string: "https://github.com/Spshulem/openAGI/releases/latest")!,
+                        subject: Text("Download OpenAGI for Mac"),
+                        message: Text("Install OpenAGI on your Mac to unlock the Coding Supervisor (Claude Code, Codex, Cursor, Paseo) and Open Computer Use:")
+                    ) {
+                        Label("Don't have the Mac app yet? Send download link to yourself", systemImage: "paperplane")
+                    }
+                    .accessibilityIdentifier("setup-share-mac-link")
+                } header: {
+                    Text("Unlock Mac Supervisor & Computer Use")
                 } footer: {
-                    Text("Use an existing OpenAGI agent on your Mac or server. You can connect later in Settings.")
+                    Text("OpenAGI on your Mac supervises all your coding sessions, reviews PRs, and runs Open Computer Use — synced live with your iPhone.")
                 }
                 Section("Connecting your devices") {
                     Label("On the same Wi-Fi, Find servers looks for an announcement from the updated desktop app or daemon. Update and restart it first.", systemImage: "wifi")

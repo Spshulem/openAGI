@@ -4,7 +4,10 @@ public enum SupervisorChannelKind: Equatable, Hashable, Sendable {
     case general
     case needsYou
     case tasks
+    case sessions
+    case activity
     case project(String)
+    case subchannel(project: String, subchannel: String)
 }
 
 public struct SupervisorChannelSummary: Identifiable, Equatable, Hashable, Sendable {
@@ -35,7 +38,9 @@ public struct SupervisorChannelSummary: Identifiable, Equatable, Hashable, Senda
 public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
     public let id: String
     public let project: String
+    public let subchannel: String?
     public let headline: String
+    public let fact: String?
     public let kindLabel: String
     public let risky: Bool
     public let noticedAtISO: String?
@@ -43,14 +48,18 @@ public struct SupervisorDecisionItem: Identifiable, Equatable, Sendable {
     public init(
         id: String,
         project: String,
+        subchannel: String? = nil,
         headline: String,
+        fact: String? = nil,
         kindLabel: String = "Needs you",
         risky: Bool = false,
         noticedAtISO: String? = nil
     ) {
         self.id = id
         self.project = project
+        self.subchannel = subchannel
         self.headline = headline
+        self.fact = fact
         self.kindLabel = kindLabel
         self.risky = risky
         self.noticedAtISO = noticedAtISO
@@ -72,6 +81,7 @@ public struct SupervisorChannelGroup: Identifiable, Equatable, Sendable {
 public struct SupervisorSessionBrief: Identifiable, Equatable, Sendable {
     public let id: String
     public let project: String
+    public let subchannel: String?
     public let theme: String
     public let title: String
     public let host: String?
@@ -82,6 +92,7 @@ public struct SupervisorSessionBrief: Identifiable, Equatable, Sendable {
     public init(
         id: String,
         project: String,
+        subchannel: String? = nil,
         theme: String = "General",
         title: String,
         host: String? = nil,
@@ -91,12 +102,41 @@ public struct SupervisorSessionBrief: Identifiable, Equatable, Sendable {
     ) {
         self.id = id
         self.project = project
+        self.subchannel = subchannel
         self.theme = theme
         self.title = title
         self.host = host
         self.cwd = cwd
         self.state = state
         self.lastActivityISO = lastActivityISO
+    }
+}
+
+public struct SupervisorSubchannelSummary: Identifiable, Equatable, Hashable, Sendable {
+    public let id: String
+    public let project: String
+    public let subchannel: String
+    public let displayName: String
+    public let waitingCount: Int
+    public let runningCount: Int
+    public let totalCount: Int
+
+    public init(
+        id: String,
+        project: String,
+        subchannel: String,
+        displayName: String,
+        waitingCount: Int = 0,
+        runningCount: Int = 0,
+        totalCount: Int = 0
+    ) {
+        self.id = id
+        self.project = project
+        self.subchannel = subchannel
+        self.displayName = displayName
+        self.waitingCount = waitingCount
+        self.runningCount = runningCount
+        self.totalCount = totalCount
     }
 }
 
@@ -115,6 +155,10 @@ public struct SupervisorOverlapNotice: Identifiable, Equatable, Sendable {
 }
 
 public enum SupervisorChannelGrouping {
+    private static func looksLikeProjectSlug(_ raw: String) -> Bool {
+        !raw.isEmpty && raw.count <= 36 && !raw.contains(": ") && !raw.contains(" ") && !raw.contains("(") && !raw.contains(")")
+    }
+
     public static func normalizeProject(
         explicit: String? = nil,
         repo: String? = nil,
@@ -122,24 +166,23 @@ public enum SupervisorChannelGrouping {
         cwd: String? = nil
     ) -> String {
         if let raw = explicit?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !raw.isEmpty,
+           looksLikeProjectSlug(raw),
            raw.caseInsensitiveCompare("General") != .orderedSame {
             return raw
         }
         if let repoRaw = repo?.trimmingCharacters(in: .whitespacesAndNewlines), !repoRaw.isEmpty {
             let parts = repoRaw.split(separator: "/").map(String.init).filter { !$0.isEmpty }
-            if let last = parts.last, !last.isEmpty {
+            if let last = parts.last, looksLikeProjectSlug(last) {
                 return last
             }
         }
-        let dirCandidate = [cwd, workspace]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-        if let dirCandidate {
+        for dirCandidate in [cwd, workspace].compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) }).filter({ !$0.isEmpty }) {
             let cleaned = dirCandidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let base = cleaned.split(separator: "/").last.map(String.init) ?? cleaned
+            let isPath = cleaned.contains("/")
+            let base = isPath ? (cleaned.split(separator: "/").last.map(String.init) ?? "") : cleaned
             if !base.isEmpty,
-               base.caseInsensitiveCompare("workspace") != .orderedSame {
+               base.caseInsensitiveCompare("workspace") != .orderedSame,
+               isPath || looksLikeProjectSlug(base) {
                 return base
             }
         }
@@ -204,7 +247,7 @@ public enum SupervisorChannelGrouping {
             }
         }
 
-        return displayNames.keys.sorted { lhs, rhs in
+        return displayNames.keys.filter { $0 != "general" }.sorted { lhs, rhs in
             let lw = waiting[lhs, default: 0], rw = waiting[rhs, default: 0]
             if lw != rw { return lw > rw }
             let lr = running[lhs, default: 0], rr = running[rhs, default: 0]
@@ -222,9 +265,68 @@ public enum SupervisorChannelGrouping {
         }
     }
 
+    public static func subchannels(
+        forProject project: String,
+        from items: [SupervisorDecisionItem],
+        sessions: [SupervisorSessionBrief]
+    ) -> [SupervisorSubchannelSummary] {
+        let projKey = normalizeProject(explicit: project).lowercased()
+        var waiting: [String: Int] = [:]
+        var running: [String: Int] = [:]
+        var total: [String: Int] = [:]
+        var displaySlug: [String: String] = [:]
+
+        func leaf(of raw: String?) -> String? {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+            let clean = raw.hasPrefix("#") ? String(raw.dropFirst()) : raw
+            let parts = clean.split(separator: "/").map(String.init)
+            let candidate = parts.count > 1 ? parts.dropFirst().joined(separator: "/") : clean
+            guard !candidate.isEmpty, candidate.lowercased() != projKey, candidate.lowercased() != "general" else { return nil }
+            return candidate
+        }
+
+        for item in items {
+            guard normalizeProject(explicit: item.project).lowercased() == projKey,
+                  let sub = leaf(of: item.subchannel) else { continue }
+            let key = "\(projKey)/\(sub.lowercased())"
+            displaySlug[key] = displaySlug[key] ?? sub
+            waiting[key, default: 0] += 1
+        }
+        for session in sessions {
+            guard normalizeProject(explicit: session.project, cwd: session.cwd).lowercased() == projKey,
+                  let sub = leaf(of: session.subchannel) else { continue }
+            let key = "\(projKey)/\(sub.lowercased())"
+            displaySlug[key] = displaySlug[key] ?? sub
+            total[key, default: 0] += 1
+            if session.state.lowercased() == "running" {
+                running[key, default: 0] += 1
+            }
+        }
+
+        return displaySlug.keys.sorted { lhs, rhs in
+            let lw = waiting[lhs, default: 0], rw = waiting[rhs, default: 0]
+            if lw != rw { return lw > rw }
+            let lr = running[lhs, default: 0], rr = running[rhs, default: 0]
+            if lr != rr { return lr > rr }
+            return (displaySlug[lhs] ?? lhs).localizedCaseInsensitiveCompare(displaySlug[rhs] ?? rhs) == .orderedAscending
+        }.map { key in
+            let sub = displaySlug[key] ?? key
+            return SupervisorSubchannelSummary(
+                id: "subchannel:\(key)",
+                project: project,
+                subchannel: key,
+                displayName: "/\(sub)",
+                waitingCount: waiting[key, default: 0],
+                runningCount: running[key, default: 0],
+                totalCount: total[key, default: 0]
+            )
+        }
+    }
+
     public static func filterSessions(
         _ sessions: [SupervisorSessionBrief],
         project: String?,
+        subchannel: String? = nil,
         theme: String? = nil
     ) -> [SupervisorSessionBrief] {
         sessions.filter { s in
@@ -232,6 +334,11 @@ public enum SupervisorChannelGrouping {
                 let targetKey = normalizeProject(explicit: project).lowercased()
                 let sKey = normalizeProject(explicit: s.project, cwd: s.cwd).lowercased()
                 if sKey != targetKey { return false }
+            }
+            if let subchannel, !subchannel.isEmpty {
+                let targetSub = subchannel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let sSub = (s.subchannel ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if sSub != targetSub && !sSub.hasSuffix("/\(targetSub)") { return false }
             }
             if let theme, !theme.isEmpty {
                 if s.theme.caseInsensitiveCompare(theme) != .orderedSame { return false }
@@ -274,19 +381,24 @@ public enum SupervisorChannelGrouping {
     }
 
     /// Overlay surface filter for pending actions: stale (>2h) `chat` ("yes NN")
-    /// confirmations are hidden so the Mac pill doesn't accumulate dead noise.
+    /// confirmations and zombie (>24h) queue requests are hidden so the Mac pill
+    /// and Dock badge do not accumulate dead noise from months-old sessions.
     public static func shouldShowInOverlay(
         mode: String?,
         raisedAtISO: String?,
         createdAtISO: String?,
         now: Date = Date(),
-        maxChatAgeSeconds: TimeInterval = 7200
+        maxChatAgeSeconds: TimeInterval = 7200,
+        maxQueueAgeSeconds: TimeInterval = 86_400
     ) -> Bool {
-        guard mode == "chat" else { return true }
-        let iso = raisedAtISO ?? createdAtISO
-        guard let iso, !iso.isEmpty else { return false }
-        guard let date = parseFlexibleISO8601(iso) else { return false }
-        return now.timeIntervalSince(date) < maxChatAgeSeconds
+        let iso = (raisedAtISO?.isEmpty == false ? raisedAtISO : nil)
+            ?? (createdAtISO?.isEmpty == false ? createdAtISO : nil)
+        if mode == "chat" {
+            guard let iso, let date = parseFlexibleISO8601(iso) else { return false }
+            return now.timeIntervalSince(date) < maxChatAgeSeconds
+        }
+        guard let iso, let date = parseFlexibleISO8601(iso) else { return true }
+        return now.timeIntervalSince(date) < maxQueueAgeSeconds
     }
 
     private static func parseFlexibleISO8601(_ string: String) -> Date? {

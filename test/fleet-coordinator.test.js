@@ -230,6 +230,28 @@ test("listWorkspaces, readChatTranscript, inspectRepoStatus, startPaseoSession, 
         stderr: ""
       };
     }
+    if (joined.includes("pr view") && joined.includes("425")) {
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          number: 425,
+          title: "closed without merge",
+          state: "CLOSED",
+          headRefName: "spencer/closed-orphan",
+          baseRefName: "main",
+          isDraft: false,
+          headRefOid: "closed425",
+          mergeStateStatus: "UNKNOWN",
+          reviewDecision: null,
+          statusCheckRollup: [],
+          updatedAt: "2026-11-16T15:00:00Z",
+          closedAt: "2026-11-16T15:00:00Z",
+          mergedAt: null,
+          url: "https://github.com/acme/recorder-app/pull/425"
+        }),
+        stderr: ""
+      };
+    }
     if (joined.includes("pr merge")) {
       mergedPrs.push(joined);
       return { code: 0, stdout: "Merged", stderr: "" };
@@ -288,6 +310,16 @@ test("listWorkspaces, readChatTranscript, inspectRepoStatus, startPaseoSession, 
   assert.equal(pr426.orphaned, true, "#426 has no loaded active session");
   assert.equal(repoStatus.recentlyMerged[0].number, 279);
   assert.equal(repoStatus.releases[0].tag, "v1.8.2");
+
+  sup.trackWork({
+    project: "recorder-app",
+    repo: "acme/recorder-app",
+    prRef: "acme/recorder-app#425",
+    goal: "Follow through on closed orphan PR",
+    doneCriteria: "Closed PR outcome recorded"
+  });
+  const closedStatus = await sup.inspectRepoStatus({ repo: "acme/recorder-app" });
+  assert.equal(closedStatus.trackedPrs.find((p) => p.number === 425).state, "CLOSED");
 
   // 4. startPaseoSession automatically targets srv_mac:/Users/dev/Dev/recorder-app with ready codex/gpt-5.4
   const started = await sup.startPaseoSession({
@@ -989,4 +1021,72 @@ test("Round 2 review regressions: migrated alias dedupe and local git origin hos
     }),
     /exists on multiple Paseo hosts/
   );
+});
+
+test("startPaseoSession with fromThreadKey resolves the exact Paseo host and workspace directory without Computer Use", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-from-thread-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = resolveFleetConfig({}, {
+    dataDir: dir,
+    paseo: { enabled: true, url: "ws://127.0.0.1:6767/ws" }
+  });
+  const sup = new FleetSupervisor({ config, dataDir: dir });
+
+  const createdCalls = [];
+  const factory = () => {
+    const makeApi = (hostId) => ({
+      providers: {
+        waitForReady: async () => ({
+          entries: [{ provider: "codex", status: "ready", models: [{ id: "gpt-5.4", isDefault: true }] }]
+        })
+      },
+      agents: {
+        list: async () => ({ entries: [], pageInfo: { hasMore: false } }),
+        ref: (agentId) => {
+          let snap = null;
+          return {
+            refresh: async () => {
+              if (hostId === "srv_4x2" && agentId === "ai-seo-audit") {
+                snap = { id: agentId, title: "AI SEO audit", cwd: "/home/dev/general/bullard", status: "closed", provider: "broken-provider" };
+              }
+            },
+            current: () => snap
+          };
+        },
+        create: async (req) => {
+          createdCalls.push({ hostId, ...req });
+          return {
+            id: "fresh-chat-1",
+            current: () => ({ id: "fresh-chat-1", status: "running", cwd: req.cwd, title: req.title ?? "Fresh chat", provider: "codex" })
+          };
+        }
+      }
+    });
+    return {
+      connect: async () => {},
+      close: async () => {},
+      ...makeApi("srv_local"),
+      hosts: {
+        list: async () => ({
+          self: { serverId: "srv_local", label: "local" },
+          hosts: [{ serverId: "srv_4x2", label: "distiller", enabled: true, status: "online" }]
+        }),
+        client: (id) => makeApi(id)
+      }
+    };
+  };
+
+  const started = await sup.startPaseoSession({
+    fromThreadKey: "paseo:srv_4x2.ai-seo-audit",
+    title: "Website hero + switching pages",
+    prompt: "Create new hero and switching pages using AI SEO audit context.",
+    factory
+  });
+  assert.equal(started.status, "started");
+  assert.equal(started.serverId, "srv_4x2");
+  assert.equal(started.cwd, "/home/dev/general/bullard");
+  assert.equal(started.provider, "codex/gpt-5.4");
+  assert.equal(createdCalls.length, 1);
+  assert.equal(createdCalls[0].hostId, "srv_4x2");
+  assert.equal(createdCalls[0].cwd, "/home/dev/general/bullard");
 });
