@@ -110,9 +110,13 @@ public struct QueuedOrigin: Equatable, Sendable {
     /// Sent with "Send anyway": when the hub takes it, it goes next and the
     /// running reply is stopped (one request, so a retry does it once).
     public var sendNext: Bool
+    /// An upload of this item was sent and no answer came back (the
+    /// connection dropped): the hub may have it. Removing it must ask the
+    /// hub too, never only drop it here.
+    public var uploadAttempted: Bool
 
     public init(sourceName: String? = nil, mine: Bool = true, heldBy: String? = nil, revision: Int = 0, pendingUpload: Bool = false,
-                error: String? = nil, sendNext: Bool = false) {
+                error: String? = nil, sendNext: Bool = false, uploadAttempted: Bool = false) {
         self.sourceName = sourceName
         self.mine = mine
         self.heldBy = heldBy
@@ -120,6 +124,7 @@ public struct QueuedOrigin: Equatable, Sendable {
         self.pendingUpload = pendingUpload
         self.error = error
         self.sendNext = sendNext
+        self.uploadAttempted = uploadAttempted
     }
 }
 
@@ -235,6 +240,25 @@ public struct QueuedTurnQueue<Payload: Equatable>: Equatable {
     }
 
     public func item(_ id: UUID) -> QueuedTurn<Payload>? { items.first { $0.id == id } }
+
+    /// The hub accepted this item; `revision` is the hub's queue revision in
+    /// that answer. When a newer snapshot was mirrored while the answer was
+    /// on the way and the item was still only here, that newer snapshot did
+    /// not list it as waiting: it is already running or has ended, so it
+    /// leaves the tray instead of staying as a row the hub no longer has.
+    public mutating func acknowledgeUpload(_ id: UUID, revision: Int?) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        if items[index].origin?.pendingUpload == true, let revision, let hubRevision, revision < hubRevision {
+            items.remove(at: index)
+            if editingID == id { editingID = nil }
+            return
+        }
+        var origin = items[index].origin ?? QueuedOrigin()
+        origin.pendingUpload = false
+        origin.uploadAttempted = false
+        origin.revision = max(origin.revision, 1)
+        items[index].origin = origin
+    }
 
     @discardableResult
     public mutating func remove(_ id: UUID) -> QueuedTurn<Payload>? {

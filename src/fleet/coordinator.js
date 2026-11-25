@@ -22,10 +22,9 @@ import {
 } from "./contracts.js";
 import { chooseRoute } from "./policy.js";
 import { readThreadConversation } from "./conversation.js";
-import { normalizePaseoImages } from "./paseo-delivery.js";
+import { normalizePaseoImages, readHostModelUsageCounts, resolveDefaultPaseoModeId, selectBestPaseoModel, titlesMatchForFailover } from "./paseo-delivery.js";
 import { collectArchiveThreads } from "./search.js";
 import { hostApi, isLocalPaseoUrl, paseoThread, withPaseo } from "./sources/paseo.js";
-import { readHostModelUsageCounts, resolveDefaultPaseoModeId, selectBestPaseoModel } from "./paseo-delivery.js";
 
 const OPAQUE_ID_RE = /^(?:paseo chat|wks_[0-9a-f]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{6,}|[0-9a-f]{12,64}|(?=[0-9a-f]*\d)[0-9a-f]{4,11})$/i;
 const REPO_SLUG_RE = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)$/;
@@ -1395,6 +1394,7 @@ export async function startPaseoSession(supervisor, {
   effort = null,
   modeId = null,
   images = null,
+  allowDuplicate = false,
   factory
 } = {}) {
   if (!supervisor?.config?.paseo?.enabled) {
@@ -1551,6 +1551,103 @@ export async function startPaseoSession(supervisor, {
         resolvedCwd = hostMatch?.preferredCwd ?? matched.defaultTarget.cwd;
       }
       workspaceLabel ??= matched.name;
+    }
+  }
+
+  // Anti-clone guard: never spawn duplicate "Continue ..." / "Resume ..." /
+  // "Failover ..." agents or duplicate an active session on the exact same
+  // title/PR in the same workspace when we can queue/send to the existing live
+  // Paseo session instead.
+  if (allowDuplicate !== true && typeof supervisor?.sendOwnerMessage === "function" && resolvedServerId && resolvedCwd) {
+    const continueLike = /^(?:continu(?:e|ing)|resum(?:e|ing)|failover|recover\s+idle)\b|\bafter\s+failover\b/i.test(cleanTitle || "")
+      || /^(?:continu(?:e|ing)|resum(?:e|ing))\s+(?:the\s+|this\s+|where\s+|work\b|active\s+work\b|pr\s*#\d+)/i.test(cleanPrompt);
+    const extractPrNums = (text) => new Set([...String(text ?? "").matchAll(/(?:^|[\s(/])(?:pr\s*)?#(\d{2,6})\b/gi)].map((m) => m[1]));
+    const reqPrNums = extractPrNums(`${cleanTitle ?? ""} ${cleanPrompt}`);
+    const normResolvedCwd = resolvedCwd.replace(/\/+$/, "");
+    const knownPool = new Map([
+      ...(supervisor?.knownThreads ?? []),
+      ...(supervisor?.lastThreads ?? [])
+    ]);
+    const liveExisting = [...knownPool.values()]
+      .filter((t) => {
+        if (!t?.key || t.kind !== "paseo" || t.archived || t.excluded) return false;
+        if (["error", "closed"].includes(String(t.agentStatus ?? "").toLowerCase())) return false;
+        if (t.meta?.serverId !== resolvedServerId) return false;
+        const tCwd = String(t.meta?.paseoCwd ?? t.cwd ?? "").trim().replace(/\/+$/, "");
+        if (!tCwd || tCwd !== normResolvedCwd) return false;
+        const tPrNums = new Set([
+          ...extractPrNums(t.title),
+          ...(t.prRefs ?? []).map((r) => String(r).split("#")[1]).filter(Boolean)
+        ]);
+        const sharedPr = [...reqPrNums].some((num) => tPrNums.has(num));
+        const exactNorm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        const exactTitleMatch = Boolean(cleanTitle && t.title && exactNorm(cleanTitle) === exactNorm(t.title));
+        // Only apply fuzzy failover title matching when the request is a
+        // continuation/recovery ("Continue ...", "Resume ...", "Failover ...");
+        // distinct new-work titles (e.g. "Fix Android production checkout" vs
+        // "Fix Android production login") must stay separate sessions.
+        const fuzzyTitleMatch = Boolean(continueLike && cleanTitle && t.title && titlesMatchForFailover(cleanTitle, t.title));
+        const promptTitleMatch = Boolean(continueLike && t.title && titlesMatchForFailover(cleanTitle || cleanPrompt.slice(0, 90), t.title));
+        const sameSourceLive = Boolean(continueLike && cleanFromKey && t.key === cleanFromKey);
+        return exactTitleMatch || fuzzyTitleMatch || promptTitleMatch || sameSourceLive || (continueLike && sharedPr);
+      })
+      .sort((a, b) => {
+        const rank = (s) => (s.agentStatus === "running" ? 0 : s.agentStatus === "idle" ? 1 : 2);
+        return rank(a) - rank(b) || String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? ""));
+      })[0] ?? null;
+
+    if (liveExisting) {
+      const sent = await supervisor.sendOwnerMessage(liveExisting.key, cleanPrompt, {
+        queue: true,
+        ...(normalizedImages.length ? { images: normalizedImages } : {})
+      });
+      const deliveryStatus = sent?.delivery?.status ?? "blocked";
+      const alreadyDelivered = sent?.delivery?.duplicate === true;
+      if (deliveryStatus === "sent" || deliveryStatus === "queued" || alreadyDelivered) {
+        supervisor.store?.recordAction?.({
+          kind: "session-reuse",
+          playbook: "owner-reuse-session",
+          threadKey: liveExisting.key,
+          route: sent.delivery.route ?? (deliveryStatus === "queued" ? "paseo-queue" : "paseo-send"),
+          status: alreadyDelivered ? "reused" : deliveryStatus,
+          by: "owner",
+          reason: clampText(`reused existing Paseo session "${liveExisting.title}" instead of creating a duplicate`, 240)
+        });
+        return {
+          status: deliveryStatus === "queued" ? "queued_existing" : "reused_existing",
+          reused: true,
+          ...(alreadyDelivered ? { duplicate: true } : {}),
+          key: liveExisting.key,
+          serverId: resolvedServerId,
+          agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
+          title: liveExisting.title,
+          workspace: workspaceLabel ?? liveExisting.workspace ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+          inferredWorkspace,
+          cwd: resolvedCwd,
+          provider: liveExisting.meta?.provider ?? null,
+          model: liveExisting.meta?.model ?? null,
+          delivery: sent.delivery,
+          openChat: openChatFor(liveExisting)
+        };
+      }
+      // Never silently fall through to api.agents.create and spawn a duplicate
+      // clone when an existing live session matched but blocked delivery (e.g.
+      // pending permission prompt); propagate the blocked reuse result cleanly.
+      return {
+        status: "blocked",
+        reused: true,
+        key: liveExisting.key,
+        serverId: resolvedServerId,
+        agentId: liveExisting.id ?? parsePaseoThreadKey(liveExisting.key)?.agentId ?? null,
+        title: liveExisting.title,
+        workspace: workspaceLabel ?? liveExisting.workspace ?? deriveProjectInfo({ cwd: resolvedCwd }).name,
+        inferredWorkspace,
+        cwd: resolvedCwd,
+        provider: liveExisting.meta?.provider ?? null,
+        model: liveExisting.meta?.model ?? null,
+        delivery: sent?.delivery ?? { status: "blocked", route: null, detail: "Existing session blocked delivery; no duplicate session created." },
+        openChat: openChatFor(liveExisting)
+      };
     }
   }
 

@@ -426,6 +426,25 @@ test("a message dispatched while a turn without a requestId still runs is not lo
   assert.deepEqual(second.calls, ["waiting behind it"], "it never began, so it runs after the restart");
 });
 
+test("a phone unpaired while its dispatched message waits behind a turn without a requestId never runs it", async (t) => {
+  const h = await hub(t);
+  // A turn the queue does not hold (an older client, or a G2 turn): the
+  // queue dispatches the phone's message at once, and it waits in
+  // AgentHost's session order. Its authority is checked when it starts.
+  const legacy = frames(await h.message("mac", { text: "[slow] legacy turn" }));
+  await until(() => h.calls.length === 1);
+  const waiting = frames(await h.message("phone", { text: "from a phone unpaired while it waits", requestId: "ios-unpair-0002" }));
+  await until(async () => (await h.queue("mac")).body.items[0]?.state === "running");
+  h.nodeRegistry.revoke(phone.id);
+  h.slow.open();
+  await legacy;
+  const ended = (await waiting).find((f) => f.event === "failure");
+  assert.equal(ended?.data.code, "sender-unpaired");
+  assert.deepEqual(h.calls, ["[slow] legacy turn"], "it never reached the model");
+  assert.equal(h.stored().some(([, text]) => text === "from a phone unpaired while it waits"), false);
+  h.nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "iPhone" });
+});
+
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC";
 
 test("Send anyway from the Mac stops the iPhone's reply midstream and goes next; pending messages keep their order", async (t) => {

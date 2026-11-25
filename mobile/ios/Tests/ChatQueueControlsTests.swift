@@ -9,7 +9,7 @@ import SupervisorChannelsKit
 final class HeldStreamProtocol: URLProtocol, @unchecked Sendable {
     struct Sent: Equatable { let text: String; let requestId: String? }
     private struct Held: @unchecked Sendable { let proto: HeldStreamProtocol; let runLoop: CFRunLoop }
-    private static let lock = NSLock()
+    static let lock = NSLock()
     nonisolated(unsafe) private static var held: [String: Held] = [:]
     nonisolated(unsafe) static var hold: Set<String> = []
     nonisolated(unsafe) static var sent: [Sent] = []
@@ -18,11 +18,13 @@ final class HeldStreamProtocol: URLProtocol, @unchecked Sendable {
     // loader thread; may call `release`.
     nonisolated(unsafe) static var answerInterrupt: (@Sendable (String) -> (Int, String))?
     nonisolated(unsafe) static var heartbeatStatus = 200
+    // What GET .../messages answers (main's shared history).
+    nonisolated(unsafe) static var history = "{\"messages\":[]}"
 
     static func reset() {
         lock.withLock {
             held = [:]; hold = []; sent = []; interrupts = []
-            answerInterrupt = nil; heartbeatStatus = 200
+            answerInterrupt = nil; heartbeatStatus = 200; history = "{\"messages\":[]}"
         }
     }
     static var sentTexts: [String] { lock.withLock { sent.map(\.text) } }
@@ -101,7 +103,7 @@ final class HeldStreamProtocol: URLProtocol, @unchecked Sendable {
             respond(Self.lock.withLock { Self.heartbeatStatus }, "{}")
             return
         }
-        respond(200, "{\"messages\":[]}")
+        respond(200, Self.lock.withLock { Self.history })
     }
 
     override func stopLoading() {}
@@ -271,23 +273,32 @@ final class ChatQueueControlsTests: XCTestCase {
     }
 
     @MainActor
-    func testSendNowStopsTheReplyMainIsStillRunningAfterItsStreamDropped() async throws {
+    func testSendNowStopsTheReplyMainIsStillRunningAfterItsStreamDroppedAndTheCorrectionGoesNext() async throws {
         let chat = conversation()
-        HeldStreamProtocol.hold.insert("Queued behind it")
         try await busy(chat, running: "Long job", queued: ["Queued behind it", "Correction"])
         let longJob = try XCTUnwrap(HeldStreamProtocol.sentTurns[0].requestId)
         // The stream drops after main accepted the turn: main keeps working.
+        HeldStreamProtocol.lock.withLock {
+            HeldStreamProtocol.history = "{\"messages\":[],\"inFlight\":[{\"requestId\":\"\(longJob)\",\"stage\":\"model\"}]}"
+        }
         HeldStreamProtocol.release("Long job", frames: "")
-        try await waitFor("the next queued message to reach main") { HeldStreamProtocol.isHeld("Queued behind it") }
-        XCTAssertTrue(chat.messages.contains { $0.isDetached && $0.requestID == longJob })
-        HeldStreamProtocol.answerInterrupt = { requestId in (200, "{\"status\":\"interrupted\",\"requestId\":\"\(requestId)\"}") }
+        try await waitFor("the reply to detach") { chat.messages.contains { $0.isDetached && $0.requestID == longJob } }
+        try await Task.sleep(for: .milliseconds(200))
+        // The queue waits here, not behind the running turn on main.
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Long job"], "nothing is sent behind a turn main still runs")
+        XCTAssertEqual(chat.queuedSubmissions.map(\.text), ["Queued behind it", "Correction"])
 
-        await chat.sendQueuedNow(id: chat.queuedSubmissions[0].id)
-        XCTAssertEqual(HeldStreamProtocol.interruptIDs, [longJob], "stop the turn main is running, not the one waiting behind it")
-
-        HeldStreamProtocol.release("Queued behind it", frames: "event: final\ndata: {\"reply\":\"ok\"}\n\n")
+        // Send Now on the correction stops the turn main is running.
+        HeldStreamProtocol.answerInterrupt = { requestId in
+            // Main has stored the stop for that turn.
+            HeldStreamProtocol.history = "{\"messages\":[{\"id\":\"u1\",\"role\":\"user\",\"text\":\"Long job\",\"at\":\"2026-11-25T00:00:00Z\",\"requestId\":\"\(requestId)\"},{\"id\":\"a1\",\"role\":\"assistant\",\"text\":\"Stopped so your next message could go first.\",\"at\":\"2026-11-25T00:00:01Z\",\"requestId\":\"\(requestId)\",\"status\":\"failed\"}],\"inFlight\":[]}"
+            return (200, "{\"status\":\"interrupted\",\"requestId\":\"\(requestId)\"}")
+        }
+        await chat.sendQueuedNow(id: chat.queuedSubmissions[1].id)
+        XCTAssertEqual(HeldStreamProtocol.interruptIDs, [longJob], "stop the turn main is running")
         try await waitFor("the queue to drain") { chat.queuedSubmissions.isEmpty && !chat.isSending }
-        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Long job", "Queued behind it", "Correction"])
+        XCTAssertEqual(HeldStreamProtocol.sentTexts, ["Long job", "Correction", "Queued behind it"],
+                       "the correction goes first; the message queued earlier keeps its place behind it")
     }
 
     @MainActor

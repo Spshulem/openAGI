@@ -201,6 +201,24 @@ final class HubQueueMirrorTests: XCTestCase {
         XCTAssertTrue(q.items.isEmpty)
     }
 
+    func testALateUploadAnswerIsCheckedAgainstTheNewestSnapshotShown() {
+        var q = QueuedTurnQueue<Int>()
+        q.mirror(hub([("r", "running", "running", false)], revision: 1), payload: { _ in 0 })
+        let late = q.enqueue(text: "finished before its answer came", payload: 0, requestID: "late", origin: QueuedOrigin(pendingUpload: true, uploadAttempted: true))
+        let current = q.enqueue(text: "answered in time", payload: 0, requestID: "current", origin: QueuedOrigin(pendingUpload: true))
+        // The hub took "late" (revision 2) and has run it since (revision 4);
+        // that newer snapshot came first and did not list it.
+        q.mirror(hub([], revision: 4), payload: { _ in 0 })
+        XCTAssertEqual(q.items.map(\.requestID), ["late", "current"], "still only here, so kept until the answer")
+        q.acknowledgeUpload(late, revision: 2)
+        XCTAssertEqual(q.items.map(\.requestID), ["current"], "the hub no longer has it waiting: no stale row")
+        // An answer as new as what is shown keeps the item, now on the hub.
+        q.acknowledgeUpload(current, revision: 4)
+        XCTAssertEqual(q.items.first?.origin?.pendingUpload, false)
+        XCTAssertEqual(q.items.first?.origin?.uploadAttempted, false)
+        XCTAssertEqual(q.items.first?.origin?.revision, 1)
+    }
+
     func testUploadsStopAtAMessageWhoseEditorIsOpenAndNothingPassesIt() {
         var q = QueuedTurnQueue<Int>()
         let first = q.enqueue(text: "first", payload: 0, requestID: "p1", origin: QueuedOrigin(pendingUpload: true))

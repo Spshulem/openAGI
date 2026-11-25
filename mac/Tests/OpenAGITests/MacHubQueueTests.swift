@@ -12,14 +12,28 @@ final class MacFakeHubProtocol: URLProtocol {
   static var log: [String] = []
   static var failNextEnqueue = false
   static var fullNextEnqueue = false
+  /// Accept the next queued message, then drop the connection (no answer).
+  static var dropNextEnqueueAnswer = false
+  /// Accept the next queued message but hold its answer until released.
+  static var holdNextEnqueue = false
+  static var revision = 1
+  private static var heldEnqueue: (proto: MacFakeHubProtocol, runLoop: CFRunLoop, answer: [String: Any])?
 
-  static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false } }
+  static func reset() {
+    lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; dropNextEnqueueAnswer = false; holdNextEnqueue = false; heldEnqueue = nil; revision = 1 }
+  }
+  static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
+  static func releaseEnqueue() {
+    guard let held = lock.withLock({ () -> (proto: MacFakeHubProtocol, runLoop: CFRunLoop, answer: [String: Any])? in defer { heldEnqueue = nil }; return heldEnqueue }) else { return }
+    CFRunLoopPerformBlock(held.runLoop, CFRunLoopMode.commonModes.rawValue) { held.proto.respond(202, held.answer) }
+    CFRunLoopWakeUp(held.runLoop)
+  }
   static func snapshot() -> [Item] { lock.withLock { items } }
   static func calls() -> [String] { lock.withLock { log } }
   static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
 
   private static func queueJSON() -> [String: Any] {
-    ["revision": 1, "items": items.enumerated().map { index, item -> [String: Any] in
+    ["revision": revision, "items": items.enumerated().map { index, item -> [String: Any] in
       var json: [String: Any] = ["requestId": item.requestId, "text": item.text, "source": ["device": item.mine ? "owner" : "phone", "name": item.source],
                                  "mine": item.mine, "state": item.state, "position": index, "revision": item.revision]
       if let heldBy = item.heldBy { json["heldBy"] = heldBy; json["heldByMe"] = heldBy == "Mac" }
@@ -78,8 +92,18 @@ final class MacFakeHubProtocol: URLProtocol {
           Self.items.append(item)
         }
       }
+      if Self.dropNextEnqueueAnswer {
+        Self.dropNextEnqueueAnswer = false
+        client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+        return
+      }
       var answer: [String: Any] = ["requestId": id, "queue": Self.queueJSON()]
       if let sendNow { answer["sendNow"] = sendNow }
+      if Self.holdNextEnqueue {
+        Self.holdNextEnqueue = false
+        Self.heldEnqueue = (self, CFRunLoopGetCurrent(), answer)
+        return
+      }
       return respond(202, answer)
     }
     let parts = path.split(separator: "/").map(String.init)
@@ -194,6 +218,40 @@ final class MacHubQueueTests: XCTestCase {
     }
     XCTAssertTrue(MacFakeHubProtocol.snapshot().contains { $0.text == "sent during an outage" })
     try await waitFor("the mirror") { supervisor.queuedMessages.first?.origin?.pendingUpload == false }
+  }
+
+  func testRemovingAMessageWhoseUploadGotNoAnswerRemovesItOnTheHubToo() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-8", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.dropNextEnqueueAnswer = true }
+    _ = await supervisor.sendMessage("taken, answer lost")
+    try await waitFor("the hub to take it") { MacFakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost" } }
+    try await waitFor("the lost answer") { supervisor.queuedMessages.first?.origin?.uploadAttempted == true }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    let item = try XCTUnwrap(supervisor.queuedMessages.first)
+    XCTAssertEqual(item.origin?.pendingUpload, true, "not confirmed here")
+    supervisor.removeQueued(id: item.id)
+    XCTAssertTrue(supervisor.queuedMessages.isEmpty)
+    try await waitFor("the hub removal") { !MacFakeHubProtocol.snapshot().contains { $0.requestId == item.requestID } }
+    XCTAssertTrue(MacFakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(item.requestID)") })
+    await supervisor.refreshMessages()
+    XCTAssertTrue(supervisor.queuedMessages.isEmpty, "never comes back, and never runs on the hub")
+  }
+
+  func testAnUploadAnswerOlderThanTheSnapshotShownLeavesNoStaleRow() async throws {
+    MacFakeHubProtocol.set { $0 = [.init(requestId: "ios-running-9", text: "busy", source: "iPhone", mine: false, state: "running", revision: 1)] }
+    let supervisor = await client()
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.revision = 2; MacFakeHubProtocol.holdNextEnqueue = true }
+    _ = await supervisor.sendMessage("finished before its answer came")
+    try await waitFor("the hub to take it, answer pending") { MacFakeHubProtocol.isHoldingEnqueue }
+    // Meanwhile both turns finished; a newer snapshot (an SSE refresh) comes first.
+    MacFakeHubProtocol.set { $0 = [] }
+    MacFakeHubProtocol.lock.withLock { MacFakeHubProtocol.revision = 4 }
+    await supervisor.refreshMessages()
+    XCTAssertEqual(supervisor.queuedMessages.count, 1, "still only here until the answer")
+    MacFakeHubProtocol.releaseEnqueue()
+    try await waitFor("the late answer") { supervisor.queuedMessages.isEmpty }
+    XCTAssertFalse(supervisor.isBusy, "no finished message keeps the Mac busy or offers queue controls")
   }
 
   func testSendAnywayAndThePreferenceWithAQueueInsteadOverride() async throws {

@@ -59,7 +59,7 @@ final class ChatConversation {
     private(set) var hubQueueAvailable = false
     // The message the hub runs now, when it came through the queue.
     private(set) var hubRunning: HubQueueItem?
-    var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
+    var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil || hasDetachedTurn }
     private var uploadTask: Task<Void, Never>?
     private var holdRenewal: Task<Void, Never>?
     // The hub revision the open editor started from. Save sends this, never a
@@ -141,10 +141,14 @@ final class ChatConversation {
 
     func removeQueuedSubmission(id: UUID) {
         guard let item = queue.item(id) else { return }
-        if hubQueueAvailable, item.requestID == uploadingRequestID {
+        // On the wire now, or sent before without an answer: the hub may
+        // have it, so it is removed there too (removeAfterUploads), never
+        // only here where the hub would still run it.
+        if hubQueueAvailable, item.requestID == uploadingRequestID || item.origin?.uploadAttempted == true {
             removeAfterUpload.insert(item.requestID)
             queue.remove(id)
             if queue.editingID == nil { queuedEditDraft = "" }
+            uploadPending()
             return
         }
         if isOnHub(item) {
@@ -295,6 +299,9 @@ final class ChatConversation {
         case .interrupt(let requestID):
             let outcome = await client.interruptTurn(thread: thread, requestId: requestID, conversationId: conversationID)
             queue.applyInterrupt(id, outcome: outcome)
+            // A detached turn that just stopped: learn it now, so the
+            // correction goes at once instead of at the next poll.
+            if hasDetachedTurn { await refresh() }
             drainIfIdle()
         }
     }
@@ -383,17 +390,20 @@ final class ChatConversation {
             while let self, !self.forgotten,
                   let next = self.queue.nextUpload {
                 self.uploadingRequestID = next.requestID
+                self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
                 var offline = false
                 do {
                     let (snapshot, interrupt) = try await self.client.enqueueMessage(
                         thread: self.thread, text: next.text, attachments: next.attachments,
                         focusedCardId: next.payload.focusedCardID, requestId: next.requestID,
                         conversationId: self.conversationID, next: next.origin?.sendNext == true)
-                    self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
                     if next.origin?.sendNext == true {
                         // What the hub confirmed; it ran at once when nothing was running.
                         self.queue.setSendNowOutcome(next.id, interrupt ?? .nothingRunning)
                     }
+                    // Checked against the newest snapshot shown, which may
+                    // have arrived (without it) while this answer was late.
+                    self.queue.acknowledgeUpload(next.id, revision: snapshot?.revision)
                     self.uploadingRequestID = nil
                     self.mirrorHub(snapshot)
                 } catch let refused as HubQueueRefused where refused.code == "queue_full" {
@@ -433,8 +443,13 @@ final class ChatConversation {
 
     // Starts sending the queue when nothing is running: after an edit
     // closes, a removal, or a retry ends. A hub queue runs on the hub.
+    // A reply whose stream was lost while main kept working (detached): main
+    // still runs it. Messages wait here, not behind it on main, so Send Now
+    // can still put a correction ahead of them; they go when it has ended.
+    var hasDetachedTurn: Bool { messages.contains { $0.role == .assistant && $0.isDetached } }
+
     private func drainIfIdle() {
-        guard !hubQueueAvailable, !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
+        guard !hubQueueAvailable, !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit, !hasDetachedTurn else { return }
         isSending = true
         Task {
             defer { isSending = false }
@@ -443,7 +458,7 @@ final class ChatConversation {
     }
 
     private func drainQueue() async {
-        while !hubQueueAvailable, !forgotten, let next = queue.takeNext() {
+        while !hubQueueAvailable, !forgotten, !hasDetachedTurn, let next = queue.takeNext() {
             appendTurn(text: next.text, attachments: next.attachments, requestID: next.requestID)
             await streamReply(text: next.text, attachments: next.attachments, replyID: messages[messages.count - 1].id,
                               focusedCardID: next.payload.focusedCardID)
@@ -814,6 +829,9 @@ final class ChatConversation {
                 persist()
             }
             applyHubQueue(hubQueue)
+            // A detached turn main has now finished (or stopped): what waited
+            // here for it goes now.
+            drainIfIdle()
             if !didLoadOlder || !overlaps {
                 // Start at the returned page, not the oldest cached line:
                 // time spent offline can leave an unloaded gap in between.

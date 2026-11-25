@@ -328,6 +328,8 @@ struct SyncedSupervisorMessage: Identifiable, Decodable, Equatable, Sendable {
   let sourceNodeId: String?
   let attachments: [SyncedAttachmentPreview]?
   var localThumbnailData: [Data] = []
+  /// The turn this line belongs to (main's history carries it).
+  var requestId: String? = nil
 
   var thumbnailImageData: [Data] {
     if !localThumbnailData.isEmpty { return localThumbnailData }
@@ -338,7 +340,7 @@ struct SyncedSupervisorMessage: Identifiable, Decodable, Equatable, Sendable {
   }
 
   enum CodingKeys: String, CodingKey {
-    case id, role, text, at, sourceName, sourceNodeId, attachments
+    case id, role, text, at, sourceName, sourceNodeId, attachments, requestId
   }
 }
 
@@ -479,9 +481,12 @@ struct MacTaskItem: Identifiable, Decodable, Equatable, Sendable {
 }
 
 private struct SyncedHistoryResponse: Decodable {
+  struct InFlight: Decodable { let requestId: String }
   let messages: [SyncedSupervisorMessage]
   /// The hub's queue for this conversation; nil from a hub without one.
   let queue: HubQueueSnapshot?
+  /// Turns main is still running (nil from a main too old to say).
+  let inFlight: [InFlight]?
 }
 
 private struct QueueEnvelope: Decodable {
@@ -580,7 +585,16 @@ final class SharedSupervisorClient: ObservableObject {
   /// Where the "while a reply is running" preference is kept (tray menu).
   private let preferences: UserDefaults
   var busySendBehavior: BusySendBehavior { BusySendBehavior.stored(in: preferences) }
-  var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil }
+  var isBusy: Bool { isSending || !queue.isEmpty || hubRunning != nil || !outstandingRequestIds.isEmpty }
+  /// Turns main is still running whose reply stream this Mac lost (it
+  /// keeps running on main without the stream). Queued messages wait here
+  /// until main has finished them, so Send Now can still go first, and Send
+  /// Now stops one of these rather than a later turn waiting behind it.
+  private(set) var outstandingRequestIds: [String] = []
+  private var outstandingPoll: Task<Void, Never>?
+  /// The current stream got main's answer (a 2xx event stream): from then
+  /// on a lost connection leaves the turn running on main.
+  private var streamOpened = false
   @Published private(set) var streamingReplyText: String? = nil
   /// The assistant messages already shown when the current reply started,
   /// and the question it answers. A new assistant message right after that
@@ -633,10 +647,14 @@ final class SharedSupervisorClient: ObservableObject {
 
   func removeQueued(id: UUID) {
     guard let item = queue.item(id) else { return }
-    if hubQueueAvailable, item.requestID == uploadingRequestID {
+    // On the wire now, or sent before without an answer: the hub may have
+    // it, so it is removed there too (removeAfterUploads), never only here
+    // where the hub would still run it.
+    if hubQueueAvailable, item.requestID == uploadingRequestID || item.origin?.uploadAttempted == true {
       removeAfterUpload.insert(item.requestID)
       queue.remove(id)
       if queue.editingID == nil { queuedEditDraft = "" }
+      uploadPending()
       return
     }
     if isOnHub(item) {
@@ -794,16 +812,19 @@ final class SharedSupervisorClient: ObservableObject {
         if !next.payload.attachments.isEmpty { body["attachments"] = next.payload.attachments.map(\.agentHostPayload) }
         if next.origin?.sendNext == true { body["next"] = true }
         self.uploadingRequestID = next.requestID
+        self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
         var offline = false
         do {
           let data = try await self.queueCall("/conversations/supervisor/queue", method: "POST", body: body)
           let envelope = try? JSONDecoder().decode(QueueEnvelope.self, from: data)
-          self.queue.setOrigin(next.id) { $0.pendingUpload = false; $0.revision = max($0.revision, 1) }
           if next.origin?.sendNext == true {
             // What the hub confirmed; it ran at once when nothing was running.
             let outcome = envelope?.sendNow.map { TurnInterruptOutcome.fromServer(status: $0.status, tool: $0.tool) } ?? .nothingRunning
             self.queue.setSendNowOutcome(next.id, outcome)
           }
+          // Checked against the newest snapshot shown, which may have
+          // arrived (without it) while this answer was late.
+          self.queue.acknowledgeUpload(next.id, revision: envelope?.queue?.revision)
           self.uploadingRequestID = nil
           self.mirrorHub(envelope?.queue)
           self.uploadRetryDelay = 2
@@ -904,7 +925,10 @@ final class SharedSupervisorClient: ObservableObject {
       }
       return
     }
-    switch queue.beginSendNow(id, replyRunning: replyInFlight, runningRequestID: runningRequestId) {
+    // The turn main is actually running: one whose stream this Mac lost runs
+    // ahead of anything sent after it, so it is the one to stop.
+    let target = outstandingRequestIds.first ?? runningRequestId
+    switch queue.beginSendNow(id, replyRunning: replyInFlight || !outstandingRequestIds.isEmpty, runningRequestID: target) {
     case .ignored, .cannotInterrupt:
       return
     case .sendNext:
@@ -912,6 +936,10 @@ final class SharedSupervisorClient: ObservableObject {
     case .interrupt(let requestId):
       let outcome = await interruptReply(requestId: requestId)
       queue.applyInterrupt(id, outcome: outcome)
+      // An outstanding turn that just stopped: learn it now, so the
+      // correction goes at once instead of at the next poll.
+      if !outstandingRequestIds.isEmpty { await refreshMessages() }
+      drainIfIdle()
     }
   }
 
@@ -944,7 +972,7 @@ final class SharedSupervisorClient: ObservableObject {
   /// Sends the queue when nothing is running: after an edit closes, a
   /// removal, or a Send Now with no reply in flight.
   private func drainIfIdle() {
-    guard !hubQueueAvailable, !isSending, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
+    guard !hubQueueAvailable, !isSending, !queue.isEmpty, !queue.isWaitingOnEdit, outstandingRequestIds.isEmpty else { return }
     isSending = true
     Task {
       defer {
@@ -957,7 +985,9 @@ final class SharedSupervisorClient: ObservableObject {
   }
 
   private func drainQueue() async {
-    while !hubQueueAvailable, let next = queue.takeNext() {
+    // A turn main still runs without this Mac's stream: what waits here goes
+    // when it has ended (settleOutstanding), not behind it on main.
+    while !hubQueueAvailable, outstandingRequestIds.isEmpty, let next = queue.takeNext() {
       _ = await executeSingleMessage(next.text, focusedCardId: next.payload.focusedCardId,
                                      attachments: next.payload.attachments, requestId: next.requestID)
     }
@@ -1186,6 +1216,7 @@ final class SharedSupervisorClient: ObservableObject {
       let decoded = try JSONDecoder().decode(SyncedHistoryResponse.self, from: data)
       messages = decoded.messages
       applyHubQueue(decoded.queue)
+      settleOutstanding(decoded)
       lastError = nil
     } catch {
       // Keep cached transcript cleanly when daemon is restarting.
@@ -1363,7 +1394,9 @@ final class SharedSupervisorClient: ObservableObject {
         return true
       }
       messages.removeAll { $0.id == localId }
-      lastError = error.localizedDescription
+      lastError = outstandingRequestIds.contains(requestId)
+        ? "Lost the connection to this reply. Main is still working on it; it will appear here when it finishes."
+        : error.localizedDescription
       return false
     }
   }
@@ -1373,11 +1406,51 @@ final class SharedSupervisorClient: ObservableObject {
   private func streamTracked(payload: [String: Any], requestId: String?) async throws -> String? {
     replyInFlight = true
     runningRequestId = requestId
+    streamOpened = false
     defer {
       replyInFlight = false
       runningRequestId = nil
     }
-    return try await performStreamedMessage(payload: payload)
+    do {
+      return try await performStreamedMessage(payload: payload)
+    } catch is SupervisorReplyInterrupted {
+      throw SupervisorReplyInterrupted()
+    } catch let error as NSError where error.domain == "OpenAGI.Agent" {
+      // Main said how the turn ended (a failure frame): nothing outstanding.
+      throw error
+    } catch {
+      // The stream went before main's last word: main keeps running the
+      // turn. Remember it until history shows how it ended.
+      if let requestId, streamOpened, !outstandingRequestIds.contains(requestId) {
+        outstandingRequestIds.append(requestId)
+        pollOutstanding()
+      }
+      throw error
+    }
+  }
+
+  /// Checks history while a turn is outstanding (`/events` also refreshes).
+  private func pollOutstanding() {
+    guard outstandingPoll == nil else { return }
+    outstandingPoll = Task { [weak self] in
+      while let self, !self.outstandingRequestIds.isEmpty, !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        await self.refreshMessages()
+      }
+      self?.outstandingPoll = nil
+    }
+  }
+
+  /// A turn is no longer outstanding once main stored its reply (or its
+  /// stop/failure record), or no longer lists it as running.
+  private func settleOutstanding(_ history: SyncedHistoryResponse) {
+    guard !outstandingRequestIds.isEmpty else { return }
+    let answered = Set(history.messages.filter { $0.role == "assistant" }.compactMap(\.requestId))
+    let running = history.inFlight.map { Set($0.map(\.requestId)) }
+    outstandingRequestIds.removeAll { id in
+      answered.contains(id) || (running.map { !$0.contains(id) } ?? false)
+    }
+    if outstandingRequestIds.isEmpty { drainIfIdle() }
   }
 
   private func performStreamedMessage(payload: [String: Any]) async throws -> String? {
@@ -1419,6 +1492,9 @@ final class SharedSupervisorClient: ObservableObject {
       return decoded.reply
     }
 
+    // Main answered with its event stream: the turn is now main's to run,
+    // whether or not this connection lasts.
+    streamOpened = true
     var parser = ServerSentEventParser()
     for try await line in ServerSentEventParser.lines(of: bytes) {
       guard let event = parser.consume(line: line) else { continue }

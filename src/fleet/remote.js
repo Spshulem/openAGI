@@ -17,7 +17,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +49,10 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/hierarchy') {
         if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/ask-supervisor') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
       if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
@@ -302,13 +306,13 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null } = {}) {
     const startedAtMs = Date.now();
     try {
       return await this.request('POST', '/fleet/api/send', {
         threadKey,
         message,
-        ...(queue === true ? { queue: true } : {}),
+        ...(typeof queue === 'boolean' ? { queue } : {}),
         ...(Array.isArray(images) && images.length ? { images } : {})
       });
     } catch (error) {
@@ -494,6 +498,7 @@ export class RemoteFleetSupervisor {
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async getSupervisorWork(input = {}) { return this.request('GET', '/fleet/api/ask-supervisor', input); }
   async getOrganization() { return (await this.request('GET', '/fleet/api/projects')).organization; }
   async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
   async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
@@ -562,6 +567,7 @@ export class RemoteFleetSupervisor {
     return rest;
   }
   async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async scheduleActiveWorkRecheck(id, input = {}) { return this.actActiveWork(id, { ...input, op: 'schedule_recheck' }); }
   async actActiveWork(id, input = {}) {
     try {
       return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
@@ -925,6 +931,7 @@ export class RemoteFleetSupervisor {
 
   mirrorActiveWork(activeWork) {
     const outreach = this.runtime?.outreach;
+    this.mirrorRecheckNotifications(activeWork?.recheckNotifications);
     if (!activeWork || !Array.isArray(activeWork.prompts)) return;
     const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
     this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
@@ -967,6 +974,32 @@ export class RemoteFleetSupervisor {
         });
       }
       if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
+    }
+  }
+
+  // A recheck's result is a one-time notice, not a live prompt: post each
+  // once, and never again once the owner has seen or dismissed it.
+  mirrorRecheckNotifications(notifications) {
+    const outreach = this.runtime?.outreach;
+    if (!outreach || !Array.isArray(notifications)) return;
+    const posted = new Set(outreach.list()
+      .filter((item) => item.sourceRef?.kind === 'active-work-recheck' && item.sourceRef.nodeId === this.nodeId)
+      .map((item) => String(item.sourceRef.id)));
+    for (const notice of notifications) {
+      if (!notice?.id || !notice.title || posted.has(String(notice.id))) continue;
+      // The coding node folded it into the item's open follow-through prompt,
+      // which mirrorActiveWork already carries here: a second entry would
+      // notify the owner twice about one blocker.
+      if (notice.reusedPrompt === true) continue;
+      outreach.append({
+        type: 'fleet-active-work-recheck',
+        sourceRef: { kind: 'active-work-recheck', id: notice.id, itemId: notice.itemId ?? null, nodeId: this.nodeId },
+        title: notice.title,
+        summary: notice.summary ?? '',
+        actions: ['dismiss'],
+        needsDecision: false
+      });
+      posted.add(String(notice.id));
     }
   }
 }

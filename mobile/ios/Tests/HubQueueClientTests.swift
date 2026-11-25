@@ -18,16 +18,20 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var sendNowStatus = "interrupted"
     // Accept the next queued message but hold the answer until released.
     nonisolated(unsafe) static var holdNextEnqueue = false
-    private struct Held: @unchecked Sendable { let proto: FakeHubProtocol; let runLoop: CFRunLoop }
+    // Accept the next queued message, then drop the connection (no answer).
+    nonisolated(unsafe) static var dropNextEnqueueAnswer = false
+    nonisolated(unsafe) static var revision = 1
+    private struct Held: @unchecked Sendable { let proto: FakeHubProtocol; let runLoop: CFRunLoop; let answer: [String: Any] }
     nonisolated(unsafe) private static var heldEnqueue: Held?
 
-    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; ended = []; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil } }
+    static func reset() { lock.withLock { items = []; log = []; failNextEnqueue = false; fullNextEnqueue = false; ended = []; sendNowStatus = "interrupted"; holdNextEnqueue = false; heldEnqueue = nil; dropNextEnqueueAnswer = false; revision = 1 } }
     static var isHoldingEnqueue: Bool { lock.withLock { heldEnqueue != nil } }
     static func releaseEnqueue() {
         guard let held = lock.withLock({ () -> Held? in defer { heldEnqueue = nil }; return heldEnqueue }) else { return }
         let proto = held.proto
-        let json = lock.withLock { queueJSON() }
-        CFRunLoopPerformBlock(held.runLoop, CFRunLoopMode.commonModes.rawValue) { proto.respond(202, ["queue": json]) }
+        // The answer as the hub made it when it took the message.
+        let answer = held.answer
+        CFRunLoopPerformBlock(held.runLoop, CFRunLoopMode.commonModes.rawValue) { proto.respond(202, answer) }
         CFRunLoopWakeUp(held.runLoop)
     }
     static func snapshot() -> [Item] { lock.withLock { items } }
@@ -35,7 +39,7 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
     static func set(_ change: (inout [Item]) -> Void) { lock.withLock { change(&items) } }
 
     private static func queueJSON() -> [String: Any] {
-        ["revision": 1, "ended": ended, "items": items.enumerated().map { index, item -> [String: Any] in
+        ["revision": revision, "ended": ended, "items": items.enumerated().map { index, item -> [String: Any] in
             var json: [String: Any] = ["requestId": item.requestId, "text": item.text, "source": ["device": item.mine ? "phone" : "owner", "name": item.source],
                                        "mine": item.mine, "state": item.state, "position": index, "revision": item.revision]
             if let heldBy = item.heldBy { json["heldBy"] = heldBy; json["heldByMe"] = heldBy == "iPhone" }
@@ -98,9 +102,14 @@ final class FakeHubProtocol: URLProtocol, @unchecked Sendable {
                     Self.items.append(item)
                 }
             }
+            if Self.dropNextEnqueueAnswer {
+                Self.dropNextEnqueueAnswer = false
+                client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                return
+            }
             if Self.holdNextEnqueue {
                 Self.holdNextEnqueue = false
-                Self.heldEnqueue = Held(proto: self, runLoop: CFRunLoopGetCurrent())
+                Self.heldEnqueue = Held(proto: self, runLoop: CFRunLoopGetCurrent(), answer: ["requestId": id, "queue": Self.queueJSON()])
                 return
             }
             var answer: [String: Any] = ["requestId": id, "queue": Self.queueJSON()]
@@ -305,6 +314,46 @@ final class HubQueueClientTests: XCTestCase {
         XCTAssertTrue(FakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(requestID)") })
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertTrue(chat.queuedSubmissions.isEmpty, "the upload's answer did not bring it back")
+    }
+
+    @MainActor
+    func testRemovingAMessageWhoseUploadGotNoAnswerRemovesItOnTheHubToo() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-8", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        // The hub takes it, but the answer is lost with the connection.
+        FakeHubProtocol.dropNextEnqueueAnswer = true
+        chat.draft = "taken, answer lost"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the hub to take it") { FakeHubProtocol.snapshot().contains { $0.text == "taken, answer lost" } }
+        try await Task.sleep(for: .milliseconds(50))
+        let item = try XCTUnwrap(chat.queuedSubmissions.first)
+        XCTAssertEqual(item.origin?.pendingUpload, true, "not confirmed here")
+        XCTAssertEqual(item.origin?.uploadAttempted, true)
+        chat.removeQueuedSubmission(id: item.id)
+        XCTAssertTrue(chat.queuedSubmissions.isEmpty)
+        try await waitFor("the hub removal") { !FakeHubProtocol.snapshot().contains { $0.requestId == item.requestID } }
+        XCTAssertTrue(FakeHubProtocol.calls().contains { $0.hasPrefix("DELETE /conversations/supervisor/queue/\(item.requestID)") })
+        await chat.refresh()
+        XCTAssertTrue(chat.queuedSubmissions.isEmpty, "never comes back, and never runs on the hub")
+    }
+
+    @MainActor
+    func testAnUploadAnswerOlderThanTheSnapshotShownLeavesNoStaleRow() async throws {
+        FakeHubProtocol.set { $0 = [.init(requestId: "mac-running-9", text: "busy", source: "Mac", mine: false, state: "running", revision: 1)] }
+        let chat = await chat()
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.revision = 2 }
+        FakeHubProtocol.holdNextEnqueue = true
+        chat.draft = "finished before its answer came"
+        XCTAssertTrue(chat.submitDraft())
+        try await waitFor("the hub to take it, answer pending") { FakeHubProtocol.isHoldingEnqueue }
+        // Meanwhile both turns finished; a newer snapshot arrives first.
+        FakeHubProtocol.set { $0 = [] }
+        FakeHubProtocol.lock.withLock { FakeHubProtocol.revision = 4 }
+        await chat.refresh()
+        XCTAssertEqual(chat.queuedSubmissions.count, 1, "still only here until the answer")
+        FakeHubProtocol.releaseEnqueue()
+        try await waitFor("the late answer") { chat.queuedSubmissions.isEmpty }
+        XCTAssertFalse(chat.isBusy, "no finished message keeps the chat busy")
     }
 
     @MainActor

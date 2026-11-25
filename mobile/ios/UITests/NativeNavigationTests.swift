@@ -21,7 +21,7 @@ final class NativeNavigationTests: XCTestCase {
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
         // Walking every accessibility type can stall while resolving system
         // toolbar snapshots, even for a fully visible native navigation row.
-        let isNativeButton = id == "approval-approve" || id == "open-settings" || id == "chat-jump-latest" || id == "chat-send" || id.hasPrefix("inbox-approval-")
+        let isNativeButton = id == "approval-approve" || id == "open-settings" || id == "chat-jump-latest" || id == "chat-send" || id == "today-open-inbox" || id.hasPrefix("inbox-approval-")
         let target = isNativeButton ? app.buttons[id] : element(app, id)
         if let listID {
             let list = element(app, listID)
@@ -396,16 +396,21 @@ final class NativeNavigationTests: XCTestCase {
     func testQueuedMessagesEditInPlaceAndSendNowSaysWhatMainConfirmed() {
         let app = launch(["--ui-chat-working"])
         tab(app, "Chat")
-        let composer = element(app, "chat-composer")
-        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        // The running reply keeps its working indicator animating, so the app
+        // is never idle and every UI query waits on it. Keep queries few and
+        // narrow: one direct tap on Send per message (no separate existence
+        // and hit-test queries), and let the first queued row (which only
+        // exists while a reply runs) stand for "a reply is running".
+        let composer = app.textFields["chat-composer"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        let send = app.buttons["chat-send"]
         for text in ["Check my agents", "Draft the update for Tuesday", "Also invite Sam"] {
             composer.tap()
             composer.typeText(text)
-            tap(app, "chat-send")
+            send.tap()
         }
-        XCTAssertTrue(element(app, "chat-working").waitForExistence(timeout: 10))
         let firstQueued = app.staticTexts.matching(identifier: "chat-queued-text").firstMatch
-        XCTAssertTrue(firstQueued.waitForExistence(timeout: 10))
+        XCTAssertTrue(firstQueued.waitForExistence(timeout: 15))
         XCTAssertTrue(firstQueued.label.contains("Draft the update for Tuesday"), firstQueued.label)
         capture("queue-tray", app: app)
 
@@ -736,6 +741,26 @@ final class NativeNavigationTests: XCTestCase {
         mic.tap()
         XCTAssertEqual(mic.label, "Dictate message")
         XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues.")
+    }
+
+    // Review on #341: after a long silence iOS fails the waiting request with
+    // "no speech". The mic must stay on, nothing heard is lost, and later
+    // speech joins the same unsent draft.
+    func testLongSilenceKeepsListeningAndKeepsTheDraft() {
+        let app = launch(["--ui-dictation-pause-fixture", "--ui-dictation-silence"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let resumed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "Still here."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [resumed], timeout: 10), .completed, "Speech after a long silence must reach the draft")
+        XCTAssertEqual(mic.label, "Stop dictation", "The microphone must still be listening after a long silence")
+        XCTAssertFalse(app.staticTexts["Dictation stopped. Your draft is saved; tap the microphone to try again."].exists)
+        XCTAssertFalse(app.staticTexts["Still here."].exists, "Dictation must never send by itself")
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertEqual(field.value as? String, "Before the pause. After the pause it continues. Still here.")
     }
 
     // The same pause on device: no final marker and no timing; the next

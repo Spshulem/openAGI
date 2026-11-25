@@ -10,14 +10,16 @@ import XCTest
 final class MacHeldStreamProtocol: URLProtocol {
   struct Sent: Equatable { let text: String; let requestId: String?; let thread: String? }
   private struct Held { let proto: MacHeldStreamProtocol; let runLoop: CFRunLoop }
-  private static let lock = NSLock()
+  static let lock = NSLock()
+  /// What GET .../messages answers (main's shared history).
+  static var history = "{\"messages\":[]}"
   private static var held: [String: Held] = [:]
   static var hold: Set<String> = []
   private static var sent: [Sent] = []
   private static var interrupts: [String] = []
   static var answerInterrupt: ((String) -> (Int, String))?
 
-  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil } }
+  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil; history = "{\"messages\":[]}" } }
   static var sentTexts: [String] { lock.withLock { sent.map(\.text) } }
   static var sentTurns: [Sent] { lock.withLock { sent } }
   static var interruptIDs: [String] { lock.withLock { interrupts } }
@@ -88,7 +90,7 @@ final class MacHeldStreamProtocol: URLProtocol {
       return
     }
     if path == "/tasks" { respond(200, "{\"tasks\":[]}"); return }
-    respond(200, "{\"messages\":[]}")
+    respond(200, Self.lock.withLock { Self.history })
   }
 
   override func stopLoading() {}
@@ -247,5 +249,31 @@ final class SupervisorQueueControlsTests: XCTestCase {
     XCTAssertEqual(outcome(404, "{}"), .unsupported)
     XCTAssertEqual(outcome(500, #"{"status":"interrupted"}"#), .unreachable, "an error status is never a success")
     XCTAssertEqual(outcome(200, "<html>"), .unreachable)
+  }
+
+  func testAfterTheStreamDropsMainsRunningTurnIsTheOneSendNowStopsAndTheQueueWaitsForIt() async throws {
+    let supervisor = client()
+    let first = try await busy(supervisor, running: "Long job", queued: ["Queued behind it", "Correction"])
+    let longJob = try XCTUnwrap(MacHeldStreamProtocol.sentTurns[0].requestId)
+    // The stream goes while main keeps running the turn.
+    MacHeldStreamProtocol.lock.withLock {
+      MacHeldStreamProtocol.history = "{\"messages\":[],\"inFlight\":[{\"requestId\":\"\(longJob)\",\"stage\":\"model\"}]}"
+    }
+    MacHeldStreamProtocol.release("Long job", frames: "")
+    _ = await first.value
+    try await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertEqual(supervisor.outstandingRequestIds, [longJob], "remembered until main says how it ended")
+    XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Long job"], "nothing is sent behind a turn main still runs")
+    XCTAssertEqual(supervisor.queuedMessages.map(\.text), ["Queued behind it", "Correction"])
+
+    MacHeldStreamProtocol.answerInterrupt = { requestId in
+      MacHeldStreamProtocol.history = "{\"messages\":[{\"id\":\"u1\",\"role\":\"user\",\"text\":\"Long job\",\"requestId\":\"\(requestId)\"},{\"id\":\"a1\",\"role\":\"assistant\",\"text\":\"Stopped so your next message could go first.\",\"requestId\":\"\(requestId)\"}],\"inFlight\":[]}"
+      return (200, "{\"status\":\"interrupted\",\"requestId\":\"\(requestId)\"}")
+    }
+    await supervisor.sendQueuedNow(id: supervisor.queuedMessages[1].id)
+    XCTAssertEqual(MacHeldStreamProtocol.interruptIDs, [longJob], "the turn main is running, not a later one")
+    try await waitFor("the queue to drain") { supervisor.queuedMessages.isEmpty && !supervisor.isSending }
+    XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Long job", "Correction", "Queued behind it"])
+    XCTAssertTrue(supervisor.outstandingRequestIds.isEmpty)
   }
 }

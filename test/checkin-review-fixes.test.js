@@ -101,7 +101,8 @@ test("on a paired node, a hub failure keeps decisions pending and the hub is ret
     config: { enabled: true, mode: "auto", proactiveSupervisorChat: true },
     deps: { now: () => nowMs, supervisorChatFetch: async (url) => { hubCalls.push(url); return { ok: hubUp, status: hubUp ? 200 : 503 }; } }
   });
-  sup.store.upsertQuestion({ dedupeKey: "ask:hub", kind: "agent-ask", threadKey: "paseo:s.h", title: "Publish the release notes?", options: ["publish", "hold"] });
+  sup.store.upsertQuestion({ dedupeKey: "ask:hub", kind: "agent-ask", threadKey: "paseo:s.h", title: "Publish the release notes?", options: ["publish", "hold"],
+    contextSnapshot: { threadTitle: "Release notes", recentMessages: [{ role: "user", text: "Draft the v0.0.85 release notes for the blog" }, { role: "assistant", text: "Notes drafted and reviewed. Publishing needs your approval. Publish them, or hold?" }] } });
   const first = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
   assert.equal(first.deliveredRemote, false);
   assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: nowMs }).deltas.length, 1, "still pending after a local-only fallback");
@@ -120,4 +121,164 @@ test("a reworded merge ask at the same head is not a new decision; a new head is
   const newHead = actionableDecisionMaterialHash({ ...base, askedHead: "9f00d1e", title: "#10346: run Mac tests or merge?", body: "CI failing on main-health." });
   assert.equal(a, reworded);
   assert.notEqual(a, newHead);
+});
+
+// Spencer's acceptance (2026-11-23): a check-in surfaces only the top 3-4
+// verified decisions that need him; none if none qualify; no counts, backlog,
+// raw ids, FYIs, routine recovery or unchanged repeats; one line on why.
+test("check-in: at most four verified decisions, merges first, nothing else", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  let nowMs = NOW;
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => nowMs } });
+  const ctx = (i, text) => ({ threadTitle: `Workstream ${i}`, recentMessages: [{ role: "user", text: `Please finish workstream ${i} end to end` }, { role: "assistant", text }] });
+  for (let i = 0; i < 5; i += 1) {
+    sup.store.upsertQuestion({ dedupeKey: `ask:${i}`, kind: "agent-ask", threadKey: `paseo:s.${i}`, title: `Workstream ${i}: pick a path?`, options: ["go", "hold"],
+      contextSnapshot: ctx(i, `Built and tested step ${i}. Shipping needs your approval. Go, or hold?`) });
+  }
+  sup.store.upsertQuestion({ dedupeKey: "ask:merge", kind: "agent-ask", mergeAsk: true, prRef: "acme/app#77", askedHead: "abc1234", threadKey: "paseo:s.m", title: "acme #77: merge?", options: ["merge", "wait"],
+    contextSnapshot: { ...ctx("M", "CI is green and the review is resolved. Merging needs your approval. Merge, or wait?"), threadTitle: "Merge train" } });
+  // Not decisions, or not verified: never in a check-in.
+  sup.store.upsertQuestion({ dedupeKey: "done:x", kind: "completed", threadKey: "paseo:s.x", title: "Docs refresh: finished", options: ["Got it"] });
+  sup.store.upsertQuestion({ dedupeKey: "err:y", kind: "session-error", threadKey: "paseo:s.y", title: "Session hit an error", options: ["retry"] });
+  sup.store.upsertQuestion({ dedupeKey: "deliver:group", kind: "deliver", threadKey: null, threadKeys: ["paseo:s.a", "paseo:s.b"], title: "2 stopped. Nudges can't get through. Nudge them?", options: ["done", "skip"] });
+  sup.store.upsertQuestion({ dedupeKey: "ask:poor", kind: "agent-ask", threadKey: "paseo:s.p", title: "Proceed?", options: ["yes", "no"] });
+
+  await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(msgs.length, 1);
+  const text = msgs[0].text;
+  const shown = text.match(/\*\*(?:New|Changed): [^*]+\*\*/g) ?? [];
+  assert.equal(shown.length, 4, "never more than four");
+  assert.match(shown[0], /Merge train/, "the merge decision comes first");
+  assert.match(text, /^\*\*Supervisor check-in: 4 decisions need you\.\*\*\n_Picked because/);
+  assert.doesNotMatch(text, /\bfq_[0-9a-f]{6,}|Decisions waiting|Sessions running|tracked goals|more new|Docs refresh|hit an error|Nudges can't get through|Proceed\?/);
+
+  // The two not shown are announced next; nothing shown is repeated.
+  nowMs += 60_000;
+  await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(msgs.length, 2);
+  assert.equal((msgs[1].text.match(/\*\*(?:New|Changed): /g) ?? []).length, 2);
+  for (const name of shown) assert.ok(!msgs[1].text.includes(name), `no repeat of ${name}`);
+
+  // Nothing new that qualifies: no check-in at all.
+  nowMs += 60_000;
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: nowMs });
+  assert.equal(res.posted, false);
+  assert.equal(msgs.length, 2);
+});
+
+// #366 review P2: options come only from a choices list tied to the
+// decision, never from verification bullets.
+test("verification bullets are never recovered as decision options", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.r", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "user", text: "Roll the API out to production" }, { role: "assistant", text: "Verified:\n- Unit tests passed\n- Staging smoke test passed\nBlocked on your decision on the production region." }]
+  });
+  assert.equal(ctx.options.length, 0, "test results are not choices");
+  assert.ok(ctx.missing.includes("decision"), "so the ask is not a verified decision");
+  const listed = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.r", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "assistant", text: "Verified:\n- Unit tests passed\n\nWhich region should production use?\n- us-east\n- eu-west" }]
+  });
+  assert.deepEqual(listed.options.map((o) => o.label), ["Us-east", "Eu-west"]);
+});
+
+// #366 review P2: a resolved decision mentioned in passing must not replace
+// the real current ask.
+test("a past decision named in an update does not override the current question", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.d", title: "Approve the production deployment?", options: ["approve", "hold"] },
+    recentMessages: [{ role: "assistant", text: "I applied your decision on the EU region. The build passed staging verification. Production deployment still needs your approval." }]
+  });
+  assert.equal(ctx.decision, "Approve the production deployment?");
+});
+
+// Live repro 2026-11-23 ~21:30Z (synthetic text, same structure): a rich
+// multi-part ask and a generic yes/no duplicate from the same session, plus a
+// session error. The check-in groups the real sub-decisions with the
+// recommendation, drops the duplicate and the error, and has no counts.
+test("check-in replay: grouped sub-decisions, no duplicate generic ask, no session error, no counts", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  const agent = "…eady say the email is only used to match accounts.\n\n**Decisions I need from you:**\n1. **The video:** will you record the narrated walkthrough and give me a public link? Or should I put screenshots in a public folder? If so, tell me where.\n2. **App Home:** should I add the welcome message so reviewers see it? Or leave the warning?\n\nOnce I have both answers, I'll update the video field and get the submission ready.";
+  const snap = { threadTitle: "Marketplace submission", recentMessages: [{ role: "user", text: "Fix the marketplace submission and get it ready to resubmit" }, { role: "assistant", text: agent }], agentSummary: agent };
+  sup.store.upsertQuestion({ dedupeKey: "ask:rich", kind: "agent-ask", threadKey: "paseo:s.mkt", title: "Marketplace: choose video and App Home", body: agent, options: ["record narrated video", "use public screenshots", "add welcome message", "leave warning"], contextSnapshot: snap });
+  sup.store.upsertQuestion({ dedupeKey: "ask:generic", kind: "agent-ask", threadKey: "paseo:s.mkt2", title: "Marketplace submission: needs your call. Answer?", options: ["yes", "no"], contextSnapshot: { threadTitle: "Marketplace submission" } });
+  sup.store.upsertQuestion({ dedupeKey: "err:zs", kind: "session-error", threadKey: "paseo:s.zs", title: "Iteration review: session hit an error", options: ["Got it"] });
+  await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  assert.equal(msgs.length, 1);
+  const text = msgs[0].text;
+  assert.equal((text.match(/\*\*New: /g) ?? []).length, 1, "only the real decision");
+  assert.match(text, /\(1\) The video: Record narrated video or Use public screenshots \(2\) App Home: Add welcome message or Leave warning/);
+  assert.match(text, /Where it stands:\*\* Once I have both answers, I'll update the video field/);
+  assert.doesNotMatch(text, /…eady|Decisions I need from you|needs your call|session hit an error|Got it|waiting on you|\bfq_/);
+});
+
+// #366 review P2 (2nd round): "No owner action required" is not a decision.
+test("a negated or completed owner action never becomes a 'Do this yourself' decision", async (t) => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  for (const text of [
+    "The rollout is complete. No owner action required; monitoring continues automatically.",
+    "Owner action: none required, the migration was already completed."
+  ]) {
+    const ctx = buildDecisionContext({ question: { kind: "agent-ask", threadKey: "paseo:s.o", title: "Rollout: needs your call. Answer?", options: [] }, recentMessages: [{ role: "assistant", text }] });
+    assert.doesNotMatch(ctx.decision ?? "", /Do this yourself/, text);
+    assert.equal(ctx.options.length, 0);
+  }
+  // Through the check-in path: nothing is announced.
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  sup.store.upsertQuestion({ dedupeKey: "ask:noaction", kind: "agent-ask", threadKey: "paseo:s.o", title: "Rollout: needs your call. Answer?", options: [],
+    contextSnapshot: { threadTitle: "Rollout", recentMessages: [{ role: "user", text: "Roll out the new cache layer" }, { role: "assistant", text: "The rollout is complete. No owner action required; monitoring continues automatically." }] } });
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  assert.equal(res.posted, false);
+  assert.equal(msgs.length, 0);
+});
+
+// #366 review P2 (2nd round): bulleted status evidence stays in "Where it
+// stands"; only choice lists are left out.
+test("bulleted results stay in where-it-stands; only choice lists are dropped", async () => {
+  const { buildDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.rel", title: "Release v2: approve?", options: ["approve", "hold"] },
+    recentMessages: [{ role: "user", text: "Cut the v2 release" }, { role: "assistant", text: "- Staging smoke test failed with HTTP 500.\nWaiting for your release approval." }]
+  });
+  assert.match(ctx.status, /Staging smoke test failed with HTTP 500\./);
+  const choices = buildDecisionContext({
+    question: { kind: "agent-ask", threadKey: "paseo:s.rel", title: "Region: needs your call. Answer?", options: [] },
+    recentMessages: [{ role: "assistant", text: "- Unit tests passed.\n\nWhich region should production use?\n- us-east\n- eu-west" }]
+  });
+  assert.match(choices.status, /Unit tests passed\./);
+  assert.doesNotMatch(choices.status, /us-east|eu-west/);
+});
+
+test("tradeoffs are said to be missing when the source states none", async () => {
+  const { buildDecisionContext, renderDecisionContext } = await import("../src/fleet/decision-context.js");
+  const ctx = buildDecisionContext({ question: { kind: "agent-ask", threadKey: "paseo:s.t", title: "Pick a vendor?", options: ["vendor a", "vendor b"] }, recentMessages: [{ role: "user", text: "Choose a vendor for the pilot" }, { role: "assistant", text: "Both vendors pass the security review. Pick a vendor?" }] });
+  assert.match(renderDecisionContext(ctx), /Options: Vendor a; Vendor b\. Tradeoffs: not stated by the agent\./);
+});
+
+// #366 review P2 (3rd round): a decision's options are never cut to fit the
+// per-decision budget; the decision is shown whole or deferred, never
+// marked surfaced with a missing choice.
+test("a five-option decision with long tradeoffs keeps every option, or is deferred", async (t) => {
+  const dir = tmp(t);
+  const { msgs, runtime } = chatRuntime();
+  const sup = new FleetSupervisor({ dataDir: dir, runtime, config: { enabled: true, mode: "auto", proactiveSupervisorChat: true }, deps: { now: () => NOW } });
+  const why = "because this changes how every regional cluster is rolled and who gets paged overnight during the change window";
+  const reply = ["DECISION CONTEXT", "Goal: Roll out the new storage engine to every region", "Assigned: Plan and run the rollout", "Verified: Canary in one region is healthy for 48h", "Blocked: The rollout order needs Spencer's call", "Decision: Which rollout plan should we use?", "Options:",
+    ...["Option one all regions at once", "Option two east first", "Option three west first", "Option four canary per region", "Option five final staged weekly"].map((o) => `- ${o} — ${why}`), "Recommendation: Option four canary per region"].join("\n");
+  sup.store.upsertQuestion({ dedupeKey: "ask:rollout", kind: "agent-ask", threadKey: "paseo:s.ro", title: "Storage rollout: which plan?", options: ["Option one all regions at once", "Option two east first", "Option three west first", "Option four canary per region", "Option five final staged weekly"],
+    contextSnapshot: { threadTitle: "Storage rollout", recentMessages: [{ role: "user", text: "Roll out the new storage engine everywhere" }, { role: "assistant", text: reply }], agentSummary: reply } });
+  const res = await sup.maybePostProactiveSupervisorDigest({ started: NOW });
+  if (res.posted) {
+    assert.match(msgs[0].text, /Option five final staged weekly/, "the fifth option is not cut off");
+  } else {
+    assert.equal(res.reason, "decision-too-long");
+    assert.equal(sup.store.diffSurfacedDecisions(sup.store.openQuestions(), { now: NOW }).deltas.length, 1, "deferred, not marked surfaced");
+  }
 });

@@ -58,6 +58,9 @@ export class ChannelManager {
       // Minted by the transport after its auth (owner-authority.js); a body
       // field can never become one.
       principal: options.principal ?? null,
+      // Re-mints the principal when the turn actually starts, after any wait
+      // behind another turn in the session (a queued device message).
+      ...(typeof options.authorize === "function" ? { authorize: options.authorize } : {}),
       // The approval continuation's action id (hosted-interface), never a
       // body field: it lets that one turn drive the lease it was approved for.
       ...(typeof options.continuationOf === "string" ? { continuationOf: options.continuationOf } : {})
