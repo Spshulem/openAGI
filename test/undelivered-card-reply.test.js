@@ -200,3 +200,26 @@ test("every expired reply gets its card back, however many expire at once", asyn
   assert.equal(reopened.length, ids.length, "none lost");
   assert.equal(ctx.calls.length, 0);
 });
+
+// Review fix (#384): identical replies from two cards to the same chat merge
+// into one queued message; only the first card was linked, so if it never
+// landed the second stayed answered with no warning.
+test("identical replies from two cards share one queued message, and both cards come back", async (t) => {
+  const ctx = setup(t);
+  const other = ctx.sup.store.upsertQuestion({ dedupeKey: "ask:sales:2", kind: "agent-ask", threadKey: ctx.thread.key, title: "Sales: also tag the release?", body: "Tag too?", options: ["yes", "no"] });
+  const text = "Yes, go ahead.";
+  for (const q of [ctx.question, other]) {
+    const sent = await ctx.sup.sendOwnerMessage(ctx.thread.key, text, { questionId: q.id, questionAnswer: text });
+    assert.equal(sent.delivery.status, "queued");
+    ctx.sup.store.answerQuestion(q.id, text);
+  }
+  assert.equal(ctx.sup.store.queuedOwnerMessages(ctx.thread.key).length, 1, "one message, not two");
+  ctx.clock.now = NOW + 25 * HOUR;
+  await ctx.sup.drainQueuedOwnerMessages({ byKey: new Map([[ctx.thread.key, ctx.thread]]), started: ctx.clock.now });
+  for (const q of [ctx.question, other]) {
+    const back = ctx.sup.store.question(q.id);
+    assert.equal(back.status, "open", q.title);
+    assert.match(back.deliveryNote, /never sent/);
+  }
+  assert.equal(ctx.calls.length, 0);
+});

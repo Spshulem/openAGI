@@ -20,6 +20,12 @@ const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
 // Pending undelivered-reply recoveries kept: far above the owner-message
 // queue's 100, so none is dropped before its card is put back.
 const UNDELIVERED_REPLIES_MAX = 1000;
+
+// Every card a queued owner message answers (older entries: just questionId).
+export function questionLinksOf(item) {
+  if (Array.isArray(item?.questionLinks) && item.questionLinks.length) return item.questionLinks.filter((l) => l && typeof l.questionId === "string");
+  return item?.questionId ? [{ questionId: item.questionId, questionAnswer: item.questionAnswer ?? null }] : [];
+}
 // A question the supervisor closed and that is asked again this soon was a
 // blip: the same record comes back instead of a new one.
 const REOPEN_MS = 60 * 60 * 1000;
@@ -715,7 +721,7 @@ export class FleetStore {
     if (!item?.questionId) return;
     const list = Array.isArray(this.state.undeliveredOwnerReplies) ? this.state.undeliveredOwnerReplies : [];
     if (list.some((entry) => entry.id === item.id)) return;
-    list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, threadKey: item.threadKey, reason, at: iso(this.now()) });
+    list.push({ id: item.id, questionId: item.questionId, questionAnswer: item.questionAnswer ?? null, questionLinks: questionLinksOf(item), threadKey: item.threadKey, reason, at: iso(this.now()) });
     // Never evict one still waiting: each is a card that would stay closed.
     // Bounded anyway: the queue holds 100 and every entry expires in a day.
     this.state.undeliveredOwnerReplies = list.slice(-UNDELIVERED_REPLIES_MAX);
@@ -1832,10 +1838,17 @@ export class FleetStore {
         || (item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig)
     );
     if (existing) {
-      if (questionId && !existing.questionId) {
-        existing.questionId = String(questionId).slice(0, 80);
-        existing.questionAnswer = clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax);
-        this._save();
+      // The same words to the same chat from another card: one message, but
+      // every card it answers stays linked, so each comes back if it fails.
+      if (questionId) {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const links = questionLinksOf(existing);
+        if (!links.some((l) => l.questionId === link.questionId)) {
+          existing.questionLinks = [...links, link].slice(-20);
+          existing.questionId ??= link.questionId;
+          existing.questionAnswer ??= link.questionAnswer;
+          this._save();
+        }
       }
       if (cleanIdempotencyKey) {
         const keys = [...new Set([existing.idempotencyKey, ...(Array.isArray(existing.idempotencyKeys) ? existing.idempotencyKeys : []), cleanIdempotencyKey].filter(Boolean))];
@@ -1855,7 +1868,10 @@ export class FleetStore {
       ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
       // The owner's card this message answers: if it never reaches the agent,
       // the card is put back instead of staying closed as answered.
-      ...(questionId ? { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) } : {}),
+      ...(questionId ? (() => {
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        return { questionId: link.questionId, questionAnswer: link.questionAnswer, questionLinks: [link] };
+      })() : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
       ...(cleanIdempotencyKey ? { idempotencyKey: cleanIdempotencyKey, idempotencyKeys: [cleanIdempotencyKey] } : {}),
       source: clampText(String(source || "owner-message"), 40),

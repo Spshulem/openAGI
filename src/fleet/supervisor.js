@@ -27,7 +27,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, u
 import { agentAskKey, asksToMergePr, chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel, repeatsLastSend } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { StorageManager } from "./storage.js";
-import { FleetStore } from "./store.js";
+import { FleetStore, questionLinksOf } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
@@ -3026,7 +3026,7 @@ export class FleetSupervisor {
   // answered. Nothing is re-sent: "unconfirmed" may have landed, so the
   // owner checks the chat first; the others reached nothing.
   reopenUndeliveredReply(entry, reason, detail = null) {
-    if (!entry?.questionId) return null;
+    if (!questionLinksOf(entry).length) return null;
     const notes = {
       expired: "Your reply waited 24 h behind the agent's running turn and was never sent. Nothing reached the agent.",
       archived: "The chat was archived before your queued reply was sent. Nothing reached the agent.",
@@ -3034,12 +3034,19 @@ export class FleetSupervisor {
       unconfirmed: "Your queued reply may have reached the agent, but delivery was not confirmed. Check the chat before sending it again."
     };
     const note = notes[reason] ?? notes.failed;
-    const reopened = this.store.reopenUndeliveredReply(entry.questionId, { answer: entry.questionAnswer ?? null, threadKey: entry.threadKey ?? null, note });
-    if (!reopened) return null;
-    this.store.recordAction({ threadKey: entry.threadKey ?? null, playbook: "owner-message", status: "blocked", route: "paseo-queue",
-      detail: clampText(`Reply to card ${entry.questionId} not delivered (${reason}); card reopened. ${note}`, 240) });
+    // One queued message can answer several cards (identical replies merge):
+    // each linked card comes back.
+    const reopened = [];
+    for (const link of questionLinksOf(entry)) {
+      const card = this.store.reopenUndeliveredReply(link.questionId, { answer: link.questionAnswer ?? null, threadKey: entry.threadKey ?? null, note });
+      if (!card) continue;
+      reopened.push(card);
+      this.store.recordAction({ threadKey: entry.threadKey ?? null, playbook: "owner-message", status: "blocked", route: "paseo-queue",
+        detail: clampText(`Reply to card ${link.questionId} not delivered (${reason}); card reopened. ${note}`, 240) });
+    }
+    if (!reopened.length) return null;
     this.emitFleet("card-reply-undelivered");
-    return reopened;
+    return reopened[0];
   }
 
   async drainQueuedOwnerMessages({ byKey = null, started = this.now(), unknownPrefixes = [] } = {}) {
