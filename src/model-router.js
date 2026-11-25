@@ -8,8 +8,8 @@
 // pinned to an exact model.
 //
 // Two knobs:
-//   • Tiers   — name a cheaper model once, reuse it.  e.g. OPENAI_MODEL_NANO=gpt-5-nano
-//   • Tasks   — pin one job to an exact model.        e.g. OPENAI_MODEL_TASK_OBSERVER=gpt-5-mini
+//   • Tiers   — name a cheaper model once, reuse it.  e.g. OPENAI_MODEL_NANO=gpt-6-luna
+//   • Tasks   — pin one job to an exact model.        e.g. OPENAI_MODEL_TASK_OBSERVER=gpt-6-luna
 //
 // Resolution for a task:  task pin  >  task's recommended tier  >  base model.
 //
@@ -20,7 +20,40 @@
 // ignored with a warning (the task falls back to the global effort) so a typo
 // cannot 400 every call for that task.
 
+// Out-of-the-box OpenAI models when the owner has not picked one. The daily
+// model check (model-upgrades.js) suggests newer ones as they ship, so these
+// only matter for fresh installs and unset keys.
+export const DEFAULT_OPENAI_MODEL = "gpt-6.2-sol";
+export const DEFAULT_OPENAI_SMALL_MODEL = "gpt-6-luna";
+export const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
+
 export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
+
+// Which reasoning.effort values a given OpenAI model id accepts. Sending one a
+// model does not accept 400s the request, so a per-chat override has to be
+// checked against the model it will actually reach — not the full list above.
+//   o1/o3/o4 ................. low, medium, high
+//   gpt-5 / -mini / -nano .... minimal, low, medium, high
+//   gpt-5.1 .................. none, low, medium, high   (codex-max: low..xhigh)
+//   gpt-5.2+ and gpt-6+ ...... none, low, medium, high, xhigh
+//   gpt-4*, other non-reasoning ids: none supported ([])
+// Unrecognized ids get the conservative low/medium/high set every reasoning
+// model accepts, so an unknown model never receives an exotic value.
+const SAFE_EFFORTS = Object.freeze(["low", "medium", "high"]);
+export function reasoningEffortsForModel(model) {
+  const id = String(model ?? "").trim().toLowerCase().replace(/^openai\//, "");
+  if (!id) return [...SAFE_EFFORTS];
+  if (/^o[134](\b|-|$)/.test(id)) return ["low", "medium", "high"];
+  if (/^(gpt-4|gpt-3|chatgpt-4o)/.test(id)) return [];
+  const gpt = id.match(/^gpt-(\d+)(?:\.(\d+))?/);
+  if (!gpt) return [...SAFE_EFFORTS];
+  const major = Number(gpt[1]);
+  const minor = gpt[2] === undefined ? 0 : Number(gpt[2]);
+  if (major < 5) return [];
+  if (major === 5 && minor === 0) return id.includes("chat") ? [] : ["minimal", "low", "medium", "high"];
+  if (major === 5 && minor === 1) return id.includes("codex-max") ? ["low", "medium", "high", "xhigh"] : ["none", "low", "medium", "high"];
+  return ["none", "low", "medium", "high", "xhigh"];
+}
 
 // The "where" — every internal job that calls the model, with a recommended
 // tier and the reason it's safe to shrink. `chat` and `autopilot` intentionally
@@ -201,10 +234,10 @@ export function renderModelPlan(router, { provider } = {}) {
     lines.push("");
     lines.push("Recommended savings — set these to use cheaper models for small jobs:");
     if (router.describe().some((r) => r.tier === "nano" && r.onBase)) {
-      lines.push(`  ${prefix}_MODEL_NANO=${prefix === "OPENAI" ? "gpt-5-nano" : "claude-haiku-4-5"}   # observer, scrutiny judges`);
+      lines.push(`  ${prefix}_MODEL_NANO=${prefix === "OPENAI" ? DEFAULT_OPENAI_SMALL_MODEL : "claude-haiku-4-5"}   # observer, scrutiny judges`);
     }
     if (router.describe().some((r) => r.tier === "mini" && r.onBase)) {
-      lines.push(`  ${prefix}_MODEL_MINI=${prefix === "OPENAI" ? "gpt-5-mini" : "claude-haiku-4-5"}   # condensing, mining, daily recap`);
+      lines.push(`  ${prefix}_MODEL_MINI=${prefix === "OPENAI" ? DEFAULT_OPENAI_SMALL_MODEL : "claude-haiku-4-5"}   # condensing, mining, daily recap`);
     }
   }
   return lines.join("\n");

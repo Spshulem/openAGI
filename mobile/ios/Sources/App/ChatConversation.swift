@@ -165,6 +165,9 @@ final class ChatConversation {
         case .interrupt(let requestID):
             let outcome = await client.interruptTurn(thread: thread, requestId: requestID, conversationId: conversationID)
             queue.applyInterrupt(id, outcome: outcome)
+            // A detached turn that just stopped: learn it now, so the
+            // correction goes at once instead of at the next poll.
+            if hasDetachedTurn { await refresh() }
             drainIfIdle()
         }
     }
@@ -183,8 +186,13 @@ final class ChatConversation {
 
     // Starts sending the queue when nothing is running: after an edit
     // closes, a removal, or a retry ends.
+    // A reply whose stream was lost while main kept working (detached): main
+    // still runs it. Messages wait here, not behind it on main, so Send Now
+    // can still put a correction ahead of them; they go when it has ended.
+    var hasDetachedTurn: Bool { messages.contains { $0.role == .assistant && $0.isDetached } }
+
     private func drainIfIdle() {
-        guard !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit else { return }
+        guard !isSending, !forgotten, !isReadOnly, !queue.isEmpty, !queue.isWaitingOnEdit, !hasDetachedTurn else { return }
         isSending = true
         Task {
             defer { isSending = false }
@@ -193,7 +201,7 @@ final class ChatConversation {
     }
 
     private func drainQueue() async {
-        while !forgotten, let next = queue.takeNext() {
+        while !forgotten, !hasDetachedTurn, let next = queue.takeNext() {
             appendTurn(text: next.text, attachments: next.attachments, requestID: next.requestID)
             await streamReply(text: next.text, attachments: next.attachments, replyID: messages[messages.count - 1].id,
                               focusedCardID: next.payload.focusedCardID)
@@ -209,7 +217,7 @@ final class ChatConversation {
         let attachments = draftAttachments
         // Busy, or messages are still waiting (one is being edited): this one
         // goes after them, never ahead.
-        if isSending || !queue.isEmpty {
+        if isSending || !queue.isEmpty || hasDetachedTurn {
             guard !forgotten else { return false }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             let effective = trimmed.isEmpty ? "Please describe the attached images." : trimmed
@@ -525,6 +533,9 @@ final class ChatConversation {
                 messages = merged
                 persist()
             }
+            // A detached turn main has now finished (or stopped): what waited
+            // here for it goes now.
+            drainIfIdle()
             if !didLoadOlder || !overlaps {
                 // Start at the returned page, not the oldest cached line:
                 // time spent offline can leave an unloaded gap in between.

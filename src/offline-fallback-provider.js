@@ -28,6 +28,13 @@ export class OfflineFallbackProvider {
   get model() { return this.primary.model; }
   get name() { return this.primary.constructor?.name ?? "provider"; }
   isConfigured() { return this.primary.isConfigured?.() ?? true; }
+  resolveModel(args) { return this.primary.resolveModel?.(args) ?? this.primary.model; }
+  // Effort reaches the cloud model only; the on-device fallback ignores it.
+  reasoningEffortSupport(args) {
+    return typeof this.primary.reasoningEffortSupport === "function"
+      ? this.primary.reasoningEffortSupport(args)
+      : { supported: false, reason: `The active model provider (${this.name}) does not expose a per-request reasoning-effort setting.` };
+  }
 
   async generate(args = {}) {
     let invokedTool = false;

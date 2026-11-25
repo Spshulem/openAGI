@@ -237,7 +237,10 @@ const failureAt = "2026-01-01T00:10:00Z";
 const laterAt = "2026-01-01T00:20:00Z";
 const errorEntry = (message = capacityError) => ({ timestamp: failureAt, item: { type: "error", message } });
 
-test("Paseo system errors reach the existing model-limit question through fresh and cached discovery", async () => {
+// Capacity is transient (2026-11-24: 18 of 27 scheduled turns on one model
+// got it and the other 9 succeeded), so it backs off and resumes, bounded,
+// instead of asking the owner to switch models.
+test("Paseo capacity errors back off and resume through fresh and cached discovery", async () => {
   const a = agent("failed", { status: "error", model: "test-model", updatedAt: failureAt });
   const entries = [
     { timestamp: "2026-01-01T00:09:00Z", item: { type: "assistant_message", text: "I will finish the verification." } },
@@ -252,17 +255,21 @@ test("Paseo system errors reach the existing model-limit question through fresh 
   const source = createPaseoSource(m);
   for (let scan = 0; scan < 2; scan++) {
     const [row] = await source(config);
-    assert.equal(row.error?.kind, "model-limit");
+    assert.equal(row.error?.kind, "overloaded");
     assert.equal(row.error.text, capacityError);
     assert.equal(row.meta.model, "test-model");
     const classified = classifyThread(row);
     assert.equal(classified.state, "infra-blocked");
     assert.equal(threadHealth(classified.state, row.error), "red");
+    // Inside the first backoff step it waits, 5 minutes after the failure.
+    const early = decideThread(classified, row, { mode: "auto", now: Date.parse(failureAt) + 2 * 60_000 });
+    assert.equal(early.action, "wait");
+    assert.equal(early.notBefore, new Date(Date.parse(failureAt) + 5 * 60_000).toISOString());
+    assert.equal(early.question ?? null, null);
+    // After it, the bounded resume playbook takes over; no switch-model ask.
     const decision = decideThread(classified, row, { mode: "auto", now: Date.parse(laterAt) });
-    assert.equal(decision.action, "ask-user");
-    assert.equal(decision.message, null);
-    assert.match(decision.question.title, /test-model capped\. Switch model\?/);
-    assert.deepEqual(decision.question.options, ["switched", "wait"]);
+    assert.equal(decision.playbook, "resume");
+    assert.equal(decision.question ?? null, null);
     assert.deepEqual(row.meta.conversation.map(m => m.text), ["I will finish the verification."]);
     assert.equal(JSON.stringify(row).includes("private tool output"), false);
   }
@@ -271,7 +278,7 @@ test("Paseo system errors reach the existing model-limit question through fresh 
 
 test("Paseo snapshot errors survive a bounded history without an error event", () => {
   const row = paseoThread(agent("failed", { status: "error", lastError: capacityError, updatedAt: failureAt }), "host");
-  assert.equal(row.error?.kind, "model-limit");
+  assert.equal(row.error?.kind, "overloaded");
   const unknown = paseoThread(agent("failed", { status: "error", lastError: "Provider failed unexpectedly" }), "host");
   assert.equal(unknown.error?.kind, "other");
   assert.equal(threadHealth(classifyThread(unknown).state, unknown.error), "red");
@@ -281,7 +288,7 @@ test("Paseo snapshot errors survive a bounded history without an error event", (
 
 test("Paseo idle failures remain detectable and a newer failure replaces the older one", () => {
   const row = paseoThread(agent("a"), "host", [errorEntry()]);
-  assert.equal(row.error?.kind, "model-limit");
+  assert.equal(row.error?.kind, "overloaded");
   const newer = paseoThread(agent("a"), "host", [errorEntry(), errorEntry("Connection failed")]);
   assert.equal(newer.error?.kind, "network");
 });
@@ -321,7 +328,7 @@ test("Paseo failure details are bounded and redacted without replacing the assis
   const row = paseoThread(agent("a"), "host", [
     { item: { type: "assistant_message", text: "Work in progress." } }, errorEntry(message)
   ]);
-  assert.equal(row.error?.kind, "model-limit");
+  assert.equal(row.error?.kind, "overloaded");
   assert.equal(row.error.text.includes(secret), false);
   assert.match(row.error.text, /\[redacted\]/);
   assert.ok(row.error.text.length <= 1000);
@@ -458,4 +465,29 @@ test("Paseo extracts asyncQuestions cards, case-insensitive migration sources, g
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
+});
+
+// Review fix (#373): Paseo can post "[System Error] Selected model is at
+// capacity…" and leave the session "running" with no active turn. Capacity
+// is now overloaded, not a hard kind, so the stuck status must still read as
+// failed for the backoff to run; a real active turn still reads as running.
+test("a stuck running session with a transient system error reads as failed", () => {
+  const stuck = paseoThread(agent("a", { status: "running" }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: `[System Error] ${capacityError}` } }
+  ]);
+  assert.equal(stuck.error?.kind, "overloaded");
+  assert.equal(stuck.agentStatus, "error");
+  const classified = classifyThread(stuck);
+  assert.equal(classified.state, "infra-blocked");
+  assert.equal(classified.infraKind, "overloaded");
+  const network = paseoThread(agent("b", { status: "running" }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: "[System Error] stream disconnected before completion" } }
+  ]);
+  assert.equal(network.error?.kind, "network");
+  assert.equal(network.agentStatus, "error");
+  const working = paseoThread(agent("c", { status: "running", activeTurn: { startedAt: laterAt } }), "host", [
+    { timestamp: failureAt, item: { type: "assistant_message", text: `[System Error] ${capacityError}` } }
+  ]);
+  assert.equal(working.error, null);
+  assert.equal(working.agentStatus, "running");
 });
