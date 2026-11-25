@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isProactiveSupervisorMessage } from "./fleet/proactive-gate.js";
 
 export const MAX_MESSAGE_IMAGES = 4;
 export const MAX_IMAGE_BYTES = 1024 * 1024;
@@ -56,8 +57,32 @@ export function imageContent(text, images = [], format = "openai") {
 export function imageHistory(messages, input, images) {
   // AgentHost's history already includes this user turn. Attach its pixels
   // to the current anchor exactly once, including on every tool-loop hop.
-  const last = messages.at(-1);
-  return (images.length && last?.role === "user" && last.content === input ? messages.slice(0, -1) : messages).slice(-12);
+  const list = Array.isArray(messages) ? messages : [];
+  const last = list.at(-1);
+  const base = images.length && last?.role === "user" && last.content === input ? list.slice(0, -1) : list;
+  // Isolate proactive Supervisor check-ins / post-send verification blasts so
+  // they can never evict the owner's real conversational history out of the
+  // 12-message window: retain up to 12 real conversational turns plus at most
+  // the 2 most recent proactive messages in chronological order.
+  const keptIndices = new Set();
+  let conversationalKept = 0;
+  let proactiveKept = 0;
+  for (let i = base.length - 1; i >= 0; i -= 1) {
+    const msg = base[i];
+    if (isProactiveSupervisorMessage(msg)) {
+      if (proactiveKept < 2 && conversationalKept <= 6) {
+        keptIndices.add(i);
+        proactiveKept += 1;
+      }
+      continue;
+    }
+    if (conversationalKept < 12) {
+      keptIndices.add(i);
+      conversationalKept += 1;
+    }
+    if (conversationalKept >= 12 && proactiveKept >= 2) break;
+  }
+  return base.filter((_, idx) => keptIndices.has(idx));
 }
 
 export function imageHistoryPreview(images) {

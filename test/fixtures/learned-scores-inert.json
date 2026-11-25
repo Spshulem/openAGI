@@ -1849,6 +1849,12 @@
       "task": "linear-task-sync"
     },
     {
+      "id": "model-upgrade-check",
+      "name": "Daily check for newer models (suggests, never switches)",
+      "enabled": true,
+      "task": "model-upgrade-check"
+    },
+    {
       "id": "nightly-pattern-mine",
       "name": "Nightly deep activity workflow miner",
       "enabled": true,

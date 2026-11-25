@@ -38,21 +38,24 @@ export class HandoffQueue {
   // A newer approved handoff to the same chat replaces one still waiting
   // there: the owner approved again, and the latest instruction wins, so
   // the chat never receives both.
-  enqueue({ key, threadKey, serverId = null, message, images = null, reason }) {
+  enqueue({ key, threadKey, serverId = null, message, images = null, reason, createdAt = null, supersedeExisting = true }) {
     const existing = this.get(key);
     if (existing) return { entry: existing, created: false };
     const at = new Date(this.now()).toISOString();
-    for (const entry of this.entries) {
-      if (entry.status === "waiting" && entry.threadKey === threadKey) {
-        entry.status = "superseded";
-        entry.updatedAt = at;
-        entry.detail = `replaced by a newer approved handoff (${key})`;
+    const created = typeof createdAt === "string" && createdAt ? createdAt : at;
+    if (supersedeExisting) {
+      for (const entry of this.entries) {
+        if (entry.status === "waiting" && entry.threadKey === threadKey) {
+          entry.status = "superseded";
+          entry.updatedAt = at;
+          entry.detail = `replaced by a newer approved handoff (${key})`;
+        }
       }
     }
     const entry = {
       key, threadKey, serverId, message,
       ...(Array.isArray(images) && images.length ? { images } : {}),
-      status: "waiting", createdAt: at, updatedAt: at, attempts: 0, nextTryAt: at,
+      status: "waiting", createdAt: created, updatedAt: at, attempts: 0, nextTryAt: at,
       detail: reason
     };
     this.entries.push(entry);
@@ -60,16 +63,17 @@ export class HandoffQueue {
     return { entry, created: true };
   }
 
-  // A newer approved send to this chat was processed (whatever its
-  // outcome): earlier waiting handoffs there are obsolete and never sent.
-  supersedeWaiting(threadKey, exceptKey) {
+  // A newer owner send to this chat was processed (whatever its
+  // outcome, keyed or unkeyed): earlier waiting handoffs there are obsolete
+  // and never sent.
+  supersedeWaiting(threadKey, exceptKey = null) {
     const at = new Date(this.now()).toISOString();
     let changed = 0;
     for (const entry of this.entries) {
-      if (entry.status === "waiting" && entry.threadKey === threadKey && entry.key !== exceptKey) {
+      if (entry.status === "waiting" && entry.threadKey === threadKey && (!exceptKey || entry.key !== exceptKey)) {
         entry.status = "superseded";
         entry.updatedAt = at;
-        entry.detail = `replaced by a newer approved send (${exceptKey})`;
+        entry.detail = exceptKey ? `replaced by a newer approved send (${exceptKey})` : "replaced by a newer owner send";
         delete entry.images;
         changed += 1;
       }

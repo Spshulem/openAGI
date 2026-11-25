@@ -521,6 +521,12 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(executedExisting.status, "routed_existing");
   assert.equal(sentToExisting.length, 1);
   assert.equal(sentToExisting[0].thread.key, "paseo:mac-laptop.seo-sleep-1");
+  const persistedExisting = supervisor.getActiveWork({ project: "AI-SEO" }).items
+    .find((item) => item.goal.includes("Steve strictly citation"));
+  assert.ok(persistedExisting, "dispatch persists one Work outcome before sending");
+  assert.equal(persistedExisting.originalAsk, persistedExisting.goal);
+  assert.equal(persistedExisting.owner.threadKey, "paseo:mac-laptop.seo-sleep-1");
+  assert.equal(persistedExisting.workflowStage, "implementing");
 
   // 4. Manager Goal Dispatch when NO existing chat matches (or in a 0-agent project): spawns a fresh Paseo session!
   const startedNew = await supervisor.dispatchGoal({
@@ -532,6 +538,10 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(createdAgents.length, 1);
   assert.equal(createdAgents[0].serverId, "mac-laptop");
   assert.equal(createdAgents[0].cwd, "/Users/dev/Dev/new-service");
+  const persistedNew = supervisor.getActiveWork({ project: "new-service" }).items
+    .find((item) => item.goal.includes("Stripe webhook"));
+  assert.ok(persistedNew, "new-session dispatch persists Work before starting Paseo");
+  assert.equal(persistedNew.workflowStage, "implementing");
 
   // 5. Verify HTTP routes, mobile allowlist, RemoteFleetSupervisor proxy, and fleet tools!
   assert.equal(isMobileRouteAllowed("GET", "/fleet/api/hierarchy"), true);

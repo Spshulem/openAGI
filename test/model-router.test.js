@@ -66,7 +66,7 @@ test("renderModelPlan shows configured tiers + savings recommendations", () => {
   assert.match(out, /Base model: gpt-5/);
   assert.match(out, /nano=gpt-5-nano/);
   // mini is still unset → recommend it
-  assert.match(out, /OPENAI_MODEL_MINI=gpt-5-mini/);
+  assert.match(out, /OPENAI_MODEL_MINI=gpt-6-luna/);
 });
 
 test("OPENAGI_MODEL_DENY: a denied model never reaches a call, whatever asks for it", async () => {

@@ -17,7 +17,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -49,6 +49,10 @@ export function createFleetCapability(supervisor) {
       if (payload.path === '/fleet/api/hierarchy') {
         if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.includeArchived !== undefined) url.searchParams.set('includeArchived', String(Boolean(payload.body.includeArchived)));
+        if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
+      }
+      if (payload.path === '/fleet/api/ask-supervisor') {
+        if (typeof payload.body?.project === 'string') url.searchParams.set('project', payload.body.project);
         if (payload.body?.limit !== undefined) url.searchParams.set('limit', String(payload.body.limit));
       }
       if (payload.path === '/fleet/api/active-work' && payload.method === 'GET') {
@@ -118,6 +122,7 @@ function fromReceipt(receipt, attempts, detail) {
   const confirmed = receipt.status === 'sent' && !unconfirmed;
   return { ...(confirmed ? { reconciledAfterTimeout: true } : {}),
     delivery: { status: receipt.status, ...(unconfirmed ? { unconfirmed: true } : {}), route: receipt.route ?? null, detail,
+      ...(receipt.handoffKey ? { handoffKey: receipt.handoffKey } : {}),
       actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true,
       verifiedAt: unconfirmed ? null : (receipt.finishedAt ?? receipt.at ?? null), attempts } };
 }
@@ -340,8 +345,44 @@ export class RemoteFleetSupervisor {
   // known: receipt ids that already existed when this request started. They
   // belong to earlier sends (the same short text can be sent twice on
   // purpose) and never count as this one's.
-  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null) {
+  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null, idempotencyKey = null) {
     try { await this.refresh(); } catch { /* still unreachable: judge on what is here */ }
+    // When an approval key was sent, reconcile against its persisted handoff
+    // outcome first: a held offline handoff sits in `handoffs` even when the
+    // executor's preliminary attempt journaled a `blocked` host-unavailable row.
+    if (idempotencyKey) {
+      const handoffs = Array.isArray(this.state.handoffs) ? this.state.handoffs : [];
+      const handoff = handoffs.find((entry) => entry?.key === idempotencyKey) ?? null;
+      if (handoff) {
+        if (handoff.status === 'waiting') {
+          return {
+            status: 'queued',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            detail: `${handoff.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.`,
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'delivered') {
+          return {
+            status: 'sent',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            id: handoff.deliveredActionId ?? null,
+            detail: handoff.detail ?? `already delivered for this approval at ${handoff.deliveredAt ?? handoff.updatedAt}; not sent again`,
+            at: handoff.deliveredAt ?? handoff.updatedAt ?? null
+          };
+        }
+        return {
+          status: 'blocked',
+          route: 'paseo-send',
+          handoffKey: handoff.key,
+          ...(handoff.status === 'unconfirmed' ? { unconfirmed: true } : {}),
+          detail: `approved handoff ${handoff.status}: ${handoff.detail}`,
+          at: handoff.updatedAt ?? null
+        };
+      }
+    }
     // The executor journals the prefixed text it sent (flattened for
     // computer-use): either form of this exact message counts.
     const hashes = ownerMessageHashes(message, images);
@@ -424,12 +465,12 @@ export class RemoteFleetSupervisor {
   // all; one it received but did not answer may have gone out, so its own
   // receipt decides, and with none it is reported unconfirmed, never sent
   // and never sent twice. Every attempt is in the result.
-  async sendOwnerMessage(threadKey, message, { queue = false, images = null, idempotencyKey = null } = {}) {
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null, idempotencyKey = null } = {}) {
     const hasImages = Array.isArray(images) && images.length > 0;
     // The approval's key travels with every attempt: the fleet computer
     // never carries out the same approval twice, and holds it while the
     // chat's host is offline.
-    const body = { threadKey, message, ...(queue === true ? { queue: true } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
+    const body = { threadKey, message, ...(typeof queue === 'boolean' ? { queue } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
     const startedAt = Date.now();
     const known = new Set((Array.isArray(this.state.actions) ? this.state.actions : []).map((action) => action?.id).filter(Boolean));
     const attempts = [];
@@ -442,8 +483,8 @@ export class RemoteFleetSupervisor {
       } catch (error) {
         attempts.push(attemptSummary(attempt, error));
         if (error.uncertain) {
-          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 160)} (the fleet computer's receipt; its reply to this request was lost)`);
+          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 220)} (the fleet computer's receipt; its reply to this request was lost)`);
           return { delivery: { status: 'unknown', unconfirmed: true, route: null,
             detail: 'the fleet computer took the message but did not answer in time and has no receipt for it yet; not sent again so it cannot arrive twice. Check fleet_thread receipts before resending.',
             attempts } };
@@ -460,10 +501,10 @@ export class RemoteFleetSupervisor {
         // It never reached the computer, so nothing went out; but if an
         // earlier reply was lost, its receipt says so before sending again.
         await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
-        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images);
-        // A send that may have landed is not sent again either.
-        if (receipt && (receipt.status === 'sent' || receipt.unconfirmed === true)) {
-          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 200));
+        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+        // A send that may have landed (or was persisted as a held handoff) is not sent again either.
+        if (receipt && (receipt.status === 'sent' || receipt.status === 'queued' || receipt.unconfirmed === true)) {
+          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 220));
         }
       }
     }
@@ -616,6 +657,7 @@ export class RemoteFleetSupervisor {
   async updatePreferences(input = {}) { return (await this.request('POST', '/fleet/api/preferences', input)).preferences; }
   async listWorkspaces(input = {}) { return this.request('GET', '/fleet/api/workspaces', input); }
   async getHierarchy(input = {}) { return this.request('GET', '/fleet/api/hierarchy', input); }
+  async getSupervisorWork(input = {}) { return this.request('GET', '/fleet/api/ask-supervisor', input); }
   async getOrganization() { return (await this.request('GET', '/fleet/api/projects')).organization; }
   async upsertProject(input = {}) { return this.request('POST', '/fleet/api/projects', input); }
   async deleteProject(projectId) { return this.request('DELETE', `/fleet/api/projects/${encodeURIComponent(projectId)}`); }
@@ -684,6 +726,7 @@ export class RemoteFleetSupervisor {
     return rest;
   }
   async scanActiveWork(input = {}) { return (await this.request('POST', '/fleet/api/active-work/scan', input)).pass ?? null; }
+  async scheduleActiveWorkRecheck(id, input = {}) { return this.actActiveWork(id, { ...input, op: 'schedule_recheck' }); }
   async actActiveWork(id, input = {}) {
     try {
       return (await this.request('POST', `/fleet/api/active-work/${encodeURIComponent(id)}/act`, input)).result ?? null;
@@ -1047,6 +1090,7 @@ export class RemoteFleetSupervisor {
 
   mirrorActiveWork(activeWork) {
     const outreach = this.runtime?.outreach;
+    this.mirrorRecheckNotifications(activeWork?.recheckNotifications);
     if (!activeWork || !Array.isArray(activeWork.prompts)) return;
     const prompts = activeWork.prompts.filter((prompt) => prompt?.id && prompt?.mark);
     this.activeWorkSignature = JSON.stringify(prompts.map((prompt) => [prompt.id, prompt.mark]).sort());
@@ -1089,6 +1133,32 @@ export class RemoteFleetSupervisor {
         });
       }
       if (item?.id) outreach.update?.(item.id, { ...shown, sourceRef });
+    }
+  }
+
+  // A recheck's result is a one-time notice, not a live prompt: post each
+  // once, and never again once the owner has seen or dismissed it.
+  mirrorRecheckNotifications(notifications) {
+    const outreach = this.runtime?.outreach;
+    if (!outreach || !Array.isArray(notifications)) return;
+    const posted = new Set(outreach.list()
+      .filter((item) => item.sourceRef?.kind === 'active-work-recheck' && item.sourceRef.nodeId === this.nodeId)
+      .map((item) => String(item.sourceRef.id)));
+    for (const notice of notifications) {
+      if (!notice?.id || !notice.title || posted.has(String(notice.id))) continue;
+      // The coding node folded it into the item's open follow-through prompt,
+      // which mirrorActiveWork already carries here: a second entry would
+      // notify the owner twice about one blocker.
+      if (notice.reusedPrompt === true) continue;
+      outreach.append({
+        type: 'fleet-active-work-recheck',
+        sourceRef: { kind: 'active-work-recheck', id: notice.id, itemId: notice.itemId ?? null, nodeId: this.nodeId },
+        title: notice.title,
+        summary: notice.summary ?? '',
+        actions: ['dismiss'],
+        needsDecision: false
+      });
+      posted.add(String(notice.id));
     }
   }
 }

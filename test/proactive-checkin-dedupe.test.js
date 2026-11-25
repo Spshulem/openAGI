@@ -269,7 +269,8 @@ test("proactive Supervisor check-ins: silent on unchanged blockers, count/reorde
 
     chatMsgs = runtime.getSupervisorMessages();
     assert.equal(chatMsgs.length, 2, "genuinely new blocker emits exactly 1 delta message");
-    assert.match(chatMsgs[1].content, /one new decision needs you/i);
+    assert.match(chatMsgs[1].content, /one decision needs you/i);
+    assert.match(chatMsgs[1].content, /\*\*New: /);
     assert.doesNotMatch(chatMsgs[1].content, /\bfq_[0-9a-z]+/i, "check-ins never show internal question ids");
     assert.match(chatMsgs[1].content, /xcodebuild -license accept|bb-recorder/i);
     assert.doesNotMatch(chatMsgs[1].content, /10344/, "old unanswered blockerA is NOT re-listed");

@@ -166,4 +166,46 @@ final class DictationTranscriptTests: XCTestCase {
         XCTAssertFalse(DictationTranscript.startsNewUtterance(previousEnd: 1.4, segments: [(2.6, 2.8)],
                                                              live: "I need milk", text: "I need milk and eggs."))
     }
+
+    // A long silence: the waiting request fails ("no speech"). What it heard
+    // stays, and the next request's speech is appended.
+    func testAFailedRequestKeepsWhatItHeard() {
+        var t = DictationTranscript(base: "")
+        _ = t.receive("Before.", isFinal: true)
+        _ = t.receive("Half a", isFinal: false)
+        XCTAssertEqual(t.endSegment(), "Before. Half a")
+        XCTAssertEqual(t.receive("Still here.", isFinal: false), "Before. Half a Still here.")
+        XCTAssertEqual(t.endSegment(), "Before. Half a Still here.")
+        XCTAssertEqual(t.endSegment(), "Before. Half a Still here.", "an empty segment adds nothing")
+    }
+
+    // Review fix (#343): words an utterance-end marker kept in the failed
+    // request are not stripped from the replacement request's fresh results.
+    func testAReplacementRequestKeepsWordsThatRepeatTheFailedRequest() {
+        var t = DictationTranscript(base: "")
+        XCTAssertEqual(t.receive("No.", isFinal: false, endsUtterance: true), "No.")
+        XCTAssertEqual(t.endSegment(), "No.")
+        XCTAssertEqual(t.receive("No.", isFinal: false), "No. No.")
+    }
+
+    func testOnlyAStoppedMicrophoneOrRepeatedImmediateFailuresEndDictation() {
+        let silence = ChatDictation.failureEndsDictation(listenedFor: 8, quickFailures: 2, microphoneRunning: true)
+        XCTAssertFalse(silence.ends, "a failure after a long silence keeps listening")
+        XCTAssertEqual(silence.quickFailures, 0, "and clears earlier immediate failures")
+        var count = 0
+        for attempt in 1...ChatDictation.quickFailureLimit {
+            let decision = ChatDictation.failureEndsDictation(listenedFor: 0.2, quickFailures: count, microphoneRunning: true)
+            count = decision.quickFailures
+            XCTAssertEqual(decision.ends, attempt == ChatDictation.quickFailureLimit, "attempt \(attempt)")
+        }
+        XCTAssertTrue(ChatDictation.failureEndsDictation(listenedFor: 8, quickFailures: 0, microphoneRunning: false).ends,
+                      "a stopped microphone ends dictation")
+    }
+
+
+
+    func testImmediateFailuresWaitLongerBeforeTheNextTry() {
+        XCTAssertEqual(ChatDictation.retryDelay(afterQuickFailures: 1), 250)
+        XCTAssertEqual(ChatDictation.retryDelay(afterQuickFailures: 2), 500)
+    }
 }

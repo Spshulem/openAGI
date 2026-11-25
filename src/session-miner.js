@@ -73,6 +73,9 @@ export class SessionMiner {
       const full = store.getSession(sess.id) ?? sess;
       for (const msg of full.messages ?? []) {
         if (msg.role !== "user" || typeof msg.content !== "string") continue;
+        // A no-capture turn (e.g. a Pebble ring recording) is never mined into
+        // a durable skill suggestion.
+        if (msg.metadata?.noCapture === true) continue;
         const text = msg.content.trim();
         if (text.length < 8 || text.length > 1500) continue;
         userMessages.push({ sessionId: sess.id, text, at: msg.at ?? full.updatedAt });

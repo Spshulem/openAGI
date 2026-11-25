@@ -179,13 +179,25 @@ export const INTENT_FAMILIES = Object.freeze({
     ].join("|"),
     tools: ["create_skill", "update_skill", "read_skill"]
   },
-  // Persistent goals & provider failover: "track this goal", "switch that chat to Claude/Antigravity".
+  // Persistent goals, preferences & provider failover: "track this goal",
+  // "switch that chat to Claude/Antigravity", "stop spamming status updates".
   goals: {
     pattern: [
-      String.raw`(?:track|set|add|create|update|manage|verify|continue)\b[^.!?\n]{0,90}?\b(?:goals?|outcomes?|active\s+work|definition\s+of\s+done|cadence)\b`,
-      String.raw`(?:switch|move|fail\s*over|rotate|change)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|model)\b`
+      String.raw`(?:track|set|add|create|update|manage|verify|continue|take\s+off|remove|drop|mark|close|snooze|pause|unpause|mute|unmute|stop)\b[^.!?\n]{0,90}?\b(?:goals?|outcomes?|active\s+work|definition\s+of\s+done|cadence|project\s+list|status\s+updates?|check[- ]?ins?|notifications?|preferences?|format)\b`,
+      String.raw`(?:switch|move|fail\s*over|rotate|change|set|update)\b[^.!?\n]{0,90}?\b(?:provider|claude|antigravity|codex|openai|gpt|opus|sonnet|model)\b`
     ].join("|"),
-    tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider"]
+    tools: ["upsert_goal", "verify_goal_progress", "fleet_track_work", "fleet_act_active_work", "fleet_switch_provider", "fleet_preferences", "set_provider"]
+  },
+  // This chat's own thinking depth or model: "set your reasoning effort to extra high",
+  // "think harder", "reset your effort", "switch your model to gpt-6.2-sol".
+  effort: {
+    pattern: [
+      String.raw`(?:set|change|switch|raise|increase|bump|turn\s+up|lower|decrease|reduce|turn\s+down|drop|put|reset|clear|use)\b[^.!?\n]{0,60}?\b(?:reasoning|thinking)(?:\s+(?:effort|level|depth|mode))?\b`,
+      String.raw`(?:set|change|switch|raise|increase|bump|lower|decrease|reduce|reset|clear)\b[^.!?\n]{0,40}?\beffort\b`,
+      String.raw`(?:set|change|switch|update)\b[^.!?\n]{0,60}?\b(?:your|my|the)?\s*(?:model|provider)\b`,
+      String.raw`think\s+(?:harder|more|deeper|less|lighter)\b`
+    ].join("|"),
+    tools: ["chat_reasoning_effort", "set_provider"]
   }
 });
 
@@ -209,7 +221,8 @@ const SUPERVISOR_DIRECTIVE_RE = new RegExp(
   `${LEAD}(?:` + [
     String.raw`(?:ask|tell|have|get|make|let)\s+(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who)\b)\S`,
     String.raw`(?:send|attach|forward|pass(?:\s+along)?|route|ping|nudge|message|reply|respond|answer)\b(?!\s+(?:me|us)\b)`,
-    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto|retry|try\s+again)\b`,
+    String.raw`(?:run|execute|diagnose|co+rdinate|cordinate|sync|orchestrate|work\s+on|fix|repair|patch|build|implement|debug|refactor|rebase|ship|merge|deploy|start|create|spin\s+up|launch|kick\s+off|approve|allow|confirm|defer|dismiss|skip|veto|retry|try\s+again|stop|mute|unmute|pause|unpause|snooze|remove|drop|take\s+[\w\s-]{1,40}?\s+off|mark\s+[\w\s-]{1,40}?\s+(?:done|complete|finished)|change|update|set|switch|make\s+sure|follow\s+up|push\s+[\w\s-]{1,40}?\s+(?:through|forward))\b`,
+    String.raw`(?:i\s+thought\s+i\s+(?:told|asked)\s+you|i\s+already\s+(?:told|asked)\s+you|didn['’]?t\s+i\s+(?:tell|ask)\s+you|i['’]?m\s+still\s+waiting\s+(?:for|on)|still\s+waiting\s+(?:for|on)|we\s+can\s+(?:take|remove|drop|close|mark|skip|stop))\b`,
     String.raw`(?:kick|spin|fire)\s+[^.!?\n]{1,40}?\b(?:off|up)\b`,
     String.raw`(?:(?:yes|yeah|yep|yup|sure|ok|okay)\b[,!.\s]+)?(?:gpt|claude|sonnet|opus|haiku|codex|gemini|o[134]\b|sol\b|model\b|(?:low|medium|high|max)\s+effort\b)(?:[^.!?\n]|\.(?=\d)){0,80}?\bin\s+paseo\b`,
     String.raw`(?:go\s+ahead|go\s+for\s+it|do\s+(?:it|that)|sounds\s+(?:good|fine)|looks\s+(?:good|fine)|fine\s+(?:with|by)\s+me|works\s+for\s+me|lgtm)\b`

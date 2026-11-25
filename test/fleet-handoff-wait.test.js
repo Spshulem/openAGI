@@ -404,3 +404,198 @@ test("restart recovery ignores an older Paseo receipt with the same text", async
   assert.equal(f.supervisor.handoffs.get("act_95").status, "delivered");
   assert.equal(sends(f.delivered).length, 2, "it was actually sent, not settled by the old receipt");
 });
+
+// Review fix (#361, Codex P1): an explicit owner send without an approval key
+// (such as fleet page replyTarget) supersedes waiting handoffs on that chat.
+test("unkeyed owner send supersedes earlier waiting handoffs", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "A: old instruction.", { idempotencyKey: "act_A" });
+  assert.equal(f.supervisor.handoffs.get("act_A").status, "waiting");
+  f.host.up = true;
+  await f.supervisor.sendOwnerMessage(KEY, "B: cancel and stop.");
+  assert.equal(f.supervisor.handoffs.get("act_A").status, "superseded");
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.deepEqual(sends(f.delivered).map((d) => d.message), ["A: old instruction.", "B: cancel and stop."]);
+});
+
+// Review fix (#361, Codex P2): resumed handoffs disable replacement-session
+// recovery so a disconnected runtime blocks rather than cloning a new chat.
+test("resumed handoff passes recoverDisconnected: false and never creates a replacement session", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-no-recover-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const agent = { id: "chat", status: "idle", updatedAt: "2026-01-01T00:00:00Z", cwd: "/w", workspaceId: "w", pendingPermissions: [] };
+  let created = 0;
+  const ref = {
+    refresh: async () => {},
+    current: () => agent,
+    send: async () => { throw new Error("ACP agent disconnected (exit code 1)"); },
+    timeline: { refetch: async () => ({ agent, entries: [] }) }
+  };
+  const factory = () => ({
+    connect: async () => {},
+    close: async () => {},
+    hosts: { list: async () => ({ self: { serverId: "host" }, hosts: [] }) },
+    agents: { ref: () => ref, create: async () => { created += 1; return { id: "clone" }; } }
+  });
+  const result = await deliverPaseo({
+    config: { paseo: { enabled: true, timeoutMs: 2000 } },
+    thread: paseoThread(agent, "host"),
+    text: "Submit release.",
+    store: { dir },
+    actionId: "a1",
+    base: { messageHash: "h", playbook: "owner-message" },
+    factory,
+    recoverDisconnected: true,
+    noPermissionReply: true
+  });
+  assert.equal(result.status, "blocked");
+  assert.equal(created, 0, "no replacement session created for resumed handoff");
+  const receiptFile = path.join(dir, "paseo-deliveries", `${createHash("sha256").update(paseoThread(agent, "host").key).digest("hex")}.json`);
+  const savedReceipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+  assert.equal(savedReceipt.pending, false);
+  assert.equal(savedReceipt.delivered, false);
+  assert.equal(savedReceipt.sendError, true);
+});
+
+// Review fix (#361, Codex P2): require a fresh Paseo scan before resuming
+// waiting handoffs so cached threads cannot hide a newer owner cancellation.
+test("failed Paseo scan defers resuming waiting handoffs", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-scan-fail-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const now = { value: T0 };
+  const host = { up: false, scanFail: false };
+  const delivered = [];
+  const list = [makeThread(KEY)];
+  const executor = {
+    deliver: async (args) => {
+      delivered.push(args.message);
+      if (!host.up) return { status: "blocked", route: args.route, detail: HOST_DOWN, actionId: `fa_${delivered.length}` };
+      return { status: "sent", route: args.route, detail: "sent", actionId: `fa_${delivered.length}` };
+    },
+    inFlight: () => [], whenIdle: async () => {}
+  };
+  const config = resolveFleetConfig({ OPENAGI_FLEET_STORAGE: "0", OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" }, { home: dir, mode: "observe", limits: { ...DEFAULTS }, managerRef: "none" });
+  const supervisor = new FleetSupervisor({
+    dataDir: dir, config, deps: {
+      now: () => now.value, executor,
+      notifier: { notifyQuestion: async () => ({ outreachId: null, pushed: false, skipped: "push-off" }) },
+      listPaseoThreads: async () => { if (host.scanFail) throw new Error("paseo scan offline"); return list; },
+      findPrForBranch: async () => null, fetchPrStates: async () => new Map(), fetchPrStateLite: async () => new Map()
+    }
+  });
+  supervisor._uiDriver = { readiness: async () => ({ ready: false }) };
+  await supervisor.tick({ reason: "test" });
+  await supervisor.sendOwnerMessage(KEY, "Ship it.", { idempotencyKey: "act_scan" });
+  host.up = true;
+  host.scanFail = true;
+  now.value += 2 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.handoffs.get("act_scan").status, "waiting");
+  assert.equal(delivered.length, 1, "did not resume against cached threads after failed Paseo scan");
+});
+
+// Review fix (#361, Codex P2): anchor createdAt before awaiting initial
+// delivery so an owner cancellation written during that await marks it stale.
+test("owner cancellation during initial offline delivery attempt marks handoff stale", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  f.host.onDeliver = async () => {
+    f.now.value += 30_000;
+    // Owner writes cancellation while the initial offline attempt is in flight.
+    f.list[0].lastUserText = "Actually stop, do not submit.";
+    f.list[0].lastUserAt = new Date(f.now.value - 5_000).toISOString();
+    f.now.value += 10_000;
+  };
+  const queued = await f.supervisor.sendOwnerMessage(KEY, "Submit now.", { idempotencyKey: "act_anchor" });
+  assert.equal(queued.delivery.status, "queued");
+  f.host.onDeliver = null;
+  f.host.up = true;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_anchor").status, "stale");
+  assert.equal(sends(f.delivered).length, 1, "stale handoff was not sent after cancellation");
+});
+
+// Review fix (#361, Codex P2): restart recovery requires explicit success
+// evidence and never settles a failed ref.send() receipt as delivered.
+test("restart recovery does not mark a failed Paseo receipt as delivered", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  await f.supervisor.sendOwnerMessage(KEY, "Submit for review.", { idempotencyKey: "act_fail_rec" });
+  const receiptDir = path.join(f.dir, "fleet", "paseo-deliveries");
+  fs.mkdirSync(receiptDir, { recursive: true });
+  const file = path.join(receiptDir, `${createHash("sha256").update(KEY).digest("hex")}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    messageId: "m1",
+    messageHash: shortHash(`${SUPERVISOR_PREFIX} Submit for review.`),
+    pending: false,
+    delivered: false,
+    sendError: true
+  }));
+  f.supervisor.handoffs.update("act_fail_rec", { dispatchingAt: new Date(f.now.value - 1_000).toISOString() });
+  const reconciled = f.supervisor.reconcileHandoffDispatch(f.supervisor.handoffs.get("act_fail_rec"));
+  assert.equal(reconciled, null, "failed sendError receipt is never treated as delivered");
+});
+
+// Review fix (#361, Codex P2): preserve approval ordering across in-flight
+// delivery attempts so an older offline result cannot queue after a newer send.
+test("older offline attempt finishing after a newer concurrent approval does not queue", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  let releaseA;
+  const aWaiting = new Promise((resolve) => { releaseA = resolve; });
+  let aEntered;
+  const aStarted = new Promise((resolve) => { aEntered = resolve; });
+  f.host.onDeliver = async (args) => {
+    if (args.message === "A: first.") {
+      aEntered();
+      await aWaiting;
+    }
+  };
+  const promiseA = f.supervisor.sendOwnerMessage(KEY, "A: first.", { idempotencyKey: "act_order_A" });
+  await aStarted;
+  // Newer approval B arrives while A is still awaiting its offline result.
+  const resB = await f.supervisor.sendOwnerMessage(KEY, "B: cancel.", { idempotencyKey: "act_order_B" });
+  assert.equal(resB.delivery.status, "queued");
+  releaseA();
+  const resA = await promiseA;
+  assert.equal(f.supervisor.handoffs.get("act_order_A").status, "superseded");
+  assert.equal(resA.delivery.status, "blocked");
+  assert.equal(f.supervisor.handoffs.get("act_order_B").status, "waiting");
+  f.host.onDeliver = null;
+  f.host.up = true;
+  f.now.value += 2 * MIN;
+  await f.supervisor.tick({ reason: "test" });
+  assert.equal(f.supervisor.handoffs.get("act_order_B").status, "delivered");
+  assert.equal(f.supervisor.handoffs.get("act_order_A").status, "superseded");
+});
+
+// Review fix (#361, Codex P2): lost remote reply reconciles against the
+// persisted handoff entry by idempotencyKey rather than preliminary blocked row.
+test("RemoteFleetSupervisor reconciles a lost reply against a queued handoff by idempotencyKey", async (t) => {
+  const f = fixture(t);
+  await f.supervisor.tick({ reason: "test" });
+  const capability = createFleetCapability(f.supervisor);
+  let dropSendReply = true;
+  const remote = new RemoteFleetSupervisor({
+    nodeId: "node_fleet",
+    runtime: {
+      nodeCapabilities: {
+        dispatch: async (_nodeId, _cap, op, payload) => {
+          const out = await capability.invoke(op, payload);
+          if (payload.path === "/fleet/api/send" && dropSendReply) {
+            dropSendReply = false;
+            throw Object.assign(new Error("Request timed out"), { nodeAcknowledged: true, timedOut: true });
+          }
+          return out;
+        }
+      }
+    }
+  });
+  const result = await remote.sendOwnerMessage(KEY, "Submit Recorder 0.4.1.", { idempotencyKey: "act_remote_q" });
+  assert.equal(result.delivery.status, "queued");
+  assert.equal(result.delivery.handoffKey, "act_remote_q");
+  assert.equal(f.supervisor.handoffs.get("act_remote_q").status, "waiting");
+});
