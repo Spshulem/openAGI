@@ -434,3 +434,33 @@ test("an interrupt during a chat approval batch finishes the running approval an
   assert.match(result.actions[1].status, /^not run: you stopped this reply first/);
   assert.equal(result.status, "partial");
 });
+
+test("a stop that lands while a spoken approval is still being validated runs nothing and leaves the card pending", async (t) => {
+  const { AgentHost } = await import("../src/agent-host.js");
+  const { PendingActionStore } = await import("../src/pending-actions.js");
+  const { ownerInterruptReason } = await import("../src/message-turns.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-approval-stop-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pendingActions = new PendingActionStore({ dir, randomInt: () => 31 });
+  const card = pendingActions.enqueue({ toolName: "fleet_send_message", args: { message: "ship it" }, context: { sessionId: "s" },
+    summary: "Send 'ship it'", mode: "chat", announce: false });
+  const owner = new AbortController();
+  const validating = gate();
+  const invoked = [];
+  const runtime = {
+    pendingActions,
+    tools: {
+      // e.g. fleet_send_message awaits the thread's detail before it is sent.
+      async approvalStillValid() { owner.abort(ownerInterruptReason()); await validating.opened; return null; },
+      async invoke(name) { invoked.push(name); return { ok: true, result: "sent" }; },
+      get: () => null
+    }
+  };
+  const host = new AgentHost({ runtime, modelProvider: { isConfigured: () => true, generate: async () => ({ text: "x" }) } });
+  setTimeout(validating.open, 30);
+  const result = await host.confirmSpoken({ decision: "approve", code: card.confirmCode },
+    { sessionId: "s", sinceIso: null, principal: { via: "phone" }, signal: owner.signal });
+  assert.deepEqual(invoked, [], "the approved tool never started");
+  assert.match(result.status, /^not run: you stopped this reply first/);
+  assert.equal(pendingActions.get(card.id).status, "pending", "still the owner's to approve");
+});
