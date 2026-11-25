@@ -93,6 +93,13 @@ import {
 } from "./integrations/g2-channel.js";
 import { DELEGATED_ENROLLMENT_CODE_TTL_MS, NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import {
+  NodeReconnectManager,
+  isNodeReconnectRequestRoute,
+  isNodeReconnectNodeRoute,
+  isNodeReconnectMobileRoute,
+  reconnectRequestId
+} from "./node-reconnect.js";
 import { executeApprovedAction } from "./approval-executor.js";
 import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
@@ -189,6 +196,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     getOrigin: () => getPublicUrl() ? new URL(getPublicUrl()).origin : `http://127.0.0.1:${server.address()?.port ?? port}` });
   const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
   const localIdentity = readOrCreateIdentity(dataDir);
+  const nodeReconnect = options.nodeReconnect ?? new NodeReconnectManager({
+    mainNodeId: localIdentity.nodeId,
+    nodeRegistry
+  });
   let localCapabilityCache = [];
   const capabilityFacade = {
     list(capabilityId) {
@@ -1004,7 +1015,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
         "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
-      ].includes(pathname);
+      ].includes(pathname)
+        || isNodeReconnectRequestRoute(method, pathname)
+        || isNodeReconnectNodeRoute(method, pathname);
       const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message") || sharedHistoryRoute;
@@ -1395,6 +1408,57 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           return sendJson(res, 400, { error: error.message });
         }
+      }
+      // Safe recovery for a node whose heartbeat reaches this main but whose
+      // desktop owner-proxy grant is missing or stale. The request is created
+      // with the target node's operational credential, and approval is only
+      // accepted from an enrolled mobile owner device on this same main.
+      if (isNodeReconnectRequestRoute(method, pathname)
+          || isNodeReconnectNodeRoute(method, pathname)
+          || isNodeReconnectMobileRoute(method, pathname)) {
+        res.setHeader("cache-control", "no-store");
+      }
+      if (isNodeReconnectRequestRoute(method, pathname)) {
+        const result = nodeReconnect.create(requestNodeId);
+        if (!result.ok) return sendJson(res, result.code === "unknown_node" ? 404 : 409, { error: result.code, message: result.message });
+        return sendJson(res, result.created ? 201 : 200, result.request);
+      }
+      if (method === "GET" && pathname === "/nodes/reconnect/requests") {
+        if (requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "mobile_approval_required", message: "Reconnect requests are reviewed from an enrolled owner phone." });
+        }
+        return sendJson(res, 200, { requests: nodeReconnect.listForMobile() });
+      }
+      if (isNodeReconnectMobileRoute(method, pathname) && pathname !== "/nodes/reconnect/requests") {
+        if (requestEnrollment?.platform !== MOBILE_PLATFORM) {
+          return sendJson(res, 403, { error: "mobile_approval_required", message: "Approve this request from an enrolled owner phone." });
+        }
+        const id = reconnectRequestId(pathname);
+        const result = pathname.endsWith("/approve")
+          ? nodeReconnect.approve(id, requestNodeId)
+          : nodeReconnect.deny(id, requestNodeId);
+        if (!result.ok) {
+          const status = result.code === "unknown_request" ? 404
+            : result.code === "request_expired" ? 410
+              : result.code === "mobile_approval_required" || result.code === "approver_must_differ" ? 403 : 409;
+          return sendJson(res, status, { error: result.code, message: result.message });
+        }
+        // Deliberately omit any credential. The target must fetch it with its
+        // own operational credential after the phone confirms approval.
+        return sendJson(res, 200, result.request);
+      }
+      if (isNodeReconnectNodeRoute(method, pathname)) {
+        const id = reconnectRequestId(pathname);
+        const result = method === "GET"
+          ? nodeReconnect.statusForNode(id, requestNodeId)
+          : nodeReconnect.acknowledge(id, requestNodeId);
+        if (!result.ok) {
+          const status = result.code === "unknown_request" ? 404
+            : result.code === "forbidden_node" ? 403
+              : result.code === "request_expired" ? 410 : 409;
+          return sendJson(res, status, { error: result.code, message: result.message });
+        }
+        return sendJson(res, 200, result.request);
       }
       if (method === "GET" && pathname === "/phone-pairing") {
         res.setHeader("Cache-Control", "no-store");

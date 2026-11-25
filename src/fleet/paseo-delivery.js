@@ -842,7 +842,20 @@ export function isPermanentlyDisconnectedRuntimeError(raw) {
   return PERMANENT_DISCONNECT_ERROR_RE.test(text);
 }
 
-export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, queue = false, holdOnPermission = false } = {}) {
+// Part of what makes two sends the same: the same words with different
+// attachments are a different message.
+export function paseoImagesHash(images) {
+  const normalizedImages = normalizePaseoImages(images);
+  return normalizedImages.length
+    ? createHash("sha256").update(normalizedImages.map((image) => `${image?.mediaType ?? image?.mimeType ?? ""}:${image?.data ?? image?.url ?? ""}`).join("\n")).digest("hex").slice(0, 16)
+    : null;
+}
+
+// noPermissionReply: this text was approved before any prompt now open in
+// the chat existed (a held handoff resuming), so it must never be read as an
+// answer to one: with a prompt open it is refused before anything is sent,
+// and it never spawns a replacement session.
+export async function deliverPaseo({ config, thread, text, store, actionId, base, factory, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, queue = false, holdOnPermission = false, noPermissionReply = false } = {}) {
   const blocked = detail => ({ status: "blocked", route: "paseo-send", actionId, detail });
   const ownerInitiated = OWNER_PLAYBOOKS.has(base?.playbook);
   const silentStuckRecovery = !ownerInitiated
@@ -860,6 +873,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   const heldUntil = ownerInitiated ? null : limitHeld(thread);
   if (heldUntil) return blocked(`Provider ${thread.error.kind} until ${heldUntil}; Supervisor resumes after the reset`);
   const normalizedImages = normalizePaseoImages(images);
+  const imagesHash = paseoImagesHash(normalizedImages);
   const blockedExclusion = ownerInitiated
     ? Boolean(thread?.archived || (thread?.excluded && !["closed", "history-unavailable"].includes(thread.excluded)))
     : Boolean(thread?.excluded);
@@ -885,6 +899,20 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       if (previous?.pending) {
         const priorCheck = await readPaseoConfirmation(ref, previous, signal, save, Infinity, { ownerInitiated });
         signal.throwIfAborted();
+        // The same owner text was already dispatched to this chat and its
+        // outcome is pending: a lost reply, not a lost message. Its own
+        // receipt decides; it is never sent a second time.
+        if (ownerInitiated && previous.messageHash && previous.messageHash === base?.messageHash && (previous.imagesHash ?? null) === imagesHash) {
+          if (priorCheck.confirmed || priorCheck.systemError) {
+            writeJsonAtomic(file, { ...previous, pending: false });
+            return { status: "sent", route: "paseo-send", actionId, reconciled: true, messageId: previous.clientMessageId ?? previous.messageId ?? null,
+              detail: priorCheck.systemError
+                ? `Paseo message delivered earlier (its turn then failed: ${priorCheck.systemError}); not sent again`
+                : "Paseo message and turn confirmed (earlier send of this same message; not sent again)" };
+          }
+          return { status: "blocked", unconfirmed: true, route: "paseo-send", actionId,
+            detail: "An earlier send of this same message to this chat is unconfirmed; not sent again so it cannot arrive twice" };
+        }
         if (priorCheck.systemError) {
           // The earlier message reached the chat (its own ID is in the
           // timeline) and the turn it started then failed: delivered, not
@@ -924,7 +952,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           statusCheckFor = { messageId: previous.messageId ?? null, outcome: rec.outcome };
         } else if (!priorCheck.confirmed) {
           // Owner explicitly initiated a new send; clear stale unconfirmed marker so older background nudges never brick manual coordination.
-          writeJsonAtomic(file, { ...previous, pending: false });
+          writeJsonAtomic(file, { ...previous, pending: false, delivered: false, clearedForNewSend: true });
         } else {
           writeJsonAtomic(file, { ...previous, pending: false });
           // This receipt belongs to an older action, not the current proposal.
@@ -944,6 +972,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         ?? null;
       if (ownerInitiated && expectedPermissionId && !livePerms.some((p) => p && String(p.id) === String(expectedPermissionId))) {
         return blocked("Paseo permission changed; scan again before sending");
+      }
+      if (noPermissionReply && livePerms.length > 0) {
+        return blocked("Paseo chat has a pending permission prompt; a held handoff is never sent into it");
       }
       if (ownerInitiated && agent && !agent.archivedAt && agent.status !== "closed" && livePerms.length > 0) {
         if (holdOnPermission === true && ownerChoice == null) {
@@ -1044,6 +1075,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         messageId,
         clientMessageId: messageId,
         messageHash: statusCheckFor ? shortHash(PASEO_STATUS_CHECK_TEXT) : base.messageHash,
+        ...(imagesHash && !statusCheckFor ? { imagesHash } : {}),
         activityAt: agent.updatedAt,
         sentAt: new Date().toISOString(),
         ...(cursor ? { cursor } : {}),
@@ -1063,10 +1095,12 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         response = await ref.send(text, sendOptions);
       } catch (sendErr) {
         if (ownerInitiated) {
-          writeJsonAtomic(file, { ...intent, pending: false });
+          // Record explicit failure evidence so restart recovery never mistakes
+          // a thrown ref.send() for a confirmed delivery.
+          writeJsonAtomic(file, { ...intent, pending: false, delivered: false, sendError: true });
           const errReason = clampText(redactSecrets(String(sendErr?.message ?? "runtime disconnected")), 120);
-          if (!recoverDisconnected || !isPermanentlyDisconnectedRuntimeError(errReason)) {
-            return blocked(`Paseo delivery failed: ${errReason}${recoverDisconnected ? "" : "; existing session only"}`);
+          if (!recoverDisconnected || noPermissionReply || !isPermanentlyDisconnectedRuntimeError(errReason)) {
+            return blocked(`Paseo delivery failed: ${errReason}${recoverDisconnected && !noPermissionReply ? "" : "; existing session only"}`);
           }
           const recovered = await recoverDisconnectedPaseoSession({
             permissionMode: ownerPermissionMode(store),
@@ -1113,8 +1147,8 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         onSawOwn: () => { sawOwnBeforeAbort = true; }
       });
       if (turnOutcome.systemError) {
-        writeJsonAtomic(file, { ...correlated, pending: false });
-        if (ownerInitiated && recoverDisconnected && isPermanentlyDisconnectedRuntimeError(turnOutcome.systemError)) {
+        writeJsonAtomic(file, { ...correlated, pending: false, delivered: false, executionError: turnOutcome.systemError });
+        if (ownerInitiated && recoverDisconnected && !noPermissionReply && isPermanentlyDisconnectedRuntimeError(turnOutcome.systemError)) {
           const recovered = await recoverDisconnectedPaseoSession({
             permissionMode: ownerPermissionMode(store),
             api,
@@ -1136,7 +1170,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
             };
           }
         }
-        return blocked(`Paseo session runtime error: ${turnOutcome.systemError}${recoverDisconnected ? "" : "; existing session only"}`);
+        return blocked(`Paseo session runtime error: ${turnOutcome.systemError}${recoverDisconnected && !noPermissionReply ? "" : "; existing session only"}`);
       }
       if (!turnOutcome.confirmed) {
         if (ownerInitiated) {

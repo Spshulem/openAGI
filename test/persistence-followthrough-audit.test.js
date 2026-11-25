@@ -111,19 +111,25 @@ test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlie
       at: new Date().toISOString(),
       detail: "Paseo message and turn confirmed"
     };
+    const actions = [earlier];
+    let landsDuringSend = null;
     const runtime = {
       events: { emit() {} },
       nodeCapabilities: {
         async dispatch(_nodeId, _cap, _op, payload) {
-          if (payload.path === "/fleet/api/send") throw sendError;
+          if (payload.path === "/fleet/api/send") {
+            // The computer journals this send's receipt, then its reply is lost.
+            if (landsDuringSend) { actions.push(landsDuringSend); landsDuringSend = null; }
+            throw sendError;
+          }
           if (payload.path === "/fleet/api/state") {
-            return { state: { mode: "auto", questions: [], actions: [earlier], settings: {} }, response: { status: 200, body: { ok: true } } };
+            return { state: { mode: "auto", questions: [], actions: [...actions], settings: {} }, response: { status: 200, body: { ok: true } } };
           }
           throw new Error("unexpected");
         }
       }
     };
-    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir });
+    const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir, sendRetryDelaysMs: [0, 0] });
 
     // A different message timing out must not borrow the earlier receipt.
     await assert.rejects(() => remote.sendOwnerMessage(threadKey, "Second instruction"), (err) => err.reached === false);
@@ -133,11 +139,17 @@ test("RemoteFleetSupervisor reconciles only the timed-out request, not an earlie
     sendError = new Error("Node is offline");
     await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
 
-    // The same message timing out is reconciled to its own receipt.
+    // The same text sent again on purpose: the receipt that already existed
+    // is the earlier send's and is never borrowed (#350 review).
     sendError = new Error("Node command timed out after 300s");
+    await assert.rejects(() => remote.sendOwnerMessage(threadKey, "First instruction"), (err) => err.reached === false);
+
+    // The same message timing out is reconciled to its own receipt: the one
+    // the computer journaled while handling this request.
+    landsDuringSend = { ...earlier, id: "act_this_send", at: new Date().toISOString() };
     const res = await remote.sendOwnerMessage(threadKey, "First instruction");
     assert.equal(res.reconciledAfterTimeout, true);
-    assert.equal(res.delivery.actionId, "act_earlier");
+    assert.equal(res.delivery.actionId, "act_this_send");
   });
 });
 

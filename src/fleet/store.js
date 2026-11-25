@@ -1730,13 +1730,16 @@ export class FleetStore {
     return stamp;
   }
 
-  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message" } = {}) {
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null } = {}) {
     const cleanKey = String(threadKey ?? "").trim();
     const cleanMsg = String(message ?? "").trim();
     // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
     // chars with acceptance criteria appended at the end) rather than silently
     // truncating trailing requirements. Reject genuinely oversized payloads.
     if (!cleanKey || !cleanMsg || cleanMsg.length > 24_000) return null;
+    const cleanIdempotencyKey = typeof idempotencyKey === "string" && idempotencyKey.trim()
+      ? idempotencyKey.trim().slice(0, 160)
+      : null;
     const nowMs = this.now();
     const nowIso = iso(nowMs);
     this.state.queuedOwnerMessages = (Array.isArray(this.state.queuedOwnerMessages) ? this.state.queuedOwnerMessages : [])
@@ -1748,9 +1751,18 @@ export class FleetStore {
     const imageSig = (imgs) => (Array.isArray(imgs) && imgs.length > 0 ? JSON.stringify(imgs) : "");
     const nextImgSig = imageSig(normalizedImages);
     const existing = this.state.queuedOwnerMessages.find(
-      (item) => item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig
+      (item) => (cleanIdempotencyKey && (item.idempotencyKey === cleanIdempotencyKey || (Array.isArray(item.idempotencyKeys) && item.idempotencyKeys.includes(cleanIdempotencyKey))))
+        || (item.threadKey === cleanKey && item.message === cleanMsg && imageSig(item.images) === nextImgSig)
     );
     if (existing) {
+      if (cleanIdempotencyKey) {
+        const keys = [...new Set([existing.idempotencyKey, ...(Array.isArray(existing.idempotencyKeys) ? existing.idempotencyKeys : []), cleanIdempotencyKey].filter(Boolean))];
+        if (!existing.idempotencyKey || !Array.isArray(existing.idempotencyKeys) || existing.idempotencyKeys.length !== keys.length) {
+          existing.idempotencyKey ??= cleanIdempotencyKey;
+          existing.idempotencyKeys = keys;
+          this._save();
+        }
+      }
       return { ...existing, deduped: true };
     }
     const entry = {
@@ -1760,6 +1772,7 @@ export class FleetStore {
       ...(normalizedImages ? { images: normalizedImages } : {}),
       ...(goalId ? { goalId: String(goalId).slice(0, 80) } : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),
+      ...(cleanIdempotencyKey ? { idempotencyKey: cleanIdempotencyKey, idempotencyKeys: [cleanIdempotencyKey] } : {}),
       source: clampText(String(source || "owner-message"), 40),
       createdAt: nowIso,
       attempts: 0,

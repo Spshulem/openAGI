@@ -3,7 +3,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
-import { MODES, SUPERVISOR_PREFIX, resolveFleetConfig, shortHash } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, clampText, redactSecrets, resolveFleetConfig, shortHash } from "./contracts.js";
 import { flattenMessage } from "./ui-delivery.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
@@ -17,7 +17,7 @@ import { batchActCards, normalizeBatchCardsInput } from './coordinator.js';
 import { isSuppressedByQuietCadence, normalizePreferences } from './preferences.js';
 import { rankCombinedSearchResults, searchFleet } from './search.js';
 
-const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/act|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
+const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|reconcile|walkthrough|mode|send|screen|click|feedback|diagnose|search|workspaces|hierarchy|ask-supervisor|active-work|active-work\/scan|active-work\/[A-Za-z0-9_-]{1,80}\/(act|verify)|projects|projects\/[A-Za-z0-9_-]{1,80}|themes\/sync|dispatch|repo-status|preferences|route|tasks\/claim|sessions\/start|cards\/batch|cards\/[A-Za-z0-9:%_-]{1,160}\/(?:act|admin-merge)|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute|transcript|organize|archive|unarchive|settings|failover))?)$`);
 
 export function createFleetCapability(supervisor) {
   const route = createFleetRoute({ supervisor });
@@ -95,6 +95,68 @@ const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 const DELIVERING = /^\/fleet\/api\/(send|click|route|dispatch|themes\/sync|tasks\/claim|sessions\/start|cards\/batch|cards\/[^/]+\/act|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/(?:push|archive|unarchive|failover))$/;
 
 const FEEDBACK_OUTBOX_MAX = 200;
+const ATTEMPTS_MAX = 100;
+// The node-control broker's per-command ceiling (MAX_COMMAND_BYTES in
+// src/node-control.js), named here so a refused screenshot says why.
+const MAX_TRANSPORT_BYTES = 256 * 1024;
+// An owner message that never reached the computer: tried this many times in
+// all, waiting these between tries. Bounded so a tool call stays short.
+const SEND_ATTEMPTS = 3;
+const SEND_RETRY_DELAYS_MS = [1500, 5000];
+// A receipt journaled up to this long before the request started still
+// counts (clocks on the two computers differ slightly).
+const RECEIPT_SKEW_MS = 5000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function imageBytes(images) {
+  return images.reduce((sum, image) => sum + (typeof image?.data === 'string' ? image.data.length : 0), 0);
+}
+
+// The result a fleet computer's own receipt stands for. One that says the
+// send may or may not have landed (the executor journals it failed or sent,
+// unconfirmed) stays unconfirmed: never a plain failure, which could invite
+// a resend, and never a confirmed send.
+function fromReceipt(receipt, attempts, detail) {
+  const unconfirmed = receipt.unconfirmed === true;
+  const confirmed = receipt.status === 'sent' && !unconfirmed;
+  return { ...(confirmed ? { reconciledAfterTimeout: true } : {}),
+    delivery: { status: receipt.status, ...(unconfirmed ? { unconfirmed: true } : {}), route: receipt.route ?? null, detail,
+      ...(receipt.handoffKey ? { handoffKey: receipt.handoffKey } : {}),
+      actionId: receipt.id ?? null, reconciled: true, reconciledReceipt: true,
+      verifiedAt: unconfirmed ? null : (receipt.finishedAt ?? receipt.at ?? null), attempts } };
+}
+
+function attemptSummary(attempt, error) {
+  return error
+    ? { attempt, kind: error.kind ?? 'failed', retryable: error.retryable === true, uncertain: error.uncertain === true, detail: clampText(redactSecrets(String(error.message ?? '')), 200) }
+    : { attempt, kind: 'ok' };
+}
+
+// Why a request to the fleet computer failed, as one of four kinds, each
+// with its own next step:
+// - refused: the computer answered with its own error (a GitHub failure, a
+//   chat whose delivery is off). It is up; its words are the answer.
+// - too-large: the request is over the link's size limit. Never retried.
+// - uncertain: the computer took it but did not answer in time; it may have
+//   run, so it is reconciled against receipts, never blindly repeated.
+// - unreachable: it never got there (offline, queue full). Safe to retry.
+export function classifyFleetRequestError(error, { reached = false, status = null } = {}) {
+  const raw = clampText(redactSecrets(String(error?.message ?? '').trim()), 200);
+  if (reached) {
+    return { kind: 'refused', message: raw && raw !== 'Fleet request failed' ? raw : `The fleet computer refused the request (HTTP ${status ?? 'error'}).`, retryable: false, uncertain: false };
+  }
+  if (/exceeded the transport limit|not serializable/i.test(raw)) {
+    return { kind: 'too-large', message: `Not sent: the request is over the ${Math.round(MAX_TRANSPORT_BYTES / 1024)} KB limit of the link to the fleet computer. Retrying cannot help; send less (for example without images).`, retryable: false, uncertain: false };
+  }
+  // The computer took it, so it may have run (a timeout, or a failure it
+  // reported after executing, such as an oversized result): reconcile
+  // against its receipts, never send again.
+  if (error?.nodeAcknowledged === true) {
+    return { kind: 'uncertain', message: `The fleet computer took the request but ${/timed out/i.test(raw) ? 'did not answer in time' : 'reported a failure after taking it'}; it may still have run. Check its receipts before trying again.`, retryable: false, uncertain: true };
+  }
+  return { kind: 'unreachable', message: `Fleet computer unavailable${raw ? ` (${clampText(raw, 120)})` : ''}. Retry when it is online.`, retryable: true, uncertain: false };
+}
 
 // Hashes the fleet computer journals for an owner send of this message:
 // the route's text (an image-only send gets its default line), prefixed as
@@ -114,7 +176,7 @@ function queuedFeedback(entry) {
 }
 
 export class RemoteFleetSupervisor {
-  constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null }) {
+  constructor({ runtime, nodeId, intervalMs = 30000, dataDir = null, sendRetryDelaysMs = SEND_RETRY_DELAYS_MS }) {
     this.runtime = runtime;
     this.nodeId = nodeId;
     this.intervalMs = intervalMs;
@@ -138,6 +200,9 @@ export class RemoteFleetSupervisor {
     this.activeWorkSignature = null;
     this.requestSequence = 0;
     this.appliedSequence = 0;
+    this.attemptsFile = dataDir ? path.join(dataDir, "fleet-remote-attempts.json") : null;
+    this.attempts = this.loadAttempts();
+    this.sendRetryDelaysMs = sendRetryDelaysMs;
   }
   lastReportedMode() {
     if (!this.modeFile) return null;
@@ -224,20 +289,119 @@ export class RemoteFleetSupervisor {
       const unsupportedRoute = (reached && status === 404 && /unknown fleet route/i.test(rawMsg))
         || /unsupported fleet request|unknown fleet route/i.test(rawMsg);
       const missingThread = reached && status === 404 && method === 'GET' && /^\/fleet\/api\/threads\/[^/]+$/.test(path);
-      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/act$/.test(path);
+      const closedCard = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/cards\/[^/]+\/(?:act|admin-merge)$/.test(path);
       const missingActiveWork = reached && status === 404 && method === 'POST' && /^\/fleet\/api\/active-work\/[^/]+\/act$/.test(path);
-      const hasSpecificNodeError = reached && Boolean(rawMsg) && rawMsg !== 'Fleet request failed';
-      const nonOutageError = hasSpecificNodeError || missingThread || closedCard || missingActiveWork || unsupportedRoute;
-      if (!nonOutageError && sequence >= this.appliedSequence) {
-        this.state.lastError = !reached && /timed out|timeout|aborted/i.test(rawMsg)
-          ? `Fleet request timed out waiting for ${this.nodeId} (${rawMsg}). Reconcile recent deliveries before resending.`
-          : 'Fleet computer unavailable or request failed. Retry when it is online.';
-      }
+      const nonOutageError = missingThread || closedCard || missingActiveWork || unsupportedRoute;
+      const failure = nonOutageError
+        ? { kind: 'not-found', message: rawMsg, retryable: false, uncertain: false }
+        : classifyFleetRequestError(error, { reached, status });
+      // Only a computer that could not be reached is an outage. One that
+      // answered with its own error is up: its state was applied above.
+      if (failure.kind === 'unreachable' && sequence >= this.appliedSequence) this.state.lastError = failure.message;
+      // The 30 s state poll is left out: an outage would fill the log with it.
+      if (!nonOutageError && !(method === 'GET' && path === '/fleet/api/state')) this.recordAttempt({ method, path, status, reached, ...failure });
       // Preserve the last snapshot/questions through connection outages, and never
       // misreport an HTTP error from an online fleet computer as an offline outage.
       const timedOut = !reached && /timed out|timeout|aborted/i.test(rawMsg);
-      throw Object.assign(new Error(nonOutageError ? rawMsg : this.state.lastError), { reached, status, unsupportedRoute, timedOut });
+      throw Object.assign(new Error(failure.message), {
+        reached, status, unsupportedRoute, timedOut, kind: failure.kind, retryable: failure.retryable, uncertain: failure.uncertain,
+        nodeAcknowledged: error?.nodeAcknowledged === true
+      });
     }
+  }
+  // Failed requests to the fleet computer and every delivering request's
+  // outcome, newest last, kept across restarts: what went wrong on which
+  // attempt, without the payload (no message text, images or tokens).
+  recordAttempt({ method, path, status = null, reached = false, kind = 'ok', message = '', retryable = false, uncertain = false }) {
+    const entry = {
+      at: new Date().toISOString(),
+      method,
+      path: clampText(String(path ?? ''), 160),
+      status: Number.isInteger(status) ? status : null,
+      reached: reached === true,
+      kind,
+      retryable: retryable === true,
+      uncertain: uncertain === true,
+      detail: clampText(redactSecrets(String(message ?? '')), 240)
+    };
+    this.attempts.push(entry);
+    if (this.attempts.length > ATTEMPTS_MAX) this.attempts.splice(0, this.attempts.length - ATTEMPTS_MAX);
+    if (this.attemptsFile) {
+      try { writeJsonAtomic(this.attemptsFile, { nodeId: this.nodeId, attempts: this.attempts }); } catch { /* the in-memory copy still answers */ }
+    }
+    return entry;
+  }
+  recentAttempts(limit = 20) {
+    return this.attempts.slice(-Math.max(1, Math.min(ATTEMPTS_MAX, limit)));
+  }
+  loadAttempts() {
+    if (!this.attemptsFile) return [];
+    const saved = readJsonFile(this.attemptsFile, null);
+    return saved?.nodeId === this.nodeId && Array.isArray(saved.attempts) ? saved.attempts.slice(-ATTEMPTS_MAX) : [];
+  }
+  // The fleet computer's own receipt for an owner message sent since
+  // startedAt (its journal hashes the text as it went into the chat), or
+  // null. Refreshes first: after a lost reply the last state predates it.
+  // known: receipt ids that already existed when this request started. They
+  // belong to earlier sends (the same short text can be sent twice on
+  // purpose) and never count as this one's.
+  async findSendReceipt(threadKey, message, startedAt, known = new Set(), images = null, idempotencyKey = null) {
+    try { await this.refresh(); } catch { /* still unreachable: judge on what is here */ }
+    // When an approval key was sent, reconcile against its persisted handoff
+    // outcome first: a held offline handoff sits in `handoffs` even when the
+    // executor's preliminary attempt journaled a `blocked` host-unavailable row.
+    if (idempotencyKey) {
+      const handoffs = Array.isArray(this.state.handoffs) ? this.state.handoffs : [];
+      const handoff = handoffs.find((entry) => entry?.key === idempotencyKey) ?? null;
+      if (handoff) {
+        if (handoff.status === 'queued') {
+          return {
+            status: 'queued',
+            queued: true,
+            route: 'paseo-queue',
+            handoffKey: handoff.key,
+            detail: handoff.detail || 'Paseo session is mid-turn; queued behind the active turn and will deliver automatically once it finishes (no duplicate agent created).',
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'waiting') {
+          return {
+            status: 'queued',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            detail: `${handoff.detail}. Kept as an approved handoff and sent to this same chat when its host is back; no new approval is needed. Not delivered yet.`,
+            at: handoff.updatedAt ?? handoff.createdAt ?? null
+          };
+        }
+        if (handoff.status === 'delivered') {
+          return {
+            status: 'sent',
+            route: 'paseo-send',
+            handoffKey: handoff.key,
+            id: handoff.deliveredActionId ?? null,
+            detail: handoff.detail ?? `already delivered for this approval at ${handoff.deliveredAt ?? handoff.updatedAt}; not sent again`,
+            at: handoff.deliveredAt ?? handoff.updatedAt ?? null
+          };
+        }
+        return {
+          status: 'blocked',
+          route: 'paseo-send',
+          handoffKey: handoff.key,
+          ...(handoff.status === 'unconfirmed' ? { unconfirmed: true } : {}),
+          detail: `approved handoff ${handoff.status}: ${handoff.detail}`,
+          at: handoff.updatedAt ?? null
+        };
+      }
+    }
+    // The executor journals the prefixed text it sent (flattened for
+    // computer-use): either form of this exact message counts.
+    const hashes = ownerMessageHashes(message, images);
+    const actions = Array.isArray(this.state.actions) ? this.state.actions : [];
+    return actions.findLast((action) => action?.threadKey === threadKey
+      && !known.has(action.id)
+      && action.playbook === 'owner-message'
+      && hashes.has(action.messageHash)
+      && (Date.parse(action.finishedAt ?? action.at ?? '') || 0) >= startedAt - RECEIPT_SKEW_MS) ?? null;
   }
   refresh() {
     if (!this.refreshing) {
@@ -306,48 +470,53 @@ export class RemoteFleetSupervisor {
   async replyQuestion(id, reply) { return this.request('POST', `/fleet/api/questions/${id}`, { reply }); }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
-  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null } = {}) {
-    const startedAtMs = Date.now();
-    try {
-      return await this.request('POST', '/fleet/api/send', {
-        threadKey,
-        message,
-        ...(typeof queue === 'boolean' ? { queue } : {}),
-        ...(Array.isArray(images) && images.length ? { images } : {})
-      });
-    } catch (error) {
-      // Only an uncertain send (it timed out in flight) may have landed; a
-      // send that never reached the computer did not.
-      if (!error?.reached && error?.timedOut) {
-        try {
-          await this.request('GET', '/fleet/api/state');
-          // The executor journals shortHash of the prefixed text it sent
-          // (flattened for computer-use); only that exact message counts.
-          const hashes = ownerMessageHashes(message, images);
-          const matched = (this.state.actions ?? []).find((act) => (
-            act?.threadKey === threadKey
-            && act?.playbook === 'owner-message'
-            && act?.status === 'sent'
-            && hashes.has(act?.messageHash)
-            && Number.isFinite(Date.parse(act?.at ?? ''))
-            && Date.parse(act.at) >= startedAtMs - 2000
-          ));
-          if (matched) {
-            return {
-              reconciledAfterTimeout: true,
-              delivery: {
-                status: 'sent',
-                route: matched.route ?? 'paseo-send',
-                actionId: matched.id ?? null,
-                reconciledReceipt: true,
-                verifiedAt: matched.at,
-                detail: matched.detail || 'Verified in fleet action log after remote response timeout; message was delivered.'
-              }
-            };
-          }
-        } catch { /* preserve original error if state reconciliation also fails */ }
+  // The owner's message to one thread. A request the computer never received
+  // (offline, its queue full) is sent again, at most SEND_ATTEMPTS times in
+  // all; one it received but did not answer may have gone out, so its own
+  // receipt decides, and with none it is reported unconfirmed, never sent
+  // and never sent twice. Every attempt is in the result.
+  async sendOwnerMessage(threadKey, message, { queue = undefined, images = null, idempotencyKey = null } = {}) {
+    const hasImages = Array.isArray(images) && images.length > 0;
+    // The approval's key travels with every attempt: the fleet computer
+    // never carries out the same approval twice, and holds it while the
+    // chat's host is offline.
+    const body = { threadKey, message, ...(typeof queue === 'boolean' ? { queue } : {}), ...(hasImages ? { images } : {}), ...(idempotencyKey ? { idempotencyKey } : {}) };
+    const startedAt = Date.now();
+    const known = new Set((Array.isArray(this.state.actions) ? this.state.actions : []).map((action) => action?.id).filter(Boolean));
+    const attempts = [];
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const result = await this.request('POST', '/fleet/api/send', body);
+        const delivery = result?.delivery ?? null;
+        this.recordAttempt({ method: 'POST', path: '/fleet/api/send', status: 200, reached: true, kind: delivery?.status === 'sent' ? 'ok' : 'delivery-' + String(delivery?.status ?? 'unknown'), message: delivery?.detail ?? '' });
+        return attempts.length && delivery ? { ...result, delivery: { ...delivery, attempts: [...attempts, attemptSummary(attempt, null)] } } : result;
+      } catch (error) {
+        attempts.push(attemptSummary(attempt, error));
+        if (error.uncertain) {
+          const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+          if (receipt) return fromReceipt(receipt, attempts, `${clampText(receipt.detail ?? '', 220)} (the fleet computer's receipt; its reply to this request was lost)`);
+          return { delivery: { status: 'unknown', unconfirmed: true, route: null,
+            detail: 'the fleet computer took the message but did not answer in time and has no receipt for it yet; not sent again so it cannot arrive twice. Check fleet_thread receipts before resending.',
+            attempts } };
+        }
+        if (error.kind === 'too-large' && hasImages) {
+          throw Object.assign(new Error(`Not sent: with its ${images.length} image(s) (about ${Math.round(imageBytes(images) / 1024)} KB) this message is over the ${Math.round(MAX_TRANSPORT_BYTES / 1024)} KB limit of the link to the fleet computer. Retrying cannot help: send it without the images (forwardImages: false) or attach a smaller screenshot.`),
+            { reached: false, status: null, kind: 'too-large', retryable: false, uncertain: false, attempts });
+        }
+        if (!error.retryable || attempt >= SEND_ATTEMPTS) {
+          error.attempts = attempts;
+          if (attempt > 1) error.message = `${error.message} (${attempt} attempts)`;
+          throw error;
+        }
+        // It never reached the computer, so nothing went out; but if an
+        // earlier reply was lost, its receipt says so before sending again.
+        await sleep(this.sendRetryDelaysMs[attempt - 1] ?? this.sendRetryDelaysMs.at(-1) ?? 0);
+        const receipt = await this.findSendReceipt(threadKey, message, startedAt, known, images, idempotencyKey);
+        // A send that may have landed (or was persisted as a held handoff) is not sent again either.
+        if (receipt && (receipt.status === 'sent' || receipt.status === 'queued' || receipt.unconfirmed === true)) {
+          return fromReceipt(receipt, attempts, clampText(receipt.detail ?? '', 220));
+        }
       }
-      throw error;
     }
   }
   async reconcileOpenQuestions({ force = false } = {}) { return (await this.request('POST', '/fleet/api/reconcile', { force: force === true })).result; }
@@ -715,6 +884,25 @@ export class RemoteFleetSupervisor {
   async routeIssue(input = {}) {
     const { state: _state, ...rest } = await this.request('POST', '/fleet/api/route', input);
     return rest;
+  }
+  // The owner's Admin Merge runs on the fleet computer, where its consent
+  // lives. Only the main's owner route calls these.
+  async previewAdminMerge(cardId, { initiator = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { preview: true });
+  }
+  async adminMergeCard(cardId, { initiator = null, consent = null } = {}) {
+    if (initiator !== 'owner') return { ok: false, kind: 'admin_merge', status: 'owner_required', detail: 'Admin Merge only runs from the owner\'s own Admin Merge control.' };
+    return this.adminMergeRequest(cardId, { consent });
+  }
+  async adminMergeRequest(cardId, body) {
+    try {
+      return (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/admin-merge`, body)).result ?? null;
+    } catch (error) {
+      if (error.status === 404 && !error.unsupportedRoute) return null;
+      if (error.unsupportedRoute) return { ok: false, kind: 'admin_merge', status: 'unsupported', detail: 'The fleet computer runs an older OpenAGI without Admin Merge. Update it first.' };
+      throw error;
+    }
   }
   async actCard(cardId, input = {}) {
     if (this.selfFixHub && typeof cardId === 'string') {
