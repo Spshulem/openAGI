@@ -371,3 +371,32 @@ test("a restart keeps a queued hold that is still running", (t) => {
   c.now.value = Date.parse(laterReset) + 10_000;
   assert.equal(new GithubThrottle({ now: c.fn, file }).current(), null);
 });
+
+// Review fix (#351): the reset probe itself can be refused with a secondary
+// limit (retry-after 900). Its error was dropped, leaving only the estimated
+// 5-minute primary hold, so owner actions resumed inside GitHub's slow-down.
+test("a secondary limit on the reset probe itself is kept, with no second probe", async () => {
+  const c = clock();
+  const throttle = new GithubThrottle({ now: c.fn });
+  let probes = 0;
+  const run = async (_bin, args) => {
+    if (String(args.join(" ")).includes("rateLimit")) {
+      probes += 1;
+      return { code: 1, stdout: "", stderr: "You have exceeded a secondary rate limit\nretry-after: 900" };
+    }
+    return { code: 1, stdout: "", stderr: PRIMARY_TEXT };
+  };
+  const first = await throttledGh(run, "gh", ["api", "graphql", "-f", "query={ viewer { login } }"], {}, { throttle, background: false });
+  assert.equal(first.throttled, true);
+  assert.equal(probes, 1, "the used-up budget with no reset probed once");
+  // Past the estimated 5-minute primary hold, GitHub's 15-minute slow-down
+  // from the probe still stops owner actions.
+  c.now.value = T0 + 6 * 60_000;
+  const held = throttle.blocking({ background: false });
+  assert.notEqual(held, null);
+  assert.equal(held.kind, "secondary");
+  assert.equal(throttle.needsProbe(), false, "never probes again while slowed down");
+  c.now.value = T0 + 15 * 60_000 + 1000;
+  assert.equal(throttle.blocking({ background: false }), null);
+  assert.equal(probes, 1);
+});

@@ -270,13 +270,15 @@ export class GithubThrottle {
     this.save();
     try {
       const result = await run(ghBin, ["api", "graphql", "-f", PROBE_QUERY], { timeoutMs: PROBE_TIMEOUT_MS });
-      const rate = readRateLimit(result?.stdout);
-      if (rate?.resetAt && rate.remaining <= this.floor) {
-        this.enter(rate.remaining <= 0 ? "primary" : "low-budget", { resetAt: rate.resetAt, remaining: rate.remaining });
-      } else if (rate) {
-        // Budget is back (a new window began): nothing to wait for.
-        this.noteBudget(rate);
-      }
+      // The probe's answer is read like any other when it says something new:
+      // a secondary limit with Retry-After is kept, and a rateLimit block
+      // sets the budget (a known reset, or a new window). The same "used up"
+      // with still no reset is not a second exhaustion: it changes nothing.
+      // observe() never probes, and this hold is already marked probed.
+      const failed = Boolean(result?.error) || result?.code !== 0;
+      const seen = classifyGithubThrottle(`${failed ? `${result?.stderr ?? ""}\n${result?.error ?? ""}\n` : ""}${graphqlErrorText(result?.stdout)}`);
+      const sameAgain = seen?.kind === "primary" && !readRateLimit(result?.stdout)?.resetAt && !seen.retryAfterSec;
+      if (!sameAgain) this.observe(result);
     } catch { /* keep the estimated hold */ }
     return this.current();
   }
