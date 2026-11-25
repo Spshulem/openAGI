@@ -115,6 +115,8 @@ struct NeedsYouRowLabel: View {
     var isUpdate: Bool = false
 
     @ScaledMetric(relativeTo: .subheadline) private var dotSize: CGFloat = 7
+    /// At accessibility text sizes rows wrap in full instead of clipping.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -123,13 +125,13 @@ struct NeedsYouRowLabel: View {
                 Text(card.headline)
                     .font(.subheadline.weight(isUpdate ? .regular : .semibold))
                     .foregroundStyle(isUpdate ? Theme.muted : Theme.ink)
-                    .lineLimit(3)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 3)
                     .multilineTextAlignment(.leading)
                 if let reason, !reason.isEmpty {
                     Text(reason)
                         .font(.footnote)
                         .foregroundStyle(Theme.muted)
-                        .lineLimit(2)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                         .multilineTextAlignment(.leading)
                 }
                 let badge = isUpdate ? nil : card.needsYouBadge
