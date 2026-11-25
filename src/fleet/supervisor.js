@@ -33,6 +33,7 @@ import { localDay } from "./diagnose.js";
 import { buildOwnerDecision, buildSupervisorDeck, computeBlockingImpact, deriveActorLabel, deriveBoardLabels, deriveCardProject, deriveSubchannel, needsOwnerDecision } from "./cards.js";
 import { executeSafePrMerge } from "./intent-resolver.js";
 import { HANDOFF_RETRY_MS, HandoffQueue, handoffStaleReason } from "./handoff-queue.js";
+import { throttleFor } from "./github-throttle.js";
 import { applyPreferencePatch, classifyQuestionSlice, effectiveCheckinCooldownMs, isSuppressedByQuietCadence, isSuppressedFromProactiveChat, pickAffirmativeOption, recordAutonomousSliceAction, recordPreferenceSignal } from "./preferences.js";
 import { dedupeDecisionDeltas, isClosedOrContradictoryDecision, reviewProactiveUpdateWithAgent } from "./proactive-gate.js";
 import { batchActCards, inspectRepoStatus, listWorkspaces, readChatTranscript, startPaseoSession } from "./coordinator.js";
@@ -902,6 +903,13 @@ export class FleetSupervisor {
   get handoffs() {
     this._handoffs ??= new HandoffQueue({ dir: path.join(this.dataDir, "fleet"), now: () => this.now() });
     return this._handoffs;
+  }
+
+  // The GitHub GraphQL cooldown every caller here shares (pollers, repo
+  // status, pre-send checks, the owner's Merge), kept with the fleet data.
+  get githubThrottle() {
+    this._githubThrottle ??= this.deps.githubThrottle ?? throttleFor(this.dataDir ? path.join(this.dataDir, "fleet", "github-throttle.json") : null);
+    return this._githubThrottle;
   }
 
   get store() {
@@ -4326,6 +4334,7 @@ export class FleetSupervisor {
       const prRef = card?.prRef ?? question.prRef ?? effectiveValue;
       const prefs = this.store.preferences();
       const mergeOutcome = await executeSafePrMerge({
+        throttle: this.githubThrottle,
         prRef,
         expectedHeadSha: card?.headSha ?? question.askedHead ?? null,
         mergePolicy: prefs.mergePolicy,
@@ -5437,7 +5446,7 @@ export class FleetSupervisor {
     const list = [...jobs.values()];
     await mapLimit(list, BRANCH_LOOKUP_CONCURRENCY, async (job) => {
       try {
-        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd })), 20_000, "pr lookup")) ?? null;
+        job.ref = (await withTimeout(Promise.resolve(find(job.repo, job.branch, config, { run, head: job.head, cwd: job.cwd, throttle: this.githubThrottle })), 20_000, "pr lookup")) ?? null;
         job.ok = true;
       } catch (error) {
         job.error = error;
@@ -5472,7 +5481,7 @@ export class FleetSupervisor {
     if (wanted.length) {
       try {
         const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+        states = (await withTimeout(Promise.resolve(fetch(wanted, config, { run, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
       } catch {
         for (const thread of several) if (conductorOwn(thread)) keepConductorPr(thread, this.conductorPicks.get(thread.key));
         return;
@@ -5509,7 +5518,7 @@ export class FleetSupervisor {
     let fresh;
     try {
       const fetch = this.deps.fetchPrStateLite ?? github.fetchPrStateLite;
-      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand })), PRE_SEND_PR_MS, "github"))?.get(ref);
+      fresh = (await withTimeout(Promise.resolve(fetch([ref], this.config, { run: this.deps.run ?? runCommand, throttle: this.githubThrottle })), PRE_SEND_PR_MS, "github"))?.get(ref);
     } catch {
       return null;
     }
@@ -5527,9 +5536,17 @@ export class FleetSupervisor {
     if (this.skip.github) return new Map();
     const refs = [...new Set([...inScope.map((thread) => thread.prRefs?.[0]), ...extraRefs].filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
+    // GitHub's limit is used up (or nearly): this scan does not ask, and says
+    // so, instead of failing each PR one by one. Last settled reads stand.
+    const cooling = this.githubThrottle.blocking({ background: true });
+    if (cooling) {
+      sourceErrors.github = clampText(cooling.message, 200);
+      for (const ref of refs) unread.add(ref);
+      return new Map();
+    }
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
-      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread, throttle: this.githubThrottle })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
     } catch (error) {
       sourceErrors.github = clampText(error?.message, 200);
       for (const ref of refs) unread.add(ref);
