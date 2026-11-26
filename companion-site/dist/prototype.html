@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f5f5f7">
+  <meta name="description" content="A practical prototype path for OpenAGI Dot: verified development modules, real component dimensions, and what still needs to be built.">
+  <title>Building Dot — OpenAGI</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23141416'/%3E%3Ccircle cx='32' cy='32' r='19' fill='none' stroke='%2300cbe9' stroke-width='4'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="dot.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header><div class="nav-inner"><a class="wordmark" href="concept.html">openagi <span>dot</span></a><nav class="nav-links" aria-label="Main navigation"><a href="#parts">The parts</a><a href="#connection">The connection</a><a class="nav-cta" href="concept.html">Back to Dot</a></nav></div></header>
+  <main class="prototype-main" id="main">
+    <div class="concept-label">OpenAGI Dot · Prototype notes</div>
+    <h1>Build the feeling.<br>Then make it smaller.</h1>
+    <p class="lede">The voice-button idea is feasible to prototype with development modules. The tiny product in the images is a design target that needs a custom board and measured fit.</p>
+    <div class="prototype-status"><span class="status-dot"></span>Parts researched. Hardware and companion integration not built.</div>
+
+    <h2>Start on the bench.</h2>
+    <p>A Seeed XIAO nRF52840 Sense already combines Bluetooth LE, a microphone, an RGB LED, and a battery charger on an approximately 21 × 18 mm board. Add a momentary button and prove hold-to-talk over USB before connecting a battery.</p>
+    <p>The board diagonal is about 28 mm. A circular first enclosure might land around 30–35 mm across before allowing for its actual battery, wiring, ports, and mounts. That is an estimate, not a validated minimum. A smaller Dot requires a custom PCB, antenna layout, power design, and enclosure stack-up.</p>
+    <p>The onboard RGB LED can test status colors. A continuous light ring needs its own LED placement and diffuser; a bright annulus is not supplied by the development board.</p>
+
+    <h2 id="parts">A useful first shopping list.</h2>
+    <p>USD listing snapshots checked September 30, 2026. Prices and stock can change. Nothing has been ordered.</p>
+    <div class="table-scroll" role="region" aria-label="Basic prototype parts" tabindex="0"><table><thead><tr><th scope="col">Part</th><th scope="col">Why it is here</th><th scope="col">Listed price</th></tr></thead><tbody>
+      <tr><td><a href="https://www.seeedstudio.com/Seeed-XIAO-BLE-Sense-nRF52840-p-5253.html">XIAO nRF52840 Sense</a></td><td>Microphone, BLE, RGB, and charger. Use the Sense variant.</td><td>$15.99</td></tr>
+      <tr><td><a href="https://www.adafruit.com/product/1317">Protected 150 mAh LiPo</a></td><td>A first battery for testing; final placement is unvalidated.</td><td>$5.95</td></tr>
+      <tr><td><a href="https://www.adafruit.com/product/367">6 mm tactile button pack</a></td><td>Twenty switches; use one for the first push-to-talk test.</td><td>$2.50</td></tr>
+      <tr><td><a href="https://www.adafruit.com/product/3814">JST-PH male-header lead</a></td><td>Connects the battery plug to the board’s battery pads.</td><td>$0.75</td></tr>
+    </tbody></table></div>
+    <p><strong>Four-item subtotal: $25.19.</strong> Add wiring, USB cable, mounting supplies, shipping, and tax. This is a bench-parts subtotal, not the cost of a finished Dot or a production bill of materials. A ring diffuser, extra LEDs, enclosure, and any display or audio parts are additional.</p>
+    <p><a href="prototype-parts.csv" download>Download the prototype parts CSV</a></p>
+
+    <h2>Yes to a little screen. Room for a voice.</h2>
+    <p>A small OLED and speaker can be tested with the same prototype before the enclosure is designed. The important measurements are the complete modules, connectors, and acoustic space, not just the visible screen.</p>
+    <div class="table-scroll" role="region" aria-label="Display and audio candidates" tabindex="0"><table><thead><tr><th scope="col">Candidate</th><th scope="col">Published envelope</th><th scope="col">What it proves</th></tr></thead><tbody>
+      <tr><td><a href="https://www.waveshare.com/0.49inch-oled-module.htm">Waveshare 0.49″ OLED</a><br>$5.99 listed</td><td>15.5 × 13.0 mm module; 64 × 32 monochrome pixels, I2C, MX1.25 connector.</td><td>A short status or small icon. Allow for the cable, mounting, and display window.</td></tr>
+      <tr><td><a href="https://www.adafruit.com/product/3006">Adafruit MAX98357A amplifier</a><br>$5.95 listed</td><td>19.4 × 17.8 × 3.0 mm board specification. Current version adds a terminal block.</td><td>A digital-audio bench path. Full connector clearance and MCU pin/clock compatibility need testing.</td></tr>
+      <tr><td><a href="https://www.adafruit.com/product/1890">Adafruit mini metal speaker</a><br>$1.95 listed; out of stock at check</td><td>28 mm diameter × 4.5 mm; 8 Ω, 0.5 W.</td><td>An example speaker envelope for the larger version. The amplifier must be limited to protect this speaker.</td></tr>
+    </tbody></table></div>
+    <p>The OLED in the render illustrates a display window and interface. It is not a drawing of that rectangular module’s fitted assembly. Smaller bare speakers and display panels exist, but selecting them moves the project toward custom electronics, acoustic design, and manufacturing work.</p>
+    <p>For v0, keep replies on a phone, Mac, or headphones. Add a speaker to the larger bench prototype once microphone capture and latency work. Speech clarity, microphone feedback, and peak battery current determine whether local replies are worth the extra size.</p>
+
+    <h2>Prove it in three steps.</h2>
+    <ol class="prototype-steps">
+      <li><strong>Interaction first.</strong> Test the button, microphone, BLE audio, host transcription, and status colors over USB. Hold a button for a short phrase; release should stop capture and yield one result.</li>
+      <li><strong>Fit actual parts.</strong> Measure current and runtime with the selected battery. Build a roomy printed enclosure around the physical stack. Test microphone openings, USB access, pocket presses, and necklace or wrist mounts.</li>
+      <li><strong>Miniaturize what works.</strong> Replace development boards with a custom PCB. Validate the antenna near the body, charging, battery protection, diffuser, tolerances, and thermal behavior. Then work with a manufacturer on assembly and certification.</li>
+    </ol>
+    <p>Do not promise all-day always-listening from the render. Continuous capture, BLE streaming, display time, LEDs, and speaker playback all consume power. An optional listening session needs visible capture, an explicit stop, and measured runtime and phone-background behavior.</p>
+
+    <h2 id="connection">One Dot. Your existing OpenAGI.</h2>
+    <div class="connection-flow" aria-label="Proposed connection flow"><span>Dot captures</span><span>Companion transcribes</span><span>OpenAGI responds</span></div>
+    <p>A phone or Mac companion would pair each Dot, receive its audio, and attach its configured role to the resulting text. Dictation would target your chosen app; agent mode would send the completed request to OpenAGI. The small device would carry neither the language model nor the account’s API credentials.</p>
+    <p>OpenAGI already has authenticated text messaging, pending-action retrieval, and native Mac notifications. A Dot BLE receiver, transcription adapter, assignment routing, and remote light control still need implementation. Existing G2 speech routes are device-specific and are not a ready-made Dot integration.</p>
+    <p>Amber would point you to the existing decision screen. Review and approval would stay on your phone or Mac. A button press should not silently approve an external action.</p>
+
+    <h2>Reuse what is already out there.</h2>
+    <p><a href="https://github.com/BasedHardware/omi">Omi’s MIT-licensed firmware and SDKs</a> are a useful BLE audio starting point, with a documented XIAO Sense target. Stock firmware is a baseline; capture gating, secure pairing, and status control must be adapted and verified.</p>
+    <p><a href="https://www.aliexpress.com/w/wholesale-bluetooth-shutter-button.html">Commodity Bluetooth shutter buttons</a> can test the physical interaction using the phone’s microphone. Check real hold/release events before buying. Those are not verified replacements for a microphone-equipped, programmable RGB Dot.</p>
+    <p>OpenAGI is source-available under PolyForm Noncommercial 1.0.0. Its license should be reviewed separately from MIT-licensed firmware when considering a commercial product.</p>
+    <p><a href="concept.html">Return to the Dot concept</a> · <a href="hardware/build-notes.html">Earlier Pocket build notes</a></p>
+  </main>
+  <footer class="footer"><div class="footer-inner"><p>Concept and prototype research · September 2026. No board has been flashed, Dot assembled, or hardware runtime measured for this concept. Photorealistic renders are visual references.</p></div></footer>
+</body>
+</html>

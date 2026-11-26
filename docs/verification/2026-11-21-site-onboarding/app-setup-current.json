@@ -1,0 +1,11 @@
+{
+  "url": "http://127.0.0.1:43311/?tab=chat",
+  "status": 200,
+  "title": "OpenAGI",
+  "heading": "Chat",
+  "errors": [],
+  "viewport": {
+    "width": 1280,
+    "height": 900
+  }
+}

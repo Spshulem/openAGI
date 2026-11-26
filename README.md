@@ -60,6 +60,15 @@ Windows PowerShell users can use `npm.cmd ci --ignore-scripts` and
 `npm.cmd run serve`. Source/portable users should relaunch after setup asks for
 a restart. See [all install paths, Docker, updates, and troubleshooting](docs/INSTALL.md).
 
+For Debian-family Linux or a compatible Raspberry Pi, inspect and run the
+shell installer:
+
+```sh
+curl -fL https://openagi.sh/install.sh -o install-openagi.sh
+less install-openagi.sh
+sh install-openagi.sh
+```
+
 ## What you can do
 
 | Goal | Where to start | What to verify |
@@ -101,13 +110,19 @@ using Computer Use and running repairs have their own controls. See the
 [voice setup](docs/setup/fleet-supervisor.md#voice) and
 [self-fix setup](docs/setup/fleet-supervisor.md#self-fix-runner).
 
-## Availability
+## Availability and evidence
 
 This README describes the repository's current capabilities. Check the
 [latest release](https://github.com/Spshulem/openAGI/releases/latest) for the
 installers and portable downloads actually published. The mobile apps are
-source/QA builds; no public store release is linked here. Windows/Linux
-portable downloads appear when the release workflow publishes those assets.
+source/QA builds; no public store release is linked here. A GitHub Actions
+artifact is uploaded evidence, not a public download, and a Store submission
+is not public availability. The website and docs label these states separately.
+
+OpenAGI does not include product telemetry or an account service. Local budget
+and audit views record configured model cost and attribution on the host; they
+do not upload message content. GitHub may show aggregate clone/download counts,
+but those are GitHub's repository analytics rather than OpenAGI user analytics.
 
 ## Why a persistent runtime helps
 

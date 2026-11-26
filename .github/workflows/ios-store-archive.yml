@@ -84,3 +84,45 @@ jobs:
           path: ${{ runner.temp }}/OpenAGI-${{ steps.ver.outputs.build }}-archive.zip
           if-no-files-found: error
           retention-days: 14
+
+  # Unsigned Android release artifacts (AAB for Play, APK for sideload QA)
+  # from the same commit. Signing and upload stay separate delivery steps;
+  # no keystore or credential is used here.
+  android-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install pinned Android SDK
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Resolve app version
+        id: ver
+        run: |
+          set -euo pipefail
+          name="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' mobile/android/app/build.gradle.kts | head -1)"
+          code="$(sed -nE 's/^[[:space:]]*versionCode = ([0-9]+).*/\1/p' mobile/android/app/build.gradle.kts | head -1)"
+          [[ -n "$name" && "$code" =~ ^[0-9]+$ ]] || { echo "::error::Could not read versionName/versionCode"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+      - name: Build unsigned store artifacts
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon --max-workers=2 bundleRelease assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-android-${{ steps.ver.outputs.name }}-${{ steps.ver.outputs.code }}-release-unsigned
+          path: |
+            mobile/android/app/build/outputs/bundle/release/*.aab
+            mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
