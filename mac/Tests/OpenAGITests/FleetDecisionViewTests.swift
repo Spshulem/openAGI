@@ -32,7 +32,8 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertEqual(view.goal.text, "Finish the remaining Sales call-type admission work.")
     XCTAssertFalse(view.goal.unknown)
     XCTAssertEqual(view.status.done, ["GitHub shows no other failing checks on either."])
-    XCTAssertEqual(view.status.blocked.count, 2)
+    // Each PR's table row is shown once, as its facts, not also as a blocker.
+    XCTAssertEqual(view.status.blocked, ["Merging needs your approval because you review every merge."])
     XCTAssertEqual(view.status.unverified, ["The post-merge verification on main is still pending."])
     XCTAssertEqual(view.status.prs.map(\.ref), ["#1201", "#1202"])
     XCTAssertEqual(view.status.prs[1].facts, ["Certificate: passed", "Conflicts: none", "Threads: 5/5 resolved", "Blocker: 1 approving review"])
@@ -76,7 +77,8 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertEqual(card.context, "Ship the release notes fix")
     XCTAssertEqual(card.decision, "Should I merge #77 over the required review with your admin rights, or wait for review?")
     XCTAssertTrue(card.secondaryAction?.adminBypass == true)
-    XCTAssertEqual(card.suggestedReplies.count, 3)
+    // The hub drops "proceed with the recommended option" when none is recommended.
+    XCTAssertEqual(card.suggestedReplies.count, 2)
     // No decisionView: today's rendering, not the four parts.
     XCTAssertNil(FleetDecisionPresentation.make(question: nil, card: card))
 
@@ -139,7 +141,7 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertFalse(p.buttons.contains(where: \.recommended), "a bypass is never the default unless recommended")
     XCTAssertTrue(try XCTUnwrap(p.buttons.first { $0.value == "merge now" }).adminBypass)
     // Its old generic quick replies are not options, so they stay.
-    XCTAssertEqual(p.quickReplies.count, 3)
+    XCTAssertEqual(p.quickReplies.count, 2)
   }
 
   func testSparseCardHasNoAnswerButtons() throws {

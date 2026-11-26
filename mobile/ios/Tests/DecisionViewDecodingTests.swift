@@ -17,7 +17,7 @@ final class DecisionViewDecodingTests: XCTestCase {
         XCTAssertEqual(view.goal.title, "Sales v1 PR review")
         XCTAssertFalse(view.goal.unknown)
         XCTAssertEqual(view.status.done.count, 1)
-        XCTAssertEqual(view.status.blocked.count, 2)
+        XCTAssertEqual(view.status.blocked.count, 1, "each PR's table row is shown once, as its facts")
         XCTAssertEqual(view.status.unverified, ["The post-merge verification on main is still pending."])
         XCTAssertEqual(view.status.prs.map(\.ref), ["#1201", "#1202"])
         XCTAssertEqual(view.status.prs.last?.facts.contains("Threads: 5/5 resolved"), true)
