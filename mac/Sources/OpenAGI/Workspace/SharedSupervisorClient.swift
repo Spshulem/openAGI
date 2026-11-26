@@ -1357,12 +1357,27 @@ final class SharedSupervisorClient: ObservableObject {
     return ok
   }
 
+  /// The text executeSingleMessage puts on the wire (and shows). A resend
+  /// of the same turn must carry exactly this: main compares it before
+  /// treating a repeat of the id as the same message.
+  /// The focused card id as the first attempt sends it, or nil.
+  nonisolated static func wireCardId(_ raw: String?) -> String? {
+    guard let card = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !card.isEmpty,
+          card.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil else { return nil }
+    return card
+  }
+
+  nonisolated static func wireText(_ text: String) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+  }
+
   /// executeSingleMessage, with the message kept in the pending file until
   /// its request has ended (main took it, refused it, or it is outstanding).
   private func sendKeepingPending(_ text: String, focusedCardId: String?, attachments: [WorkspaceImageAttachment],
                                   requestId: String) async -> Bool {
     sendingPending = SupervisorPendingQueueStore.message(
-      requestId: requestId, text: text, focusedCardId: focusedCardId, attachments: attachments,
+      requestId: requestId, text: Self.wireText(text), focusedCardId: Self.wireCardId(focusedCardId), attachments: attachments,
       pendingUpload: hubQueueAvailable, uploadAttempted: true)
     savePendingIfChanged()
     defer {
@@ -1374,14 +1389,13 @@ final class SharedSupervisorClient: ObservableObject {
 
   private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],
                                     requestId: String) async -> Bool {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
     replyBaselineIds = previousAssistantIds
     lastError = nil
     streamingReplyText = nil
     progressStage = "queued"
 
-    let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+    let displayText = Self.wireText(text)
     replyPromptText = displayText
     let localId = "local_\(UUID().uuidString)"
     let optimistic = SyncedSupervisorMessage(

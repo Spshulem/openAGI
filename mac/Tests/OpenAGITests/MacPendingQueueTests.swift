@@ -87,10 +87,14 @@ final class MacPendingQueueTests: XCTestCase {
     let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: config), baseURL: URL(string: "http://daemon.test:43210")!,
                                             token: "synthetic", pendingQueueURL: file)
     MacHeldStreamProtocol.hold.insert("Sent, not answered")
-    let send = Task { await supervisor.sendMessage("Sent, not answered") }
+    let send = Task { await supervisor.sendMessage("  Sent, not answered \n", focusedCardId: " card:7 ") }
     try await waitFor("the request to reach main") { MacHeldStreamProtocol.isHeld("Sent, not answered") }
     let requestId = try XCTUnwrap(MacHeldStreamProtocol.sentTurns.first?.requestId)
-    XCTAssertEqual(SupervisorPendingQueueStore(url: file).load().map(\.requestId), [requestId], "a quit now still has it, with its turn id")
+    let saved = SupervisorPendingQueueStore(url: file).load()
+    XCTAssertEqual(saved.map(\.requestId), [requestId], "a quit now still has it, with its turn id")
+    XCTAssertEqual(saved.first?.text, "Sent, not answered", "exactly the text on the wire, so a resend is the same message to main")
+    XCTAssertEqual(saved.first?.focusedCardId, "card:7")
+    XCTAssertEqual(SharedSupervisorClient.wireText("  "), "Please inspect the attached screenshot(s).", "an image-only send, as sent")
     MacHeldStreamProtocol.release("Sent, not answered", frames: "event: final\ndata: {\"reply\":\"Done\"}\n\n")
     _ = await send.value
     XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "answered: nothing left only on this Mac")
