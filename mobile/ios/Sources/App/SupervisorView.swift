@@ -373,6 +373,13 @@ struct SupervisorView: View {
             }
         }
         .task(id: model.fleetGeneration) { await refresh() }
+        // A Live Activity, notification or Shortcut asks for a session (or
+        // just the overview): close whatever sheet is up, then open the
+        // requested context through the same path as a notification tap.
+        .onChange(of: PushRouter.shared.dismissesSheets, initial: true) { _, dismiss in
+            guard dismiss else { return }
+            applyRequestedContextOpen(cardID: model.requestedOpenContextCardID, threadKey: model.requestedOpenThreadKey)
+        }
         .onChange(of: model.requestedFocusCardID, initial: true) { _, cardID in
             applyRequestedFocus(cardID)
         }
@@ -1594,6 +1601,13 @@ struct SupervisorView: View {
     }
 
     private func applyRequestedContextOpen(cardID: String?, threadKey: String?) {
+        // Consumed by whichever request handler runs first, so the sheet a
+        // link presents below is never the one it closes.
+        if PushRouter.shared.dismissesSheets {
+            PushRouter.shared.dismissesSheets = false
+            activeSheet = nil
+            openThread = nil
+        }
         let cleanCardID = cardID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanThreadKey = threadKey?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (cleanCardID?.isEmpty == false) || (cleanThreadKey?.isEmpty == false) else {
