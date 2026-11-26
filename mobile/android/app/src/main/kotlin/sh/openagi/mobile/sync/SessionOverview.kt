@@ -63,7 +63,8 @@ data class SessionOverview(
                     .thenByDescending { it.watch?.since ?: Instant.MIN })
             fun count(group: String) = sessions.count { it.watch?.group == group }
             return SessionOverview(count("you"), count("working"), count("waiting"), count("blocked"), sessions.firstOrNull(),
-                state.snapshot?.at ?: state.lastTickAt, state.lastErrorText != null || state.snapshot?.sourceErrorTexts?.isNotEmpty() == true)
+                state.snapshot?.at ?: state.lastTickAt, state.lastErrorText != null || state.snapshot?.sourceErrorTexts?.isNotEmpty() == true ||
+                    state.snapshot?.unknownPrefixes?.isNotEmpty() == true)
         }
     }
 }

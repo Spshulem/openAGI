@@ -40,6 +40,9 @@ data class FleetSnapshot(
     val threads: List<FleetThread> = emptyList(),
     val infra: JsonElement? = null,
     val sourceErrors: Map<String, JsonElement> = emptyMap(),
+    // Thread-key prefixes of Paseo hosts that could not be reached; their
+    // previous rows are carried forward, so the snapshot is partial.
+    val unknownPrefixes: List<String> = emptyList(),
 ) {
     // Only sources that actually carry a message; an empty entry is not a failure.
     val sourceErrorTexts: Map<String, String>

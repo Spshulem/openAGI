@@ -102,7 +102,10 @@ export function buildActivity(state, now = new Date()) {
     at: now.toISOString(), counts, rows: rows.slice(0, ROWS_MAX),
     // Sending a push does not mean the underlying scan is fresh.
     observedAt: isoOrNull(state?.snapshot?.at) ?? isoOrNull(state?.lastTickAt),
+    // An unreachable Paseo host is not a sourceErrors entry: its prefix is
+    // listed and its previous rows are carried forward as if current.
     partial: Boolean(state?.lastError) || Object.values(state?.snapshot?.sourceErrors ?? {}).some(Boolean)
+      || (Array.isArray(state?.snapshot?.unknownPrefixes) && state.snapshot.unknownPrefixes.length > 0)
   };
 }
 

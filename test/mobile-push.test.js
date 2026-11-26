@@ -766,3 +766,10 @@ test("source failures flag partial results while preserving the last observed ti
   assert.equal(activity.partial, true);
   assert.equal(activity.observedAt, new Date(T0 - 60 * MIN).toISOString());
 });
+
+test("an unreachable Paseo host marks the activity partial even when every source scanned", () => {
+  const snapshot = { at: new Date(T0).toISOString(), threads: [thread("a", "working")], sourceErrors: {} };
+  assert.equal(buildActivity({ snapshot }, new Date(T0)).partial, false);
+  assert.equal(buildActivity({ snapshot: { ...snapshot, unknownPrefixes: ["paseo:host-b."] } }, new Date(T0)).partial, true);
+  assert.equal(buildActivity({ snapshot: { ...snapshot, unknownPrefixes: [] } }, new Date(T0)).partial, false);
+});

@@ -31,6 +31,14 @@ class SessionOverviewTest {
         assertTrue(SessionOverview.from(FleetState()).stale(now))
     }
 
+    @Test fun unreachablePaseoHostMarksCountsPartial() {
+        val threads = listOf(thread("paseo:b.1", "working"))
+        assertFalse(SessionOverview.from(FleetState(snapshot = FleetSnapshot(at = now, threads = threads))).partial)
+        val overview = SessionOverview.from(FleetState(snapshot = FleetSnapshot(at = now, threads = threads, unknownPrefixes = listOf("paseo:b."))))
+        assertTrue(overview.partial)
+        assertTrue(overview.body(now, false).contains("Some sessions unavailable"))
+    }
+
     @Test fun reconnectReplacesCountsAndFreshness() {
         val old = SessionOverview.from(FleetState(snapshot = FleetSnapshot(at = now.minusSeconds(1800), threads = listOf(thread("a", "working")))))
         assertTrue(old.stale(now))
