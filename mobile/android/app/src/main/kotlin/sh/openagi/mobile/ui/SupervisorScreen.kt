@@ -61,6 +61,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
@@ -90,6 +91,8 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.FleetAction
 import sh.openagi.mobile.protocol.FleetConversation
@@ -139,6 +142,8 @@ fun SupervisorScreen(
     // to the open supervisor conversation rather than the dashboard.
     chatOpenState: MutableState<Boolean> = remember { mutableStateOf(false) },
     showChatInline: Boolean = false,
+    requestedThreadKey: String? = null,
+    onThreadRequestConsumed: () -> Unit = {},
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -447,6 +452,26 @@ fun SupervisorScreen(
                 replyBusyThread = null
             }
         }
+    }
+
+    // Keyed on the request alone, so a state change does not restart it
+    // between the lookup and the fetch below.
+    LaunchedEffect(requestedThreadKey) {
+        val key = requestedThreadKey ?: return@LaunchedEffect
+        fun find(fresh: FleetState?) = fresh?.snapshot?.threads?.firstOrNull { it.key == key }
+        var match = find(snapshotFlow { state }.filterNotNull().first())
+        // The snapshot on screen can predate the notification: fetch once
+        // before deciding the session is gone.
+        if (match == null) {
+            refresh()
+            match = find(state)
+        }
+        chatOpen = false
+        openThread = null
+        match?.let { openSheet(it) }
+        // A session still absent after that fetch opens the overview, never
+        // a different session or an automatic reply.
+        onThreadRequestConsumed()
     }
 
     LaunchedEffect(resumeSignal, chatOpen, showChatInline) {

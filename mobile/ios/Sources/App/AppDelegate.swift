@@ -95,8 +95,13 @@ final class PushRouter {
     var pendingThreadKey: String?
     // Any other tab a notification tap asks for.
     var wantsTab: AppTab?
+    // Set by every Supervisor link (notification, Live Activity, Shortcut):
+    // whatever sheet is up closes once, so an overview request is not hidden
+    // behind an older session and a linked one can present.
+    var dismissesSheets = false
 
     func openSupervisor(questionID: String? = nil, threadKey: String? = nil) {
+        dismissesSheets = true
         if let q = questionID?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
             pendingQuestionID = q
         }
