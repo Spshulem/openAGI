@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Generate AppIcon.icns and MenuIcon@x.png from the source PNGs in
-# mac/Resources/icon-sources/. Idempotent — safe to re-run.
+# Generate AppIcon.icns from the source PNG in mac/Resources/icon-sources/.
+# Idempotent — safe to re-run.
 #
-# Inputs (committed):
+# Input (committed):
 #   mac/Resources/icon-sources/AppIcon-source.png   (square, 1024+ px, opaque ok)
-#   mac/Resources/icon-sources/MenuIcon-source.png  (square, alpha required, black-on-clear)
 #
-# Outputs:
+# Output:
 #   mac/Resources/AppIcon.icns          (referenced by Info.plist)
-#   mac/Resources/MenuIcon.png          (22x22, template)
-#   mac/Resources/MenuIcon@2x.png       (44x44, template)
+#
+# The menu bar icon is not built here: it is vector paths drawn in code
+# (mac/Sources/OpenAGI/MenuBarIcon.swift), traced from
+# icon-sources/MenuIcon-source.png by scripts/trace-menu-icon.py.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,10 +18,8 @@ SRC_DIR="${ROOT}/mac/Resources/icon-sources"
 OUT_DIR="${ROOT}/mac/Resources"
 
 APP_SRC="${SRC_DIR}/AppIcon-source.png"
-MENU_SRC="${SRC_DIR}/MenuIcon-source.png"
 
 [[ -f "${APP_SRC}" ]] || { echo "Missing ${APP_SRC}" >&2; exit 1; }
-[[ -f "${MENU_SRC}" ]] || { echo "Missing ${MENU_SRC}" >&2; exit 1; }
 
 # === AppIcon.icns =========================================================
 # macOS expects an .iconset directory with these specific filenames + sizes.
@@ -55,35 +54,5 @@ echo "▶ Compiling AppIcon.icns"
 iconutil --convert icns --output "${OUT_DIR}/AppIcon.icns" "${ICONSET}"
 rm -rf "${ICONSET}"
 
-# === MenuIcon (template) ==================================================
-# macOS template images use the alpha channel only — RGB is ignored — so we
-# only need the source to have transparent background. The build is a simple
-# downscale to 22pt (1x) and 44pt (2x).
-echo "▶ Building MenuIcon"
-# Auto-crop transparent padding so the glyph fills its bounding box, then
-# downscale. Without this step macOS shows ~15% empty padding around the
-# logo and it reads as smaller than every other menu bar item.
-CROPPED="$(mktemp -t menuicon-cropped).png"
-python3 - "${MENU_SRC}" "${CROPPED}" <<'PY'
-import sys
-from PIL import Image
-src, dst = sys.argv[1], sys.argv[2]
-img = Image.open(src).convert("RGBA")
-bbox = img.getbbox()
-if bbox: img = img.crop(bbox)
-# Re-square so menu bar centers it correctly.
-w, h = img.size
-side = max(w, h)
-canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-canvas.paste(img, ((side - w) // 2, (side - h) // 2))
-canvas.save(dst, "PNG")
-PY
-# 28pt @1x / 56px @2x — pushes the glyph to the top of the menu bar slot.
-sips --setProperty format png --resampleHeightWidth 28 28 \
-     "${CROPPED}" --out "${OUT_DIR}/MenuIcon.png" >/dev/null
-sips --setProperty format png --resampleHeightWidth 56 56 \
-     "${CROPPED}" --out "${OUT_DIR}/MenuIcon@2x.png" >/dev/null
-rm -f "${CROPPED}"
-
 echo "▶ Done."
-ls -lh "${OUT_DIR}/AppIcon.icns" "${OUT_DIR}/MenuIcon.png" "${OUT_DIR}/MenuIcon@2x.png"
+ls -lh "${OUT_DIR}/AppIcon.icns"
