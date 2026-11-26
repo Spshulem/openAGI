@@ -52,7 +52,10 @@ struct SupervisorView: View {
     @State private var clearedFocusCardID: String?
     @State private var selectedMessage: UUID?
     @State private var browserThread: ConversationThread = .supervisor
+    // UI tests start expanded so card actions are reachable; pass
+    // --ui-deck-collapsed to start from the collapsed bar a person sees first.
     @State private var isDeckExpanded: Bool = ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        && !ProcessInfo.processInfo.arguments.contains("--ui-deck-collapsed")
     @State private var optimisticallyDismissedCardIDs: Set<String> = []
     @State private var inFlightCardIDs: Set<String> = []
     @State private var toastBanner: SupervisorToast? = nil
@@ -1460,6 +1463,9 @@ struct SupervisorView: View {
         .frame(maxWidth: 720)
         .background(Theme.surface, in: Capsule())
         .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+        // Contain the children: an identifier on a plain stack is copied onto
+        // every child, which hid the Review button's own identifier.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("supervisor-collapsed-deck-bar")
     }
 
