@@ -8,6 +8,7 @@
 //   openagi status                        health + provider + task counts
 //   openagi doctor                        diagnose setup/connection, print fixes
 //   openagi setup                         print the dashboard/setup URL + token
+//   openagi provider [use <claude-cli|codex-cli>]  check / verify+select a CLI sign-in provider
 //   OPENAGI_REMOTE_TOKEN=… openagi pair <url>  pair to an HTTPS remote main
 //   openagi unpair                        forget the saved remote main
 //   openagi tick                          fire a scheduler tick
@@ -19,7 +20,8 @@ import readline from "node:readline";
 import { resolveDataDir } from "../src/data-dir.js";
 import {
   resolveTarget, resolveUpdateTarget, CliClient, runDoctor, writeNodeConfig, normalizeBase,
-  authorizeWorkerProxy, reconnectWorker, readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
+  authorizeWorkerProxy, reconnectWorker, readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider,
+  readProviderState, useCliProvider
 } from "../src/cli-client.js";
 import { pinnedRemoteOrigin } from "../src/node-control.js";
 import { buildPairingUrl, assertPhoneReachable } from "../src/pair-phone.js";
@@ -46,6 +48,7 @@ function parseArgs(argv) {
     else if (a === "--from") flags.from = argv[++i];
     else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "--force") flags.force = true;
+    else if (a === "--replace") flags.replace = true;
     else if (a === "--respond") flags.respond = argv[++i];
     else if (a === "--capture") flags.capture = argv[++i];
     else if (a === "--trigger") flags.trigger = argv[++i];
@@ -155,8 +158,44 @@ async function cmdSetup(flags) {
   }
   console.log(`Open the setup wizard: ${c(BOLD, setupUrl)}`);
   if (target.nodeId) console.log(c(DIM, "This paired node retains only a scoped credential; open the setup URL with the main's admin login."));
-  else if (target.token) console.log(c(DIM, `Auth token (for the login prompt / nodes): ${target.token}`));
+  // The token is an owner credential. Show it to a person at a terminal, but
+  // never write it into a pipe, log file or coding-agent transcript.
+  else if (target.token && tty) console.log(c(DIM, `Auth token (for the login prompt / nodes): ${target.token}`));
+  else if (target.token) console.log("Auth token: hidden because output is not a terminal. Run `openagi setup` yourself in a terminal to show it.");
   else console.log(c(DIM, "No auth token known here — the wizard will generate one on first run."));
+  return 0;
+}
+
+async function cmdProvider(positional, flags) {
+  const [sub, choice] = positional;
+  const { client } = makeClient(flags);
+  if (!sub || sub === "status") {
+    const state = await readProviderState(client);
+    if (flags.json) { console.log(JSON.stringify(state, null, 2)); return state.ok ? 0 : 1; }
+    if (!state.ok) {
+      console.error(c(RED, `✗ ${state.error}`));
+      if (state.fix) console.error(c(YELLOW, `  → ${state.fix}`));
+      return 1;
+    }
+    console.log(`active:     ${state.configured ? c(GREEN, state.active) : c(YELLOW, "none (no working model yet)")}${state.model ? c(DIM, ` · ${state.model}`) : ""}`);
+    console.log(`preference: ${state.preference}`);
+    for (const [id, p] of Object.entries(state.cli)) {
+      console.log(`${id.padEnd(11)} ${p.ready ? c(GREEN, "CLI found + signed in (as the daemon's user)") : c(DIM, `not ready — install ${p.label}, then run \`${p.signIn}\` yourself`)}`);
+    }
+    return 0;
+  }
+  if (sub !== "use") {
+    console.error(c(RED, "usage: openagi provider [status] | openagi provider use <claude-cli|codex-cli> [--replace]"));
+    return 1;
+  }
+  const result = await useCliProvider(client, String(choice ?? "").toLowerCase(), { replace: Boolean(flags.replace) });
+  if (flags.json) { console.log(JSON.stringify(result, null, 2)); return result.ok ? 0 : 1; }
+  if (!result.ok) {
+    console.error(c(RED, `✗ ${result.step}: ${result.error}`));
+    if (result.fix) console.error(c(YELLOW, `  → ${result.fix}`));
+    return 1;
+  }
+  console.log(c(GREEN, `✓ ${result.provider} answered a real test prompt and is now the active provider`) + (result.model ? c(DIM, ` (${result.model})`) : ""));
   return 0;
 }
 
@@ -575,6 +614,10 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi status              health, provider, memory, task counts
   openagi doctor              diagnose setup/connection and print fixes
   openagi setup               print the dashboard/setup URL + token
+  openagi provider            which model is active; is Claude Code / Codex
+                              signed in where the daemon can use it
+  openagi provider use claude-cli|codex-cli [--replace]
+                              run one real test prompt, then select it
   openagi update [--check]    fast-forward + restart (or just check); set
                               OPENAGI_AUTO_UPDATE=1 for a daily auto-update;
                               defaults to this device even when it is paired
@@ -626,6 +669,7 @@ async function main() {
       case "status": return await cmdStatus(flags);
       case "doctor": return await cmdDoctor(flags);
       case "setup": return await cmdSetup(flags);
+      case "provider": return await cmdProvider(positional, flags);
       case "pair": return await cmdPair(positional, flags);
       case "pair-phone": return await cmdPairPhone(flags);
       case "reconnect": return await cmdReconnect(flags);

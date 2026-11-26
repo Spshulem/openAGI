@@ -12,6 +12,15 @@
 # Or with options:
 #   curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh | OPENAGI_FORCE=docker sh
 #
+# After installing, it OFFERS (never assumes) to hand setup to a coding agent:
+# scripts/setup-agent.sh installs the versioned skills/openagi-setup skill for
+# Claude Code or Codex and can open that agent with the setup context. Default
+# answer is no; without a terminal nothing is installed and the manual steps
+# are printed. Control it with:
+#   OPENAGI_AGENT_SETUP=skip        don't offer at all
+#   OPENAGI_AGENT=claude|codex|manual  preselect (still asks before installing)
+#   OPENAGI_NONINTERACTIVE=1        never prompt; print the manual path
+#
 # Tested on: Raspberry Pi OS (bookworm), Ubuntu 22.04+, Debian 12, Armbian, pamir.ai box.
 set -eu
 
@@ -300,6 +309,35 @@ install_via_systemd() {
   color_green "✓ systemd service running."
 }
 
+# Offer the guided, agent-assisted setup. Never fails the install: a missing
+# download or a declined prompt just leaves the browser/manual path.
+offer_agent_setup() {
+  [ "${OPENAGI_AGENT_SETUP:-ask}" = "skip" ] && return 0
+  [ -n "${INSTALLED_MODE}" ] || return 0
+  agent_script=""
+  agent_tmp=""
+  if [ -f "${INSTALL_DIR}/scripts/setup-agent.sh" ] && [ -f "${INSTALL_DIR}/skills/openagi-setup/SKILL.md" ]; then
+    agent_script="${INSTALL_DIR}/scripts/setup-agent.sh"
+  else
+    # Same origin and ref as this installer's own documented URL.
+    agent_tmp="$(mktemp -d)"
+    if ! curl -fsSL --proto '=https' \
+        "https://raw.githubusercontent.com/Spshulem/openAGI/${OPENAGI_SKILL_REF:-main}/scripts/setup-agent.sh" \
+        -o "${agent_tmp}/setup-agent.sh"; then
+      color_yellow "Guided agent setup is unavailable right now; use the setup page above."
+      rm -rf "${agent_tmp}"
+      return 0
+    fi
+    agent_script="${agent_tmp}/setup-agent.sh"
+  fi
+  agent_dir_arg=""
+  [ "${INSTALLED_MODE}" = "systemd" ] && agent_dir_arg="${INSTALL_DIR}"
+  sh "${agent_script}" --agent "${OPENAGI_AGENT:-auto}" --install-mode "${INSTALLED_MODE}" \
+    ${agent_dir_arg:+--install-dir "${agent_dir_arg}"} ${agent_tmp:+--from-download} || true
+  [ -n "${agent_tmp}" ] && rm -rf "${agent_tmp}"
+  return 0
+}
+
 # --- main ---
 arch="$(detect_arch)"
 ip="$(ip_for_user || true)"
@@ -394,3 +432,6 @@ EOF
 esac
 
 printf '\n──────────────────────────────────────────────\n'
+
+# Last, so the sign-in details above are on screen before any agent opens.
+offer_agent_setup
