@@ -18,8 +18,10 @@ final class MacHeldStreamProtocol: URLProtocol {
   private static var sent: [Sent] = []
   private static var interrupts: [String] = []
   static var answerInterrupt: ((String) -> (Int, String))?
+  /// Answer like a main older than turn ids: a requestId is an unsupported field.
+  static var rejectRequestId = false
 
-  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil; history = "{\"messages\":[]}" } }
+  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil; rejectRequestId = false; history = "{\"messages\":[]}" } }
   static var sentTexts: [String] { lock.withLock { sent.map(\.text) } }
   static var sentTurns: [Sent] { lock.withLock { sent } }
   static var interruptIDs: [String] { lock.withLock { interrupts } }
@@ -65,6 +67,10 @@ final class MacHeldStreamProtocol: URLProtocol {
     if path == "/message" {
       let body = jsonBody()
       let text = body["text"] as? String ?? ""
+      if body["requestId"] != nil, Self.lock.withLock({ Self.rejectRequestId }) {
+        respond(400, "{\"error\":\"node message contains unsupported fields\"}")
+        return
+      }
       let shouldHold = Self.lock.withLock {
         Self.sent.append(Sent(text: text, requestId: body["requestId"] as? String, thread: body["thread"] as? String))
         return Self.hold.contains(text)
@@ -274,6 +280,32 @@ final class SupervisorQueueControlsTests: XCTestCase {
     XCTAssertEqual(MacHeldStreamProtocol.interruptIDs, [longJob], "the turn main is running, not a later one")
     try await waitFor("the queue to drain") { supervisor.queuedMessages.isEmpty && !supervisor.isSending }
     XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Long job", "Correction", "Queued behind it"])
+    XCTAssertTrue(supervisor.outstandingRequestIds.isEmpty)
+  }
+
+  func testPartialTextWithoutAFinalFrameIsNotAFinishedReplyAndTheQueueWaits() async throws {
+    let supervisor = client()
+    let first = try await busy(supervisor, running: "Long job", queued: ["Next"])
+    let longJob = try XCTUnwrap(MacHeldStreamProtocol.sentTurns[0].requestId)
+    MacHeldStreamProtocol.lock.withLock {
+      MacHeldStreamProtocol.history = "{\"messages\":[],\"inFlight\":[{\"requestId\":\"\(longJob)\",\"stage\":\"model\"}]}"
+    }
+    // Some text, then the connection ends with no final frame.
+    MacHeldStreamProtocol.release("Long job", frames: "event: delta\ndata: {\"text\":\"Half an ans\"}\n\n")
+    let ok = await first.value
+    XCTAssertFalse(ok, "half a reply is not a finished turn")
+    try await Task.sleep(nanoseconds: 300_000_000)
+    XCTAssertEqual(supervisor.outstandingRequestIds, [longJob], "main may still run it: remembered until history says")
+    XCTAssertFalse(supervisor.messages.contains { $0.role == "assistant" && $0.text == "Half an ans" }, "never shown as the reply")
+    XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Long job"], "nothing is sent behind it")
+    XCTAssertEqual(supervisor.queuedMessages.map(\.text), ["Next"])
+
+    MacHeldStreamProtocol.lock.withLock {
+      MacHeldStreamProtocol.history = "{\"messages\":[{\"id\":\"u1\",\"role\":\"user\",\"text\":\"Long job\",\"requestId\":\"\(longJob)\"},{\"id\":\"a1\",\"role\":\"assistant\",\"text\":\"Half an answer, finished.\",\"requestId\":\"\(longJob)\"}],\"inFlight\":[]}"
+    }
+    await supervisor.refreshMessages()
+    try await waitFor("the queue to drain") { supervisor.queuedMessages.isEmpty && !supervisor.isSending }
+    XCTAssertEqual(MacHeldStreamProtocol.sentTexts, ["Long job", "Next"])
     XCTAssertTrue(supervisor.outstandingRequestIds.isEmpty)
   }
 }

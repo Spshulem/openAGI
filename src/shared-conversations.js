@@ -12,6 +12,7 @@ const DEVICE_SESSION = /^devices:(agent|supervisor):(main|[0-9a-f-]{36})$/;
 const WEB_SESSION = /^local:browser(?:-[^:\x00]{1,180})?:main$/;
 const HISTORY_PATH = /^\/conversations\/(agent|supervisor)\/messages$/;
 const INTERRUPT_PATH = /^\/conversations\/(agent|supervisor)\/interrupt$/;
+const TURNS_PATH = /^\/conversations\/(agent|supervisor)\/turns$/;
 const MESSAGE_ID = /^[\w-]{1,200}$/;
 
 // Same { code, status } shape as G2ChannelError so both transports can map it.
@@ -35,6 +36,7 @@ export function sharedThreadForSession(sessionId) { return DEVICE_SESSION.exec(s
 export function sharedConversationForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[2] ?? null; }
 export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
 export function sharedInterruptThread(pathname) { return INTERRUPT_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+export function sharedTurnsThread(pathname) { return TURNS_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
 // /conversations/:thread/queue[/:requestId[/send-now]] (conversation-queue.js).
 const QUEUE_PATH = /^\/conversations\/(agent|supervisor)\/queue(?:\/([A-Za-z0-9_-]{8,128})(\/send-now)?)?$/;
 export function sharedQueueRoute(pathname) {

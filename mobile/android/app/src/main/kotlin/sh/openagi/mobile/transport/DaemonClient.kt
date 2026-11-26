@@ -17,6 +17,7 @@ import sh.openagi.mobile.protocol.AnswerClarificationResult
 import sh.openagi.mobile.protocol.ApprovalResult
 import sh.openagi.mobile.protocol.Clarification
 import sh.openagi.mobile.protocol.ConversationPage
+import sh.openagi.mobile.protocol.TurnStates
 import sh.openagi.mobile.protocol.CreateTaskRequest
 import sh.openagi.mobile.protocol.DenyRequest
 import sh.openagi.mobile.protocol.DenyResult
@@ -265,6 +266,19 @@ class DaemonClient(
             limit?.let { put("limit", it.toString()) }
         }
         return getJson("/conversations/$thread/messages", query, ConversationPage.serializer())
+    }
+
+    // What main knows about up to 50 of this phone's turns, by id, so a send
+    // whose answer was lost is only sent again when main never took it.
+    // NotFound (owner) or Unauthorized (a phone) is a main older than the route.
+    suspend fun conversationTurns(thread: String, requestIds: List<String>, conversationId: String? = null): TurnStates {
+        require(thread == "agent" || thread == "supervisor") { "unknown thread" }
+        require(requestIds.size in 1..50 && requestIds.none { it.isBlank() || ',' in it }) { "1 to 50 turn ids" }
+        val query = buildMap {
+            put("ids", requestIds.joinToString(","))
+            conversationId?.let { put("conversationId", it) }
+        }
+        return getJson("/conversations/$thread/turns", query, TurnStates.serializer())
     }
 
     // ─── Lifelog (PROTOCOL.md §3.2: GET /lifelog/moments, read-only) ─────────

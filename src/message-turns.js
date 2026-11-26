@@ -238,3 +238,38 @@ export function replayedFailure(stored, requestId) {
   error.openagiReplayed = true;
   return error;
 }
+
+// A turn id a client may name (the same rule /message applies).
+export const CLIENT_TURN_ID = /^[A-Za-z0-9_-]{8,128}$/;
+
+// How each named turn stands, for a client reconnecting with sends it never
+// heard back about (GET /conversations/:thread/turns). It asks before it
+// resends anything, so a send main already took is waited for, not sent
+// again behind the turn it is part of. From main's own state, newest first:
+//
+//   queued       waiting in the hub's queue (conversation-queue.js)
+//   running      running now
+//   done         its reply is stored
+//   failed       it ended without a reply: a failure record, or it left the
+//                hub's queue without running (`code`: stopped, removed,
+//                not_run)
+//   interrupted  its question is stored but main stopped before the reply
+//                (a restart): a retry is a new turn with a new id
+//   unknown      main has no trace of it, so it never took it: sending it
+//                again with the same id is safe
+//
+// `queue` is the hub's ConversationQueue (find, tombstoneFor), or null.
+export function turnStates({ store, liveTurns, queue = null, sessionId, requestIds }) {
+  return requestIds.map((requestId) => {
+    const live = liveTurns?.get(sessionId, requestId);
+    if (live) return { requestId, state: live.stage === "queued" ? "queued" : "running", stage: live.stage };
+    if (queue?.find?.(sessionId, requestId)) return { requestId, state: "queued", stage: "queued" };
+    const stored = storedTurn(store, sessionId, requestId) ?? liveTurns?.stoppedTurn?.(store, sessionId, requestId) ?? null;
+    if (stored?.status === "complete") return { requestId, state: "done", replyId: stored.message.id };
+    if (stored?.status === "failed") return { requestId, state: "failed", code: stored.code ?? "agent_failed" };
+    if (stored?.status === "interrupted") return { requestId, state: "interrupted", code: "interrupted" };
+    const gone = queue?.tombstoneFor?.(sessionId, requestId);
+    if (gone) return { requestId, state: "failed", code: gone.outcome };
+    return { requestId, state: "unknown" };
+  });
+}

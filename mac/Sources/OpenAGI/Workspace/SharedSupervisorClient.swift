@@ -555,7 +555,19 @@ final class SharedSupervisorClient: ObservableObject {
   /// Messages sent while a reply runs: one at a time, in order. Edit holds
   /// the queue at that item; Send Now interrupts the running reply and sends
   /// the item next (see SupervisorChannelsKit's QueuedTurnQueue).
-  @Published private(set) var queue = QueuedTurnQueue<SupervisorQueuedPayload>()
+  @Published private(set) var queue = QueuedTurnQueue<SupervisorQueuedPayload>() {
+    didSet { savePendingIfChanged() }
+  }
+  /// Where the messages only this Mac has (not yet on the hub, or queued
+  /// here for a main without a hub queue) are kept across a quit or a crash,
+  /// and what was last written there.
+  private let pendingStore: SupervisorPendingQueueStore
+  private var savedPending: [SupervisorPendingMessage] = []
+  /// The message whose /message request is out now. It left the queue when
+  /// it was sent, but main has not answered yet: kept on disk (first) until
+  /// that request ends, so a quit mid-send still has it. Its turn id makes a
+  /// resend after relaunch attach to or replay the turn, never run it twice.
+  private var sendingPending: SupervisorPendingMessage?
   /// The open queued-message editor's text. Saving never sends.
   @Published var queuedEditDraft = ""
   /// The turn id of the reply streaming now, when main was sent one.
@@ -566,7 +578,9 @@ final class SharedSupervisorClient: ObservableObject {
   /// tray mirrors it -- every device's waiting messages, in the hub's order
   /// -- and Edit, Remove and Send Now are hub requests. Otherwise the queue
   /// stays on this Mac, as before.
-  @Published private(set) var hubQueueAvailable = false
+  @Published private(set) var hubQueueAvailable = false {
+    didSet { savePendingIfChanged() }
+  }
   /// The message the hub runs now, when it came through the queue.
   @Published private(set) var hubRunning: HubQueueItem? = nil
   private var uploadTask: Task<Void, Never>?
@@ -999,8 +1013,8 @@ final class SharedSupervisorClient: ObservableObject {
     // A turn main still runs without this Mac's stream: what waits here goes
     // when it has ended (settleOutstanding), not behind it on main.
     while !hubQueueAvailable, outstandingRequestIds.isEmpty, let next = queue.takeNext() {
-      _ = await executeSingleMessage(next.text, focusedCardId: next.payload.focusedCardId,
-                                     attachments: next.payload.attachments, requestId: next.requestID)
+      _ = await sendKeepingPending(next.text, focusedCardId: next.payload.focusedCardId,
+                                   attachments: next.payload.attachments, requestId: next.requestID)
     }
   }
 
@@ -1016,15 +1030,47 @@ final class SharedSupervisorClient: ObservableObject {
     baseURLOverride = nil
     tokenOverride = nil
     preferences = .standard
+    pendingStore = SupervisorPendingQueueStore(url: SupervisorPendingQueueStore.defaultURL)
+    restorePending()
   }
 
   /// A separate client for tests: its own session, daemon URL, token and
-  /// preferences.
-  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard) {
+  /// preferences, and its own pending-message file (none unless given).
+  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard,
+       pendingQueueURL: URL? = nil) {
     session = testSession
     baseURLOverride = baseURL
     tokenOverride = token
     self.preferences = preferences
+    pendingStore = SupervisorPendingQueueStore(url: pendingQueueURL)
+    restorePending()
+  }
+
+  /// Messages typed before a quit that main never took go back in the
+  /// queue with their turn ids. They go once history has said whether the
+  /// hub keeps the queue (uploadPending) or not (drainIfIdle).
+  private func restorePending() {
+    let saved = pendingStore.load()
+    guard !saved.isEmpty else { return }
+    var restored = queue
+    SupervisorPendingQueueStore.restore(saved, into: &restored)
+    queue = restored
+    savedPending = currentPending()
+  }
+
+  private func currentPending() -> [SupervisorPendingMessage] {
+    var pending = SupervisorPendingQueueStore.pending(queue, hubQueueAvailable: hubQueueAvailable)
+    if let sending = sendingPending, !pending.contains(where: { $0.requestId == sending.requestId }) {
+      pending.insert(sending, at: 0)
+    }
+    return pending
+  }
+
+  private func savePendingIfChanged() {
+    let pending = currentPending()
+    guard pending != savedPending else { return }
+    savedPending = pending
+    pendingStore.save(pending)
   }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
@@ -1228,6 +1274,9 @@ final class SharedSupervisorClient: ObservableObject {
       messages = decoded.messages
       applyHubQueue(decoded.queue)
       settleOutstanding(decoded)
+      // A main without a hub queue: messages restored after a relaunch (or
+      // left waiting while it was out of reach) go now, one at a time.
+      if !hubQueueAvailable { drainIfIdle() }
       lastError = nil
     } catch {
       // Keep cached transcript cleanly when daemon is restarting.
@@ -1303,21 +1352,50 @@ final class SharedSupervisorClient: ObservableObject {
       streamingReplyText = nil
       progressStage = nil
     }
-    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments, requestId: Self.newRequestId())
+    let ok = await sendKeepingPending(text, focusedCardId: focusedCardId, attachments: attachments, requestId: Self.newRequestId())
     await drainQueue()
     return ok
   }
 
+  /// The text executeSingleMessage puts on the wire (and shows). A resend
+  /// of the same turn must carry exactly this: main compares it before
+  /// treating a repeat of the id as the same message.
+  /// The focused card id as the first attempt sends it, or nil.
+  nonisolated static func wireCardId(_ raw: String?) -> String? {
+    guard let card = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !card.isEmpty,
+          card.range(of: "^[A-Za-z0-9:_-]{1,120}$", options: .regularExpression) != nil else { return nil }
+    return card
+  }
+
+  nonisolated static func wireText(_ text: String) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+  }
+
+  /// executeSingleMessage, with the message kept in the pending file until
+  /// its request has ended (main took it, refused it, or it is outstanding).
+  private func sendKeepingPending(_ text: String, focusedCardId: String?, attachments: [WorkspaceImageAttachment],
+                                  requestId: String) async -> Bool {
+    sendingPending = SupervisorPendingQueueStore.message(
+      requestId: requestId, text: Self.wireText(text), focusedCardId: Self.wireCardId(focusedCardId), attachments: attachments,
+      pendingUpload: hubQueueAvailable, uploadAttempted: true)
+    savePendingIfChanged()
+    defer {
+      if sendingPending?.requestId == requestId { sendingPending = nil }
+      savePendingIfChanged()
+    }
+    return await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments, requestId: requestId)
+  }
+
   private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],
                                     requestId: String) async -> Bool {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     let previousAssistantIds = Set(messages.filter { $0.role == "assistant" }.map(\.id))
     replyBaselineIds = previousAssistantIds
     lastError = nil
     streamingReplyText = nil
     progressStage = "queued"
 
-    let displayText = trimmed.isEmpty ? "Please inspect the attached screenshot(s)." : trimmed
+    let displayText = Self.wireText(text)
     replyPromptText = displayText
     let localId = "local_\(UUID().uuidString)"
     let optimistic = SyncedSupervisorMessage(
@@ -1356,7 +1434,15 @@ final class SharedSupervisorClient: ObservableObject {
             includeThread: attempt.includeThread,
             includeFocusedCard: attempt.includeFocusedCard
           )
-          if attempt.includeRequestId { payload["requestId"] = requestId }
+          if attempt.includeRequestId {
+            payload["requestId"] = requestId
+          } else if sendingPending?.requestId == requestId {
+            // A main older than turn ids can't tell a resend from a new
+            // message, so this attempt must never be replayed after a
+            // relaunch: it leaves the pending file before it goes.
+            sendingPending = nil
+            savePendingIfChanged()
+          }
           replyText = try await streamTracked(payload: payload, requestId: attempt.includeRequestId ? requestId : nil)
           break
         } catch is UnsupportedFieldsError {
@@ -1548,9 +1634,10 @@ final class SharedSupervisorClient: ObservableObject {
       return text
     }
 
-    if let partial = streamingReplyText, !partial.isEmpty {
-      return partial
-    }
+    // Ended without its final frame: main may still be running the turn,
+    // so partial text is not a finished reply. streamTracked keeps the turn
+    // outstanding and the queue waits until history says how it ended,
+    // instead of sending the next message behind it.
     throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
       NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
     ])

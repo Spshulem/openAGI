@@ -75,7 +75,7 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { logOperationalEvent, validRequestId } from "./operational-log.js";
-import { LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn, STOPPED_TEXT } from "./message-turns.js";
+import { CLIENT_TURN_ID, LiveTurns, storedTurn, replayedResult, replayedFailure, interruptTurn, STOPPED_TEXT, turnStates } from "./message-turns.js";
 import { ConversationQueue, QueueError, submissionDigest } from "./conversation-queue.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
@@ -120,6 +120,7 @@ import {
   parseLifelogMomentsQuery,
   sharedHistoryThread,
   sharedInterruptThread,
+  sharedTurnsThread,
   sharedSessionId,
   sharedThreadForSession,
   sharedConversationForSession,
@@ -1114,7 +1115,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       ].includes(pathname)
         || isNodeReconnectRequestRoute(method, pathname)
         || isNodeReconnectNodeRoute(method, pathname);
-      const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
+      const sharedHistoryRoute = method === "GET" && (sharedHistoryThread(pathname) !== null || sharedTurnsThread(pathname) !== null);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message") || sharedHistoryRoute;
       const headerNodeId = typeof req.headers["x-openagi-node-id"] === "string"
@@ -2242,6 +2243,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const turnsThread = sharedTurnsThread(pathname);
+        if (turnsThread) {
+          // How each turn a client named stands, so a client reconnecting
+          // with sends it never heard back about resends only the ones main
+          // never took, one at a time, instead of all of them.
+          const ids = [...new Set(String(url.searchParams.get("ids") ?? "").split(",").filter(Boolean))];
+          if (ids.length < 1 || ids.length > 50 || ids.some((id) => !CLIENT_TURN_ID.test(id))) {
+            return sendJson(res, 400, { error: "invalid_ids", message: "ids must list 1 to 50 turn ids." });
+          }
+          const conversationId = url.searchParams.get("conversationId") ?? "main";
+          try {
+            const sessionId = sharedSessionId(turnsThread, conversationId);
+            return sendJson(res, 200, {
+              thread: turnsThread, conversationId,
+              active: liveTurns.list(sessionId),
+              turns: turnStates({ store, liveTurns, queue: conversationQueue, sessionId, requestIds: ids })
+            });
+          } catch (error) {
+            if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+            throw error;
+          }
+        }
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {

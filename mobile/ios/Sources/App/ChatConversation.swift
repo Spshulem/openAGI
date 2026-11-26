@@ -49,6 +49,13 @@ final class ChatConversation {
     // see QueuedTurnQueue for Edit, Remove and Send Now.
     private(set) var queue = QueuedTurnQueue<ChatQueuedPayload>()
     var queuedSubmissions: [QueuedChatSubmission] { queue.items }
+    // What of the queue was last written to disk (messages main has not
+    // taken yet; see ChatHistoryStore.saveQueued).
+    private var savedQueued: [SavedQueuedMessage] = []
+    // Full images of sent turns main has not confirmed yet (see
+    // SavedSendingImages), and what of them was last written.
+    private var sendingImages: [SavedSendingImages] = []
+    private var savedSending: [SavedSendingImages] = []
     var editingQueuedID: UUID? { queue.editingID }
     // The open queued-message editor's text. Saving never sends.
     var queuedEditDraft = ""
@@ -122,7 +129,76 @@ final class ChatConversation {
         // See DaemonClient.sendMessageStreaming: keeps an older main from
         // putting the supervisor chat in the same session as Chat.
         self.legacyConversationKey = thread == .supervisor ? "mobile-supervisor" : nil
-        self.messages = ChatHistoryCodec.restored(store.load(nodeID: nodeID))
+        // A turn sent but never confirmed gets its full images back, so it
+        // can still be resent (the history keeps only previews).
+        let sending = isReadOnly ? [] : store.loadSending(nodeID: nodeID)
+        self.messages = ChatHistoryCodec.restored(ChatConversation.rehydrated(store.load(nodeID: nodeID), sending: sending))
+        self.sendingImages = sending
+        self.savedSending = sending
+        // Messages queued before a quit that main never took come back with
+        // their turn ids. They go once history says whether the hub keeps
+        // the queue (uploadPending) or not (drainIfIdle).
+        let restored = ChatConversation.restoredQueue(isReadOnly ? [] : store.loadQueued(nodeID: nodeID))
+        self.queue = restored
+        self.savedQueued = ChatConversation.pendingQueue(restored, hubQueueAvailable: false)
+    }
+
+    // The queue's messages only this phone has. Without a hub queue that is
+    // every item (an edit may have given a local item an origin); with one,
+    // the items the hub has not accepted yet, never mirrored hub items.
+    nonisolated static func pendingQueue(_ queue: QueuedTurnQueue<ChatQueuedPayload>, hubQueueAvailable: Bool) -> [SavedQueuedMessage] {
+        queue.items.compactMap { item in
+            guard !hubQueueAvailable || item.origin?.pendingUpload == true else { return nil }
+            return SavedQueuedMessage(requestID: item.requestID, text: item.text, attachments: item.payload.attachments,
+                                      focusedCardID: item.payload.focusedCardID, pendingUpload: item.origin?.pendingUpload == true,
+                                      uploadAttempted: item.origin?.uploadAttempted == true, error: item.origin?.error,
+                                      sendNext: item.origin?.sendNext == true ? true : nil)
+        }
+    }
+
+    nonisolated static func restoredQueue(_ saved: [SavedQueuedMessage]) -> QueuedTurnQueue<ChatQueuedPayload> {
+        var queue = QueuedTurnQueue<ChatQueuedPayload>()
+        for message in saved where queue.item(requestID: message.requestID) == nil {
+            queue.enqueue(text: message.text, payload: ChatQueuedPayload(attachments: message.attachments, focusedCardID: message.focusedCardID),
+                          requestID: message.requestID,
+                          origin: message.pendingUpload
+                            ? QueuedOrigin(mine: true, pendingUpload: true, error: message.error, sendNext: message.sendNext == true,
+                                           uploadAttempted: message.uploadAttempted)
+                            : nil)
+        }
+        return queue
+    }
+
+    nonisolated static func rehydrated(_ entries: [SavedChatEntry], sending: [SavedSendingImages]) -> [SavedChatEntry] {
+        guard !sending.isEmpty else { return entries }
+        let images = Dictionary(sending.map { ($0.userID, $0.attachments) }, uniquingKeysWith: { first, _ in first })
+        return entries.map { entry in
+            guard entry.role == "user", let full = images[entry.id] else { return entry }
+            var restored = entry
+            restored.attachments = full
+            return restored
+        }
+    }
+
+    // The reply to this user line is still unconfirmed: on the wire and not
+    // accepted, or "not sent" and waiting for its one resend.
+    private func awaitsConfirmation(userID: UUID) -> Bool {
+        guard let user = messages.firstIndex(where: { $0.id == userID }),
+              let reply = messages[(user + 1)...].first(where: { $0.role == .assistant }) else { return false }
+        return !reply.accepted && (reply.isStreaming || (reply.isFailed && reply.autoRetry))
+    }
+
+    // Writes the messages main has not taken yet whenever they change, so a
+    // force-quit never loses one, with the full images of sent turns it has
+    // not confirmed yet.
+    private func persistQueue() {
+        guard !forgotten, !isReadOnly else { return }
+        sendingImages.removeAll { !awaitsConfirmation(userID: $0.userID) }
+        let pending = Self.pendingQueue(queue, hubQueueAvailable: hubQueueAvailable)
+        guard pending != savedQueued || sendingImages != savedSending else { return }
+        savedQueued = pending
+        savedSending = sendingImages
+        store.saveQueued(nodeID: nodeID, items: pending, sending: sendingImages)
     }
 
     // MARK: - Sending
@@ -141,6 +217,7 @@ final class ChatConversation {
 
     func removeQueuedSubmission(id: UUID) {
         guard let item = queue.item(id) else { return }
+        defer { persistQueue() }
         // On the wire now, or sent before without an answer: the hub may
         // have it, so it is removed there too (removeAfterUploads), never
         // only here where the hub would still run it.
@@ -224,6 +301,7 @@ final class ChatConversation {
     @discardableResult
     func saveQueuedEdit() -> Bool {
         guard let id = queue.editingID, let item = queue.item(id) else { return false }
+        defer { persistQueue() }
         var text = queuedEditDraft
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !item.attachments.isEmpty {
             text = "Please describe the attached images."
@@ -348,6 +426,7 @@ final class ChatConversation {
         // Every waiting message keeps its controls here, including one this
         // phone sent on a stream that the hub queued behind another turn.
         queue.mirror(snapshot, payload: { _ in ChatQueuedPayload(attachments: [], focusedCardID: nil) }, skip: removeAfterUpload)
+        persistQueue()
         settleEnded(snapshot.ended ?? [])
     }
 
@@ -391,6 +470,7 @@ final class ChatConversation {
         guard let item = queue.item(requestID: requestID) else { return }
         let text = (error as? HubQueueRefused)?.displayMessage ?? fallback
         queue.setOrigin(item.id) { $0.error = text }
+        persistQueue()
     }
 
     // Sends messages the hub has not accepted yet, oldest first, each with
@@ -407,6 +487,9 @@ final class ChatConversation {
                 // hub itself answers, whatever this try's failure.
                 let earlierUncertain = next.origin?.uploadAttempted == true
                 self.queue.setOrigin(next.id) { $0.uploadAttempted = true }
+                // On disk before the request goes: after a quit mid-upload,
+                // removing it must still ask the hub.
+                self.persistQueue()
                 var offline = false
                 do {
                     let (snapshot, interrupt) = try await self.client.enqueueMessage(
@@ -437,6 +520,7 @@ final class ChatConversation {
                 }
                 self.uploadingRequestID = nil
                 await self.removeAfterUploads()
+                self.persistQueue()
                 if offline { break }
             }
             self?.uploadTask = nil
@@ -506,6 +590,7 @@ final class ChatConversation {
             let id = queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
                                    requestID: Self.newRequestID(),
                                    origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true, sendNext: true) : nil)
+            persistQueue()
             if hubQueueAvailable {
                 // Shown first at once, asking; the hub's answer says what happened.
                 queue.beginHubSendNow(id)
@@ -549,6 +634,7 @@ final class ChatConversation {
         queue.enqueue(text: effective, payload: ChatQueuedPayload(attachments: attachments, focusedCardID: focusedCardID),
                       requestID: Self.newRequestID(),
                       origin: hubQueueAvailable ? QueuedOrigin(mine: true, pendingUpload: true) : nil)
+        persistQueue()
         if hubQueueAvailable { uploadPending() } else { drainIfIdle() }
         return true
     }
@@ -581,6 +667,10 @@ final class ChatConversation {
         reply.requestID = requestID
         messages.append(user)
         messages.append(reply)
+        // Its images stay on disk in full until main confirms the turn.
+        if !attachments.isEmpty, attachments.allSatisfy({ $0.data != nil }) {
+            sendingImages.append(SavedSendingImages(userID: user.id, attachments: attachments))
+        }
         persist()
     }
 
@@ -919,6 +1009,7 @@ final class ChatConversation {
     func persist() {
         guard !forgotten else { return }
         store.save(nodeID: nodeID, entries: messages.map(ChatHistoryCodec.saved))
+        persistQueue()
     }
 
     // Stop late replies/history refreshes from writing while setup is open,
@@ -940,6 +1031,9 @@ final class ChatConversation {
         draft = ""
         draftAttachments = []
         queue.removeAll()
+        savedQueued = []
+        sendingImages = []
+        savedSending = []
         queuedEditDraft = ""
         focusedCardID = nil
         composerRevision += 1

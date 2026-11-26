@@ -245,6 +245,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| GET | `/conversations/agent/turns` | where each named agent turn stands, §3.1 |
+| GET | `/conversations/supervisor/turns` | where each named supervisor turn stands, §3.1 |
 | POST | `/conversations/agent/interrupt` | stop the running reply so a queued message goes first, §3.1 |
 | POST | `/conversations/supervisor/interrupt` | same, supervisor thread, §3.1 |
 | GET, POST | `/conversations/agent/queue`, `/conversations/supervisor/queue` | the hub's queue for the thread; add a message, §3.1 |
@@ -403,6 +405,23 @@ names each turn:
   also lists the thread's turns still running:
   `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
   A turn in `inFlight`, or whose reply is not there yet, is still working.
+- `GET /conversations/:thread/turns?ids=a,b` (1-50 ids, optional
+  `conversationId`; owner, paired phones and owner proxies) says how each
+  named turn stands, for a client reconnecting with sends it never heard
+  back about: `{"thread", "conversationId", "active": [<inFlight entries>],
+  "turns": [{"requestId", "state", "code"?}]}`. `state` is `queued` (waiting
+  in the hub's queue), `running`, `done` (its reply is in history), `failed`
+  (a failure record, or it left the hub's queue without running: `code`
+  `stopped`, `removed` or `not_run`), `interrupted` (its question is stored
+  but main stopped before the reply: a retry is a new turn with a new id), or
+  `unknown` (main never took it: safe to send again with the same id). Other
+  ids are `400`. Mains older than this route answer `404` (owner) or `401`
+  (a phone; its heartbeat still succeeds): resend an unconfirmed send at
+  most once, with the same id, and only while history lists nothing in
+  `inFlight`.
+- After a drop, a client resends at most one unconfirmed send at a time, and
+  only once main says it never took it and `active` is empty. Reconnecting
+  must never release several queued sends at once.
 
 #### Interrupting a reply (queued message "Send now")
 

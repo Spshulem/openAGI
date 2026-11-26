@@ -110,6 +110,10 @@ const EXACT = new Set([
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  // How each turn the phone named stands, when it reconnects with sends it
+  // never heard back about.
+  "GET /conversations/agent/turns",
+  "GET /conversations/supervisor/turns",
   // Stop a running reply so a corrected message goes first.
   "POST /conversations/agent/interrupt",
   "POST /conversations/supervisor/interrupt",

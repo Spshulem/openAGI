@@ -49,6 +49,61 @@ private struct SavedConversation: Codable {
     var entries: [SavedChatEntry]
 }
 
+// One queued message main has not taken yet: typed while a reply ran and
+// not yet uploaded to the hub's queue (offline, main restarting), or waiting
+// in this phone's own queue on a main without one. Kept so a force-quit or a
+// relaunch while offline never loses it; it keeps its turn id, so when it
+// does go main runs it once. Keeps the full image data (the history file
+// keeps only previews). Messages the hub accepted are not kept here: the
+// hub's queue is durable and the tray mirrors it.
+public struct SavedQueuedMessage: Codable, Sendable, Equatable {
+    public var requestID: String
+    public var text: String
+    public var attachments: [ChatAttachment]
+    public var focusedCardID: String?
+    // For the hub's queue (true), or this phone's own queue (false).
+    public var pendingUpload: Bool
+    // An upload went out and no answer came back: the hub may have it.
+    public var uploadAttempted: Bool
+    // The hub's last refusal, shown on its row.
+    public var error: String?
+    // "Send anyway": when the hub takes it, it goes next and the running
+    // reply is stopped. Optional, so files written before it decode.
+    public var sendNext: Bool?
+
+    public init(requestID: String, text: String, attachments: [ChatAttachment], focusedCardID: String?,
+                pendingUpload: Bool, uploadAttempted: Bool, error: String? = nil, sendNext: Bool? = nil) {
+        self.requestID = requestID
+        self.text = text
+        self.attachments = attachments
+        self.focusedCardID = focusedCardID
+        self.pendingUpload = pendingUpload
+        self.uploadAttempted = uploadAttempted
+        self.error = error
+        self.sendNext = sendNext
+    }
+}
+
+// The full images of a sent turn main has not confirmed yet, keyed by its
+// user line (`SavedChatEntry.id`, which a retry keeps). The history keeps
+// only previews, so without these a relaunch could not resend the turn.
+public struct SavedSendingImages: Codable, Sendable, Equatable {
+    public var userID: UUID
+    public var attachments: [ChatAttachment]
+
+    public init(userID: UUID, attachments: [ChatAttachment]) {
+        self.userID = userID
+        self.attachments = attachments
+    }
+}
+
+private struct SavedQueue: Codable {
+    var nodeID: String
+    var items: [SavedQueuedMessage]
+    // Optional, so files written before it decode.
+    var sending: [SavedSendingImages]?
+}
+
 // A conversation kept on the phone so a relaunch, a process kill, or a
 // daemon that is unreachable right now does not wipe it -- the same job as
 // Android's ChatHistoryStore. The daemon's shared thread is the source of
@@ -61,9 +116,14 @@ public struct ChatHistoryStore: Sendable {
     public static let maxEntries = 200
 
     private let file: URL
+    // Queued messages main has not taken yet, beside the history and scoped
+    // the same way. A separate file: the history is rewritten often and must
+    // not carry image data.
+    private let queueFile: URL
 
     public init(thread: String, directory: URL = ChatHistoryStore.defaultDirectory) {
         self.file = directory.appending(path: "chat-\(thread).json")
+        self.queueFile = directory.appending(path: "chat-\(thread).queued.json")
     }
 
     // Application Support, not the App Group container: the widget never
@@ -92,7 +152,36 @@ public struct ChatHistoryStore: Sendable {
         try? data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 
+    private func loadQueueFile(nodeID: String) -> SavedQueue? {
+        guard let data = try? Data(contentsOf: queueFile),
+              let saved = try? ProtocolDecoder.json.decode(SavedQueue.self, from: data),
+              saved.nodeID == nodeID
+        else { return nil }
+        return saved
+    }
+
+    public func loadQueued(nodeID: String) -> [SavedQueuedMessage] {
+        loadQueueFile(nodeID: nodeID)?.items ?? []
+    }
+
+    public func loadSending(nodeID: String) -> [SavedSendingImages] {
+        loadQueueFile(nodeID: nodeID)?.sending ?? []
+    }
+
+    // Never trimmed: every item is something the person asked to send.
+    // Nothing left, no file.
+    public func saveQueued(nodeID: String, items: [SavedQueuedMessage], sending: [SavedSendingImages] = []) {
+        guard !items.isEmpty || !sending.isEmpty else {
+            try? FileManager.default.removeItem(at: queueFile)
+            return
+        }
+        guard let data = try? ProtocolDecoder.jsonEncoder.encode(SavedQueue(nodeID: nodeID, items: items, sending: sending.isEmpty ? nil : sending)) else { return }
+        try? FileManager.default.createDirectory(at: queueFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: queueFile, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
     public func delete() {
         try? FileManager.default.removeItem(at: file)
+        try? FileManager.default.removeItem(at: queueFile)
     }
 }
