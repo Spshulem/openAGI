@@ -79,7 +79,7 @@ final class MenuBarIconTests: XCTestCase {
         report["\(name)-\(scale)x-glyphPixelHeight"] = alpha.boundingBox(threshold: 128)?.height ?? 0
         for (appearance, ink, background) in [("light", NSColor.black, NSColor(white: 0.93, alpha: 1)),
                                               ("dark", NSColor.white, NSColor(white: 0.16, alpha: 1))] {
-          let png = Self.tintedPNG(image, scale: CGFloat(scale), ink: ink, background: background, magnify: 12 / scale)
+          let png = Self.tintedPNG(image, scale: CGFloat(scale), ink: ink, background: background, magnify: CGFloat(12 / scale))
           try png.write(to: dir.appendingPathComponent("\(name)-\(scale)x-\(appearance).png"))
         }
       }
