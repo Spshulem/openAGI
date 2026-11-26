@@ -52,6 +52,10 @@ final class ChatConversation {
     // What of the queue was last written to disk (messages main has not
     // taken yet; see ChatHistoryStore.saveQueued).
     private var savedQueued: [SavedQueuedMessage] = []
+    // Full images of sent turns main has not confirmed yet (see
+    // SavedSendingImages), and what of them was last written.
+    private var sendingImages: [SavedSendingImages] = []
+    private var savedSending: [SavedSendingImages] = []
     var editingQueuedID: UUID? { queue.editingID }
     // The open queued-message editor's text. Saving never sends.
     var queuedEditDraft = ""
@@ -125,7 +129,12 @@ final class ChatConversation {
         // See DaemonClient.sendMessageStreaming: keeps an older main from
         // putting the supervisor chat in the same session as Chat.
         self.legacyConversationKey = thread == .supervisor ? "mobile-supervisor" : nil
-        self.messages = ChatHistoryCodec.restored(store.load(nodeID: nodeID))
+        // A turn sent but never confirmed gets its full images back, so it
+        // can still be resent (the history keeps only previews).
+        let sending = isReadOnly ? [] : store.loadSending(nodeID: nodeID)
+        self.messages = ChatHistoryCodec.restored(ChatConversation.rehydrated(store.load(nodeID: nodeID), sending: sending))
+        self.sendingImages = sending
+        self.savedSending = sending
         // Messages queued before a quit that main never took come back with
         // their turn ids. They go once history says whether the hub keeps
         // the queue (uploadPending) or not (drainIfIdle).
@@ -160,14 +169,36 @@ final class ChatConversation {
         return queue
     }
 
+    nonisolated static func rehydrated(_ entries: [SavedChatEntry], sending: [SavedSendingImages]) -> [SavedChatEntry] {
+        guard !sending.isEmpty else { return entries }
+        let images = Dictionary(sending.map { ($0.userID, $0.attachments) }, uniquingKeysWith: { first, _ in first })
+        return entries.map { entry in
+            guard entry.role == "user", let full = images[entry.id] else { return entry }
+            var restored = entry
+            restored.attachments = full
+            return restored
+        }
+    }
+
+    // The reply to this user line is still unconfirmed: on the wire and not
+    // accepted, or "not sent" and waiting for its one resend.
+    private func awaitsConfirmation(userID: UUID) -> Bool {
+        guard let user = messages.firstIndex(where: { $0.id == userID }),
+              let reply = messages[(user + 1)...].first(where: { $0.role == .assistant }) else { return false }
+        return !reply.accepted && (reply.isStreaming || (reply.isFailed && reply.autoRetry))
+    }
+
     // Writes the messages main has not taken yet whenever they change, so a
-    // force-quit never loses one.
+    // force-quit never loses one, with the full images of sent turns it has
+    // not confirmed yet.
     private func persistQueue() {
         guard !forgotten, !isReadOnly else { return }
+        sendingImages.removeAll { !awaitsConfirmation(userID: $0.userID) }
         let pending = Self.pendingQueue(queue, hubQueueAvailable: hubQueueAvailable)
-        guard pending != savedQueued else { return }
+        guard pending != savedQueued || sendingImages != savedSending else { return }
         savedQueued = pending
-        store.saveQueued(nodeID: nodeID, items: pending)
+        savedSending = sendingImages
+        store.saveQueued(nodeID: nodeID, items: pending, sending: sendingImages)
     }
 
     // MARK: - Sending
@@ -636,6 +667,10 @@ final class ChatConversation {
         reply.requestID = requestID
         messages.append(user)
         messages.append(reply)
+        // Its images stay on disk in full until main confirms the turn.
+        if !attachments.isEmpty, attachments.allSatisfy({ $0.data != nil }) {
+            sendingImages.append(SavedSendingImages(userID: user.id, attachments: attachments))
+        }
         persist()
     }
 
@@ -997,6 +1032,8 @@ final class ChatConversation {
         draftAttachments = []
         queue.removeAll()
         savedQueued = []
+        sendingImages = []
+        savedSending = []
         queuedEditDraft = ""
         focusedCardID = nil
         composerRevision += 1

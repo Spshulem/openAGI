@@ -71,6 +71,41 @@ final class ChatQueuedPersistenceTests: XCTestCase {
     }
 
     @MainActor
+    func testASentTurnMainNeverConfirmedComesBackWithItsFullImages() {
+        // What a kill mid-send leaves: the history keeps the user line with a
+        // preview only and the unconfirmed reply; the queued file keeps the
+        // full images for that line.
+        let store = ChatHistoryStore(thread: "sending-\(UUID().uuidString)", directory: directory)
+        let userID = UUID()
+        let full = ChatAttachment(id: "img-9", name: "shot.jpg", data: "FULLDATA", thumbnail: "TH")
+        store.save(nodeID: "mobile:test", entries: [
+            SavedChatEntry(id: userID, role: "user", at: Date(), text: "look at this", attachments: [full.previewOnly], requestID: "ios-sending-0001"),
+            SavedChatEntry(id: UUID(), role: "assistant", at: Date(), text: ChatHistoryCodec.unconfirmedText, failed: true, retrySafe: true,
+                           requestID: "ios-sending-0001", autoRetry: true),
+        ])
+        store.saveQueued(nodeID: "mobile:test", items: [], sending: [SavedSendingImages(userID: userID, attachments: [full])])
+        XCTAssertEqual(store.loadSending(nodeID: "mobile:test").map(\.userID), [userID])
+
+        let chat = chat(store: store)
+        let user = chat.messages.first { $0.id == userID }
+        XCTAssertEqual(user?.attachments.map(\.data), ["FULLDATA"], "the full image, not the preview")
+        let reply = chat.messages.last
+        XCTAssertEqual(reply?.retrySafe, true, "still resendable without reattaching")
+        XCTAssertEqual(reply?.autoRetry, true)
+    }
+
+    func testRehydrationOnlyTouchesTheMatchingUserLine() {
+        let target = UUID(), other = UUID()
+        let entries = [
+            SavedChatEntry(id: other, role: "user", at: Date(), text: "older", attachments: [ChatAttachment(id: "a", name: "a.jpg", data: nil, thumbnail: "x")]),
+            SavedChatEntry(id: target, role: "user", at: Date(), text: "this one", attachments: [ChatAttachment(id: "b", name: "b.jpg", data: nil, thumbnail: "y")]),
+        ]
+        let out = ChatConversation.rehydrated(entries, sending: [SavedSendingImages(userID: target, attachments: [ChatAttachment(id: "b", name: "b.jpg", data: "DATA", thumbnail: "y")])])
+        XCTAssertNil(out[0].attachments?.first?.data)
+        XCTAssertEqual(out[1].attachments?.first?.data, "DATA")
+    }
+
+    @MainActor
     private func chat(store: ChatHistoryStore) -> ChatConversation {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [FakeHubProtocol.self]
