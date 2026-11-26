@@ -6,14 +6,9 @@ struct TrayLabel: View {
 
   var body: some View {
     HStack(spacing: 2) {
-      if let nsImage = TrayLabel.menuIcon {
-        // NSImage marked isTemplate=true — macOS auto-recolors based on
-        // dark/light menu bar tint, matching SF Symbol behavior.
-        Image(nsImage: nsImage)
-      } else {
-        // Fallback only fires if MenuIcon.png is missing from the bundle.
-        Image(systemName: "circle.dotted").renderingMode(.template)
-      }
+      // Vector, drawn at the menu bar's backing scale; a template image, so
+      // macOS tints it for light/dark menu bars like an SF Symbol.
+      Image(nsImage: TrayLabel.menuIcon)
       // Tiny status dot to the right when something needs attention.
       switch state.status {
       case .healthy, .unknown:
@@ -26,16 +21,7 @@ struct TrayLabel: View {
     }
   }
 
-  // Loaded once from the bundle; the size has to be set explicitly so the
-  // menu bar gives it the standard ~18pt height instead of the source size.
-  private static let menuIcon: NSImage? = {
-    guard let url = Bundle.main.url(forResource: "MenuIcon", withExtension: "png"),
-          let img = NSImage(contentsOf: url) else { return nil }
-    img.isTemplate = true
-    // Source is auto-cropped during build, so the full box is glyph.
-    img.size = NSSize(width: 26, height: 26)
-    return img
-  }()
+  private static let menuIcon = MenuBarIcon.makeImage()
 }
 
 struct TrayMenu: View {
