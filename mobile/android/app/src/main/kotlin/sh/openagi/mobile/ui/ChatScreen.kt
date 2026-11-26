@@ -602,6 +602,11 @@ class ChatConversationState(
     private fun unconfirmed(): List<ChatEntry.Assistant> =
         messages.value.filterIsInstance<ChatEntry.Assistant>().filter { it.failed && it.autoRetry && it.retryText != null }
 
+    // Every send main never confirmed, including one whose automatic resend
+    // is used up: main is still asked whether it took the last attempt.
+    private fun awaitingReceipt(): List<ChatEntry.Assistant> =
+        messages.value.filterIsInstance<ChatEntry.Assistant>().filter { ChatTurnRecovery.awaitingReceipt(it) }
+
     // At most one automatic resend per pass, oldest first, and only once the
     // last one has ended (it holds isStreaming until then). Main is asked
     // first what became of each such send: one it took (an answer lost
@@ -610,9 +615,9 @@ class ChatConversationState(
     // gets the old single resend. Main is asked even when nothing may be
     // resent yet, so a send it is running shows as working, not "Not sent."
     private suspend fun resendUnconfirmed(transport: ChatTransport) {
-        if (unconfirmed().isEmpty()) return
+        if (awaitingReceipt().isEmpty()) return
         val name = sharedThread
-        val ids = unconfirmed().mapNotNull { it.requestId }.distinct().take(ChatTurnRecovery.MAX_TURN_IDS)
+        val ids = awaitingReceipt().mapNotNull { it.requestId }.distinct().take(ChatTurnRecovery.MAX_TURN_IDS)
         val ask = transport.turns
         val states: TurnStates? = if (name == null || ids.isEmpty() || ask == null) {
             null

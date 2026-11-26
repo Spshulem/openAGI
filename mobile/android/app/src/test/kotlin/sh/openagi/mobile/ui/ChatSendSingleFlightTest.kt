@@ -288,6 +288,29 @@ class ChatSendSingleFlightTest {
     }
 
     @Test
+    fun aSendWhoseOneResendIsUsedUpIsStillCheckedAndFoundWhenMainTookIt() {
+        val main = FakeMain().apply { dropBeforeAccept = true }
+        val s = state().with(unconfirmed(0, "first", "android-a"))
+        val chat = main.transport()
+        s.resume(chat)
+        scope.runCurrent()
+        val lost = s.reply("android-a")
+        assertTrue(lost.failed && lost.autoResent && !lost.autoRetry)
+        // That resend did reach main, which queued it before the drop.
+        main.states = mapOf("android-a" to "queued")
+        val queries = main.turnQueries
+        s.pause()
+        s.resume(chat)
+        scope.runCurrent()
+        assertTrue("still asked about", main.turnQueries > queries)
+        assertEquals("never posted again", listOf<String?>("android-a"), main.posts)
+        val found = s.reply("android-a")
+        assertTrue(found.detached && !found.failed)
+        assertEquals(ChatTurnRecovery.STILL_WORKING, found.activity)
+        s.pause()
+    }
+
+    @Test
     fun anOlderMainWithoutTheTurnsRouteGetsAtMostOneResend() {
         for (withTurns in listOf(true, false)) {
             val main = FakeMain().apply {

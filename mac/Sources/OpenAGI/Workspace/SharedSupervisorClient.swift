@@ -1434,7 +1434,15 @@ final class SharedSupervisorClient: ObservableObject {
             includeThread: attempt.includeThread,
             includeFocusedCard: attempt.includeFocusedCard
           )
-          if attempt.includeRequestId { payload["requestId"] = requestId }
+          if attempt.includeRequestId {
+            payload["requestId"] = requestId
+          } else if sendingPending?.requestId == requestId {
+            // A main older than turn ids can't tell a resend from a new
+            // message, so this attempt must never be replayed after a
+            // relaunch: it leaves the pending file before it goes.
+            sendingPending = nil
+            savePendingIfChanged()
+          }
           replyText = try await streamTracked(payload: payload, requestId: attempt.includeRequestId ? requestId : nil)
           break
         } catch is UnsupportedFieldsError {

@@ -128,4 +128,22 @@ final class MacPendingQueueTests: XCTestCase {
     XCTAssertEqual(after.queuedMessages.map(\.requestID), [requestId], "shown as the hub's waiting message")
     XCTAssertEqual(after.queuedMessages.first?.origin?.pendingUpload, false)
   }
+
+  func testASendAnOlderMainTookWithoutATurnIdIsNeverKeptForReplay() async throws {
+    MacHeldStreamProtocol.reset()
+    defer { MacHeldStreamProtocol.reset() }
+    MacHeldStreamProtocol.lock.withLock { MacHeldStreamProtocol.rejectRequestId = true }
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [MacHeldStreamProtocol.self]
+    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: config), baseURL: URL(string: "http://daemon.test:43210")!,
+                                            token: "synthetic", pendingQueueURL: file)
+    MacHeldStreamProtocol.hold.insert("No turn ids here")
+    let send = Task { await supervisor.sendMessage("No turn ids here") }
+    try await waitFor("the fallback to reach main") { MacHeldStreamProtocol.isHeld("No turn ids here") }
+    XCTAssertNil(MacHeldStreamProtocol.sentTurns.last?.requestId, "sent without a turn id")
+    XCTAssertFalse(FileManager.default.fileExists(atPath: file.path),
+                   "main can't tell a resend from a new message, so a relaunch must not replay it")
+    MacHeldStreamProtocol.release("No turn ids here", frames: "event: final\ndata: {\"reply\":\"ok\"}\n\n")
+    _ = await send.value
+  }
 }

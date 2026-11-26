@@ -18,8 +18,10 @@ final class MacHeldStreamProtocol: URLProtocol {
   private static var sent: [Sent] = []
   private static var interrupts: [String] = []
   static var answerInterrupt: ((String) -> (Int, String))?
+  /// Answer like a main older than turn ids: a requestId is an unsupported field.
+  static var rejectRequestId = false
 
-  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil; history = "{\"messages\":[]}" } }
+  static func reset() { lock.withLock { held = [:]; hold = []; sent = []; interrupts = []; answerInterrupt = nil; rejectRequestId = false; history = "{\"messages\":[]}" } }
   static var sentTexts: [String] { lock.withLock { sent.map(\.text) } }
   static var sentTurns: [Sent] { lock.withLock { sent } }
   static var interruptIDs: [String] { lock.withLock { interrupts } }
@@ -65,6 +67,10 @@ final class MacHeldStreamProtocol: URLProtocol {
     if path == "/message" {
       let body = jsonBody()
       let text = body["text"] as? String ?? ""
+      if body["requestId"] != nil, Self.lock.withLock({ Self.rejectRequestId }) {
+        respond(400, "{\"error\":\"node message contains unsupported fields\"}")
+        return
+      }
       let shouldHold = Self.lock.withLock {
         Self.sent.append(Sent(text: text, requestId: body["requestId"] as? String, thread: body["thread"] as? String))
         return Self.hold.contains(text)

@@ -61,10 +61,17 @@ internal object ChatTurnRecovery {
     // decides, and a retry is a new turn. Unknown (main never took it) stays
     // as it is, to be resent with the same id; an id main did not answer
     // about is left for the next pass.
+    // A send main never confirmed, whether or not its one automatic resend
+    // is still left: main may have taken the last attempt, so it is still
+    // asked about. Only `autoRetry` allows another POST.
+    fun awaitingReceipt(entry: ChatEntry.Assistant): Boolean =
+        entry.failed && entry.requestId != null && entry.retryText != null &&
+            (entry.autoRetry || (entry.autoResent && entry.text == NOT_SENT))
+
     fun reconcile(entries: List<ChatEntry>, states: TurnStates): List<ChatEntry> {
         val byId = states.turns.associateBy { it.requestId }
         return entries.map { entry ->
-            val reply = (entry as? ChatEntry.Assistant)?.takeIf { it.failed && it.autoRetry && it.requestId != null } ?: return@map entry
+            val reply = (entry as? ChatEntry.Assistant)?.takeIf { awaitingReceipt(it) } ?: return@map entry
             when (byId[reply.requestId]?.state) {
                 "queued", "running", "done" -> reply.copy(
                     text = "", failureDetail = null, streaming = true, failed = false, accepted = true, detached = true,
