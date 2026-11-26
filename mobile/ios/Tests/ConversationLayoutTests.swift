@@ -30,6 +30,41 @@ final class ConversationLayoutTests: XCTestCase {
         XCTAssertNil(regions.historyHeight)
     }
 
+    // The largest accessibility text on a 6.9" iPhone: the expanded decision
+    // deck and composer wanted ~754 pt of a 757 pt chat, and drew over the
+    // 73 pt Supervisor channel bar, so #needs-you could not be tapped.
+    func testSharedRegionInputStopsBelowTheHistoryHeader() {
+        let regions = ConversationRegions(size: .init(width: 440, height: 757), division: nil)
+        var offered: CGFloat?
+        let height = regions.inputHeight(ideal: 754, reservedHistory: 73) { room in
+            offered = room
+            return room
+        }
+        XCTAssertEqual(offered, 684)
+        XCTAssertEqual(height, 684, "The deck gives way; the channel bar stays clear")
+    }
+
+    func testInputThatCannotShrinkKeepsItsHeightSoTheComposerStaysOnScreen() {
+        let regions = ConversationRegions(size: .init(width: 440, height: 757), division: nil)
+        XCTAssertEqual(regions.inputHeight(ideal: 754, reservedHistory: 73) { _ in 700 }, 700)
+        XCTAssertEqual(regions.inputHeight(ideal: 900, reservedHistory: 73) { _ in 900 }, 757,
+                       "Never taller than the region")
+    }
+
+    func testInputThatFitsIsNotAskedToShrink() {
+        let regions = ConversationRegions(size: .init(width: 440, height: 757), division: nil)
+        XCTAssertEqual(regions.inputHeight(ideal: 300, reservedHistory: 73) { _ in
+            XCTFail("An input that fits is not measured again")
+            return 0
+        }, 300)
+    }
+
+    func testFoldRegionsIgnoreTheHistoryHeader() {
+        let regions = ConversationRegions(size: .init(width: 700, height: 1000),
+                                          division: .init(x: 0, y: 480, width: 700, height: 40))
+        XCTAssertEqual(regions.inputHeight(ideal: 600, reservedHistory: 300) { _ in 0 }, 480)
+    }
+
     func testBookSizesTheConversationListToTheLeadingPage() {
         let fold = CGRect(x: 470, y: 0, width: 12, height: 660)
         XCTAssertEqual(ChatBookPages.sidebarWidth(division: fold, size: .init(width: 950, height: 660), rightToLeft: false), 470)
