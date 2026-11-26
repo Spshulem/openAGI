@@ -179,6 +179,7 @@ struct ChatConversationView: View {
 
     @State private var scrollPosition = ScrollPosition(idType: UUID.self)
     @State private var isPinnedToBottom = true
+    @State private var historyHeaderHeight: CGFloat = 0
     @State private var hasContentBelow = false
     @State private var isBottomVisible = false
     @State private var userIsScrolling = false
@@ -215,7 +216,8 @@ struct ChatConversationView: View {
             // arrangement can put it behind the message scroll view, where
             // it is visible but cannot receive taps or keyboard focus.
             ConversationLayout(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
-                               rightToLeft: layoutDirection == .rightToLeft) {
+                               rightToLeft: layoutDirection == .rightToLeft,
+                               reservedHistoryHeight: historyHeaderHeight) {
                 conversationContent
                 inputBar
             }
@@ -284,8 +286,14 @@ struct ChatConversationView: View {
 
     private var conversationContent: some View {
         VStack(spacing: 0) {
-            if let topAccessory { topAccessory }
-            header
+            // The fixed part above the messages keeps its full height, and
+            // the composer area never covers it (ConversationLayout).
+            VStack(spacing: 0) {
+                if let topAccessory { topAccessory }
+                header
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { historyHeaderHeight = $0 }
             GeometryReader { geometry in
                 messageScroll(width: geometry.size.width)
             }

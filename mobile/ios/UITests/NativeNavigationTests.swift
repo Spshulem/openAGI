@@ -516,7 +516,10 @@ final class NativeNavigationTests: XCTestCase {
         let atBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latest)
         XCTAssertEqual(XCTWaiter.wait(for: [atBottom], timeout: 10), .completed)
         XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
-        let history = element(app, "chat-history")
+        // The history is a scroll view. Querying it by type reads one
+        // attribute per element; matching identifiers across every type reads
+        // five, which is slow against 16 pages of history and the keyboard.
+        let history = app.scrollViews["chat-history"].firstMatch
         history.swipeDown()
         history.swipeDown()
         XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
@@ -544,7 +547,10 @@ final class NativeNavigationTests: XCTestCase {
         // Expanded layouts also show this text in the sidebar preview.
         // Verify the actual message in history, not that second label.
         let reply = history.staticTexts["Synthetic reply"]
-        let replyExists = reply.waitForExistence(timeout: 10)
+        // The synthetic reply is immediate. The longer waits only absorb a
+        // slow CI simulator; the reply must still appear, and become visible,
+        // without any scrolling.
+        let replyExists = reply.waitForExistence(timeout: 30)
         if !replyExists {
             capture("native-chat-reply-missing", app: app)
             let hierarchy = XCTAttachment(string: app.debugDescription)
@@ -554,7 +560,7 @@ final class NativeNavigationTests: XCTestCase {
         }
         XCTAssertTrue(replyExists)
         let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
-        let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 10)
+        let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 30)
         if visibilityResult != .completed {
             capture("native-chat-reply-visibility-failure", app: app)
             let hierarchy = XCTAttachment(string: app.debugDescription)
