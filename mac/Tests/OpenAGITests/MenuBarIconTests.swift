@@ -91,11 +91,14 @@ final class MenuBarIconTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(1.0))
         if let window = item.button?.window {
           let file = dir.appendingPathComponent("\(name)-statusitem-\(appearance == .aqua ? "light" : "dark").png")
-          let capture = Process()
-          capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-          capture.arguments = ["-x", "-o", "-l\(window.windowNumber)", file.path]
-          try? capture.run()
-          capture.waitUntilExit()
+          // The status item's own window; if the system declines that, the
+          // same rectangle of the screen (screencapture -R is top-left).
+          Self.screencapture(["-x", "-o", "-l\(window.windowNumber)", file.path])
+          if !FileManager.default.fileExists(atPath: file.path), let screen = window.screen ?? NSScreen.main {
+            let f = window.frame
+            let top = screen.frame.maxY - f.maxY
+            Self.screencapture(["-x", "-R\(Int(f.minX)),\(Int(top)),\(Int(f.width)),\(Int(f.height))", file.path])
+          }
           if let shot = NSImage(contentsOf: file), let rep = shot.representations.first as? NSBitmapImageRep {
             report["\(name)-statusitem-\(appearance == .aqua ? "light" : "dark")-pixels"] = [rep.pixelsWide, rep.pixelsHigh]
             report["\(name)-statusitem-\(appearance == .aqua ? "light" : "dark")-glyphPixelHeight"] = Self.inkHeight(rep) ?? 0
@@ -110,6 +113,14 @@ final class MenuBarIconTests: XCTestCase {
   }
 
   // MARK: - Rendering helpers
+
+  private static func screencapture(_ arguments: [String]) {
+    let capture = Process()
+    capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    capture.arguments = arguments
+    try? capture.run()
+    capture.waitUntilExit()
+  }
 
   struct Alpha {
     let width: Int

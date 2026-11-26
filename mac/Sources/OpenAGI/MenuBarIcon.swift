@@ -11,10 +11,11 @@ import AppKit
 /// It is a template image: macOS tints it for light and dark menu bars and
 /// for the highlighted state, as before.
 enum MenuBarIcon {
-  /// The glyph's height in points: the size the previous bitmap's glyph
-  /// appeared at (14 px of a 28 px image shown at 26 pt).
-  static let glyphHeight: CGFloat = 14
-  /// The image's size in points, fits the menu bar without being scaled.
+  /// The glyph's height in points: what the previous bitmap's glyph
+  /// measured when AppKit drew it (13 px at 1x, 25 px at 2x).
+  static let glyphHeight: CGFloat = 13
+  /// The image's size in points. It fits the 22 pt menu bar as is; the
+  /// previous 26 pt image made its status item taller than the bar.
   static let canvasSize = NSSize(width: 18, height: 18)
 
   enum PathElement {
