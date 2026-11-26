@@ -10,20 +10,18 @@ access. A browser or paired phone connects to that host.
 
 | Platform | Available install path | What you get |
 | --- | --- | --- |
-| macOS | Download the release's `OpenAGI-<version>.dmg`, drag OpenAGI to Applications, then open it | Native menu bar app, bundled runtime, updates, optional screen capture and computer control |
-| Windows | [Download source ZIP](https://github.com/Spshulem/openAGI/archive/refs/heads/main.zip), install Node.js 22+, then follow the Windows steps below | Browser dashboard and CLI runtime; native macOS capture/control features are not included |
-| Linux / Raspberry Pi | [Download source archive](https://github.com/Spshulem/openAGI/archive/refs/heads/main.tar.gz), use the installer below, or run Docker | Browser dashboard and an always-on agent on a desktop, server, or supported SBC |
+| macOS | [Download the latest release's `OpenAGI-<version>.dmg`](https://github.com/Spshulem/openAGI/releases/latest), drag OpenAGI to Applications, then open it | Native menu bar app, bundled runtime, updates, optional screen capture and computer control |
+| Windows | [Download `OpenAGI-Windows-x64.zip` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), extract it, then run `Start-OpenAGI.cmd` | Browser dashboard and CLI runtime with Node included; native macOS capture/control features are not included |
+| Linux x64 | [Download `OpenAGI-Linux-x64.tar.gz` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a desktop or server |
+| Linux arm64 / Raspberry Pi | [Download `OpenAGI-Linux-arm64.tar.gz` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a compatible 64-bit SBC |
 | iPhone / Android | [Companion-app source and pairing guide](../mobile/README.md) | A paired mobile client; no public App Store, TestFlight, or Play Store link is advertised here |
 
-The source archive links track `main`; use **Source code** on a specific release
-for that release's exact source. Choose the Mac app for native screen features.
-
-Releases produced after the portable-download workflow lands also attach
-`OpenAGI-Windows-x64.zip`, `OpenAGI-Linux-x64.tar.gz`, and
-`OpenAGI-Linux-arm64.tar.gz`, each with a `.sha256` checksum. These contain
-Node.js and the installed runtime dependencies. Until those files appear on a
-release, use the available source install above. We do not advertise missing
-assets as working downloads.
+The latest release attaches the Mac DMG, the Windows x64 ZIP, and the Linux
+x64/arm64 archives, with `.sha256` checksums for the portable archives. The
+[latest release page](https://github.com/Spshulem/openAGI/releases/latest) also offers that
+release's exact **Source code** archive. The portable archives contain
+Node.js and the installed runtime dependencies; they are the browser/CLI
+runtime, not native Windows or Linux capture apps.
 
 For a portable download, extract the **whole** archive into a folder you own.
 Double-click `Start-OpenAGI.cmd` on Windows, or run `./start-openagi.sh` on Linux.
@@ -32,6 +30,10 @@ Ctrl+C stops it. No administrator access, Git, Node install, or npm command is
 needed for these bundles. After saving setup, relaunch if the page asks you to.
 Check a downloaded file with `Get-FileHash <file> -Algorithm SHA256` in
 PowerShell or `sha256sum <file>` on Linux against its accompanying checksum.
+
+The links above open GitHub Releases, the all-platform download index, while
+`https://openagi.sh/download` is a convenience redirect that currently points
+to the Mac DMG.
 
 ## macOS
 
@@ -75,10 +77,13 @@ For a supported Debian/Ubuntu/Raspberry Pi OS installation, download and inspect
 the installer before running it:
 
 ```sh
-curl -fL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh -o install-openagi.sh
+curl -fL https://openagi.sh/install.sh -o install-openagi.sh
 less install-openagi.sh
 sh install-openagi.sh
 ```
+
+The same script is available from the source tree at
+`https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh`.
 
 The installer chooses an existing Docker installation or a native Node/systemd
 path and prints the setup address. It may request sudo to install a system
@@ -128,8 +133,9 @@ integration and channel settings remain under **Advanced settings**.
 
 ## Docker
 
-Use the version tag you selected from GitHub Releases. Replace `<version>`
-below, for example with `v0.0.58`. The volume keeps state across replacements.
+Use the version tag you selected from GitHub Releases, such as the tag shown on
+the [latest release](https://github.com/Spshulem/openAGI/releases/latest). Replace `<version>` below
+with that tag. The volume keeps state across replacements.
 Binding the published port to loopback keeps setup on this computer.
 
 ```sh

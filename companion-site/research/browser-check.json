@@ -1,0 +1,937 @@
+{
+  "date": "2026-11-10",
+  "preview": "http://buildbot3:8789/",
+  "initial_browser_check": {
+    "results": [
+      {
+        "path": "",
+        "width": 1440,
+        "status": 200,
+        "title": "OpenAGI \u2014 Your agent. Already on it.",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "",
+        "width": 1024,
+        "status": 200,
+        "title": "OpenAGI \u2014 Your agent. Already on it.",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "",
+        "width": 768,
+        "status": 200,
+        "title": "OpenAGI \u2014 Your agent. Already on it.",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "",
+        "width": 390,
+        "status": 200,
+        "title": "OpenAGI \u2014 Your agent. Already on it.",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "",
+        "width": 320,
+        "status": 200,
+        "title": "OpenAGI \u2014 Your agent. Already on it.",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "setup.html",
+        "width": 1440,
+        "status": 200,
+        "title": "Install OpenAGI \u2014 Start with one useful job",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "setup.html",
+        "width": 1024,
+        "status": 200,
+        "title": "Install OpenAGI \u2014 Start with one useful job",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "setup.html",
+        "width": 768,
+        "status": 200,
+        "title": "Install OpenAGI \u2014 Start with one useful job",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "setup.html",
+        "width": 390,
+        "status": 200,
+        "title": "Install OpenAGI \u2014 Start with one useful job",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "setup.html",
+        "width": 320,
+        "status": 200,
+        "title": "Install OpenAGI \u2014 Start with one useful job",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "ecosystem.html",
+        "width": 1440,
+        "status": 200,
+        "title": "Apps & integrations \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "ecosystem.html",
+        "width": 1024,
+        "status": 200,
+        "title": "Apps & integrations \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "ecosystem.html",
+        "width": 768,
+        "status": 200,
+        "title": "Apps & integrations \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "ecosystem.html",
+        "width": 390,
+        "status": 200,
+        "title": "Apps & integrations \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "ecosystem.html",
+        "width": 320,
+        "status": 200,
+        "title": "Apps & integrations \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "technology.html",
+        "width": 1440,
+        "status": 200,
+        "title": "Technology \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "technology.html",
+        "width": 1024,
+        "status": 200,
+        "title": "Technology \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "technology.html",
+        "width": 768,
+        "status": 200,
+        "title": "Technology \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "technology.html",
+        "width": 390,
+        "status": 200,
+        "title": "Technology \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "technology.html",
+        "width": 320,
+        "status": 200,
+        "title": "Technology \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "hardware.html",
+        "width": 1440,
+        "status": 200,
+        "title": "Hardware \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "hardware.html",
+        "width": 1024,
+        "status": 200,
+        "title": "Hardware \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "hardware.html",
+        "width": 768,
+        "status": 200,
+        "title": "Hardware \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "hardware.html",
+        "width": 390,
+        "status": 200,
+        "title": "Hardware \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "hardware.html",
+        "width": 320,
+        "status": 200,
+        "title": "Hardware \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "devices.html",
+        "width": 1440,
+        "status": 200,
+        "title": "Find your device \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "devices.html",
+        "width": 1024,
+        "status": 200,
+        "title": "Find your device \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "devices.html",
+        "width": 768,
+        "status": 200,
+        "title": "Find your device \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "devices.html",
+        "width": 390,
+        "status": 200,
+        "title": "Find your device \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "devices.html",
+        "width": 320,
+        "status": 200,
+        "title": "Find your device \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "how-it-works.html",
+        "width": 1440,
+        "status": 200,
+        "title": "How hardware connects \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "how-it-works.html",
+        "width": 1024,
+        "status": 200,
+        "title": "How hardware connects \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "how-it-works.html",
+        "width": 768,
+        "status": 200,
+        "title": "How hardware connects \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "how-it-works.html",
+        "width": 390,
+        "status": 200,
+        "title": "How hardware connects \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "how-it-works.html",
+        "width": 320,
+        "status": 200,
+        "title": "How hardware connects \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "device-guide.html?device=vocci",
+        "width": 1440,
+        "status": 200,
+        "title": "Put recorded context to work. \u2014 OpenAGI",
+        "viewport": 1440,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 52,
+          "y": 24,
+          "width": 1336,
+          "height": 70,
+          "top": 24,
+          "right": 1388,
+          "bottom": 94,
+          "left": 52
+        }
+      },
+      {
+        "path": "device-guide.html?device=vocci",
+        "width": 1024,
+        "status": 200,
+        "title": "Put recorded context to work. \u2014 OpenAGI",
+        "viewport": 1024,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 32,
+          "y": 24,
+          "width": 960,
+          "height": 70,
+          "top": 24,
+          "right": 992,
+          "bottom": 94,
+          "left": 32
+        }
+      },
+      {
+        "path": "device-guide.html?device=vocci",
+        "width": 768,
+        "status": 200,
+        "title": "Put recorded context to work. \u2014 OpenAGI",
+        "viewport": 768,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 20,
+          "y": 24,
+          "width": 728,
+          "height": 70,
+          "top": 24,
+          "right": 748,
+          "bottom": 94,
+          "left": 20
+        }
+      },
+      {
+        "path": "device-guide.html?device=vocci",
+        "width": 390,
+        "status": 200,
+        "title": "Put recorded context to work. \u2014 OpenAGI",
+        "viewport": 390,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 362,
+          "height": 58,
+          "top": 16,
+          "right": 376,
+          "bottom": 74,
+          "left": 14
+        }
+      },
+      {
+        "path": "device-guide.html?device=vocci",
+        "width": 320,
+        "status": 200,
+        "title": "Put recorded context to work. \u2014 OpenAGI",
+        "viewport": 320,
+        "overflow": [],
+        "images": [],
+        "header": {
+          "x": 14,
+          "y": 16,
+          "width": 292,
+          "height": 58,
+          "top": 16,
+          "right": 306,
+          "bottom": 74,
+          "left": 14
+        }
+      }
+    ],
+    "issues": []
+  },
+  "final_responsive_and_clipboard_check": {
+    "results": [
+      {
+        "path": "",
+        "width": 1440,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "",
+        "width": 1024,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "",
+        "width": 1000,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "",
+        "width": 900,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "",
+        "width": 768,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "",
+        "width": 390,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "",
+        "width": 320,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "setup.html",
+        "width": 1440,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "setup.html",
+        "width": 1024,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "setup.html",
+        "width": 1000,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "setup.html",
+        "width": 900,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "setup.html",
+        "width": 768,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "setup.html",
+        "width": 390,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "setup.html",
+        "width": 320,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "hardware.html",
+        "width": 1440,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "hardware.html",
+        "width": 1024,
+        "overflow": false,
+        "menuVisible": false,
+        "headerOverlap": false
+      },
+      {
+        "path": "hardware.html",
+        "width": 1000,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "hardware.html",
+        "width": 900,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "hardware.html",
+        "width": 768,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "hardware.html",
+        "width": 390,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      },
+      {
+        "path": "hardware.html",
+        "width": 320,
+        "overflow": false,
+        "menuVisible": true,
+        "headerOverlap": false,
+        "menuOpens": true
+      }
+    ],
+    "clipboardFallback": "Copied",
+    "errors": []
+  }
+}

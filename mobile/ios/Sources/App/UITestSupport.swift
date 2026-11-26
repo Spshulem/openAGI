@@ -30,6 +30,25 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     static var isEnabled: Bool {
         ProcessInfo.processInfo.arguments.contains("--ui-testing") || StoreScreenshotProtocol.isEnabled
     }
+
+    /// XCTest launches the app with OS_ACTIVITY_DT_MODE=YES and
+    /// OS_ACTIVITY_MODE=info, so every log line is mirrored to stdout and
+    /// stderr: a pseudo-terminal that xcodebuild drains. UI queries are
+    /// evaluated on the app's main thread, and XCTest logs several lines for
+    /// every accessibility attribute a query reads (about 60,000 lines in one
+    /// long chat test). On a loaded CI runner the terminal fills, and the main
+    /// thread blocks in write(2): idle waits hit their 60 s limit and queries
+    /// fail with "Timed out while evaluating UI query". Send the UI-test
+    /// console to a file in the app's temporary directory instead, where a
+    /// write never waits on another process.
+    static func divertConsoleOutput() {
+        let path = FileManager.default.temporaryDirectory.appending(path: "ui-testing-console.log").path(percentEncoded: false)
+        let descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard descriptor >= 0 else { return }
+        dup2(descriptor, STDOUT_FILENO)
+        dup2(descriptor, STDERR_FILENO)
+        close(descriptor)
+    }
     private static let decidedActions = OSAllocatedUnfairLock(initialState: Set<String>())
     private struct BudgetFixtureState: Sendable {
         var dailyLimit: Double = 10.0

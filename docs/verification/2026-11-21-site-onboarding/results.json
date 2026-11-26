@@ -1,0 +1,58 @@
+{
+  "base": "http://127.0.0.1:8789",
+  "capturedAt": "2026-11-21T18:00:01.926Z",
+  "results": [
+    {
+      "name": "home",
+      "path": "/",
+      "width": 1440,
+      "status": 200,
+      "title": "OpenAGI — Your agent. Already on it.",
+      "h1": "Your agent.\nAlready on it.",
+      "overflow": {
+        "scrollWidth": 1440,
+        "clientWidth": 1440
+      },
+      "errors": []
+    },
+    {
+      "name": "setup",
+      "path": "/setup.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Install OpenAGI — Start with one useful job",
+      "h1": "Install your agent.\nGive it a job.",
+      "overflow": {
+        "scrollWidth": 1440,
+        "clientWidth": 1440
+      },
+      "errors": []
+    },
+    {
+      "name": "onboarding",
+      "path": "/onboarding.html",
+      "width": 1440,
+      "status": 200,
+      "title": "Onboarding — one real result with OpenAGI",
+      "h1": "Choose a path.\nDo one real thing.",
+      "overflow": {
+        "scrollWidth": 1440,
+        "clientWidth": 1440
+      },
+      "errors": []
+    },
+    {
+      "name": "onboarding-mobile",
+      "path": "/onboarding.html",
+      "width": 390,
+      "status": 200,
+      "title": "Onboarding — one real result with OpenAGI",
+      "h1": "Choose a path.\nDo one real thing.",
+      "overflow": {
+        "scrollWidth": 390,
+        "clientWidth": 390
+      },
+      "errors": []
+    }
+  ]
+}

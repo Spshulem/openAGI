@@ -45,10 +45,46 @@ final class NeedsYouReviewTests: XCTestCase {
         app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS[c] %@", fragment)).firstMatch
     }
 
+    /// The row sits inside the browser and clear of a search field floating
+    /// over the list's bottom edge. A row's frame can reach past either.
+    private func isClear(_ row: XCUIElement, in browser: XCUIElement, app: XCUIApplication) -> Bool {
+        guard row.exists && row.isHittable else { return false }
+        var bottom = browser.frame.maxY
+        let search = app.searchFields.firstMatch
+        if search.exists && search.frame.minY > row.frame.minY {
+            bottom = min(bottom, search.frame.minY)
+        }
+        return row.frame.minY >= browser.frame.minY && row.frame.maxY <= bottom
+    }
+
+    private func openSupervisorConversation(_ app: XCUIApplication) {
+        tapButton(app, "chat-conversations")
+        let browser = element(app, "conversation-browser")
+        XCTAssertTrue(browser.waitForExistence(timeout: 10), "Missing conversation-browser")
+        let row = element(app, "conversation-supervisor")
+        XCTAssertTrue(row.waitForExistence(timeout: 10), "Missing conversation-supervisor")
+        // At the largest text sizes on a 6.9" iPhone the Supervisor row
+        // starts below the fold, under the floating search field, with a
+        // 33 pt sliver showing. XCTest tapped that sliver and the browser
+        // stayed open. Scroll the row into the clear first, as a person
+        // would. Short drags without a fling, so the row cannot overshoot
+        // past the top.
+        let lower = browser.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.65))
+        let upper = browser.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+        for _ in 0..<8 where !isClear(row, in: browser, app: app) {
+            if row.exists && row.frame.minY < browser.frame.minY {
+                upper.press(forDuration: 0.1, thenDragTo: lower)
+            } else {
+                lower.press(forDuration: 0.1, thenDragTo: upper)
+            }
+        }
+        XCTAssertTrue(isClear(row, in: browser, app: app), "The Supervisor conversation can be scrolled fully into view")
+        row.tap()
+    }
+
     private func openNeedsYou(_ app: XCUIApplication) {
         tab(app, "Chat")
-        tapButton(app, "chat-conversations")
-        tapButton(app, "conversation-supervisor")
+        openSupervisorConversation(app)
         // The #needs-you chip, not the navigation title: at the largest
         // accessibility sizes the bar's title is not exposed by name.
         tapButton(app, "supervisor-channel-needs-you")

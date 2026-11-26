@@ -24,6 +24,33 @@ a new conversation with an editable starter request. Nothing is sent until you
 press Send. The agent asks one question at a time and helps check your result.
 You can also ask "Help me get started" from a connected phone chat.
 
+## Choose a path
+
+The intended onboarding handoff offers **Personal Assistant**, **Agent
+Supervisor**, or **Both**. The paths combine and can be skipped and resumed.
+Before suggesting a default, onboarding should ask whether you code or
+vibe-code and whether your coding agent is on this device or another one
+(Codex, Claude Code, T3, Paseo, or another tool). It checks support and
+authentication rather than assuming a CLI, project, model, or host exists.
+
+The first success is a real reply plus one checkable outcome: a saved and
+recalled preference, a visible project status/blocker, a reachable paired host,
+or a notification test. A denied permission, missing model, expired pairing
+code, or unavailable provider gets a recovery message and a way to skip or
+resume; it does not silently switch providers or grant access.
+
+The current shipped flow is the deterministic `/setup` wizard, `Get started`
+guides, Supervisor's read/observe controls, and the mobile phone-only/server
+choices described below. The unified opt-in installed-app prescan, test
+notification handoff, and bundled no-key help skill are tracked as planned
+work in the [Mac/iOS onboarding handoff](plans/2026-11-21-onboarding-handoff.md).
+
+When no model is configured, the UI and deterministic help remain available so
+you can read setup and recovery instructions. It does not claim to provide
+normal model reasoning. Choose an on-device model or an explicitly configured
+local server when you want requests to stay local; the active destination is
+shown before a request is sent.
+
 ## 1. Meet your agent
 
 Tell it one goal, such as planning your day or keeping track of a project.

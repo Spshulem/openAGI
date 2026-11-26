@@ -1,0 +1,226 @@
+{
+  "target": "openagi-hardware.vercel.app",
+  "sourceDigest": "310eb1f897264ebe8c1a4bd6bc5db51a5d4935ee7d3bf34a583612cf87f45432",
+  "files": [
+    {
+      "path": "assets/dot-assignments.jpg",
+      "bytes": 208801,
+      "sha256": "cb3cf228404fec76ac863f6ded485c8a1f1a66a514e03c9fd764f2a8d79970e8"
+    },
+    {
+      "path": "assets/dot-display.png",
+      "bytes": 1625341,
+      "sha256": "97e788b8a156cc5be2a54adf73cbeceb30abd73e76d88f1c811a32c86820f60c"
+    },
+    {
+      "path": "assets/dot-hero.png",
+      "bytes": 1829124,
+      "sha256": "72fe5e3b6ed82ef9e9041eb61ca845764917674f1c7137f34fdc0e3065ca594e"
+    },
+    {
+      "path": "assets/dot-necklace.jpg",
+      "bytes": 322460,
+      "sha256": "0aef23871484bad7ee72da6c4635f346741419cbd5509c15b9be263417a1a593"
+    },
+    {
+      "path": "assets/dot-pocket.jpg",
+      "bytes": 334600,
+      "sha256": "51ff90bae531bcb1c43eed5ca423313b88afc142fa1d068f004aaddc778d2a92"
+    },
+    {
+      "path": "assets/dot-wrist.jpg",
+      "bytes": 286080,
+      "sha256": "5dded1849d801ed06bfea2a034a615e38c9fadc5812ce9d0340cb633e8cae62f"
+    },
+    {
+      "path": "assets/natura-interface.webp",
+      "bytes": 20246,
+      "sha256": "0b446728dd6b805ff8260a5796dbb7981ec7a24661fe65f5bedc28a86f9fca04"
+    },
+    {
+      "path": "assets/openagi-mark.svg",
+      "bytes": 244,
+      "sha256": "1fb269ebcdd5b66894ff1c8392cb3d8a1e672966edad3d390df4609c1b5d71e5"
+    },
+    {
+      "path": "assets/pocket-dark-shell-reference.png",
+      "bytes": 1684527,
+      "sha256": "d673e54c78bbad33c696e080e987e00f7787b97cf795da5441964ea6fb862a5a"
+    },
+    {
+      "path": "assets/pocket-hand-selected-v1.png",
+      "bytes": 1804481,
+      "sha256": "31c894f033fef53693d7d6c4f1c015cf3eb1bfb93bf492a45b9a7d22f78d1301"
+    },
+    {
+      "path": "assets/pocket-hand.png",
+      "bytes": 2006256,
+      "sha256": "cf75897ad7e0db3e2aacc62410914917c4c12ccc7ae2d73a9c479213e13aa8e0"
+    },
+    {
+      "path": "assets/pocket-in-hand-compact-ivory-violet.png",
+      "bytes": 1965126,
+      "sha256": "46799934174b7e91dbdd4e39e84629890b791ba092ec22049d4881f53011d1b4"
+    },
+    {
+      "path": "assets/pocket-in-hand-ivory-violet.png",
+      "bytes": 2072320,
+      "sha256": "d2ea24d5110f6a0b4c47dbf6a3d3e73138e96e2c7b26b90233f4c9cecdb77e6f"
+    },
+    {
+      "path": "assets/pocket-product.glb",
+      "bytes": 194204,
+      "sha256": "eb494094fc622941d7b69c5f2fd78df280009145aa5465bbaa0396acab7aa217"
+    },
+    {
+      "path": "assets/pocket-studio.png",
+      "bytes": 1850670,
+      "sha256": "dcf85c26e040b0c20dfa24b542181e6d869941b0255bd900ade1ddfe146d7db9"
+    },
+    {
+      "path": "assets/pocket-warm-shell-reference.png",
+      "bytes": 2088043,
+      "sha256": "4990a614493609c6db0a3f523ffb147834eaf2364259ff1b43d54ed21163e07b"
+    },
+    {
+      "path": "assets/vocci-ring.jpg",
+      "bytes": 144487,
+      "sha256": "c6ccc84329e09b146b0705f359c5bdeb7639622402153dbe7db1e06eeab5c28b"
+    },
+    {
+      "path": "assets/waveshare-amoled.jpg",
+      "bytes": 64609,
+      "sha256": "6818448fda58f63cfb2a98e85f22b96ca27b5be1a23288bc32575c5aff1aed2d"
+    },
+    {
+      "path": "concept.html",
+      "bytes": 9890,
+      "sha256": "ecff6e9cbee2bd32430fde55bd3384afc23fa2e8e2f1a5f4fc95d528a86169bb"
+    },
+    {
+      "path": "device-guide.html",
+      "bytes": 3903,
+      "sha256": "3be4f4963d89999d0572a388802cab2d10a2a96b5565e7856931ad2c35c9ae83"
+    },
+    {
+      "path": "device-guide.js",
+      "bytes": 17263,
+      "sha256": "25c6692fdb60e2d1161a7ebacad64de0876b8bddd39a01d8f8fd2a7d300ae5e9"
+    },
+    {
+      "path": "devices.html",
+      "bytes": 8359,
+      "sha256": "dd5eb84627463675986edebe9dfb4180d9f0af32b7819ab078e145679f6f98de"
+    },
+    {
+      "path": "dot.css",
+      "bytes": 14080,
+      "sha256": "aa3a6eb4c7325188937405128b81dc6f7fe74949c439282006baab3714f7cc7d"
+    },
+    {
+      "path": "dot.js",
+      "bytes": 2802,
+      "sha256": "87da1fe2ddb233746a581b71ec343109a81888e26459f7a321cf5b40f7c6c48b"
+    },
+    {
+      "path": "ecosystem.html",
+      "bytes": 10396,
+      "sha256": "b0a9ad6bd23bf6589fde4debf45a4a33d2e82949f6b5d9861683f4f5b50948dc"
+    },
+    {
+      "path": "experience.js",
+      "bytes": 9389,
+      "sha256": "fe755f6232f70a3b633dd413665f0dfbf30ab0ea4c6faccb4fd194a1829d3597"
+    },
+    {
+      "path": "hardware/build-notes.html",
+      "bytes": 6943,
+      "sha256": "bdb3d36e2c45d85570f74be63f68c905a66e88fea0e98155405c1d7e68539ba4"
+    },
+    {
+      "path": "hardware/pocket-architecture.svg",
+      "bytes": 2925,
+      "sha256": "cd9aa81918ef6a5e07a9dfbe2d0232d4914a629c6974afffa1fbdcf5e9340b6d"
+    },
+    {
+      "path": "hardware/pocket-envelope.scad",
+      "bytes": 2022,
+      "sha256": "7ab916b4816491ee1b6c6fc4a5ae30988133d6e65647fcc8138d87b370b2c22f"
+    },
+    {
+      "path": "hardware/pocket-v2.scad",
+      "bytes": 1817,
+      "sha256": "7dc3ad2dc3d032c230cfc2dbda65358bc0c0868abd4d07c03b13c0c12d019113"
+    },
+    {
+      "path": "hardware.html",
+      "bytes": 10887,
+      "sha256": "8a96f52dc56c6b18acf473e1a969502e50a1d3f331a575c668467e2a9022e6eb"
+    },
+    {
+      "path": "how-it-works.html",
+      "bytes": 6262,
+      "sha256": "68f10a795d874487cde0f61af266bb1a3206c4f8ea7411e423ea383fea8397fb"
+    },
+    {
+      "path": "index.html",
+      "bytes": 16662,
+      "sha256": "fb28565f49053d53728c23848fd366fe86201a98788f7822f4e3e44beaf38586"
+    },
+    {
+      "path": "overview.css",
+      "bytes": 20224,
+      "sha256": "6be6851eeebe2a0e4347ce0fab6db41db43aa8150b35c72b8c1cf8f451912894"
+    },
+    {
+      "path": "platform.css",
+      "bytes": 23761,
+      "sha256": "7f7a42d72cca1db8de777f70828d1cc492b86c737d61b75c1e8eb1acb6323059"
+    },
+    {
+      "path": "platform.js",
+      "bytes": 7683,
+      "sha256": "12aa1fc17393d84501e2dd15135ec2647ac1ca40ac7c6768a1715f9145835cdf"
+    },
+    {
+      "path": "prototype-parts.csv",
+      "bytes": 1278,
+      "sha256": "8acfc4137960785c4609a272c36838e4988154952e1d1bb3efcafe1172e7d1c8"
+    },
+    {
+      "path": "prototype.html",
+      "bytes": 9379,
+      "sha256": "bc67f30388ec2dced43dd22f4969cd223a24edd910c06953c7ae680db3bdc2d7"
+    },
+    {
+      "path": "script.js",
+      "bytes": 1669,
+      "sha256": "1f7ee382c58085f1cd85abea1605a94883fa5414fbf2f40b08ce2e92f65f4e24"
+    },
+    {
+      "path": "setup.html",
+      "bytes": 6844,
+      "sha256": "5d4b84f207ded1c70011c8baf37eff09905aa25157292b4fcc440d73599628ee"
+    },
+    {
+      "path": "software.css",
+      "bytes": 15551,
+      "sha256": "ffc3d79e66cd05509be5e4c8fdbad86c60a536cfc0f6f17c969f2fc642b5e138"
+    },
+    {
+      "path": "software.js",
+      "bytes": 3484,
+      "sha256": "be545ef06a5873ee39bb1c32cd75bd5584bf0df8cb9f00647f3e036249714746"
+    },
+    {
+      "path": "styles.css",
+      "bytes": 13948,
+      "sha256": "ed2cb4a0fff5a22522aa105cda791c973aa3d963f1e0c0a5d4f9e3a45bf9e032"
+    },
+    {
+      "path": "technology.html",
+      "bytes": 9315,
+      "sha256": "44cc92d713f9956822df1f20a6b82d167ac4b14d41b6e48376d0b5bf52828ef4"
+    }
+  ]
+}
