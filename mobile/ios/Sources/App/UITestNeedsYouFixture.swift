@@ -1282,8 +1282,7 @@ enum UITestNeedsYouFixture {
       "GitHub shows no other failing checks on either."
      ],
      "blocked": [
-      "Merging needs your approval because you review every merge.",
-      "#1201 reports flag consolidation: Certificate: ✅ passed, Conflicts: none, Threads: 0, Blocker: 1 approving review."
+      "Merging needs your approval because you review every merge."
      ],
      "unverified": [
       "The post-merge verification on main is still pending."
@@ -1347,12 +1346,12 @@ enum UITestNeedsYouFixture {
    "brief": {
     "context": "Finish the remaining Sales call-type admission work.",
     "currentState": "Paused at a decision checkpoint — waiting for your call before continuing.",
-    "whatChanged": "#1201 reports flag consolidation: Certificate: ✅ passed, Conflicts: none, Threads: 0, Blocker: 1 approving review. GitHub shows no other failing checks on either.",
+    "whatChanged": "#1201 reports flag consolidation: Certificate: passed, Conflicts: none, Threads: 0, Blocker: 1 approving review. GitHub shows no other failing checks on either.",
     "decision": "Choose whether to use admin rights to merge both without the required teammate approval, or wait for an independent review.",
     "details": "Both flag PRs are now merge-ready, apart from the required review:\n\nGitHub shows no other failing checks on either. The post-merge verification on main is still pending.\n\nDecision needed: should I merge #1201 and #1202 over the required review with your admin rights (they're your PRs, so you can't approve them yourself), or leave them for a teammate's review?\n\nBlocked: Merging needs your approval because you review every merge.",
     "goal": "Finish the remaining Sales call-type admission work.",
     "assignment": "Finish the Sales flag consolidation PRs and get them merged once verified",
-    "whereItStands": "#1201 reports flag consolidation: Certificate: ✅ passed, Conflicts: none, Threads: 0, Blocker: 1 approving review. GitHub shows no other failing checks on either.",
+    "whereItStands": "#1201 reports flag consolidation: Certificate: passed, Conflicts: none, Threads: 0, Blocker: 1 approving review. GitHub shows no other failing checks on either.",
     "verified": null,
     "blocked": "Merging needs your approval because you review every merge.",
     "options": [
@@ -1749,7 +1748,6 @@ enum UITestNeedsYouFixture {
     ]
    },
    "suggestedReplies": [
-    "Proceed with the recommended option above",
     "Approved — finish all remaining in-scope items",
     "Hold off — tell me what's still unverified first"
    ],

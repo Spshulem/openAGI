@@ -136,11 +136,15 @@ struct FleetDecisionPresentation: Equatable {
     return out
   }
 
-  /// "Merge both (admin bypass)" when the label does not already say so.
+  /// The option's own words. A bypass is labelled by the caption under the
+  /// button ("Admin bypass — skips required review"), as on the phone, so a
+  /// server-side "(admin bypass)" suffix is not repeated in the label.
   static func buttonLabel(_ label: String, adminBypass: Bool) -> String {
     let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard adminBypass, !trimmed.lowercased().contains("admin bypass") else { return trimmed }
-    return "\(trimmed) (admin bypass)"
+    guard adminBypass else { return trimmed }
+    return trimmed
+      .replacingOccurrences(of: #"\s*\(\s*admin bypass\s*\)"#, with: "", options: [.regularExpression, .caseInsensitive])
+      .trimmingCharacters(in: .whitespacesAndNewlines)
   }
 
   /// Lowercased, single-spaced, without a trailing "(admin bypass)".

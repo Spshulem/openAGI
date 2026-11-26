@@ -124,7 +124,8 @@ final class FleetDecisionViewTests: XCTestCase {
 
   func testRegressionButtonsPutTheRecommendationFirstAndLabelTheBypass() throws {
     let p = try XCTUnwrap(try question("fq_regression").decisionPresentation(card: try card("fq_regression")))
-    XCTAssertEqual(p.buttons.map(\.label), ["Wait for teammate review", "Merge both (admin bypass)"])
+    XCTAssertEqual(p.buttons.map(\.label), ["Wait for teammate review", "Merge both"])
+    XCTAssertEqual(p.buttons.map(\.adminBypass), [false, true], "the bypass is labelled by its caption")
     XCTAssertEqual(p.buttons.map(\.value), ["wait for teammate review", "merge both"], "the question's own option strings")
     XCTAssertEqual(p.buttons.map(\.recommended), [true, false])
     XCTAssertEqual(p.buttons.map(\.adminBypass), [false, true])
@@ -173,7 +174,8 @@ final class FleetDecisionViewTests: XCTestCase {
     let p = try XCTUnwrap(FleetDecisionPresentation.make(question: nil, card: card))
     let keys = p.buttons.map { FleetDecisionPresentation.normalized($0.value) }
     XCTAssertEqual(keys.count, Set(keys).count, "no option appears as two buttons")
-    XCTAssertEqual(p.buttons.map(\.label), ["Wait for teammate review", "Merge both (admin bypass)"])
+    XCTAssertEqual(p.buttons.map(\.label), ["Wait for teammate review", "Merge both"])
+    XCTAssertEqual(p.buttons.map(\.adminBypass), [false, true], "the bypass is labelled by its caption")
     XCTAssertEqual(p.buttons.filter(\.recommended).count, 1)
     XCTAssertEqual(p.quickReplies, ["Ask for a status update"], "a reply equal to an option, or a bypass, is dropped")
 

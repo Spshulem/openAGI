@@ -178,10 +178,6 @@ final class NeedsYouReviewTests: XCTestCase {
         root.descendants(matching: .staticText).matching(NSPredicate(format: "label CONTAINS %@", "|"))
     }
 
-    private func buttons(_ app: XCUIApplication, labelled fragment: String) -> XCUIElementQuery {
-        app.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", fragment))
-    }
-
     private func scrollUntilHittable(_ target: XCUIElement, in app: XCUIApplication, attempts: Int = 6) {
         for _ in 0..<attempts where !(target.exists && target.isHittable) { app.swipeUp() }
     }
@@ -218,7 +214,9 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertEqual(bypass.label, "Merge both")
         XCTAssertTrue((bypass.value as? String ?? "").contains("Admin bypass"), "The bypass is labelled plainly")
         XCTAssertFalse((bypass.value as? String ?? "").contains("Recommended"))
-        XCTAssertEqual(buttons(app, labelled: "Merge both").count, 1, "Merge both is offered once")
+        // Scoped to this card: a wide layout can show the same decision in a
+        // second pane, which is not a duplicated row on the card.
+        XCTAssertEqual(deck.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once on the card")
         capture("decision-regression-card", app: app)
 
         // The Thread sheet: the contract, each option once, an empty composer.
@@ -233,7 +231,7 @@ final class NeedsYouReviewTests: XCTestCase {
         scrollUntilHittable(threadRecommended, in: app)
         XCTAssertEqual(threadRecommended.label, "Wait for teammate review")
         XCTAssertTrue((threadRecommended.value as? String ?? "").contains("Recommended"))
-        XCTAssertEqual(buttons(app, labelled: "Merge both").count, 1, "Merge both is offered once in the Thread sheet")
+        XCTAssertEqual(sheet.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once in the Thread sheet")
         let reply = element(app, "thread-decision-reply")
         scrollUntilHittable(reply, in: app)
         reply.tap()
@@ -270,7 +268,7 @@ final class NeedsYouReviewTests: XCTestCase {
         let detailBypass = element(app, "needs-you-action-1")
         XCTAssertEqual(detailBypass.label, "Merge both")
         XCTAssertTrue((detailBypass.value as? String ?? "").contains("Admin bypass"))
-        XCTAssertEqual(buttons(app, labelled: "Merge both").count, 1, "Merge both is offered once on the decision screen")
+        XCTAssertEqual(element(app, "needs-you-detail").buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once on the decision screen")
         XCTAssertFalse(app.textFields["chat-composer"].exists, "Replies go through the Supervisor composer")
         capture("decision-regression-detail-scrolled", app: app)
         backFromDecision(app)

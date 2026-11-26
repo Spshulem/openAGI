@@ -83,7 +83,10 @@ test("regression: the flag-PR admin-merge card follows the decision contract", (
   assert.deepEqual(view.status.prs.map((p) => p.ref), ["#1201", "#1202"]);
   assert.ok(view.status.prs[1].facts.includes("Threads: 5/5 resolved"));
   assert.ok(view.status.prs[0].facts.includes("Blocker: 1 approving review"));
-  assert.ok(view.status.blocked.some((s) => /approving review/.test(s)));
+  assert.ok(view.status.blocked.some((s) => /approval/.test(s)));
+  const statusLines = [...view.status.done, ...view.status.blocked, ...view.status.unverified];
+  assert.ok(statusLines.every((s) => !/^#120[12] .*Certificate/.test(s)), "a PR's table row is shown once, as its facts");
+  assert.doesNotMatch(JSON.stringify(view), /✅/);
   assert.ok(view.status.unverified.some((s) => /still pending/.test(s)));
 
   // Decision and recommendation agree with the buttons.

@@ -86,7 +86,8 @@ export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLi
   const base = tableToSentences(asText(text))
     .replace(BRACKET_LABEL_RE, "")
     .replace(/\*\*|__/g, "")
-    .replace(/`([^`]+)`/g, "$1");
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[✅❌✔✖]\uFE0F?\s*/gu, "");
   if (keepLines) {
     // Line structure ("Options:\n- Rotate key") is kept for clients that
     // render it; each line is cleaned on its own.
@@ -225,14 +226,16 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
   const agentSentences = agentTexts.slice(0, 2)
     .flatMap((t) => splitSentences(cleanDecisionProse(t, { max: 4000 })))
     .filter((s) => !/\?\s*$/.test(s));
-  const unverified = uniq([...statusSentences, ...agentSentences].filter((s) => UNVERIFIED_RE.test(s))).slice(0, 3);
-  const blockedList = uniq([
-    ...(ctx?.blocked ? splitSentences(cleanDecisionProse(ctx.blocked, { max: 400 })) : []),
-    ...statusSentences.filter((s) => BLOCKED_RE.test(s) && !UNVERIFIED_RE.test(s))
-  ]).slice(0, 3);
+  
+
   const prs = prFacts({ texts: agentTexts, prContext, prRef });
   // A PR's table row is shown once, as that PR's facts.
   const isPrRow = (s) => prs.some((p) => s.startsWith(`${p.ref} `) && /:\s/.test(s) && /,|;/.test(s));
+  const blockedList = uniq([
+    ...(ctx?.blocked ? splitSentences(cleanDecisionProse(ctx.blocked, { max: 400 })) : []),
+    ...statusSentences.filter((s) => BLOCKED_RE.test(s) && !UNVERIFIED_RE.test(s) && !isPrRow(s))
+  ]).slice(0, 3);
+  const unverified = uniq([...statusSentences, ...agentSentences].filter((s) => UNVERIFIED_RE.test(s) && !isPrRow(s))).slice(0, 3);
   const done = uniq(statusSentences.filter((s) => !UNVERIFIED_RE.test(s) && !BLOCKED_RE.test(s) && !isPrRow(s))).slice(0, 4);
   const status = {
     done: done.map((s) => clamp(s, 240)),
