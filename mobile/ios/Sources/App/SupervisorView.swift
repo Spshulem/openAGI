@@ -2186,7 +2186,10 @@ private struct SupervisorCardDeckView: View {
             // stay put for short cards, and grows to 235 pt only when the
             // card's content needs it. A fixed 235 pt, together with the
             // voice bar and composer below, left a folded phone's chat
-            // history about one line tall.
+            // history about one line tall. When even that does not fit (the
+            // largest accessibility text on a phone), the body gives way
+            // before the deck may cover the channel bar above the chat; see
+            // ConversationRegions.inputHeight.
             ScrollView(.vertical, showsIndicators: true) {
                 cardDetailsContent
                     .padding(.trailing, 2)
@@ -2201,7 +2204,9 @@ private struct SupervisorCardDeckView: View {
             } action: { _, height in
                 detailsContentHeight = height
             }
-            .frame(height: min(max(detailsContentHeight, 145), 235))
+            .frame(minHeight: 44,
+                   idealHeight: min(max(detailsContentHeight, 145), 235),
+                   maxHeight: min(max(detailsContentHeight, 145), 235))
 
             if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {

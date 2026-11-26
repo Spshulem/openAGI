@@ -12,6 +12,9 @@ struct OpenAGIApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        #if DEBUG
+        if UITestProtocol.isEnabled { UITestProtocol.divertConsoleOutput() }
+        #endif
         BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.refreshTaskIdentifier, using: nil) { task in
             guard let appRefreshTask = task as? BGAppRefreshTask else {
                 task.setTaskCompleted(success: false)
