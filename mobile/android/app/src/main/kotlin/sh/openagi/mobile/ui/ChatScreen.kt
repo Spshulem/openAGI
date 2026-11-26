@@ -623,6 +623,10 @@ class ChatConversationState(
                 throw cancelled
             } catch (missing: DaemonException.NotFound) {
                 null
+            } catch (older: DaemonException.Unauthorized) {
+                // A main older than the route refuses it from a phone (it is
+                // not on that main's allowlist) while the heartbeat works.
+                null
             } catch (error: Exception) {
                 // Can't tell now: ask again on the next pass, send nothing.
                 return

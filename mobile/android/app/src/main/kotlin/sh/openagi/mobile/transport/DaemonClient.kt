@@ -270,7 +270,7 @@ class DaemonClient(
 
     // What main knows about up to 50 of this phone's turns, by id, so a send
     // whose answer was lost is only sent again when main never took it.
-    // NotFound is a main older than the route.
+    // NotFound (owner) or Unauthorized (a phone) is a main older than the route.
     suspend fun conversationTurns(thread: String, requestIds: List<String>, conversationId: String? = null): TurnStates {
         require(thread == "agent" || thread == "supervisor") { "unknown thread" }
         require(requestIds.size in 1..50 && requestIds.none { it.isBlank() || ',' in it }) { "1 to 50 turn ids" }
