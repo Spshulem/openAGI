@@ -555,7 +555,14 @@ final class SharedSupervisorClient: ObservableObject {
   /// Messages sent while a reply runs: one at a time, in order. Edit holds
   /// the queue at that item; Send Now interrupts the running reply and sends
   /// the item next (see SupervisorChannelsKit's QueuedTurnQueue).
-  @Published private(set) var queue = QueuedTurnQueue<SupervisorQueuedPayload>()
+  @Published private(set) var queue = QueuedTurnQueue<SupervisorQueuedPayload>() {
+    didSet { savePendingIfChanged() }
+  }
+  /// Where the messages only this Mac has (not yet on the hub, or queued
+  /// here for a main without a hub queue) are kept across a quit or a crash,
+  /// and what was last written there.
+  private let pendingStore: SupervisorPendingQueueStore
+  private var savedPending: [SupervisorPendingMessage] = []
   /// The open queued-message editor's text. Saving never sends.
   @Published var queuedEditDraft = ""
   /// The turn id of the reply streaming now, when main was sent one.
@@ -1016,15 +1023,39 @@ final class SharedSupervisorClient: ObservableObject {
     baseURLOverride = nil
     tokenOverride = nil
     preferences = .standard
+    pendingStore = SupervisorPendingQueueStore(url: SupervisorPendingQueueStore.defaultURL)
+    restorePending()
   }
 
   /// A separate client for tests: its own session, daemon URL, token and
-  /// preferences.
-  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard) {
+  /// preferences, and its own pending-message file (none unless given).
+  init(testSession: URLSession, baseURL: URL, token: String, preferences: UserDefaults = .standard,
+       pendingQueueURL: URL? = nil) {
     session = testSession
     baseURLOverride = baseURL
     tokenOverride = token
     self.preferences = preferences
+    pendingStore = SupervisorPendingQueueStore(url: pendingQueueURL)
+    restorePending()
+  }
+
+  /// Messages typed before a quit that main never took go back in the
+  /// queue with their turn ids. They go once history has said whether the
+  /// hub keeps the queue (uploadPending) or not (drainIfIdle).
+  private func restorePending() {
+    let saved = pendingStore.load()
+    guard !saved.isEmpty else { return }
+    var restored = queue
+    SupervisorPendingQueueStore.restore(saved, into: &restored)
+    queue = restored
+    savedPending = SupervisorPendingQueueStore.pending(queue)
+  }
+
+  private func savePendingIfChanged() {
+    let pending = SupervisorPendingQueueStore.pending(queue)
+    guard pending != savedPending else { return }
+    savedPending = pending
+    pendingStore.save(pending)
   }
 
   /// Builds a `POST /message` payload restricted to fields allowlisted by
@@ -1228,6 +1259,9 @@ final class SharedSupervisorClient: ObservableObject {
       messages = decoded.messages
       applyHubQueue(decoded.queue)
       settleOutstanding(decoded)
+      // A main without a hub queue: messages restored after a relaunch (or
+      // left waiting while it was out of reach) go now, one at a time.
+      if !hubQueueAvailable { drainIfIdle() }
       lastError = nil
     } catch {
       // Keep cached transcript cleanly when daemon is restarting.
@@ -1548,9 +1582,10 @@ final class SharedSupervisorClient: ObservableObject {
       return text
     }
 
-    if let partial = streamingReplyText, !partial.isEmpty {
-      return partial
-    }
+    // Ended without its final frame: main may still be running the turn,
+    // so partial text is not a finished reply. streamTracked keeps the turn
+    // outstanding and the queue waits until history says how it ended,
+    // instead of sending the next message behind it.
     throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
       NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
     ])
