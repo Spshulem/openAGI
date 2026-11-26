@@ -326,7 +326,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   runtime.hubProactiveGuard = hubProactiveGuard;
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), dataDir, runtime });
   const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
-  const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
+  const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime, history: (nodeId, consentId, windowMs) => g2Proactive.recentHistory(nodeId, consentId, windowMs) }) : null;
   let g2Requests = null;
   try { g2Requests = channels?.g2 ? new G2Requests({ channel: channels.g2, dir: path.join(dataDir, "g2-requests"),
     onCancel: async record => {

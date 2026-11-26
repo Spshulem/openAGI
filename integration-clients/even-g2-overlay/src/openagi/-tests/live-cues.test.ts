@@ -12,6 +12,14 @@ it('bounds live context and does not replay earlier conversations after a pause'
   context.clear(); expect(context.add('New conversation', 33000)).toBe('New conversation')
 })
 
+it('checks a direct question within seconds, while other speech waits 30 seconds', () => {
+  const context = new LiveCueContext()
+  expect(context.add('We were planning the trip', 1000)).not.toBeNull()
+  expect(context.add('It should be fun', 4000)).toBeNull()
+  expect(context.add("What's the capital of Washington?", 7000)).toContain('capital of Washington')
+  expect(context.add('Is it far', 9000)).toBeNull() // still at least 5 s apart
+})
+
 it('checks only explicit HTTPS candidates without sending credentials or following redirects', async () => {
   const fetcher = vi.fn<typeof fetch>(() => Promise.resolve(new Response(JSON.stringify({ service: 'openagi', role: 'main' }))))
   expect(normalizeServerAddress('main.example.ts.net')).toBe('https://main.example.ts.net')
