@@ -232,7 +232,21 @@ function statusSentences(text) {
   // Only the decision's own choice lists are left out of "where it stands":
   // bullets right after a line asking for a choice, and numbered items that
   // ask something. Other bullets (test results, failures) are status.
-  const prose_ = withoutChoiceLists(text);
+  // Table rows are status in plain words, never pipes: one line per PR row,
+  // each value named by its column.
+  let header = null;
+  const prose_ = withoutChoiceLists(text)
+    .split(/\n/)
+    .flatMap((line) => {
+      if (!/^\s*\|.*\|\s*$/.test(line)) { header = null; return [line]; }
+      const cells = line.trim().slice(1, -1).split("|").map((c) => c.replace(/\*\*|`/g, "").replace(/^[✅❌⚠️]\s*/u, "").trim());
+      if (cells.every((c) => /^:?-{2,}:?$/.test(c) || !c)) return [];
+      if (!header) { header = cells; return []; }
+      if (!/#\d{2,7}\b/.test(cells[0] ?? "")) return [];
+      const facts = cells.slice(1).map((c, i) => (c ? `${header[i + 1] || "Value"}: ${c}` : null)).filter(Boolean);
+      return [`${cells[0]}: ${facts.join(", ")}.`];
+    })
+    .join("\n");
   return splitSentences(prose_.replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
     .map((t) => t.replace(/^[-*•]\s+/, "").trim())
     // A clipped excerpt starts mid-sentence ("…eady say"); a lead-in ends in

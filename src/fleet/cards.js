@@ -4,6 +4,7 @@
 // so Android, push extensions, and older clients stay 100% compatible.
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
+import { buildDecisionView, alignActionsWithDecisionView, cleanSuggestedReplies, cleanDecisionProse } from "./decision-view.js";
 import { asksToMergePr } from "./policy.js";
 import { buildDecisionContext, groupItemName, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
@@ -1135,6 +1136,26 @@ export function buildSupervisorCard(
     suggestedReplies = buildSuggestedReplies(question, { kind, canReply, recommendation });
   }
   const heldForContext = shouldHoldForContext(question, decisionContext, Number(now) || Date.now());
+  // The Needs You contract (goal, status, decision, recommendation), with
+  // actions and replies made consistent with it for every client.
+  const decisionView = buildDecisionView({
+    ctx: decisionContext,
+    options: Array.isArray(question.options) ? question.options : [],
+    recommendation: decisionContext.recommendation || recommendation,
+    prContext,
+    prRef,
+    agentTexts: [snap?.agentSummary, question.askContext, thread?.lastAgentFull].filter((t) => typeof t === "string"),
+    itemName: decisionContext.itemName ?? sessionTitle
+  });
+  const aligned = alignActionsWithDecisionView(decisionView, { primaryAction, secondaryAction, extraActions });
+  suggestedReplies = cleanSuggestedReplies(suggestedReplies, decisionView);
+  for (const field of ["context", "goal", "whatChanged", "whereItStands", "currentState", "decision", "details", "verified", "blocked"]) {
+    if (typeof brief[field] === "string" && brief[field]) brief[field] = cleanDecisionProse(brief[field], { max: field === "details" ? 2400 : 1100, keepLines: true }) ?? brief[field];
+  }
+  if (recommendation) recommendation = cleanDecisionProse(recommendation, { max: 240 }) ?? recommendation;
+  // Boilerplate that would steer the owner to an admin bypass is not shown
+  // as the recommendation.
+  if (decisionView.recommendation.unknown && decisionView.decision.options.some((o) => o.adminBypass)) recommendation = null;
 
   return {
     id: question.id,
@@ -1144,12 +1165,15 @@ export function buildSupervisorCard(
     rank,
     headline,
     ...ownerDecision,
+    // The decision's default action is the aligned (recommended) one.
+    ...(aligned.primaryAction && ownerDecision.decisionAction ? { decisionAction: buildOwnerDecision(question, { kind, primaryAction: aligned.primaryAction }).decisionAction } : {}),
     // Held for context, or Supervisor delivery recovery ("N stopped. Nudges
     // can't get through"): neither waits on the owner, so no Done is needed.
     ...(heldForContext || (question.kind === "deliver" && decisionContext.askType === "session_error") ? { needsYou: false } : {}),
     askType: decisionContext.askType,
     contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
     decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },
+    decisionView,
     sessionTitle,
     // A reply that never reached the agent says so first, so the owner does
     // not re-answer blind (an unconfirmed one may already have landed).
@@ -1180,9 +1204,9 @@ export function buildSupervisorCard(
     answerIn: question.answerIn ?? "here",
     risky: Boolean(question.risky),
     options: Array.isArray(question.options) ? [...question.options] : [],
-    primaryAction,
-    secondaryAction,
-    extraActions,
+    primaryAction: aligned.primaryAction,
+    secondaryAction: aligned.secondaryAction,
+    extraActions: aligned.extraActions,
     timeline: buildTimeline(question, row, actions, prMeta),
     resources: buildResources(question, row, prRef, { openChat, sessionTitle, prUrlOverride: prUrl }),
     openChat,
