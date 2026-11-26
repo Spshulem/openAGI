@@ -113,7 +113,7 @@ browser/CLI runtime is not a native capture app.
 | iOS push and phone-agent/workspace additions | Merged #208/#209 after v0.0.58; source/QA availability, not a store release |
 | New messaging/Google/Pebble connections | Merged #210 after v0.0.58; owner accounts, configuration and live acceptance required |
 | Provider, cost and approval improvements | Merged #212–#214 after v0.0.58; not evidence that an installed app has updated |
-| Guided onboarding and Windows/Linux portable downloads | The deterministic setup/Get started flows are shipped; v0.0.83 publicly has Mac, Windows x64, and Linux x64/arm64 assets. Unified opt-in discovery and the no-key help skill remain planned in [`docs/plans/2026-11-21-onboarding-handoff.md`](plans/2026-11-21-onboarding-handoff.md). |
+| Guided onboarding and Windows/Linux portable downloads | The deterministic setup/Get started flows are shipped; the [latest release](https://github.com/Spshulem/openAGI/releases/latest) publicly has Mac, Windows x64, and Linux x64/arm64 assets. Unified opt-in discovery and the no-key help skill remain planned in [`docs/plans/2026-11-21-onboarding-handoff.md`](plans/2026-11-21-onboarding-handoff.md). |
 
 Before publishing, recheck the latest release assets, use only those download
 links, and verify desktop/mobile layout, navigation and screenshot privacy in

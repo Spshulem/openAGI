@@ -85,11 +85,16 @@ details.thread>summary{padding:0}
 a.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:var(--text)}
 a.btn.primary{color:var(--ink)}
 .risk{margin:10px 0 0;font-size:14px;font-weight:650;color:var(--hot)}
+.admin{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.admin p{margin:6px 0 0;font-size:14px}.admin code{word-break:break-all}.btn.hot{border-color:var(--hot);color:var(--hot)}
 .chats{display:grid;gap:6px;margin-top:10px;font-size:14px;color:var(--soft)}
 .chats div{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px}
 .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .item .acts .btn{margin:0;width:auto;flex:1 1 auto}
 .ask{margin-top:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px}
+.settings{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--raise)}
+.settings h4{margin:0 0 8px;font-size:15px}.settings label{display:block;margin-top:9px;font-size:13px;color:var(--muted)}
+.settings select{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit}
+.settings .note{margin:8px 0 0}.settings .acts{margin-top:10px}
 .ask .t{display:block}
 .chat{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .chat .log{max-height:420px;overflow:auto}
@@ -228,6 +233,10 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   var openThreads = new Set();
   var groupOpen = new Map();
   var cards = new Map();
+  // question id -> { plan, consent }: an Admin Merge preview the owner is
+  // reading. Polling re-renders keep showing it until Cancel, confirm, or
+  // the consent expires.
+  var adminPreviews = new Map();
   // Expanded rows: thread key -> { at, thread, error } from the detail route,
   // and the function that repaints that row once its detail arrives.
   var details = new Map();
@@ -462,6 +471,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
       // Answered only in the agent's app: the way there comes first.
       if (inApp) openChatLink(q.openChat, 'btn primary', opts);
       answerButtons(q, opts, !inApp);
+      adminMergeOffer(q, t && t.pr, card);
       if (inApp) {
         el('p', 'note', appNote(q), card);
       } else if (q.kind === 'agent-ask') {
@@ -475,6 +485,8 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
   // so and shows all of it, the agent's own message too, before any button.
   function askText(q, parent) {
     if (q.risky) el('p', 'risk', 'Risky: read all of it before you answer.', parent);
+    // Its earlier reply never reached the agent (or was not confirmed).
+    if (q.deliveryNote) el('p', 'warn', q.deliveryNote, parent);
     if (q.body) el('p', null, q.body, parent);
     var plan = q.meta && q.meta.plan;
     if (plan) {
@@ -523,6 +535,79 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     });
     buttons.push(button('Dismiss', 'btn ghost', parent, function () { return decide(q, { dismiss: true }, buttons); }));
     return buttons;
+  }
+
+  // Admin Merge: offered only on an open PR GitHub reports as held by its
+  // required review. Ordinary answers never bypass anything; this is a
+  // separate, deliberate step. Preview (read-only) shows what would be
+  // waived and the exact repo, PR, and head; only then can the owner confirm.
+  function adminMergeOffer(q, pr, card) {
+    if (!q.prRef || !pr || String(q.prRef).toLowerCase() !== String(pr.ref || '').toLowerCase()) return;
+    var up = function (v) { return String(v || '').toUpperCase(); };
+    if (up(pr.state) !== 'OPEN' || pr.isDraft || up(pr.mergeState) !== 'BLOCKED' || up(pr.reviewDecision) !== 'REVIEW_REQUIRED') return;
+    var box = el('div', 'admin', null, card);
+    var open = adminPreviews.get(q.id);
+    if (open && Date.parse(open.consent.expiresAt) > Date.now()) { adminPlan(q, box, open.plan, open.consent); return; }
+    adminPreviews.delete(q.id);
+    el('p', 'note', 'GitHub holds this PR for a required review. Merge will not bypass that.', box);
+    var b = button('Admin Merge…', 'btn ghost', box, function () { return adminPreview(q, box, b); });
+  }
+
+  function adminPath(q) { return '/fleet/api/cards/' + encodeURIComponent(q.id) + '/admin-merge'; }
+
+  async function adminPreview(q, box, b) {
+    b.disabled = true;
+    try {
+      var r = await api(adminPath(q), { preview: true });
+      var res = r && r.result;
+      if (!res || !res.ok || !res.plan || !res.consent) {
+        b.disabled = false;
+        say('Admin Merge not available: ' + ((res && res.detail) || 'no preview returned.'), true);
+        return;
+      }
+      adminPreviews.set(q.id, { plan: res.plan, consent: res.consent });
+      adminPlan(q, box, res.plan, res.consent);
+    } catch (e) {
+      b.disabled = false;
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
+  }
+
+  function adminPlan(q, box, plan, consent) {
+    box.replaceChildren();
+    el('p', 'risk', 'Admin Merge uses your GitHub admin bypass. Read all of it before you confirm.', box);
+    var what = el('p', null, 'Squash-merge ' + plan.repo + '#' + plan.number + ' into ' + plan.baseRef + ' at head ', box);
+    el('code', null, plan.headSha, what);
+    if (plan.githubLogin) el('p', 'note', 'As GitHub user ' + plan.githubLogin + '.', box);
+    el('p', 'k', 'Waives only:', box);
+    (plan.waives || []).forEach(function (w) { el('p', null, '• ' + w.label + ': ' + w.detail, box); });
+    el('p', 'k', 'Still enforced:', box);
+    (plan.stillEnforced || []).forEach(function (line) { el('p', null, '• ' + line, box); });
+    el('p', 'note', 'GitHub decides whether your identity may bypass the review. If it refuses, you will see its exact answer. Nothing is deployed. Confirm before ' + when(consent.expiresAt) + '.', box);
+    var acts = el('div', 'opts', null, box);
+    var buttons = [];
+    buttons.push(button('Admin Merge ' + plan.repo + '#' + plan.number + ' at ' + plan.headSha.slice(0, 7), 'btn hot', acts, function () {
+      return adminConfirm(q, consent, buttons);
+    }));
+    buttons.push(button('Cancel', 'btn ghost', acts, function () { adminPreviews.delete(q.id); return load(); }));
+  }
+
+  async function adminConfirm(q, consent, buttons) {
+    buttons.forEach(function (b) { b.disabled = true; });
+    // The consent is single-use: whatever the answer, a new preview is needed.
+    adminPreviews.delete(q.id);
+    try {
+      var r = await api(adminPath(q), { consent: consent });
+      var res = r && r.result;
+      if (r && r.state) render(r.state); else await load();
+      if (res && res.ok) say(res.detail || 'Admin merged.');
+      else say((res && res.detail) || 'Admin Merge halted. Nothing was merged.', true);
+    } catch (e) {
+      buttons.forEach(function (b) { b.disabled = false; });
+      say(e.message, true);
+      if (e.status === 404) await load();
+    }
   }
 
   // Why the supervisor's review kept an open question (live), or the close
@@ -635,6 +720,77 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     var reply = asks.filter(function (q) { return q.canReply === true; })[0];
     if (reply) return reply;
     return asks.filter(function (q) { return q.kind === 'agent-card' || q.kind === 'prompt'; })[0] || null;
+  }
+
+  var settingsLoading = new Set();
+  var settingsOpen = new Set();
+
+  function currentSettingsOption(select, settings, name) {
+    var current = settings && settings.current ? settings.current[name] : null;
+    if (!current) return;
+    var option = document.createElement('option');
+    option.value = current;
+    option.textContent = current;
+    option.selected = true;
+    option.disabled = true;
+    select.append(option);
+  }
+
+  function renderPaseoSettings(parent, t) {
+    var box = el('div', 'settings', null, parent);
+    el('h4', null, 'Paseo session settings', box);
+    var status = el('p', 'note', 'Loading authoritative settings…', box);
+    if (settingsLoading.has(t.key)) return box;
+    settingsLoading.add(t.key);
+    api(threadPath(t.key) + '/settings').then(function (result) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      var settings = result && result.settings ? result.settings : null;
+      if (!settings) { el('p', 'note', 'Settings are unavailable until this Paseo host can be read safely.', box); return; }
+      var stateText = settings.status === 'pending'
+        ? 'A pending permission card is open. Answer that card; settings cannot approve or clear it.'
+        : settings.status === 'busy'
+          ? 'This session has an active turn. Settings take effect after it finishes; no restart is performed.'
+          : 'Changes are sent to this exact session and confirmed by a fresh readback.';
+      el('p', 'note', stateText, box);
+      var names = [['model', 'Model'], ['reasoningEffort', 'Reasoning effort'], ['permissions', 'Permissions']];
+      var changed = false;
+      names.forEach(function (pair) {
+        var name = pair[0], label = pair[1];
+        var options = Array.isArray(settings.supported && settings.supported[name]) ? settings.supported[name] : [];
+        var select = document.createElement('select');
+        var lab = el('label', null, label, box); lab.append(select);
+        var unavailable = settings.unavailable && settings.unavailable[name];
+        if (unavailable) { currentSettingsOption(select, settings, name); select.disabled = true; el('p', 'note', unavailable, box); return; }
+        if (!options.length) { select.disabled = true; el('p', 'note', 'Unavailable on this host/provider.', box); return; }
+        options.forEach(function (item) {
+          var option = document.createElement('option'); option.value = item.id; option.textContent = item.label;
+          option.disabled = item.selectable === false; option.selected = settings.current && settings.current[name] === item.id; select.append(option);
+        });
+        select.disabled = settings.status !== 'ready';
+        select.addEventListener('change', function () {
+          if (changed || select.disabled) return;
+          changed = true; select.disabled = true;
+          api(threadPath(t.key) + '/settings', { confirmed: true, targetFingerprint: settings.targetFingerprint, [name]: select.value }).then(function () {
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say('Paseo ' + label.toLowerCase() + ' change confirmed by readback.');
+          }).catch(function (error) {
+            // Never leave the rejected value displayed as current; reread the session.
+            box.replaceWith(renderPaseoSettings(parent, t));
+            say(error.message || 'The setting was not changed.', true);
+          });
+        });
+      });
+    }).catch(function (error) {
+      settingsLoading.delete(t.key);
+      if (!box.isConnected) { if (settingsOpen.has(t.key) && current) render(current); return; }
+      box.replaceChildren();
+      el('h4', null, 'Paseo session settings', box);
+      el('p', 'note', error.message || 'Settings could not be read; nothing was changed.', box);
+    });
+    return box;
   }
 
   // Where the reply box sends: the question's own reply when it takes one,
@@ -1035,6 +1191,15 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     } else {
       var mu = button('Mute ' + MUTE_HOURS + 'h', 'btn', acts, function () { return mute(t, true, mu); });
     }
+    if (t.kind === 'paseo') {
+      var settings = button('Session settings', 'btn', acts, function () {
+        settingsOpen.add(t.key);
+        settings.disabled = true;
+        renderPaseoSettings(parent, t);
+      });
+      settings.disabled = settingsOpen.has(t.key);
+      if (settingsOpen.has(t.key)) renderPaseoSettings(parent, t);
+    }
   }
 
   function renderThread(t, parent) {
@@ -1070,7 +1235,7 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     // A row the owner just opened wants fresh detail; one a re-render keeps
     // open (its toggle fires too) refetches only once the detail is stale.
     d.addEventListener('toggle', function () {
-      if (!d.open) { openThreads.delete(t.key); return; }
+      if (!d.open) { openThreads.delete(t.key); settingsOpen.delete(t.key); return; }
       var fresh = !openThreads.has(t.key);
       openThreads.add(t.key);
       wantDetail(t.key, fresh ? BUSY_POLL_MS : DETAIL_TTL_MS);

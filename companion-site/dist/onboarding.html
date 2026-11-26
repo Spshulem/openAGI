@@ -1,70 +1,116 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#f6f6f0">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f5ef">
   <meta name="description" content="OpenAGI onboarding: choose a personal assistant, coding-agent Supervisor, or both, then get one real result.">
-  <title>Onboarding — one real result with OpenAGI</title>
-  <link rel="icon" href="assets/openagi-mark.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="platform.css"><link rel="stylesheet" href="overview.css"><link rel="stylesheet" href="software.css">
-  <script src="platform.js" defer></script><script src="software.js" defer></script>
+  <title>Get started — one real result with OpenAGI</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
 </head>
-<body class="install-page onboarding-page">
-<a class="skip-link" href="#main">Skip to content</a>
-<header class="site-header unified-header">
-  <a class="brand" href="index.html" aria-label="OpenAGI home">openagi<span class="brand-dot" aria-hidden="true"></span></a>
-  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu <span aria-hidden="true">+</span></button>
-  <nav id="site-nav" aria-label="Main navigation">
-    <a href="index.html#personal-agent">Personal agent</a><a href="index.html#supervisor">Supervisor</a><a href="ecosystem.html">Apps &amp; integrations</a><a href="https://github.com/Spshulem/openAGI">GitHub <span aria-hidden="true">↗</span></a><a class="nav-action" href="setup.html">Install OpenAGI <span aria-hidden="true">↗</span></a>
-  </nav>
-</header>
-
-<main id="main">
-  <section class="section onboarding-hero">
-    <p class="eyebrow">A first useful result</p>
-    <h1>Choose a path.<br><span>Do one real thing.</span></h1>
-    <p class="lede">OpenAGI is an assistant and a coding-agent Supervisor on the host you choose. Pick one path, combine both, or skip a step and come back later.</p>
-    <div class="hero-actions"><a class="button dark" href="setup.html">Start setup <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md">Read the full guide ↗</a></div>
-  </section>
-
-  <section class="section onboarding-choice" aria-labelledby="choice-heading">
-    <div><p class="eyebrow">Three quick taps</p><h2 id="choice-heading">What would help first?</h2><p class="section-description">The choices combine. Every optional permission, account, pairing step, and send action stays separate and reviewable.</p></div>
-    <div class="onboarding-choice-grid">
-      <a href="#assistant-path"><span>01</span><div><h3>Personal Assistant</h3><p>Save a useful preference, complete a small task, and learn what optional observation can do.</p></div><b aria-hidden="true">↓</b></a>
-      <a href="#supervisor-path"><span>02</span><div><h3>Agent Supervisor</h3><p>Choose which coding project to watch, then see a real status, blocker, or watched update.</p></div><b aria-hidden="true">↓</b></a>
-      <a href="#both-path"><span>03</span><div><h3>Both</h3><p>Get a real assistant reply first, then connect the project view when it is useful.</p></div><b aria-hidden="true">↓</b></a>
+<body class="onboarding-page">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="wordmark" href="index.html" aria-label="OpenAGI home">openagi<span aria-hidden="true">.</span></a>
+    <nav aria-label="Primary navigation">
+      <a href="index.html#supervisor">Supervisor</a>
+      <a href="index.html#principles">How it works</a>
+      <a href="onboarding.html" aria-current="page">Get started</a>
+      <a href="index.html#install">Install</a>
+      <a href="index.html#compare">Compare</a>
+      <a class="nav-source" href="https://github.com/Spshulem/openAGI">GitHub ↗</a>
+    </nav>
+    <button class="menu-button" type="button" aria-expanded="false" aria-controls="mobile-nav">Menu</button>
+    <div class="mobile-nav" id="mobile-nav" hidden>
+      <a href="index.html#supervisor">Supervisor</a><a href="index.html#principles">How it works</a><a href="onboarding.html" aria-current="page">Get started</a><a href="index.html#install">Install</a><a href="index.html#compare">Compare</a><a href="https://github.com/Spshulem/openAGI">GitHub ↗</a>
     </div>
-  </section>
+  </header>
 
-  <section class="section onboarding-status" aria-labelledby="status-heading">
-    <div><p class="eyebrow">What happens before chat</p><h2 id="status-heading">Setup is deterministic.</h2></div>
-    <div class="status-steps"><article><span>01</span><h3>Choose a model</h3><p>Use a cloud provider, an OpenAI-compatible local server, or the native Apple Intelligence path in a compatible Mac/iPhone build.</p><em class="status-shipped">Shipped</em></article><article><span>02</span><h3>Connect &amp; verify</h3><p>A short test must receive a real answer. A key in a field, an installed CLI, or a historical screenshot is not proof of a working connection.</p><em class="status-shipped">Shipped</em></article><article><span>03</span><h3>Meet your agent</h3><p>Send one small request, check the reply, and verify one result. Credentials belong in Settings, never in chat.</p><em class="status-shipped">Shipped</em></article></div>
-  </section>
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow">A first useful result</p>
+        <h1>Choose a path.<br><em>Do one real thing.</em></h1>
+        <p class="hero-lede">OpenAGI is an assistant and a coding-agent Supervisor on the host you choose. Pick one path, combine both, or skip a step and come back later.</p>
+        <div class="hero-actions">
+          <a class="button button-dark" href="index.html#install">Start with an install <span aria-hidden="true">↗</span></a>
+          <a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md">Read the full guide ↗</a>
+        </div>
+        <p class="hero-note">Labels on this page separate what ships today from what is planned. Already running OpenAGI? <a href="http://127.0.0.1:43210/">Open your local dashboard ↗</a>.</p>
+      </div>
+      <div class="hero-card" aria-label="Onboarding paths and their status">
+        <div class="card-top"><span class="status-dot"></span><span>GET STARTED · THREE PATHS</span><span class="card-date">SKIPPABLE</span></div>
+        <p class="card-kicker">The choices combine</p>
+        <h2>One real reply.<br><strong>One checked result.</strong></h2>
+        <div class="signal-row"><span class="signal-mark signal-green">01</span><div><b>Personal Assistant</b><small>save a preference or finish a small task</small></div><span class="signal-label">SHIPPED</span></div>
+        <div class="signal-row"><span class="signal-mark signal-amber">02</span><div><b>Agent Supervisor</b><small>shipped controls · unified prescan planned</small></div><span class="signal-label">PARTLY PLANNED</span></div>
+        <div class="signal-row"><span class="signal-mark signal-gray">03</span><div><b>Both</b><small>reply first · handoff improvements planned</small></div><span class="signal-label">PARTLY PLANNED</span></div>
+        <div class="card-bottom"><span>Nothing is granted by setup.</span><span>You choose access</span></div>
+      </div>
+    </section>
 
-  <section class="section onboarding-path onboarding-path-assistant" id="assistant-path" aria-labelledby="assistant-heading">
-    <div class="path-kicker"><p class="eyebrow">Personal Assistant</p><span class="status-shipped">Shipped path</span></div>
-    <div class="path-layout"><div><h2 id="assistant-heading">Take one useful task off your plate.</h2><p class="lede">Start with a short brief, a non-sensitive preference, or a follow-up you would otherwise keep in your head.</p></div><ol class="path-checklist"><li><strong>Ask one question.</strong><span>“Help me plan today in three bullets.”</span></li><li><strong>Save one preference.</strong><span>Ask to remember it, then recall it in a new chat.</span></li><li><strong>Correct it when needed.</strong><span>Review Memory and decide what should remain.</span></li><li><strong>Choose integrations later.</strong><span>Settings explains what each connection unlocks and where its key goes.</span></li></ol></div>
-    <div class="path-note"><strong>Optional Mac observation.</strong> Capture is off until you enable it. Screen Recording, exclusions, pause, delete, and local-model choices remain separate from chat. Observation provides history; it does not silently grant clicks or typing.</div>
-  </section>
+    <section class="section customize" id="choose" aria-labelledby="choice-heading">
+      <div class="section-heading"><p class="eyebrow">Three quick taps</p><h2 id="choice-heading">What would<br><em>help first?</em></h2><p>Every optional permission, account, pairing step, and send action stays separate and reviewable.</p></div>
+      <div class="customize-grid">
+        <article><span>01 · Personal Assistant</span><h3>Take one task off your plate.</h3><p>Save a useful preference, complete a small task, and learn what optional observation can do.</p><a href="#assistant-path">See the assistant path ↓</a></article>
+        <article><span>02 · Agent Supervisor</span><h3>See the project that needs you.</h3><p>Choose which coding project to watch, then see a real status, blocker, or watched update.</p><a href="#supervisor-path">See the Supervisor path ↓</a></article>
+        <article><span>03 · Both</span><h3>Reply first. Connect more when it helps.</h3><p>Get a real assistant reply first, then connect the project view when it is useful.</p><a href="#both-path">See the combined path ↓</a></article>
+      </div>
+    </section>
 
-  <section class="section onboarding-path onboarding-path-supervisor" id="supervisor-path" aria-labelledby="supervisor-heading">
-    <div class="path-kicker"><p class="eyebrow">Agent Supervisor</p><span class="status-planned">Unified prescan planned</span></div>
-    <div class="path-layout"><div><h2 id="supervisor-heading">See the project that needs you.</h2><p class="lede">Supervisor lets you manage coding agents from your Mac or phone, organize them by project, see progress and blockers, and act on decisions without patrolling every tab.</p></div><ol class="path-checklist"><li><strong>Opt in to a read-only prescan.</strong><span>Check supported local Codex, Claude Code, T3, Paseo, or other session sources on this device.</span></li><li><strong>Choose what to manage.</strong><span>Review discovered projects and capabilities; no blanket access is granted.</span></li><li><strong>See one real outcome.</strong><span>Open a project status, blocker, PR/evidence card, or watched update.</span></li><li><strong>Decide what happens next.</strong><span>Observe is read-only; Propose asks before sending; Auto is explicit and bounded.</span></li></ol></div>
-    <div class="path-note"><strong>Current shipped controls.</strong> `/fleet` reads supported session stores and shows work, questions, PRs, and verification evidence. Managed sessions, watched conversations, and Supervisor sends are distinct. Discovery alone never sends an agent message or runs an action.</div>
-  </section>
+    <section class="devices-section" id="setup-status" aria-labelledby="status-heading">
+      <div class="section devices-inner">
+        <div class="section-heading"><p class="eyebrow">What happens before chat</p><h2 id="status-heading">Setup is<br><em>deterministic.</em></h2><p>The same three steps come first on every path. A key in a field, an installed CLI, or a historical screenshot is not proof of a working connection.</p></div>
+        <div class="device-status">
+          <div class="device-row"><b>01 · Choose a model</b><span>A cloud provider, an OpenAI-compatible local server, or the native Apple Intelligence path in a compatible Mac/iPhone build.</span><em class="available">Shipped</em></div>
+          <div class="device-row"><b>02 · Connect &amp; verify</b><span>A short test must receive a real answer before setup continues.</span><em class="available">Shipped</em></div>
+          <div class="device-row"><b>03 · Meet your agent</b><span>Send one small request, check the reply, and verify one result. Credentials belong in Settings, never in chat.</span><em class="available">Shipped</em></div>
+          <a class="button button-light" href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md#connect-a-model-then-learn-in-chat">Read model setup ↗</a>
+        </div>
+      </div>
+    </section>
 
-  <section class="section onboarding-path onboarding-path-both" id="both-path" aria-labelledby="both-heading">
-    <div class="path-kicker"><p class="eyebrow">Both paths</p><span class="status-planned">Handoff improvements planned</span></div>
-    <div class="path-layout"><div><h2 id="both-heading">Reply first. Connect more when it helps.</h2><p class="lede">On Mac, ask whether this is your main computer or a remote host. On iPhone, stay phone-only or connect an existing computer. Pairing is optional.</p></div><ol class="path-checklist"><li><strong>Get a real reply.</strong><span>Complete model verification and send the first message.</span></li><li><strong>Test notifications.</strong><span>Accept or deny permission; either way, keep a visible retry and skip path.</span></li><li><strong>Verify one setup outcome.</strong><span>Confirm a saved memory, reachable host, project status, or notification receipt.</span></li><li><strong>Recover without guessing.</strong><span>Handle no model, denied permissions, failed provider tests, and pairing failures with local help.</span></li></ol></div>
-    <div class="path-note"><strong>Phone-only is first-class.</strong> Compatible iPhone builds can use Apple Intelligence or a supported local/hosted model without a Mac. Shared tasks, integrations, coding Supervisor, and host Computer Use require a reachable host and the capabilities it advertises.</div>
-  </section>
+    <section class="section principles" id="assistant-path" aria-labelledby="assistant-heading">
+      <div class="section-heading"><p class="eyebrow">Personal Assistant · <em class="status-label available">Shipped path</em></p><h2 id="assistant-heading">Take one<br><em>useful task.</em></h2><p>Start with a short brief, a non-sensitive preference, or a follow-up you would otherwise keep in your head.</p></div>
+      <div class="principle-list">
+        <article><span class="principle-number">01</span><div><h3>Ask one question.</h3><p>“Help me plan today in three bullets.”</p></div></article>
+        <article><span class="principle-number">02</span><div><h3>Save one preference.</h3><p>Ask to remember it, then recall it in a new chat.</p></div></article>
+        <article><span class="principle-number">03</span><div><h3>Correct it when needed.</h3><p>Review Memory and decide what should remain.</p></div></article>
+        <article><span class="principle-number">04</span><div><h3>Choose integrations later.</h3><p>Settings explains what each connection unlocks and where its key goes.</p><p class="example"><b>Optional Mac observation</b> Capture is off until you enable it. Screen Recording, exclusions, pause, delete, and local-model choices remain separate from chat. Observation provides history; it does not silently grant clicks or typing.</p></div></article>
+      </div>
+    </section>
 
-  <section class="section onboarding-offline" aria-labelledby="offline-heading">
-    <div><p class="eyebrow">No key · offline · limits</p><h2 id="offline-heading">Keep the thread intact.</h2></div>
-    <div><p>When credits, daily/monthly caps, network, or a provider stop a turn, OpenAGI should preserve the conversation and explain what happened. Offer a manual retry or an opted-in local fallback; never silently resend a possibly completed request or send local-only context to a cloud provider.</p><p class="status-planned">Planned: a versioned setup/help skill for supported local models plus a deterministic help path that can explain setup, permissions, pairing, and recovery without cloud credentials.</p><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/plans/2026-11-21-onboarding-handoff.md">Read the tracked Mac/iOS plan ↗</a></div>
-  </section>
-</main>
+    <section class="section principles" id="supervisor-path" aria-labelledby="supervisor-heading">
+      <div class="section-heading"><p class="eyebrow">Agent Supervisor · <em class="status-label planned">Unified prescan planned</em></p><h2 id="supervisor-heading">See the project<br><em>that needs you.</em></h2><p>Supervisor lets you manage coding agents from your Mac or phone, organize them by project, see progress and blockers, and act on decisions without patrolling every tab.</p><a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/setup/fleet-supervisor.md">Read the Supervisor setup ↗</a></div>
+      <div class="principle-list">
+        <article><span class="principle-number">01</span><div><h3>Opt in to a read-only prescan.</h3><p>Check supported local session sources on this device, such as Codex, Claude Code, Conductor, or Paseo. <em class="status-label planned">Planned as one onboarding step</em></p></div></article>
+        <article><span class="principle-number">02</span><div><h3>Choose what to manage.</h3><p>Review discovered projects and capabilities; no blanket access is granted.</p></div></article>
+        <article><span class="principle-number">03</span><div><h3>See one real outcome.</h3><p>Open a project status, blocker, PR/evidence card, or watched update.</p></div></article>
+        <article><span class="principle-number">04</span><div><h3>Decide what happens next.</h3><p>Observe is read-only; Propose asks before sending; Auto is explicit and bounded.</p><p class="example"><b>Current shipped controls</b> <code>/fleet</code> reads supported session stores and shows work, questions, PRs, and verification evidence. Managed sessions, watched conversations, and Supervisor sends are distinct. Discovery alone never sends an agent message or runs an action.</p></div></article>
+      </div>
+    </section>
 
-<footer class="site-footer unified-footer"><div class="footer-top"><a class="brand" href="index.html">openagi<span class="brand-dot" aria-hidden="true"></span></a><div><a href="index.html#supervisor">Supervisor</a><a href="setup.html">Install</a><a href="https://github.com/Spshulem/openAGI">Source ↗</a><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases ↗</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md">Docs ↗</a></div></div><p>A personal, proactive agent. Start with one real result and choose the access you need.</p><div class="footer-bottom"><span>Your host. Your models. Your permissions.</span><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">Source-available · PolyForm Noncommercial</a></div></footer>
+    <section class="section principles" id="both-path" aria-labelledby="both-heading">
+      <div class="section-heading"><p class="eyebrow">Both paths · <em class="status-label planned">Handoff improvements planned</em></p><h2 id="both-heading">Reply first.<br><em>Connect more later.</em></h2><p>On Mac, choose whether this is your main computer or a remote host. On iPhone, stay phone-only or connect an existing computer. Pairing is optional.</p></div>
+      <div class="principle-list">
+        <article><span class="principle-number">01</span><div><h3>Get a real reply.</h3><p>Complete model verification and send the first message.</p></div></article>
+        <article><span class="principle-number">02</span><div><h3>Test notifications.</h3><p>Accept or deny permission; either way, keep a visible retry and skip path.</p></div></article>
+        <article><span class="principle-number">03</span><div><h3>Verify one setup outcome.</h3><p>Confirm a saved memory, reachable host, project status, or notification receipt.</p></div></article>
+        <article><span class="principle-number">04</span><div><h3>Recover without guessing.</h3><p>Handle no model, denied permissions, failed provider tests, and pairing failures with local help.</p><p class="example"><b>Phone-only is first-class</b> Compatible iPhone builds can use Apple Intelligence or a supported local/hosted model without a Mac. Shared tasks, integrations, coding Supervisor, and host Computer Use require a reachable host and the capabilities it advertises.</p></div></article>
+      </div>
+    </section>
+
+    <section class="section intro" id="offline" aria-labelledby="offline-heading">
+      <div class="section-heading"><p class="eyebrow">No key · offline · limits</p><h2 id="offline-heading">Keep the thread<br><em>intact.</em></h2></div>
+      <div class="section-body">
+        <p>When credits, daily/monthly caps, network, or a provider stop a turn, OpenAGI should preserve the conversation and explain what happened. Offer a manual retry or an opted-in local fallback; never silently resend a possibly completed request or send local-only context to a cloud provider.</p>
+        <p><em class="status-label planned">Planned</em> A versioned setup/help skill for supported local models plus a deterministic help path that can explain setup, permissions, pairing, and recovery without cloud credentials.</p>
+        <a class="text-link" href="https://github.com/Spshulem/openAGI/blob/main/docs/plans/2026-11-21-onboarding-handoff.md">Read the tracked Mac/iOS plan ↗</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer"><div class="footer-brand"><a class="wordmark" href="index.html">openagi<span aria-hidden="true">.</span></a><p>A self-hosted personal runtime and evidence-backed Supervisor for the agents you already use.</p></div><div class="footer-links"><a href="https://github.com/Spshulem/openAGI">GitHub</a><a href="https://github.com/Spshulem/openAGI/releases/latest">Releases</a><a href="https://github.com/Spshulem/openAGI/blob/main/docs/GETTING_STARTED.md">First-use guide</a><a href="index.html#install">Install</a><a href="hardware.html">Hardware</a><a href="https://github.com/Spshulem/openAGI/blob/main/LICENSE">License</a></div><div class="footer-bottom"><span>Host your own runtime. Choose your model. Keep the final say.</span><span>Preview only · no production deployment</span></div></footer>
 </body>
 </html>

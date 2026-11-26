@@ -515,9 +515,12 @@ struct FleetState: Decodable, Equatable {
   /// snapshot.threads: the Watching list. Empty before the first scan.
   let threads: [FleetThread]
   let activityEvents: [FleetActivityEvent]
+  /// The hub's decision cards (`cards`), trimmed to the brief the Needs You
+  /// detail shows. Empty from a hub before them.
+  var cards: [FleetCardBrief] = []
 
   enum CodingKeys: String, CodingKey {
-    case mode, enabled, running, lastTickAt, nextTickAt, lastError, questions, snapshot, activityEvents
+    case mode, enabled, running, lastTickAt, nextTickAt, lastError, questions, snapshot, activityEvents, cards
   }
   private enum SnapshotKeys: String, CodingKey { case threads }
 
@@ -543,6 +546,73 @@ extension FleetState {
     let rawThreads = (try? snapshot?.decodeIfPresent([Lossy<FleetThread>].self, forKey: .threads)) ?? nil
     threads = (rawThreads ?? []).compactMap { $0.value }
     activityEvents = ((try? c.decodeIfPresent([Lossy<FleetActivityEvent>].self, forKey: .activityEvents)) ?? []).compactMap { $0.value }
+    cards = ((try? c.decodeIfPresent([Lossy<FleetCardBrief>].self, forKey: .cards)) ?? []).compactMap { $0.value }
+  }
+}
+
+/// One hub decision card (src/fleet/cards.js buildSupervisorCard), only the
+/// parts the Needs You detail adds to its question: the goal / where it
+/// stands / decision brief, the recommendation, and the PR state.
+struct FleetCardBrief: Decodable, Equatable {
+  let id: String
+  let questionId: String?
+  let needsYou: Bool
+  let kind: String?
+  let context: String?
+  let currentState: String?
+  let whatChanged: String?
+  let decision: String?
+  let recommendation: String?
+  let prRef: String?
+  let prUrl: String?
+  let ciState: String?
+
+  /// The question this card is about.
+  var questionKey: String { questionId ?? id }
+
+  enum CodingKeys: String, CodingKey {
+    case id, questionId, needsYou, kind, brief, recommendation, prRef, prUrl, ciState
+  }
+  private enum BriefKeys: String, CodingKey { case context, currentState, whatChanged, decision }
+
+  init(id: String, questionId: String? = nil, needsYou: Bool = true, kind: String? = nil,
+       context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil,
+       recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil) {
+    self.id = id
+    self.questionId = questionId
+    self.needsYou = needsYou
+    self.kind = kind
+    self.context = context
+    self.currentState = currentState
+    self.whatChanged = whatChanged
+    self.decision = decision
+    self.recommendation = recommendation
+    self.prRef = prRef
+    self.prUrl = prUrl
+    self.ciState = ciState
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    questionId = try? c.decodeIfPresent(String.self, forKey: .questionId)
+    needsYou = (try? c.decodeIfPresent(Bool.self, forKey: .needsYou)) ?? true
+    kind = try? c.decodeIfPresent(String.self, forKey: .kind)
+    if let b = try? c.nestedContainer(keyedBy: BriefKeys.self, forKey: .brief) {
+      context = try? b.decodeIfPresent(String.self, forKey: .context)
+      currentState = try? b.decodeIfPresent(String.self, forKey: .currentState)
+      whatChanged = try? b.decodeIfPresent(String.self, forKey: .whatChanged)
+      decision = try? b.decodeIfPresent(String.self, forKey: .decision)
+    } else {
+      context = nil
+      currentState = nil
+      whatChanged = nil
+      decision = nil
+    }
+    recommendation = try? c.decodeIfPresent(String.self, forKey: .recommendation)
+    prRef = try? c.decodeIfPresent(String.self, forKey: .prRef)
+    prUrl = try? c.decodeIfPresent(String.self, forKey: .prUrl)
+    ciState = try? c.decodeIfPresent(String.self, forKey: .ciState)
   }
 }
 

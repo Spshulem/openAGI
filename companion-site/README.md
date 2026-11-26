@@ -1,38 +1,55 @@
-# OpenAGI website
+# OpenAGI site preview
 
-Static website for the agent, Supervisor, apps, integrations, and optional hardware.
+This is a static, reviewable preview of the OpenAGI website narrative and
+information architecture. It is intentionally separate from the production
+redirects at `openagi.sh`; it does not deploy or change the live site.
 
-The original companion-site checkout was absent from the migrated workspace. The
-public static files were recovered from https://openagi-hardware.vercel.app/ on
-2026-11-10 before this revision. See research/recovered-deployment.json for the
-complete recovery manifest. Additional baseline assets were recovered from the original Mac Git checkout
-before publishing. No application-runtime files were changed.
+## Preview locally
 
-Preview with: python3 -m http.server 8789 --directory dist
+From this directory:
 
-The software pages are GitHub-first: the hero, navigation, install section,
-and footer link to the source repository, install docs, release page, and
-platform downloads. `onboarding.html` is the reviewable outcome-led handoff;
-it labels the deterministic setup and current Supervisor controls as shipped
-and the unified opt-in discovery/no-key help work as planned.
+```sh
+python3 -m http.server 8789 --directory dist
+```
 
-The current public release evidence is v0.0.83: Mac DMG, Windows x64 ZIP, and
-Linux x64/arm64 archives are on GitHub Releases. `openagi.sh/download` remains
-a Mac convenience redirect. iOS and Android links intentionally point to
-source/QA setup because no public store download is advertised.
+Open <http://127.0.0.1:8789/>. The page is static and has no build step.
 
-This checkout is a static preview and PR input. Do not treat a local preview,
-uploaded CI artifact, or Store submission as a production deployment.
+For the BuildBot3 preview used for acceptance, forward the remote server through the connected Mac with `ssh -N -L 8792:buildbot3:18791 spencer-mac`, then open <http://127.0.0.1:8792/> while that tunnel is running.
 
-Deploy only the contents of dist. Keep openagi.sh and its installer routing
-separate.
+## Evidence and status
 
-The research manifest below records the historical 2026-11-10 deployment at
-https://openagi-hardware.vercel.app/. It does not include this PR's new
-onboarding page or GitHub-first copy; regenerate it only after the website
-owner reviews and deploys the changes.
+The `dist/assets/evidence/` screenshots are dated verification captures from
+the repository's onboarding QA. Their captions distinguish shipped controls,
+historical evidence, and fresh-install expectations. `research/factual-checks.md`
+records the release, license, install, mobile, and competitor checks used by
+the page.
 
-Production deployment: dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA. The staged build was
-verified before promotion; all 44 published files match the release manifest.
-Desktop and mobile browser checks passed on eight pages. See research/ for
-the deployment record, file hashes, browser results, and screenshots.
+This preview does not publish, merge, deploy, change the license, or imply that
+the iOS/Android source builds have public store distribution.
+
+## Pages
+
+- `index.html` is the self-hosted runtime and Supervisor page. Its install
+  cards link to [the latest GitHub release](https://github.com/Spshulem/openAGI/releases/latest),
+  the all-platform download index, rather than to a pinned version.
+- `onboarding.html` ("Get started") is the outcome-led handoff: Personal
+  Assistant, Agent Supervisor, or Both. It labels the deterministic setup and
+  the current Supervisor controls as shipped, and the unified opt-in
+  discovery, notification handoff, and no-key help work as planned in
+  `docs/plans/2026-11-21-onboarding-handoff.md`.
+- `hardware.html`, `devices.html`, `device-guide.html`, `how-it-works.html`,
+  `concept.html`, `prototype.html`, and `hardware/` are the hardware and DIY
+  catalogue, with `ecosystem.html` (apps and integrations) and
+  `technology.html`. They were recovered from the 2026-11-10 deployment at
+  <https://openagi-hardware.vercel.app/> (see `research/recovered-deployment.json`)
+  and keep their own stylesheets (`platform.css`, `overview.css`, `dot.css`,
+  `hardware/build-notes.css`). Their navigation points back to the pages above.
+- `setup.html` only forwards old links to the install section. `story.js` and
+  `experience.js` are recovered scripts that no current page loads.
+
+The `research/` deployment, manifest, browser-check, and screenshot records
+describe the historical 2026-11-10 deployment (production deployment
+`dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA`, 44 published files). They do not cover the
+current pages; regenerate them only after the website owner reviews and
+deploys a change. `docs/verification/2026-11-21-site-onboarding.md` records the
+dated onboarding preview checks.

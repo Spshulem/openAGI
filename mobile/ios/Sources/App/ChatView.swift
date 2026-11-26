@@ -1,4 +1,5 @@
 import SwiftUI
+import SupervisorChannelsKit
 import PhotosUI
 import UIKit
 import UniformTypeIdentifiers
@@ -17,7 +18,7 @@ struct ChatView: View {
     var onClose: (() -> Void)? = nil
 
     private enum ChatSheet: String, Identifiable {
-        case model, settings, fallback, conversations
+        case model, budget, settings, fallback, conversations
         var id: String { rawValue }
     }
 
@@ -40,6 +41,11 @@ struct ChatView: View {
             case .model:
                 NavigationStack {
                     ModelSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            case .budget:
+                NavigationStack {
+                    BudgetSettingsView()
                         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
                 }
             case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
@@ -132,6 +138,7 @@ struct ChatView: View {
                                     Text("Supervisor").tag(ConversationThread.supervisor)
                                 }
                             }
+                            Button("Budget", systemImage: "dollarsign.circle") { destination = .budget }
                             Button("Settings", systemImage: "gearshape") { destination = .settings }
                             if !model.isOnPhone {
                                 Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
@@ -182,10 +189,21 @@ struct ChatConversationView: View {
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
     @State private var reviewingApproval: PendingAction?
+    @State private var showingBudgetSheet = false
     // Cards put away in this chat. The approval stays in the Inbox.
     @State private var hiddenApprovals: Set<String> = []
     @State private var dictation = ChatDictation()
+    // Voice Mode in the Supervisor chat: one continuous spoken conversation
+    // through the hub. Both sides land in this same thread, so typing after
+    // it continues the same history.
+    @State private var voice: VoiceSession?
+    // A voice start waiting on microphone permission; any stop invalidates it.
+    @State private var pendingVoiceStart: UUID?
+    @State private var voiceNote: String?
     @FocusState private var composerFocused: Bool
+    @FocusState private var queuedEditFocused: Bool
+    // Observed so the composer's busy line follows Settings at once.
+    @AppStorage(BusySendBehavior.defaultsKey) private var busySendPreference = BusySendBehavior.default.rawValue
     @Environment(\.layoutDirection) private var layoutDirection
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -228,6 +246,12 @@ struct ChatConversationView: View {
                 .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { reviewingApproval = nil } } }
             }
         }
+        .sheet(isPresented: $showingBudgetSheet) {
+            NavigationStack {
+                BudgetSettingsView()
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingBudgetSheet = false } } }
+            }
+        }
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in
@@ -238,8 +262,10 @@ struct ChatConversationView: View {
             onComposerFocusChanged(focused)
         }
         .task(id: conversation.identity) { await conversation.resume() }
-        .onDisappear { dictation.stop() }
-        .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onDisappear { dictation.stop(); stopVoice() }
+        .onChange(of: conversation.identity) { _, _ in dictation.stop(); stopVoice() }
+        // "This" means the card on screen now, not the one voice started on.
+        .onChange(of: conversation.focusedCardID) { _, id in voice?.setFocus(VoiceFocus(questionId: id)) }
         .onChange(of: conversation.composerFocusRequest) { _, _ in composerFocused = true }
         .onChange(of: conversation.isSending) { _, sending in
             if !sending {
@@ -251,7 +277,8 @@ struct ChatConversationView: View {
         .onChange(of: scenePhase) { _, phase in
             // Catching up on return (and pausing while away) is app-wide, for
             // every open chat: see ConversationLibrary.resumeOpenChats.
-            if phase != .active { dictation.stop() }
+            // Voice never listens in the background.
+            if phase != .active { dictation.stop(); stopVoice() }
         }
     }
 
@@ -351,11 +378,12 @@ struct ChatConversationView: View {
                                    offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
             } action: { previous, geometry in
                 hasContentBelow = !geometry.isAtBottom
-                // Keyboard dismissal and fold changes resize the viewport
-                // after Send has already moved to the reply. Resolve the
-                // message again at that size, rather than retaining a lazy
-                // stack's estimated bottom offset.
-                if previous.viewportHeight != geometry.viewportHeight && isPinnedToBottom && !userIsScrolling {
+                // Keyboard dismissal, fold changes and lazy multi-line row
+                // measurement resize the scroll geometry after an initial or
+                // post-send scroll. Settle again while pinned to the bottom.
+                if (previous.viewportHeight != geometry.viewportHeight
+                    || (previous.contentHeight != geometry.contentHeight && !geometry.isAtBottom))
+                    && isPinnedToBottom && !userIsScrolling {
                     scrollToLatest()
                 }
                 // Loading history, streaming and keyboard resizing must
@@ -379,8 +407,30 @@ struct ChatConversationView: View {
                 if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
                     // Keep the message the reader was looking at in place
                     // when an earlier page is inserted above it.
+                    isPinnedToBottom = false
                     scrollPosition.scrollTo(id: first, anchor: .top)
-                } else if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+                } else if !new.isEmpty && (isPinnedToBottom || isBottomVisible) {
+                    isPinnedToBottom = true
+                    scrollToLatest()
+                    // Lazy message rows resolve their wrapped height after
+                    // materializing; settle onto the true end once laid out.
+                    // Only when history first loads: on an ordinary append
+                    // (a send and its reply) a short pane keeps the sent
+                    // message in view instead of snapping past it.
+                    guard old.isEmpty else { return }
+                    Task { @MainActor in
+                        await Task.yield()
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling {
+                            scrollToLatest()
+                        }
+                        try? await Task.sleep(for: .milliseconds(120))
+                        if !messages.isEmpty && isPinnedToBottom && !userIsScrolling && !isBottomVisible {
+                            withAnimation(nil) {
+                                scrollPosition.scrollTo(id: Self.endOfConversation, anchor: .bottom)
+                            }
+                        }
+                    }
+                }
             }
             .onAppear {
                 if let id = scrollToMessageID {
@@ -498,6 +548,14 @@ struct ChatConversationView: View {
             if isLatestReply, !conversation.isReadOnly, let code = ApprovalCodePrompt.extractCode(from: item.message.text) {
                 ChatConfirmationCodeBar(code: code, conversation: conversation)
             }
+            if item.message.id == messages.last?.id, !conversation.isReadOnly,
+               BudgetLimitPrompt.isBudgetExceeded(item.message) {
+                ChatBudgetExceededBar(
+                    message: item.message,
+                    conversation: conversation,
+                    onOpenBudgetSettings: { showingBudgetSheet = true }
+                )
+            }
             // Offer a resend only when it cannot run a turn twice: main
             // rejected it before it ran, or main never confirmed it and the
             // resend carries the same turn id (main replays or follows it).
@@ -538,8 +596,8 @@ struct ChatConversationView: View {
                                     // A main that predates shared threads runs
                                     // phone chats under other session ids; keep
                                     // showing every recent approval there.
-                                    scopedToSession: conversation.historyStatus != .needsUpdate)
-            .filter { !hiddenApprovals.contains($0.id) }
+                                    scopedToSession: conversation.historyStatus != .needsUpdate,
+                                    excluding: hiddenApprovals)
     }
 
     private var chatHome: some View {
@@ -596,6 +654,13 @@ struct ChatConversationView: View {
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let composerAccessory { composerAccessory(composerFocused) }
+            // Idle voice lives in the composer (no extra height on small
+            // screens); the status row with Stop appears only while voice runs
+            // or has something to say, such as an error or setup note.
+            if supportsVoice, showsVoiceBar {
+                SupervisorVoiceBar(status: voice?.status ?? VoiceStatus(), note: voiceNote,
+                                   start: startVoice, stop: { stopVoice() })
+            }
             if conversation.isReadOnly {
                 Text("Web conversation · Continue in a new chat with its latest 50 messages.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -614,6 +679,7 @@ struct ChatConversationView: View {
                     .accessibilityIdentifier("chat-attachment-error")
             }
             if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
+            if conversation.isBusy && canSend { busySendChoice }
             composerBar
             }
         }
@@ -629,6 +695,9 @@ struct ChatConversationView: View {
             composerField
             dictationButton.buttonStyle(.plain).foregroundStyle(dictation.isListening ? Theme.alert : Theme.muted)
                 .frame(width: 44, height: 44)
+            if supportsVoice && !showsVoiceBar {
+                voiceStartButton.buttonStyle(.plain).foregroundStyle(Theme.live).frame(width: 44, height: 44)
+            }
             sendButton.buttonStyle(.plain).frame(width: 44, height: 44)
         }
         .padding(.horizontal, 4).padding(.vertical, 2)
@@ -650,11 +719,60 @@ struct ChatConversationView: View {
                        rightToLeft: layoutDirection == .rightToLeft)
     }
 
+    // The hub runs voice; a phone-only agent and read-only web chats have none.
+    // The hub records voice turns in the main Supervisor conversation only, so
+    // voice is offered only there, where the spoken turns will appear.
+    private var supportsVoice: Bool {
+        conversation.thread == .supervisor && conversation.conversationID == "main"
+            && !conversation.isReadOnly && !model.isOnPhone
+    }
+
+    private func stopVoice() {
+        pendingVoiceStart = nil
+        voice?.stop()
+    }
+
+    private func startVoice() {
+        voiceNote = nil
+        dictation.stop()
+        composerFocused = false
+        let attempt = UUID()
+        pendingVoiceStart = attempt
+        let identity = conversation.identity
+        Task {
+            let allowed = await VoiceAudio.requestPermission()
+            // Leaving the chat, switching chats, dictating, backgrounding or
+            // Stop while permission was pending must not start recording.
+            guard pendingVoiceStart == attempt, conversation.identity == identity, scenePhase == .active else { return }
+            pendingVoiceStart = nil
+            guard allowed else {
+                voiceNote = "Voice needs the microphone. Allow it in Settings › OpenAGI."
+                return
+            }
+            let session = voice ?? VoiceSession(server: model.credentials.server, token: model.credentials.token, audio: VoiceAudio())
+            session.onTurnSaved = { [conversation] in Task { await conversation.refresh() } }
+            session.setFocus(VoiceFocus(questionId: conversation.focusedCardID))
+            voice = session
+            session.handsFree(true)
+        }
+    }
+
+    private var voiceActive: Bool { (voice?.status.phase ?? .idle) != .idle || pendingVoiceStart != nil }
+    private var showsVoiceBar: Bool { voiceActive || voice?.status.message != nil || voiceNote != nil }
+
+    private var voiceStartButton: some View {
+        Button(action: startVoice) { composerIcon("waveform") }
+            .accessibilityLabel("Talk with Supervisor")
+            .accessibilityHint("Starts a spoken conversation. Your words and replies are saved in this chat.")
+            .accessibilityIdentifier("supervisor-voice-start")
+    }
+
     private var dictationButton: some View {
         Button {
             if dictation.isListening || dictation.isStarting { dictation.stop() }
             else {
                 composerFocused = false
+                stopVoice()
                 Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
             }
         } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
@@ -685,59 +803,170 @@ struct ChatConversationView: View {
         .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
     }
 
+    // Messages sent while a reply runs. Each row: Edit (inline; Save never
+    // sends), Send now (interrupts the running reply, then sends this next)
+    // and Remove. The status line says only what main confirmed.
     private var queuedSubmissionsTray: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Queued (\(conversation.queuedSubmissions.count))")
+        let items = conversation.queuedSubmissions
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(conversation.editingQueuedID != nil && items.first?.id == conversation.editingQueuedID
+                 ? "Queued (\(items.count)) · waiting for your edit" : "Queued (\(items.count))")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(Theme.muted)
-            ForEach(conversation.queuedSubmissions) { item in
-                HStack(spacing: 8) {
-                    Image(systemName: "clock")
-                        .font(.caption2)
-                        .foregroundStyle(Theme.live)
-                    Text(item.text)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.ink)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if !item.attachments.isEmpty {
-                        Text("\(item.attachments.count) img")
-                            .font(.caption2)
-                            .foregroundStyle(Theme.muted)
-                    }
-                    Button("Edit") {
-                        guard let popped = conversation.popQueuedSubmissionForEdit(id: item.id) else { return }
-                        if conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            conversation.draft = popped.text
-                        } else {
-                            conversation.draft += "\n" + popped.text
-                        }
-                        if !popped.attachments.isEmpty {
-                            let available = max(0, ChatAttachment.maximumCount - conversation.draftAttachments.count)
-                            conversation.draftAttachments.append(contentsOf: popped.attachments.prefix(available))
-                        }
-                        composerFocused = true
-                    }
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Theme.live)
-                    .buttonStyle(.plain)
-                    Button {
-                        conversation.removeQueuedSubmission(id: item.id)
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(Theme.muted)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Remove queued message")
+                .accessibilityAddTraits(.isHeader)
+            if let running = conversation.hubRunning, running.mine != true {
+                Text("Running now from \(running.source?.name ?? "another device"): \(running.text)")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(2)
+                    .accessibilityIdentifier("chat-queue-running")
+            }
+            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                if conversation.editingQueuedID == item.id {
+                    queuedEditor(item)
+                } else {
+                    queuedRow(item, position: index + 1, of: items.count)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
             }
         }
         .padding(.horizontal, 14)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-queue")
+    }
+
+    private func queuedRow(_ item: QueuedChatSubmission, position: Int, of total: Int) -> some View {
+        let canSendNow = conversation.canSendQueuedNow(id: item.id)
+        let sendNowLabel = conversation.isSending ? "Interrupt & send" : "Send now"
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Group {
+                    if item.sendNow == .requesting { ProgressView().controlSize(.mini) }
+                    else { Image(systemName: item.sendNow == nil ? "clock" : "arrow.up.to.line") }
+                }
+                .font(.caption2)
+                .foregroundStyle(Theme.live)
+                .accessibilityHidden(true)
+                Text(item.text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Queued message \(position) of \(total): \(item.text)")
+                    .accessibilityIdentifier("chat-queued-text")
+                if !item.attachments.isEmpty {
+                    Text("\(item.attachments.count) img")
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                }
+                Button("Edit") {
+                    if conversation.beginEditingQueued(id: item.id) { queuedEditFocused = true }
+                }
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Theme.live)
+                .buttonStyle(.plain)
+                .disabled(conversation.editingQueuedID != nil || item.origin?.heldBy != nil)
+                .accessibilityLabel("Edit queued message")
+                .accessibilityIdentifier("chat-queued-edit")
+                Button {
+                    Task { await conversation.sendQueuedNow(id: item.id) }
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill").font(.body)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(canSendNow ? Theme.live : Theme.muted)
+                .disabled(!canSendNow)
+                .accessibilityLabel(conversation.isSending ? "Interrupt reply and send this now" : "Send this next")
+                .accessibilityIdentifier("chat-queued-send-now")
+                .help(sendNowLabel)
+                Button {
+                    conversation.removeQueuedSubmission(id: item.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Theme.muted)
+                }
+                .buttonStyle(.plain)
+                .disabled(item.origin?.heldBy != nil)
+                .accessibilityLabel("Remove queued message")
+                .accessibilityIdentifier("chat-queued-remove")
+            }
+            if let origin = item.origin {
+                // Where this message is on the hub's shared queue.
+                let notes = [
+                    origin.mine ? nil : "From \(origin.sourceName ?? "another device")",
+                    origin.heldBy.map { "Being edited on \($0)" },
+                    origin.pendingUpload && origin.error == nil
+                        ? (origin.uploadAttempted ? "Checking whether main got this; Edit opens once it answers" : "Not on main yet; sends when connected") : nil
+                ].compactMap { $0 }
+                if !notes.isEmpty {
+                    Text(notes.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(Theme.muted)
+                        .accessibilityIdentifier("chat-queued-origin")
+                }
+                if let error = origin.error {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.caution)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("chat-queued-error")
+                }
+            }
+            if let state = item.sendNow {
+                Text(state.label)
+                    .font(.caption2)
+                    .foregroundStyle(state.isError ? Theme.caution : Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("chat-queued-status")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.edge, lineWidth: 1))
+        // Each control stays its own element, so VoiceOver, Voice Control
+        // ("Tap Edit") and Full Keyboard Access reach every one.
+        .accessibilityElement(children: .contain)
+    }
+
+    // Inline editor. Return adds a line; only Save changes the message, and
+    // Save never sends it -- the queue continues by itself afterwards.
+    private func queuedEditor(_ item: QueuedChatSubmission) -> some View {
+        @Bindable var conversation = conversation
+        return VStack(alignment: .leading, spacing: 6) {
+            TextField("Queued message", text: $conversation.queuedEditDraft, axis: .vertical)
+                .font(Theme.Typography.caption)
+                .lineLimit(1...6)
+                .focused($queuedEditFocused)
+                .accessibilityLabel("Edit queued message")
+                .accessibilityIdentifier("chat-queued-edit-field")
+            HStack {
+                Text("The queue waits here until you save.")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.muted)
+                Spacer()
+                Button("Cancel", role: .cancel) {
+                    conversation.cancelQueuedEdit()
+                    queuedEditFocused = false
+                }
+                .font(.caption.weight(.semibold))
+                .keyboardShortcut(.cancelAction)
+                .accessibilityIdentifier("chat-queued-cancel")
+                Button("Save") {
+                    if conversation.saveQueuedEdit() { queuedEditFocused = false }
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.live)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(conversation.queuedEditDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && item.attachments.isEmpty)
+                .accessibilityHint("Saves the change. It does not send.")
+                .accessibilityIdentifier("chat-queued-save")
+            }
+        }
+        .padding(10)
+        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.6), lineWidth: 1))
     }
 
     private var attachmentStrip: some View {
@@ -853,8 +1082,31 @@ struct ChatConversationView: View {
             .accessibilityIdentifier("chat-composer")
     }
 
+    // While a reply runs: what Send will do (the Settings preference) and the
+    // other choice for this one message.
+    private var busySendChoice: some View {
+        let preference = BusySendBehavior(rawValue: busySendPreference) ?? .default
+        return HStack(spacing: 8) {
+            Text(preference == .queue ? "A reply is running. Send queues this." : "A reply is running. Send stops it and sends this next.")
+                .font(.caption2)
+                .foregroundStyle(Theme.muted)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(preference.other == .sendNow ? "Send anyway" : "Queue instead") {
+                sendDraft(override: preference.other)
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+            .tint(preference.other == .sendNow ? Theme.alert : Theme.live)
+            .accessibilityHint(preference.other == .sendNow
+                ? "Stops the current reply and sends this next. An action already running finishes; nothing is undone."
+                : "Waits until the current reply and earlier queued messages finish.")
+            .accessibilityIdentifier("chat-send-other")
+        }
+        .padding(.horizontal, 16)
+    }
+
     private var sendButton: some View {
-        Button(action: sendDraft) {
+        Button { sendDraft() } label: {
             Image(systemName: "arrow.up")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(canSend ? Color(uiColor: .systemBackground) : Theme.muted)
@@ -863,8 +1115,14 @@ struct ChatConversationView: View {
                 .frame(width: 44, height: 44)
                 .contentShape(.circle)
         }
-            .accessibilityLabel("Send")
+            .accessibilityLabel(conversation.isBusy ? conversation.busySendBehavior.busyLabel : "Send")
             .disabled(!canSend)
+            .contextMenu {
+                if conversation.isBusy && canSend {
+                    Button("Queue message", systemImage: "clock") { sendDraft(override: .queue) }
+                    Button("Send anyway", systemImage: "arrow.up.to.line") { sendDraft(override: .sendNow) }
+                }
+            }
             .accessibilityIdentifier("chat-send")
     }
 
@@ -877,10 +1135,10 @@ struct ChatConversationView: View {
             .contentShape(.rect)
     }
 
-    private func sendDraft() {
+    private func sendDraft(override: BusySendBehavior? = nil) {
         guard canSend else { return }
         dictation.stop()
-        if conversation.submitDraft() { isPinnedToBottom = true }
+        if conversation.submitDraft(override: override) { isPinnedToBottom = true }
     }
 
     private var canSend: Bool {
@@ -913,6 +1171,25 @@ enum ChatRetry {
               user.attachments.allSatisfy({ $0.data != nil })
         else { return nil }
         return (index, user.text, user.attachments)
+    }
+
+    enum BudgetResend: Equatable {
+        case send(text: String, attachments: [ChatAttachment])
+        case attachmentsUnavailable
+        case nothingToResend
+    }
+
+    // "+$10 & retry" for a reply that is not retry-safe: re-send the user
+    // turn immediately before the blocked reply, attachments included. Never
+    // search further back -- that would re-send an older, different request.
+    static func budgetResend(failedID: UUID, in messages: [ChatMessage]) -> BudgetResend {
+        guard let index = messages.firstIndex(where: { $0.id == failedID }),
+              let user = messages[..<index].last(where: { $0.role == .user })
+        else { return .nothingToResend }
+        guard user.attachments.allSatisfy({ $0.data != nil }) else { return .attachmentsUnavailable }
+        guard !user.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !user.attachments.isEmpty
+        else { return .nothingToResend }
+        return .send(text: user.text, attachments: user.attachments)
     }
 }
 
@@ -1224,5 +1501,130 @@ struct ChatScrollGeometry: Equatable {
         // Bottom alignment and rubber-banding can produce negative offsets
         // even when the entire conversation fits in the visible viewport.
         return maximumOffset == 0 || offset >= maximumOffset - 60
+    }
+}
+
+enum BudgetLimitPrompt {
+    static func isBudgetExceeded(_ message: ChatMessage) -> Bool {
+        guard message.role == .assistant, !message.isStreaming else { return false }
+        let lower = message.text.lowercased()
+        return lower.contains("daily budget exceeded") || lower.contains("daily budget reached")
+    }
+}
+
+private struct ChatBudgetExceededBar: View {
+    @Environment(AppModel.self) private var model
+    let message: ChatMessage
+    let conversation: ChatConversation
+    let onOpenBudgetSettings: () -> Void
+    @State private var isWorking = false
+    @State private var showingCustomPrompt = false
+    @State private var customAmountText = "50"
+    @State private var note: (text: String, isError: Bool)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await addAndRetry(amount: 10, retryTurn: true) }
+                    } label: {
+                        Label("+$10 & retry", systemImage: "plus.circle.fill")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-10")
+
+                    Button {
+                        Task { await addAndRetry(amount: 25, retryTurn: true) }
+                    } label: {
+                        Text("+$25 & retry")
+                            .font(.footnote.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-25")
+
+                    Button {
+                        showingCustomPrompt = true
+                    } label: {
+                        Text("+$$$…")
+                            .font(.footnote.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isWorking || conversation.isSending)
+                    .accessibilityIdentifier("chat-budget-add-custom")
+
+                    Button("Settings", action: onOpenBudgetSettings)
+                        .font(.footnote.weight(.medium))
+                        .buttonStyle(.bordered)
+                        .disabled(isWorking)
+                        .accessibilityIdentifier("chat-budget-open")
+                }
+            }
+            if let note {
+                Text(note.text)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(note.isError ? Theme.alert : Theme.live)
+            }
+        }
+        .padding(.top, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("chat-budget-exceeded-bar")
+        .alert("Add extra budget for today", isPresented: $showingCustomPrompt) {
+            TextField("Amount in USD (e.g. 50)", text: $customAmountText)
+                .keyboardType(.decimalPad)
+            Button("Add & retry") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: true) }
+                }
+            }
+            Button("Add only") {
+                if let amount = parsedCustomAmount() {
+                    Task { await addAndRetry(amount: amount, retryTurn: false) }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Adds immediate headroom for today without permanently changing tomorrow's daily cap.")
+        }
+    }
+
+    private func parsedCustomAmount() -> Double? {
+        let cleaned = customAmountText
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: "+", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let amount = Double(cleaned), amount >= 0.5, amount <= 10000 else {
+            note = ("Enter an amount between $0.50 and $10,000.", true)
+            return nil
+        }
+        return amount
+    }
+
+    private func addAndRetry(amount: Double, retryTurn: Bool) async {
+        isWorking = true
+        note = nil
+        defer { isWorking = false }
+        do {
+            let updated = try await model.client.updateBudget(BudgetUpdate(addUsdToday: amount))
+            note = (String(format: "Added +$%.2f today ($%.2f remaining).", amount, max(0, updated.remainingUsd)), false)
+            guard retryTurn else { return }
+            if message.isFailed && message.retrySafe {
+                await conversation.retry(message)
+            } else {
+                switch ChatRetry.budgetResend(failedID: message.id, in: conversation.messages) {
+                case .send(let text, let attachments):
+                    await conversation.send(text, attachments: attachments)
+                case .attachmentsUnavailable:
+                    note = ("Budget added, but the images in that message can't be re-sent. Attach them again and send.", true)
+                case .nothingToResend:
+                    break
+                }
+            }
+        } catch {
+            note = (BudgetSettingsErrorCopy.saveMessage(for: error), true)
+        }
     }
 }

@@ -245,6 +245,11 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 | GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
 | GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| POST | `/conversations/agent/interrupt` | stop the running reply so a queued message goes first, §3.1 |
+| POST | `/conversations/supervisor/interrupt` | same, supervisor thread, §3.1 |
+| GET, POST | `/conversations/agent/queue`, `/conversations/supervisor/queue` | the hub's queue for the thread; add a message, §3.1 |
+| PATCH, DELETE | `/conversations/:thread/queue/:requestId` | edit/hold or remove one waiting message, §3.1 |
+| POST | `/conversations/:thread/queue/:requestId/send-now` | move one waiting message first and stop what runs now, §3.1 |
 | GET | `/lifelog/moments` | read-only G2 lifelog moments, §3.2 |
 
 `:id` above means a task/action id as minted by `createId()`:
@@ -398,6 +403,99 @@ names each turn:
   also lists the thread's turns still running:
   `"inFlight": [{"requestId": "…", "stage": "model", "startedAt": "…"}]`.
   A turn in `inFlight`, or whose reply is not there yet, is still working.
+
+#### Interrupting a reply (queued message "Send now")
+
+While a reply runs, a phone queues what the owner types and sends it, one at
+a time, after the reply ends. To send a queued message now instead, the
+client asks main to stop the running reply, then sends the message as the
+next turn in the same thread. No provider supports adding a message to a turn
+already running, so this is stop-then-send, never in-turn steering.
+
+`POST /conversations/:thread/interrupt` with
+`{"requestId": "<the running turn's id>", "conversationId"?: "…"}` (no other
+fields; `400` otherwise). Paired phones, owner proxies and the owner; not a
+G2 or other node. Main aborts that turn's signal: it stops before its next
+model call or tool call. A tool already running is not cancelled and nothing
+is rolled back. Main waits up to about 4 s for the turn to end, then answers
+`200` with one of:
+
+- `{"status": "interrupted"}`: the turn has stopped. Its stream ends with a
+  `failure` frame, code `stopped` (not `interrupted`, which still means
+  "main restarted"), and main stores the reply record "Stopped so your next
+  message could go first. Anything already under way may have finished;
+  nothing was undone." (`"status": "failed"`, code `stopped`).
+- `{"status": "stopping", "tool"?: "send_email"}`: asked to stop; it ends
+  after the action running now. The stream's `failure` frame follows.
+- `{"status": "finished", "outcome": "complete" | "failed" | "interrupted"}`:
+  it ended on its own first. Nothing was interrupted.
+- `{"status": "not_found"}`: main has no turn by that id in this thread (it
+  never arrived, or main restarted before storing it).
+
+Repeating the request (a double tap, a resend after a dropped response) is
+safe and reports the same state. A message sent after any answer runs after
+the old turn has fully ended: main runs one turn per thread at a time, and a
+turn still waiting behind another one is dropped without running. A main
+older than this route answers a phone's request with `401` (a heartbeat then
+succeeds) or the owner's with `404`: treat both as "this main can't
+interrupt", and say so; never report the reply as stopped.
+
+The owner's Mac sends `requestId` on its own `POST /message` with `thread`
+too, so its Supervisor chat can name and interrupt its turns the same way.
+
+#### The hub's queue (one per conversation, shared by every device)
+
+Every message a phone or the owner's Mac sends to a shared thread with a
+`requestId` joins the hub's queue for that conversation, whether it came on
+`POST /message` (a stream) or `POST /conversations/:thread/queue` (no stream;
+what a client uses when it knows something is running). The hub runs them one
+at a time in arrival order, each with the authority of the device that sent
+it. The queue is durable: messages not yet started survive a hub restart and
+run afterwards; one that was running when the hub stopped is not run again.
+
+- `POST /conversations/:thread/queue` `{text, requestId, attachments?,
+  focusedCardId?, conversationId?, from?, next?}` -> `202 {requestId,
+  duplicate, queue, sendNow?}`. Same validation as `/message`. The `202`
+  comes only after the message is saved to disk; if it can't be saved the
+  answer is `503 queue_unavailable` and nothing is queued. `next: true` is
+  "Send anyway": in the same request the message goes next (ahead of the other
+  waiting messages, which keep their order) and whatever runs now is stopped;
+  `sendNow` is what the hub confirmed, as for send-now below. Repeating a `requestId` keeps one
+  message (`duplicate: true`; after it ran, `outcome` says how it ended); the
+  same id with different text or images is `409 request_conflict`. More than
+  50 waiting is `429 queue_full`. A `/message` stream for a message that waits
+  says `status {stage: "queued"}` and a `session` frame (it is durably
+  accepted) and then streams its reply when it runs.
+- `GET /conversations/:thread/queue` and `queue` in the newest history page:
+  `{revision, items: [{requestId, text, attachmentCount, source: {device,
+  name, nodeId}, mine, state: "running" | "queued" | "held", heldBy?,
+  heldByMe?, position, revision}]}`. `mine` and `heldByMe` are relative to
+  the caller. Every change also emits `conversation.updated` with
+  `queueRevision`, so devices reload.
+- `PATCH .../queue/:requestId` `{hold?, text?, baseRevision?}`: `hold: true`
+  holds a waiting message for the caller's editor (a 90 s lease, renewed while
+  the editor is open; the queue waits at it, so the old text never runs and
+  nothing passes it). `text` requires the `baseRevision` the editor opened at
+  and releases the hold. Refusals are `409` with `error`: `held` (another
+  device is editing it; `message` names it), `conflict` (it changed since;
+  `item` is the current one), `already_sent`, `already_removed`.
+- `DELETE .../queue/:requestId?baseRevision=` removes a waiting message (same
+  refusals). A stream following it ends with failure code `removed`; a resend
+  of its id replays that, never re-queues it.
+- `POST .../queue/:requestId/send-now` moves it first and stops whatever runs
+  now, whichever device sent that: `{status, interrupted, item, queue}` with
+  `status` as for interrupt above, or `next` when nothing was running.
+
+Clients: while nothing runs, Send sends. While a reply runs, Send follows
+the device's Settings preference, "Queue message" (default) or "Send
+immediately" (`next: true`), and the composer offers the other choice for
+one message ("Send anyway" / "Queue instead").
+
+A hub without the queue answers these routes 404 (owner) or 401 (a phone;
+its heartbeat still succeeds) and its history has no `queue`: clients then
+keep their own queue as before. Messages without a `requestId` (older
+clients, G2 voice) do not join the queue; they still wait for the turn ahead
+of them, but no device can see, edit or reorder them.
 
 A G2 joins the same threads through `POST /nodes/g2/experience`: op
 `submit` accepts `"thread"` (beside or inside `question`; no

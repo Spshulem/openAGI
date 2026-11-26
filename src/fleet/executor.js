@@ -4,12 +4,12 @@
 // thread, see ui-delivery.js), and agentapi send-message for Antigravity. This is the only fleet unit that writes to
 // other processes, so it re-checks every precondition instead of trusting policy.
 
-import { deliverPaseo } from "./paseo-delivery.js";
+import { deliverPaseo, paseoImagesHash } from "./paseo-delivery.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { isSelfThread, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, isWatchOnlyThread, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
@@ -228,7 +228,8 @@ export const SELF_SESSION_BLOCK = "the supervisor's own session: it is not nudge
 function selfBlock(thread, config, playbook) {
   // Checked on its own: the host may be known only by PASEO_AGENT_ID.
   if (isSelfThread(thread, { selfSessionIds: config?.hostSessionIds ?? [] })) return SELF_HOST_BLOCK;
-  if (!isSelf(thread, config)) return null;
+  // Watch-only sessions follow the same rule: only the owner's own words go there.
+  if (!isSelf(thread, config) && !isWatchOnlyThread(thread, config)) return null;
   return OWNER_DIRECTED.has(playbook) ? null : SELF_SESSION_BLOCK;
 }
 
@@ -279,6 +280,7 @@ export function backgroundRouteFor(thread, config) {
 }
 
 function antigravityBusy(thread) {
+  if (thread.meta?.silentStuck === true && runStatusOf(thread.meta?.runStatus) === "IDLE") return false;
   return thread.agentStatus === "running" || ["RUNNING", "BUSY", "CANCELING"].includes(runStatusOf(thread.meta?.runStatus)) || thread.meta?.notFullyIdle === true;
 }
 
@@ -735,7 +737,7 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
 
   // typedOnly: a risky ask's owner answer, which only ever goes typed into
   // the app; a block there returns as is, never by a background route.
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null } = {}) {
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null, queue = false, typedOnly = false, ownerChoice = null, expectedPermissionId = null, images = null, recoverDisconnected = true, holdOnPermission = false, noPermissionReply = false } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -759,12 +761,13 @@ export function createExecutor({ config, run, paseoDelivery = deliverPaseo, stor
     if (step.blocked) return blocked(step.blocked);
     if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
-    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(fallbackFrom ? { fallbackFrom } : {}) };
+    const imagesHash = step.paseo ? paseoImagesHash(images) : null;
+    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(imagesHash ? { imagesHash } : {}), ...(fallbackFrom ? { fallbackFrom } : {}) };
     if (step.paseo) {
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
       try {
-        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images });
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base, ownerChoice, expectedPermissionId, images, recoverDisconnected, queue, holdOnPermission, ...(noPermissionReply ? { noPermissionReply: true } : {}) });
         const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
         return { ...result, actionId: id };
       }

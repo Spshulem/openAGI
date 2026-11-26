@@ -46,7 +46,10 @@ test("decisions keep-alive gate suppresses completed chats, escalates owner bloc
   const decisionCalls = [];
   const decisionsFetch = async (url, init) => {
     const body = JSON.parse(init.body);
-    decisionCalls.push({ url, body });
+    // The owner-precedent engine consults the same endpoint for owner asks;
+    // this test counts only keep-alive batches (they carry candidates).
+    if (body.input && Array.isArray(JSON.parse(body.input).candidates)) decisionCalls.push({ url, body });
+    else return { ok: true, status: 200, json: async () => ({ model: "gpt-6-luna-2026", answers: body.questions.map((q) => ({ type: "predicate", name: q.name, probability: 0.05 })), usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } }) };
     const answers = body.questions.map((q) => {
       const idxMatch = /^c(\d+)_(keep_alive|needs_owner)$/.exec(q.name);
       const idx = Number(idxMatch[1]);
@@ -518,6 +521,12 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(executedExisting.status, "routed_existing");
   assert.equal(sentToExisting.length, 1);
   assert.equal(sentToExisting[0].thread.key, "paseo:mac-laptop.seo-sleep-1");
+  const persistedExisting = supervisor.getActiveWork({ project: "AI-SEO" }).items
+    .find((item) => item.goal.includes("Steve strictly citation"));
+  assert.ok(persistedExisting, "dispatch persists one Work outcome before sending");
+  assert.equal(persistedExisting.originalAsk, persistedExisting.goal);
+  assert.equal(persistedExisting.owner.threadKey, "paseo:mac-laptop.seo-sleep-1");
+  assert.equal(persistedExisting.workflowStage, "implementing");
 
   // 4. Manager Goal Dispatch when NO existing chat matches (or in a 0-agent project): spawns a fresh Paseo session!
   const startedNew = await supervisor.dispatchGoal({
@@ -529,6 +538,10 @@ test("hierarchy, Paseo label sync, and manager goal dispatch unify multi-host pr
   assert.equal(createdAgents.length, 1);
   assert.equal(createdAgents[0].serverId, "mac-laptop");
   assert.equal(createdAgents[0].cwd, "/Users/dev/Dev/new-service");
+  const persistedNew = supervisor.getActiveWork({ project: "new-service" }).items
+    .find((item) => item.goal.includes("Stripe webhook"));
+  assert.ok(persistedNew, "new-session dispatch persists Work before starting Paseo");
+  assert.equal(persistedNew.workflowStage, "implementing");
 
   // 5. Verify HTTP routes, mobile allowlist, RemoteFleetSupervisor proxy, and fleet tools!
   assert.equal(isMobileRouteAllowed("GET", "/fleet/api/hierarchy"), true);
@@ -783,6 +796,22 @@ test("deliverPaseo recovers disconnected ACP sessions in-place, unblocks stale n
   assert.match(createdSessions[0].prompt, /Why is paseo broken/);
   assert.equal(imageFollowUps.length, 1);
   assert.equal(imageFollowUps[0].options.images.length, 1);
+
+  // Active Work resumes are existing-session-only: a disconnected runtime
+  // must be reported as blocked instead of creating a replacement session.
+  const noRecovery = await deliverPaseo({
+    config: { paseo: { enabled: true } },
+    thread: paseoThread(initialBroken, "srv_mac"),
+    text: "[OpenAGI supervisor] Follow up in the existing session.",
+    store: { dir },
+    actionId: "act-no-recovery",
+    base: { messageHash: "owner-no-recovery", playbook: "owner-message" },
+    factory: factoryA,
+    recoverDisconnected: false
+  });
+  assert.equal(noRecovery.status, "blocked");
+  assert.match(noRecovery.detail, /existing session only/);
+  assert.equal(createdSessions.length, 1);
 
   // Case B: Turnless ACP/Claude provider confirms owner message + clears stale unconfirmed background receipt!
   const turnlessAgent = {

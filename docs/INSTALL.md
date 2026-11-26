@@ -10,15 +10,16 @@ access. A browser or paired phone connects to that host.
 
 | Platform | Available install path | What you get |
 | --- | --- | --- |
-| macOS | [Download the v0.0.83 DMG](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-0.0.83.dmg), drag OpenAGI to Applications, then open it | Native menu bar app, bundled runtime, updates, optional screen capture and computer control |
-| Windows | [Download the Windows x64 bundle](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-Windows-x64.zip), extract it, then run `Start-OpenAGI.cmd` | Browser dashboard and CLI runtime with Node included; native macOS capture/control features are not included |
-| Linux x64 | [Download the Linux x64 bundle](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-Linux-x64.tar.gz), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a desktop or server |
-| Linux arm64 / Raspberry Pi | [Download the Linux arm64 bundle](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-Linux-arm64.tar.gz), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a compatible 64-bit SBC |
+| macOS | [Download the latest release's `OpenAGI-<version>.dmg`](https://github.com/Spshulem/openAGI/releases/latest), drag OpenAGI to Applications, then open it | Native menu bar app, bundled runtime, updates, optional screen capture and computer control |
+| Windows | [Download `OpenAGI-Windows-x64.zip` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), extract it, then run `Start-OpenAGI.cmd` | Browser dashboard and CLI runtime with Node included; native macOS capture/control features are not included |
+| Linux x64 | [Download `OpenAGI-Linux-x64.tar.gz` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a desktop or server |
+| Linux arm64 / Raspberry Pi | [Download `OpenAGI-Linux-arm64.tar.gz` from the latest release](https://github.com/Spshulem/openAGI/releases/latest), use the shell installer below, or run Docker | Browser dashboard and an always-on agent on a compatible 64-bit SBC |
 | iPhone / Android | [Companion-app source and pairing guide](../mobile/README.md) | A paired mobile client; no public App Store, TestFlight, or Play Store link is advertised here |
 
-The links above are the publicly available v0.0.83 assets. Use the [latest
-release page](https://github.com/Spshulem/openAGI/releases/latest) for a newer
-version and its exact **Source code** archive. The portable archives contain
+The latest release attaches the Mac DMG, the Windows x64 ZIP, and the Linux
+x64/arm64 archives, with `.sha256` checksums for the portable archives. The
+[latest release page](https://github.com/Spshulem/openAGI/releases/latest) also offers that
+release's exact **Source code** archive. The portable archives contain
 Node.js and the installed runtime dependencies; they are the browser/CLI
 runtime, not native Windows or Linux capture apps.
 
@@ -30,9 +31,9 @@ needed for these bundles. After saving setup, relaunch if the page asks you to.
 Check a downloaded file with `Get-FileHash <file> -Algorithm SHA256` in
 PowerShell or `sha256sum <file>` on Linux against its accompanying checksum.
 
-The Mac download link above is a release asset, while
+The links above open GitHub Releases, the all-platform download index, while
 `https://openagi.sh/download` is a convenience redirect that currently points
-to the Mac DMG. GitHub Releases is the all-platform download index.
+to the Mac DMG.
 
 ## macOS
 
@@ -132,9 +133,9 @@ integration and channel settings remain under **Advanced settings**.
 
 ## Docker
 
-Use the version tag you selected from GitHub Releases. The current public
-release is `v0.0.83`; replace the tag below when you intentionally choose a
-different release. The volume keeps state across replacements.
+Use the version tag you selected from GitHub Releases, such as the tag shown on
+the [latest release](https://github.com/Spshulem/openAGI/releases/latest). Replace `<version>` below
+with that tag. The volume keeps state across replacements.
 Binding the published port to loopback keeps setup on this computer.
 
 ```sh
@@ -176,6 +177,7 @@ See the [first-use guide](GETTING_STARTED.md) for the six flows.
 | Agent cannot answer | Reopen Settings, check provider sign-in/key, model availability, balance, and limits. Saving a key is not a successful provider test. |
 | Phone cannot connect | A phone cannot use your computer's `localhost`. Use a reachable private address or authenticated HTTPS, then follow the pairing guide. |
 | Screen history but no computer input | Check the intended node, its advertised capabilities, current permissions, screen lock, and the separate Computer Use approval. |
+| Mac is visible but desktop says main authorization is missing | On that Mac run `openagi reconnect`, then approve the short-lived request from an already paired owner phone. This keeps the node and phone pairing; it does not use a phone code or export the main owner token. |
 
 ## Updates and data
 

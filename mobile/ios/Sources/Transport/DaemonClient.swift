@@ -1,4 +1,5 @@
 import Foundation
+import SupervisorChannelsKit
 
 public enum MainConnectionIssue: String, Sendable, Equatable {
     case authorizationRequired = "main-pairing-required"
@@ -464,6 +465,129 @@ public actor DaemonClient {
         return try Self.decodeJSON(ConversationPage.self, from: data)
     }
 
+    private struct InterruptAnswer: Decodable { let status: String?; let tool: String? }
+
+    // `POST /conversations/:thread/interrupt` -- ask main to stop the reply
+    // named `requestId` so a queued message can go first. Never throws: the
+    // answer is what main confirmed, and a request with no answer is
+    // `.unreachable` (it may or may not have stopped), never a success. An
+    // older main without the route reads as `.unsupported`: it answers a
+    // phone's unknown route with 401, which `performConversationRequest`
+    // tells apart from a lost pairing with a heartbeat.
+    public func interruptTurn(thread: ConversationThread, requestId: String, conversationId: String = "main") async -> TurnInterruptOutcome {
+        if sharedThreadsUnsupported || turnIdsUnsupported { return .unsupported }
+        var body: [String: Any] = ["requestId": requestId]
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        do {
+            var request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/interrupt", method: "POST")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            // Main waits up to ~4s for the reply to stop before answering.
+            request.timeoutInterval = 20
+            let (data, http) = try await performConversationRequest(request)
+            try Self.requireConversationJSON(data: data, response: http)
+            let answer = try Self.decodeJSON(InterruptAnswer.self, from: data)
+            return TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool)
+        } catch DaemonError.notFound {
+            return .unsupported
+        } catch {
+            return .unreachable
+        }
+    }
+
+    // MARK: - The hub's conversation queue (mobile/PROTOCOL.md §3.1)
+
+    private struct QueueEnvelope: Decodable {
+        struct SendNow: Decodable { let status: String?; let tool: String? }
+        let queue: HubQueueSnapshot?
+        let sendNow: SendNow?
+    }
+    private struct QueueRefusalBody: Decodable { let error: String?; let message: String? }
+    private struct SendNowAnswer: Decodable { let status: String?; let tool: String?; let queue: HubQueueSnapshot? }
+
+    // The newest history page and the hub's queue from the same response.
+    // The queue is nil from a hub that does not keep one (then the phone
+    // keeps its own, as before).
+    public func conversationPageWithQueue(thread: ConversationThread, conversationId: String = "main") async throws -> (ConversationPage, HubQueueSnapshot?) {
+        var items = [URLQueryItem(name: "limit", value: "50")]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        let page = try Self.decodeJSON(ConversationPage.self, from: data)
+        let queue = (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+        return (page, queue)
+    }
+
+    // Sends one queue request. A refusal (held, conflict, already sent, full)
+    // is a HubQueueRefused with the hub's own code, never a generic failure.
+    private func queueCall(_ path: String, method: String, body: [String: Any]? = nil, query: [URLQueryItem] = []) async throws -> Data {
+        var request = try authorizedRequest(path: path, method: method, queryItems: query)
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        request.timeoutInterval = 20
+        let (data, response) = try await Self.networkCall(request, session: session)
+        guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
+        if [400, 409, 429].contains(http.statusCode) {
+            let refusal = try? ProtocolDecoder.json.decode(QueueRefusalBody.self, from: data)
+            throw HubQueueRefused(code: refusal?.error ?? "status_\(http.statusCode)", message: refusal?.message)
+        }
+        _ = try validate(response, data: data)
+        return data
+    }
+
+    // Adds a message to the hub's queue without holding a stream open. Safe
+    // to repeat with the same requestId: the hub keeps one.
+    // `next`: "Send anyway" -- the hub puts it next and stops what runs now
+    // in the same request; the outcome is only what the hub confirmed.
+    public func enqueueMessage(thread: ConversationThread, text: String, attachments: [ChatAttachment] = [],
+                               focusedCardId: String? = nil, requestId: String, conversationId: String = "main",
+                               next: Bool = false) async throws -> (HubQueueSnapshot?, TurnInterruptOutcome?) {
+        var body: [String: Any] = ["text": text, "requestId": requestId]
+        if next { body["next"] = true }
+        if !attachments.isEmpty {
+            try await requireImageSupport()
+            body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
+        }
+        if let focusedCardId, !focusedCardId.isEmpty { body["focusedCardId"] = focusedCardId }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue", method: "POST", body: body)
+        let envelope = try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data)
+        return (envelope?.queue, envelope?.sendNow.map { TurnInterruptOutcome.fromServer(status: $0.status, tool: $0.tool) })
+    }
+
+    // Edit (hold the item while its editor is open; save text against the
+    // revision it was opened at) or release it.
+    public func updateQueued(thread: ConversationThread, requestId: String, text: String? = nil, hold: Bool? = nil,
+                             baseRevision: Int? = nil, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+        var body: [String: Any] = [:]
+        if let text { body["text"] = text }
+        if let hold { body["hold"] = hold }
+        if let baseRevision { body["baseRevision"] = baseRevision }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)", method: "PATCH", body: body)
+        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+    }
+
+    public func removeQueued(thread: ConversationThread, requestId: String, baseRevision: Int?, conversationId: String = "main") async throws -> HubQueueSnapshot? {
+        var query: [URLQueryItem] = []
+        if let baseRevision { query.append(URLQueryItem(name: "baseRevision", value: String(baseRevision))) }
+        if conversationId != "main" { query.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)", method: "DELETE", query: query)
+        return (try? ProtocolDecoder.json.decode(QueueEnvelope.self, from: data))?.queue
+    }
+
+    // Moves the item first and has the hub stop whatever runs now (any
+    // device's turn). The outcome is only what the hub confirmed.
+    public func sendQueuedNow(thread: ConversationThread, requestId: String, conversationId: String = "main") async throws -> (TurnInterruptOutcome, HubQueueSnapshot?) {
+        var query: [URLQueryItem] = []
+        if conversationId != "main" { query.append(URLQueryItem(name: "conversationId", value: conversationId)) }
+        let data = try await queueCall("/conversations/\(thread.rawValue)/queue/\(requestId)/send-now", method: "POST", query: query)
+        let answer = try Self.decodeJSON(SendNowAnswer.self, from: data)
+        return (TurnInterruptOutcome.fromServer(status: answer.status, tool: answer.tool), answer.queue)
+    }
+
     public func conversations() async throws -> [ConversationSummary] {
         let request = try authorizedRequest(path: "/conversations", method: "GET")
         let (data, http) = try await performConversationRequest(request)
@@ -531,6 +655,27 @@ public actor DaemonClient {
         let request = try authorizedRequest(path: "/fleet/api/state", method: "GET")
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(FleetState.self, from: data)
+    }
+
+    // The Needs You walkthrough is main-owned and shared with G2. Navigation
+    // changes only the cursor; card/question actions still use their normal
+    // approval-gated routes and must be resolved by identity on the main.
+    public func fleetWalkthrough(operation: String = "view", expectedId: String? = nil) async throws -> SupervisorWalkthrough {
+        let allowed = Set(["view", "start", "next", "back", "skip", "pause", "resume"])
+        guard allowed.contains(operation) else { throw DaemonError.malformedResponse }
+        let request: URLRequest
+        if operation == "view" {
+            request = try authorizedRequest(path: "/fleet/api/walkthrough", method: "GET")
+        } else {
+            var mutable = try authorizedRequest(path: "/fleet/api/walkthrough", method: "POST")
+            var body: [String: Any] = ["operation": operation]
+            if let expectedId, !expectedId.isEmpty { body["expectedId"] = expectedId }
+            mutable.httpBody = try JSONSerialization.data(withJSONObject: body)
+            mutable.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request = mutable
+        }
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(SupervisorWalkthrough.self, from: data)
     }
 
     // A scan can take up to ~100s. No body: the route reads none.
@@ -908,6 +1053,7 @@ public actor DaemonClient {
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(nodeID, forHTTPHeaderField: "X-OpenAGI-Node-ID")
+        request.setValue(TimeZone.current.identifier, forHTTPHeaderField: "X-OpenAGI-Timezone")
         request.timeoutInterval = 12
         return request
     }
@@ -1071,6 +1217,34 @@ extension DaemonClient {
         try await json(ModelTestResult.self, path: "/settings/models/test", method: "POST", body: Data("{}".utf8), timeout: 45)
     }
 
+    public func budget() async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "GET")
+    }
+
+    public func updateBudget(_ update: BudgetUpdate) async throws -> BudgetStatus {
+        try await performBudgetRequest(BudgetStatus.self, path: "/budget", method: "POST", body: try ProtocolDecoder.jsonEncoder.encode(update), timeout: 20)
+    }
+
+    private func performBudgetRequest<T: Decodable>(_ type: T.Type, path: String, method: String, body: Data? = nil, timeout: TimeInterval? = nil) async throws -> T {
+        do {
+            return try await json(type, path: path, method: method, body: body, timeout: timeout)
+        } catch DaemonError.unauthorized {
+            // A main server running OpenAGI v0.0.83 or earlier rejects `/budget`
+            // at the mobile scope gate (401/403) even when this phone's pairing
+            // is healthy. Prove pairing health via heartbeat and report `.notFound`
+            // so the UI asks to update main instead of blaming connectivity.
+            try await heartbeat()
+            throw DaemonError.notFound
+        } catch DaemonError.mainConnection(.authorizationRequired) {
+            // Same case when routed through a worker (`routeMainData` maps an
+            // older main's 401/403 on `/budget` to 502 `main-pairing-required`).
+            if (try? await heartbeat()) != nil {
+                throw DaemonError.notFound
+            }
+            throw DaemonError.mainConnection(.authorizationRequired)
+        }
+    }
+
     public func persona() async throws -> PersonaDocument {
         try await json(PersonaDocument.self, path: "/workspace/persona", method: "GET")
     }
@@ -1151,4 +1325,12 @@ extension DaemonClient {
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(type, from: data)
     }
+}
+
+// The hub refused a queue change (mobile/PROTOCOL.md §3.1): "held",
+// "conflict", "already_sent", "already_removed", "queue_full", ...
+public struct HubQueueRefused: Error, Equatable, Sendable {
+    public let code: String
+    public let message: String?
+    public var displayMessage: String { HubQueueRefusal.message(code: code, fallback: message) }
 }

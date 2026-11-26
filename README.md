@@ -8,27 +8,30 @@ Run a personal agent on a computer you control. Chat with it, teach it your
 preferences, monitor coding agents, and connect your tools and devices. Add
 screen observation or approved computer interaction when you need them.
 
-**[GitHub source](https://github.com/Spshulem/openAGI)** ·
-**[Latest release and downloads](https://github.com/Spshulem/openAGI/releases/latest)** ·
-**[Install docs](docs/INSTALL.md)** ·
+**[Download for macOS](https://github.com/Spshulem/openAGI/releases/latest)** ·
+**[Windows install](docs/INSTALL.md#windows-from-source-powershell)** ·
+**[Linux / Raspberry Pi install](docs/INSTALL.md#linux-and-raspberry-pi)** ·
 **[First-use guide](docs/GETTING_STARTED.md)** ·
 **[Website](https://openagi.sh)**
+
+**[Review the current website preview](companion-site/README.md)** · The
+preview starts with the self-hosted project, links the current release and
+install paths, and labels shipped, historical, and planned behavior.
 
 ## Pick your install
 
 | Platform | Start here | Includes |
 | --- | --- | --- |
-| **macOS** | [Download the v0.0.83 DMG](https://github.com/Spshulem/openAGI/releases/download/v0.0.83/OpenAGI-0.0.83.dmg) or [view releases](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
-| **Windows** | [Download the Windows x64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Windows-x64.zip), extract, run `Start-OpenAGI.cmd` | Browser dashboard and CLI runtime with Node included; native Mac capture/control is not included |
-| **Linux x64** | [Download the Linux x64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Linux-x64.tar.gz) or [use the shell installer](docs/INSTALL.md#linux-and-raspberry-pi) | Browser dashboard and persistent runtime with Node included |
-| **Linux arm64 / Raspberry Pi** | [Download the Linux arm64 bundle](https://github.com/Spshulem/openAGI/releases/latest/download/OpenAGI-Linux-arm64.tar.gz) or [use Docker](docs/INSTALL.md#docker) | Browser dashboard and persistent runtime; use a compatible 64-bit OS |
+| **macOS** | [Download the latest DMG](https://github.com/Spshulem/openAGI/releases/latest), drag to Applications, launch | Native menu bar app, bundled runtime, updates, optional screen capture and Computer Use |
+| **Windows** | [Download the latest portable ZIP](https://github.com/Spshulem/openAGI/releases/latest), or [follow the PowerShell steps](docs/INSTALL.md#windows-from-source-powershell) | Browser dashboard and CLI; the published bundle includes Node.js |
+| **Linux / Raspberry Pi** | [Download the latest x64/arm64 bundle](https://github.com/Spshulem/openAGI/releases/latest), [use Docker](docs/INSTALL.md#docker), or [follow the install guide](docs/INSTALL.md#linux-and-raspberry-pi) | Browser dashboard, persistent runtime, optional systemd service; Raspberry Pi needs a compatible 64-bit arm64 OS |
 | **iPhone / Android** | [Companion app and pairing](mobile/README.md) | Mobile source with tasks, chat, approvals, and supervisor views; no public store download linked |
 
-The public **v0.0.83** release (published 2026-11-20) has all four desktop
-artifacts above and checksum files for the portable archives. The v0.0.83
-links are pinned evidence; use the release page for a newer version. Verify the
-checksum next to each portable download. Each release also offers its exact
-source under **Assets → Source code**.
+The latest release publishes the Mac DMG, Windows x64 ZIP, and Linux x64/arm64
+bundles with Node included, plus SHA-256 checksums. See [download availability
+and launch instructions](docs/INSTALL.md#downloads) and the [release page](https://github.com/Spshulem/openAGI/releases/latest).
+Source ZIP/archive links above track `main`; each GitHub release also offers its
+exact source under **Assets → Source code**.
 
 ## Your first five minutes
 
@@ -161,6 +164,7 @@ claim universal hardware support.
 - [Coding Agents](docs/setup/coding-supervisor.md) and [Fleet supervisor](docs/setup/fleet-supervisor.md)
 - [Computer Use readiness](docs/setup/computer-use-readiness.md) and [optional backend](docs/setup/open-computer-use.md)
 - [Mobile setup](mobile/README.md) and [mobile feature surface](mobile/FEATURES.md)
+- [Recover a paired Mac node](docs/setup/node-reconnect.md)
 - [Even G2](docs/setup/even-g2.md), [remote channels](docs/setup/remote-channels.md), and [integrations](docs/setup/partner-and-integrations.md)
 - [Architecture](docs/abi-architecture.md), [whitepaper](WHITEPAPER.md), and [release process](docs/RELEASE.md)
 
