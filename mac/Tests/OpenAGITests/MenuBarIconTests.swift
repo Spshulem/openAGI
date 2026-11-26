@@ -5,8 +5,8 @@ import XCTest
 /// The menu bar icon is vector, a template, sized to fit the menu bar
 /// unscaled, and sharp at native resolution. With OPENAGI_UI_SNAPSHOT_DIR
 /// set (CI), it also writes evidence: offscreen renders at 1x/2x/3x on light
-/// and dark backgrounds, and real NSStatusItem captures from the runner's
-/// menu bar, next to the previous bitmap when that file is present.
+/// and dark backgrounds, and a real NSStatusItem capture from the runner's
+/// menu bar.
 @MainActor
 final class MenuBarIconTests: XCTestCase {
   private var outputDirectory: URL? {
@@ -14,17 +14,6 @@ final class MenuBarIconTests: XCTestCase {
     let url = URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent("menu-bar-icon", isDirectory: true)
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
-  }
-
-  /// The bitmap the icon used to be, if it is still in the checkout.
-  private var previousBitmap: NSImage? {
-    let resources = URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-      .appendingPathComponent("Resources/MenuIcon.png")
-    guard let image = NSImage(contentsOf: resources) else { return nil }
-    image.isTemplate = true
-    image.size = NSSize(width: 26, height: 26)
-    return image
   }
 
   func testIconIsAVectorTemplateThatFitsTheMenuBar() {
@@ -50,14 +39,12 @@ final class MenuBarIconTests: XCTestCase {
       let box = try XCTUnwrap(alpha.boundingBox(threshold: 128))
       // The glyph is the height it should be, in device pixels.
       XCTAssertEqual(CGFloat(box.height), MenuBarIcon.glyphHeight * CGFloat(scale), accuracy: 1.5, "at \(scale)x")
+      // Solid ink, not a smear. The vector glyph measured 0.13 / 0.40 / 0.57
+      // at 1x / 2x / 3x on CI; the previous bitmap shown at 26 pt measured
+      // 0.008 / 0.014 / 0.025, the fuzz the owner saw.
+      let floor: [Int: Double] = [1: 0.08, 2: 0.3, 3: 0.45]
+      XCTAssertGreaterThan(alpha.solidShare, floor[scale]!, "at \(scale)x")
     }
-  }
-
-  func testSharperThanThePreviousBitmapOnRetina() throws {
-    guard let old = previousBitmap else { throw XCTSkip("The previous MenuIcon.png is no longer in the checkout.") }
-    let before = Self.alpha(of: old, scale: 2)
-    let after = Self.alpha(of: MenuBarIcon.makeImage(), scale: 2)
-    XCTAssertGreaterThan(after.solidShare, before.solidShare, "before \(before.solidShare), after \(after.solidShare)")
   }
 
   func testWriteEvidence() throws {
@@ -69,8 +56,7 @@ final class MenuBarIconTests: XCTestCase {
       "canvasPoints": [MenuBarIcon.canvasSize.width, MenuBarIcon.canvasSize.height],
       "glyphHeightPoints": MenuBarIcon.glyphHeight,
     ]
-    var images: [(String, NSImage)] = [("after", MenuBarIcon.makeImage())]
-    if let old = previousBitmap { images.insert(("before", old), at: 0) }
+    let images: [(String, NSImage)] = [("after", MenuBarIcon.makeImage())]
 
     for (name, image) in images {
       for scale in [1, 2, 3] {
