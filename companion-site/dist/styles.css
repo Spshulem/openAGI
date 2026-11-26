@@ -3,3 +3,5 @@
 .mobile-nav[hidden]{display:none!important}
 .install-command{display:block;margin-top:14px;padding:8px 9px;border-radius:6px;background:#e4ece0;color:#315b44;font:10px ui-monospace,monospace;max-width:100%;overflow:auto;white-space:nowrap}
 .install-doc-link{font-size:12px;font-weight:700;color:var(--green);margin-top:14px}.install-download{font-size:12px;font-weight:700;color:var(--green-dark);margin-top:auto;padding-top:20px}
+.status-label{font:700 10px ui-monospace,SFMono-Regular,Menlo,monospace;font-style:normal;letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}.principle-list .status-label{display:inline-block;margin-left:6px}.onboarding-page .principle-list code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.section-body .text-link+.text-link{margin-left:18px}.first-result li span a,.install-note a{color:#eff6ed;font-weight:700;text-decoration:underline;text-underline-offset:3px}.devices-more{margin:22px 0 0;font-size:13px;color:var(--muted)}.devices-more .text-link{display:inline-block;margin:6px 14px 0 0}

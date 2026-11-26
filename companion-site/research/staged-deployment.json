@@ -1,0 +1,37 @@
+{
+  "status": "ok",
+  "deployment": {
+    "id": "dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "url": "https://openagi-hardware-qbi4wi4r1-spencer-shulems-projects.vercel.app",
+    "productionUrl": null,
+    "inspectorUrl": "https://vercel.com/spencer-shulems-projects/openagi-hardware/3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "readyState": "READY",
+    "target": "production",
+    "deploymentApiUrl": "https://api.vercel.com/v13/deployments/dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "buildMachine": {
+      "cores": 2,
+      "memory": 8192,
+      "machine": "basic",
+      "selectionType": "fixed",
+      "selectionSource": "plan-default"
+    },
+    "deploymentProtection": [
+      "vercel_authentication"
+    ]
+  },
+  "message": "Deployment openagi-hardware-qbi4wi4r1-spencer-shulems-projects.vercel.app ready.",
+  "next": [
+    {
+      "command": "vercel curl https://openagi-hardware-qbi4wi4r1-spencer-shulems-projects.vercel.app",
+      "when": "Verify deployment, including when Deployment Protection is enabled"
+    },
+    {
+      "command": "vercel inspect openagi-hardware-qbi4wi4r1-spencer-shulems-projects.vercel.app --scope spencer-shulems-projects --non-interactive",
+      "when": "Inspect deployment"
+    },
+    {
+      "command": "vercel deploy --prod --scope spencer-shulems-projects --non-interactive",
+      "when": "Promote to production"
+    }
+  ]
+}

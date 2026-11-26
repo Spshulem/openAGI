@@ -1,0 +1,36 @@
+{
+  "publishedAt": "2026-11-10T04:34:37.268649+00:00",
+  "project": "openagi-hardware",
+  "projectId": "prj_IL77zcqpOrzRv4PKMLY0kBPNE1vK",
+  "team": "spencer-shulems-projects",
+  "teamId": "team_igqveYOtDiF0HSYoLHBhaV2i",
+  "productionUrl": "https://openagi-hardware.vercel.app/",
+  "deployment": {
+    "id": "dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "url": "https://openagi-hardware-qbi4wi4r1-spencer-shulems-projects.vercel.app",
+    "productionUrl": null,
+    "inspectorUrl": "https://vercel.com/spencer-shulems-projects/openagi-hardware/3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "readyState": "READY",
+    "target": "production",
+    "deploymentApiUrl": "https://api.vercel.com/v13/deployments/dpl_3iVoWbQ5tduUkcSsJvxFWCuksqyA",
+    "buildMachine": {
+      "cores": 2,
+      "memory": 8192,
+      "machine": "basic",
+      "selectionType": "fixed",
+      "selectionSource": "plan-default"
+    },
+    "deploymentProtection": [
+      "vercel_authentication"
+    ]
+  },
+  "sourceDigest": "310eb1f897264ebe8c1a4bd6bc5db51a5d4935ee7d3bf34a583612cf87f45432",
+  "source": "Uncommitted static website revision in companion-site/dist, based on the published 3e04247 baseline",
+  "previousDeploymentId": "dpl_33LjDFTkXNeB6wnxtQPQaorLm7Wb",
+  "verification": {
+    "all44FilesMatchRelease": true,
+    "desktopAndMobileBrowserCheck": "Passed",
+    "pages": 8,
+    "consoleErrors": 0
+  }
+}

@@ -1,0 +1,222 @@
+[
+  {
+    "path": "assets/dot-assignments.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/dot-display.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/dot-hero.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/dot-necklace.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/dot-pocket.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/dot-wrist.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/natura-interface.webp",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/openagi-mark.svg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-dark-shell-reference.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-hand-selected-v1.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-hand.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-in-hand-compact-ivory-violet.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-in-hand-ivory-violet.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-product.glb",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-studio.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/pocket-warm-shell-reference.png",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/vocci-ring.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "assets/waveshare-amoled.jpg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "concept.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "device-guide.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "device-guide.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "devices.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "dot.css",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "dot.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "ecosystem.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "experience.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "hardware/build-notes.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "hardware/pocket-architecture.svg",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "hardware/pocket-envelope.scad",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "hardware/pocket-v2.scad",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "hardware.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "how-it-works.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "index.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "overview.css",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "platform.css",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "platform.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "prototype-parts.csv",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "prototype.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "script.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "setup.html",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "software.css",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "software.js",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "styles.css",
+    "status": 200,
+    "matchesRelease": true
+  },
+  {
+    "path": "technology.html",
+    "status": 200,
+    "matchesRelease": true
+  }
+]

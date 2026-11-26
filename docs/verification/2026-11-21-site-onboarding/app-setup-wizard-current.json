@@ -1,0 +1,11 @@
+{
+  "url": "http://127.0.0.1:43311/setup",
+  "status": 200,
+  "title": "Connect your model · OpenAGI",
+  "heading": "Your agent.\nYour choice of model.",
+  "errors": [],
+  "viewport": {
+    "width": 1280,
+    "height": 900
+  }
+}

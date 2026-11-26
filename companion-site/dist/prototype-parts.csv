@@ -1,0 +1,8 @@
+variant,part,quantity_to_buy,listed_price_usd,published_envelope,purpose,url,status,checked_date
+basic,XIAO nRF52840 Sense,1,15.99,approximately 21 x 18 mm board,BLE microphone RGB and charging,https://www.seeedstudio.com/Seeed-XIAO-BLE-Sense-nRF52840-p-5253.html,not ordered,2026-09-30
+basic,Adafruit protected 150 mAh LiPo 1317,1,5.95,fit not validated,prototype battery,https://www.adafruit.com/product/1317,not ordered,2026-09-30
+basic,Adafruit tactile button pack 367,1 pack of 20 use 1,2.50,6 mm switch,hold to talk,https://www.adafruit.com/product/367,not ordered,2026-09-30
+basic,Adafruit JST-PH male-header lead 3814,1,0.75,fit not validated,battery connection,https://www.adafruit.com/product/3814,not ordered,2026-09-30
+display,Waveshare 0.49 inch OLED,1,5.99,15.5 x 13.0 mm module excluding cable,64 x 32 I2C status display,https://www.waveshare.com/0.49inch-oled-module.htm,not ordered,2026-09-30
+display,Adafruit MAX98357A 3006,1,5.95,19.4 x 17.8 x 3.0 mm board additional terminal clearance,digital audio amplifier bench candidate,https://www.adafruit.com/product/3006,not ordered,2026-09-30
+display,Adafruit mini metal speaker 1890,1,1.95,28 mm diameter x 4.5 mm,8 ohm 0.5 W example speaker,https://www.adafruit.com/product/1890,out of stock at check,2026-09-30

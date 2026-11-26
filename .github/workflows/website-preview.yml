@@ -6,6 +6,7 @@ on:
       - 'companion-site/**'
       - 'README.md'
       - 'docs/plans/2026-11-21-onboarding-handoff.md'
+      - 'docs/INSTALL.md'
       - '.github/workflows/website-preview.yml'
   workflow_dispatch:
 
@@ -22,7 +23,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check JavaScript syntax
-        run: node --check companion-site/dist/script.js
+        run: |
+          for file in companion-site/dist/*.js; do
+            node --check "$file"
+          done
 
       - name: Check local assets and anchors
         run: |
@@ -57,15 +61,31 @@ jobs:
                   if tag == "a":
                       self.anchor_depth -= 1
 
-          page = Page()
-          page.feed((root / "index.html").read_text())
-          assert not page.nested_anchor, "nested anchors"
-          for src in page.src:
-              assert (root / src).exists(), f"missing local asset: {src}"
-          for href in page.href:
-              if href.startswith("#"):
-                  assert href[1:] in page.ids, f"missing local anchor: {href}"
-          print(f"checked {len(page.href)} links and {len(page.src)} local assets")
+          from urllib.parse import urlsplit
+
+          pages = {}
+          for path in sorted(root.rglob("*.html")):
+              page = Page()
+              page.feed(path.read_text())
+              pages[path.resolve()] = page
+
+          links = assets = 0
+          for path, page in pages.items():
+              name = path.relative_to(root.resolve())
+              assert not page.nested_anchor, f"{name}: nested anchors"
+              for ref in page.src + page.href:
+                  url = urlsplit(ref)
+                  if url.scheme or ref.startswith("//"):
+                      continue
+                  target = (path.parent / url.path).resolve() if url.path else path
+                  if target.is_dir():
+                      target = target / "index.html"
+                  assert target.exists(), f"{name}: missing local file: {ref}"
+                  if url.fragment and target in pages:
+                      assert url.fragment in pages[target].ids, f"{name}: missing anchor: {ref}"
+              links += len(page.href)
+              assets += len(page.src)
+          print(f"checked {len(pages)} pages, {links} links and {assets} assets")
           PY
 
       - name: Serve and smoke-test the preview
@@ -77,6 +97,8 @@ jobs:
             if curl --fail --silent --show-error http://127.0.0.1:8789/ >/tmp/openagi-site.html; then
               grep -q 'Your work' /tmp/openagi-site.html
               grep -q 'Open the full Docker command' /tmp/openagi-site.html
+              curl --fail --silent --show-error http://127.0.0.1:8789/onboarding.html >/tmp/openagi-onboarding.html
+              grep -q 'Agent Supervisor' /tmp/openagi-onboarding.html
               exit 0
             fi
             sleep 1
