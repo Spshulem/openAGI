@@ -270,69 +270,10 @@ struct NeedsYouDetailView: View {
                 .padding(.vertical, 2)
             }
 
-            ForEach(digest.sections.filter { $0.kind != .evidence }) { section in
-                Section(section.title) {
-                    MarkdownContent(blocks: MarkdownParser.parse(section.text))
-                        .font(.subheadline)
-                        .textSelection(.enabled)
-                }
-            }
-
-            Section {
-                ForEach(Array(actions.decisions.enumerated()), id: \.offset) { index, action in
-                    Button {
-                        onAct(card, action)
-                    } label: {
-                        Text(action.label)
-                            .fontWeight(index == 0 && !card.risky ? .semibold : .regular)
-                    }
-                    .disabled(isBusy)
-                    .accessibilityIdentifier("needs-you-action-\(index)")
-                }
-                if actions.canReply {
-                    Button {
-                        onReplyInChat(card)
-                    } label: {
-                        Label(actions.answersInChat ? "Answer in Supervisor chat" : "Reply in Supervisor chat",
-                              systemImage: "arrowshape.turn.up.left")
-                            .fontWeight(actions.answersInChat && actions.decisions.isEmpty ? .semibold : .regular)
-                    }
-                    .accessibilityIdentifier("needs-you-reply")
-                }
-                if actions.reviewsPlan, let plan = card.plan {
-                    DisclosureGroup(isExpanded: $showsPlan) {
-                        planDetails(plan)
-                    } label: {
-                        Text("Review plan")
-                    }
-                    .accessibilityIdentifier("needs-you-review-plan")
-                }
-                Button {
-                    onAct(card, actions.dismiss)
-                } label: {
-                    Text(actions.dismiss.label)
-                        .foregroundStyle(Theme.muted)
-                }
-                .disabled(isBusy)
-                .accessibilityIdentifier("needs-you-dismiss")
-            } header: {
-                Text(actions.decisions.isEmpty ? "Actions" : "Decide")
-            } footer: {
-                if isBusy {
-                    Text("Sending…")
-                }
-            }
-
-            let evidence = digest.sections(.evidence)
-            if !evidence.isEmpty {
-                Section("Evidence") {
-                    ForEach(evidence) { item in
-                        MarkdownContent(blocks: MarkdownParser.parse(item.text))
-                            .font(.footnote)
-                            .foregroundStyle(Theme.muted)
-                            .textSelection(.enabled)
-                    }
-                }
+            if let decisionView = card.decisionView {
+                contract(card, decisionView, actions: actions)
+            } else {
+                legacy(card, digest: digest, actions: actions)
             }
 
             Section {
@@ -350,6 +291,131 @@ struct NeedsYouDetailView: View {
             }
         }
         .listStyle(.insetGrouped)
+    }
+
+    /// The decision contract: Goal, Status, Decision and Recommendation,
+    /// then the options (each once, the recommended one filled and tagged),
+    /// Reply and Dismiss, then evidence links on their own.
+    @ViewBuilder
+    private func contract(_ card: SupervisorCard, _ decisionView: SupervisorDecisionView, actions: NeedsYouActions) -> some View {
+        let choices = DecisionContract.choices(for: card)
+        DecisionContractSections(view: decisionView, choices: choices)
+
+        Section {
+            ForEach(Array(choices.enumerated()), id: \.element.id) { index, choice in
+                DecisionChoiceButton(choice: choice, enabled: !isBusy, fullWidth: true) {
+                    onAct(card, choice.action)
+                }
+                .listRowSeparator(.hidden)
+                .accessibilityIdentifier("needs-you-action-\(index)")
+            }
+            if actions.canReply {
+                Button {
+                    onReplyInChat(card)
+                } label: {
+                    Label(choices.isEmpty ? "Answer in Supervisor chat" : "Reply in Supervisor chat",
+                          systemImage: "arrowshape.turn.up.left")
+                }
+                .accessibilityIdentifier("needs-you-reply")
+            }
+            if actions.reviewsPlan, let plan = card.plan {
+                DisclosureGroup(isExpanded: $showsPlan) {
+                    planDetails(plan)
+                } label: {
+                    Text("Review plan")
+                }
+                .accessibilityIdentifier("needs-you-review-plan")
+            }
+            Button {
+                onAct(card, actions.dismiss)
+            } label: {
+                Text(actions.dismiss.label)
+                    .foregroundStyle(Theme.muted)
+            }
+            .disabled(isBusy)
+            .accessibilityIdentifier("needs-you-dismiss")
+        } header: {
+            Text(choices.isEmpty ? "Actions" : "Decide")
+        } footer: {
+            if isBusy {
+                Text("Sending…")
+            }
+        }
+
+        if !decisionView.evidence.isEmpty {
+            Section("Evidence") {
+                DecisionEvidenceLinks(evidence: decisionView.evidence)
+            }
+        }
+    }
+
+    /// Cards from hubs without the decision contract, unchanged.
+    @ViewBuilder
+    private func legacy(_ card: SupervisorCard, digest: SupervisorNeedsYouDigest, actions: NeedsYouActions) -> some View {
+        ForEach(digest.sections.filter { $0.kind != .evidence }) { section in
+            Section(section.title) {
+                MarkdownContent(blocks: MarkdownParser.parse(section.text))
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            }
+        }
+
+        Section {
+            ForEach(Array(actions.decisions.enumerated()), id: \.offset) { index, action in
+                Button {
+                    onAct(card, action)
+                } label: {
+                    Text(action.label)
+                        .fontWeight(index == 0 && !card.risky ? .semibold : .regular)
+                }
+                .disabled(isBusy)
+                .accessibilityIdentifier("needs-you-action-\(index)")
+            }
+            if actions.canReply {
+                Button {
+                    onReplyInChat(card)
+                } label: {
+                    Label(actions.answersInChat ? "Answer in Supervisor chat" : "Reply in Supervisor chat",
+                          systemImage: "arrowshape.turn.up.left")
+                        .fontWeight(actions.answersInChat && actions.decisions.isEmpty ? .semibold : .regular)
+                }
+                .accessibilityIdentifier("needs-you-reply")
+            }
+            if actions.reviewsPlan, let plan = card.plan {
+                DisclosureGroup(isExpanded: $showsPlan) {
+                    planDetails(plan)
+                } label: {
+                    Text("Review plan")
+                }
+                .accessibilityIdentifier("needs-you-review-plan")
+            }
+            Button {
+                onAct(card, actions.dismiss)
+            } label: {
+                Text(actions.dismiss.label)
+                    .foregroundStyle(Theme.muted)
+            }
+            .disabled(isBusy)
+            .accessibilityIdentifier("needs-you-dismiss")
+        } header: {
+            Text(actions.decisions.isEmpty ? "Actions" : "Decide")
+        } footer: {
+            if isBusy {
+                Text("Sending…")
+            }
+        }
+
+        let evidence = digest.sections(.evidence)
+        if !evidence.isEmpty {
+            Section("Evidence") {
+                ForEach(evidence) { item in
+                    MarkdownContent(blocks: MarkdownParser.parse(item.text))
+                        .font(.footnote)
+                        .foregroundStyle(Theme.muted)
+                        .textSelection(.enabled)
+                }
+            }
+        }
     }
 }
 

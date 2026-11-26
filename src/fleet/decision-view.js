@@ -334,6 +334,8 @@ export function cleanSuggestedReplies(replies, view) {
     const text = asText(reply);
     if (!text.trim()) return false;
     if (BYPASS_RE.test(text) || (MERGE_RE.test(text) && /\badmin\b/i.test(text))) return false;
+    // "Proceed with the recommended option" only when an option is recommended.
+    if (/\brecommend(?:ed|ation)\b/i.test(text) && !view?.recommendation?.option) return false;
     const words = normalizeWords(text).join(" ");
     return !optionWords.some((o) => o && (words === o || words.startsWith(`${o} `) && words.split(" ").length - o.split(" ").length <= 3));
   });

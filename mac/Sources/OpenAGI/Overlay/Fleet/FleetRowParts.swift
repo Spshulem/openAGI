@@ -49,17 +49,20 @@ struct FleetQuestionAnswer: View {
 
   var body: some View {
     let options = question.tappableOptions
+    let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id])
     VStack(alignment: .leading, spacing: 4) {
       if question.risky { FleetRiskyLabel() }
       Text(question.title)
         .font(.system(size: 11, weight: .semibold))
         .lineLimit(question.risky ? nil : 3)
         .fixedSize(horizontal: false, vertical: true)
-      if !question.body.isEmpty {
+      if let decision {
+        NeedsYouDecisionSections(presentation: decision, style: .compact)
+      } else if !question.body.isEmpty {
         Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
-      if question.risky, let context = question.displayAskContext {
+      if decision == nil, question.risky, let context = question.displayAskContext {
         Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -103,9 +106,17 @@ struct FleetOptionButtons: View {
   let options: [String]
 
   var body: some View {
-    ViewThatFits(in: .horizontal) {
-      HStack(spacing: 6) { buttons }
-      VStack(alignment: .leading, spacing: 4) { buttons }
+    if let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id]) {
+      // A four-part decision card: one button per option, the recommended
+      // one prominent, an admin bypass captioned.
+      NeedsYouDecisionButtons(buttons: decision.buttons) { button in
+        Task { await fleet.answer(question, option: button.value) }
+      }
+    } else {
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 6) { buttons }
+        VStack(alignment: .leading, spacing: 4) { buttons }
+      }
     }
   }
 

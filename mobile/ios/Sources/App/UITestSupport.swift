@@ -254,6 +254,11 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                                "configured": saved, "apiKeySaved": saved]]])
         case "/workspace/integrations/linear/sync":
             finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
+        case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-decision-view-fixture"):
+            deliver(status: 200, data: Data(UITestNeedsYouFixture.decisionViewStateJSON.utf8), contentType: "application/json")
+        case let path where path.hasPrefix("/fleet/api/threads/") && ProcessInfo.processInfo.arguments.contains("--ui-decision-view-fixture"):
+            // Not in the latest scan: the Thread sheet shows the card's saved context.
+            finish(status: 404, object: ["error": "Thread not found"])
         case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-needs-you-fixture"):
             deliver(status: 200, data: Data(UITestNeedsYouFixture.stateJSON.utf8), contentType: "application/json")
         case "/fleet/api/state":

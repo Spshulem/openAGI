@@ -837,15 +837,23 @@ public struct SupervisorCardAction: Decodable, Sendable, Equatable {
     public var label: String
     public var value: String?
     public var destructive: Bool
+    /// The hub's recommended option (src/fleet/decision-view.js). The hub
+    /// orders it first; it is styled the same way everywhere.
+    public var recommended: Bool
+    /// Choosing this skips a required review using admin rights.
+    public var adminBypass: Bool
 
-    public init(op: String, label: String, value: String? = nil, destructive: Bool = false) {
+    public init(op: String, label: String, value: String? = nil, destructive: Bool = false,
+                recommended: Bool = false, adminBypass: Bool = false) {
         self.op = op
         self.label = label
         self.value = value
         self.destructive = destructive
+        self.recommended = recommended
+        self.adminBypass = adminBypass
     }
 
-    private enum CodingKeys: String, CodingKey { case op, label, value, destructive }
+    private enum CodingKeys: String, CodingKey { case op, label, value, destructive, recommended, adminBypass }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -853,6 +861,220 @@ public struct SupervisorCardAction: Decodable, Sendable, Equatable {
         label = c.lenient(String.self, .label) ?? ""
         value = c.lenient(String.self, .value)
         destructive = c.lenient(Bool.self, .destructive) ?? false
+        recommended = c.lenient(Bool.self, .recommended) ?? false
+        adminBypass = c.lenient(Bool.self, .adminBypass) ?? false
+    }
+}
+
+// MARK: - Decision contract (card.decisionView, src/fleet/decision-view.js)
+
+/// Goal, status, decision, recommendation: what every decision card shows
+/// before its buttons. Each section says when the source did not state it
+/// (`unknown`) so the phone labels the gap instead of hiding or inventing it.
+/// Absent on older hubs; cards then keep their previous rendering.
+public struct SupervisorDecisionView: Decodable, Sendable, Equatable {
+    public struct Goal: Decodable, Sendable, Equatable {
+        public var title: String?
+        public var text: String?
+        public var unknown: Bool
+
+        public init(title: String? = nil, text: String? = nil, unknown: Bool = false) {
+            self.title = title
+            self.text = text
+            self.unknown = unknown
+        }
+
+        private enum CodingKeys: String, CodingKey { case title, text, unknown }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            title = c.lenient(String.self, .title)
+            text = c.lenient(String.self, .text)
+            unknown = c.lenient(Bool.self, .unknown) ?? (title == nil && text == nil)
+        }
+    }
+
+    public struct PullRequest: Decodable, Sendable, Equatable, Identifiable {
+        public var ref: String
+        public var title: String?
+        public var facts: [String]
+
+        public var id: String { ref + (title ?? "") }
+
+        public init(ref: String, title: String? = nil, facts: [String] = []) {
+            self.ref = ref
+            self.title = title
+            self.facts = facts
+        }
+
+        private enum CodingKeys: String, CodingKey { case ref, title, facts }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            ref = c.lenient(String.self, .ref) ?? ""
+            title = c.lenient(String.self, .title)
+            facts = c.lenientList(String.self, .facts)
+        }
+    }
+
+    public struct Status: Decodable, Sendable, Equatable {
+        public var done: [String]
+        public var blocked: [String]
+        public var unverified: [String]
+        public var prs: [PullRequest]
+        public var unknown: Bool
+
+        public init(done: [String] = [], blocked: [String] = [], unverified: [String] = [],
+                    prs: [PullRequest] = [], unknown: Bool = false) {
+            self.done = done
+            self.blocked = blocked
+            self.unverified = unverified
+            self.prs = prs
+            self.unknown = unknown
+        }
+
+        private enum CodingKeys: String, CodingKey { case done, blocked, unverified, prs, unknown }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            done = c.lenientList(String.self, .done)
+            blocked = c.lenientList(String.self, .blocked)
+            unverified = c.lenientList(String.self, .unverified)
+            prs = c.lenientList(PullRequest.self, .prs).filter { !$0.ref.isEmpty }
+            unknown = c.lenient(Bool.self, .unknown)
+                ?? (done.isEmpty && blocked.isEmpty && unverified.isEmpty && prs.isEmpty)
+        }
+    }
+
+    public struct Option: Decodable, Sendable, Equatable, Identifiable {
+        public var value: String
+        public var label: String
+        public var consequence: String?
+        public var adminBypass: Bool
+        public var recommended: Bool
+
+        public var id: String { value.isEmpty ? label : value }
+
+        public init(value: String, label: String, consequence: String? = nil,
+                    adminBypass: Bool = false, recommended: Bool = false) {
+            self.value = value
+            self.label = label
+            self.consequence = consequence
+            self.adminBypass = adminBypass
+            self.recommended = recommended
+        }
+
+        private enum CodingKeys: String, CodingKey { case value, label, consequence, adminBypass, recommended }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let rawLabel = c.lenient(String.self, .label)
+            let rawValue = c.lenient(String.self, .value)
+            label = rawLabel ?? rawValue ?? ""
+            value = rawValue ?? rawLabel ?? ""
+            consequence = c.lenient(String.self, .consequence)
+            adminBypass = c.lenient(Bool.self, .adminBypass) ?? false
+            recommended = c.lenient(Bool.self, .recommended) ?? false
+        }
+    }
+
+    public struct Decision: Decodable, Sendable, Equatable {
+        public var question: String?
+        public var options: [Option]
+        public var unknown: Bool
+
+        public init(question: String? = nil, options: [Option] = [], unknown: Bool = false) {
+            self.question = question
+            self.options = options
+            self.unknown = unknown
+        }
+
+        private enum CodingKeys: String, CodingKey { case question, options, unknown }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            question = c.lenient(String.self, .question)
+            options = c.lenientList(Option.self, .options).filter { !$0.label.isEmpty }
+            unknown = c.lenient(Bool.self, .unknown) ?? (question == nil && options.isEmpty)
+        }
+    }
+
+    public struct Recommendation: Decodable, Sendable, Equatable {
+        public var option: String?
+        public var label: String?
+        public var why: String?
+        public var unknown: Bool
+
+        public init(option: String? = nil, label: String? = nil, why: String? = nil, unknown: Bool = false) {
+            self.option = option
+            self.label = label
+            self.why = why
+            self.unknown = unknown
+        }
+
+        private enum CodingKeys: String, CodingKey { case option, label, why, unknown }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            option = c.lenient(String.self, .option)
+            label = c.lenient(String.self, .label)
+            why = c.lenient(String.self, .why)
+            unknown = c.lenient(Bool.self, .unknown) ?? (option == nil && label == nil && why == nil)
+        }
+    }
+
+    public struct Evidence: Decodable, Sendable, Equatable, Identifiable {
+        public var label: String
+        public var url: String
+
+        public var id: String { url }
+
+        public init(label: String, url: String) {
+            self.label = label
+            self.url = url
+        }
+
+        private enum CodingKeys: String, CodingKey { case label, url }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            url = c.lenient(String.self, .url) ?? ""
+            label = c.lenient(String.self, .label) ?? url
+        }
+    }
+
+    public var version: Int
+    public var goal: Goal
+    public var status: Status
+    public var decision: Decision
+    public var recommendation: Recommendation
+    public var unknowns: [String]
+    public var evidence: [Evidence]
+
+    public init(version: Int = 1, goal: Goal = Goal(unknown: true), status: Status = Status(unknown: true),
+                decision: Decision = Decision(unknown: true), recommendation: Recommendation = Recommendation(unknown: true),
+                unknowns: [String] = [], evidence: [Evidence] = []) {
+        self.version = version
+        self.goal = goal
+        self.status = status
+        self.decision = decision
+        self.recommendation = recommendation
+        self.unknowns = unknowns
+        self.evidence = evidence
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, goal, status, decision, recommendation, unknowns, evidence }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = c.lenient(Int.self, .version) ?? 1
+        // A missing section is an unknown one: labelled, never dropped.
+        goal = c.lenient(Goal.self, .goal) ?? Goal(unknown: true)
+        status = c.lenient(Status.self, .status) ?? Status(unknown: true)
+        decision = c.lenient(Decision.self, .decision) ?? Decision(unknown: true)
+        recommendation = c.lenient(Recommendation.self, .recommendation) ?? Recommendation(unknown: true)
+        unknowns = c.lenientList(String.self, .unknowns)
+        evidence = c.lenientList(Evidence.self, .evidence).filter { !$0.url.isEmpty }
     }
 }
 
@@ -1139,6 +1361,8 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var actorLabel: String?
     public var subchannel: String?
     public var labels: [String]
+    /// The four-section decision contract; nil from hubs that predate it.
+    public var decisionView: SupervisorDecisionView?
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, needsYou: Bool = true, decisionHeadline: String? = nil,
@@ -1155,7 +1379,8 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
                 timeline: [SupervisorTimelineItem] = [], resources: [SupervisorResource] = [],
                 openChat: FleetOpenChat? = nil, project: String? = nil, plan: SupervisorSuggestionPlan? = nil,
                 blockingCount: Int = 0, blockingSummary: String? = nil, actorLabel: String? = nil,
-                subchannel: String? = nil, labels: [String] = []) {
+                subchannel: String? = nil, labels: [String] = [],
+                decisionView: SupervisorDecisionView? = nil) {
         self.id = id
         self.questionId = questionId
         self.kind = kind
@@ -1205,6 +1430,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.actorLabel = actorLabel
         self.subchannel = subchannel
         self.labels = labels
+        self.decisionView = decisionView
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1212,7 +1438,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         case threadKey, threadKeys, repo, branch, workspace, prRef, prUrl, prNumber, headSha
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
         case prContext, recentMessages, timeline, resources, openChat, project, plan
-        case blockingCount, blockingSummary, actorLabel, subchannel, labels
+        case blockingCount, blockingSummary, actorLabel, subchannel, labels, decisionView
     }
 
     public init(from decoder: Decoder) throws {
@@ -1266,6 +1492,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         actorLabel = c.lenient(String.self, .actorLabel)
         subchannel = c.lenient(String.self, .subchannel)
         labels = c.lenientList(String.self, .labels)
+        decisionView = c.lenient(SupervisorDecisionView.self, .decisionView)
     }
 }
 

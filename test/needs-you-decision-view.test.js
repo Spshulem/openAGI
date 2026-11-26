@@ -129,6 +129,7 @@ test("an older card without a recommendation never defaults to the admin bypass"
   assert.equal(card.primaryAction.value, "wait for review", "a bypass is never the default without a recommendation");
   assert.equal(card.primaryAction.recommended, undefined, "nothing is styled as recommended");
   assert.match(card.secondaryAction.label, /admin bypass/i);
+  assert.ok(card.suggestedReplies.every((r) => !/recommended/i.test(r)), "no reply points at a recommendation that isn't there");
 });
 
 test("helpers: table rows become facts, recommendation ties name no option, bypass needs a merge", () => {
