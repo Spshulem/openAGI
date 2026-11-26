@@ -1,0 +1,49 @@
+{
+  "after-1x-glyphPixelHeight" : 12,
+  "after-1x-solidShare" : 0.12903225806451613,
+  "after-2x-glyphPixelHeight" : 26,
+  "after-2x-solidShare" : 0.40196078431372551,
+  "after-3x-glyphPixelHeight" : 39,
+  "after-3x-solidShare" : 0.57166392092257001,
+  "after-statusitem-buttonPoints" : [
+    34,
+    22
+  ],
+  "after-statusitem-dark-glyphPixelHeight" : 0,
+  "after-statusitem-dark-pixels" : [
+    34,
+    30
+  ],
+  "after-statusitem-light-glyphPixelHeight" : 13,
+  "after-statusitem-light-pixels" : [
+    34,
+    30
+  ],
+  "before-1x-glyphPixelHeight" : 13,
+  "before-1x-solidShare" : 0.0077519379844961239,
+  "before-2x-glyphPixelHeight" : 25,
+  "before-2x-solidShare" : 0.0137524557956778,
+  "before-3x-glyphPixelHeight" : 38,
+  "before-3x-solidShare" : 0.024914089347079039,
+  "before-statusitem-buttonPoints" : [
+    42,
+    26
+  ],
+  "before-statusitem-dark-glyphPixelHeight" : 0,
+  "before-statusitem-dark-pixels" : [
+    42,
+    30
+  ],
+  "before-statusitem-light-glyphPixelHeight" : 13,
+  "before-statusitem-light-pixels" : [
+    42,
+    30
+  ],
+  "canvasPoints" : [
+    18,
+    18
+  ],
+  "glyphHeightPoints" : 13,
+  "screenBackingScale" : 1,
+  "statusBarThickness" : 22
+}
