@@ -131,17 +131,19 @@ final class ChatConversation {
         // the queue (uploadPending) or not (drainIfIdle).
         let restored = ChatConversation.restoredQueue(isReadOnly ? [] : store.loadQueued(nodeID: nodeID))
         self.queue = restored
-        self.savedQueued = ChatConversation.pendingQueue(restored)
+        self.savedQueued = ChatConversation.pendingQueue(restored, hubQueueAvailable: false)
     }
 
-    // The queue's messages only this phone has: not yet on the hub, or in
-    // its own queue on a main without one. Hub items are not kept here.
-    nonisolated static func pendingQueue(_ queue: QueuedTurnQueue<ChatQueuedPayload>) -> [SavedQueuedMessage] {
+    // The queue's messages only this phone has. Without a hub queue that is
+    // every item (an edit may have given a local item an origin); with one,
+    // the items the hub has not accepted yet, never mirrored hub items.
+    nonisolated static func pendingQueue(_ queue: QueuedTurnQueue<ChatQueuedPayload>, hubQueueAvailable: Bool) -> [SavedQueuedMessage] {
         queue.items.compactMap { item in
-            guard item.origin == nil || item.origin?.pendingUpload == true else { return nil }
+            guard !hubQueueAvailable || item.origin?.pendingUpload == true else { return nil }
             return SavedQueuedMessage(requestID: item.requestID, text: item.text, attachments: item.payload.attachments,
                                       focusedCardID: item.payload.focusedCardID, pendingUpload: item.origin?.pendingUpload == true,
-                                      uploadAttempted: item.origin?.uploadAttempted == true, error: item.origin?.error)
+                                      uploadAttempted: item.origin?.uploadAttempted == true, error: item.origin?.error,
+                                      sendNext: item.origin?.sendNext == true ? true : nil)
         }
     }
 
@@ -151,7 +153,8 @@ final class ChatConversation {
             queue.enqueue(text: message.text, payload: ChatQueuedPayload(attachments: message.attachments, focusedCardID: message.focusedCardID),
                           requestID: message.requestID,
                           origin: message.pendingUpload
-                            ? QueuedOrigin(mine: true, pendingUpload: true, error: message.error, uploadAttempted: message.uploadAttempted)
+                            ? QueuedOrigin(mine: true, pendingUpload: true, error: message.error, sendNext: message.sendNext == true,
+                                           uploadAttempted: message.uploadAttempted)
                             : nil)
         }
         return queue
@@ -161,7 +164,7 @@ final class ChatConversation {
     // force-quit never loses one.
     private func persistQueue() {
         guard !forgotten, !isReadOnly else { return }
-        let pending = Self.pendingQueue(queue)
+        let pending = Self.pendingQueue(queue, hubQueueAvailable: hubQueueAvailable)
         guard pending != savedQueued else { return }
         savedQueued = pending
         store.saveQueued(nodeID: nodeID, items: pending)

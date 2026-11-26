@@ -31,6 +31,9 @@ struct SupervisorPendingMessage: Codable, Equatable, Sendable {
   var uploadAttempted: Bool
   /// The hub's last refusal, shown on its row.
   var error: String?
+  /// "Send anyway": when the hub takes it, it goes next and the running
+  /// reply is stopped. Optional, so files written before it decode.
+  var sendNext: Bool? = nil
 }
 
 /// The file the pending messages live in. Every change to them is written
@@ -44,22 +47,33 @@ struct SupervisorPendingQueueStore {
     return support.appendingPathComponent("OpenAGI/supervisor-pending-queue.json")
   }
 
-  /// What in the queue only this Mac has: never mirrored hub items.
-  static func pending(_ queue: QueuedTurnQueue<SupervisorQueuedPayload>) -> [SupervisorPendingMessage] {
+  /// What in the queue only this Mac has. Without a hub queue that is
+  /// every item (an edit may have given a local item an origin); with one,
+  /// the items the hub has not accepted yet, never mirrored hub items.
+  static func pending(_ queue: QueuedTurnQueue<SupervisorQueuedPayload>, hubQueueAvailable: Bool) -> [SupervisorPendingMessage] {
     queue.items.compactMap { item in
-      guard item.origin == nil || item.origin?.pendingUpload == true else { return nil }
-      return SupervisorPendingMessage(
-        requestId: item.requestID,
-        text: item.text,
-        focusedCardId: item.payload.focusedCardId,
-        images: item.payload.attachments.map {
-          SupervisorPendingMessage.Image(id: $0.id, name: $0.name, mimeType: $0.mimeType, data: $0.data, thumbnail: $0.thumbnail)
-        },
-        pendingUpload: item.origin?.pendingUpload == true,
-        uploadAttempted: item.origin?.uploadAttempted == true,
-        error: item.origin?.error
-      )
+      guard !hubQueueAvailable || item.origin?.pendingUpload == true else { return nil }
+      return message(requestId: item.requestID, text: item.text, focusedCardId: item.payload.focusedCardId,
+                     attachments: item.payload.attachments, pendingUpload: item.origin?.pendingUpload == true,
+                     uploadAttempted: item.origin?.uploadAttempted == true, error: item.origin?.error,
+                     sendNext: item.origin?.sendNext == true)
     }
+  }
+
+  static func message(requestId: String, text: String, focusedCardId: String?, attachments: [WorkspaceImageAttachment],
+                      pendingUpload: Bool, uploadAttempted: Bool, error: String? = nil, sendNext: Bool = false) -> SupervisorPendingMessage {
+    SupervisorPendingMessage(
+      requestId: requestId,
+      text: text,
+      focusedCardId: focusedCardId,
+      images: attachments.map {
+        SupervisorPendingMessage.Image(id: $0.id, name: $0.name, mimeType: $0.mimeType, data: $0.data, thumbnail: $0.thumbnail)
+      },
+      pendingUpload: pendingUpload,
+      uploadAttempted: uploadAttempted,
+      error: error,
+      sendNext: sendNext ? true : nil
+    )
   }
 
   /// Puts saved messages back in the queue, in their order, with their turn
@@ -74,7 +88,8 @@ struct SupervisorPendingQueueStore {
           preview: NSImage(data: full) ?? NSImage(size: NSSize(width: 1, height: 1)))
       }
       let origin = message.pendingUpload
-        ? QueuedOrigin(mine: true, pendingUpload: true, error: message.error, uploadAttempted: message.uploadAttempted)
+        ? QueuedOrigin(mine: true, pendingUpload: true, error: message.error, sendNext: message.sendNext == true,
+                       uploadAttempted: message.uploadAttempted)
         : nil
       queue.enqueue(text: message.text, payload: SupervisorQueuedPayload(focusedCardId: message.focusedCardId, attachments: images),
                     requestID: message.requestId, origin: origin)

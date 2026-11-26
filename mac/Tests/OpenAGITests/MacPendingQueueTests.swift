@@ -41,33 +41,59 @@ final class MacPendingQueueTests: XCTestCase {
   }
 
   func testOnlyMessagesMainHasNotTakenAreSavedAndTheyComeBackInOrderWithTheirIds() throws {
-    var queue = QueuedTurnQueue<SupervisorQueuedPayload>()
     let image = WorkspaceImageAttachment(id: "img_synthetic01", name: "shot.jpg", mimeType: "image/jpeg",
                                          data: Data([0xFF, 0xD8, 0xFF, 0x00]).base64EncodedString(),
                                          thumbnail: Data([0xFF, 0xD8]).base64EncodedString(),
                                          previewData: Data([0xFF, 0xD8]), preview: NSImage(size: NSSize(width: 1, height: 1)))
-    queue.enqueue(text: "local only", payload: SupervisorQueuedPayload(focusedCardId: "card:1", attachments: [image]), requestID: "mac-local-0001")
-    queue.enqueue(text: "on the hub", payload: SupervisorQueuedPayload(focusedCardId: nil, attachments: []), requestID: "mac-onhub-0002",
-                  origin: QueuedOrigin(mine: true, revision: 1, pendingUpload: false))
-    queue.enqueue(text: "upload unanswered", payload: SupervisorQueuedPayload(focusedCardId: nil, attachments: []), requestID: "mac-unsure-003",
-                  origin: QueuedOrigin(mine: true, pendingUpload: true, uploadAttempted: true))
-    let pending = SupervisorPendingQueueStore.pending(queue)
-    XCTAssertEqual(pending.map(\.requestId), ["mac-local-0001", "mac-unsure-003"], "the hub's own item is not kept here")
+    // No hub queue: every item is this Mac's own, including one an edit
+    // gave an origin.
+    var local = QueuedTurnQueue<SupervisorQueuedPayload>()
+    local.enqueue(text: "local only", payload: SupervisorQueuedPayload(focusedCardId: "card:1", attachments: [image]), requestID: "mac-local-0001")
+    let edited = local.enqueue(text: "edited here", payload: SupervisorQueuedPayload(focusedCardId: nil, attachments: []), requestID: "mac-edited-002")
+    local.setOrigin(edited) { $0.error = nil }
+    XCTAssertEqual(SupervisorPendingQueueStore.pending(local, hubQueueAvailable: false).map(\.requestId), ["mac-local-0001", "mac-edited-002"])
+
+    // A hub queue: only what it has not accepted yet.
+    var hub = QueuedTurnQueue<SupervisorQueuedPayload>()
+    hub.enqueue(text: "on the hub", payload: SupervisorQueuedPayload(focusedCardId: nil, attachments: []), requestID: "mac-onhub-0003",
+                origin: QueuedOrigin(mine: true, revision: 1, pendingUpload: false))
+    hub.enqueue(text: "send anyway, unanswered", payload: SupervisorQueuedPayload(focusedCardId: nil, attachments: []), requestID: "mac-unsure-004",
+                origin: QueuedOrigin(mine: true, pendingUpload: true, sendNext: true, uploadAttempted: true))
+    let onHub = SupervisorPendingQueueStore.pending(hub, hubQueueAvailable: true)
+    XCTAssertEqual(onHub.map(\.requestId), ["mac-unsure-004"], "the hub's own item is not kept here")
 
     let store = SupervisorPendingQueueStore(url: file)
-    store.save(pending)
+    store.save(SupervisorPendingQueueStore.pending(local, hubQueueAvailable: false) + onHub)
     var restored = QueuedTurnQueue<SupervisorQueuedPayload>()
     SupervisorPendingQueueStore.restore(store.load(), into: &restored)
-    XCTAssertEqual(restored.items.map(\.text), ["local only", "upload unanswered"])
-    XCTAssertEqual(restored.items.map(\.requestID), ["mac-local-0001", "mac-unsure-003"])
+    XCTAssertEqual(restored.items.map(\.text), ["local only", "edited here", "send anyway, unanswered"])
+    XCTAssertEqual(restored.items.map(\.requestID), ["mac-local-0001", "mac-edited-002", "mac-unsure-004"])
     XCTAssertNil(restored.items[0].origin)
     XCTAssertEqual(restored.items[0].payload.focusedCardId, "card:1")
     XCTAssertEqual(restored.items[0].payload.attachments.map(\.data), [image.data], "the full image, as it is sent")
-    XCTAssertEqual(restored.items[1].origin?.pendingUpload, true)
-    XCTAssertEqual(restored.items[1].origin?.uploadAttempted, true, "still possibly on the hub")
+    XCTAssertEqual(restored.items[2].origin?.pendingUpload, true)
+    XCTAssertEqual(restored.items[2].origin?.uploadAttempted, true, "still possibly on the hub")
+    XCTAssertEqual(restored.items[2].origin?.sendNext, true, "still goes next when the hub takes it")
 
     store.save([])
     XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "nothing pending, no file")
+  }
+
+  func testAMessageWhoseSendIsOutStaysOnDiskUntilMainAnswers() async throws {
+    MacHeldStreamProtocol.reset()
+    defer { MacHeldStreamProtocol.reset() }
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [MacHeldStreamProtocol.self]
+    let supervisor = SharedSupervisorClient(testSession: URLSession(configuration: config), baseURL: URL(string: "http://daemon.test:43210")!,
+                                            token: "synthetic", pendingQueueURL: file)
+    MacHeldStreamProtocol.hold.insert("Sent, not answered")
+    let send = Task { await supervisor.sendMessage("Sent, not answered") }
+    try await waitFor("the request to reach main") { MacHeldStreamProtocol.isHeld("Sent, not answered") }
+    let requestId = try XCTUnwrap(MacHeldStreamProtocol.sentTurns.first?.requestId)
+    XCTAssertEqual(SupervisorPendingQueueStore(url: file).load().map(\.requestId), [requestId], "a quit now still has it, with its turn id")
+    MacHeldStreamProtocol.release("Sent, not answered", frames: "event: final\ndata: {\"reply\":\"Done\"}\n\n")
+    _ = await send.value
+    XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "answered: nothing left only on this Mac")
   }
 
   func testAMessageTypedOfflineSurvivesARelaunchAndReachesTheHubOnce() async throws {

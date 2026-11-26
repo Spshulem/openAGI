@@ -563,6 +563,11 @@ final class SharedSupervisorClient: ObservableObject {
   /// and what was last written there.
   private let pendingStore: SupervisorPendingQueueStore
   private var savedPending: [SupervisorPendingMessage] = []
+  /// The message whose /message request is out now. It left the queue when
+  /// it was sent, but main has not answered yet: kept on disk (first) until
+  /// that request ends, so a quit mid-send still has it. Its turn id makes a
+  /// resend after relaunch attach to or replay the turn, never run it twice.
+  private var sendingPending: SupervisorPendingMessage?
   /// The open queued-message editor's text. Saving never sends.
   @Published var queuedEditDraft = ""
   /// The turn id of the reply streaming now, when main was sent one.
@@ -573,7 +578,9 @@ final class SharedSupervisorClient: ObservableObject {
   /// tray mirrors it -- every device's waiting messages, in the hub's order
   /// -- and Edit, Remove and Send Now are hub requests. Otherwise the queue
   /// stays on this Mac, as before.
-  @Published private(set) var hubQueueAvailable = false
+  @Published private(set) var hubQueueAvailable = false {
+    didSet { savePendingIfChanged() }
+  }
   /// The message the hub runs now, when it came through the queue.
   @Published private(set) var hubRunning: HubQueueItem? = nil
   private var uploadTask: Task<Void, Never>?
@@ -1006,8 +1013,8 @@ final class SharedSupervisorClient: ObservableObject {
     // A turn main still runs without this Mac's stream: what waits here goes
     // when it has ended (settleOutstanding), not behind it on main.
     while !hubQueueAvailable, outstandingRequestIds.isEmpty, let next = queue.takeNext() {
-      _ = await executeSingleMessage(next.text, focusedCardId: next.payload.focusedCardId,
-                                     attachments: next.payload.attachments, requestId: next.requestID)
+      _ = await sendKeepingPending(next.text, focusedCardId: next.payload.focusedCardId,
+                                   attachments: next.payload.attachments, requestId: next.requestID)
     }
   }
 
@@ -1048,11 +1055,19 @@ final class SharedSupervisorClient: ObservableObject {
     var restored = queue
     SupervisorPendingQueueStore.restore(saved, into: &restored)
     queue = restored
-    savedPending = SupervisorPendingQueueStore.pending(queue)
+    savedPending = currentPending()
+  }
+
+  private func currentPending() -> [SupervisorPendingMessage] {
+    var pending = SupervisorPendingQueueStore.pending(queue, hubQueueAvailable: hubQueueAvailable)
+    if let sending = sendingPending, !pending.contains(where: { $0.requestId == sending.requestId }) {
+      pending.insert(sending, at: 0)
+    }
+    return pending
   }
 
   private func savePendingIfChanged() {
-    let pending = SupervisorPendingQueueStore.pending(queue)
+    let pending = currentPending()
     guard pending != savedPending else { return }
     savedPending = pending
     pendingStore.save(pending)
@@ -1337,9 +1352,24 @@ final class SharedSupervisorClient: ObservableObject {
       streamingReplyText = nil
       progressStage = nil
     }
-    let ok = await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments, requestId: Self.newRequestId())
+    let ok = await sendKeepingPending(text, focusedCardId: focusedCardId, attachments: attachments, requestId: Self.newRequestId())
     await drainQueue()
     return ok
+  }
+
+  /// executeSingleMessage, with the message kept in the pending file until
+  /// its request has ended (main took it, refused it, or it is outstanding).
+  private func sendKeepingPending(_ text: String, focusedCardId: String?, attachments: [WorkspaceImageAttachment],
+                                  requestId: String) async -> Bool {
+    sendingPending = SupervisorPendingQueueStore.message(
+      requestId: requestId, text: text, focusedCardId: focusedCardId, attachments: attachments,
+      pendingUpload: hubQueueAvailable, uploadAttempted: true)
+    savePendingIfChanged()
+    defer {
+      if sendingPending?.requestId == requestId { sendingPending = nil }
+      savePendingIfChanged()
+    }
+    return await executeSingleMessage(text, focusedCardId: focusedCardId, attachments: attachments, requestId: requestId)
   }
 
   private func executeSingleMessage(_ text: String, focusedCardId: String? = nil, attachments: [WorkspaceImageAttachment] = [],

@@ -67,9 +67,12 @@ public struct SavedQueuedMessage: Codable, Sendable, Equatable {
     public var uploadAttempted: Bool
     // The hub's last refusal, shown on its row.
     public var error: String?
+    // "Send anyway": when the hub takes it, it goes next and the running
+    // reply is stopped. Optional, so files written before it decode.
+    public var sendNext: Bool?
 
     public init(requestID: String, text: String, attachments: [ChatAttachment], focusedCardID: String?,
-                pendingUpload: Bool, uploadAttempted: Bool, error: String? = nil) {
+                pendingUpload: Bool, uploadAttempted: Bool, error: String? = nil, sendNext: Bool? = nil) {
         self.requestID = requestID
         self.text = text
         self.attachments = attachments
@@ -77,6 +80,7 @@ public struct SavedQueuedMessage: Codable, Sendable, Equatable {
         self.pendingUpload = pendingUpload
         self.uploadAttempted = uploadAttempted
         self.error = error
+        self.sendNext = sendNext
     }
 }
 

@@ -42,22 +42,32 @@ final class ChatQueuedPersistenceTests: XCTestCase {
     }
 
     func testOnlyMessagesMainHasNotTakenAreKeptAndTheyComeBackInOrder() {
-        var queue = QueuedTurnQueue<ChatQueuedPayload>()
-        queue.enqueue(text: "local only", payload: ChatQueuedPayload(attachments: [], focusedCardID: "card:2"), requestID: "ios-local-00001")
-        queue.enqueue(text: "on the hub", payload: ChatQueuedPayload(attachments: [], focusedCardID: nil), requestID: "ios-onhub-00002",
-                      origin: QueuedOrigin(mine: true, revision: 1, pendingUpload: false))
-        queue.enqueue(text: "upload unanswered", payload: ChatQueuedPayload(attachments: [], focusedCardID: nil), requestID: "ios-unsure-0003",
-                      origin: QueuedOrigin(mine: true, pendingUpload: true, uploadAttempted: true))
-        let pending = ChatConversation.pendingQueue(queue)
-        XCTAssertEqual(pending.map(\.requestID), ["ios-local-00001", "ios-unsure-0003"], "the hub's own item is not kept here")
+        // No hub queue: every item is this phone's own, including one an
+        // edit gave an origin.
+        var local = QueuedTurnQueue<ChatQueuedPayload>()
+        local.enqueue(text: "local only", payload: ChatQueuedPayload(attachments: [], focusedCardID: "card:2"), requestID: "ios-local-00001")
+        let edited = local.enqueue(text: "edited here", payload: ChatQueuedPayload(attachments: [], focusedCardID: nil), requestID: "ios-edited-0002")
+        local.setOrigin(edited) { $0.error = nil }
+        let kept = ChatConversation.pendingQueue(local, hubQueueAvailable: false)
+        XCTAssertEqual(kept.map(\.requestID), ["ios-local-00001", "ios-edited-0002"])
 
-        let restored = ChatConversation.restoredQueue(pending)
-        XCTAssertEqual(restored.items.map(\.text), ["local only", "upload unanswered"])
-        XCTAssertEqual(restored.items.map(\.requestID), ["ios-local-00001", "ios-unsure-0003"])
+        // A hub queue: only what it has not accepted yet.
+        var hub = QueuedTurnQueue<ChatQueuedPayload>()
+        hub.enqueue(text: "on the hub", payload: ChatQueuedPayload(attachments: [], focusedCardID: nil), requestID: "ios-onhub-00003",
+                    origin: QueuedOrigin(mine: true, revision: 1, pendingUpload: false))
+        hub.enqueue(text: "send anyway, unanswered", payload: ChatQueuedPayload(attachments: [], focusedCardID: nil), requestID: "ios-unsure-0004",
+                    origin: QueuedOrigin(mine: true, pendingUpload: true, sendNext: true, uploadAttempted: true))
+        let onHub = ChatConversation.pendingQueue(hub, hubQueueAvailable: true)
+        XCTAssertEqual(onHub.map(\.requestID), ["ios-unsure-0004"], "the hub's own item is not kept here")
+
+        let restored = ChatConversation.restoredQueue(kept + onHub)
+        XCTAssertEqual(restored.items.map(\.text), ["local only", "edited here", "send anyway, unanswered"])
+        XCTAssertEqual(restored.items.map(\.requestID), ["ios-local-00001", "ios-edited-0002", "ios-unsure-0004"])
         XCTAssertNil(restored.items[0].origin)
         XCTAssertEqual(restored.items[0].payload.focusedCardID, "card:2")
-        XCTAssertEqual(restored.items[1].origin?.pendingUpload, true)
-        XCTAssertEqual(restored.items[1].origin?.uploadAttempted, true, "still possibly on the hub")
+        XCTAssertEqual(restored.items[2].origin?.pendingUpload, true)
+        XCTAssertEqual(restored.items[2].origin?.uploadAttempted, true, "still possibly on the hub")
+        XCTAssertEqual(restored.items[2].origin?.sendNext, true, "still goes next when the hub takes it")
     }
 
     @MainActor
