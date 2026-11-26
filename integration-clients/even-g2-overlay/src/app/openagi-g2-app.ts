@@ -84,7 +84,18 @@ export class OpenAGIG2App {
   private lastPingedSupervisor: InboxItem | null = null
   private supervisorWalkthrough: SupervisorWalkthrough | null = null
   private clearNotice(): void { if (this.noticeTimer) clearTimeout(this.noticeTimer); this.noticeTimer = null; this.lastPingedSupervisor = null }
+  // The quiet display wakes only for a new actionable Supervisor item: not
+  // for one that was already there when it went quiet, or one seen before.
+  private wakesQuietDisplay(item?: InboxItem): boolean {
+    if (!item?.supervisor || this.quietSeen.has(this.walkthroughIdentity(item))) return false
+    return Boolean(item.cardId || item.questionId || item.options?.length || ['act-fleet-card', 'answer-fleet'].includes(item.action))
+  }
+  private quietSeen = new Set<string>()
   private showNotice(item: InboxItem): void {
+    if (this.displaySleeping) {
+      if (!this.wakesQuietDisplay(item)) return
+      this.quietSeen.add(this.walkthroughIdentity(item)); this.toggleDisplay()
+    }
     this.clearNotice()
     const isMergeNotice = item.cardKind === 'merge_ready' || item.cardKind === 'pr_ready'
     const isBlockedNotice = item.cardKind === 'blocker' || item.cardKind === 'blocked'
@@ -159,6 +170,7 @@ export class OpenAGIG2App {
   private lastListeningPulse = 0
   private foregroundActive = true
   private lastAudioAt = 0
+  private audioGapStreak = 0
   private audioWatch: ReturnType<typeof setInterval> | null = null
   private lifelogRequest = 0
   // Lifelog runtime: never persisted, so reopening Agents always listens.
@@ -191,11 +203,17 @@ export class OpenAGIG2App {
   }
   private stopAudioWatch(): void { if (this.audioWatch) clearInterval(this.audioWatch); this.audioWatch = null }
   private async suspendForAudioGap(): Promise<void> {
-    const detail = 'No microphone audio for 10 seconds while the phone was locked. Even may have paused audio. Lifelog resumes on your next glasses gesture or when you unlock.'
+    const detail = 'No microphone audio for 10 seconds while the phone was locked. Even may have paused audio. Lifelog retries by itself, and on your next glasses gesture or when you unlock.'
     this.memoryRequest++; this.cancelSpeechRecovery()
     await this.stopAmbient(detail)
     this.phone.activity?.(detail); this.setLifelog('waiting', detail)
     if (this.mode === 'ambient') this.showHome()
+    // Keep listening wherever Even still delivers audio: retry with backoff.
+    if (this.homeMode === 'lifelog' && !this.lifelogUserPaused && !this.exited) {
+      clearTimeout(this.lifelogRetryTimer)
+      const delay = Math.min(300_000, 15_000 * 2 ** Math.min(this.audioGapStreak++, 5))
+      this.lifelogRetryTimer = setTimeout(() => { this.lifelogRetryTimer = undefined; void this.startLifelog() }, delay)
+    }
   }
   /** Any glasses gesture: Agents is on the glasses right now. */
   glassesInput(): void {
@@ -294,7 +312,8 @@ export class OpenAGIG2App {
         if (this.mode === 'walkthrough') this.showSupervisorWalkthrough()
       },
     },
-    () => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
+    item => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.requestController
+      && (!this.displaySleeping || this.wakesQuietDisplay(item)),
     item => this.showNotice(item))
   }
   openInbox(id?: string, supervisorOnly = false): void {
@@ -379,15 +398,30 @@ export class OpenAGIG2App {
     this.renderer.inbox?.(this.pages[this.page] ?? '', this.inboxIndex + 1, this.inboxItems.length, this.page + 1, this.pages.length)
   }
   private openLifelogControls(): void {
-    this.actionTarget = { id: '', title: 'Lifelog', summary: '', category: '', important: false, seen: true, action: '' }
+    this.actionTarget = this.lifelogControlsTarget()
     this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction()
   }
-  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer' | 'act-card'; value?: string; cardOp?: 'primary' | 'fix_ci' | 'defer' }[] {
+  private lifelogControlsTarget(): InboxItem {
+    const title = this.store.snapshot().recordingConsent ? 'Lifelog'
+      : 'Lifelog records speech near you and keeps the text on your main. Confirm everyone present agrees. Stays on until you stop it.'
+    return { id: '', title, summary: '', category: '', important: false, seen: true, action: '' }
+  }
+  private get lifelogControlsOpen(): boolean { return ['inbox-action', 'inbox-confirm'].includes(this.mode) && this.actionTarget !== null && !this.actionTarget.id }
+  // Consent can change from the phone while the controls are open: never
+  // leave a stale list (the old "Resume listening" over a live microphone).
+  private refreshLifelogControls(): void {
+    if (!this.lifelogControlsOpen) return
+    this.actionTarget = this.lifelogControlsTarget(); this.mode = 'inbox-action'
+    this.actionIndex = Math.max(0, Math.min(this.actionIndex, this.inboxActions().length - 1)); this.showInboxAction()
+  }
+  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'resume' | 'recent' | 'answer' | 'act-card' | 'consent' | 'stop'; value?: string; cardOp?: 'primary' | 'fix_ci' | 'defer' }[] {
     const item = this.actionTarget
     // An empty target is the Lifelog controls list (swipe down in Lifelog).
     if (item && !item.id) {
+      if (!this.store.snapshot().recordingConsent) return [{ label: 'Give recording consent', op: 'consent' }, { label: 'Recent answers', op: 'recent' }]
       return [...(this.proactive.capturing ? [{ label: 'Mark this moment', op: 'mark' as const }] : []),
         this.ambientRunning && !this.lifelogUserPaused ? { label: 'Pause listening', op: 'pause' as const } : { label: 'Resume listening', op: 'resume' as const },
+        { label: 'Stop Lifelog · withdraw consent', op: 'stop' },
         { label: 'Recent answers', op: 'recent' }]
     }
     const isMergeCard = item?.cardKind === 'merge_ready' || item?.cardKind === 'pr_ready'
@@ -425,6 +459,9 @@ export class OpenAGIG2App {
     if (action.op === 'talk') { this.voiceTarget = target.id ? { ...target } : null; this.showHome(); await this.startAsk(); return }
     if (action.op === 'mark') { await this.markMoment(); return }
     if (this.mode !== 'inbox-confirm') { this.mode = 'inbox-confirm'; this.showInboxAction(); return }
+    // Consent is given or withdrawn only on an explicit confirm.
+    if (action.op === 'consent') { this.showHome(); await this.configureRecordingConsent(true); return }
+    if (action.op === 'stop') { this.showHome(); await this.configureRecordingConsent(false); return }
     this.navigationBusy = true
     if (action.op === 'act-card') {
       try {
@@ -495,6 +532,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.homeMode === 'lifelog') { this.lifelogFailures = 0; await this.startLifelog() }
+    this.refreshLifelogControls()
   }
   async pauseLifelog(): Promise<void> {
     if (this.homeMode !== 'lifelog') return
@@ -540,7 +578,9 @@ export class OpenAGIG2App {
   private setLifelog(state: LifelogHomeState, detail = ''): void {
     this.lifelogState = state; this.lifelogDetail = detail
     this.phone.lifelogState?.(state, detail)
-    if (this.mode === 'home' && this.homeMode === 'lifelog' && !this.noticeTimer && !this.exited && this.store.snapshot().nodeToken) this.renderHome()
+    if (this.exited || !this.store.snapshot().nodeToken) return
+    if (this.mode === 'home' && this.homeMode === 'lifelog' && !this.noticeTimer) this.renderHome()
+    else this.refreshLifelogControls()
   }
   private kickLifelog(delay = 400): void {
     if (this.exited || this.homeMode !== 'lifelog' || this.lifelogUserPaused) return
@@ -755,7 +795,9 @@ export class OpenAGIG2App {
   scrollUp(): void { this.movePage(-1) }
   scrollDown(): void { this.movePage(1) }
   private movePage(direction: number): void {
-    if (this.exited || this.displaySleeping) return
+    if (this.exited) return
+    // Quiet display: any swipe wakes it; swipe up also opens the inbox to browse.
+    if (this.displaySleeping) { this.toggleDisplay(); if (direction < 0 && ['home', 'ambient'].includes(this.mode)) this.openInbox(undefined, this.homeMode === 'supervisor'); return }
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }
     this.clearNotice()
     if (this.mode === 'cue') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showCuePage() }
@@ -771,6 +813,7 @@ export class OpenAGIG2App {
       this.renderActiveProgress?.()
     }
     else if (this.mode === 'answer') this.showAnswer(Math.max(0, Math.min(this.pages.length - 1, this.page + direction)))
+    else if (this.mode === 'status' && direction > 0 && this.page >= this.pages.length - 1) { this.showHome(); this.toggleDisplay() }
     else if (this.mode === 'status') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderer.fleetStatus(this.pages[this.page] ?? '', this.page, this.pages.length) }
     else if (this.mode === 'home' || this.mode === 'ambient') {
       // Swipe up: Inbox. Swipe down: Recent (Talk), controls (Lifelog) or thread status (Supervisor).
@@ -847,6 +890,7 @@ export class OpenAGIG2App {
   }
   toggleDisplay(): void {
     if (this.exited) return
+    if (!this.displaySleeping) { this.clearNotice(); this.quietSeen = new Set([...this.quietSeen, ...this.proactive.items.map(item => this.walkthroughIdentity(item))].slice(-500)) }
     this.displaySleeping = !this.displaySleeping
     this.renderer.sleep?.(this.displaySleeping)
     this.phone.displaySleeping?.(this.displaySleeping)
@@ -1390,7 +1434,7 @@ export class OpenAGIG2App {
       this.lastAudioAt = Date.now()
       await this.audio.start(pcm => {
         try {
-          if (pcm.byteLength) this.lastAudioAt = Date.now()
+          if (pcm.byteLength) { this.lastAudioAt = Date.now(); this.audioGapStreak = 0 }
           received += pcm.byteLength / 32000
           if (Math.floor(received) !== displayedSecond && !this.ambientProcessing && !this.requestController && this.mode === 'ambient') {
             displayedSecond = Math.floor(received)
@@ -1526,7 +1570,7 @@ export class OpenAGIG2App {
       this.lastAudioAt = Date.now()
       await this.audio.start(pcm => {
         if (this.liveSpeech !== speech || this.exited) return
-        if (pcm.byteLength) this.lastAudioAt = Date.now()
+        if (pcm.byteLength) { this.lastAudioAt = Date.now(); this.audioGapStreak = 0 }
         speech.push(pcm); this.listeningPulse()
       })
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { await this.audio.stop(); return }

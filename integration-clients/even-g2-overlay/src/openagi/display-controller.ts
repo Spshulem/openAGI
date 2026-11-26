@@ -1,7 +1,7 @@
 import { CreateStartUpPageContainer, StartUpPageCreateResult, TextContainerProperty, TextContainerUpgrade, type EvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { DisplaySurface } from '../even/display-controller'
 
-export type G2DisplayPhase = 'idle' | 'listening' | 'thinking' | 'checking' | 'paused'
+export type G2DisplayPhase = 'idle' | 'listening' | 'thinking' | 'checking' | 'paused' | 'interrupted'
 export interface AgentsDisplaySurface extends DisplaySurface {
   show(content: string, immediate?: boolean, phase?: boolean | G2DisplayPhase): void
   requestExit(): Promise<boolean>
@@ -16,7 +16,6 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
   private timer: ReturnType<typeof setTimeout> | null = null
   private rendering = false
 
-  private pulse = 0
   constructor(private readonly bridge: EvenAppBridge, private readonly debounceMs = 160, private readonly now = () => new Date()) {}
 
   requestExit(): Promise<boolean> {
@@ -83,9 +82,11 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
         }
         if (target !== this.pending) continue
         if (target.phase) {
+          // A still clock. Active capture adds nothing; only real work or an
+          // interrupted microphone gets one short word. Nothing animates.
           const time = this.now().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
-          const label = { idle: '', listening: 'Listening', thinking: 'Thinking', checking: 'Checking', paused: 'Paused' }[target.phase]
-          const indicator = `${time}${label ? `  ${label}` : ''}${['idle', 'paused'].includes(target.phase) ? '' : '.'.repeat(this.pulse++ % 3 + 1)}`
+          const label = { idle: '', listening: '', thinking: 'Checking…', checking: 'Checking…', paused: 'Paused', interrupted: 'Mic off' }[target.phase]
+          const indicator = `${time}${label ? `  ${label}` : ''}`
           if (indicator !== this.lastIndicator) {
             if (!await this.update(2, 'status', indicator)) return
             this.lastIndicator = indicator
