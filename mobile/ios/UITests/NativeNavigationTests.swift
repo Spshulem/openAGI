@@ -327,7 +327,7 @@ final class NativeNavigationTests: XCTestCase {
     // it, a horizontal swipe on the card must move one card in each
     // direction, the arrow buttons must do the same, and "Hide" collapses it.
     func testSupervisorDeckExpandsAndMovesLeftAndRight() {
-        let app = launch(["--ui-deck-collapsed"])
+        let app = launch(["--ui-deck-collapsed", "--ui-needs-you-fixture"])
         tab(app, "Chat")
         tap(app, "chat-conversations")
         tap(app, "conversation-supervisor")

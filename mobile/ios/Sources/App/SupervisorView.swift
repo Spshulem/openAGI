@@ -1463,6 +1463,9 @@ struct SupervisorView: View {
         .frame(maxWidth: 720)
         .background(Theme.surface, in: Capsule())
         .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+        // Contain the children: an identifier on a plain stack is copied onto
+        // every child, which hid the Review button's own identifier.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("supervisor-collapsed-deck-bar")
     }
 
