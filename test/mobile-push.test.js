@@ -11,6 +11,7 @@ import { EventEmitter } from "node:events";
 import { MobilePush, PUSH_TIMING, alertOptions, buildActivity, buildAlert } from "../src/mobile-push.js";
 import { MobilePushStore } from "../src/mobile-push-store.js";
 import { openPushEnvelope } from "../src/mobile-push-envelope.js";
+const FULL = { previews: "full" };
 
 const T0 = Date.parse("2026-10-15T12:00:00.000Z");
 const SEC = 1000;
@@ -25,7 +26,7 @@ function harness(t, { threads = [], questions = [] } = {}) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const key = crypto.randomBytes(32).toString("base64url");
   const store = new MobilePushStore({ dir });
-  store.put(NODE, { pass: "p1.pass-one", key, env: "sandbox" });
+  store.put(NODE, { pass: "p1.pass-one", key, env: "sandbox", previews: "full" });
   const state = { snapshot: { threads }, questions };
   const supervisor = { getState: () => structuredClone(state) };
 
@@ -122,12 +123,12 @@ test("activity rows: active groups only, you → working → waiting, newest fir
 test("alert plaintext: the Android option filter, caps, and a fallback title", () => {
   assert.deepEqual(alertOptions(["Approve", "dismiss", "Open Thread", " DISMISS ", "Skip", "Later", "More"]), ["Approve", "Skip", "Later"]);
   assert.deepEqual(alertOptions(null), []);
-  const alert = buildAlert({ id: "fq1", title: "  ", body: "B".repeat(300), options: ["Approve"], threadKey: "codex:abc" });
+  const alert = buildAlert({ id: "fq1", title: "  ", body: "B".repeat(300), options: ["Approve"], threadKey: "codex:abc" }, FULL);
   assert.deepEqual(Object.keys(alert), ["questionId", "title", "body", "options", "threadKey", "canReply"]);
   assert.equal(alert.title, "Needs you");
   assert.equal(alert.body.length, 220);
-  assert.equal(buildAlert({ id: "fq2", title: "T".repeat(150) }).title.length, 100);
-  assert.equal(buildAlert({ id: "fq3", title: "x" }).threadKey, null);
+  assert.equal(buildAlert({ id: "fq2", title: "T".repeat(150) }, FULL).title.length, 100);
+  assert.equal(buildAlert({ id: "fq3", title: "x" }, FULL).threadKey, null);
 });
 
 test("a fleet event starts the activity once, 2 s later, with a 30 min stale date", async (t) => {
@@ -772,4 +773,22 @@ test("an unreachable Paseo host marks the activity partial even when every sourc
   assert.equal(buildActivity({ snapshot }, new Date(T0)).partial, false);
   assert.equal(buildActivity({ snapshot: { ...snapshot, unknownPrefixes: ["paseo:host-b."] } }, new Date(T0)).partial, true);
   assert.equal(buildActivity({ snapshot: { ...snapshot, unknownPrefixes: [] } }, new Date(T0)).partial, false);
+});
+
+test("a phone registered with default settings gets one private alert per new question, then none for repeats", async (t) => {
+  const h = harness(t, { questions: [question("fq1", { title: "Merge acme/payroll #42?", body: "Salary table migration ready." })] });
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox" });
+  await h.push.flush();
+  const alerts = h.sent.filter((s) => s.type === "alert");
+  assert.equal(alerts.length, 1);
+  const plain = h.open(alerts[0]);
+  assert.equal(plain.questionId, "fq1");
+  assert.equal(plain.title, "Supervisor needs you");
+  assert.doesNotMatch(JSON.stringify(plain), /payroll|Salary|codex:a|yes|no"/);
+  // The same open question never alerts twice; a new one does.
+  await h.push.flush();
+  assert.equal(h.sent.filter((s) => s.type === "alert").length, 1);
+  h.state.questions.push(question("fq2"));
+  await h.push.flush();
+  assert.deepEqual(h.sent.filter((s) => s.type === "alert").map((a) => a.collapseId), ["fq1", "fq2"]);
 });

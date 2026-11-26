@@ -170,7 +170,6 @@ export class OpenAGIG2App {
   private lastListeningPulse = 0
   private foregroundActive = true
   private lastAudioAt = 0
-  private audioGapStreak = 0
   private audioWatch: ReturnType<typeof setInterval> | null = null
   private lifelogRequest = 0
   // Lifelog runtime: never persisted, so reopening Agents always listens.
@@ -203,17 +202,13 @@ export class OpenAGIG2App {
   }
   private stopAudioWatch(): void { if (this.audioWatch) clearInterval(this.audioWatch); this.audioWatch = null }
   private async suspendForAudioGap(): Promise<void> {
-    const detail = 'No microphone audio for 10 seconds while the phone was locked. Even may have paused audio. Lifelog retries by itself, and on your next glasses gesture or when you unlock.'
+    // No background capture: Lifelog stays off (and says so) until the phone
+    // is unlocked or the glasses are used again.
+    const detail = 'No microphone audio for 10 seconds while the phone was locked. Even paused audio, so Lifelog is off. It resumes when you unlock or use the glasses.'
     this.memoryRequest++; this.cancelSpeechRecovery()
     await this.stopAmbient(detail)
     this.phone.activity?.(detail); this.setLifelog('waiting', detail)
     if (this.mode === 'ambient') this.showHome()
-    // Keep listening wherever Even still delivers audio: retry with backoff.
-    if (this.homeMode === 'lifelog' && !this.lifelogUserPaused && !this.exited) {
-      clearTimeout(this.lifelogRetryTimer)
-      const delay = Math.min(300_000, 15_000 * 2 ** Math.min(this.audioGapStreak++, 5))
-      this.lifelogRetryTimer = setTimeout(() => { this.lifelogRetryTimer = undefined; void this.startLifelog() }, delay)
-    }
   }
   /** Any glasses gesture: Agents is on the glasses right now. */
   glassesInput(): void {
@@ -1434,7 +1429,7 @@ export class OpenAGIG2App {
       this.lastAudioAt = Date.now()
       await this.audio.start(pcm => {
         try {
-          if (pcm.byteLength) { this.lastAudioAt = Date.now(); this.audioGapStreak = 0 }
+          if (pcm.byteLength) this.lastAudioAt = Date.now()
           received += pcm.byteLength / 32000
           if (Math.floor(received) !== displayedSecond && !this.ambientProcessing && !this.requestController && this.mode === 'ambient') {
             displayedSecond = Math.floor(received)
@@ -1570,7 +1565,7 @@ export class OpenAGIG2App {
       this.lastAudioAt = Date.now()
       await this.audio.start(pcm => {
         if (this.liveSpeech !== speech || this.exited) return
-        if (pcm.byteLength) { this.lastAudioAt = Date.now(); this.audioGapStreak = 0 }
+        if (pcm.byteLength) this.lastAudioAt = Date.now()
         speech.push(pcm); this.listeningPulse()
       })
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { await this.audio.stop(); return }

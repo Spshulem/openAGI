@@ -976,7 +976,7 @@ it('Stop Lifelog on the glasses withdraws consent on main and turns the micropho
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
-it('after a locked-phone audio gap, Lifelog retries by itself with the same consent', async () => {
+it('after a locked-phone audio gap, Lifelog stays off and says so until unlock, then resumes with the same consent', async () => {
   vi.useFakeTimers()
   const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
   const f = await lifelogFixture()
@@ -985,9 +985,13 @@ it('after a locked-phone audio gap, Lifelog retries by itself with the same cons
     f.receive(new Uint8Array(640))
     await vi.advanceTimersByTimeAsync(12_000)
     expect(f.app.proactive.capturing).toBe(false)
-    expect(f.renderer.lifelogHome).toHaveBeenLastCalledWith('waiting', expect.stringContaining('retries by itself'))
+    expect(f.renderer.lifelogHome).toHaveBeenLastCalledWith('waiting', expect.stringContaining('Lifelog is off'))
     const starts = f.audio.start.mock.calls.length
-    await vi.advanceTimersByTimeAsync(15_100)
+    // No background capture: nothing reopens the microphone while locked.
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(f.audio.start.mock.calls.length).toBe(starts)
+    visibility.mockReturnValue('visible'); document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(500)
     expect(f.audio.start.mock.calls.length).toBe(starts + 1)
     f.receive(new Uint8Array(640))
     expect(f.app.proactive.capturing).toBe(true); expect(f.main.state.grants).toBe(1)

@@ -30,7 +30,7 @@ const FILE_VERSION = 1;
 /// { ok: false, error }, never throws.
 export function validatePushRegistration(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "body must be an object" };
-  const { pass, key, env, activities, alerts, approvals } = body;
+  const { pass, key, env, activities, alerts, approvals, previews } = body;
   if (typeof pass !== "string" || !pass.startsWith("p1.") || pass.length > PUSH_PASS_MAX) {
     return { ok: false, error: `pass must start with "p1." and be at most ${PUSH_PASS_MAX} chars` };
   }
@@ -39,7 +39,10 @@ export function validatePushRegistration(body) {
   if (activities !== undefined && typeof activities !== "boolean") return { ok: false, error: "activities must be a boolean" };
   if (alerts !== undefined && typeof alerts !== "boolean") return { ok: false, error: "alerts must be a boolean" };
   if (approvals !== undefined && typeof approvals !== "boolean") return { ok: false, error: "approvals must be a boolean" };
-  return { ok: true, value: { pass, key, env, activities: activities !== false, alerts: alerts !== false, approvals: approvals === true } };
+  if (previews !== undefined && !["private", "full"].includes(previews)) return { ok: false, error: 'previews must be "private" or "full"' };
+  // Lock-screen privacy: card text, options and approval summaries leave the
+  // main only when the owner chose full previews on that phone.
+  return { ok: true, value: { pass, key, env, activities: activities !== false, alerts: alerts !== false, approvals: approvals === true, previews: previews === "full" ? "full" : "private" } };
 }
 
 const copy = (record) => ({
@@ -68,6 +71,7 @@ export class MobilePushStore {
         activities: record.activities !== false,
         alerts: record.alerts !== false,
         approvals: record.approvals === true,
+        previews: record.previews === "full" ? "full" : "private",
         approvalsNotified: Array.isArray(record.approvalsNotified) ? record.approvalsNotified.filter((id) => typeof id === "string") : [],
         renew: record.renew === true,
         noLiveActivity: record.noLiveActivity === true,
@@ -89,7 +93,7 @@ export class MobilePushStore {
   /// the same pass keeps its activity state, a new pass is a new push-to-start
   /// token whose activity is not ours to update. The notified ids carry over
   /// either way: it is the same phone, which already saw those alerts.
-  put(nodeId, { pass, key, env, activities = true, alerts = true, approvals = false }) {
+  put(nodeId, { pass, key, env, activities = true, alerts = true, approvals = false, previews = "private" }) {
     const prior = this.records.get(nodeId);
     const samePass = prior?.pass === pass;
     const record = {
@@ -100,6 +104,7 @@ export class MobilePushStore {
       activities: activities !== false,
       alerts: alerts !== false,
       approvals: approvals === true,
+      previews: previews === "full" ? "full" : "private",
       // The relay's verdicts belong to the pass, not the request.
       renew: samePass ? prior.renew === true : false,
       noLiveActivity: samePass ? prior.noLiveActivity === true : false,

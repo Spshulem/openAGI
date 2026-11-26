@@ -127,7 +127,14 @@ export function acceptsReply(question) {
 /// The alert plaintext (kind "alert") for one open question. Options pass
 /// through untouched: the answer route accepts only an exact option string.
 /// canReply asks the phone for a Reply text field.
-export function buildAlert(question) {
+export const PRIVATE_ALERT = Object.freeze({ title: "Supervisor needs you", body: "Open OpenAGI to review it." });
+export const PRIVATE_APPROVAL = "An action is waiting for your approval. Open OpenAGI to review it.";
+
+/// previews "private" (the default) sends no card text, options or thread:
+/// a lock screen, or glasses mirroring phone notifications, shows only that
+/// the Supervisor needs the owner. The id still opens the exact item.
+export function buildAlert(question, { previews = "private" } = {}) {
+  if (previews !== "full") return { questionId: question.id, ...PRIVATE_ALERT, options: [], threadKey: null, canReply: false, private: true };
   const title = typeof question?.title === "string" ? question.title.trim() : "";
   const body = typeof question?.body === "string" ? question.body.trim() : "";
   return {
@@ -149,12 +156,12 @@ export function approvalNeedsOwner(action) {
 /// The approval plaintext (kind "approval"). The phone shows it with Approve
 /// and Deny, and both go through the same authenticated approve/deny routes
 /// as its Inbox; nothing in here authorizes anything.
-export function buildApproval(action) {
+export function buildApproval(action, { previews = "private" } = {}) {
   const summary = typeof action?.summary === "string" ? action.summary.trim() : "";
   const tool = typeof action?.toolName === "string" && action.toolName ? action.toolName : "a tool";
   return {
     actionId: action.id,
-    summary: capText(summary || `Run ${tool}`, APPROVAL_SUMMARY_MAX),
+    summary: previews === "full" ? capText(summary || `Run ${tool}`, APPROVAL_SUMMARY_MAX) : PRIVATE_APPROVAL,
     code: typeof action.confirmCode === "string" && action.confirmCode ? action.confirmCode : null
   };
 }
@@ -379,7 +386,7 @@ export class MobilePush {
     const fresh = unsent.slice(0, ALERTS_PER_PASS);
     let sent = 0;
     for (const question of fresh) {
-      const result = await this.send(registration, { type: "alert", sealed: this.sealAlert(registration.key, question), collapseId: question.id });
+      const result = await this.send(registration, { type: "alert", sealed: this.sealAlert(registration.key, question, registration.previews), collapseId: question.id });
       if (!isCurrent()) return { stop: true, backlog: false };
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       // Retry unsent questions even if no new fleet event arrives.
@@ -422,7 +429,7 @@ export class MobilePush {
     const fresh = unsent.slice(0, ALERTS_PER_PASS);
     let sent = 0;
     for (const action of fresh) {
-      const result = await this.send(registration, { type: "alert", sealed: this.sealApproval(registration.key, action), collapseId: action.id });
+      const result = await this.send(registration, { type: "alert", sealed: this.sealApproval(registration.key, action, registration.previews), collapseId: action.id });
       if (!isCurrent()) return { stop: true, backlog: false };
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       if (result !== "ok") break;
@@ -529,16 +536,16 @@ export class MobilePush {
     return this.send(registration, { type, sealed, ...extra });
   }
 
-  sealAlert(key, question) {
-    const plain = buildAlert(question);
+  sealAlert(key, question, previews = "private") {
+    const plain = buildAlert(question, { previews });
     const sealed = sealPushEnvelope(key, "alert", plain);
     // Title and body are capped; only many long options can overflow. The
     // alert still says the supervisor needs the owner, and a tap opens it.
     return sealed.length > SEALED_MAX ? sealPushEnvelope(key, "alert", { ...plain, options: [] }) : sealed;
   }
 
-  sealApproval(key, action) {
-    return sealPushEnvelope(key, "approval", buildApproval(action));
+  sealApproval(key, action, previews = "private") {
+    return sealPushEnvelope(key, "approval", buildApproval(action, { previews }));
   }
 
   // "ok" | "gone" | "renew" | "error". Never throws, never logs a body.
