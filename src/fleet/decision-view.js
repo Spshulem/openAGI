@@ -28,6 +28,15 @@ const NEGATION_RE = /\b(?:do\s+not|don'?t|does\s+not|should\s+not|shouldn'?t|not
 
 // A status icon that is the whole value says something: it becomes a word.
 // An icon beside its own text is only decoration and is dropped.
+// Markdown emphasis pairs only: "**word**" anywhere a word starts, and
+// "__word__" set off by spaces or punctuation. Lone or path-embedded
+// markers ("rm -rf **/build", "/tmp/__cache__") are command text.
+export function stripEmphasis(text) {
+  return asText(text)
+    .replace(/\*\*(?=\S)([^*\n]*?\S)\*\*(?!\*)/g, "$1")
+    .replace(/(^|[\s(])__(?=[^\s_])([^_\n]*?[^\s_])__(?=$|[\s.,;:!?)])/gm, "$1$2");
+}
+
 export function iconsToWords(text) {
   return asText(text)
     .replace(/(^|[\s|(:])[✅✔☑]\uFE0F?(?=\s*(?:$|[|,;.)]))/gmu, "$1passed")
@@ -64,7 +73,7 @@ export function markdownTableRows(text) {
   for (const raw of lines) {
     const line = raw.trim();
     if (!/^\|.*\|$/.test(line)) { header = null; continue; }
-    const cells = line.slice(1, -1).split("|").map((c) => iconsToWords(c.replace(/\*\*|__|`/g, "")).trim());
+    const cells = line.slice(1, -1).split("|").map((c) => iconsToWords(stripEmphasis(c).replace(/`/g, "")).trim());
     if (cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
     if (!header) { header = cells; continue; }
     rows.push(Object.fromEntries(cells.map((c, i) => [header[i] || `Column ${i + 1}`, c])));
@@ -105,8 +114,11 @@ export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLi
   const residue = (s) => /^\s*\|.*\|\s*\.?\s*$/.test(s) || /\|\s*:?-{3,}:?\s*\|/.test(s) || /^\s*:?-{3,}(?:\s+:?-{3,})*\s*\.?\s*$/.test(s);
   const base = tableToSentences(iconsToWords(asText(text)))
     .replace(BRACKET_LABEL_RE, "")
-    .replace(/\*\*|__/g, "")
-    .replace(/`([^`]+)`/g, "$1");
+    .split(/(`[^`]*`)/)
+    // Code spans are literal; elsewhere only real emphasis pairs are removed
+    // ("**word**", " __word__ "), never "__cache__" in a path or "**/build".
+    .map((part) => (part.startsWith("`") && part.endsWith("`") && part.length > 1 ? part.slice(1, -1) : stripEmphasis(part)))
+    .join("");
   if (keepLines) {
     // Line structure ("Options:\n- Rotate key") is kept for clients that
     // render it; each line is cleaned on its own.
@@ -139,8 +151,8 @@ function splitSentences(text) {
     .filter(Boolean);
 }
 
-const PR_REF_RE = /#(\d{2,7})\b/;
-const QUALIFIED_PR_RE = /(?:\b([\w.-]+\/[\w.-]+))?#(\d{2,7})\b/;
+const PR_REF_RE = /#(\d{1,7})\b/;
+const QUALIFIED_PR_RE = /(?:\b([\w.-]+\/[\w.-]+))?#(\d{1,7})\b/;
 
 // Per-PR facts recovered from the agent's tables and the card's PR context.
 function prFacts({ texts = [], prContext = null, prRef = null }) {

@@ -205,7 +205,8 @@ struct FleetDecisionPresentation: Equatable {
       lines.append(line)
     }
     return lines.joined(separator: "\n")
-      .replacingOccurrences(of: "**", with: "")
+      // Emphasis pairs only: "rm -rf **/build" stays as written.
+      .replacingOccurrences(of: #"\*\*(?=\S)([^*\n]*?\S)\*\*(?!\*)"#, with: "$1", options: .regularExpression)
       .replacingOccurrences(of: #"\b(?:paseo|codex|conductor|claude):[A-Za-z0-9_.\-]+"#, with: "", options: .regularExpression)
       .replacingOccurrences(of: #"\b(?:srv|wks|fq)_[A-Za-z0-9_.\-]+"#, with: "", options: .regularExpression)
       .replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)

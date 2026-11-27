@@ -190,7 +190,8 @@ enum DecisionContract {
                 && line.range(of: #"^\s*\|?\s*:?-{3,}"#, options: .regularExpression) == nil
         }
         let cleaned = lines.joined(separator: " ")
-            .replacingOccurrences(of: "**", with: "")
+            // Emphasis pairs only: "rm -rf **/build" stays as written.
+            .replacingOccurrences(of: #"\*\*(?=\S)([^*\n]*?\S)\*\*(?!\*)"#, with: "$1", options: .regularExpression)
             .replacingOccurrences(of: #"\b(?:paseo|codex|claude):[^\s,;)]+"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"\b(?:srv|wks|fq)_[A-Za-z0-9._-]+"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)

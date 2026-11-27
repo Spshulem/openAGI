@@ -211,6 +211,8 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertTrue(text.contains("5/5 resolved; and/or wait."))
     XCTAssertEqual(FleetDecisionPresentation.displayText("Allow npm test || rm -rf /tmp/build-output?"),
                    "Allow npm test || rm -rf /tmp/build-output?", "shell operators and paths are command text")
+    XCTAssertEqual(FleetDecisionPresentation.displayText("Allow rm -rf **/build and /tmp/__cache__?"),
+                   "Allow rm -rf **/build and /tmp/__cache__?", "globs and underscores are command text")
   }
 
   func testClarificationQuestionKeepsItsOwnFlow() throws {

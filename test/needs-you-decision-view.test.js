@@ -266,3 +266,28 @@ test("review: the live message's unverified work is reported", () => {
   }, { now: NOW, threadsByKey: new Map([["paseo:s.live", { key: "paseo:s.live", lastAgentFull: live }]]) });
   assert.ok(card.decisionView.status.unverified.some((s) => /Production deployment is not verified/.test(s)), JSON.stringify(card.decisionView.status));
 });
+
+test("review: a permission command's underscores and globs are shown exactly", () => {
+  for (const command of ["rm -rf /tmp/__cache__", "rm -rf **/build"]) {
+    const card = buildSupervisorCard({
+      id: "fq_lit", kind: "prompt", status: "open", threadKey: "paseo:s.lit",
+      title: `Allow ${command}?`, body: `Allow ${command}?`, options: ["allow", "deny"], meta: { command },
+      contextSnapshot: { recentMessages: [{ role: "user", text: "Clean up" }, { role: "assistant", text: `I need to run ${command}.` }] }
+    }, { now: NOW });
+    const shown = JSON.stringify(card.decisionView.decision);
+    assert.ok(shown.includes(command), `${command} shown exactly: ${shown}`);
+  }
+  assert.equal(cleanDecisionProse("**#1201** reports a __bold__ change"), "#1201 reports a bold change");
+});
+
+test("review: single-digit PR numbers keep their facts", () => {
+  const table = "| PR | CI |\n|---|---|\n| acme/api#1 | passed |\n| acme/web#2 | failed |\n\nShip which?";
+  const card = buildSupervisorCard({
+    id: "fq_small", kind: "agent-ask", status: "open", threadKey: "paseo:s.small",
+    title: "Ship api or web?", options: ["ship api", "ship web"], askContext: table,
+    contextSnapshot: { agentSummary: table, recentMessages: [{ role: "user", text: "Ship" }, { role: "assistant", text: table }] }
+  }, { now: NOW });
+  const prs = Object.fromEntries(card.decisionView.status.prs.map((p) => [p.ref, p.facts]));
+  assert.deepEqual(prs["acme/api#1"], ["CI: passed"]);
+  assert.deepEqual(prs["acme/web#2"], ["CI: failed"]);
+});

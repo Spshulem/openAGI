@@ -102,6 +102,8 @@ final class DecisionViewDecodingTests: XCTestCase {
         XCTAssertEqual(DecisionContract.clean(raw), "See in /Users/x/repo/file.swift, 5/5 resolved.")
         XCTAssertNil(DecisionContract.clean("| a | b |"))
         XCTAssertEqual(DecisionContract.clean("Allow npm test || rm -rf /tmp/build-output?"), "Allow npm test || rm -rf /tmp/build-output?")
+        XCTAssertEqual(DecisionContract.clean("Allow rm -rf **/build and /tmp/__cache__?"), "Allow rm -rf **/build and /tmp/__cache__?")
+        XCTAssertEqual(DecisionContract.clean("**#1201** reports"), "#1201 reports")
     }
 
     // MARK: PR #391 review findings
