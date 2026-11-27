@@ -102,8 +102,8 @@ final class FleetOverlayTests: XCTestCase {
     let delivered = try line(#"{"status":"sent","outcome":"delivered"}"#)
     XCTAssertEqual(delivered.text, "Sent to the agent.")
     XCTAssertFalse(delivered.isError)
-    let queued = try line(#"{"status":"queued","outcome":"queued","detail":"The agent is mid-turn"}"#)
-    XCTAssertEqual(queued.text, "Queued. It goes to the agent once its current turn ends.")
+    let queued = try line(#"{"status":"queued","outcome":"queued","detail":"Saved. It goes to the agent once the Mac can type (secure input is on)."}"#)
+    XCTAssertEqual(queued.text, "Saved. It goes to the agent once the Mac can type (secure input is on).", "the hub's reason for waiting stands")
     XCTAssertFalse(queued.isError)
     let ambiguous = try line(#"{"status":"blocked","unconfirmed":true,"outcome":"ambiguous","detail":"turn confirmation timed out"}"#)
     XCTAssertEqual(ambiguous.text, "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.")
@@ -112,7 +112,7 @@ final class FleetOverlayTests: XCTestCase {
     XCTAssertEqual(refused.text, "Not sent: the chat is archived; nothing was sent")
     XCTAssertTrue(refused.isError)
     XCTAssertEqual(FleetThreadOutcome.reply(FleetDelivery(status: "queued", detail: nil, outcome: "queued")).text,
-                   "Queued. It goes to the agent once its current turn ends.")
+                   "Queued. It goes to the agent as soon as it can take it.")
   }
 
   func testStatusLine() {

@@ -652,6 +652,8 @@ const RECONCILE_MAX_PAGES = 30;
 const RECONCILE_BUDGET_MS = 12_000;
 // The one status check an unconfirmable delivery may get, never a replay.
 export const PASEO_STATUS_CHECK_TEXT = "[OpenAGI supervisor] Status check: where did you stop? Reply briefly; do not redo earlier steps.";
+// The longest a background receipt check may hold a chat's send guard.
+const RECEIPT_CHECK_MS = 12_000;
 // A receipt this young may still be waiting for its turn to start.
 const STATUS_CHECK_MIN_AGE_MS = 30 * 60_000;
 
@@ -848,7 +850,9 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
 // Returns { confirmed, systemError } or { confirmed: false, detail }.
 // messageId: the exact send being settled (the same words sent again under
 // another approval are another send, never evidence for this one).
-export async function checkPaseoReceipt({ config, thread, store, messageHash, messageId, factory } = {}) {
+// timeoutMs bounds the whole check (connection, host lookup, reads): it
+// holds this chat's send guard, so an owner send waits at most that long.
+export async function checkPaseoReceipt({ config, thread, store, messageHash, messageId, factory, timeoutMs = RECEIPT_CHECK_MS } = {}) {
   if (!config?.paseo?.enabled || thread?.kind !== "paseo" || !store?.dir || !messageHash || !messageId) return { confirmed: false, detail: "not a Paseo receipt" };
   const file = path.join(store.dir, "paseo-deliveries", `${createHash("sha256").update(thread.key).digest("hex")}.json`);
   // Serialized with sends to this chat (deliverPaseo holds the same guard):
@@ -868,12 +872,14 @@ export async function checkPaseoReceipt({ config, thread, store, messageHash, me
     writeJsonAtomic(file, next);
     return true;
   };
+  const bounded = Math.max(1, Math.min(Number(timeoutMs) || RECEIPT_CHECK_MS, config.paseo.timeoutMs ?? RECEIPT_CHECK_MS));
+  const checkConfig = { ...config, paseo: { ...config.paseo, timeoutMs: bounded } };
   active.add(file);
   try {
-    return await withPaseo(config, async (client, signal) => {
+    return await withPaseo(checkConfig, async (client, signal) => {
       const api = await hostApi(client, thread.meta.serverId);
       const ref = api.agents.ref(thread.id);
-      const check = await readPaseoConfirmation(ref, receipt, signal, saveIfCurrent, performance.now() + 10_000, { ownerInitiated: true });
+      const check = await readPaseoConfirmation(ref, receipt, signal, saveIfCurrent, performance.now() + bounded, { ownerInitiated: true });
       if (check.confirmed || check.systemError) {
         if (!saveIfCurrent({ ...receipt, pending: false, settledLate: true, ...(check.systemError ? { executionError: check.systemError } : {}) })) {
           return { confirmed: false, detail: "a later send replaced the receipt" };

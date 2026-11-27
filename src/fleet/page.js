@@ -405,7 +405,8 @@ textarea.reply{display:block;width:100%;min-height:76px;margin-top:10px;padding:
     // The hub's outcome (delivered, queued, ambiguous, refused) decides first.
     var outcome = delivery && delivery.outcome;
     if (outcome === 'delivered') return { text: 'Sent to the agent.', bad: false };
-    if (outcome === 'queued') return { text: 'Queued. It goes to the agent once its current turn ends.', bad: false };
+    // The hub says why it waits (a running turn, the Mac unable to type).
+    if (outcome === 'queued') return { text: detail || 'Queued. It goes to the agent as soon as it can take it.', bad: false };
     if (outcome === 'ambiguous') return { text: 'May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.', bad: true };
     if (outcome === 'refused') return { text: 'Not sent' + (detail ? ': ' + detail : '.'), bad: true };
     if (status === 'sent') return { text: 'Sent to the agent.', bad: false };

@@ -907,7 +907,8 @@ struct FleetDelivery: Decodable, Equatable {
     let shown = trimmed.isEmpty ? nil : String(trimmed.prefix(300))
     switch outcome {
     case "delivered": return FleetNote(text: "Sent to the agent.", isError: false)
-    case "queued": return FleetNote(text: "Queued. It goes to the agent once its current turn ends.", isError: false)
+    // The hub says why it waits (a running turn, the Mac unable to type).
+    case "queued": return FleetNote(text: shown ?? "Queued. It goes to the agent as soon as it can take it.", isError: false)
     case "ambiguous":
       return FleetNote(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isError: true)
     case "refused": return FleetNote(text: "Not sent: \(shown ?? "refused")", isError: true)

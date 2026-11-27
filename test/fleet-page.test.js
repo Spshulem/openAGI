@@ -252,7 +252,9 @@ test("tapping an option posts the answer and re-renders from the reply", async (
 test("an answer's outcome decides its line: delivered, queued, ambiguous, refused", async () => {
   const cases = [
     [{ status: "sent", outcome: "delivered" }, "Sent to the agent.", false],
-    [{ status: "queued", outcome: "queued", detail: "The agent is mid-turn; your answer is queued" }, "Queued. It goes to the agent once its current turn ends.", false],
+    [{ status: "queued", outcome: "queued", detail: "The agent is mid-turn; your answer is queued" }, "The agent is mid-turn; your answer is queued", false],
+    [{ status: "queued", outcome: "queued", detail: "Saved. It goes to the agent once the Mac can type (secure input is on)." }, "Saved. It goes to the agent once the Mac can type (secure input is on).", false],
+    [{ status: "queued", outcome: "queued" }, "Queued. It goes to the agent as soon as it can take it.", false],
     [{ status: "blocked", unconfirmed: true, outcome: "ambiguous", detail: "turn confirmation timed out" }, "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", true],
     [{ status: "blocked", outcome: "refused", detail: "the chat is archived; nothing was sent" }, "Not sent: the chat is archived; nothing was sent", true]
   ];

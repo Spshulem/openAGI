@@ -308,6 +308,29 @@ test("a later send of the same text never settles an older unconfirmed approval"
   assert.equal(sup.handoffs.get("approval-1").status, "unconfirmed");
 });
 
+// Review fix (#393): a stalled timeline read held the chat's send guard for
+// Paseo's whole request timeout; the check is bounded end to end.
+test("a receipt check whose timeline read stalls gives up within its bound and frees the chat", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-stall-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const thread = paseoThread(antigravityAgent, "srv_bb");
+  const journal = path.join(dir, "paseo-deliveries");
+  fs.mkdirSync(journal, { recursive: true });
+  const file = path.join(journal, `${createHash("sha256").update(thread.key).digest("hex")}.json`);
+  fs.writeFileSync(file, JSON.stringify({ messageId: "m-1", clientMessageId: "m-1", messageHash: "h-1", pending: true }));
+  let stalled = true;
+  const ref = { current: () => antigravityAgent, timeline: { refetch: () => (stalled ? new Promise(() => {}) : Promise.resolve({ agent: antigravityAgent, entries: [] })) } };
+  const client = { connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "srv_bb" }, hosts: [] }) }, agents: { ref: () => ref } };
+  const args = { config: { paseo: { enabled: true } }, thread, store: { dir }, messageHash: "h-1", messageId: "m-1", factory: () => client, timeoutMs: 300 };
+  const started = Date.now();
+  const result = await checkPaseoReceipt(args);
+  assert.equal(result.confirmed, false);
+  assert.ok(Date.now() - started < 3000, `bounded (${Date.now() - started} ms)`);
+  stalled = false;
+  const next = await checkPaseoReceipt(args);
+  assert.notEqual(next.detail, "a send to this chat is in progress", "the chat's guard was released");
+});
+
 // Review fix (#393): with more unconfirmed handoffs than one scan checks,
 // each scan checks the least recently checked, so none is starved.
 test("unconfirmed handoffs are checked in turn, not always the newest few", async (t) => {

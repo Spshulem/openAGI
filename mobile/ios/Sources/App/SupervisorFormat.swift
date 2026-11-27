@@ -236,7 +236,8 @@ enum SupervisorFormat {
         let detail = nonBlank(rawDetail?.trimmingCharacters(in: .whitespacesAndNewlines))
         switch outcome {
         case "delivered": return Note(text: "Sent to the agent.", isAlert: false)
-        case "queued": return Note(text: "Queued. It goes to the agent once its current turn ends.", isAlert: false)
+        // The hub says why it waits (a running turn, the Mac unable to type).
+        case "queued": return Note(text: detail ?? "Queued. It goes to the agent as soon as it can take it.", isAlert: false)
         case "ambiguous":
             return Note(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isAlert: true)
         case "refused": return Note(text: "Not sent: " + (detail ?? "refused"), isAlert: true)
