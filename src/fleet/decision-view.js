@@ -152,11 +152,14 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
     const m = QUALIFIED_PR_RE.exec(String(text ?? ""));
     return m ? (m[1] ? `${m[1]}#${m[2]}` : `#${m[2]}`) : null;
   };
+  // One value per PR and column: sources are read oldest to newest (saved
+  // snapshot, ask, live agent message, then live PR state), so a newer
+  // value replaces an older one instead of sitting beside it.
   const add = (ref, title, facts) => {
     if (!ref) return;
-    const entry = byRef.get(ref) ?? { ref, title: null, facts: [] };
+    const entry = byRef.get(ref) ?? { ref, title: null, facts: new Map() };
     if (title && !entry.title) entry.title = clamp(title, 120);
-    for (const f of facts) if (f && !entry.facts.includes(f)) entry.facts.push(f);
+    for (const [column, value] of facts) if (column && value) entry.facts.set(column, value);
     byRef.set(ref, entry);
   };
   for (const text of texts) {
@@ -169,7 +172,7 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
       const facts = entries
         .filter(([k]) => k !== refCell[0])
         .filter(([, v]) => v && !/^[-—–]$/.test(v))
-        .map(([k, v]) => `${k}: ${v}`);
+        .map(([k, v]) => [k, v]);
       add(ref, title, facts);
     }
   }
@@ -177,8 +180,8 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
     const ref = refOf(prContext.ref ?? prRef);
     if (ref) {
       const facts = [];
-      if (prContext.ciState) facts.push(`CI: ${String(prContext.ciState).toLowerCase()}`);
-      if (prContext.mergeState) facts.push(`Merge state: ${String(prContext.mergeState).toLowerCase()}`);
+      if (prContext.ciState) facts.push(["CI", String(prContext.ciState).toLowerCase()]);
+      if (prContext.mergeState) facts.push(["Merge state", String(prContext.mergeState).toLowerCase()]);
       add(ref, prContext.title ?? null, facts);
     }
   }
@@ -188,10 +191,13 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
     if (qualified.length !== 1) continue;
     const target = byRef.get(qualified[0]);
     if (entry.title && !target.title) target.title = entry.title;
-    for (const f of entry.facts) if (!target.facts.includes(f)) target.facts.push(f);
+    for (const [column, value] of entry.facts) if (!target.facts.has(column)) target.facts.set(column, value);
     byRef.delete(key);
   }
-  return [...byRef.values()].slice(0, 6);
+  return [...byRef.values()].slice(0, 6).map((entry) => ({
+    ...entry,
+    facts: [...entry.facts].map(([column, value]) => `${column}: ${value}`)
+  }));
 }
 
 function normalizeWords(text) {

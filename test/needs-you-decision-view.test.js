@@ -223,3 +223,25 @@ test("review: same-numbered PRs in different repositories stay separate", () => 
   assert.deepEqual(prs["acme/api#123"], ["CI: passed"]);
   assert.deepEqual(prs["acme/web#123"], ["CI: failed"]);
 });
+
+test("review: a newer PR fact replaces an older one; live PR state wins", () => {
+  const card = buildSupervisorCard({
+    id: "fq_fresh", kind: "agent-ask", status: "open", threadKey: "paseo:s.fresh",
+    title: "Merge #123?", options: ["merge", "wait"],
+    askContext: "| PR | CI |\n|---|---|\n| acme/app#123 | pending |\n\nMerge #123?",
+    contextSnapshot: { agentSummary: "| PR | CI | Threads |\n|---|---|---|\n| acme/app#123 | pending | 2 open |", recentMessages: [{ role: "user", text: "Land #123" }, { role: "assistant", text: "Merge #123?" }] }
+  }, { now: NOW, threadsByKey: new Map([["paseo:s.fresh", { key: "paseo:s.fresh", lastAgentFull: "| PR | CI |\n|---|---|\n| acme/app#123 | passed |\n\nMerge #123?" }]]) });
+  const pr = card.decisionView.status.prs.find((p) => p.ref === "acme/app#123");
+  assert.deepEqual(pr.facts, ["CI: passed", "Threads: 2 open"], "one value per column, newest first wins");
+});
+
+test("review: a grouped question never takes a member's transcript into its status", () => {
+  const memberTable = "| PR | CI |\n|---|---|\n| acme/app#900 | failed |\n\nCapacity again.";
+  const card = buildSupervisorCard({
+    id: "fq_group", kind: "deliver", status: "open", dedupeKey: "limit:group:capacity",
+    title: "2 sessions stopped at capacity", options: ["retry", "wait"],
+    threadKeys: ["paseo:s.m1", "paseo:s.m2"]
+  }, { now: NOW, threadsByKey: new Map([["paseo:s.m1", { key: "paseo:s.m1", lastAgentFull: memberTable }]]) });
+  assert.equal(card.decisionView.status.prs.length, 0);
+  assert.doesNotMatch(JSON.stringify(card.decisionView), /#900/);
+});

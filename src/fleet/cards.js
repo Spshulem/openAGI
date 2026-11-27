@@ -1163,7 +1163,10 @@ export function buildSupervisorCard(
     prRef,
     // Redacted like every other owner-facing field: transcript text never
     // reaches the decision view with credentials in it.
-    agentTexts: [snap?.agentSummary, question.askContext, thread?.lastAgentFull].filter((t) => typeof t === "string").map((t) => redactSecrets(t)),
+    // Oldest to newest (saved snapshot, ask, live message), so newer facts
+    // win. A grouped question is not about any one member: no member's
+    // transcript is used, as for its decision context.
+    agentTexts: groupedQuestion ? [] : [snap?.agentSummary, question.askContext, thread?.lastAgentFull].filter((t) => typeof t === "string").map((t) => redactSecrets(t)),
     itemName: decisionContext.itemName ?? sessionTitle
   });
   redactStringsInPlace(decisionView);
