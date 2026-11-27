@@ -3066,11 +3066,23 @@ export class FleetSupervisor {
     const check = this.deps.checkPaseoReceipt ?? checkPaseoReceipt;
     const now = this.now();
     const settled = [];
-    const candidates = this.handoffs.entries
+    // Least recently checked first, so a bounded check per scan still
+    // reaches every unconfirmed handoff in turn.
+    this._handoffSettleCheckedAt ??= new Map();
+    const checkedAt = this._handoffSettleCheckedAt;
+    const eligible = this.handoffs.entries
       .filter((entry) => entry.status === "unconfirmed" && typeof entry.message === "string" && entry.message
-        && now - (Date.parse(entry.updatedAt ?? entry.createdAt ?? "") || 0) < HANDOFF_SETTLE_MS)
-      .slice(-limit);
+        && now - (Date.parse(entry.updatedAt ?? entry.createdAt ?? "") || 0) < HANDOFF_SETTLE_MS);
+    const live = new Set(eligible.map((entry) => entry.key));
+    for (const key of [...checkedAt.keys()]) if (!live.has(key)) checkedAt.delete(key);
+    const candidates = eligible
+      .map((entry, index) => ({ entry, index }))
+      .sort((a, b) => (checkedAt.get(a.entry.key) ?? -Infinity) - (checkedAt.get(b.entry.key) ?? -Infinity) || b.index - a.index)
+      .slice(0, limit)
+      .map(({ entry }) => entry);
+    let order = 0;
     for (const entry of candidates) {
+      checkedAt.set(entry.key, now + order++ / 1000);
       const thread = this.lastThreads.get(entry.threadKey) ?? null;
       if (!thread || thread.kind !== "paseo") continue;
       const text = entry.message.trim();

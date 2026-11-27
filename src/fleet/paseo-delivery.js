@@ -849,23 +849,41 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
 export async function checkPaseoReceipt({ config, thread, store, messageHash, factory } = {}) {
   if (!config?.paseo?.enabled || thread?.kind !== "paseo" || !store?.dir || !messageHash) return { confirmed: false, detail: "not a Paseo receipt" };
   const file = path.join(store.dir, "paseo-deliveries", `${createHash("sha256").update(thread.key).digest("hex")}.json`);
+  // Serialized with sends to this chat (deliverPaseo holds the same guard):
+  // a send in progress owns the receipt, and its new one must not be
+  // overwritten with this older one.
+  if (active.has(file)) return { confirmed: false, detail: "a send to this chat is in progress" };
   let receipt;
   try { receipt = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return { confirmed: false, detail: "no receipt" }; }
   if (receipt?.messageHash !== messageHash) return { confirmed: false, detail: "a later send replaced the receipt" };
   if (!receipt.pending) return { confirmed: receipt.delivered !== false && !receipt.sendError, detail: "already settled" };
+  // Writes only while the journal still holds this receipt.
+  const saveIfCurrent = (next) => {
+    try {
+      const now = JSON.parse(fs.readFileSync(file, "utf8"));
+      if (now?.messageId !== receipt.messageId || now?.messageHash !== receipt.messageHash) return false;
+    } catch { return false; }
+    writeJsonAtomic(file, next);
+    return true;
+  };
+  active.add(file);
   try {
     return await withPaseo(config, async (client, signal) => {
       const api = await hostApi(client, thread.meta.serverId);
       const ref = api.agents.ref(thread.id);
-      const check = await readPaseoConfirmation(ref, receipt, signal, (next) => writeJsonAtomic(file, next), performance.now() + 10_000, { ownerInitiated: true });
+      const check = await readPaseoConfirmation(ref, receipt, signal, saveIfCurrent, performance.now() + 10_000, { ownerInitiated: true });
       if (check.confirmed || check.systemError) {
-        writeJsonAtomic(file, { ...receipt, pending: false, settledLate: true, ...(check.systemError ? { executionError: check.systemError } : {}) });
+        if (!saveIfCurrent({ ...receipt, pending: false, settledLate: true, ...(check.systemError ? { executionError: check.systemError } : {}) })) {
+          return { confirmed: false, detail: "a later send replaced the receipt" };
+        }
         return { confirmed: true, ...(check.systemError ? { systemError: check.systemError } : {}) };
       }
       return { confirmed: false, detail: check.sawOwn ? "in the chat; its turn has not started" : "not confirmed yet" };
     }, factory);
   } catch (error) {
     return { confirmed: false, detail: clampText(redactSecrets(String(error?.message ?? error)), 120) };
+  } finally {
+    active.delete(file);
   }
 }
 

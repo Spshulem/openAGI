@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -169,4 +170,49 @@ test("an Antigravity send whose turn starts late ends delivered once the turn st
   assert.equal(again.delivery.status, "sent");
   assert.match(again.delivery.detail, /already delivered/);
   assert.equal(chat.sent.length, 1, "sent exactly once");
+});
+
+// Review fix (#393): a check of an older receipt that races a new send to
+// the same chat never writes the old receipt over the new one.
+test("checking a receipt never overwrites a newer send's receipt", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-race-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const thread = paseoThread(antigravityAgent, "srv_bb");
+  const journal = path.join(dir, "paseo-deliveries");
+  fs.mkdirSync(journal, { recursive: true });
+  const file = path.join(journal, `${createHash("sha256").update(thread.key).digest("hex")}.json`);
+  const old = { messageId: "m-old", clientMessageId: "m-old", messageHash: "h-old", pending: true, sentAt: "2026-11-27T14:20:00Z" };
+  const newer = { messageId: "m-new", clientMessageId: "m-new", messageHash: "h-new", pending: true, sentAt: "2026-11-27T14:21:00Z" };
+  fs.writeFileSync(file, JSON.stringify(old));
+  const agent = { ...antigravityAgent, status: "running", activeTurn: { turnId: "acp:m-old" } };
+  const ref = {
+    current: () => agent,
+    timeline: {
+      refetch: async () => {
+        // A new send replaces the journal while the old receipt is being read.
+        fs.writeFileSync(file, JSON.stringify(newer));
+        return { agent, entries: [{ item: { type: "user_message", messageId: "m-old" }, seqEnd: 1 }] };
+      }
+    }
+  };
+  const client = { connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "srv_bb" }, hosts: [] }) }, agents: { ref: () => ref } };
+  const result = await checkPaseoReceipt({ config: { paseo: { enabled: true } }, thread, store: { dir }, messageHash: "h-old", factory: () => client });
+  assert.equal(result.confirmed, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), newer, "the newer receipt stands");
+});
+
+// Review fix (#393): with more unconfirmed handoffs than one scan checks,
+// each scan checks the least recently checked, so none is starved.
+test("unconfirmed handoffs are checked in turn, not always the newest few", async (t) => {
+  const sup = supervisorWith(t);
+  const checked = [];
+  sup.deps.checkPaseoReceipt = async ({ thread }) => { checked.push(thread.key); return { confirmed: false }; };
+  for (let i = 0; i < 7; i += 1) {
+    const key = `paseo:srv_bb.chat_${i}`;
+    sup.lastThreads.set(key, { key, kind: "paseo", id: `chat_${i}`, meta: { serverId: "srv_bb" } });
+    sup.handoffs.enqueue({ key: `approval-${i}`, threadKey: key, message: `step ${i}`, reason: "unconfirmed", status: "unconfirmed" });
+  }
+  await sup.settleUnconfirmedHandoffs(null, { limit: 5 });
+  await sup.settleUnconfirmedHandoffs(null, { limit: 5 });
+  assert.equal(new Set(checked).size, 7, "every handoff was checked within two scans");
 });
