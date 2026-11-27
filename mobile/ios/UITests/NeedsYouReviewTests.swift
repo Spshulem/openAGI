@@ -249,7 +249,15 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertTrue(typed.isEmpty || typed == field.placeholderValue, "The reply composer opens empty, got: \(typed)")
         XCTAssertFalse(typed.localizedCaseInsensitiveContains("bypass"))
         capture("decision-regression-thread-reply", app: app)
-        app.buttons["Done"].firstMatch.tap()
+        // Opening the composer scrolls the sheet: cancel the reply, then
+        // close the sheet from its Done button (scrolled back into view) or
+        // by swiping it down.
+        let cancel = app.buttons["Cancel"].firstMatch
+        if cancel.exists && cancel.isHittable { cancel.tap() }
+        let done = app.buttons["Done"].firstMatch
+        for _ in 0..<4 where !(done.exists && done.isHittable) { sheet.swipeDown() }
+        if done.exists && done.isHittable { done.tap() }
+        XCTAssertTrue(deck.waitForExistence(timeout: 10), "Back on the deck after closing the Thread sheet")
 
         // The other cards on the deck.
         for index in 2...4 {
