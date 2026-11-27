@@ -445,6 +445,13 @@ final class NeedsYouReviewTests: XCTestCase {
         let retry = element(app, "needs-you-question-item-retry-4")
         XCTAssertTrue(retry.exists, "A failed answer offers Retry")
         retry.tap()
+        // Retry opens the walkthrough at that question with its kept answer.
+        XCTAssertTrue(element(app, "question-walkthrough").waitForExistence(timeout: 5), "Retry opens the question")
+        let resend = element(app, "question-walkthrough-retry")
+        XCTAssertTrue(resend.waitForExistence(timeout: 5))
+        resend.tap()
+        tapButton(app, "question-walkthrough-done")
+        scrollUntilHittable(failed, in: app, attempts: 10)
         let nowDelivered = NSPredicate(format: "value == %@", "Delivered")
         expectation(for: nowDelivered, evaluatedWith: failed)
         waitForExpectations(timeout: 10)

@@ -580,35 +580,6 @@ struct QuestionItemFullRow: View {
     }
 }
 
-/// Retry one failed question from a list (outside the walkthrough).
-@MainActor
-enum QuestionItemsRetry {
-    static func answer(for item: SupervisorQuestionItem, questionID: String,
-                       store: QuestionItemsDraftStore = .shared) -> String? {
-        let drafted = store.draft(questionID: questionID, itemID: item.itemId)?.sendableAnswer
-        let kept = item.state.answer?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let answer = drafted ?? kept
-        return (answer?.isEmpty ?? true) ? nil : answer
-    }
-
-    static func run(_ item: SupervisorQuestionItem, card: SupervisorCard, client: DaemonClient,
-                    store: QuestionItemsDraftStore = .shared) async -> FleetCardActResult? {
-        guard item.state.status == "failed",
-              let answer = answer(for: item, questionID: card.questionId ?? card.id, store: store) else { return nil }
-        do {
-            let result = try await client.fleetAnswerCardItems(
-                id: card.id, answers: [SupervisorQuestionItemAnswer(itemId: item.itemId, answer: answer)])
-            let status = result.items.first { $0.itemId == item.itemId }?.state.status
-            if status == "delivered" || status == "queued" {
-                store.save(nil, questionID: card.questionId ?? card.id, itemID: item.itemId)
-            }
-            return result
-        } catch {
-            return FleetCardActResult(ok: false, status: "failed", message: "Can't reach OpenAGI. The answer is kept to retry.")
-        }
-    }
-}
-
 /// The questions section shared by the decision screen and the Thread
 /// sheet: a summary, "Review N questions", and every question in full. It
 /// owns the walkthrough sheet so it can open from inside another sheet.
@@ -659,20 +630,9 @@ struct QuestionItemsSection: View {
             drafts: drafts,
             idPrefix: "\(idPrefix)-question-item",
             onOpen: { itemID in walkthrough = QuestionWalkthroughStart(card: card, itemID: itemID) },
-            onRetry: { item in
-                guard retryingItemID == nil else { return }
-                retryingItemID = item.itemId
-                Task {
-                    let result = await QuestionItemsRetry.run(item, card: card, client: model.client)
-                    retryingItemID = nil
-                    draftsVersion += 1
-                    if let result {
-                        retryNote = .init(text: result.message ?? (result.ok ? "Sent." : "Could not deliver the answer; it is kept to retry."),
-                                          isAlert: !result.ok)
-                        resultHandler.handle(result)
-                    }
-                }
-            },
+            // Retry opens the walkthrough at that question: the kept answer
+            // is shown and resent from there, one send path for every retry.
+            onRetry: { item in walkthrough = QuestionWalkthroughStart(card: card, itemID: item.itemId) },
             retryingItemID: retryingItemID
         )
     }
