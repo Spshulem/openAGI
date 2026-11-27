@@ -216,7 +216,15 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertFalse((bypass.value as? String ?? "").contains("Recommended"))
         // Scoped to this card: a wide layout can show the same decision in a
         // second pane, which is not a duplicated row on the card.
-        XCTAssertEqual(deck.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once on the card")
+        let mergeButtons = deck.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both"))
+        if mergeButtons.count != 1 {
+            let found = mergeButtons.allElementsBoundByIndex.map { "\($0.identifier) | \($0.label) | \($0.frame)" }.joined(separator: "\n")
+            let attachment = XCTAttachment(string: "Merge both buttons on the card:\n\(found)\n\n\(deck.debugDescription)")
+            attachment.name = "decision-regression-card-merge-buttons"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        XCTAssertEqual(mergeButtons.count, 1, "Merge both is offered once on the card")
         capture("decision-regression-card", app: app)
 
         // The Thread sheet: the contract, each option once, an empty composer.

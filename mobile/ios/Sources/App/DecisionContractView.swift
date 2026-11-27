@@ -492,6 +492,11 @@ private struct DecisionOptionsBody: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     .accessibilityElement(children: .combine)
+                    // Read-only text: inside the deck card's tap-to-open body
+                    // it would otherwise be exposed as a second "Merge both"
+                    // button next to the real option button.
+                    .accessibilityRemoveTraits(.isButton)
+                    .accessibilityAddTraits(.isStaticText)
                 }
                 if !compact && choices.isEmpty {
                     Text("No options were offered. Reply below with your call.")
