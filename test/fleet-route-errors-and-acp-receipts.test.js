@@ -172,6 +172,88 @@ test("an Antigravity send whose turn starts late ends delivered once the turn st
   assert.equal(chat.sent.length, 1, "sent exactly once");
 });
 
+// 14:20-14:27 both fleet computers (buildbot3 and the MacBook) failed /state
+// and /workspaces at once; what they share is the Paseo daemon. Whatever
+// Paseo does (throws, times out, returns a partial or malformed agent), the
+// state and workspace routes answer 200 from what was last read, say which
+// source failed, and log it.
+function paseoFactory({ hostsThrow = null, agents = null } = {}) {
+  const ok = { id: "agent_ok", title: "Recorder", status: "idle", provider: "claude", updatedAt: "2026-11-27T14:10:00Z", cwd: "/work/recorder", workspaceId: "ws_rec" };
+  const list = agents ?? [ok];
+  const api = {
+    agents: {
+      list: async () => ({ entries: list.map((agent) => ({ agent })), pageInfo: { hasMore: false } }),
+      ref: (id) => {
+        const agent = list.find((a) => a?.id === id) ?? { id, status: "idle" };
+        return { current: () => agent, refresh: async () => ({ agent }), timeline: { refetch: async () => ({ agent, entries: [] }) } };
+      }
+    }
+  };
+  return () => ({
+    ...api,
+    connect: async () => {},
+    close: async () => {},
+    hosts: {
+      list: async () => { if (hostsThrow) throw hostsThrow; return { self: { serverId: "srv_bb", label: "buildbot3" }, hosts: [] }; },
+      client: async () => api
+    }
+  });
+}
+
+function scanningSupervisor(t, factory) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-paseo-down-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sup = new FleetSupervisor({
+    dataDir: dir, runtime: { events: { emit() {} } }, forceMode: "observe",
+    config: { enabled: true, mode: "observe", paseo: { enabled: true, only: true, timeoutMs: 2000 }, review: { enabled: false } },
+    deps: {
+      paseoFactory: factory, judge: null, decisionsGate: null,
+      run: async () => ({ code: 1, stdout: "", stderr: "no commands in tests" }),
+      executor: { async deliver() { throw new Error("must not send"); } },
+      notifier: { notifyQuestion: async () => null, notify: async () => null }
+    }
+  });
+  return sup;
+}
+
+const malformedAgents = [
+  { ...antigravityAgent, status: "running", activeTurn: { turnId: "acp:45915736-0d13-4cf4-8d4f-b69110314095" } },
+  { id: "agent_weird", title: { text: "not a string" }, status: 42, provider: null, updatedAt: "not a date", labels: "x",
+    pendingPermissions: { not: "an array" }, activeTurn: "acp:string", persistence: { metadata: { asyncQuestions: [{ question: 5, options: "x" }, null] } },
+    runtimeInfo: { sessionId: "plugin:{not json" } },
+  null,
+  { status: "idle" }
+];
+
+for (const [name, factory] of Object.entries({
+  "Paseo throws": paseoFactory({ hostsThrow: new Error("Paseo request timed out") }),
+  "Paseo returns malformed agents": paseoFactory({ agents: malformedAgents })
+})) {
+  test(`${name} during a scan, /state and /workspaces: 200 from the last read, the failed source named`, async (t) => {
+    const lines = captureErrors(t);
+    // A good scan first: what the routes fall back to.
+    const sup = scanningSupervisor(t, paseoFactory());
+    await sup.tick("first");
+    assert.ok(sup.lastThreads.has("paseo:srv_bb.agent_ok"));
+    sup.deps.paseoFactory = factory;
+    sup.paseoSource = null;
+    await sup.tick("second");
+    const route = createFleetRoute({ supervisor: sup });
+    const state = await get(route, "/fleet/api/state");
+    assert.equal(state.status, 200, JSON.stringify(state.body.error ?? ""));
+    assert.ok(sup.lastThreads.has("paseo:srv_bb.agent_ok") || name.includes("malformed"), "the last read stands when Paseo fails");
+    const workspaces = await route("GET", "/fleet/api/workspaces", new URL("http://localhost/fleet/api/workspaces?limit=30"), async () => ({}), {});
+    assert.equal(workspaces.status, 200, JSON.stringify(workspaces.body.error ?? ""));
+    assert.ok(Array.isArray(workspaces.body.workspaces));
+    if (name === "Paseo throws") {
+      assert.match(state.body.snapshot.sourceErrors?.paseo ?? "", /timed out/, "the state names the failed source");
+      assert.match(workspaces.body.sourceErrors?.paseo ?? "", /timed out/);
+      const logged = lines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((e) => e?.event === "fleet.source_error");
+      assert.ok(logged.some((e) => e.source === "paseo" && /timed out/.test(e.message)), "logged");
+    }
+  });
+}
+
 // Review fix (#393): a check of an older receipt that races a new send to
 // the same chat never writes the old receipt over the new one.
 test("checking a receipt never overwrites a newer send's receipt", async (t) => {

@@ -1388,6 +1388,23 @@ export class FleetSupervisor {
       ...(degraded.length ? { degraded: degraded.slice(0, 20) } : {}) };
   }
 
+  // A source (Paseo, git, GitHub) that failed a read: the last read stands
+  // and the failure is logged once per distinct error every 10 minutes
+  // under fleet.source_error, so "check the daemon log" finds it.
+  noteSourceError(source, error, during = "scan") {
+    const message = clampText(redactSecrets(String(error?.message ?? error ?? "unknown error")), 200);
+    const signature = `${source}:${during}:${message}`;
+    this._sourceErrorLogged ??= new Map();
+    const at = Date.now();
+    if (at - (this._sourceErrorLogged.get(signature) ?? 0) < 10 * MIN) return;
+    this._sourceErrorLogged.set(signature, at);
+    if (this._sourceErrorLogged.size > 200) this._sourceErrorLogged.delete(this._sourceErrorLogged.keys().next().value);
+    try {
+      console.error(JSON.stringify({ event: "fleet.source_error", source, during, message,
+        stack: clampText(redactSecrets(String(error?.stack ?? "")), 1500) }));
+    } catch { /* logging never blocks */ }
+  }
+
   // A part of the state that could not be built: logged once per distinct
   // failure every 10 minutes, with its stack (redacted), under a stable
   // event name; the state says which part, without internals.
@@ -5298,6 +5315,7 @@ export class FleetSupervisor {
     const guard = (name, fn, fallback) => withTimeout(Promise.resolve().then(fn), SOURCE_TIMEOUT_MS, name)
       .catch((error) => {
         sourceErrors[name] = clampText(error?.message ?? String(error), 200);
+        this.noteSourceError(name, error, "scan");
         return fallback;
       });
 
