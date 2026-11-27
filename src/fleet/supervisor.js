@@ -6,6 +6,7 @@
 // Needs-you questions are raised in every mode. The constructor has no side
 // effects; hosted-interface calls start() on listen and stop() on close.
 
+import { composeItemsReply, withItemState, questionItemsFor, GROUP_OPTION_RE } from "./decision-items.js";
 import path from "node:path";
 import fs from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -324,6 +325,13 @@ function notReadyBlocker(pr) {
 // or answered it itself.
 // prMissing: GitHub answered and has no such PR. notReady: a blocker this
 // scan read on the PR (notReadyBlocker).
+// An ask carrying several questions (saved or parsed from the agent's text).
+function isMultiQuestionAsk(question) {
+  if (Array.isArray(question?.meta?.questionItemDefs) && question.meta.questionItemDefs.length >= 2) return true;
+  if (!["agent-ask", "stuck"].includes(String(question?.kind ?? ""))) return false;
+  return questionItemsFor([question.contextSnapshot?.agentSummary, question.askContext, question.body]).length >= 2;
+}
+
 export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false, notReady = null } = {}) {
   const effectiveAskedAt = Date.parse(
     question.agentAskedAt
@@ -359,6 +367,11 @@ export function settledAsk(question, { thread = null, pr = null, prMissing = fal
   if (question.kind === "ready" && notReady) return `PR no longer ready: ${notReady}`;
   if (question.kind !== "agent-ask") return null;
   if (muted) return "muted by owner";
+  // A multi-question ask the owner has started answering stays open until
+  // every question is delivered: the agent's reply to some answers is not
+  // the agent moving on from the rest.
+  const itemAnswers = question.meta?.itemAnswers;
+  if (itemAnswers && typeof itemAnswers === "object" && Object.keys(itemAnswers).length > 0) return null;
   if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
   const spokeAt = Date.parse(agentReply(thread).at ?? "");
   if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
@@ -2360,6 +2373,11 @@ export class FleetSupervisor {
     if (!question || question.status !== "open") return null;
     if (question.kind === "self-fix" && (question.options ?? []).includes(answer)) return this.selfFixHub.answer(id, answer);
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
+    // A blanket answer ("Approve recommended choices", "Answer all
+    // questions") is never sent from any surface: card, chat tool or API.
+    // Only on an ask carrying several questions: a native prompt's own
+    // "Approve all" button on a single-question card stays a normal answer.
+    if (GROUP_OPTION_RE.test(String(answer ?? "")) && isMultiQuestionAsk(question)) return null;
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
@@ -2675,6 +2693,106 @@ export class FleetSupervisor {
   // The owner's own words to the agent that asked ("Owner says: ..."), for
   // a question canReplyTo allows. Sent or kept for when the Mac can type
   // closes it; blocked or failed leaves it open. null: closed, or no reply.
+  // Partial answers to an ask with several questions, sent to the agent as
+  // one plain-text reply. Each item records queued / delivered / failed;
+  // skipped and unanswered items stay open, and the question closes only
+  // when every item has been delivered. Owner precedents are not recorded
+  // from these answers, and nothing here merges, deploys or approves a
+  // permission: the agent is told so in the reply.
+  async answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
+    // One submission per ask at a time: a second device's concurrent send
+    // waits its turn instead of passing the same state check.
+    if (this.answering.has(question.id)) {
+      return { ok: false, kind: "answer_items", status: "busy", detail: "Answers for this card are already being sent; try again in a moment." };
+    }
+    this.answering.add(question.id);
+    try {
+      return await this._answerQuestionItems(question, card, { items, skip, deadlineAt });
+    } finally {
+      this.answering.delete(question.id);
+    }
+  }
+
+  async _answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
+    const all = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    // Only items still open (unanswered, skipped, failed) can be answered or
+    // skipped: a stale device can't resend or downgrade a delivered or
+    // queued item.
+    const saved = this.store.question(question.id)?.meta?.itemAnswers ?? {};
+    const isOpen = (itemId) => !["delivered", "queued"].includes(saved?.[itemId]?.status);
+    const answers = (Array.isArray(items) ? items : []).filter((it) => it && typeof it.answer === "string" && it.answer.trim() && isOpen(it.itemId));
+    const skipped = (Array.isArray(skip) ? skip : []).filter((itemId) => isOpen(itemId));
+    const composed = composeItemsReply(all, { answers, skipped });
+    if (!composed) return { ok: false, kind: "answer_items", status: "blocked", detail: "Answer or skip at least one question." };
+    const skipUpdates = Object.fromEntries(composed.skipped.map((itemId) => [itemId, { status: "skipped" }]));
+    if (!composed.answered.length) {
+      this.store.recordQuestionItemAnswers(question.id, skipUpdates, { defs: all.map(({ state: _state, ...item }) => item) });
+      this.emitFleet("card-items-skipped");
+      return { ok: true, kind: "answer_items", status: "skipped", detail: "Skipped questions stay open.", items: this.questionItemStates(question.id, all) };
+    }
+    const targetKey = card?.threadKey ?? question.threadKey ?? null;
+    if (!targetKey) return { ok: false, kind: "answer_items", status: "blocked", detail: "No coding session is linked to this card." };
+    // Linked to the question and its items, so a queued reply settles them
+    // when it is sent or fails (never assumed delivered).
+    const sent = await this.sendOwnerMessage(targetKey, composed.text, { deadlineAt, questionId: question.id, questionAnswer: composed.text, questionItemIds: composed.answered });
+    const status = sent?.delivery?.status === "sent" ? "delivered" : sent?.delivery?.status === "queued" ? "queued" : "failed";
+    const answerById = new Map(answers.map((it) => [it.itemId, it.answer.trim()]));
+    const updates = { ...skipUpdates };
+    for (const itemId of composed.answered) {
+      updates[itemId] = { status, answer: answerById.get(itemId) ?? null, detail: sent?.delivery?.detail ?? null };
+    }
+    this.store.recordQuestionItemAnswers(question.id, updates, { defs: all.map(({ state: _state, ...item }) => item) });
+    if (status !== "failed") this.recordOwnerActivity();
+    this.closeQuestionIfAllItemsDelivered(question.id, composed.text);
+    const states = this.questionItemStates(question.id, all);
+    this.emitFleet("card-items-answered");
+    return {
+      ok: status !== "failed",
+      kind: "answer_items",
+      status,
+      detail: status === "failed"
+        ? (sent?.delivery?.detail ?? "Could not deliver the answers; they are kept to retry.")
+        : `${composed.answered.length} answer${composed.answered.length === 1 ? "" : "s"} ${status === "queued" ? "queued for" : "delivered to"} the agent.`,
+      delivery: sent?.delivery ?? null,
+      items: states
+    };
+  }
+
+  // A queued item reply was sent (delivered) or not (failed, answer kept).
+  settleQuestionItems(link, status, detail = null) {
+    const question = this.store.question(link?.questionId);
+    if (!question || question.status !== "open") return;
+    const saved = question.meta?.itemAnswers ?? {};
+    const updates = {};
+    for (const itemId of link.itemIds ?? []) {
+      if (saved[itemId]?.status !== "queued") continue;
+      updates[itemId] = { status, answer: saved[itemId].answer ?? null, detail };
+    }
+    if (!Object.keys(updates).length) return;
+    this.store.recordQuestionItemAnswers(question.id, updates);
+    this.closeQuestionIfAllItemsDelivered(question.id, link.questionAnswer ?? null);
+    this.emitFleet(status === "delivered" ? "card-items-delivered" : "card-items-undelivered");
+  }
+
+  // Closes a multi-question ask only once every item's answer was delivered
+  // (not merely queued). Marked so it never becomes an owner precedent.
+  closeQuestionIfAllItemsDelivered(questionId, answerText) {
+    const question = this.store.question(questionId);
+    if (!question || question.status !== "open") return false;
+    const card = (this.getState().cards ?? []).find((c) => c.questionId === questionId) ?? null;
+    const items = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    if (items.length < 2 || !items.every((it) => it.state?.status === "delivered")) return false;
+    this.store.markQuestionNoPrecedent(questionId);
+    this.store.answerQuestion(questionId, answerText || `${items.length} questions answered`);
+    this.resolveOutreach(question, "reply", "acted");
+    return true;
+  }
+
+  questionItemStates(questionId, items) {
+    const saved = this.store.question(questionId)?.meta?.itemAnswers ?? {};
+    return withItemState(items.map(({ state: _state, ...item }) => item), saved).items;
+  }
+
   async replyQuestion(id, reply, { deadlineAt = null } = {}) {
     const startedAt = Date.now();
     const text = String(reply ?? "").trim();
@@ -2782,7 +2900,7 @@ export class FleetSupervisor {
     return await this._deliverOwnerMessage(threadKey, text, { ...opts, key });
   }
 
-  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false, questionId = null, questionAnswer = null } = {}) {
+  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false, questionId = null, questionAnswer = null, questionItemIds = null } = {}) {
     const startedAt = Date.now();
     // Capture the approval/send-start boundary before awaiting delivery so any
     // owner cancellation written while the initial attempt is in flight makes
@@ -2900,7 +3018,7 @@ export class FleetSupervisor {
         ownerChoice,
         source: "owner-message",
         ...(key ? { idempotencyKey: key } : {}),
-        ...(questionId ? { questionId, questionAnswer } : {})
+        ...(questionId ? { questionId, questionAnswer, ...(questionItemIds ? { questionItemIds } : {}) } : {})
       });
       if (!queued) {
         const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
@@ -3268,6 +3386,12 @@ export class FleetSupervisor {
     // each linked card comes back.
     const reopened = [];
     for (const link of questionLinksOf(entry)) {
+      // Item answers of a multi-question ask: those items fail (answers kept
+      // to retry); the ask itself was never closed.
+      if (Array.isArray(link.itemIds) && link.itemIds.length) {
+        this.settleQuestionItems(link, "failed", note);
+        continue;
+      }
       const card = this.store.reopenUndeliveredReply(link.questionId, { answer: link.questionAnswer ?? null, threadKey: entry.threadKey ?? null, note });
       if (!card) continue;
       reopened.push(card);
@@ -3384,6 +3508,9 @@ export class FleetSupervisor {
         }
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
+        for (const link of questionLinksOf(entry)) {
+          if (Array.isArray(link.itemIds) && link.itemIds.length) this.settleQuestionItems(link, "delivered", delivery?.detail ?? null);
+        }
         results.push({ id: entry.id, threadKey: effectiveKey, ...(effectiveKey !== entry.threadKey ? { redirectedFrom: entry.threadKey } : {}), status: "sent", delivery });
       } else if (
         delivery?.unconfirmed === true
@@ -4771,7 +4898,7 @@ export class FleetSupervisor {
     return { ...result, ...(delivery ? { delivery } : {}), ...(outcome ? { outcome } : {}) };
   }
 
-  async _actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
+  async _actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null, items = null, skip = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
 
@@ -4818,6 +4945,24 @@ export class FleetSupervisor {
     // answer reaches it. Only the owner's own admin-merge route does.
     if (effectiveOp === "admin_merge") {
       return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    }
+
+    // An ask with several questions is answered question by question.
+    const questionItems = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    if (questionItems.length >= 2) {
+      if (effectiveOp === "review_items") {
+        return { ok: true, kind: "review_items", status: "walkthrough", items: questionItems, summary: card.questionItemsSummary ?? null };
+      }
+      // A blanket answer ("Approve recommended choices", "Answer all
+      // questions") is never sent or turned into any action.
+      if (effectiveOp === "answer" && (GROUP_OPTION_RE.test(String(effectiveValue ?? "")) || !effectiveValue)) {
+        return { ok: false, kind: "answer", status: "blocked", detail: "Answer each question on its own; a blanket answer is not sent." };
+      }
+      if (effectiveOp === "answer_items") {
+        return this.answerQuestionItems(question, card, { items, skip, deadlineAt });
+      }
+    } else if (effectiveOp === "answer_items" || effectiveOp === "review_items") {
+      return { ok: false, kind: effectiveOp, status: "blocked", detail: "This card has a single question." };
     }
 
     if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {

@@ -4,6 +4,7 @@
 // Ordinary writes retain disk errors in lastWriteError. Mode changes throw
 // and roll back on failure: an unsaved Auto choice must never be acknowledged.
 
+import { ownerAnswerText } from "./decision-items.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -588,6 +589,15 @@ export class FleetStore {
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
+      // A rescan refreshes scan metadata but never the owner's progress on a
+      // multi-question ask.
+      if (existing.meta?.itemAnswers) {
+        fields.meta = {
+          ...(fields.meta ?? {}),
+          itemAnswers: existing.meta.itemAnswers,
+          ...(existing.meta.questionItemDefs ? { questionItemDefs: existing.meta.questionItemDefs } : {})
+        };
+      }
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
         Object.assign(existing, fields, { updatedAt: iso(now) });
@@ -871,6 +881,44 @@ export class FleetStore {
 
   // Records how the notifier reached the owner so a later tick neither
   // re-posts the outreach item nor re-pushes the phone.
+  // Per-question answer state for an ask with several questions:
+  // { itemId: { status, answer, at, detail } }. Unanswered items stay open.
+  recordQuestionItemAnswers(id, updates = {}, { now = this.now(), defs = null } = {}) {
+    const question = this._findQuestion(id);
+    if (!question || question.status !== "open") return null;
+    const at = iso(toMs(now, this.now()));
+    const meta = question.meta && typeof question.meta === "object" ? question.meta : {};
+    const current = meta.itemAnswers && typeof meta.itemAnswers === "object" ? { ...meta.itemAnswers } : {};
+    for (const [itemId, update] of Object.entries(updates ?? {})) {
+      if (typeof itemId !== "string" || !itemId || itemId.length > 80 || !update || typeof update !== "object") continue;
+      current[itemId] = {
+        status: String(update.status ?? "unanswered").slice(0, 20),
+        // As typed (line breaks and indentation kept), so a retry sends the
+        // same answer.
+        answer: typeof update.answer === "string" ? ownerAnswerText(update.answer, 1200) : (current[itemId]?.answer ?? null),
+        at,
+        detail: typeof update.detail === "string" ? clampText(update.detail, 240) : null
+      };
+    }
+    // The questions themselves are kept with the ask once answering starts:
+    // the agent's full message may later be gone from the excerpts.
+    const keepDefs = Array.isArray(meta.questionItemDefs) && meta.questionItemDefs.length >= 2
+      ? meta.questionItemDefs
+      : (Array.isArray(defs) && defs.length >= 2 ? defs.slice(0, 25) : null);
+    question.meta = { ...meta, itemAnswers: current, ...(keepDefs ? { questionItemDefs: keepDefs } : {}) };
+    this._save();
+    return { ...question };
+  }
+
+  // Answers composed for a multi-question ask are never owner precedents.
+  markQuestionNoPrecedent(id) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.noPrecedent = true;
+    this._save();
+    return { ...question };
+  }
+
   markQuestionNotified(id, { outreachId, pushedAt } = {}) {
     const question = this._findQuestion(id);
     if (!question) return null;
@@ -1830,7 +1878,10 @@ export class FleetStore {
     return resolvedKeys;
   }
 
-  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null } = {}) {
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null, questionItemIds = null } = {}) {
+    // Items of a multi-question ask this message answers: settled to
+    // delivered or failed when the queued message is (see settleQuestionItems).
+    const itemIds = Array.isArray(questionItemIds) && questionItemIds.length ? questionItemIds.map((i) => String(i).slice(0, 80)).slice(0, 25) : null;
     const cleanKey = String(threadKey ?? "").trim();
     const cleanMsg = String(message ?? "").trim();
     // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
@@ -1860,7 +1911,7 @@ export class FleetStore {
       // The same words to the same chat from another card: one message, but
       // every card it answers stays linked, so each comes back if it fails.
       if (questionId) {
-        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax), ...(itemIds ? { itemIds } : {}) };
         const links = questionLinksOf(existing);
         if (!links.some((l) => l.questionId === link.questionId)) {
           existing.questionLinks = [...links, link].slice(-20);
@@ -1888,7 +1939,7 @@ export class FleetStore {
       // The owner's card this message answers: if it never reaches the agent,
       // the card is put back instead of staying closed as answered.
       ...(questionId ? (() => {
-        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax), ...(itemIds ? { itemIds } : {}) };
         return { questionId: link.questionId, questionAnswer: link.questionAnswer, questionLinks: [link] };
       })() : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),

@@ -320,4 +320,167 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertFalse(element(app, "decision-section-goal").exists, "Older cards keep their previous rendering")
         capture("decision-legacy-detail", app: app)
     }
+
+    // MARK: - Asks with several questions (`--ui-question-items-fixture`)
+
+    /// Group answers that once hid ten separate decisions: never a button
+    /// or a label anywhere on these screens.
+    private func assertNoGroupAnswer(_ app: XCUIApplication, _ screen: String) {
+        for phrase in ["Approve recommended", "Answer all", "Accept recommendations", "Approve all"] {
+            XCTAssertFalse(labelled(app, phrase).exists, "\(screen): no \"\(phrase)\"")
+        }
+    }
+
+    private func value(_ element: XCUIElement) -> String { element.value as? String ?? "" }
+
+    /// The release ask with ten questions: the card lists each question with
+    /// its state and offers "Review 10 questions"; the walkthrough shows one
+    /// question at a time, keeps picks as drafts, and sends only what was
+    /// answered or skipped. The partially answered ask shows Delivered,
+    /// Failed (answer kept, Retry) and Skipped; a single question keeps its
+    /// options; nothing anywhere approves the recommendations in bulk.
+    func testQuestionWalkthroughAnswersTwoSkipsOneAndShowsItemStates() {
+        let app = launch(["--ui-question-items-fixture"])
+        tab(app, "Chat")
+        openSupervisorConversation(app)
+
+        // The deck card.
+        let deck = element(app, "supervisor-card-deck")
+        XCTAssertTrue(deck.waitForExistence(timeout: 10), "The decision deck is shown")
+        let review = element(app, "supervisor-card-review-items-fq_release")
+        for _ in 0..<4 where !review.waitForExistence(timeout: 2) {
+            let next = app.buttons["Next decision"].firstMatch
+            guard next.exists, next.isHittable else { break }
+            next.tap()
+        }
+        XCTAssertTrue(review.waitForExistence(timeout: 5), "The ten-question card offers a walkthrough")
+        XCTAssertEqual(review.label, "Review 10 questions")
+        XCTAssertTrue(element(app, "question-items-compact").exists, "Each question is listed on the card")
+        XCTAssertTrue(element(app, "question-item-row-1").exists)
+        XCTAssertEqual(value(element(app, "question-item-row-1")), "Not answered")
+        XCTAssertTrue(element(app, "supervisor-card-secondary-fq_release").exists, "Later is offered")
+        assertNoGroupAnswer(app, "card")
+        capture("question-items-card", app: app)
+
+        // The walkthrough: one question per page.
+        review.tap()
+        XCTAssertTrue(element(app, "question-walkthrough").waitForExistence(timeout: 10), "Review opens the walkthrough")
+        let progress = element(app, "question-walkthrough-progress")
+        XCTAssertTrue(progress.waitForExistence(timeout: 5))
+        XCTAssertEqual(progress.label, "1 of 10")
+        let send = element(app, "question-walkthrough-send")
+        XCTAssertFalse(send.isEnabled, "Nothing to send before an answer")
+
+        // 1: typed answer.
+        let field = element(app, "question-free-text")
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        field.typeText("Alex and Sam")
+        tapButton(app, "question-walkthrough-next")
+        XCTAssertEqual(progress.label, "2 of 10")
+
+        // 2: skipped (stays open).
+        tapButton(app, "question-walkthrough-skip")
+        XCTAssertEqual(progress.label, "3 of 10")
+
+        // 3: a choice; the recommendation is text and nothing is preselected.
+        XCTAssertTrue(element(app, "question-walkthrough-recommendation").exists, "The agent's recommendation is shown")
+        let choice = element(app, "question-choice-1")
+        XCTAssertTrue(choice.waitForExistence(timeout: 5))
+        XCTAssertEqual(choice.label, "Separate documents")
+        XCTAssertFalse(value(choice).contains("Selected"), "A recommendation never preselects a choice")
+        XCTAssertFalse(value(element(app, "question-choice-0")).contains("Selected"))
+        choice.tap()
+        XCTAssertTrue(value(choice).contains("Selected"), "A tapped choice is the draft")
+        assertNoGroupAnswer(app, "walkthrough")
+        capture("question-walkthrough-page", app: app)
+
+        XCTAssertEqual(send.label, "Send 2 answers, skip 1")
+        send.tap()
+        let state = element(app, "question-walkthrough-state")
+        let delivered = NSPredicate(format: "label == %@", "Delivered")
+        expectation(for: delivered, evaluatedWith: state)
+        waitForExpectations(timeout: 10)
+        XCTAssertTrue(element(app, "question-walkthrough-sent").exists, "A delivered answer is read-only")
+        XCTAssertFalse(element(app, "question-choice-1").exists, "No choices on a delivered question")
+        capture("question-walkthrough-sent", app: app)
+        tapButton(app, "question-walkthrough-back")
+        tapButton(app, "question-walkthrough-back")
+        XCTAssertEqual(state.label, "Sent, waiting to be delivered", "A typed answer waits for the Mac")
+        tapButton(app, "question-walkthrough-done")
+
+        // Back on the card: each item's state, the rest still open.
+        XCTAssertTrue(review.waitForExistence(timeout: 10))
+        let reviewEight = NSPredicate(format: "label == %@", "Review 8 questions")
+        expectation(for: reviewEight, evaluatedWith: review)
+        waitForExpectations(timeout: 10)
+        XCTAssertEqual(value(element(app, "question-item-row-1")), "Queued")
+        XCTAssertEqual(value(element(app, "question-item-row-2")), "Skipped")
+        XCTAssertEqual(value(element(app, "question-item-row-3")), "Delivered")
+        XCTAssertEqual(value(element(app, "question-item-row-4")), "Not answered")
+        assertNoGroupAnswer(app, "card after sending")
+        capture("question-items-card-after-send", app: app)
+
+        // The partially answered ask on the decision screen.
+        tapButton(app, "supervisor-channel-needs-you")
+        tapButton(app, "needs-you-row-fq_release_partial")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        let detailReview = element(app, "needs-you-review-items")
+        scrollUntilHittable(detailReview, in: app, attempts: 8)
+        XCTAssertEqual(detailReview.label, "Review 9 questions")
+        XCTAssertFalse(element(app, "needs-you-action-0").exists, "No group answer buttons")
+        // The list is lazy: rows are checked top to bottom as they scroll in.
+        let skippedRow = element(app, "needs-you-question-item-full-1")
+        scrollUntilHittable(skippedRow, in: app, attempts: 10)
+        XCTAssertEqual(value(skippedRow), "Skipped")
+        let deliveredRow = element(app, "needs-you-question-item-full-3")
+        scrollUntilHittable(deliveredRow, in: app, attempts: 10)
+        XCTAssertEqual(value(deliveredRow), "Delivered")
+        let failed = element(app, "needs-you-question-item-full-4")
+        scrollUntilHittable(failed, in: app, attempts: 10)
+        XCTAssertEqual(value(failed), "Failed")
+        XCTAssertTrue(failed.label.contains("Yes"), "The failed answer is kept")
+        assertNoGroupAnswer(app, "decision screen")
+        capture("question-items-partial-detail", app: app)
+        let retry = element(app, "needs-you-question-item-retry-4")
+        XCTAssertTrue(retry.exists, "A failed answer offers Retry")
+        retry.tap()
+        // Retry opens the walkthrough at that question with its kept answer.
+        XCTAssertTrue(element(app, "question-walkthrough").waitForExistence(timeout: 5), "Retry opens the question")
+        let resend = element(app, "question-walkthrough-retry")
+        XCTAssertTrue(resend.waitForExistence(timeout: 5))
+        resend.tap()
+        tapButton(app, "question-walkthrough-done")
+        scrollUntilHittable(failed, in: app, attempts: 10)
+        let nowDelivered = NSPredicate(format: "value == %@", "Delivered")
+        expectation(for: nowDelivered, evaluatedWith: failed)
+        waitForExpectations(timeout: 10)
+        capture("question-items-partial-detail-retried", app: app)
+        backFromDecision(app)
+
+        // A single question keeps the decision contract and its options.
+        tapButton(app, "needs-you-row-fq_single")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        let deploy = element(app, "needs-you-action-0")
+        scrollUntilHittable(deploy, in: app, attempts: 8)
+        XCTAssertEqual(deploy.label, "Deploy")
+        XCTAssertFalse(element(app, "needs-you-review-items").exists, "No walkthrough for a single question")
+        backFromDecision(app)
+
+        // A completed FYI carrying items is an update, never a walkthrough.
+        let updates = element(app, "needs-you-updates")
+        for _ in 0..<8 where !(updates.exists && updates.isHittable) { app.swipeUp() }
+        if updates.exists && updates.isHittable {
+            updates.tap()
+            let fyi = element(app, "needs-you-row-fq_fyi_done")
+            for _ in 0..<4 where !fyi.exists { app.swipeUp() }
+            XCTAssertTrue(fyi.waitForExistence(timeout: 5), "The completion sits under Updates")
+            fyi.tap()
+            XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+            XCTAssertFalse(element(app, "needs-you-review-items").exists, "A completion never offers the walkthrough")
+            XCTAssertFalse(element(app, "question-items-compact").exists)
+        } else {
+            XCTFail("Updates toggle reachable")
+        }
+    }
 }

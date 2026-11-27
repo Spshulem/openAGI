@@ -98,6 +98,9 @@ struct SupervisorView: View {
     }
 
     @State private var openThread: ThreadPresentation?
+    /// "Review N questions" reached the shared action path: the walkthrough
+    /// opens here instead of the action being sent.
+    @State private var reviewItemsStart: QuestionWalkthroughStart?
     @State private var activeSheet: SupervisorSheet?
     @State private var budgetStatus: BudgetStatus?
     @State private var budgetBusy = false
@@ -564,6 +567,22 @@ struct SupervisorView: View {
             let chatTitle = req.card.sessionTitle ?? req.card.headline
             Text("Archiving hides “\(chatTitle)” from your active Paseo coding sessions. To only clear this notification message, choose Just Dismiss Notification.")
         }
+        .sheet(item: $reviewItemsStart) { start in
+            QuestionWalkthroughSheet(card: start.card, startItemID: start.itemID)
+        }
+        // Item answers sent from any walkthrough or list come back here, so
+        // the deck, the decision screen and the Thread sheet update at once.
+        .environment(\.questionItemsResultHandler, QuestionItemsResultHandler { result in
+            acceptQuestionItemsResult(result)
+        })
+    }
+
+    private func acceptQuestionItemsResult(_ result: FleetCardActResult) {
+        if let fresh = result.state {
+            accept(nextSequence(), fresh)
+        } else {
+            Task { await refresh() }
+        }
     }
 
     @ViewBuilder
@@ -702,6 +721,11 @@ struct SupervisorView: View {
     private func handleOrConfirmCardAction(_ card: SupervisorCard, action: SupervisorCardAction) {
         let lowerOp = action.op.lowercased()
         let lowerVal = (action.value ?? "").lowercased()
+        if DecisionContract.walkthroughOps.contains(lowerOp) {
+            // Opens the questions one at a time; nothing is sent.
+            if card.hasQuestionWalkthrough { reviewItemsStart = QuestionWalkthroughStart(card: card) }
+            return
+        }
         if lowerOp == "open_chat" || lowerVal == "open thread" {
             openContext(for: card)
             return
@@ -1864,6 +1888,9 @@ struct SupervisorView: View {
     @discardableResult
     private func act(_ card: SupervisorCard, action: SupervisorCardAction, confirmed: Bool = false, images: [ChatAttachment] = []) async -> Bool {
         guard !inFlightCardIDs.contains(card.id) else { return false }
+        // "Review N questions" is a local walkthrough, never a POST; item
+        // answers go through fleetAnswerCardItems.
+        guard !DecisionContract.walkthroughOps.contains(action.op.lowercased()) else { return false }
         inFlightCardIDs.insert(card.id)
         withAnimation(.spring(duration: 0.22)) {
             optimisticallyDismissedCardIDs.insert(card.id)
@@ -2046,6 +2073,8 @@ private struct SupervisorCardDeckView: View {
 
     @State private var revealedPlanCardIDs: Set<String> = []
     @State private var detailsContentHeight: CGFloat = 0
+    @State private var walkthrough: QuestionWalkthroughStart?
+    @State private var draftsVersion = 0
 
     private var card: SupervisorCard { cards[index] }
     private var isBusy: Bool { busyCardID == card.id }
@@ -2231,7 +2260,7 @@ private struct SupervisorCardDeckView: View {
             // An option is offered once, as its button: quick replies that
             // copy an option, or carry bypass text, are dropped.
             let quickReplies = DecisionContract.quickReplies(for: card)
-            if card.canReply, !quickReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
+            if card.canReply, !quickReplies.isEmpty, !card.hasQuestionWalkthrough, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         ForEach(Array(quickReplies.prefix(3).enumerated()), id: \.offset) { _, quickReply in
@@ -2279,6 +2308,9 @@ private struct SupervisorCardDeckView: View {
         )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("supervisor-card-deck")
+        .sheet(item: $walkthrough, onDismiss: { draftsVersion += 1 }) { start in
+            QuestionWalkthroughSheet(card: start.card, startItemID: start.itemID)
+        }
     }
 
     private func headlineRow(showsChevron: Bool) -> some View {
@@ -2349,7 +2381,15 @@ private struct SupervisorCardDeckView: View {
                     }
                 }
             }
-            if let decisionView = card.decisionView {
+            if card.hasQuestionWalkthrough {
+                // Each question on its own line with its state; answered in
+                // the walkthrough, never through a group option.
+                let _ = draftsVersion
+                QuestionItemsCompactList(
+                    card: card,
+                    drafts: QuestionItemsDraftStore.shared.drafts(questionID: card.questionId ?? card.id, items: card.questionItems)
+                )
+            } else if let decisionView = card.decisionView {
                 DecisionContractView(view: decisionView, choices: DecisionContract.choices(for: card), style: .compact)
             } else {
                 legacyBriefContent
@@ -2357,7 +2397,7 @@ private struct SupervisorCardDeckView: View {
             if revealedPlanCardIDs.contains(card.id), let plan = card.plan {
                 planReveal(plan)
             }
-            if card.decisionView == nil {
+            if card.decisionView == nil && !card.hasQuestionWalkthrough {
                 legacyRecommendation
             }
         }
@@ -2473,10 +2513,42 @@ private struct SupervisorCardDeckView: View {
     @ViewBuilder
     private var cardActions: some View {
         let isCompletionOrOpenCard = card.kind == "completed" || card.primaryAction?.op == "open_chat"
-        if DecisionContract.ownsActions(card) && !isCompletionOrOpenCard {
+        if card.hasQuestionWalkthrough {
+            questionItemsCardActions
+        } else if DecisionContract.ownsActions(card) && !isCompletionOrOpenCard {
             contractCardActions
         } else {
             legacyCardActions
+        }
+    }
+
+    /// An ask with several questions: "Review N questions" opens the
+    /// walkthrough (it sends nothing), then Details and Later. No group
+    /// answer, and no button that applies the recommendations.
+    private var questionItemsCardActions: some View {
+        let later = card.secondaryAction.flatMap { ["defer", "dismiss"].contains($0.op.lowercased()) && !$0.label.isEmpty ? $0 : nil }
+            ?? SupervisorCardAction(op: "defer", label: "Later", value: "dismiss")
+        return HStack(spacing: 8) {
+            DeckPillButton(title: QuestionItemsText.reviewLabel(card.questionItemsCounts), filled: true, enabled: !isBusy) {
+                walkthrough = QuestionWalkthroughStart(card: card)
+            }
+            .accessibilityIdentifier("supervisor-card-review-items-\(card.id)")
+            if hasThreadContext {
+                DeckPillButton(title: "Details", filled: false, enabled: true) {
+                    onOpenContext(card)
+                }
+                .accessibilityIdentifier("supervisor-card-review-\(card.id)")
+            }
+            Spacer(minLength: 0)
+            Button(later.label) {
+                onAct(card, later)
+            }
+            .font(Theme.Typography.caption.weight(.medium))
+            .foregroundStyle(Theme.muted)
+            .frame(minHeight: 36)
+            .padding(.horizontal, 6)
+            .disabled(isBusy)
+            .accessibilityIdentifier("supervisor-card-secondary-\(card.id)")
         }
     }
 
@@ -4211,7 +4283,16 @@ private struct ThreadDetailSheet: View {
                     Section("Needs your decision") {
                         let decisionTitle = trimmedNonEmpty(card?.headline) ?? trimmedNonEmpty(question?.title) ?? "Decision"
                         Text(decisionTitle).font(.headline)
-                        if let card, let decisionView = card.decisionView {
+                        if let card, card.hasQuestionWalkthrough {
+                            // Several questions: the contract's goal and
+                            // status, then every question in full.
+                            if let decisionView = card.decisionView {
+                                DecisionContractView(view: decisionView, choices: [], style: .full)
+                            }
+                            if questionIsOpen {
+                                QuestionItemsSection(card: card, idPrefix: "thread")
+                            }
+                        } else if let card, let decisionView = card.decisionView {
                             // The decision contract replaces the free-form
                             // brief: Goal, Status, Decision, Recommendation.
                             DecisionContractView(view: decisionView, choices: DecisionContract.choices(for: card), style: .full)
@@ -4273,7 +4354,9 @@ private struct ThreadDetailSheet: View {
                         }
 
                         if questionIsOpen {
-                            if let card, DecisionContract.ownsActions(card) {
+                            if let card, card.hasQuestionWalkthrough {
+                                questionItemsActionBar
+                            } else if let card, DecisionContract.ownsActions(card) {
                                 contractActionBar(card)
                             } else {
                                 decisionActionBar
@@ -4744,6 +4827,23 @@ private struct ThreadDetailSheet: View {
                 Label("Respond in the original app on your Mac. Reading this thread does not send an answer.", systemImage: "macbook")
                     .font(.footnote).foregroundStyle(.secondary)
             }
+        }
+        .padding(.top, 4)
+    }
+
+    /// Reply and Later for an ask with several questions; the questions are
+    /// answered through "Review N questions" above.
+    private var questionItemsActionBar: some View {
+        FlowLayout(spacing: 8) {
+            DeckPillButton(title: replyOpen ? "Close reply" : "Reply", filled: false, enabled: !questionBusy) {
+                if !replyOpen { replyText = "" }
+                replyOpen.toggle()
+            }
+            .accessibilityIdentifier("thread-decision-reply")
+            DeckPillButton(title: "Later", filled: false, enabled: !questionBusy) {
+                onDefer()
+            }
+            .accessibilityIdentifier("thread-decision-later")
         }
         .padding(.top, 4)
     }

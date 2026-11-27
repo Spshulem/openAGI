@@ -640,6 +640,8 @@ export class OwnerPrecedentStore {
     let added = 0;
     for (const q of questions) {
       if (!q || q.status !== "answered" || !q.answer) continue;
+      // Composed answers to a multi-question ask are never precedents.
+      if (q.noPrecedent === true) continue;
       if (["dismiss", "later", "skip", "open thread", "got it"].includes(String(q.answer).toLowerCase())) continue;
       if (checkHardRedLine(q).blocked) continue;
       const wasAdded = this.recordOwnerDecision({

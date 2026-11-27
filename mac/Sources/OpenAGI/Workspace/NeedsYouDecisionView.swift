@@ -30,6 +30,10 @@ struct FleetDecisionPresentation: Equatable {
   let view: FleetDecisionView
   let buttons: [FleetDecisionButton]
   let quickReplies: [String]
+  /// Two or more: the card asks that many separate questions, answered one
+  /// by one in NeedsYouQuestionItemsView. It then has no answer buttons and
+  /// no quick replies here: nothing answers the group as a whole.
+  var questionItemCount: Int = 0
 
   var evidence: [FleetDecisionView.Evidence] { view.evidence.filter { $0.link != nil } }
 
@@ -44,6 +48,12 @@ struct FleetDecisionPresentation: Equatable {
     // merge & deploy, CI fix or preference is not an "answer", and a
     // suggestion's "Answer question" / "Review plan" are handled locally.
     if isSpecialized(card: card, question: question) { return nil }
+    // Several questions in one ask: never buttons built from options or the
+    // question's own answers ("Answer all questions", "Approve recommended
+    // choices" would answer the group). Each question is answered on its own.
+    if card.hasQuestionItems {
+      return FleetDecisionPresentation(view: view, buttons: [], quickReplies: [], questionItemCount: card.questionItems.count)
+    }
 
     let answerActions = card.allActions.filter { action in
       (action.op ?? "answer") == "answer" && !(action.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -382,7 +392,11 @@ struct NeedsYouDecisionSections: View {
           .padding(.leading, 12)
         }
       }
-      if d.options.isEmpty {
+      if presentation.questionItemCount >= 2 {
+        Text("\(presentation.questionItemCount) separate questions, each answered on its own.")
+          .font(smallFont)
+          .foregroundStyle(WorkspaceTheme.muted)
+      } else if d.options.isEmpty {
         Text("Options: Not stated")
           .font(smallFont.italic())
           .foregroundStyle(WorkspaceTheme.muted)

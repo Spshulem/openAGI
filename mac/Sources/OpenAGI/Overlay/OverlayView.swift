@@ -27,7 +27,7 @@ struct OverlayView: View {
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    voiceWatchers(fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody))))))))))
+    voiceWatchers(questionItemWatchers(fleetDetailWatchers(watchingWatchers(fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))))))
   }
 
   private func voiceWatchers<V: View>(_ content: V) -> some View {
@@ -198,6 +198,17 @@ struct OverlayView: View {
     .onChange(of: fleet.detailLoading) { _, _ in onContentChange() }
     .onChange(of: fleet.threadInFlight) { _, _ in onContentChange() }
     .onChange(of: fleet.threadNotes) { _, _ in onContentChange() }
+  }
+
+  // A several-question ask: its item states, the walkthrough page, drafts
+  // and the send result each change the card's height.
+  private func questionItemWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.cardBriefs) { _, _ in onContentChange() }
+    .onChange(of: fleet.walkthroughs) { _, _ in onContentChange() }
+    .onChange(of: fleet.itemDrafts) { _, _ in onContentChange() }
+    .onChange(of: fleet.itemsInFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.itemNotes) { _, _ in onContentChange() }
   }
 
   /// Outreach rows for "Needs you". Supervisor questions also arrive as

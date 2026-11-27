@@ -62,6 +62,9 @@ struct FleetQuestionAnswer: View {
         Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
+      if let itemsCard = fleet.questionItemsCard(for: question) {
+        NeedsYouQuestionList(question: question, card: itemsCard, style: .compact, maxRows: 3)
+      }
       if decision == nil, question.risky, let context = question.displayAskContext {
         Text(context).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
@@ -74,7 +77,7 @@ struct FleetQuestionAnswer: View {
           .font(.system(size: 10)).foregroundStyle(.secondary)
       }
       HStack(spacing: 6) {
-        if !options.isEmpty {
+        if !options.isEmpty || fleet.questionItemsCard(for: question) != nil {
           FleetOptionButtons(question: question, options: options)
             .disabled(busy || offline)
         }
@@ -106,7 +109,13 @@ struct FleetOptionButtons: View {
   let options: [String]
 
   var body: some View {
-    if let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id]) {
+    if let itemsCard = fleet.questionItemsCard(for: question) {
+      // Several separate questions: one button opens them one at a time on
+      // the detail screen. Nothing answers the group as a whole.
+      if fleet.walkthroughs[question.id] == nil {
+        NeedsYouReviewQuestionsButton(question: question, card: itemsCard, opensDetail: fleet.openItem != .question(question.id))
+      }
+    } else if let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id]) {
       // A four-part decision card: one button per option, the recommended
       // one prominent, an admin bypass captioned.
       NeedsYouDecisionButtons(buttons: decision.buttons) { button in

@@ -363,6 +363,20 @@ struct SupervisorThreadInspectorView: View {
           NeedsYouSections(digest: digest, kinds: [.decision, .recommendation])
         }
 
+        if let itemsCard = fleet.questionItemsCard(for: q) {
+          // Several separate questions: each one inline, or one at a time.
+          if fleet.walkthroughs[q.id] != nil {
+            NeedsYouQuestionWalkthrough(question: q, card: itemsCard)
+          } else {
+            NeedsYouQuestionList(question: q, card: itemsCard, style: .full) { index in
+              fleet.moveWalkthrough(q.id, to: index)
+            }
+            if let note = fleet.itemNotes[q.id] {
+              FleetNoteRow(note: note) { fleet.clearItemNote(q.id) }
+            }
+          }
+        }
+
         if !q.remainingItemIds.isEmpty {
           Text("More owner questions remain; answer this one before the next is presented.")
             .font(.caption)
@@ -684,7 +698,13 @@ struct SupervisorThreadInspectorView: View {
 
   @ViewBuilder
   private func optionButtons(_ q: FleetQuestion, busy: Bool) -> some View {
-    if let decision = q.decisionPresentation(card: fleet.cardBriefs[q.id]) {
+    if let itemsCard = fleet.questionItemsCard(for: q) {
+      // Several questions: one button opens the walkthrough. No option, and
+      // no "answer all" or "accept recommendations", answers the group.
+      if fleet.walkthroughs[q.id] == nil {
+        NeedsYouReviewQuestionsButton(question: q, card: itemsCard)
+      }
+    } else if let decision = q.decisionPresentation(card: fleet.cardBriefs[q.id]) {
       // One button per option, the recommended one prominent.
       NeedsYouDecisionButtons(buttons: decision.buttons) { button in
         Task { await fleet.answer(q, option: button.value) }

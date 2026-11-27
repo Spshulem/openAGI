@@ -49,6 +49,7 @@ struct FleetDetailScreen: View {
     let detail = key.flatMap { fleet.details[$0] }
     let conversation = detail?.conversation
     let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id])
+    let itemsCard = fleet.questionItemsCard(for: question)
 
     if question.risky { FleetRiskyLabel() }
     Text(question.title)
@@ -74,6 +75,9 @@ struct FleetDetailScreen: View {
             .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
         }
+        if let itemsCard, fleet.walkthroughs[question.id] == nil {
+          NeedsYouQuestionList(question: question, card: itemsCard, style: .compact)
+        }
         // The ask's own words: always for a risky ask, else when the chat
         // below can't show them.
         if decision == nil, let context = question.displayAskContext, question.risky || (conversation?.messages.isEmpty ?? true) {
@@ -96,8 +100,14 @@ struct FleetDetailScreen: View {
     }
     .frame(maxHeight: Self.infoHeight)
 
-    if let key {
+    if let itemsCard, fleet.walkthroughs[question.id] != nil {
+      // One question at a time, in place of the conversation.
+      NeedsYouQuestionWalkthrough(question: question, card: itemsCard, compact: true)
+    } else if let key {
       FleetConversationList(conversation: conversation, loading: fleet.detailLoading.contains(key))
+    }
+    if let itemsCard, fleet.walkthroughs[question.id] == nil, let note = fleet.itemNotes[question.id] {
+      FleetNoteRow(note: note) { fleet.clearItemNote(itemsCard.questionKey) }
     }
 
     if question.answersInThread {
@@ -106,7 +116,7 @@ struct FleetDetailScreen: View {
         .font(.system(size: 10)).foregroundStyle(.secondary)
     }
     HStack(spacing: 6) {
-      if !options.isEmpty {
+      if !options.isEmpty || itemsCard != nil {
         FleetOptionButtons(question: question, options: options)
           .disabled(busy || offline)
       }

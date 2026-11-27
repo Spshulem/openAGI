@@ -770,6 +770,28 @@ public actor DaemonClient {
         return try Self.decodeJSON(FleetCardActResult.self, from: data)
     }
 
+    /// Partial answers to an ask with several questions (`answer_items`):
+    /// only the given items, each with its own answer, plus the ids the
+    /// owner skipped. Never a group reply or a recommendation applied in bulk.
+    public func fleetAnswerCardItems(id: String, answers: [SupervisorQuestionItemAnswer],
+                                     skip: [String] = []) async throws -> FleetCardActResult {
+        guard !id.isEmpty, !id.contains("/") else { throw DaemonError.malformedResponse }
+        var request = try authorizedRequest(path: "/fleet/api/cards/\(id)/act", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: Self.answerItemsBody(answers: answers, skip: skip))
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetCardActResult.self, from: data)
+    }
+
+    static func answerItemsBody(answers: [SupervisorQuestionItemAnswer], skip: [String]) -> [String: Any] {
+        [
+            "op": "answer_items",
+            "items": answers.map { ["itemId": $0.itemId, "answer": $0.answer] },
+            "skip": skip
+        ]
+    }
+
     public func fleetUnarchiveThread(key: String) async throws -> FleetCardActResult {
         guard key.range(of: #"^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
             throw DaemonError.malformedResponse
