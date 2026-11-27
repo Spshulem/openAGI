@@ -324,3 +324,44 @@ test("unconfirmed handoffs are checked in turn, not always the newest few", asyn
   await sup.settleUnconfirmedHandoffs(null, { limit: 5 });
   assert.equal(new Set(checked).size, 7, "every handoff was checked within two scans");
 });
+
+// Review fix (#393): an approved handoff that queued behind a running turn
+// and was then sent unconfirmed by the drain kept no receipt identity, so it
+// could never settle.
+test("a queued approval sent unconfirmed by the drain settles once its exact turn starts", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "drain-receipt-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let busy = true;
+  const sent = [];
+  const sup = new FleetSupervisor({
+    dataDir: dir, runtime: { events: { emit() {} } },
+    config: { enabled: true, mode: "auto", paseo: { enabled: true, only: true } },
+    deps: {
+      now: () => Date.now(),
+      executor: {
+        async deliver(opts) {
+          if (busy && opts.queue) return { status: "busy", busy: true, route: "paseo-send", detail: "mid-turn" };
+          sent.push(opts);
+          return { status: "blocked", unconfirmed: true, route: "paseo-send", messageId: "exact-send-id", detail: "turn start unconfirmed" };
+        }
+      }
+    }
+  });
+  const thread = { key: "paseo:srv_bb.chat_q", kind: "paseo", id: "chat_q", title: "Queued", agentStatus: "running", archived: false, meta: { serverId: "srv_bb" } };
+  sup.lastThreads.set(thread.key, thread);
+  const queued = await sup.sendOwnerMessage(thread.key, "Ship the fix after the tests pass.", { idempotencyKey: "approval-q" });
+  assert.equal(queued.delivery.status, "queued");
+  busy = false;
+  const idle = { ...thread, agentStatus: "idle" };
+  sup.lastThreads.set(idle.key, idle);
+  const drained = await sup.drainQueuedOwnerMessages({ byKey: new Map([[idle.key, idle]]) });
+  assert.equal(drained[0].status, "unconfirmed");
+  assert.equal(sup.handoffs.get("approval-q").status, "unconfirmed");
+  assert.equal(sup.handoffs.get("approval-q").receiptMessageId, "exact-send-id");
+  const checks = [];
+  sup.deps.checkPaseoReceipt = async ({ messageId }) => { checks.push(messageId); return { confirmed: messageId === "exact-send-id" }; };
+  assert.deepEqual(await sup.settleUnconfirmedHandoffs(), ["approval-q"]);
+  assert.deepEqual(checks, ["exact-send-id"]);
+  assert.equal(sup.handoffs.get("approval-q").status, "delivered");
+  assert.equal(sent.length, 1, "sent once");
+});

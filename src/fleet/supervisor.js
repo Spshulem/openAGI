@@ -3228,7 +3228,7 @@ export class FleetSupervisor {
     } catch { receipt = null; }
     if (receipt?.messageHash === hash && (receipt.imagesHash ?? null) === entryImagesHash) {
       if (receipt.pending) {
-        return { status: "unconfirmed", detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" };
+        return { status: "unconfirmed", ...(receipt.messageId ? { receiptMessageId: receipt.messageId } : {}), detail: "sent before a restart but its turn is unconfirmed; not sent again so it cannot arrive twice" };
       }
       if (receipt.delivered !== false && !receipt.sendError && !receipt.executionError && !receipt.clearedForNewSend) {
         return { status: "delivered", deliveredAt: new Date(this.now()).toISOString(), detail: "delivered before a restart (Paseo receipt); not sent again" };
@@ -3396,6 +3396,8 @@ export class FleetSupervisor {
         for (const k of approvalKeys) {
           this.handoffs.update(k, {
             status: "unconfirmed",
+            // The exact send, so a later scan can settle it once its turn starts.
+            receiptMessageId: delivery?.messageId ?? null,
             detail: `${clampText(delivery?.detail || "Queued message reached Paseo but turn confirmation timed out", 160)}; not sent again so it cannot arrive twice`
           });
         }
