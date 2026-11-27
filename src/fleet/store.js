@@ -588,6 +588,11 @@ export class FleetStore {
       // Asked again at a new head: the ask stands at that head.
       if (head) existing.askedHead = head;
       keepReviewWording(existing, fields);
+      // A rescan refreshes scan metadata but never the owner's progress on a
+      // multi-question ask.
+      if (existing.meta?.itemAnswers) {
+        fields.meta = { ...(fields.meta ?? {}), itemAnswers: existing.meta.itemAnswers };
+      }
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
         Object.assign(existing, fields, { updatedAt: iso(now) });
@@ -877,6 +882,15 @@ export class FleetStore {
       };
     }
     question.meta = { ...meta, itemAnswers: current };
+    this._save();
+    return { ...question };
+  }
+
+  // Answers composed for a multi-question ask are never owner precedents.
+  markQuestionNoPrecedent(id) {
+    const question = this._findQuestion(id);
+    if (!question) return null;
+    question.noPrecedent = true;
     this._save();
     return { ...question };
   }
@@ -1840,7 +1854,10 @@ export class FleetStore {
     return resolvedKeys;
   }
 
-  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null } = {}) {
+  enqueueOwnerMessage({ threadKey, message, images = null, goalId = null, ownerChoice = null, source = "owner-message", idempotencyKey = null, questionId = null, questionAnswer = null, questionItemIds = null } = {}) {
+    // Items of a multi-question ask this message answers: settled to
+    // delivered or failed when the queued message is (see settleQuestionItems).
+    const itemIds = Array.isArray(questionItemIds) && questionItemIds.length ? questionItemIds.map((i) => String(i).slice(0, 80)).slice(0, 25) : null;
     const cleanKey = String(threadKey ?? "").trim();
     const cleanMsg = String(message ?? "").trim();
     // Preserve full owner directives (ActiveWork follow-ups can reach 6,000+
@@ -1870,7 +1887,7 @@ export class FleetStore {
       // The same words to the same chat from another card: one message, but
       // every card it answers stays linked, so each comes back if it fails.
       if (questionId) {
-        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax), ...(itemIds ? { itemIds } : {}) };
         const links = questionLinksOf(existing);
         if (!links.some((l) => l.questionId === link.questionId)) {
           existing.questionLinks = [...links, link].slice(-20);
@@ -1898,7 +1915,7 @@ export class FleetStore {
       // The owner's card this message answers: if it never reaches the agent,
       // the card is put back instead of staying closed as answered.
       ...(questionId ? (() => {
-        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax) };
+        const link = { questionId: String(questionId).slice(0, 80), questionAnswer: clampText(questionAnswer ?? cleanMsg, this.limits.bodyMax), ...(itemIds ? { itemIds } : {}) };
         return { questionId: link.questionId, questionAnswer: link.questionAnswer, questionLinks: [link] };
       })() : {}),
       ...(ownerChoice != null ? { ownerChoice: String(ownerChoice).slice(0, 200) } : {}),

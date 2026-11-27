@@ -2282,6 +2282,9 @@ export class FleetSupervisor {
     if (!question || question.status !== "open") return null;
     if (question.kind === "self-fix" && (question.options ?? []).includes(answer)) return this.selfFixHub.answer(id, answer);
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
+    // A blanket answer ("Approve recommended choices", "Answer all
+    // questions") is never sent from any surface: card, chat tool or API.
+    if (GROUP_OPTION_RE.test(String(answer ?? ""))) return null;
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
@@ -2514,8 +2517,13 @@ export class FleetSupervisor {
   // permission: the agent is told so in the reply.
   async answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
     const all = Array.isArray(card?.questionItems) ? card.questionItems : [];
-    const answers = (Array.isArray(items) ? items : []).filter((it) => it && typeof it.answer === "string" && it.answer.trim());
-    const skipped = Array.isArray(skip) ? skip : [];
+    // Only items still open (unanswered, skipped, failed) can be answered or
+    // skipped: a stale device can't resend or downgrade a delivered or
+    // queued item.
+    const saved = this.store.question(question.id)?.meta?.itemAnswers ?? {};
+    const isOpen = (itemId) => !["delivered", "queued"].includes(saved?.[itemId]?.status);
+    const answers = (Array.isArray(items) ? items : []).filter((it) => it && typeof it.answer === "string" && it.answer.trim() && isOpen(it.itemId));
+    const skipped = (Array.isArray(skip) ? skip : []).filter((itemId) => isOpen(itemId));
     const composed = composeItemsReply(all, { answers, skipped });
     if (!composed) return { ok: false, kind: "answer_items", status: "blocked", detail: "Answer or skip at least one question." };
     const skipUpdates = Object.fromEntries(composed.skipped.map((itemId) => [itemId, { status: "skipped" }]));
@@ -2526,7 +2534,9 @@ export class FleetSupervisor {
     }
     const targetKey = card?.threadKey ?? question.threadKey ?? null;
     if (!targetKey) return { ok: false, kind: "answer_items", status: "blocked", detail: "No coding session is linked to this card." };
-    const sent = await this.sendOwnerMessage(targetKey, composed.text, { deadlineAt });
+    // Linked to the question and its items, so a queued reply settles them
+    // when it is sent or fails (never assumed delivered).
+    const sent = await this.sendOwnerMessage(targetKey, composed.text, { deadlineAt, questionId: question.id, questionAnswer: composed.text, questionItemIds: composed.answered });
     const status = sent?.delivery?.status === "sent" ? "delivered" : sent?.delivery?.status === "queued" ? "queued" : "failed";
     const answerById = new Map(answers.map((it) => [it.itemId, it.answer.trim()]));
     const updates = { ...skipUpdates };
@@ -2534,14 +2544,9 @@ export class FleetSupervisor {
       updates[itemId] = { status, answer: answerById.get(itemId) ?? null, detail: sent?.delivery?.detail ?? null };
     }
     this.store.recordQuestionItemAnswers(question.id, updates);
+    if (status !== "failed") this.recordOwnerActivity();
+    this.closeQuestionIfAllItemsDelivered(question.id, composed.text);
     const states = this.questionItemStates(question.id, all);
-    if (status !== "failed") {
-      this.recordOwnerActivity();
-      if (states.every((it) => ["delivered", "queued"].includes(it.state.status))) {
-        this.store.answerQuestion(question.id, composed.text);
-        this.resolveOutreach(question, "reply", "acted");
-      }
-    }
     this.emitFleet("card-items-answered");
     return {
       ok: status !== "failed",
@@ -2553,6 +2558,36 @@ export class FleetSupervisor {
       delivery: sent?.delivery ?? null,
       items: states
     };
+  }
+
+  // A queued item reply was sent (delivered) or not (failed, answer kept).
+  settleQuestionItems(link, status, detail = null) {
+    const question = this.store.question(link?.questionId);
+    if (!question || question.status !== "open") return;
+    const saved = question.meta?.itemAnswers ?? {};
+    const updates = {};
+    for (const itemId of link.itemIds ?? []) {
+      if (saved[itemId]?.status !== "queued") continue;
+      updates[itemId] = { status, answer: saved[itemId].answer ?? null, detail };
+    }
+    if (!Object.keys(updates).length) return;
+    this.store.recordQuestionItemAnswers(question.id, updates);
+    this.closeQuestionIfAllItemsDelivered(question.id, link.questionAnswer ?? null);
+    this.emitFleet(status === "delivered" ? "card-items-delivered" : "card-items-undelivered");
+  }
+
+  // Closes a multi-question ask only once every item's answer was delivered
+  // (not merely queued). Marked so it never becomes an owner precedent.
+  closeQuestionIfAllItemsDelivered(questionId, answerText) {
+    const question = this.store.question(questionId);
+    if (!question || question.status !== "open") return false;
+    const card = (this.getState().cards ?? []).find((c) => c.questionId === questionId) ?? null;
+    const items = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    if (items.length < 2 || !items.every((it) => it.state?.status === "delivered")) return false;
+    this.store.markQuestionNoPrecedent(questionId);
+    this.store.answerQuestion(questionId, answerText || `${items.length} questions answered`);
+    this.resolveOutreach(question, "reply", "acted");
+    return true;
   }
 
   questionItemStates(questionId, items) {
@@ -2657,7 +2692,7 @@ export class FleetSupervisor {
     return await this._deliverOwnerMessage(threadKey, text, { ...opts, key });
   }
 
-  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false, questionId = null, questionAnswer = null } = {}) {
+  async _deliverOwnerMessage(threadKey, text, { deadlineAt = null, queue = null, images = null, recoverDisconnected = false, goalId = null, ownerChoice = null, key = null, resume = false, questionId = null, questionAnswer = null, questionItemIds = null } = {}) {
     const startedAt = Date.now();
     // Capture the approval/send-start boundary before awaiting delivery so any
     // owner cancellation written while the initial attempt is in flight makes
@@ -2775,7 +2810,7 @@ export class FleetSupervisor {
         ownerChoice,
         source: "owner-message",
         ...(key ? { idempotencyKey: key } : {}),
-        ...(questionId ? { questionId, questionAnswer } : {})
+        ...(questionId ? { questionId, questionAnswer, ...(questionItemIds ? { questionItemIds } : {}) } : {})
       });
       if (!queued) {
         const detail = "Could not durably queue message (queue full, disk write failed, or message exceeds 24,000 characters); not sent while the Paseo session is mid-turn.";
@@ -3093,6 +3128,12 @@ export class FleetSupervisor {
     // each linked card comes back.
     const reopened = [];
     for (const link of questionLinksOf(entry)) {
+      // Item answers of a multi-question ask: those items fail (answers kept
+      // to retry); the ask itself was never closed.
+      if (Array.isArray(link.itemIds) && link.itemIds.length) {
+        this.settleQuestionItems(link, "failed", note);
+        continue;
+      }
       const card = this.store.reopenUndeliveredReply(link.questionId, { answer: link.questionAnswer ?? null, threadKey: entry.threadKey ?? null, note });
       if (!card) continue;
       reopened.push(card);
@@ -3209,6 +3250,9 @@ export class FleetSupervisor {
         }
         this.store.markCompletionReviewed(thread.key, started);
         this.registerFollowThroughWatch(thread, entry.message, { source: "owner-queued", goalId: entry.goalId ?? null });
+        for (const link of questionLinksOf(entry)) {
+          if (Array.isArray(link.itemIds) && link.itemIds.length) this.settleQuestionItems(link, "delivered", delivery?.detail ?? null);
+        }
         results.push({ id: entry.id, threadKey: effectiveKey, ...(effectiveKey !== entry.threadKey ? { redirectedFrom: entry.threadKey } : {}), status: "sent", delivery });
       } else if (
         delivery?.unconfirmed === true

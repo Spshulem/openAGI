@@ -15,7 +15,8 @@ final class QuestionItemsTests: XCTestCase {
     private func freshDefaults() -> UserDefaults {
         let name = "question-items-tests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: name) }
+        // Capture only the (Sendable) suite name in the teardown closure.
+        addTeardownBlock { UserDefaults(suiteName: name)?.removePersistentDomain(forName: name) }
         return defaults
     }
 

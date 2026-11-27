@@ -208,3 +208,80 @@ test("the agent's own headline decision leads the questions and is never hidden"
   assert.equal(rest.length, 10);
   assert.equal(card.primaryAction.label, "Review 11 questions");
 });
+
+// PR #394 review findings.
+async function itemsSupervisor(t, { delivery = "sent" } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "items-rev-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sup = new FleetSupervisor({ dataDir: dir, config: resolveFleetConfig({}, { enabled: true, mode: "propose" }), deps: { now: () => NOW } });
+  const sent = [];
+  const box = { delivery };
+  sup.sendOwnerMessage = async (threadKey, text, opts) => { sent.push({ threadKey, text, opts }); return { delivery: { status: box.delivery } }; };
+  const q = sup.store.upsertQuestion({ dedupeKey: "ask:release", ...groupedQuestion(), id: undefined, meta: { hasPlanArtifact: true } });
+  const items = () => sup.getState().cards.find((c) => c.questionId === q.id).questionItems;
+  return { dir, sup, sent, box, q, items };
+}
+
+test("review: queued item answers settle on real delivery and never close the card early", async (t) => {
+  const { sup, sent, box, q, items } = await itemsSupervisor(t, { delivery: "queued" });
+  const all = items();
+  const res = await sup.actCard(q.id, { op: "answer_items", items: all.map((i) => ({ itemId: i.itemId, answer: i.choices[0] ?? "ok" })) });
+  assert.equal(res.status, "queued");
+  assert.deepEqual(sent[0].opts.questionItemIds.length, 10, "the queued message is linked to its items");
+  assert.equal(sup.store.question(q.id).status, "open", "queued is not delivered: the card stays");
+  // The queue fails the message: items fail, answers kept.
+  sup.settleQuestionItems({ questionId: q.id, itemIds: all.slice(0, 3).map((i) => i.itemId) }, "failed", "never sent");
+  const failed = items().slice(0, 3);
+  assert.ok(failed.every((i) => i.state.status === "failed" && i.state.answer));
+  // The rest are sent from the queue: delivered, and the card still waits on the failed ones.
+  sup.settleQuestionItems({ questionId: q.id, itemIds: all.slice(3).map((i) => i.itemId) }, "delivered");
+  assert.equal(sup.store.question(q.id).status, "open");
+  box.delivery = "sent";
+  await sup.actCard(q.id, { op: "answer_items", items: failed.map((i) => ({ itemId: i.itemId, answer: i.state.answer })) });
+  assert.equal(sup.store.question(q.id).status, "answered", "closes once every item is delivered");
+  // The store keeps the item linkage on a queued entry.
+  const entry = sup.store.enqueueOwnerMessage({ threadKey: "paseo:s.x", message: "hi", questionId: q.id, questionItemIds: ["q1-a"] });
+  assert.deepEqual(entry.questionLinks[0].itemIds, ["q1-a"]);
+});
+
+test("review: a closed multi-question reply is never backfilled as an owner precedent", async (t) => {
+  const { dir, sup, q, items } = await itemsSupervisor(t);
+  await sup.actCard(q.id, { op: "answer_items", items: items().map((i) => ({ itemId: i.itemId, answer: i.choices[0] ?? "ok" })) });
+  assert.equal(sup.store.question(q.id).status, "answered");
+  assert.equal(sup.store.question(q.id).noPrecedent, true);
+  const fresh = new FleetSupervisor({ dataDir: dir, config: resolveFleetConfig({}, { enabled: true, mode: "propose" }), deps: { now: () => NOW } });
+  const memory = fresh.precedentMemory;
+  const dump = JSON.stringify(typeof memory.list === "function" ? memory.list() : memory);
+  assert.doesNotMatch(dump, /Answers to your questions/);
+});
+
+test("review: delivered or queued items can't be re-answered or skipped by a stale device", async (t) => {
+  const { sup, sent, q, items } = await itemsSupervisor(t);
+  const [a, b] = items();
+  await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "first" }] });
+  const stale = await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "second" }], skip: [a.itemId] });
+  assert.equal(stale.ok, false, "nothing left to send");
+  assert.equal(sent.length, 1);
+  const after = items().find((i) => i.itemId === a.itemId);
+  assert.equal(after.state.status, "delivered");
+  assert.equal(after.state.answer, "first");
+  assert.equal(items().find((i) => i.itemId === b.itemId).state.status, "unanswered");
+});
+
+test("review: a rescan keeps the owner's item answers", async (t) => {
+  const { sup, q, items } = await itemsSupervisor(t, { delivery: "failed" });
+  const [a] = items();
+  await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "keep me" }] });
+  sup.store.upsertQuestion({ dedupeKey: "ask:release", ...groupedQuestion(), id: undefined, meta: { hasPlanArtifact: true, wall: "x" } });
+  const again = items().find((i) => i.itemId === a.itemId);
+  assert.equal(again.state.status, "failed");
+  assert.equal(again.state.answer, "keep me");
+});
+
+test("review: no surface can send a blanket answer", async (t) => {
+  const { sup, sent, q } = await itemsSupervisor(t);
+  const res = await sup.answerQuestion(q.id, "Approve recommended choices");
+  assert.equal(res, null);
+  assert.equal(sent.length, 0);
+  assert.equal(sup.store.question(q.id).status, "open");
+});
