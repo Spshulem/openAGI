@@ -140,7 +140,8 @@ export function questionItemsFor(texts = []) {
 // hidden behind the list.
 export function mainDecisionItem(ctx, items = []) {
   const question = clean(ctx?.decision ?? "", 400);
-  if (!ctx?.agentSupplied || !question || !Array.isArray(ctx.options) || !ctx.options.length) return null;
+  // A headline decision without listed options is still asked, in words.
+  if (!ctx?.agentSupplied || !question) return null;
   const key = (t) => String(t ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 60);
   if (items.some((it) => key(it.question) && (key(it.question).includes(key(question).slice(0, 40)) || key(question).includes(key(it.question).slice(0, 40))))) return null;
   return {
@@ -149,7 +150,9 @@ export function mainDecisionItem(ctx, items = []) {
     label: "Main decision",
     question,
     context: null,
-    choices: ctx.options.map((o) => clean(o?.label ?? o, 80)).filter(Boolean).slice(0, 4),
+    // Never the card's blanket or navigation options.
+    choices: (Array.isArray(ctx.options) ? ctx.options : []).map((o) => clean(o?.label ?? o, 80))
+      .filter((o) => o && !GROUP_OPTION_RE.test(o) && !/^(?:open thread|dismiss|later)$/i.test(o)).slice(0, 4),
     freeText: true,
     recommendation: clean(String(ctx.recommendation ?? "").replace(/^recommend(?:ation)?:\s*/i, ""), 240) || null,
     unblocks: clean(ctx.blocked ?? "", 240) || null

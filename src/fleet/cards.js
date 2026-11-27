@@ -1178,13 +1178,18 @@ export function buildSupervisorCard(
   // unblocks), answered one at a time in a walkthrough. A blanket "Answer all
   // questions" / "Approve recommended choices" is never an answer.
   const itemsEligible = !groupedQuestion && ["agent-ask", "stuck"].includes(String(question.kind ?? ""));
-  const parsedItems = itemsEligible
+  // Questions saved with the ask (once answering started) win over a
+  // re-parse of excerpts that may no longer hold the whole list.
+  const savedDefs = Array.isArray(question.meta?.questionItemDefs) && question.meta.questionItemDefs.length >= 2
+    ? question.meta.questionItemDefs
+    : null;
+  const parsedItems = savedDefs ?? (itemsEligible
     ? questionItemsFor([thread?.lastAgentFull, snap?.agentSummary, question.askContext, question.body]
       .filter((t) => typeof t === "string").map((t) => redactSecrets(t)))
-    : [];
+    : []);
   let questionItems = null;
-  if (parsedItems.length >= 2) {
-    const main = mainDecisionItem(decisionContext, parsedItems);
+  if (itemsEligible && parsedItems.length >= 2) {
+    const main = savedDefs ? null : mainDecisionItem(decisionContext, parsedItems);
     const { items, summary } = withItemState(main ? [main, ...parsedItems] : parsedItems, question.meta?.itemAnswers ?? {});
     redactStringsInPlace(items);
     questionItems = { items, summary };

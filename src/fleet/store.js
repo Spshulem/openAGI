@@ -4,6 +4,7 @@
 // Ordinary writes retain disk errors in lastWriteError. Mode changes throw
 // and roll back on failure: an unsaved Auto choice must never be acknowledged.
 
+import { ownerAnswerText } from "./decision-items.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -591,7 +592,11 @@ export class FleetStore {
       // A rescan refreshes scan metadata but never the owner's progress on a
       // multi-question ask.
       if (existing.meta?.itemAnswers) {
-        fields.meta = { ...(fields.meta ?? {}), itemAnswers: existing.meta.itemAnswers };
+        fields.meta = {
+          ...(fields.meta ?? {}),
+          itemAnswers: existing.meta.itemAnswers,
+          ...(existing.meta.questionItemDefs ? { questionItemDefs: existing.meta.questionItemDefs } : {})
+        };
       }
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
@@ -866,7 +871,7 @@ export class FleetStore {
   // re-posts the outreach item nor re-pushes the phone.
   // Per-question answer state for an ask with several questions:
   // { itemId: { status, answer, at, detail } }. Unanswered items stay open.
-  recordQuestionItemAnswers(id, updates = {}, { now = this.now() } = {}) {
+  recordQuestionItemAnswers(id, updates = {}, { now = this.now(), defs = null } = {}) {
     const question = this._findQuestion(id);
     if (!question || question.status !== "open") return null;
     const at = iso(toMs(now, this.now()));
@@ -876,12 +881,19 @@ export class FleetStore {
       if (typeof itemId !== "string" || !itemId || itemId.length > 80 || !update || typeof update !== "object") continue;
       current[itemId] = {
         status: String(update.status ?? "unanswered").slice(0, 20),
-        answer: typeof update.answer === "string" ? clampText(update.answer, 1200) : (current[itemId]?.answer ?? null),
+        // As typed (line breaks and indentation kept), so a retry sends the
+        // same answer.
+        answer: typeof update.answer === "string" ? ownerAnswerText(update.answer, 1200) : (current[itemId]?.answer ?? null),
         at,
         detail: typeof update.detail === "string" ? clampText(update.detail, 240) : null
       };
     }
-    question.meta = { ...meta, itemAnswers: current };
+    // The questions themselves are kept with the ask once answering starts:
+    // the agent's full message may later be gone from the excerpts.
+    const keepDefs = Array.isArray(meta.questionItemDefs) && meta.questionItemDefs.length >= 2
+      ? meta.questionItemDefs
+      : (Array.isArray(defs) && defs.length >= 2 ? defs.slice(0, 25) : null);
+    question.meta = { ...meta, itemAnswers: current, ...(keepDefs ? { questionItemDefs: keepDefs } : {}) };
     this._save();
     return { ...question };
   }

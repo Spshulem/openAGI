@@ -6,7 +6,7 @@
 // Needs-you questions are raised in every mode. The constructor has no side
 // effects; hosted-interface calls start() on listen and stop() on close.
 
-import { composeItemsReply, withItemState, GROUP_OPTION_RE } from "./decision-items.js";
+import { composeItemsReply, withItemState, questionItemsFor, GROUP_OPTION_RE } from "./decision-items.js";
 import path from "node:path";
 import fs from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -323,6 +323,13 @@ function notReadyBlocker(pr) {
 // or answered it itself.
 // prMissing: GitHub answered and has no such PR. notReady: a blocker this
 // scan read on the PR (notReadyBlocker).
+// An ask carrying several questions (saved or parsed from the agent's text).
+function isMultiQuestionAsk(question) {
+  if (Array.isArray(question?.meta?.questionItemDefs) && question.meta.questionItemDefs.length >= 2) return true;
+  if (!["agent-ask", "stuck"].includes(String(question?.kind ?? ""))) return false;
+  return questionItemsFor([question.contextSnapshot?.agentSummary, question.askContext, question.body]).length >= 2;
+}
+
 export function settledAsk(question, { thread = null, pr = null, prMissing = false, threadGone = false, muted = false, notReady = null } = {}) {
   const effectiveAskedAt = Date.parse(
     question.agentAskedAt
@@ -2289,7 +2296,9 @@ export class FleetSupervisor {
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
     // A blanket answer ("Approve recommended choices", "Answer all
     // questions") is never sent from any surface: card, chat tool or API.
-    if (GROUP_OPTION_RE.test(String(answer ?? ""))) return null;
+    // Only on an ask carrying several questions: a native prompt's own
+    // "Approve all" button on a single-question card stays a normal answer.
+    if (GROUP_OPTION_RE.test(String(answer ?? "")) && isMultiQuestionAsk(question)) return null;
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
@@ -2547,7 +2556,7 @@ export class FleetSupervisor {
     if (!composed) return { ok: false, kind: "answer_items", status: "blocked", detail: "Answer or skip at least one question." };
     const skipUpdates = Object.fromEntries(composed.skipped.map((itemId) => [itemId, { status: "skipped" }]));
     if (!composed.answered.length) {
-      this.store.recordQuestionItemAnswers(question.id, skipUpdates);
+      this.store.recordQuestionItemAnswers(question.id, skipUpdates, { defs: all.map(({ state: _state, ...item }) => item) });
       this.emitFleet("card-items-skipped");
       return { ok: true, kind: "answer_items", status: "skipped", detail: "Skipped questions stay open.", items: this.questionItemStates(question.id, all) };
     }
@@ -2562,7 +2571,7 @@ export class FleetSupervisor {
     for (const itemId of composed.answered) {
       updates[itemId] = { status, answer: answerById.get(itemId) ?? null, detail: sent?.delivery?.detail ?? null };
     }
-    this.store.recordQuestionItemAnswers(question.id, updates);
+    this.store.recordQuestionItemAnswers(question.id, updates, { defs: all.map(({ state: _state, ...item }) => item) });
     if (status !== "failed") this.recordOwnerActivity();
     this.closeQuestionIfAllItemsDelivered(question.id, composed.text);
     const states = this.questionItemStates(question.id, all);

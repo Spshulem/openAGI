@@ -327,3 +327,59 @@ test("review: a suggestion's 'Answer question' is not a blanket answer", () => {
   assert.equal(GROUP_OPTION_RE.test("Answer question"), false);
   assert.equal(GROUP_OPTION_RE.test("Answer all questions"), true);
 });
+
+test("review: the questions survive once the full agent message is gone", async (t) => {
+  const { sup, q, items } = await itemsSupervisor(t);
+  const [a] = items();
+  await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "Nikhil" }] });
+  // Later excerpts no longer hold the list.
+  const live = sup.store.state.questions.find((x) => x.id === q.id);
+  live.askContext = "…10. Store scope: is the whole shared store suspect, or only Vite?";
+  live.contextSnapshot = { agentSummary: "Thanks, noted.", recentMessages: [{ role: "assistant", text: "Thanks, noted." }] };
+  live.body = "Thanks, noted.";
+  const card = sup.getState().cards.find((c) => c.questionId === q.id);
+  assert.equal(card.questionItems.length, 10);
+  assert.equal(card.primaryAction.op, "review_items");
+  assert.equal(card.questionItems.find((i) => i.itemId === a.itemId).state.answer, "Nikhil");
+});
+
+test("review: a failed multi-line answer is kept as typed for the retry", async (t) => {
+  const { sup, q, items } = await itemsSupervisor(t, { delivery: "failed" });
+  const [, b] = items();
+  const code = "if ready:\n    deploy()\nelse:\n    hold()";
+  await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: b.itemId, answer: code }] });
+  assert.equal(items().find((i) => i.itemId === b.itemId).state.answer, code);
+});
+
+test("review: a single-question prompt's own 'Approve all' button still works", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "items-approve-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sup = new FleetSupervisor({ dataDir: dir, config: resolveFleetConfig({}, { enabled: true, mode: "propose" }), deps: { now: () => NOW } });
+  const q = sup.store.upsertQuestion({ dedupeKey: "prompt:native", kind: "prompt", threadKey: "paseo:s.native", title: "Allow edits to 3 files?", body: "Allow edits to 3 files?", options: ["Approve all", "Deny"] });
+  let reached = false;
+  sup.deliverToAsker = async () => { reached = true; return { delivery: { status: "sent" } }; };
+  sup.clickThread = async () => { reached = true; return { ok: true }; };
+  await sup.answerQuestion(q.id, "Approve all").catch(() => null);
+  assert.equal(reached, true, "the native approval is not swallowed by the blanket-answer guard");
+});
+
+test("review: a free-text headline decision is asked as its own question", () => {
+  const withContext = [
+    "DECISION CONTEXT",
+    "Goal: Ship the release.",
+    "Blocked: Nobody owns the release.",
+    "Decision: Who should own the release?",
+    "Recommendation: Name one owner.",
+    "",
+    "Original questions:",
+    "1. **Theme:** dark or light?",
+    "2. **Font:** which font should we use?"
+  ].join("\n");
+  const card = buildSupervisorCard(groupedQuestion({ askContext: withContext, contextSnapshot: { agentSummary: withContext, recentMessages: [{ role: "assistant", text: withContext }] } }), { now: NOW });
+  const [main] = card.questionItems;
+  assert.equal(main.label, "Main decision");
+  assert.match(main.question, /Who should own the release/);
+  assert.deepEqual(main.choices, []);
+  assert.equal(main.freeText, true);
+  assert.equal(card.questionItems.length, 3);
+});
