@@ -187,7 +187,6 @@ struct DecisionRecommendedTag: View {
         Label("Recommended", systemImage: "star.fill")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(onFilled ? Color.white : Theme.live)
-            .accessibilityIdentifier("decision-recommended-tag")
     }
 }
 
@@ -198,7 +197,6 @@ struct DecisionBypassCaption: View {
             .font(.caption2.weight(.semibold))
             .foregroundStyle(Theme.caution)
             .fixedSize(horizontal: false, vertical: true)
-            .accessibilityIdentifier("decision-admin-bypass")
     }
 }
 
@@ -238,11 +236,14 @@ struct DecisionChoiceButton: View {
                     .foregroundStyle(choice.recommended ? Color.white : (enabled ? Theme.ink : Theme.muted))
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
+                // Said once, in the button's accessibility value.
                 if choice.recommended {
                     DecisionRecommendedTag(onFilled: true)
+                        .accessibilityHidden(true)
                 }
                 if choice.adminBypass {
                     DecisionBypassCaption()
+                        .accessibilityHidden(true)
                         .padding(.horizontal, choice.recommended ? 4 : 0)
                         .background {
                             if choice.recommended {
@@ -269,10 +270,11 @@ struct DecisionChoiceButton: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
-        .accessibilityElement(children: .ignore)
+        // One accessible button: its label is the option, its value carries
+        // "Recommended" / "Admin bypass". Wrapping the Button in another
+        // element exposed the same option twice to VoiceOver.
         .accessibilityLabel(choice.label)
         .accessibilityValue(choice.accessibilityValue)
-        .accessibilityAddTraits(.isButton)
     }
 }
 
