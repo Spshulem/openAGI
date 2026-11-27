@@ -239,4 +239,14 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertNil(FleetDecisionPresentation.make(question: nil, card: card))
   }
 
+
+  /// Answers that differ only in case (branch names, paths) are both kept.
+  func testAnswersDifferingOnlyInCaseAreBothKept() {
+    let out = FleetDecisionPresentation.orderedUnique([
+      FleetDecisionButton(value: "delete Feature", label: "Delete Feature", recommended: false, adminBypass: false),
+      FleetDecisionButton(value: "delete feature", label: "Delete feature", recommended: false, adminBypass: false)
+    ])
+    XCTAssertEqual(out.map(\.value), ["delete Feature", "delete feature"])
+  }
+
 }

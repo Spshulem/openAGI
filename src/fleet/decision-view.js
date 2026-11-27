@@ -261,7 +261,8 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
     return true;
   });
   // What is still unverified is often only in the agent's latest message.
-  const agentSentences = agentTexts.slice(0, 2)
+  // Newest first (the live message, then the ask, then the saved summary).
+  const agentSentences = [...agentTexts].reverse()
     .flatMap((t) => splitSentences(cleanDecisionProse(t, { max: 4000 })))
     .filter((s) => !/\?\s*$/.test(s));
   
@@ -339,15 +340,21 @@ export function alignActionsWithDecisionView(view, { primaryAction, secondaryAct
   const byValue = new Map();
   const unique = [];
   for (const action of all) {
-    const key = `${action.op}:${String(action.value ?? action.label ?? "").toLowerCase()}`;
-    const labelKey = `label:${String(action.label ?? "").toLowerCase()}`;
+    // Exact identity: "delete Feature" and "delete feature" are different
+    // answers (branches, paths and arguments are case-sensitive).
+    const key = `${action.op}:${String(action.value ?? action.label ?? "").trim()}`;
+    const labelKey = `label:${action.op}:${String(action.label ?? "").trim()}`;
     if (byValue.has(key) || byValue.has(labelKey)) continue;
     byValue.set(key, true);
     byValue.set(labelKey, true);
     unique.push({ ...action });
   }
   const optionFor = (action) => (answerOps.has(action.op)
-    ? view?.decision?.options?.find((o) => o.value.toLowerCase() === String(action.value ?? "").toLowerCase())
+    ? (view?.decision?.options?.find((o) => o.value === String(action.value ?? ""))
+      ?? (() => {
+        const loose = view?.decision?.options?.filter((o) => o.value.toLowerCase() === String(action.value ?? "").toLowerCase()) ?? [];
+        return loose.length === 1 ? loose[0] : null;
+      })())
     : null);
   for (const action of unique) {
     const opt = optionFor(action);

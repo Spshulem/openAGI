@@ -149,4 +149,23 @@ final class DecisionViewDecodingTests: XCTestCase {
         XCTAssertEqual(DecisionContract.clean("see paseo:srv_x.123 now"), "see now")
     }
 
+
+    /// Answers that differ only in case (branch names, paths) are both kept.
+    func testAnswersDifferingOnlyInCaseAreBothOffered() throws {
+        let json = """
+        {"id": "fq_case", "kind": "approval", "headline": "Which branch?", "options": ["delete Feature", "delete feature"],
+         "primaryAction": {"op": "answer", "label": "Delete Feature", "value": "delete Feature"},
+         "secondaryAction": {"op": "answer", "label": "Delete feature", "value": "delete feature"},
+         "extraActions": [],
+         "decisionView": {"version": 1, "goal": {"title": null, "text": "Clean up branches", "unknown": false},
+           "status": {"done": [], "blocked": [], "unverified": [], "prs": [], "unknown": true},
+           "decision": {"question": "Which branch should I delete?", "options": [
+             {"value": "delete Feature", "label": "Delete Feature", "consequence": null, "adminBypass": false, "recommended": false},
+             {"value": "delete feature", "label": "Delete feature", "consequence": null, "adminBypass": false, "recommended": false}], "unknown": false},
+           "recommendation": {"option": null, "label": null, "why": null, "unknown": true}, "unknowns": [], "evidence": []}}
+        """
+        let card = try JSONDecoder().decode(SupervisorCard.self, from: Data(json.utf8))
+        XCTAssertEqual(DecisionContract.choices(for: card).map { $0.action.value ?? "" }, ["delete Feature", "delete feature"])
+    }
+
 }

@@ -245,3 +245,24 @@ test("review: a grouped question never takes a member's transcript into its stat
   assert.equal(card.decisionView.status.prs.length, 0);
   assert.doesNotMatch(JSON.stringify(card.decisionView), /#900/);
 });
+
+test("review: answers that differ only in case are both kept", () => {
+  const card = buildSupervisorCard({
+    id: "fq_case", kind: "agent-ask", status: "open", threadKey: "paseo:s.case",
+    title: "Which branch should I delete?", options: ["delete Feature", "delete feature"],
+    contextSnapshot: { recentMessages: [{ role: "user", text: "Clean up the branches" }, { role: "assistant", text: "Two branches differ only in case. Which branch should I delete?" }] }
+  }, { now: NOW });
+  const values = [card.primaryAction, card.secondaryAction, ...card.extraActions].filter((a) => a.op === "answer").map((a) => a.value);
+  assert.deepEqual(values.sort(), ["delete Feature", "delete feature"].sort());
+});
+
+test("review: the live message's unverified work is reported", () => {
+  const progress = Array.from({ length: 14 }, (_, i) => `Step ${i + 1} of the release checklist finished cleanly with every artifact uploaded and signed by the release key.`).join(" ");
+  const live = `${progress} Production deployment is not verified. Ship or hold?`;
+  const card = buildSupervisorCard({
+    id: "fq_live", kind: "agent-ask", status: "open", threadKey: "paseo:s.live",
+    title: "Ship or hold?", options: ["ship", "hold"], askContext: "Ship or hold?",
+    contextSnapshot: { agentSummary: "Release prep started.", recentMessages: [{ role: "user", text: "Cut the release" }, { role: "assistant", text: "Ship or hold?" }] }
+  }, { now: NOW, threadsByKey: new Map([["paseo:s.live", { key: "paseo:s.live", lastAgentFull: live }]]) });
+  assert.ok(card.decisionView.status.unverified.some((s) => /Production deployment is not verified/.test(s)), JSON.stringify(card.decisionView.status));
+});

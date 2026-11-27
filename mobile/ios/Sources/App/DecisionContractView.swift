@@ -17,7 +17,7 @@ struct DecisionChoice: Equatable, Identifiable {
     let recommended: Bool
     let adminBypass: Bool
 
-    var id: String { DecisionContract.normalized(action.value ?? label) }
+    var id: String { "\(action.op):\(DecisionContract.identity(action.value ?? label))" }
 
     /// What VoiceOver reads after the label, and what UI tests assert on.
     var accessibilityValue: String {
@@ -35,6 +35,12 @@ enum DecisionContract {
     /// two spellings of one option are recognised as the same option.
     static func normalized(_ text: String?) -> String {
         cleanLabel(text ?? "").lowercased()
+    }
+
+    /// Exact identity of an answer: trimmed, without the "(admin bypass)"
+    /// suffix, case kept ("delete Feature" and "delete feature" differ).
+    static func identity(_ text: String?) -> String {
+        cleanLabel(text ?? "").replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 
     static func cleanLabel(_ label: String) -> String {
@@ -73,7 +79,7 @@ enum DecisionContract {
     static func passthrough(_ actions: [SupervisorCardAction]) -> [DecisionChoice] {
         var seen = Set<String>()
         return actions.compactMap { action in
-            let key = "\(action.op.lowercased()):\(normalized(action.value ?? action.label))"
+            let key = "\(action.op.lowercased()):\(identity(action.value ?? action.label))"
             guard !action.label.isEmpty, seen.insert(key).inserted else { return nil }
             return DecisionChoice(action: action, label: cleanLabel(action.label), consequence: nil,
                                   recommended: action.recommended, adminBypass: action.adminBypass)
@@ -87,10 +93,10 @@ enum DecisionContract {
     static func choices(for card: SupervisorCard) -> [DecisionChoice] {
         guard let view = card.decisionView, ownsActions(card) else { return [] }
         let options = view.decision.options
-        let recommendedKey = view.recommendation.unknown ? "" : normalized(view.recommendation.option ?? view.recommendation.label)
+        let recommendedKey = view.recommendation.unknown ? "" : identity(view.recommendation.option ?? view.recommendation.label)
         func matches(_ option: SupervisorDecisionView.Option, _ action: SupervisorCardAction) -> Bool {
-            let keys = [normalized(option.value), normalized(option.label)]
-            return keys.contains(normalized(action.value)) || keys.contains(normalized(action.label))
+            let keys = [identity(option.value), identity(option.label)]
+            return keys.contains(identity(action.value)) || keys.contains(identity(action.label))
         }
         func isRecommendedKey(_ keys: [String]) -> Bool {
             !recommendedKey.isEmpty && keys.contains(recommendedKey)
@@ -100,7 +106,7 @@ enum DecisionContract {
         var seen = Set<String>()
         let actions = ([card.primaryAction, card.secondaryAction].compactMap { $0 } + card.extraActions).filter { action in
             let op = action.op.lowercased()
-            let value = normalized(action.value)
+            let value = normalized(action.value)  // case-insensitive only for the fixed words below
             return !action.label.isEmpty
                 && !["defer", "dismiss", "open_chat", "reply"].contains(op)
                 && !["dismiss", "later", "open thread"].contains(value)
@@ -112,7 +118,7 @@ enum DecisionContract {
             // when it shares a target (Merge PR / Merge & Deploy on one PR).
             let op = action.op.lowercased()
             let scope = op == "answer" ? "" : "\(op):"
-            let keys = [normalized(label), normalized(action.value), normalized(option?.value)]
+            let keys = [identity(label), identity(action.value), identity(option?.value)]
                 .filter { !$0.isEmpty }
                 .map { scope + $0 }
             guard !keys.isEmpty, keys.allSatisfy({ !seen.contains($0) }) else { continue }
@@ -130,7 +136,7 @@ enum DecisionContract {
         }
         // Options the hub did not turn into a button are still answers.
         for option in options {
-            let keys = [normalized(option.label), normalized(option.value)].filter { !$0.isEmpty }
+            let keys = [identity(option.label), identity(option.value)].filter { !$0.isEmpty }
             guard !keys.isEmpty, keys.allSatisfy({ !seen.contains($0) }) else { continue }
             seen.formUnion(keys)
             let recommended = option.recommended || isRecommendedKey(keys)
@@ -564,7 +570,7 @@ private struct DecisionRecommendationBody: View {
     var body: some View {
         let rec = view.recommendation
         let label = DecisionContract.clean(rec.label)
-            ?? choices.first(where: { $0.id == DecisionContract.normalized(rec.option) })?.label
+            ?? choices.first(where: { DecisionContract.identity($0.action.value) == DecisionContract.identity(rec.option) })?.label
             ?? DecisionContract.clean(rec.option)
         let why = DecisionContract.clean(rec.why)
         if rec.unknown || (label == nil && why == nil) {

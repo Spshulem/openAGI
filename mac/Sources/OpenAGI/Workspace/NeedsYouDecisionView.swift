@@ -48,16 +48,16 @@ struct FleetDecisionPresentation: Equatable {
     let answerActions = card.allActions.filter { action in
       (action.op ?? "answer") == "answer" && !(action.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
-    let recommendedKey = view.recommendation.option.map(normalized)
+    let recommendedKey = view.recommendation.option.map(identity)
 
     var candidates: [FleetDecisionButton] = []
     if !view.decision.options.isEmpty {
       for option in view.decision.options {
         let action = answerActions.first {
-          normalized($0.value ?? "") == normalized(option.value) || normalized($0.label ?? "") == normalized(option.label)
+          identity($0.value ?? "") == identity(option.value) || identity($0.label ?? "") == identity(option.label)
         }
         let bypass = option.adminBypass || action?.adminBypass == true
-        let recommended = option.recommended || action?.recommended == true || recommendedKey == normalized(option.value)
+        let recommended = option.recommended || action?.recommended == true || recommendedKey == identity(option.value)
         candidates.append(FleetDecisionButton(
           value: option.value,
           label: buttonLabel(action?.label ?? option.label, adminBypass: bypass),
@@ -68,7 +68,7 @@ struct FleetDecisionPresentation: Equatable {
     } else {
       for action in answerActions {
         let value = action.value ?? ""
-        let recommended = action.recommended || recommendedKey == normalized(value)
+        let recommended = action.recommended || recommendedKey == identity(value)
         candidates.append(FleetDecisionButton(
           value: value,
           label: buttonLabel(action.label ?? value, adminBypass: action.adminBypass),
@@ -83,10 +83,12 @@ struct FleetDecisionPresentation: Equatable {
       // it takes that the card did not list, plainly.
       let accepted = question.tappableOptions.filter { $0 != "Answer question" && $0 != "Review plan" }
       candidates = candidates.compactMap { button in
-        guard let exact = accepted.first(where: { normalized($0) == normalized(button.value) }) else { return nil }
+        // Exact spelling first; a case-only match counts when it is the only one.
+        let loose = accepted.filter { normalized($0) == normalized(button.value) }
+        guard let exact = accepted.first(where: { identity($0) == identity(button.value) }) ?? (loose.count == 1 ? loose[0] : nil) else { return nil }
         return FleetDecisionButton(value: exact, label: button.label, recommended: button.recommended, adminBypass: button.adminBypass)
       }
-      for option in accepted where !candidates.contains(where: { normalized($0.value) == normalized(option) }) {
+      for option in accepted where !candidates.contains(where: { identity($0.value) == identity(option) }) {
         candidates.append(FleetDecisionButton(value: option, label: question.label(for: option), recommended: false, adminBypass: false))
       }
     }
@@ -116,7 +118,8 @@ struct FleetDecisionPresentation: Equatable {
     var seen = Set<String>()
     var out: [FleetDecisionButton] = []
     for button in ordered {
-      let keys = [normalized(button.value), normalized(button.label)]
+      // Exact identity: answers that differ only in case are different.
+      let keys = [identity(button.value), identity(button.label)]
       if keys.contains(where: { seen.contains($0) }) { continue }
       keys.forEach { seen.insert($0) }
       out.append(button)
@@ -166,6 +169,14 @@ struct FleetDecisionPresentation: Equatable {
   }
 
   /// Lowercased, single-spaced, without a trailing "(admin bypass)".
+  /// An answer's exact identity: trimmed, single-spaced, without the
+  /// "(admin bypass)" suffix, case kept.
+  static func identity(_ text: String) -> String {
+    text.replacingOccurrences(of: #"\(\s*admin bypass\s*\)"#, with: "", options: [.regularExpression, .caseInsensitive])
+      .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
   static func normalized(_ text: String) -> String {
     text.lowercased()
       .replacingOccurrences(of: #"\(\s*admin bypass\s*\)"#, with: "", options: .regularExpression)
@@ -381,7 +392,7 @@ struct NeedsYouDecisionSections: View {
   private func isRecommended(_ option: FleetDecisionView.Option) -> Bool {
     if option.recommended { return true }
     guard let key = view.recommendation.option else { return false }
-    return FleetDecisionPresentation.normalized(key) == FleetDecisionPresentation.normalized(option.value)
+    return FleetDecisionPresentation.identity(key) == FleetDecisionPresentation.identity(option.value)
   }
 
   // MARK: Recommendation
