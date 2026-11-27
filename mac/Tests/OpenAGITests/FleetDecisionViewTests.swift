@@ -203,11 +203,14 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertFalse(text.contains("paseo:"))
     XCTAssertFalse(text.contains("srv_"))
     XCTAssertFalse(text.contains("fq_"))
-    XCTAssertFalse(text.contains("/Users/"))
+    // Paths stay: a permission prompt's command target is the decision.
+    XCTAssertTrue(text.contains("/Users/me/work/repo/file.swift"))
     XCTAssertFalse(text.contains("**"))
     XCTAssertTrue(text.contains("PR · Certificate"))
     XCTAssertTrue(text.contains("#1201 reports · ✅ passed"))
     XCTAssertTrue(text.contains("5/5 resolved; and/or wait."))
+    XCTAssertEqual(FleetDecisionPresentation.displayText("Allow npm test || rm -rf /tmp/build-output?"),
+                   "Allow npm test || rm -rf /tmp/build-output?", "shell operators and paths are command text")
   }
 
   func testClarificationQuestionKeepsItsOwnFlow() throws {

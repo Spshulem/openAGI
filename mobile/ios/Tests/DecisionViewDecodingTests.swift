@@ -97,10 +97,11 @@ final class DecisionViewDecodingTests: XCTestCase {
         XCTAssertEqual(DecisionContract.quickReplies(for: card), ["Tell me more"])
     }
 
-    func testCleanDropsTablesRoutingIdsAndPaths() {
-        let raw = "Ready: | PR | CI |\n|---|---|\nSee paseo:srv_test.0001 in /Users/x/repo/file.swift, 5/5 resolved."
-        XCTAssertEqual(DecisionContract.clean(raw), "See in , 5/5 resolved.")
+    func testCleanDropsTablesAndRoutingIdsButKeepsPathsAndShellOperators() {
+        let raw = "| PR | CI |\n|---|---|\nSee paseo:srv_test.0001 in /Users/x/repo/file.swift, 5/5 resolved."
+        XCTAssertEqual(DecisionContract.clean(raw), "See in /Users/x/repo/file.swift, 5/5 resolved.")
         XCTAssertNil(DecisionContract.clean("| a | b |"))
+        XCTAssertEqual(DecisionContract.clean("Allow npm test || rm -rf /tmp/build-output?"), "Allow npm test || rm -rf /tmp/build-output?")
     }
 
     // MARK: PR #391 review findings

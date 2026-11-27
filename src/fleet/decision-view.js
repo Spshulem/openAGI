@@ -99,7 +99,10 @@ function tableToSentences(text) {
 // Plain owner-facing prose: no review-template labels ("[1. Agent Goal]"),
 // no table pipes, no Markdown emphasis, no internal routing sentences.
 export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLines = false } = {}) {
-  const residue = (s) => (s.match(/\|/g) ?? []).length >= 2 || /(?:^|\s)-{3,}(?:\s|$)/.test(s);
+  // Only real table structure is residue: a row framed by pipes ("| PR |
+  // CI |") or a separator ("|---|"). Shell operators ("npm test || rm …",
+  // "a | b | c") are command text and stay.
+  const residue = (s) => /^\s*\|.*\|\s*\.?\s*$/.test(s) || /\|\s*:?-{3,}:?\s*\|/.test(s) || /^\s*:?-{3,}(?:\s+:?-{3,})*\s*\.?\s*$/.test(s);
   const base = tableToSentences(iconsToWords(asText(text)))
     .replace(BRACKET_LABEL_RE, "")
     .replace(/\*\*|__/g, "")
@@ -112,7 +115,6 @@ export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLi
       const body = splitSentences(line.slice(bullet.length))
         .filter((s) => !residue(s) && (!dropRouting || !ROUTING_RE.test(s)))
         .join(" ")
-        .replace(/\|/g, " ")
         .replace(/[ \t]+/g, " ")
         .trim();
       return body ? `${bullet ? "- " : ""}${body}` : (line.trim() ? null : "");
@@ -125,7 +127,6 @@ export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLi
   const t = splitSentences(base.replace(/^\s*[-*•]\s+/gm, ""))
     .filter((s) => !residue(s) && (!dropRouting || !ROUTING_RE.test(s)))
     .join(" ")
-    .replace(/\|/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   return t ? clamp(t, max) : null;
@@ -139,10 +140,18 @@ function splitSentences(text) {
 }
 
 const PR_REF_RE = /#(\d{2,7})\b/;
+const QUALIFIED_PR_RE = /(?:\b([\w.-]+\/[\w.-]+))?#(\d{2,7})\b/;
 
 // Per-PR facts recovered from the agent's tables and the card's PR context.
 function prFacts({ texts = [], prContext = null, prRef = null }) {
+  // Keyed by the repository-qualified reference when the source gives one
+  // (acme/api#123 and acme/web#123 are two PRs); a bare #123 joins the one
+  // qualified PR with that number, if there is exactly one.
   const byRef = new Map();
+  const refOf = (text) => {
+    const m = QUALIFIED_PR_RE.exec(String(text ?? ""));
+    return m ? (m[1] ? `${m[1]}#${m[2]}` : `#${m[2]}`) : null;
+  };
   const add = (ref, title, facts) => {
     if (!ref) return;
     const entry = byRef.get(ref) ?? { ref, title: null, facts: [] };
@@ -155,8 +164,8 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
       const entries = Object.entries(row);
       const refCell = entries.find(([, v]) => PR_REF_RE.test(v));
       if (!refCell) continue;
-      const ref = `#${PR_REF_RE.exec(refCell[1])[1]}`;
-      const title = refCell[1].replace(PR_REF_RE, "").replace(/^\W+|\W+$/g, "").trim() || null;
+      const ref = refOf(refCell[1]);
+      const title = refCell[1].replace(QUALIFIED_PR_RE, "").replace(/^\W+|\W+$/g, "").trim() || null;
       const facts = entries
         .filter(([k]) => k !== refCell[0])
         .filter(([, v]) => v && !/^[-—–]$/.test(v))
@@ -165,13 +174,22 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
     }
   }
   if (prContext && (prContext.ref || prRef)) {
-    const ref = `#${PR_REF_RE.exec(String(prContext.ref ?? prRef))?.[1] ?? ""}`;
-    if (ref !== "#") {
+    const ref = refOf(prContext.ref ?? prRef);
+    if (ref) {
       const facts = [];
       if (prContext.ciState) facts.push(`CI: ${String(prContext.ciState).toLowerCase()}`);
       if (prContext.mergeState) facts.push(`Merge state: ${String(prContext.mergeState).toLowerCase()}`);
       add(ref, prContext.title ?? null, facts);
     }
+  }
+  for (const [key, entry] of [...byRef]) {
+    if (!key.startsWith("#")) continue;
+    const qualified = [...byRef.keys()].filter((k) => !k.startsWith("#") && k.endsWith(key));
+    if (qualified.length !== 1) continue;
+    const target = byRef.get(qualified[0]);
+    if (entry.title && !target.title) target.title = entry.title;
+    for (const f of entry.facts) if (!target.facts.includes(f)) target.facts.push(f);
+    byRef.delete(key);
   }
   return [...byRef.values()].slice(0, 6);
 }
@@ -244,7 +262,7 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
 
   const prs = prFacts({ texts: agentTexts, prContext, prRef });
   // A PR's table row is shown once, as that PR's facts.
-  const isPrRow = (s) => prs.some((p) => s.startsWith(`${p.ref} `) && /:\s/.test(s) && /,|;/.test(s));
+  const isPrRow = (s) => prs.some((p) => [p.ref, `#${p.ref.split("#")[1]}`].some((r) => s.startsWith(`${r} `) || s.startsWith(`${r}:`)) && /:\s/.test(s));
   const blockedList = uniq([
     ...(ctx?.blocked ? splitSentences(cleanDecisionProse(ctx.blocked, { max: 400 })) : []),
     ...statusSentences.filter((s) => (BLOCKED_RE.test(s) || isFailure(s)) && !UNVERIFIED_RE.test(s) && !isPrRow(s))

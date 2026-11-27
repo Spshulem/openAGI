@@ -200,3 +200,26 @@ test("review: failing CI is blocked, not done; icon-only table cells keep their 
   assert.deepEqual(ci["#123"], ["CI: passed"]);
   assert.deepEqual(ci["#124"], ["CI: failed"]);
 });
+
+test("review: shell operators in a permission command are not table residue", () => {
+  const card = buildSupervisorCard({
+    id: "fq_perm2", kind: "prompt", status: "open", threadKey: "paseo:s.perm2",
+    title: "Allow npm test || rm -rf /tmp/build-output?", body: "Allow npm test || rm -rf /tmp/build-output?", options: ["allow", "deny"],
+    meta: { command: "npm test || rm -rf /tmp/build-output" },
+    contextSnapshot: { recentMessages: [{ role: "user", text: "Run the tests" }, { role: "assistant", text: "I need to run npm test || rm -rf /tmp/build-output." }] }
+  }, { now: NOW });
+  assert.match(String(card.decisionView.decision.question), /npm test \|\| rm -rf \/tmp\/build-output/);
+  assert.equal(cleanDecisionProse("Run cat a.log | grep err | wc -l now."), "Run cat a.log | grep err | wc -l now.");
+});
+
+test("review: same-numbered PRs in different repositories stay separate", () => {
+  const table = "| PR | CI |\n|---|---|\n| acme/api#123 | passed |\n| acme/web#123 | failed |\n\nWhich to ship?";
+  const card = buildSupervisorCard({
+    id: "fq_repos", kind: "agent-ask", status: "open", threadKey: "paseo:s.repos",
+    title: "Ship api or web?", options: ["ship api", "ship web"], askContext: table,
+    contextSnapshot: { agentSummary: table, recentMessages: [{ role: "user", text: "Ship the fix" }, { role: "assistant", text: table }] }
+  }, { now: NOW });
+  const prs = Object.fromEntries(card.decisionView.status.prs.map((p) => [p.ref, p.facts]));
+  assert.deepEqual(prs["acme/api#123"], ["CI: passed"]);
+  assert.deepEqual(prs["acme/web#123"], ["CI: failed"]);
+});

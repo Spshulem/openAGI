@@ -179,7 +179,11 @@ struct FleetDecisionPresentation: Equatable {
     var lines: [String] = []
     for line in raw.components(separatedBy: .newlines) {
       let trimmed = line.trimmingCharacters(in: .whitespaces)
-      if trimmed.contains("|") && (trimmed.contains("---") || trimmed.filter({ $0 == "|" }).count >= 2) {
+      // Only real table structure: a row framed by pipes, or a "|---|"
+      // separator. Shell operators ("npm test || rm …") are command text.
+      let isTableRow = trimmed.range(of: #"^\|.*\|\.?$"#, options: .regularExpression) != nil
+        || trimmed.range(of: #"^\|?\s*:?-{3,}"#, options: .regularExpression) != nil
+      if isTableRow {
         let cleaned = trimmed.replacingOccurrences(of: #":?-{3,}:?"#, with: "", options: .regularExpression)
         let cells = cleaned.split(separator: "|")
           .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -193,7 +197,6 @@ struct FleetDecisionPresentation: Equatable {
       .replacingOccurrences(of: "**", with: "")
       .replacingOccurrences(of: #"\b(?:paseo|codex|conductor|claude):[A-Za-z0-9_.\-]+"#, with: "", options: .regularExpression)
       .replacingOccurrences(of: #"\b(?:srv|wks|fq)_[A-Za-z0-9_.\-]+"#, with: "", options: .regularExpression)
-      .replacingOccurrences(of: #"(?<![\w:/.])(?:~|/)[\w.\-]+(?:/[\w.\-]+)+"#, with: "", options: .regularExpression)
       .replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
       .replacingOccurrences(of: #"\(\s*\)"#, with: "", options: .regularExpression)
       .trimmingCharacters(in: .whitespacesAndNewlines)

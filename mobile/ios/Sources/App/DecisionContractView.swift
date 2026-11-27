@@ -177,9 +177,11 @@ enum DecisionContract {
     /// keeps a stray one off the phone. Nil when nothing readable is left.
     static func clean(_ text: String?) -> String? {
         guard let text else { return nil }
+        // Only real table structure is dropped (a row framed by pipes, or a
+        // "|---|" separator); shell operators such as "a || b" are kept.
         let lines = text.components(separatedBy: .newlines).filter { line in
-            let pipes = line.filter { $0 == "|" }.count
-            return pipes < 2 && line.range(of: #"^\s*\|?\s*:?-{3,}"#, options: .regularExpression) == nil
+            line.range(of: #"^\s*\|.*\|\s*\.?\s*$"#, options: .regularExpression) == nil
+                && line.range(of: #"^\s*\|?\s*:?-{3,}"#, options: .regularExpression) == nil
         }
         let cleaned = lines.joined(separator: " ")
             .replacingOccurrences(of: "**", with: "")
