@@ -65,6 +65,17 @@ final class FleetConsumer: ObservableObject {
   @Published var currentQuestionIndex: Int = 0
   /// Whether the collapsible session list in the overlay is expanded.
   @Published var watchingExpanded: Bool = false
+  /// An ask with several questions: the owner's unsent answers and skips,
+  /// by question id, then item id. Mirrored to UserDefaults so a walkthrough
+  /// resumes after a relaunch.
+  @Published private(set) var itemDrafts: [String: [String: FleetQuestionItemDraft]] = [:]
+  /// Open question walkthroughs: question id -> the item index on screen.
+  /// Changes the panel's height.
+  @Published private(set) var walkthroughs: [String: Int] = [:]
+  /// Question ids with an answer_items request in flight.
+  @Published private(set) var itemsInFlight: Set<String> = []
+  /// Each several-question ask's last send result.
+  @Published private(set) var itemNotes: [String: FleetNote] = [:]
 
   /// Bumped by every refresh start and every apply. A refresh publishes only
   /// if nothing newer started or landed meanwhile, so a slow GET can never
@@ -90,11 +101,14 @@ final class FleetConsumer: ObservableObject {
   private let fetchDetail: (URLRequest) async throws -> (Data, URLResponse)
   /// Replies' POSTs; tests stand in for the hub.
   private let send: (URLRequest) async throws -> (Data, URLResponse)
+  private let itemDraftStore: FleetQuestionItemDraftStore
 
   init(fetchDetail: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) },
-       send: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) }) {
+       send: @escaping (URLRequest) async throws -> (Data, URLResponse) = { try await URLSession.shared.data(for: $0) },
+       itemDraftDefaults: UserDefaults = .standard) {
     self.fetchDetail = fetchDetail
     self.send = send
+    self.itemDraftStore = FleetQuestionItemDraftStore(defaults: itemDraftDefaults)
   }
 
   func refresh() async {
@@ -135,6 +149,12 @@ final class FleetConsumer: ObservableObject {
   }
 
   func answer(_ question: FleetQuestion, option: String) async {
+    // An ask with several questions is answered question by question: a
+    // reply to the whole group is never sent (the hub refuses it too).
+    if cardBriefs[question.id]?.hasQuestionItems == true, FleetQuestionItemsLogic.isGroupAnswer(option) {
+      notes[question.id] = FleetNote(text: "Answer each question on its own; a blanket answer is not sent.", isError: true)
+      return
+    }
     await decide(question, body: ["answer": option], dismissed: false)
   }
 
@@ -812,6 +832,169 @@ final class FleetConsumer: ObservableObject {
     refreshOwnsError = false
   }
 
+  // MARK: - Several questions in one ask
+
+  /// The card when this question is an open ask with two or more questions,
+  /// answered one by one. Nil for a single question (the #391 decision
+  /// contract), an update, or a completed acknowledgment.
+  func questionItemsCard(for question: FleetQuestion) -> FleetCardBrief? {
+    guard question.needsYou, let card = cardBriefs[question.id], card.asksQuestionItems else { return nil }
+    return card
+  }
+
+  func itemDraft(_ questionId: String, _ itemId: String) -> FleetQuestionItemDraft? {
+    itemDrafts[questionId]?[itemId]
+  }
+
+  /// The owner picked a choice or typed: the draft for that question. A
+  /// blank answer clears it. Nothing is sent.
+  func setItemAnswer(_ answer: String?, questionId: String, itemId: String) {
+    var drafts = itemDrafts[questionId] ?? [:]
+    let text = answer ?? ""
+    drafts[itemId] = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : FleetQuestionItemDraft(answer: text, skipped: false)
+    storeItemDrafts(drafts, for: questionId)
+  }
+
+  /// Skip for now: sent with the next Send so the agent knows it stays open.
+  func skipItem(questionId: String, itemId: String) {
+    var drafts = itemDrafts[questionId] ?? [:]
+    drafts[itemId] = FleetQuestionItemDraft(answer: nil, skipped: true)
+    storeItemDrafts(drafts, for: questionId)
+  }
+
+  func clearItemDraft(questionId: String, itemId: String) {
+    var drafts = itemDrafts[questionId] ?? [:]
+    drafts[itemId] = nil
+    storeItemDrafts(drafts, for: questionId)
+  }
+
+  /// "Review N questions": opens the walkthrough where the owner left off.
+  /// Sends nothing.
+  func startWalkthrough(_ question: FleetQuestion) {
+    guard let card = questionItemsCard(for: question) else { return }
+    let saved = itemDraftStore.load(question.id).position
+    walkthroughs[question.id] = FleetQuestionItemsLogic.startIndex(items: card.questionItems, drafts: itemDrafts[question.id] ?? [:], saved: saved)
+  }
+
+  func closeWalkthrough(_ questionId: String) {
+    walkthroughs[questionId] = nil
+  }
+
+  /// Back / Next / a jump from the list. The position is saved to resume.
+  func moveWalkthrough(_ questionId: String, to index: Int) {
+    guard let count = cardBriefs[questionId]?.questionItems.count, count > 0 else { return }
+    let clamped = min(max(index, 0), count - 1)
+    walkthroughs[questionId] = clamped
+    var saved = itemDraftStore.load(questionId)
+    saved.drafts = itemDrafts[questionId] ?? [:]
+    saved.position = clamped
+    itemDraftStore.save(saved, for: questionId)
+  }
+
+  func clearItemNote(_ questionId: String) { itemNotes[questionId] = nil }
+
+  /// The request Send would make now.
+  func pendingItemsRequest(for question: FleetQuestion, only: Set<String>? = nil) -> FleetAnswerItemsRequest {
+    guard let card = cardBriefs[question.id], card.hasQuestionItems else { return FleetAnswerItemsRequest() }
+    return FleetQuestionItemsLogic.request(items: card.questionItems, drafts: itemDrafts[question.id] ?? [:], only: only)
+  }
+
+  /// POST /fleet/api/cards/:id/act { op: "answer_items", items, skip }: the
+  /// drafted answers and skips in one request (`only` = Retry of one). The
+  /// result shows per question from the hub's own item states.
+  func sendItemAnswers(_ question: FleetQuestion, only: Set<String>? = nil) async {
+    let qid = question.id
+    guard let card = cardBriefs[qid], card.hasQuestionItems, !itemsInFlight.contains(qid) else { return }
+    let payload = FleetQuestionItemsLogic.request(items: card.questionItems, drafts: itemDrafts[qid] ?? [:], only: only)
+    guard !payload.isEmpty else {
+      itemNotes[qid] = FleetNote(text: "Answer or skip at least one question first.", isError: true)
+      return
+    }
+    itemsInFlight.insert(qid)
+    defer { itemsInFlight.remove(qid) }
+    itemNotes[qid] = nil
+
+    var req = request(path: Self.cardActPath(card.id), method: "POST", timeout: 150)
+    req.httpBody = try? JSONSerialization.data(withJSONObject: payload.body)
+    do {
+      let (data, response) = try await send(req)
+      let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+      switch code {
+      case 200..<300:
+        let decoded = try? JSONDecoder().decode(FleetCardActResponse.self, from: data)
+        if let state = decoded?.state { apply(state) } else { await refresh() }
+        let resultItems = decoded?.result?.items ?? []
+        let items = resultItems.isEmpty ? (cardBriefs[qid]?.questionItems ?? []) : resultItems
+        if isOpen(qid) {
+          storeItemDrafts(FleetQuestionItemsLogic.draftsAfterSend(itemDrafts[qid] ?? [:], sent: payload, items: items), for: qid)
+          itemNotes[qid] = FleetQuestionItemsLogic.outcome(decoded?.result)
+        } else {
+          lastOutcome = "\(Self.named(question)): every question answered."
+        }
+      case 404:
+        await refresh()
+        if isOpen(qid) {
+          itemNotes[qid] = FleetNote(text: Self.serverError(data) ?? "The supervisor couldn't find this card. Your answers are kept.", isError: true)
+        } else {
+          setActionError("\(Self.named(question)): question already closed.")
+        }
+      case 400, 409, 500:
+        await refresh()
+        itemNotes[qid] = FleetNote(text: (Self.serverError(data) ?? "The supervisor couldn't take those answers.") + " Your answers are kept.", isError: true)
+      case 503:
+        itemNotes[qid] = FleetNote(text: "Supervisor isn't available. Your answers are kept.", isError: true)
+      case 401:
+        itemNotes[qid] = FleetNote(text: "Daemon sign-in failed. Your answers are kept.", isError: true)
+      default:
+        itemNotes[qid] = FleetNote(text: "Couldn't reach the supervisor. Your answers are kept.", isError: true)
+      }
+    } catch let error as URLError where error.code == .timedOut {
+      itemNotes[qid] = FleetNote(text: "No reply yet. The answers may still be sending; check each question's state before sending again.", isError: false)
+      await refresh()
+    } catch {
+      itemNotes[qid] = FleetNote(text: "Couldn't reach the supervisor. Your answers are kept.", isError: true)
+    }
+  }
+
+  /// "/fleet/api/cards/<id>/act", the id percent-encoded.
+  static func cardActPath(_ cardId: String) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-_.")
+    return "/fleet/api/cards/\(cardId.addingPercentEncoding(withAllowedCharacters: allowed) ?? cardId)/act"
+  }
+
+  private func storeItemDrafts(_ drafts: [String: FleetQuestionItemDraft], for questionId: String) {
+    let kept = drafts.filter { !$0.value.isEmpty }
+    itemDrafts[questionId] = kept.isEmpty ? nil : kept
+    var saved = itemDraftStore.load(questionId)
+    saved.drafts = kept
+    itemDraftStore.save(saved, for: questionId)
+  }
+
+  /// After each state: saved drafts load for asks newly on screen, drafts a
+  /// delivered question no longer needs drop, and a closed ask forgets its
+  /// drafts, walkthrough and note.
+  private func reconcileQuestionItems(closed: [String]) {
+    for id in closed {
+      itemDraftStore.clear(id)
+      itemDrafts[id] = nil
+      walkthroughs[id] = nil
+      itemNotes[id] = nil
+    }
+    for (qid, card) in cardBriefs where card.hasQuestionItems {
+      let current = itemDrafts[qid] ?? itemDraftStore.load(qid).drafts
+      let pruned = FleetQuestionItemsLogic.pruned(current, items: card.questionItems)
+      if pruned != (itemDrafts[qid] ?? [:]) { storeItemDrafts(pruned, for: qid) }
+      if let index = walkthroughs[qid], !card.questionItems.indices.contains(index) {
+        walkthroughs[qid] = max(0, card.questionItems.count - 1)
+      }
+    }
+    // A card that no longer lists questions (an older hub, or now one left).
+    for qid in walkthroughs.keys where cardBriefs[qid]?.asksQuestionItems != true {
+      walkthroughs[qid] = nil
+    }
+  }
+
   // MARK: - State
 
   func apply(_ state: FleetState) {
@@ -832,6 +1015,7 @@ final class FleetConsumer: ObservableObject {
     }
     openQuestionIDs = Set(state.questions.map(\.id))
     cardBriefs = Dictionary(state.cards.map { ($0.questionKey, $0) }, uniquingKeysWith: { first, _ in first })
+    reconcileQuestionItems(closed: oldQuestions.map(\.id).filter { !open.contains($0) })
     threads = state.threads
     activityEvents = state.activityEvents
     nextTickAt = state.nextTickAt
@@ -909,6 +1093,10 @@ final class FleetConsumer: ObservableObject {
     available = false
     currentQuestionIndex = 0
     watchingExpanded = false
+    // Saved drafts stay on disk: the supervisor may only be away for now.
+    itemDrafts = [:]
+    walkthroughs = [:]
+    itemNotes = [:]
     OverlayState.shared.selectTab(.tasks)
     OverlayState.shared.pruneFleetContext(openIDs: [])
     OverlayState.shared.pruneVoiceContext(openIDs: [], threadKeys: [])

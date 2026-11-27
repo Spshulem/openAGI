@@ -254,6 +254,17 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                                "configured": saved, "apiKeySaved": saved]]])
         case "/workspace/integrations/linear/sync":
             finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
+        case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-question-items-fixture"):
+            finish(object: UITestQuestionItemsFixture.state())
+        case let path where path.hasPrefix("/fleet/api/threads/") && ProcessInfo.processInfo.arguments.contains("--ui-question-items-fixture"):
+            // Not in the latest scan: the Thread sheet shows the card's saved context.
+            finish(status: 404, object: ["error": "Thread not found"])
+        case let path where path.hasPrefix("/fleet/api/cards/") && path.hasSuffix("/act")
+            && ProcessInfo.processInfo.arguments.contains("--ui-question-items-fixture"):
+            let cardID = path.dropFirst("/fleet/api/cards/".count).dropLast("/act".count)
+            let body = Self.body(request).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            let reply = UITestQuestionItemsFixture.act(cardID: String(cardID), body: body)
+            finish(status: reply.status, object: reply.object)
         case "/fleet/api/state" where ProcessInfo.processInfo.arguments.contains("--ui-decision-view-fixture"):
             deliver(status: 200, data: Data(UITestNeedsYouFixture.decisionViewStateJSON.utf8), contentType: "application/json")
         case let path where path.hasPrefix("/fleet/api/threads/") && ProcessInfo.processInfo.arguments.contains("--ui-decision-view-fixture"):

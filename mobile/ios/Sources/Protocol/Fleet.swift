@@ -1311,6 +1311,153 @@ public struct SupervisorSuggestionPlan: Decodable, Sendable, Equatable {
     }
 }
 
+// MARK: - Asks with several questions (card.questionItems, src/fleet/decision-items.js)
+
+/// One of several independent questions in a single ask. Present only when
+/// an ask carries two or more; each is answered, skipped or retried on its
+/// own and never folded into a group reply.
+public struct SupervisorQuestionItem: Decodable, Sendable, Equatable, Identifiable {
+    public struct State: Decodable, Sendable, Equatable {
+        /// "unanswered" | "skipped" | "queued" | "delivered" | "failed".
+        public var status: String
+        public var answer: String?
+        public var at: String?
+        public var detail: String?
+
+        public init(status: String = "unanswered", answer: String? = nil, at: String? = nil, detail: String? = nil) {
+            self.status = status
+            self.answer = answer
+            self.at = at
+            self.detail = detail
+        }
+
+        private enum CodingKeys: String, CodingKey { case status, answer, at, detail }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let raw = (c.lenient(String.self, .status) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            status = Self.known.contains(raw) ? raw : "unanswered"
+            answer = c.lenient(String.self, .answer)
+            at = c.lenient(String.self, .at)
+            detail = c.lenient(String.self, .detail)
+        }
+
+        static let known: Set<String> = ["unanswered", "skipped", "queued", "delivered", "failed"]
+
+        /// Sent to the agent (queued or confirmed): read-only on the phone.
+        public var isSent: Bool { status == "queued" || status == "delivered" }
+        /// Still needs the owner: unanswered, skipped, or failed to send.
+        public var isOpen: Bool { !isSent }
+    }
+
+    public var itemId: String
+    public var index: Int
+    public var label: String?
+    public var question: String
+    public var context: String?
+    public var choices: [String]
+    public var freeText: Bool
+    public var recommendation: String?
+    public var unblocks: String?
+    public var state: State
+
+    public var id: String { itemId }
+
+    public init(itemId: String, index: Int, label: String? = nil, question: String, context: String? = nil,
+                choices: [String] = [], freeText: Bool = true, recommendation: String? = nil,
+                unblocks: String? = nil, state: State = State()) {
+        self.itemId = itemId
+        self.index = index
+        self.label = label
+        self.question = question
+        self.context = context
+        self.choices = choices
+        self.freeText = freeText
+        self.recommendation = recommendation
+        self.unblocks = unblocks
+        self.state = state
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case itemId, index, label, question, context, choices, freeText, recommendation, unblocks, state
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        itemId = c.lenient(String.self, .itemId) ?? ""
+        index = c.lenient(Int.self, .index) ?? 0
+        label = c.lenient(String.self, .label)
+        question = c.lenient(String.self, .question) ?? ""
+        context = c.lenient(String.self, .context)
+        choices = c.lenientList(String.self, .choices).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        // No choices means the answer has to be typed.
+        freeText = (c.lenient(Bool.self, .freeText) ?? true) || choices.isEmpty
+        recommendation = c.lenient(String.self, .recommendation)
+        unblocks = c.lenient(String.self, .unblocks)
+        state = c.lenient(State.self, .state) ?? State()
+    }
+
+    /// "Main decision" for index 0, else the agent's label, else "Question N".
+    public var displayLabel: String {
+        if let label = label?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty { return label }
+        return index == 0 ? "Main decision" : "Question \(index)"
+    }
+}
+
+public struct SupervisorQuestionItemsSummary: Decodable, Sendable, Equatable {
+    public var total: Int
+    public var unanswered: Int
+    public var skipped: Int
+    public var queued: Int
+    public var delivered: Int
+    public var failed: Int
+    /// unanswered + skipped + failed.
+    public var open: Int
+
+    public init(total: Int = 0, unanswered: Int = 0, skipped: Int = 0, queued: Int = 0,
+                delivered: Int = 0, failed: Int = 0, open: Int? = nil) {
+        self.total = total
+        self.unanswered = unanswered
+        self.skipped = skipped
+        self.queued = queued
+        self.delivered = delivered
+        self.failed = failed
+        self.open = open ?? (unanswered + skipped + failed)
+    }
+
+    /// Counted from the items themselves (after a send, before the hub's
+    /// next state arrives).
+    public init(items: [SupervisorQuestionItem]) {
+        func count(_ status: String) -> Int { items.filter { $0.state.status == status }.count }
+        self.init(total: items.count, unanswered: count("unanswered"), skipped: count("skipped"),
+                  queued: count("queued"), delivered: count("delivered"), failed: count("failed"))
+    }
+
+    private enum CodingKeys: String, CodingKey { case total, unanswered, skipped, queued, delivered, failed, open }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let unanswered = c.lenient(Int.self, .unanswered) ?? 0
+        let skipped = c.lenient(Int.self, .skipped) ?? 0
+        let failed = c.lenient(Int.self, .failed) ?? 0
+        self.init(total: c.lenient(Int.self, .total) ?? 0, unanswered: unanswered, skipped: skipped,
+                  queued: c.lenient(Int.self, .queued) ?? 0, delivered: c.lenient(Int.self, .delivered) ?? 0,
+                  failed: failed, open: c.lenient(Int.self, .open))
+    }
+}
+
+/// One answer in an `answer_items` request: the chosen choice's text or the
+/// owner's typed words, for one item.
+public struct SupervisorQuestionItemAnswer: Sendable, Equatable {
+    public var itemId: String
+    public var answer: String
+
+    public init(itemId: String, answer: String) {
+        self.itemId = itemId
+        self.answer = answer
+    }
+}
+
 public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var id: String
     public var questionId: String?
@@ -1363,6 +1510,25 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
     public var labels: [String]
     /// The four-section decision contract; nil from hubs that predate it.
     public var decisionView: SupervisorDecisionView?
+    /// "decision" | "fyi" | ...: an FYI is never an owner ask.
+    public var askType: String?
+    /// Two or more independent questions in this ask; empty otherwise.
+    public var questionItems: [SupervisorQuestionItem]
+    public var questionItemsSummary: SupervisorQuestionItemsSummary?
+
+    /// Whether this card is answered question by question. Completions and
+    /// FYIs never are, whatever they carry.
+    public var hasQuestionWalkthrough: Bool {
+        guard questionItems.count >= 2 else { return false }
+        if (kind ?? "").lowercased() == "completed" { return false }
+        if (askType ?? "").lowercased() == "fyi" { return false }
+        return true
+    }
+
+    /// The hub's counts, else counted from the items.
+    public var questionItemsCounts: SupervisorQuestionItemsSummary {
+        questionItemsSummary ?? SupervisorQuestionItemsSummary(items: questionItems)
+    }
 
     public init(id: String, questionId: String? = nil, kind: String? = nil, kindLabel: String? = nil,
                 slice: String? = nil, headline: String, needsYou: Bool = true, decisionHeadline: String? = nil,
@@ -1380,7 +1546,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
                 openChat: FleetOpenChat? = nil, project: String? = nil, plan: SupervisorSuggestionPlan? = nil,
                 blockingCount: Int = 0, blockingSummary: String? = nil, actorLabel: String? = nil,
                 subchannel: String? = nil, labels: [String] = [],
-                decisionView: SupervisorDecisionView? = nil) {
+                decisionView: SupervisorDecisionView? = nil, askType: String? = nil,
+                questionItems: [SupervisorQuestionItem] = [],
+                questionItemsSummary: SupervisorQuestionItemsSummary? = nil) {
         self.id = id
         self.questionId = questionId
         self.kind = kind
@@ -1431,6 +1599,9 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         self.subchannel = subchannel
         self.labels = labels
         self.decisionView = decisionView
+        self.askType = askType
+        self.questionItems = questionItems
+        self.questionItemsSummary = questionItemsSummary
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1439,6 +1610,7 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         case ciState, mergeState, noticedAt, risky, options, primaryAction, secondaryAction, extraActions
         case prContext, recentMessages, timeline, resources, openChat, project, plan
         case blockingCount, blockingSummary, actorLabel, subchannel, labels, decisionView
+        case askType, questionItems, questionItemsSummary
     }
 
     public init(from decoder: Decoder) throws {
@@ -1493,6 +1665,11 @@ public struct SupervisorCard: Decodable, Sendable, Equatable, Identifiable {
         subchannel = c.lenient(String.self, .subchannel)
         labels = c.lenientList(String.self, .labels)
         decisionView = c.lenient(SupervisorDecisionView.self, .decisionView)
+        askType = c.lenient(String.self, .askType)
+        questionItems = c.lenientList(SupervisorQuestionItem.self, .questionItems)
+            .filter { !$0.itemId.isEmpty && !$0.question.isEmpty }
+            .sorted { $0.index < $1.index }
+        questionItemsSummary = c.lenient(SupervisorQuestionItemsSummary.self, .questionItemsSummary)
     }
 }
 
@@ -1621,22 +1798,29 @@ public struct FleetCardActResult: Decodable, Sendable, Equatable {
     public var message: String?
     public var delivery: FleetDelivery?
     public var state: FleetState?
+    /// "answer_items" | "review_items" | "answer" | ...
+    public var kind: String?
+    /// `answer_items`: every item of the ask with its updated state.
+    public var items: [SupervisorQuestionItem]
 
     public init(ok: Bool = false, status: String? = nil, reason: String? = nil, message: String? = nil,
-                delivery: FleetDelivery? = nil, state: FleetState? = nil) {
+                delivery: FleetDelivery? = nil, state: FleetState? = nil, kind: String? = nil,
+                items: [SupervisorQuestionItem] = []) {
         self.ok = ok
         self.status = status
         self.reason = reason
         self.message = message
         self.delivery = delivery
         self.state = state
+        self.kind = kind
+        self.items = items
     }
 
     private static let failureStatuses: Set<String> = [
         "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "failed", "closed"
     ]
 
-    private enum CodingKeys: String, CodingKey { case result, ok, status, reason, detail, message, delivery, state }
+    private enum CodingKeys: String, CodingKey { case result, ok, status, reason, detail, message, delivery, state, kind, items }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1651,6 +1835,10 @@ public struct FleetCardActResult: Decodable, Sendable, Equatable {
             ?? c.lenient(String.self, .message)
         delivery = inner?.lenient(FleetDelivery.self, .delivery) ?? c.lenient(FleetDelivery.self, .delivery)
         state = c.lenient(FleetState.self, .state) ?? inner?.lenient(FleetState.self, .state)
+        kind = inner?.lenient(String.self, .kind) ?? c.lenient(String.self, .kind)
+        let innerItems = inner?.lenientList(SupervisorQuestionItem.self, .items) ?? []
+        items = (innerItems.isEmpty ? c.lenientList(SupervisorQuestionItem.self, .items) : innerItems)
+            .filter { !$0.itemId.isEmpty }
         ok = decodedOk ?? !(decodedStatus.map { Self.failureStatuses.contains($0) } ?? false)
     }
 }

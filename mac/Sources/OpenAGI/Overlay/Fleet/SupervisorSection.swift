@@ -303,12 +303,17 @@ struct SupervisorSection: View {
         .help("Open context and reply")
       }
 
+      if let itemsCard = fleet.questionItemsCard(for: question) {
+        // Each question inline; "Review N questions" opens them one by one.
+        NeedsYouQuestionList(question: question, card: itemsCard, style: .compact, maxRows: 3)
+      }
+
       if let note = fleet.notes[question.id] {
         FleetNoteRow(note: note) { fleet.clearNote(question.id) }
       }
 
       HStack(spacing: 6) {
-        if !options.isEmpty {
+        if !options.isEmpty || fleet.questionItemsCard(for: question) != nil {
           FleetOptionButtons(question: question, options: options)
             .disabled(busy || offline)
         }

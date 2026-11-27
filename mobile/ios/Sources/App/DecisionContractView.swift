@@ -55,6 +55,9 @@ enum DecisionContract {
     /// still shows its four sections above them.
     static let executableOps: Set<String> = ["merge", "merge_and_deploy", "fix_ci", "preference", "set_preference", "watch_ci"]
     static let localOptions: Set<String> = ["answer question", "review plan"]
+    /// Operations of an ask with several questions: opening the walkthrough
+    /// and sending item answers. Never a decision button of their own.
+    static let walkthroughOps: Set<String> = ["review_items", "answer_items"]
     static let specializedKinds: Set<String> = ["ready", "merge_ready", "pr_ready", "ci_failed", "preference", "suggestion", "completed"]
 
     /// Whether the contract's option buttons replace the card's buttons:
@@ -63,6 +66,10 @@ enum DecisionContract {
     /// completions) keep the hub's executable actions untouched.
     static func ownsActions(_ card: SupervisorCard) -> Bool {
         guard card.decisionView != nil else { return false }
+        // Several questions in one ask are answered one by one in the
+        // walkthrough (QuestionItemsView), never through option buttons.
+        if card.questionItems.count >= 2 { return false }
+        if [card.primaryAction, card.secondaryAction].compactMap({ $0 }).contains(where: { walkthroughOps.contains($0.op.lowercased()) }) { return false }
         if specializedKinds.contains((card.kind ?? "").lowercased()) { return false }
         let actions = [card.primaryAction, card.secondaryAction].compactMap { $0 } + card.extraActions
         if card.primaryAction?.op.lowercased() == "open_chat" { return false }
@@ -80,7 +87,8 @@ enum DecisionContract {
         var seen = Set<String>()
         return actions.compactMap { action in
             let key = "\(action.op.lowercased()):\(identity(action.value ?? action.label))"
-            guard !action.label.isEmpty, seen.insert(key).inserted else { return nil }
+            guard !action.label.isEmpty, !walkthroughOps.contains(action.op.lowercased()),
+                  seen.insert(key).inserted else { return nil }
             return DecisionChoice(action: action, label: cleanLabel(action.label), consequence: nil,
                                   recommended: action.recommended, adminBypass: action.adminBypass)
         }
@@ -109,6 +117,7 @@ enum DecisionContract {
             let value = normalized(action.value)  // case-insensitive only for the fixed words below
             return !action.label.isEmpty
                 && !["defer", "dismiss", "open_chat", "reply"].contains(op)
+                && !walkthroughOps.contains(op)
                 && !["dismiss", "later", "open thread"].contains(value)
         }
         for action in actions {

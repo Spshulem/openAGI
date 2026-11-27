@@ -83,6 +83,11 @@ struct NeedsYouActions: Equatable {
         if isCompletion {
             decisions = []
             dismiss = dismissAction
+        } else if card.hasQuestionWalkthrough || DecisionContract.walkthroughOps.contains((op ?? "").lowercased()) {
+            // Answered question by question in the walkthrough; "Review N
+            // questions" is not an answer and is never sent as one.
+            decisions = []
+            dismiss = dismissAction
         } else if isExplicitAction, let primary = card.primaryAction, !primary.label.isEmpty {
             let extra = card.extraActions.first { $0.op != "defer" && $0.op != "dismiss" && !$0.destructive && !$0.label.isEmpty }
             decisions = [primary] + (extra.map { [$0] } ?? [])
@@ -270,7 +275,9 @@ struct NeedsYouDetailView: View {
                 .padding(.vertical, 2)
             }
 
-            if let decisionView = card.decisionView {
+            if card.hasQuestionWalkthrough {
+                questionItems(card, actions: actions)
+            } else if let decisionView = card.decisionView {
                 contract(card, decisionView, actions: actions)
             } else {
                 legacy(card, digest: digest, actions: actions)
@@ -350,6 +357,52 @@ struct NeedsYouDetailView: View {
         if !decisionView.evidence.isEmpty {
             Section("Evidence") {
                 DecisionEvidenceLinks(evidence: decisionView.evidence)
+            }
+        }
+    }
+
+    /// An ask with several questions: the contract's goal and status, then
+    /// every question in full with "Review N questions", then Reply and
+    /// Later. There is no group answer button.
+    @ViewBuilder
+    private func questionItems(_ card: SupervisorCard, actions: NeedsYouActions) -> some View {
+        if let decisionView = card.decisionView {
+            DecisionContractSections(view: decisionView, choices: [])
+        }
+
+        Section {
+            QuestionItemsSection(card: card, idPrefix: "needs-you")
+        } header: {
+            Text("Questions")
+                .accessibilityIdentifier("needs-you-questions-header")
+        }
+
+        Section {
+            if actions.canReply {
+                Button {
+                    onReplyInChat(card)
+                } label: {
+                    Label("Reply in Supervisor chat", systemImage: "arrowshape.turn.up.left")
+                }
+                .accessibilityIdentifier("needs-you-reply")
+            }
+            let later = card.secondaryAction.flatMap { ["defer", "dismiss"].contains($0.op.lowercased()) && !$0.label.isEmpty ? $0 : nil }
+                ?? actions.dismiss
+            Button {
+                onAct(card, later)
+            } label: {
+                Text(later.label)
+                    .foregroundStyle(Theme.muted)
+            }
+            .disabled(isBusy)
+            .accessibilityIdentifier("needs-you-dismiss")
+        } header: {
+            Text("Actions")
+        }
+
+        if let evidence = card.decisionView?.evidence, !evidence.isEmpty {
+            Section("Evidence") {
+                DecisionEvidenceLinks(evidence: evidence)
             }
         }
     }

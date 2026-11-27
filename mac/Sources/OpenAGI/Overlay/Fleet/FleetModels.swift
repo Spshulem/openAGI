@@ -591,6 +591,11 @@ struct FleetCardBrief: Decodable, Equatable {
   var secondaryAction: FleetCardAction? = nil
   var extraActions: [FleetCardAction] = []
   var suggestedReplies: [String] = []
+  /// An ask with several independent questions (src/fleet/decision-items.js),
+  /// each answered on its own. Empty from a hub before it, and for an ask
+  /// with one question (that keeps the single decision contract).
+  var questionItems: [FleetQuestionItem] = []
+  var questionItemsSummary: FleetQuestionItemsSummary? = nil
 
   /// The question this card is about.
   var questionKey: String { questionId ?? id }
@@ -598,9 +603,23 @@ struct FleetCardBrief: Decodable, Equatable {
   /// primary, secondary, then the extras, in the hub's order.
   var allActions: [FleetCardAction] { [primaryAction, secondaryAction].compactMap { $0 } + extraActions }
 
+  /// Two or more questions: the card is answered question by question.
+  var hasQuestionItems: Bool { questionItems.count >= 2 }
+
+  /// Kinds that only report: a completed or FYI card never shows the
+  /// question walkthrough, even if it lists questions.
+  static let updateKinds: Set<String> = ["completed", "fyi", "update", "info"]
+
+  /// The owner is asked these questions now: an open Needs You card with
+  /// two or more of them. Completed acknowledgments never qualify.
+  var asksQuestionItems: Bool {
+    needsYou && hasQuestionItems && !Self.updateKinds.contains((kind ?? "").lowercased())
+  }
+
   enum CodingKeys: String, CodingKey {
     case id, questionId, needsYou, kind, brief, recommendation, prRef, prUrl, ciState
     case decisionView, primaryAction, secondaryAction, extraActions, suggestedReplies
+    case questionItems, questionItemsSummary
   }
   private enum BriefKeys: String, CodingKey { case context, currentState, whatChanged, decision }
 
@@ -608,7 +627,8 @@ struct FleetCardBrief: Decodable, Equatable {
        context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil,
        recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil,
        decisionView: FleetDecisionView? = nil, primaryAction: FleetCardAction? = nil, secondaryAction: FleetCardAction? = nil,
-       extraActions: [FleetCardAction] = [], suggestedReplies: [String] = []) {
+       extraActions: [FleetCardAction] = [], suggestedReplies: [String] = [],
+       questionItems: [FleetQuestionItem] = [], questionItemsSummary: FleetQuestionItemsSummary? = nil) {
     self.id = id
     self.questionId = questionId
     self.needsYou = needsYou
@@ -626,6 +646,8 @@ struct FleetCardBrief: Decodable, Equatable {
     self.secondaryAction = secondaryAction
     self.extraActions = extraActions
     self.suggestedReplies = suggestedReplies
+    self.questionItems = questionItems
+    self.questionItemsSummary = questionItemsSummary
   }
 
   init(from decoder: Decoder) throws {
@@ -654,6 +676,210 @@ struct FleetCardBrief: Decodable, Equatable {
     secondaryAction = try? c.decodeIfPresent(FleetCardAction.self, forKey: .secondaryAction)
     extraActions = ((try? c.decodeIfPresent([Lossy<FleetCardAction>].self, forKey: .extraActions)) ?? []).compactMap(\.value)
     suggestedReplies = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .suggestedReplies)) ?? []).compactMap(\.value)
+    // One item this build cannot read costs that item; the rest still show.
+    var seenItems = Set<String>()
+    questionItems = ((try? c.decodeIfPresent([Lossy<FleetQuestionItem>].self, forKey: .questionItems)) ?? [])
+      .compactMap(\.value)
+      .filter { seenItems.insert($0.itemId).inserted }
+    questionItemsSummary = try? c.decodeIfPresent(FleetQuestionItemsSummary.self, forKey: .questionItemsSummary)
+  }
+}
+
+/// Where one question of a several-question ask stands, as the hub recorded
+/// it. The hub owns this: the app shows it and never advances it itself.
+struct FleetQuestionItemState: Decodable, Equatable {
+  enum Status: String, Equatable {
+    case unanswered, skipped, queued, delivered, failed
+    /// A status this build does not know: shown, never answered over.
+    case unknown
+  }
+
+  var status: Status = .unanswered
+  var answer: String? = nil
+  var at: String? = nil
+  var detail: String? = nil
+
+  enum CodingKeys: String, CodingKey { case status, answer, at, detail }
+
+  init(status: Status = .unanswered, answer: String? = nil, at: String? = nil, detail: String? = nil) {
+    self.status = status
+    self.answer = answer
+    self.at = at
+    self.detail = detail
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    let raw = ((try? c.decodeIfPresent(String.self, forKey: .status)) ?? nil)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    status = raw.map { Status(rawValue: $0) ?? .unknown } ?? .unanswered
+    answer = FleetQuestionItem.text(c, .answer)
+    at = FleetQuestionItem.text(c, .at)
+    detail = FleetQuestionItem.text(c, .detail)
+  }
+}
+
+/// One question of an ask that carries several: its own words, its choices
+/// (or free text), the agent's recommendation and what answering unblocks.
+/// The recommendation is text only: it is never a preselected answer.
+struct FleetQuestionItem: Decodable, Equatable, Identifiable {
+  let itemId: String
+  /// 0 is the agent's own headline decision ("Main decision").
+  var index: Int = 0
+  var label: String? = nil
+  let question: String
+  var context: String? = nil
+  var choices: [String] = []
+  var freeText: Bool = true
+  var recommendation: String? = nil
+  var unblocks: String? = nil
+  var state = FleetQuestionItemState()
+
+  var id: String { itemId }
+
+  enum CodingKeys: String, CodingKey { case itemId, index, label, question, context, choices, freeText, recommendation, unblocks, state }
+
+  init(itemId: String, index: Int = 0, label: String? = nil, question: String, context: String? = nil,
+       choices: [String] = [], freeText: Bool = true, recommendation: String? = nil, unblocks: String? = nil,
+       state: FleetQuestionItemState = FleetQuestionItemState()) {
+    self.itemId = itemId
+    self.index = index
+    self.label = label
+    self.question = question
+    self.context = context
+    self.choices = choices
+    self.freeText = freeText
+    self.recommendation = recommendation
+    self.unblocks = unblocks
+    self.state = state
+  }
+
+  /// `itemId` and `question` are required: an answer must name its item,
+  /// and a question with no words cannot be answered.
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    guard let itemId = Self.text(c, .itemId) else {
+      throw DecodingError.dataCorruptedError(forKey: .itemId, in: c, debugDescription: "item with no id")
+    }
+    guard let question = Self.text(c, .question) else {
+      throw DecodingError.dataCorruptedError(forKey: .question, in: c, debugDescription: "item with no question")
+    }
+    self.itemId = itemId
+    self.question = question
+    index = ((try? c.decodeIfPresent(Int.self, forKey: .index)) ?? nil) ?? 0
+    label = Self.text(c, .label)
+    context = Self.text(c, .context)
+    var seen = Set<String>()
+    choices = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .choices)) ?? [])
+      .compactMap { $0.value?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty && seen.insert($0).inserted }
+    // With no choices the only way to answer is typing.
+    freeText = (((try? c.decodeIfPresent(Bool.self, forKey: .freeText)) ?? nil) ?? true) || choices.isEmpty
+    recommendation = Self.text(c, .recommendation)
+    unblocks = Self.text(c, .unblocks)
+    state = ((try? c.decodeIfPresent(FleetQuestionItemState.self, forKey: .state)) ?? nil) ?? FleetQuestionItemState()
+  }
+
+  /// "Main decision" for the agent's headline decision, else "3. Canvas pages".
+  var title: String {
+    if index == 0 { return label.map { "Main decision · \($0)" } ?? "Main decision" }
+    return label.map { "\(index). \($0)" } ?? "Question \(index)"
+  }
+
+  /// The choice the recommendation names exactly, if any. A recommendation
+  /// sentence ("The owner recommends separate documents.") names none: it
+  /// stays text, and no choice is tagged, preselected or sent for it.
+  var recommendedChoice: String? {
+    guard let rec = recommendation else { return nil }
+    let key = FleetDecisionPresentation.identity(rec).lowercased()
+    return choices.first { FleetDecisionPresentation.identity($0).lowercased() == key }
+  }
+
+  fileprivate static func text<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> String? {
+    guard let raw = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+/// Counts over a card's questions, as the hub sent them.
+struct FleetQuestionItemsSummary: Decodable, Equatable {
+  var total = 0
+  var unanswered = 0
+  var skipped = 0
+  var queued = 0
+  var delivered = 0
+  var failed = 0
+  var open = 0
+
+  enum CodingKeys: String, CodingKey { case total, unanswered, skipped, queued, delivered, failed, open }
+
+  init(total: Int = 0, unanswered: Int = 0, skipped: Int = 0, queued: Int = 0, delivered: Int = 0, failed: Int = 0, open: Int = 0) {
+    self.total = total
+    self.unanswered = unanswered
+    self.skipped = skipped
+    self.queued = queued
+    self.delivered = delivered
+    self.failed = failed
+    self.open = open
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    func int(_ key: CodingKeys) -> Int { max(0, ((try? c.decodeIfPresent(Int.self, forKey: key)) ?? nil) ?? 0) }
+    total = int(.total)
+    unanswered = int(.unanswered)
+    skipped = int(.skipped)
+    queued = int(.queued)
+    delivered = int(.delivered)
+    failed = int(.failed)
+    open = int(.open)
+  }
+}
+
+/// POST /fleet/api/cards/:id/act -> { result, state }. Only the parts the
+/// question walkthrough reads: what happened to the answers, and each item.
+struct FleetCardActResponse: Decodable {
+  struct Result: Decodable, Equatable {
+    var ok = false
+    var kind: String? = nil
+    var status: String? = nil
+    var detail: String? = nil
+    var items: [FleetQuestionItem] = []
+
+    enum CodingKeys: String, CodingKey { case ok, kind, status, detail, items }
+
+    init(ok: Bool = false, kind: String? = nil, status: String? = nil, detail: String? = nil, items: [FleetQuestionItem] = []) {
+      self.ok = ok
+      self.kind = kind
+      self.status = status
+      self.detail = detail
+      self.items = items
+    }
+
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      ok = ((try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? nil) ?? false
+      kind = FleetQuestionItem.text(c, .kind)
+      status = FleetQuestionItem.text(c, .status)
+      detail = FleetQuestionItem.text(c, .detail)
+      items = ((try? c.decodeIfPresent([Lossy<FleetQuestionItem>].self, forKey: .items)) ?? []).compactMap(\.value)
+    }
+  }
+
+  let result: Result?
+  let state: FleetState?
+
+  enum CodingKeys: String, CodingKey { case result, state }
+
+  init(result: Result?, state: FleetState?) {
+    self.result = result
+    self.state = state
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    result = try? c.decodeIfPresent(Result.self, forKey: .result)
+    state = try? c.decodeIfPresent(FleetState.self, forKey: .state)
   }
 }
 
