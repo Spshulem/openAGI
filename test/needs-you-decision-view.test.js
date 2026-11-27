@@ -148,3 +148,55 @@ test("helpers: table rows become facts, recommendation ties name no option, bypa
   assert.equal(view.decision.options.length, 2);
   assert.ok(view.unknowns.includes("Consequences: not stated for any option"));
 });
+
+// PR #391 review findings (Codex), each reproduced through buildSupervisorCard.
+test("review: transcript secrets never reach the decision view", () => {
+  const token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+  const card = buildSupervisorCard({
+    id: "fq_secret", kind: "agent-ask", status: "open", threadKey: "paseo:s.secret",
+    title: "Deploy or hold?", options: ["deploy", "hold"],
+    askContext: `Deployment is not verified with token ${token}.\n\n| PR | Token |\n|---|---|\n| #5 x | ${token} |`,
+    contextSnapshot: { agentSummary: `Deployment is not verified with token ${token}. Deploy or hold?`, recentMessages: [{ role: "user", text: "Ship it" }, { role: "assistant", text: `Deployment is not verified with token ${token}. Deploy or hold?` }] }
+  }, { now: NOW });
+  assert.doesNotMatch(JSON.stringify(card.decisionView), /ghp_[A-Za-z0-9]{20,}/);
+});
+
+test("review: an option the recommendation rejects is never the recommended one", () => {
+  const card = buildSupervisorCard({
+    id: "fq_neg", kind: "agent-ask", status: "open", threadKey: "paseo:s.neg", mergeAsk: true,
+    title: "Merge #9 over the required review?", options: ["merge now", "wait"],
+    reviewedAt: "2026-11-26T15:00:00Z",
+    reviewBrief: { decision: "Merge #9 now over the required review, or wait?", recommendation: "Wait; do not merge now without the required review." },
+    contextSnapshot: { recentMessages: [{ role: "user", text: "Land #9" }, { role: "assistant", text: "CI is green on #9. Should I merge now over the required review with admin rights, or wait?" }] }
+  }, { now: NOW });
+  assert.equal(card.decisionView.recommendation.option, "wait");
+  assert.notEqual(card.primaryAction.value, "merge now");
+  assert.ok(!card.decisionView.decision.options.find((o) => o.value === "merge now").recommended);
+  assert.equal(matchRecommendedOption("Merge or wait — either works", [{ label: "merge" }, { label: "wait" }]), null, "ambiguous names no option");
+});
+
+test("review: a permission prompt keeps its command and paths", () => {
+  const card = buildSupervisorCard({
+    id: "fq_perm", kind: "prompt", status: "open", threadKey: "paseo:s.perm",
+    title: "Allow rm -rf /tmp/build-output?", body: "Allow rm -rf /tmp/build-output?", options: ["allow", "deny"],
+    meta: { command: "rm -rf /tmp/build-output" },
+    contextSnapshot: { recentMessages: [{ role: "user", text: "Clean the build output" }, { role: "assistant", text: "I need to run rm -rf /tmp/build-output to clean the build." }] }
+  }, { now: NOW });
+  const text = JSON.stringify(card.decisionView.decision) + JSON.stringify(card.decisionView.recommendation);
+  assert.ok(card.decisionContext.decision, "the context has a decision");
+  assert.match(String(card.decisionView.decision.question), /\/tmp\/build-output/, `decision: ${text}`);
+});
+
+test("review: failing CI is blocked, not done; icon-only table cells keep their meaning", () => {
+  const card = buildSupervisorCard({
+    id: "fq_ci", kind: "agent-ask", status: "open", threadKey: "paseo:s.ci",
+    title: "Fix forward or revert #77?", options: ["fix forward", "revert"],
+    askContext: "| PR | CI |\n|---|---|\n| #123 search | ✅ |\n| #124 index | ❌ |\n\nFix forward or revert #77?",
+    contextSnapshot: { pr: { ref: "acme/app#77", ciState: "FAILURE" }, agentSummary: "| PR | CI |\n|---|---|\n| #123 search | ✅ |\n| #124 index | ❌ |\n\nFix forward or revert #77?", recentMessages: [{ role: "user", text: "Fix the indexer" }, { role: "assistant", text: "Fix forward or revert #77?" }] }
+  }, { now: NOW });
+  const view = card.decisionView;
+  assert.ok(view.status.done.every((s) => !/fail/i.test(s)), `done: ${view.status.done.join(" | ")}`);
+  const ci = Object.fromEntries(view.status.prs.map((p) => [p.ref, p.facts]));
+  assert.deepEqual(ci["#123"], ["CI: passed"]);
+  assert.deepEqual(ci["#124"], ["CI: failed"]);
+});

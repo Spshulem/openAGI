@@ -298,7 +298,12 @@ struct NeedsYouDetailView: View {
     /// Reply and Dismiss, then evidence links on their own.
     @ViewBuilder
     private func contract(_ card: SupervisorCard, _ decisionView: SupervisorDecisionView, actions: NeedsYouActions) -> some View {
-        let choices = DecisionContract.choices(for: card)
+        // Plain answers use the contract's options; a specialized card (PR
+        // ready, CI failing, suggestion) keeps the hub's executable actions,
+        // while "Answer question" and "Review plan" stay local below.
+        let choices = DecisionContract.ownsActions(card)
+            ? DecisionContract.choices(for: card)
+            : DecisionContract.passthrough(actions.decisions)
         DecisionContractSections(view: decisionView, choices: choices)
 
         Section {

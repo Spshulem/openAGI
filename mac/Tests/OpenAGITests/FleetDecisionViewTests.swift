@@ -216,4 +216,24 @@ final class FleetDecisionViewTests: XCTestCase {
       """.utf8))
     XCTAssertNil(q.decisionPresentation(card: try card("fq_regression")))
   }
+
+  // MARK: PR #391 review findings
+
+  /// A PR-ready card keeps its own merge buttons: no answer buttons are
+  /// synthesized from its options.
+  func testSpecializedPRCardFallsBackToItsOwnButtons() throws {
+    let json = """
+    {"id": "fq_spec", "questionId": "fq_spec", "kind": "merge_ready",
+     "primaryAction": {"op": "merge", "label": "Merge PR", "value": "acme/app#412"},
+     "extraActions": [{"op": "merge_and_deploy", "label": "Merge & Deploy", "value": "acme/app#412"}],
+     "decisionView": {"version": 1, "goal": {"title": null, "text": "Ship it", "unknown": false},
+       "status": {"done": [], "blocked": [], "unverified": [], "prs": [], "unknown": true},
+       "decision": {"question": "Merge PR #412?", "options": [{"value": "merge now", "label": "Merge now", "consequence": null, "adminBypass": false, "recommended": false}], "unknown": false},
+       "recommendation": {"option": null, "label": null, "why": null, "unknown": true}, "unknowns": [], "evidence": []}}
+    """
+    let card = try JSONDecoder().decode(FleetCardBrief.self, from: Data(json.utf8))
+    XCTAssertNotNil(card.decisionView)
+    XCTAssertNil(FleetDecisionPresentation.make(question: nil, card: card))
+  }
+
 }

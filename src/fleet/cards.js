@@ -910,6 +910,23 @@ function enrichBriefWithDecisionContext(brief, ctx) {
   return brief;
 }
 
+// Every string in an owner-facing structure, redacted (decision context
+// fields come from transcripts too).
+function redactStringsInPlace(value) {
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      if (typeof value[i] === "string") value[i] = redactSecrets(value[i]);
+      else redactStringsInPlace(value[i]);
+    }
+  } else if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v === "string") value[k] = redactSecrets(v);
+      else redactStringsInPlace(v);
+    }
+  }
+  return value;
+}
+
 export function buildSupervisorCard(
   question,
   { rowsByKey = new Map(), threadsByKey = new Map(), prsByKey = new Map(), actions = [], prefs = normalizePreferences(null), blockingResolver = null, activeGoalResolver = null, now = Date.now() } = {}
@@ -1144,9 +1161,12 @@ export function buildSupervisorCard(
     recommendation: decisionContext.recommendation || recommendation,
     prContext,
     prRef,
-    agentTexts: [snap?.agentSummary, question.askContext, thread?.lastAgentFull].filter((t) => typeof t === "string"),
+    // Redacted like every other owner-facing field: transcript text never
+    // reaches the decision view with credentials in it.
+    agentTexts: [snap?.agentSummary, question.askContext, thread?.lastAgentFull].filter((t) => typeof t === "string").map((t) => redactSecrets(t)),
     itemName: decisionContext.itemName ?? sessionTitle
   });
+  redactStringsInPlace(decisionView);
   const aligned = alignActionsWithDecisionView(decisionView, { primaryAction, secondaryAction, extraActions });
   suggestedReplies = cleanSuggestedReplies(suggestedReplies, decisionView);
   for (const field of ["context", "goal", "whatChanged", "whereItStands", "currentState", "decision", "details", "verified", "blocked"]) {

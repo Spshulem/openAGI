@@ -40,6 +40,10 @@ struct FleetDecisionPresentation: Equatable {
   static func make(question: FleetQuestion?, card: FleetCardBrief?) -> FleetDecisionPresentation? {
     guard let card, let view = card.decisionView else { return nil }
     if question?.isClarificationQuestion == true { return nil }
+    // Specialized cards keep their own buttons and handlers: a guarded merge,
+    // merge & deploy, CI fix or preference is not an "answer", and a
+    // suggestion's "Answer question" / "Review plan" are handled locally.
+    if isSpecialized(card: card, question: question) { return nil }
 
     let answerActions = card.allActions.filter { action in
       (action.op ?? "answer") == "answer" && !(action.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -134,6 +138,20 @@ struct FleetDecisionPresentation: Equatable {
       out.append(text)
     }
     return out
+  }
+
+  static let executableOps: Set<String> = ["merge", "merge_and_deploy", "fix_ci", "preference", "set_preference", "watch_ci", "open_chat"]
+  static let specializedKinds: Set<String> = ["ready", "merge_ready", "pr_ready", "ci_failed", "preference", "suggestion", "completed"]
+  static let localOptions: Set<String> = ["answer question", "review plan"]
+
+  static func isSpecialized(card: FleetCardBrief, question: FleetQuestion?) -> Bool {
+    if specializedKinds.contains((card.kind ?? "").lowercased()) { return true }
+    for action in card.allActions {
+      if executableOps.contains((action.op ?? "answer").lowercased()) { return true }
+      if localOptions.contains(normalized(action.label ?? "")) || localOptions.contains(normalized(action.value ?? "")) { return true }
+    }
+    if let options = question?.options, options.contains(where: { localOptions.contains(normalized($0)) }) { return true }
+    return false
   }
 
   /// The option's own words. A bypass is labelled by the caption under the

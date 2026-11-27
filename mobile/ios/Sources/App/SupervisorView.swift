@@ -2473,7 +2473,7 @@ private struct SupervisorCardDeckView: View {
     @ViewBuilder
     private var cardActions: some View {
         let isCompletionOrOpenCard = card.kind == "completed" || card.primaryAction?.op == "open_chat"
-        if card.decisionView != nil && !isCompletionOrOpenCard {
+        if DecisionContract.ownsActions(card) && !isCompletionOrOpenCard {
             contractCardActions
         } else {
             legacyCardActions
@@ -4273,7 +4273,7 @@ private struct ThreadDetailSheet: View {
                         }
 
                         if questionIsOpen {
-                            if let card, card.decisionView != nil {
+                            if let card, DecisionContract.ownsActions(card) {
                                 contractActionBar(card)
                             } else {
                                 decisionActionBar

@@ -102,4 +102,50 @@ final class DecisionViewDecodingTests: XCTestCase {
         XCTAssertEqual(DecisionContract.clean(raw), "See in , 5/5 resolved.")
         XCTAssertNil(DecisionContract.clean("| a | b |"))
     }
+
+    // MARK: PR #391 review findings
+
+    private func specializedCard(kind: String, actions: String, options: String) throws -> SupervisorCard {
+        let json = """
+        {"id": "fq_spec", "questionId": "fq_spec", "kind": "\(kind)", "headline": "PR #412 ready", "options": \(options),
+         \(actions),
+         "decisionView": {"version": 1, "goal": {"title": "Checkout", "text": "Ship the checkout redesign", "unknown": false},
+           "status": {"done": [], "blocked": [], "unverified": [], "prs": [], "unknown": true},
+           "decision": {"question": "Merge PR #412?", "options": [{"value": "merge now", "label": "Merge now", "consequence": null, "adminBypass": false, "recommended": false}, {"value": "later", "label": "Later", "consequence": null, "adminBypass": false, "recommended": false}], "unknown": false},
+           "recommendation": {"option": null, "label": null, "why": null, "unknown": true}, "unknowns": [], "evidence": []}}
+        """
+        return try JSONDecoder().decode(SupervisorCard.self, from: Data(json.utf8))
+    }
+
+    /// A PR-ready card keeps the hub's merge actions: no synthesized
+    /// "answer: merge now" next to Merge PR / Merge & Deploy.
+    func testSpecializedPRCardKeepsTheHubsExecutableActions() throws {
+        let card = try specializedCard(kind: "merge_ready", actions: """
+            "primaryAction": {"op": "merge", "label": "Merge PR", "value": "acme/app#412"},
+            "secondaryAction": {"op": "defer", "label": "Later", "value": "later"},
+            "extraActions": [{"op": "merge_and_deploy", "label": "Merge & Deploy", "value": "acme/app#412"}]
+            """, options: #"["merge now", "later"]"#)
+        XCTAssertFalse(DecisionContract.ownsActions(card))
+        XCTAssertTrue(DecisionContract.choices(for: card).isEmpty, "no answer buttons synthesized from options")
+        let passed = DecisionContract.passthrough([card.primaryAction!] + card.extraActions)
+        XCTAssertEqual(passed.map(\.action.op), ["merge", "merge_and_deploy"], "Merge & Deploy is not deduplicated away by sharing a PR")
+    }
+
+    /// A suggestion's "Answer question" / "Review plan" stay local.
+    func testSuggestionCardKeepsLocalHandlers() throws {
+        let card = try specializedCard(kind: "approval", actions: """
+            "primaryAction": {"op": "answer", "label": "Answer question", "value": "Answer question"},
+            "secondaryAction": {"op": "answer", "label": "Review plan", "value": "Review plan"},
+            "extraActions": []
+            """, options: #"["Answer question", "Review plan"]"#)
+        XCTAssertFalse(DecisionContract.ownsActions(card))
+        XCTAssertTrue(DecisionContract.choices(for: card).isEmpty)
+    }
+
+    /// A permission prompt's command keeps its paths.
+    func testCleanKeepsCommandPaths() {
+        XCTAssertEqual(DecisionContract.clean("Allow rm -rf /tmp/build-output?"), "Allow rm -rf /tmp/build-output?")
+        XCTAssertEqual(DecisionContract.clean("see paseo:srv_x.123 now"), "see now")
+    }
+
 }

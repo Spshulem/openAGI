@@ -43,11 +43,49 @@ enum DecisionContract {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Operations that do more than record an answer (guarded merges, CI
+    /// fixes, preferences) or that the app handles locally. A card carrying
+    /// one keeps the hub's own buttons and their handlers; the contract
+    /// still shows its four sections above them.
+    static let executableOps: Set<String> = ["merge", "merge_and_deploy", "fix_ci", "preference", "set_preference", "watch_ci"]
+    static let localOptions: Set<String> = ["answer question", "review plan"]
+    static let specializedKinds: Set<String> = ["ready", "merge_ready", "pr_ready", "ci_failed", "preference", "suggestion", "completed"]
+
+    /// Whether the contract's option buttons replace the card's buttons:
+    /// only for plain answer decisions. Specialized cards (PR ready, CI
+    /// failing, suggestions with "Answer question" / "Review plan",
+    /// completions) keep the hub's executable actions untouched.
+    static func ownsActions(_ card: SupervisorCard) -> Bool {
+        guard card.decisionView != nil else { return false }
+        if specializedKinds.contains((card.kind ?? "").lowercased()) { return false }
+        let actions = [card.primaryAction, card.secondaryAction].compactMap { $0 } + card.extraActions
+        if card.primaryAction?.op.lowercased() == "open_chat" { return false }
+        for action in actions {
+            if executableOps.contains(action.op.lowercased()) { return false }
+            if localOptions.contains(normalized(action.label)) || localOptions.contains(normalized(action.value)) { return false }
+        }
+        if card.options.contains(where: { localOptions.contains(normalized($0)) }) { return false }
+        return true
+    }
+
+    /// The hub's own actions as choice buttons, unchanged (operation, value,
+    /// handler), for specialized cards on the decision screen.
+    static func passthrough(_ actions: [SupervisorCardAction]) -> [DecisionChoice] {
+        var seen = Set<String>()
+        return actions.compactMap { action in
+            let key = "\(action.op.lowercased()):\(normalized(action.value ?? action.label))"
+            guard !action.label.isEmpty, seen.insert(key).inserted else { return nil }
+            return DecisionChoice(action: action, label: cleanLabel(action.label), consequence: nil,
+                                  recommended: action.recommended, adminBypass: action.adminBypass)
+        }
+    }
+
     /// The decision's options in the order they are offered: the hub's
     /// recommended option first, every option once. Empty without a
-    /// decisionView (the caller keeps its previous buttons).
+    /// decisionView, or for a specialized card (the caller keeps its
+    /// previous buttons).
     static func choices(for card: SupervisorCard) -> [DecisionChoice] {
-        guard let view = card.decisionView else { return [] }
+        guard let view = card.decisionView, ownsActions(card) else { return [] }
         let options = view.decision.options
         let recommendedKey = view.recommendation.unknown ? "" : normalized(view.recommendation.option ?? view.recommendation.label)
         func matches(_ option: SupervisorDecisionView.Option, _ action: SupervisorCardAction) -> Bool {
@@ -70,7 +108,13 @@ enum DecisionContract {
         for action in actions {
             let option = options.first { matches($0, action) }
             let label = option?.label ?? cleanLabel(action.label)
-            let keys = [normalized(label), normalized(action.value), normalized(option?.value)].filter { !$0.isEmpty }
+            // An operation other than a plain answer is its own choice even
+            // when it shares a target (Merge PR / Merge & Deploy on one PR).
+            let op = action.op.lowercased()
+            let scope = op == "answer" ? "" : "\(op):"
+            let keys = [normalized(label), normalized(action.value), normalized(option?.value)]
+                .filter { !$0.isEmpty }
+                .map { scope + $0 }
             guard !keys.isEmpty, keys.allSatisfy({ !seen.contains($0) }) else { continue }
             seen.formUnion(keys)
             let recommended = action.recommended || option?.recommended == true || isRecommendedKey(keys)
@@ -127,8 +171,9 @@ enum DecisionContract {
         }
     }
 
-    /// Display text without raw Markdown tables, emphasis markers, internal
-    /// routing ids or file paths. The hub already cleans the contract; this
+    /// Display text without raw Markdown tables, emphasis markers or internal
+    /// routing ids. File paths stay: a permission prompt's command (e.g.
+    /// "rm -rf /tmp/build") is the decision itself. The hub already cleans the contract; this
     /// keeps a stray one off the phone. Nil when nothing readable is left.
     static func clean(_ text: String?) -> String? {
         guard let text else { return nil }
@@ -140,7 +185,6 @@ enum DecisionContract {
             .replacingOccurrences(of: "**", with: "")
             .replacingOccurrences(of: #"\b(?:paseo|codex|claude):[^\s,;)]+"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"\b(?:srv|wks|fq)_[A-Za-z0-9._-]+"#, with: "", options: .regularExpression)
-            .replacingOccurrences(of: #"(?<![\w.:/])(?:~|/)[\w.-]+(?:/[\w.-]+)+"#, with: "", options: .regularExpression)
             .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? nil : cleaned

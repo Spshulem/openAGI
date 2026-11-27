@@ -15,6 +15,7 @@
 // `missing`, so the caller can ask the owning agent for it before surfacing the
 // ask, or label the gap honestly if the agent cannot be reached.
 
+import { iconsToWords } from "./decision-view.js";
 import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
 
 // How long a new ask is held back while its owning agent supplies missing
@@ -239,7 +240,7 @@ function statusSentences(text) {
     .split(/\n/)
     .flatMap((line) => {
       if (!/^\s*\|.*\|\s*$/.test(line)) { header = null; return [line]; }
-      const cells = line.trim().slice(1, -1).split("|").map((c) => c.replace(/\*\*|`/g, "").replace(/^[✅❌⚠️]\s*/u, "").trim());
+      const cells = line.trim().slice(1, -1).split("|").map((c) => iconsToWords(c.replace(/\*\*|`/g, "")).trim());
       if (cells.every((c) => /^:?-{2,}:?$/.test(c) || !c)) return [];
       if (!header) { header = cells; return []; }
       if (!/#\d{2,7}\b/.test(cells[0] ?? "")) return [];

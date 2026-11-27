@@ -13,11 +13,28 @@ const BRACKET_LABEL_RE = /\[\s*\d+\s*\.[^\]]{0,60}\]\s*/g;
 const SECTION_PREFIX_RE = /^\s*(?:recommend(?:ation|ed)?|decision|goal|status)\s*:\s*/i;
 // Instructions about which agent or session should do the work, and the
 // internal identifiers that come with them, are routing, not the goal.
-const ROUTING_RE = /\b(?:route|routed|routing|re-?route|hand(?:ed|ing)?\s+(?:it\s+)?off|delegate[ds]?)\b[^.;]*\b(?:owner|agent|session|workspace|thread|chat)\b|\bif\s+viable\b|\bpaseo\b|\b(?:srv|wks|fq|msg)_[\w-]{4,}|(?:^|\s)\/(?:home|Users|tmp)\/\S+|\b(?:session|thread)\s+[0-9a-f]{8}(?:-[0-9a-f]{4}){0,4}\b|\bimported-history\b/i;
+const ROUTING_RE = /\b(?:route|routed|routing|re-?route|hand(?:ed|ing)?\s+(?:it\s+)?off|delegate[ds]?)\b[^.;]*\b(?:owner|agent|session|workspace|thread|chat)\b|\bif\s+viable\b|\bpaseo\b|\b(?:srv|wks|fq|msg)_[\w-]{4,}|\b(?:session|thread)\s+[0-9a-f]{8}(?:-[0-9a-f]{4}){0,4}\b|\bimported-history\b/i;
 const UNVERIFIED_RE = /\b(?:not\s+(?:yet\s+)?(?:verified|checked|tested|confirmed|run)|unverified|untested|still\s+(?:running|queued|pending|in\s+progress)|(?:verification|ci|checks?|tests?|run)\s+(?:is\s+|are\s+)?(?:still\s+)?(?:running|queued|pending|in\s+progress)|hasn'?t\s+(?:picked|run|been\s+(?:verified|checked))|no\s+(?:ci|checks?|status)\s+(?:runs?\s+)?(?:has\s+|have\s+)?(?:shown|reported|appeared))\b/i;
 const BLOCKED_RE = /\b(?:blocked|blocker|needs?\s+(?:your|an?|the|one|1)\b|requires?\b|still\s+(?:requires?|needs?|lacks?)|waiting\s+(?:on|for)|can(?:no|')t\s+(?:proceed|merge|approve|continue)|lacks?\b)/i;
 const BYPASS_RE = /\b(?:admin(?:istrator)?\s+(?:rights|override|merge|bypass|privileges)|bypass(?:ing)?|override\s+(?:the\s+)?(?:required\s+)?review|over\s+(?:the\s+)?required\s+review|without\s+(?:the\s+)?(?:required\s+)?(?:review|approval)|skip(?:ping)?\s+(?:the\s+)?(?:required\s+)?review)\b/i;
 const MERGE_RE = /\bmerge\b/i;
+// A failed check or error is a blocker, never completed work; "no failing
+// checks" is not a failure.
+const FAILED_RE = /\b(?:fail(?:s|ed|ing|ure|ures)?|errored|errors?|broken|regress(?:ed|ion)|rejected|crash(?:ed|es|ing)?|timed\s*out)\b/i;
+const NOT_FAILED_RE = /\b(?:no|zero|0|without|none)\s+(?:other\s+|new\s+|more\s+)?(?:failing|failures?|errors?|failed|regressions?)\b|\bnot\s+(?:fail|failing|broken)\b/i;
+const isFailure = (s) => FAILED_RE.test(s) && !NOT_FAILED_RE.test(s);
+// Words that reject what follows ("do not merge now", "rather than merging").
+const NEGATION_RE = /\b(?:do\s+not|don'?t|does\s+not|should\s+not|shouldn'?t|not|never|avoid|instead\s+of|rather\s+than|against)\b[^.;!?]*/gi;
+
+// A status icon that is the whole value says something: it becomes a word.
+// An icon beside its own text is only decoration and is dropped.
+export function iconsToWords(text) {
+  return asText(text)
+    .replace(/(^|[\s|(:])[✅✔☑]\uFE0F?(?=\s*(?:$|[|,;.)]))/gmu, "$1passed")
+    .replace(/(^|[\s|(:])[❌✖✗]\uFE0F?(?=\s*(?:$|[|,;.)]))/gmu, "$1failed")
+    .replace(/(^|[\s|(:])⚠\uFE0F?(?=\s*(?:$|[|,;.)]))/gmu, "$1warning")
+    .replace(/[✅✔☑❌✖✗⚠]\uFE0F?\s*/gu, "");
+}
 const GENERIC_REC_RE = /\bif the caveats above look right\b|\bpick another option\b|\breply below\b|\bopen details\b|^\s*(?:recommend:\s*)?session finished\b/i;
 const WAITS_FOR_REVIEW_RE = /\b(?:wait|after\s+(?:review|approval)|once\s+(?:reviewed|approved)|when\s+(?:reviewed|approved)|teammate|reviewer|stop\s+at)\b/i;
 const STOP_WORDS = new Set(["the", "and", "for", "with", "both", "then", "now", "this", "that", "them", "its", "all", "a", "an", "to", "of", "on", "or", "it"]);
@@ -47,7 +64,7 @@ export function markdownTableRows(text) {
   for (const raw of lines) {
     const line = raw.trim();
     if (!/^\|.*\|$/.test(line)) { header = null; continue; }
-    const cells = line.slice(1, -1).split("|").map((c) => c.replace(/\*\*|__|`/g, "").trim());
+    const cells = line.slice(1, -1).split("|").map((c) => iconsToWords(c.replace(/\*\*|__|`/g, "")).trim());
     if (cells.every((c) => /^:?-{2,}:?$/.test(c) || c === "")) continue;
     if (!header) { header = cells; continue; }
     rows.push(Object.fromEntries(cells.map((c, i) => [header[i] || `Column ${i + 1}`, c])));
@@ -66,7 +83,7 @@ function tableToSentences(text) {
       const entries = Object.entries(row).filter(([, v]) => v);
       if (!entries.length) continue;
       const [[, first], ...rest] = entries;
-      out.push(`${first} — ${rest.map(([k, v]) => `${k}: ${v.replace(/^[✅❌⚠️✔️✖️]\s*/u, "")}`).join("; ")}`);
+      out.push(`${first} — ${rest.map(([k, v]) => `${k}: ${v}`).join("; ")}`);
     }
     buffer = [];
   };
@@ -83,11 +100,10 @@ function tableToSentences(text) {
 // no table pipes, no Markdown emphasis, no internal routing sentences.
 export function cleanDecisionProse(text, { max = 600, dropRouting = true, keepLines = false } = {}) {
   const residue = (s) => (s.match(/\|/g) ?? []).length >= 2 || /(?:^|\s)-{3,}(?:\s|$)/.test(s);
-  const base = tableToSentences(asText(text))
+  const base = tableToSentences(iconsToWords(asText(text)))
     .replace(BRACKET_LABEL_RE, "")
     .replace(/\*\*|__/g, "")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/[✅❌✔✖]\uFE0F?\s*/gu, "");
+    .replace(/`([^`]+)`/g, "$1");
   if (keepLines) {
     // Line structure ("Options:\n- Rotate key") is kept for clients that
     // render it; each line is cleaned on its own.
@@ -144,7 +160,7 @@ function prFacts({ texts = [], prContext = null, prRef = null }) {
       const facts = entries
         .filter(([k]) => k !== refCell[0])
         .filter(([, v]) => v && !/^[-—–]$/.test(v))
-        .map(([k, v]) => `${k}: ${v.replace(/^[✅❌⚠️✔️✖️]\s*/u, "")}`);
+        .map(([k, v]) => `${k}: ${v}`);
       add(ref, title, facts);
     }
   }
@@ -167,18 +183,16 @@ function normalizeWords(text) {
 // The option the recommendation names: an exact phrase first, then a clear
 // word match. A tie names no option rather than guessing.
 export function matchRecommendedOption(recommendation, options) {
-  const rec = asText(recommendation).toLowerCase();
-  if (!rec || !Array.isArray(options) || !options.length) return null;
+  // What the recommendation rejects ("do not merge now") never counts as
+  // what it recommends; an ambiguous match names no option.
+  const rec = asText(recommendation).toLowerCase().replace(NEGATION_RE, " ");
+  if (!rec.trim() || !Array.isArray(options) || !options.length) return null;
   const phrase = options.filter((o) => {
     const label = asText(o.label ?? o).toLowerCase().trim();
-    return label.length >= 3 && rec.includes(label);
+    return label.length >= 3 && new RegExp(`(?:^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-z0-9])`).test(rec);
   });
   if (phrase.length === 1) return phrase[0];
-  if (phrase.length > 1) {
-    const longest = [...phrase].sort((a, b) => asText(b.label ?? b).length - asText(a.label ?? a).length);
-    if (asText(longest[0].label ?? longest[0]).length > asText(longest[1].label ?? longest[1]).length) return longest[0];
-    return null;
-  }
+  if (phrase.length > 1) return null;
   const recWords = new Set(normalizeWords(rec));
   const scored = options.map((o) => {
     const words = normalizeWords(o.label ?? o);
@@ -233,10 +247,10 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
   const isPrRow = (s) => prs.some((p) => s.startsWith(`${p.ref} `) && /:\s/.test(s) && /,|;/.test(s));
   const blockedList = uniq([
     ...(ctx?.blocked ? splitSentences(cleanDecisionProse(ctx.blocked, { max: 400 })) : []),
-    ...statusSentences.filter((s) => BLOCKED_RE.test(s) && !UNVERIFIED_RE.test(s) && !isPrRow(s))
+    ...statusSentences.filter((s) => (BLOCKED_RE.test(s) || isFailure(s)) && !UNVERIFIED_RE.test(s) && !isPrRow(s))
   ]).slice(0, 3);
   const unverified = uniq([...statusSentences, ...agentSentences].filter((s) => UNVERIFIED_RE.test(s) && !isPrRow(s))).slice(0, 3);
-  const done = uniq(statusSentences.filter((s) => !UNVERIFIED_RE.test(s) && !BLOCKED_RE.test(s) && !isPrRow(s))).slice(0, 4);
+  const done = uniq(statusSentences.filter((s) => !UNVERIFIED_RE.test(s) && !BLOCKED_RE.test(s) && !isFailure(s) && !isPrRow(s))).slice(0, 4);
   const status = {
     done: done.map((s) => clamp(s, 240)),
     blocked: blockedList.map((s) => clamp(s, 240)),
@@ -248,7 +262,9 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
   if (!unverified.length) unknowns.push("Unverified: the source does not say what is still unverified");
 
   // 3. Decision: exact choice, each option with its consequence.
-  const question = cleanDecisionProse(ctx?.decision, { max: 500 });
+  // The decision is shown as the source states it: a permission prompt's
+  // command and paths are the decision, not routing.
+  const question = cleanDecisionProse(ctx?.decision, { max: 500, dropRouting: false });
   const decisionText = [ctx?.decision, ...agentTexts].map(asText).join(" ");
   const ctxOptions = Array.isArray(ctx?.options) ? ctx.options : [];
   const rawOptions = (options.length ? options : ctxOptions.map((o) => o.label))
@@ -256,11 +272,11 @@ export function buildDecisionView({ ctx = null, options = [], recommendation = n
   // Supervisor boilerplate ("'Merge now' if the caveats above look right",
   // "reply below with your call") is not a recommendation.
   const rawRec = asText(recommendation);
-  const recText = GENERIC_REC_RE.test(rawRec) ? null : cleanDecisionProse(rawRec.replace(SECTION_PREFIX_RE, "").replace(/^Recommend:\s*/i, ""), { max: 400 });
+  const recText = GENERIC_REC_RE.test(rawRec) ? null : cleanDecisionProse(rawRec.replace(SECTION_PREFIX_RE, "").replace(/^Recommend:\s*/i, ""), { max: 400, dropRouting: false });
   const viewOptions = rawOptions.map((value) => {
     const fromCtx = ctxOptions.find((o) => asText(o.label).toLowerCase() === value.toLowerCase());
     const adminBypass = isAdminBypassOption(value, decisionText);
-    const consequence = cleanDecisionProse(fromCtx?.consequence, { max: 240 })
+    const consequence = cleanDecisionProse(fromCtx?.consequence, { max: 240, dropRouting: false })
       || (adminBypass ? ADMIN_BYPASS_NOTE : null);
     return { value, label: sentenceCase(fromCtx?.label || value), consequence, adminBypass, recommended: false };
   });
