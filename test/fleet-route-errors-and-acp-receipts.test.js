@@ -278,9 +278,34 @@ test("checking a receipt never overwrites a newer send's receipt", async (t) => 
     }
   };
   const client = { connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "srv_bb" }, hosts: [] }) }, agents: { ref: () => ref } };
-  const result = await checkPaseoReceipt({ config: { paseo: { enabled: true } }, thread, store: { dir }, messageHash: "h-old", factory: () => client });
+  const result = await checkPaseoReceipt({ config: { paseo: { enabled: true } }, thread, store: { dir }, messageHash: "h-old", messageId: "m-old", factory: () => client });
   assert.equal(result.confirmed, false);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), newer, "the newer receipt stands");
+});
+
+// Review fix (#393): the same words sent again under another approval are
+// another send; their confirmed turn never settles the older approval.
+test("a later send of the same text never settles an older unconfirmed approval", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acp-receipt-identity-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const thread = paseoThread(antigravityAgent, "srv_bb");
+  const journal = path.join(dir, "paseo-deliveries");
+  fs.mkdirSync(journal, { recursive: true });
+  const file = path.join(journal, `${createHash("sha256").update(thread.key).digest("hex")}.json`);
+  // The third send, "continue" again, pending and about to be confirmed.
+  fs.writeFileSync(file, JSON.stringify({ messageId: "m-3", clientMessageId: "m-3", messageHash: "h-continue", pending: true }));
+  const agent = { ...antigravityAgent, status: "running", activeTurn: { turnId: "acp:m-3" } };
+  const ref = { current: () => agent, timeline: { refetch: async () => ({ agent, entries: [{ item: { type: "user_message", messageId: "m-3" }, seqEnd: 1 }] }) } };
+  const client = { connect: async () => {}, close: async () => {}, hosts: { list: async () => ({ self: { serverId: "srv_bb" }, hosts: [] }) }, agents: { ref: () => ref } };
+  const sup = supervisorWith(t, { threads: [thread] });
+  sup.deps.checkPaseoReceipt = (args) => checkPaseoReceipt({ ...args, factory: () => client });
+  const { entry } = sup.handoffs.enqueue({ key: "approval-1", threadKey: thread.key, message: "continue", reason: "unconfirmed", status: "unconfirmed" });
+  sup.handoffs.update(entry.key, { status: "unconfirmed", receiptMessageId: "m-1" });
+  // Same text, same hash, different send.
+  const direct = await checkPaseoReceipt({ config: { paseo: { enabled: true } }, thread, store: { dir }, messageHash: "h-continue", messageId: "m-1", factory: () => client });
+  assert.equal(direct.confirmed, false);
+  assert.deepEqual(await sup.settleUnconfirmedHandoffs(), []);
+  assert.equal(sup.handoffs.get("approval-1").status, "unconfirmed");
 });
 
 // Review fix (#393): with more unconfirmed handoffs than one scan checks,
@@ -293,6 +318,7 @@ test("unconfirmed handoffs are checked in turn, not always the newest few", asyn
     const key = `paseo:srv_bb.chat_${i}`;
     sup.lastThreads.set(key, { key, kind: "paseo", id: `chat_${i}`, meta: { serverId: "srv_bb" } });
     sup.handoffs.enqueue({ key: `approval-${i}`, threadKey: key, message: `step ${i}`, reason: "unconfirmed", status: "unconfirmed" });
+    sup.handoffs.update(`approval-${i}`, { receiptMessageId: `m-${i}` });
   }
   await sup.settleUnconfirmedHandoffs(null, { limit: 5 });
   await sup.settleUnconfirmedHandoffs(null, { limit: 5 });

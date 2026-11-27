@@ -92,7 +92,7 @@ test("(a) a running agent with an active turn: the answer is queued behind it, l
   assert.equal(res.status, 200);
   assert.equal(res.body.delivery.status, "queued");
   assert.equal(res.body.delivery.outcome, "queued");
-  assert.match(res.body.delivery.detail, /queued and goes to it once that turn ends/);
+  assert.match(res.body.delivery.detail, /mid-turn; your answer is queued/);
   assert.equal(ctx.sent.length, 0, "nothing steered into the running turn");
   const [queued] = ctx.sup.store.queuedOwnerMessages(ctx.thread.key);
   assert.equal(queued.questionId, ctx.question.id, "the queued message is linked to its card (#384)");
@@ -106,6 +106,24 @@ test("(a) a running agent with an active turn: the answer is queued behind it, l
   assert.equal(ctx.sent.length, 1);
   assert.match(ctx.sent[0].text, /Owner answer: yes, write spec\./);
   assert.equal(openQuestion(ctx).status, "answered");
+});
+
+// Review fix (#393): an answer given after the turn ended but before the
+// queue drained went ahead of an earlier queued answer.
+test("(a) a second answer while an earlier one is still queued goes behind it, in order", async (t) => {
+  const ctx = setup(t, { agent: { status: "running", activeTurn: { id: "turn-0" } } });
+  const second = ctx.sup.store.upsertQuestion({ dedupeKey: "ask:bb:second", kind: "agent-ask", threadKey: ctx.thread.key, title: "buildbetter: also migrate the formats?", body: "?", options: ["yes", "later"] });
+  assert.equal((await answerViaQuestions(ctx)).body.delivery.outcome, "queued");
+  // The turn ends; the queue has not drained yet.
+  ctx.setLive({ status: "idle", activeTurn: null });
+  ctx.sup.lastThreads.set(ctx.thread.key, { ...ctx.thread, agentStatus: "idle" });
+  const p = `/fleet/api/questions/${second.id}`;
+  const res = await ctx.route("POST", p, new URL(`http://localhost${p}`), async () => ({ answer: "yes" }), {});
+  assert.equal(res.body.delivery.outcome, "queued");
+  assert.match(res.body.delivery.detail, /Earlier messages to this agent are still queued/);
+  assert.equal(ctx.sent.length, 0, "nothing jumped the queue");
+  const queue = ctx.sup.store.queuedOwnerMessages(ctx.thread.key);
+  assert.deepEqual(queue.map((m) => m.questionId), [ctx.question.id, second.id], "first answer first");
 });
 
 test("(b) a send that times out before its turn is confirmed: ambiguous, the card stays open saying so, and a second tap sends nothing", async (t) => {

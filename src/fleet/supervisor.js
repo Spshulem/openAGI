@@ -2628,6 +2628,25 @@ export class FleetSupervisor {
     // of steering into the running turn. An open prompt is still answered
     // directly (deliverPaseo answers it before it checks for a running turn).
     const queueBehindTurn = queueIfBusy && route === "paseo-send" && thread?.kind === "paseo";
+    // Owner messages already waiting for this chat go first: an answer is
+    // appended behind them (FIFO), never sent ahead of them. Not a prompt's
+    // own answer, which must reach its open prompt directly.
+    const behindBacklog = queueBehindTurn && !expectedPermissionId && this.store.queuedOwnerMessages(thread.key).length > 0;
+    // Linked to the card: if it never reaches the agent (expired, chat
+    // archived, send failed or unconfirmed), the card comes back (#384).
+    // Plain prose in the queue: never read as the answer to a prompt that
+    // opens meanwhile (the drain holds while one is open).
+    const queueAnswer = (why) => {
+      const queued = this.store.enqueueOwnerMessage({ threadKey: thread.key, message, source: "owner-answer", questionId: question.id, questionAnswer: answer });
+      const detail = queued
+        ? `${why}; your answer is queued and goes to it once the agent is free.`
+        : `${why} and your answer could not be queued (queue full or disk write failed); nothing was sent.`;
+      const action = this.store.recordAction({ threadKey: thread.key, playbook: "owner-answer", questionId: question.id, status: queued ? "queued" : "blocked", route: "paseo-queue", detail });
+      if (!queued) return { delivery: { status: "blocked", route: "paseo-queue", actionId: action?.id ?? null, detail } };
+      this.scheduleQueuedOwnerMessageDrain();
+      return { queuedBehindTurn: true, delivery: { status: "queued", queued: true, queueId: queued.id ?? null, route: "paseo-queue", actionId: action?.id ?? null, detail } };
+    };
+    if (behindBacklog) return queueAnswer("Earlier messages to this agent are still queued");
     let delivery;
     if (!thread || !route) {
       const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
@@ -2638,20 +2657,7 @@ export class FleetSupervisor {
       delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt, ownerChoice, expectedPermissionId, ...(queueBehindTurn ? { queue: true } : {}), ...(risky ? { typedOnly: true } : {}) });
       progress.dispatching = false;
       progress.delivery = delivery;
-      if (queueBehindTurn && delivery?.status === "busy") {
-        // Linked to the card: if it never reaches the agent (expired, chat
-        // archived, send failed or unconfirmed), the card comes back (#384).
-        // Plain prose in the queue: never read as the answer to a prompt
-        // that opens meanwhile (the drain holds while one is open).
-        const queued = this.store.enqueueOwnerMessage({ threadKey: thread.key, message, source: "owner-answer", questionId: question.id, questionAnswer: answer });
-        const detail = queued
-          ? "The agent is mid-turn; your answer is queued and goes to it once that turn ends."
-          : "The agent is mid-turn and your answer could not be queued (queue full or disk write failed); nothing was sent.";
-        const action = this.store.recordAction({ threadKey: thread.key, playbook: "owner-answer", questionId: question.id, status: queued ? "queued" : "blocked", route: "paseo-queue", detail });
-        if (!queued) return { delivery: { status: "blocked", route: "paseo-queue", actionId: action?.id ?? null, detail } };
-        this.scheduleQueuedOwnerMessageDrain();
-        return { queuedBehindTurn: true, delivery: { status: "queued", queued: true, queueId: queued.id ?? null, route: "paseo-queue", actionId: action?.id ?? null, detail } };
-      }
+      if (queueBehindTurn && delivery?.status === "busy") return queueAnswer("The agent is mid-turn");
       if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
       // Starts the cooldown but does not spend the no-progress nudge budget.
@@ -3041,7 +3047,7 @@ export class FleetSupervisor {
       // never sent again, even after other messages replace its receipt.
       if (delivery.unconfirmed) {
         this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "unconfirmed", createdAt: approvalStartedAt });
-        this.handoffs.update(key, { status: "unconfirmed", detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+        this.handoffs.update(key, { status: "unconfirmed", receiptMessageId: delivery.messageId ?? null, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
       }
       if (delivery.status === "sent") {
         this.handoffs.enqueue({ key, threadKey: thread.key, serverId: thread.meta?.serverId ?? null, message: text, reason: "sent", createdAt: approvalStartedAt });
@@ -3088,7 +3094,7 @@ export class FleetSupervisor {
     this._handoffSettleCheckedAt ??= new Map();
     const checkedAt = this._handoffSettleCheckedAt;
     const eligible = this.handoffs.entries
-      .filter((entry) => entry.status === "unconfirmed" && typeof entry.message === "string" && entry.message
+      .filter((entry) => entry.status === "unconfirmed" && typeof entry.message === "string" && entry.message && entry.receiptMessageId
         && now - (Date.parse(entry.updatedAt ?? entry.createdAt ?? "") || 0) < HANDOFF_SETTLE_MS);
     const live = new Set(eligible.map((entry) => entry.key));
     for (const key of [...checkedAt.keys()]) if (!live.has(key)) checkedAt.delete(key);
@@ -3105,7 +3111,7 @@ export class FleetSupervisor {
       const text = entry.message.trim();
       const messageHash = shortHash(text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`);
       let result;
-      try { result = await check({ config: this.config, thread, store: this.store, messageHash, factory: this.deps.paseoFactory }); }
+      try { result = await check({ config: this.config, thread, store: this.store, messageHash, messageId: entry.receiptMessageId, factory: this.deps.paseoFactory }); }
       catch { continue; }
       if (!result?.confirmed) continue;
       const detail = result.systemError
@@ -3179,7 +3185,7 @@ export class FleetSupervisor {
         if (delivery?.status === "sent") {
           this.handoffs.update(entry.key, { status: "delivered", attempts, deliveredAt: new Date(this.now()).toISOString(), deliveredActionId: delivery.actionId ?? null, detail: delivery.detail ?? "sent" });
         } else if (delivery?.unconfirmed) {
-          this.handoffs.update(entry.key, { status: "unconfirmed", attempts, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
+          this.handoffs.update(entry.key, { status: "unconfirmed", attempts, receiptMessageId: delivery.messageId ?? null, detail: `${clampText(delivery.detail ?? "", 160)}; not sent again so it cannot arrive twice` });
         } else if (delivery?.status === "busy" || delivery?.busy === true) {
           this.handoffs.update(entry.key, { attempts, nextTryAt: new Date(this.now() + HANDOFF_RETRY_MS).toISOString(), detail: "held: the chat is mid-turn; it waits until its current turn finishes" });
         } else if (delivery?.permissionRequired === true || /pending permission prompt; a held handoff is never sent into it|permission prompt pending/i.test(String(delivery?.detail ?? ""))) {

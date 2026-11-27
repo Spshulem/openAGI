@@ -846,8 +846,10 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
 // journaled hash of what was sent) once its turn is confirmed, so a send
 // whose turn started late (an ACP host) ends delivered. Never sends.
 // Returns { confirmed, systemError } or { confirmed: false, detail }.
-export async function checkPaseoReceipt({ config, thread, store, messageHash, factory } = {}) {
-  if (!config?.paseo?.enabled || thread?.kind !== "paseo" || !store?.dir || !messageHash) return { confirmed: false, detail: "not a Paseo receipt" };
+// messageId: the exact send being settled (the same words sent again under
+// another approval are another send, never evidence for this one).
+export async function checkPaseoReceipt({ config, thread, store, messageHash, messageId, factory } = {}) {
+  if (!config?.paseo?.enabled || thread?.kind !== "paseo" || !store?.dir || !messageHash || !messageId) return { confirmed: false, detail: "not a Paseo receipt" };
   const file = path.join(store.dir, "paseo-deliveries", `${createHash("sha256").update(thread.key).digest("hex")}.json`);
   // Serialized with sends to this chat (deliverPaseo holds the same guard):
   // a send in progress owns the receipt, and its new one must not be
@@ -855,7 +857,7 @@ export async function checkPaseoReceipt({ config, thread, store, messageHash, fa
   if (active.has(file)) return { confirmed: false, detail: "a send to this chat is in progress" };
   let receipt;
   try { receipt = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return { confirmed: false, detail: "no receipt" }; }
-  if (receipt?.messageHash !== messageHash) return { confirmed: false, detail: "a later send replaced the receipt" };
+  if (receipt?.messageHash !== messageHash || receipt?.messageId !== messageId) return { confirmed: false, detail: "a later send replaced the receipt" };
   if (!receipt.pending) return { confirmed: receipt.delivered !== false && !receipt.sendError, detail: "already settled" };
   // Writes only while the journal still holds this receipt.
   const saveIfCurrent = (next) => {
@@ -950,6 +952,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   let dispatched = false;
   // A prompt's answer was handed to Paseo: a throw now may have answered it.
   let answeringPrompt = false;
+  // The ID of the message this call handed to Paseo: an unconfirmed result
+  // carries it, so a later check settles exactly this send.
+  let sentMessageId = null;
   const markPromptDispatched = () => { dispatched = answeringPrompt = true; };
   let sawOwnBeforeAbort = false;
   try {
@@ -1136,6 +1141,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
       if (changed) return statusCheckFor ? holdForCheck(changed) : blocked(changed);
       if (statusCheckFor) text = PASEO_STATUS_CHECK_TEXT;
       const messageId = randomUUID();
+      sentMessageId = messageId;
       const cursor = timelineCursor(baseline);
       const intent = {
         messageId,
@@ -1245,6 +1251,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
             unconfirmed: true,
             route: "paseo-send",
             actionId,
+            messageId,
             detail: turnOutcome.sawOwn
               ? "Message accepted by Paseo and visible in timeline; agent turn has not started yet. No automatic resend."
               : "Message accepted by Paseo; turn start unconfirmed. No automatic resend."
@@ -1280,6 +1287,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         unconfirmed: true,
         route: "paseo-send",
         actionId,
+        ...(sentMessageId && !answeringPrompt ? { messageId: sentMessageId } : {}),
         detail: answeringPrompt
           ? `The prompt's answer went to Paseo but was not confirmed${errMsg}. No automatic resend.`
           : sawOwnBeforeAbort
