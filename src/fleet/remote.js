@@ -3,7 +3,7 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
-import { MODES, SUPERVISOR_PREFIX, clampText, redactSecrets, resolveFleetConfig, shortHash } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, clampText, deliveryOutcome, redactSecrets, resolveFleetConfig, shortHash, withDeliveryOutcome } from "./contracts.js";
 import { flattenMessage } from "./ui-delivery.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
@@ -219,6 +219,9 @@ export class RemoteFleetSupervisor {
     this.attemptsFile = dataDir ? path.join(dataDir, "fleet-remote-attempts.json") : null;
     this.attempts = this.loadAttempts();
     this.sendRetryDelaysMs = sendRetryDelaysMs;
+    // What became of an owner answer the fleet computer did not take, by
+    // question id, shown on its card (deliveryNote) while it stays open.
+    this.answerNotes = new Map();
   }
   lastReportedMode() {
     if (!this.modeFile) return null;
@@ -280,6 +283,7 @@ export class RemoteFleetSupervisor {
   }
   getState() {
     const state = structuredClone(this.state);
+    this.applyAnswerNotes(state);
     state.questionsAuthoritative = this.questionsAuthoritative;
     state.modeConfirmed = this.questionsAuthoritative;
     const localFixQuestions = this.selfFixHub ? this.selfFixHub.store.openQuestions() : [];
@@ -311,6 +315,53 @@ export class RemoteFleetSupervisor {
       }
     }
     return state;
+  }
+  // A note this server keeps for a card whose answer the fleet computer did
+  // not take; the computer's own note, once it has one, wins.
+  applyAnswerNotes(state) {
+    if (!this.answerNotes.size) return;
+    const open = new Set((state.questions ?? []).map((q) => q?.id).filter(Boolean));
+    for (const id of [...this.answerNotes.keys()]) if (!open.has(id)) this.answerNotes.delete(id);
+    for (const q of state.questions ?? []) {
+      const note = this.answerNotes.get(q?.id);
+      if (note && !q.deliveryNote) q.deliveryNote = note;
+    }
+    for (const card of Array.isArray(state.cards) ? state.cards : []) {
+      const note = this.answerNotes.get(card?.questionId) ?? this.answerNotes.get(card?.id);
+      if (!note || card.deliveryNote) continue;
+      card.deliveryNote = note;
+      card.summary = clampText(`${note} — ${card.summary ?? ""}`, 700);
+    }
+  }
+  // An owner answer or reply the fleet computer did not take, as a result
+  // instead of a throw (which the route reports only as "Fleet supervisor
+  // error"). The computer said no: refused, with its reason. It took the
+  // request but its answer was lost, or it failed while handling it: the
+  // answer may have reached the agent, so it is never sent again from here.
+  // Out of reach: nothing was sent.
+  answerNotTaken(id, answer, error, noun = 'answer', { note = true } = {}) {
+    const raw = clampText(redactSecrets(String(error?.message ?? '').trim()), 200);
+    const status = Number(error?.status);
+    let delivery;
+    if (error?.uncertain === true || (error?.reached && status >= 500)) {
+      delivery = { status: 'blocked', unconfirmed: true, route: null, outcome: 'ambiguous',
+        detail: error?.reached
+          ? `the fleet computer failed while handling it (${raw || `HTTP ${status}`}); it may have reached the agent. Not sent again so it cannot arrive twice`
+          : `${raw || 'The fleet computer took the request but did not answer in time.'} Not sent again so it cannot arrive twice` };
+    } else if (error?.reached && (status === 404 || status === 409)) {
+      delivery = { status: 'blocked', route: null, outcome: 'refused', detail: `the fleet computer no longer has this question open${raw ? ` (${raw})` : ''}; nothing was sent` };
+    } else if (error?.reached) {
+      delivery = { status: 'blocked', route: null, outcome: 'refused', detail: `the fleet computer refused it${raw ? `: ${raw}` : ''}` };
+    } else {
+      delivery = { status: 'blocked', route: null, outcome: 'refused', detail: raw || 'Fleet computer unavailable; nothing was sent. Retry when it is online.' };
+    }
+    const said = clampText(answer, 60);
+    const detail = clampText(delivery.detail.replace(/[.;\s]+$/, ''), 160);
+    if (note) this.answerNotes.set(id, delivery.outcome === 'ambiguous'
+      ? `Your ${noun} "${said}" may have reached the agent, but it was not confirmed. It is not sent again automatically; check the chat before answering again.`
+      : `Your ${noun} "${said}" was not sent: ${detail}`);
+    const question = (this.getState().questions ?? []).find((q) => q?.id === id) ?? null;
+    return { question, delivery };
   }
   beginOutreachDecision(id) {
     this.pendingOutreachDecisions.set(id, (this.pendingOutreachDecisions.get(id) ?? 0) + 1);
@@ -511,9 +562,15 @@ export class RemoteFleetSupervisor {
       this.noteOwnerAck();
       return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
     }
-    const res = await this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    let res;
+    try {
+      res = await this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
+    } catch (error) {
+      return this.answerNotTaken(id, answer, error);
+    }
+    this.answerNotes.delete(id);
     this.noteOwnerAck();
-    return res;
+    return res?.delivery ? { ...res, delivery: withDeliveryOutcome(res.delivery) } : res;
   }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
@@ -543,9 +600,15 @@ export class RemoteFleetSupervisor {
   }
   // Brings back a question the computer's review closed.
   async replyQuestion(id, reply) {
-    const res = await this.request('POST', `/fleet/api/questions/${id}`, { reply });
+    let res;
+    try {
+      res = await this.request('POST', `/fleet/api/questions/${id}`, { reply });
+    } catch (error) {
+      return this.answerNotTaken(id, reply, error, 'reply');
+    }
+    this.answerNotes.delete(id);
     this.noteOwnerAck();
-    return res;
+    return res?.delivery ? { ...res, delivery: withDeliveryOutcome(res.delivery) } : res;
   }
   async reopenReviewed(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { reopen: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
@@ -1030,11 +1093,26 @@ export class RemoteFleetSupervisor {
     try {
       const res = (await this.request('POST', `/fleet/api/cards/${encodeURIComponent(cardId)}/act`, input)).result ?? null;
       if (res?.ok !== false) this.noteOwnerAck();
-      return res;
+      if (res && typeof cardId === 'string') this.answerNotes.delete(cardId.replace(/^question:/, ''));
+      if (!res?.delivery) return res;
+      const delivery = withDeliveryOutcome(res.delivery);
+      return { ...res, delivery, ...(res.outcome ? {} : { outcome: deliveryOutcome(delivery) }) };
     } catch (error) {
       const legacyRouteMissing = Boolean(error.unsupportedRoute) || /unknown fleet route|unsupported fleet request/i.test(String(error?.message ?? ''));
       if (error.status === 404 && !legacyRouteMissing) return null;
-      if (!legacyRouteMissing) throw error;
+      if (!legacyRouteMissing) {
+        // A result, never a throw: refused with the computer's reason, or
+        // ambiguous when it may have run there (never re-sent from here).
+        const qid = String(cardId ?? '').replace(/^question:/, '');
+        const card = (this.getState().cards ?? []).find((c) => c.id === cardId || c.id === qid || c.questionId === qid) ?? null;
+        const op = String(input?.op ?? 'primary').toLowerCase();
+        const action = op === 'secondary' ? card?.secondaryAction : op === 'primary' ? card?.primaryAction : null;
+        const kind = String(action?.op ?? (op === 'primary' || op === 'secondary' ? 'answer' : op));
+        const toAgent = kind === 'answer' || kind === 'reply';
+        const shown = (typeof input?.value === 'string' && input.value.trim()) || action?.value || kind;
+        const { question, delivery } = this.answerNotTaken(card?.questionId ?? qid, shown, error, kind === 'reply' ? 'reply' : 'answer', { note: toAgent });
+        return { ok: false, kind, status: 'blocked', detail: delivery.detail, question, ...(toAgent ? { outcome: delivery.outcome, delivery } : {}) };
+      }
       if (!this.questionsAuthoritative) await this.request('GET', '/fleet/api/state').catch(() => {});
       if (this.questionsAuthoritative) this.state.lastError = null;
       const qid = String(cardId ?? '').replace(/^question:/, '');

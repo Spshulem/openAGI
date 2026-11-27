@@ -759,6 +759,18 @@ export class FleetStore {
     return live ? { ...live } : reopened;
   }
 
+  // An open card whose answer did not reach the agent says so (the same
+  // note a reopened one carries): refused, or sent with no confirmation.
+  // A new answer clears it (answerQuestion).
+  noteQuestionDelivery(id, note) {
+    const question = this._findQuestion(id);
+    if (!question || question.status !== "open" || !note) return null;
+    question.deliveryNote = clampText(note, 240);
+    question.deliveryNoteAt = iso(this.now());
+    this._save();
+    return { ...question };
+  }
+
   reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;

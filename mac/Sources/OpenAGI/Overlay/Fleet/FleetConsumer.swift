@@ -1185,6 +1185,7 @@ final class FleetConsumer: ObservableObject {
   /// render red: the question is still open and nothing reached the agent.
   static func outcome(_ response: FleetQuestionResponse?, dismissed: Bool) -> (text: String, isError: Bool) {
     if dismissed { return ("Dismissed.", false) }
+    if let note = response?.delivery?.outcomeNote { return (note.text, note.isError) }
     let detail = response?.delivery?.detail?.trimmingCharacters(in: .whitespacesAndNewlines)
     let shownDetail = (detail?.isEmpty ?? true) ? nil : detail.map { String($0.prefix(300)) }
     let deliveryStatus = response?.delivery?.status

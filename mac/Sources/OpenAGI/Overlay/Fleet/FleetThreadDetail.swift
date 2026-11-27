@@ -423,6 +423,7 @@ enum FleetThreadOutcome {
 
   /// A typed reply: POST /fleet/api/send, or a question's { reply }.
   static func reply(_ delivery: FleetDelivery?) -> FleetNote {
+    if let note = delivery?.outcomeNote { return note }
     let detail = delivery?.detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let shown = detail.isEmpty ? nil : String(detail.prefix(300))
     switch delivery?.status {

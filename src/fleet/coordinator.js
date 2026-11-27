@@ -398,6 +398,7 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
   }
 
   let emptyWorkspaces = [];
+  const sourceErrors = {};
   if (supervisor?.config?.paseo?.enabled) {
     try {
       const live = await fetchPaseoHostInventory(supervisor.config, { includeArchived, factory });
@@ -407,8 +408,11 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
         const merged = mergeDiscoveredIntoKnown(supervisor, fresh);
         byKey.set(fresh.key, merged);
       }
-    } catch {
-      // Degrade gracefully to cached scan threads when Paseo WS is temporarily unreachable.
+    } catch (error) {
+      // Degrade to the cached scan threads when Paseo is unreachable or
+      // answers badly, and say so (the reply and the daemon log).
+      sourceErrors.paseo = clampText(redactSecrets(String(error?.message ?? error ?? "Paseo unavailable")), 200);
+      supervisor?.noteSourceError?.("paseo", error, "workspaces");
     }
   }
 
@@ -708,7 +712,8 @@ export async function listWorkspaces(supervisor, { query = "", includeArchived =
     query: needle || null,
     totalWorkspaces: workspaces.length,
     totalSessions: filteredSessionsCount,
-    workspaces: workspaces.slice(0, maxWorkspaces)
+    workspaces: workspaces.slice(0, maxWorkspaces),
+    ...(Object.keys(sourceErrors).length ? { sourceErrors } : {})
   };
 }
 

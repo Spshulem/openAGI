@@ -92,6 +92,29 @@ final class FleetOverlayTests: XCTestCase {
     XCTAssertFalse(dismissed.isError)
   }
 
+  /// The hub's outcome decides the line: four answers, four lines.
+  func testOutcomeFieldDecidesTheLine() throws {
+    typealias R = FleetQuestionResponse
+    func line(_ json: String) throws -> (text: String, isError: Bool) {
+      let delivery = try JSONDecoder().decode(FleetDelivery.self, from: Data(json.utf8))
+      return FleetConsumer.outcome(R(question: .init(id: "q", status: "open"), delivery: delivery, state: nil), dismissed: false)
+    }
+    let delivered = try line(#"{"status":"sent","outcome":"delivered"}"#)
+    XCTAssertEqual(delivered.text, "Sent to the agent.")
+    XCTAssertFalse(delivered.isError)
+    let queued = try line(#"{"status":"queued","outcome":"queued","detail":"Saved. It goes to the agent once the Mac can type (secure input is on)."}"#)
+    XCTAssertEqual(queued.text, "Saved. It goes to the agent once the Mac can type (secure input is on).", "the hub's reason for waiting stands")
+    XCTAssertFalse(queued.isError)
+    let ambiguous = try line(#"{"status":"blocked","unconfirmed":true,"outcome":"ambiguous","detail":"turn confirmation timed out"}"#)
+    XCTAssertEqual(ambiguous.text, "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.")
+    XCTAssertTrue(ambiguous.isError)
+    let refused = try line(#"{"status":"blocked","outcome":"refused","detail":"the chat is archived; nothing was sent"}"#)
+    XCTAssertEqual(refused.text, "Not sent: the chat is archived; nothing was sent")
+    XCTAssertTrue(refused.isError)
+    XCTAssertEqual(FleetThreadOutcome.reply(FleetDelivery(status: "queued", detail: nil, outcome: "queued")).text,
+                   "Queued. It goes to the agent as soon as it can take it.")
+  }
+
   func testStatusLine() {
     let now = ISO8601DateFormatter().date(from: "2026-09-29T10:04:00Z")!
     let status = FleetStatus(mode: "propose", enabled: true, running: false,

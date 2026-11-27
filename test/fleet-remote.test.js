@@ -133,7 +133,12 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   const { remote, runtime } = fixture(t);
   await remote.refresh();
   runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
-  await assert.rejects(remote.answerQuestion('fq_one', 'feature'), /unavailable/);
+  // Refused with the reason, never a throw (the route's catch-all) and never
+  // a confirmation.
+  const result = await remote.answerQuestion('fq_one', 'feature');
+  assert.equal(result.delivery.outcome, 'refused');
+  assert.match(result.delivery.detail, /unavailable/);
+  assert.equal(result.question.status ?? 'open', 'open');
   assert.equal(remote.getState().questions.length, 1);
   assert.equal(runtime.outreach.list()[0].status, 'unseen');
   assert.match(remote.getState().lastError, /unavailable/);

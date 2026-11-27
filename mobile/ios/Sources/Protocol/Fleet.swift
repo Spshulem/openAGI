@@ -744,20 +744,26 @@ public struct FleetDelivery: Decodable, Sendable, Equatable {
     public var status: String?
     public var route: String?
     public var detail: String?
+    // What became of an answer or reply: delivered, queued, ambiguous (may
+    // have landed, not confirmed, never re-sent) or refused. Nil from an
+    // older hub, where status decides.
+    public var outcome: String?
 
-    public init(status: String? = nil, route: String? = nil, detail: String? = nil) {
+    public init(status: String? = nil, route: String? = nil, detail: String? = nil, outcome: String? = nil) {
         self.status = status
         self.route = route
         self.detail = detail
+        self.outcome = outcome
     }
 
-    private enum CodingKeys: String, CodingKey { case status, route, detail }
+    private enum CodingKeys: String, CodingKey { case status, route, detail, outcome }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         status = c.lenient(String.self, .status)
         route = c.lenient(String.self, .route)
         detail = c.lenient(String.self, .detail)
+        outcome = c.lenient(String.self, .outcome)
     }
 }
 
@@ -1802,10 +1808,12 @@ public struct FleetCardActResult: Decodable, Sendable, Equatable {
     public var kind: String?
     /// `answer_items`: every item of the ask with its updated state.
     public var items: [SupervisorQuestionItem]
+    // An answer's or reply's outcome (see FleetDelivery.outcome).
+    public var outcome: String?
 
     public init(ok: Bool = false, status: String? = nil, reason: String? = nil, message: String? = nil,
                 delivery: FleetDelivery? = nil, state: FleetState? = nil, kind: String? = nil,
-                items: [SupervisorQuestionItem] = []) {
+                items: [SupervisorQuestionItem] = [], outcome: String? = nil) {
         self.ok = ok
         self.status = status
         self.reason = reason
@@ -1814,13 +1822,14 @@ public struct FleetCardActResult: Decodable, Sendable, Equatable {
         self.state = state
         self.kind = kind
         self.items = items
+        self.outcome = outcome
     }
 
     private static let failureStatuses: Set<String> = [
         "halted", "merge_blocked", "ci_failed", "sha_changed", "not_mergeable", "blocked", "failed", "closed"
     ]
 
-    private enum CodingKeys: String, CodingKey { case result, ok, status, reason, detail, message, delivery, state, kind, items }
+    private enum CodingKeys: String, CodingKey { case result, ok, status, reason, detail, message, delivery, state, kind, items, outcome }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -1839,6 +1848,7 @@ public struct FleetCardActResult: Decodable, Sendable, Equatable {
         let innerItems = inner?.lenientList(SupervisorQuestionItem.self, .items) ?? []
         items = (innerItems.isEmpty ? c.lenientList(SupervisorQuestionItem.self, .items) : innerItems)
             .filter { !$0.itemId.isEmpty }
+        outcome = inner?.lenient(String.self, .outcome) ?? c.lenient(String.self, .outcome) ?? delivery?.outcome
         ok = decodedOk ?? !(decodedStatus.map { Self.failureStatuses.contains($0) } ?? false)
     }
 }
