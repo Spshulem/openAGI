@@ -12,7 +12,7 @@ export const MAX_QUESTION_ITEMS = 20;
 
 // Blanket answers a reviewer may attach to a multi-question ask. They hide
 // the questions and could read as approval, so they are never offered.
-export const GROUP_OPTION_RE = /^\s*(?:answer\s+(?:all|every|each)(?:\s+(?:the|of\s+the))?\s+questions?|approve\s+(?:all\s+)?(?:the\s+)?recommend(?:ed|ations?)(?:\s+(?:choices|options|answers))?|accept\s+(?:all\s+)?(?:the\s+)?recommend(?:ed|ations?)(?:\s+choices)?|approve\s+all|answer\s+questions?|resolve\s+(?:all\s+)?(?:release\s+)?decisions)\s*$/i;
+export const GROUP_OPTION_RE = /^\s*(?:answer\s+(?:all|every|each)(?:\s+(?:the|of\s+the))?\s+questions?|approve\s+(?:all\s+)?(?:the\s+)?recommend(?:ed|ations?)(?:\s+(?:choices|options|answers))?|accept\s+(?:all\s+)?(?:the\s+)?recommend(?:ed|ations?)(?:\s+choices)?|approve\s+all|resolve\s+all\s+(?:release\s+)?decisions)\s*$/i;
 
 const ITEM_START_RE = /^\s*(?:[-*•]\s*)?(\d{1,2})[.)]\s+(.*)$/;
 const LABEL_RE = /^\*\*([^*]{2,80}?)\s*:?\s*\*\*\s*:?\s*(.*)$|^([A-Z][^:?.!]{1,60}):\s+(.*)$/;
@@ -97,7 +97,10 @@ export function extractQuestionItems(text) {
   if (!list) return [];
   return list.slice(0, MAX_QUESTION_ITEMS).map((it) => {
     const raw = it.body.trim();
-    const lm = LABEL_RE.exec(raw);
+    // A bold prefix is a label only when question text follows it; a fully
+    // bolded question ("**Should we add Redis?**") is the question itself.
+    const lm0 = LABEL_RE.exec(raw);
+    const lm = lm0 && String(lm0[2] ?? lm0[4] ?? "").trim() ? lm0 : null;
     const label = lm ? clean(lm[1] ?? lm[3], 80).replace(/:$/, "") : null;
     const rest = lm ? (lm[2] ?? lm[4] ?? "") : raw;
     const parts = sentences(rest);
@@ -112,7 +115,7 @@ export function extractQuestionItems(text) {
       label,
       question,
       context,
-      choices: inferChoices(rest),
+      choices: inferChoices(clean(rest, 1000)),
       freeText: true,
       recommendation,
       unblocks
@@ -183,6 +186,13 @@ export function withItemState(items, itemAnswers = {}) {
   return { items: out, summary };
 }
 
+// The owner's own words, as typed: trimmed and bounded, control characters
+// removed, line breaks, indentation and backticks kept.
+export function ownerAnswerText(value, max = 1200) {
+  const t = String(value ?? "").replace(/\r\n?/g, "\n").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/^\s*\n|\s+$/g, "");
+  return t.length > max ? t.slice(0, max) : t;
+}
+
 export const ANSWERS_ONLY_NOTE = "These are answers to your questions only. They do not approve any merge, deploy, permission or other action; ask for those separately.";
 
 // One plain-text reply to the agent: each answered question by number and
@@ -194,10 +204,13 @@ export function composeItemsReply(items, { answers = [], skipped = [] } = {}) {
   const answered = [];
   for (const entry of answers) {
     const item = byId.get(entry?.itemId);
-    const text = clean(entry?.answer, 1200);
+    const text = ownerAnswerText(entry?.answer);
     if (!item || !text || GROUP_OPTION_RE.test(text)) continue;
     answered.push(item.itemId);
-    lines.push(`${item.index ? `${item.index}. ` : ""}${item.label ? `${item.label}: ` : ""}${text}`);
+    const head = `${item.index ? `${item.index}.` : ""}${item.label ? `${item.index ? " " : ""}${item.label}:` : ""}`;
+    // A multi-line answer (code, config) is sent exactly as typed, on its
+    // own lines below the question it answers.
+    lines.push(text.includes("\n") ? `${head}\n${text}` : `${head}${head ? " " : ""}${text}`);
   }
   const skippedItems = skipped.map((id) => byId.get(id)).filter(Boolean).filter((i) => !answered.includes(i.itemId));
   if (!lines.length && !skippedItems.length) return null;

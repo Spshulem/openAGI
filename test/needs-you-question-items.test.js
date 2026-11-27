@@ -285,3 +285,45 @@ test("review: no surface can send a blanket answer", async (t) => {
   assert.equal(sent.length, 0);
   assert.equal(sup.store.question(q.id).status, "open");
 });
+
+test("review: concurrent submissions for one card are serialized", async (t) => {
+  const { sup, sent, q, items } = await itemsSupervisor(t);
+  const [a] = items();
+  let release;
+  sup.sendOwnerMessage = async (threadKey, text) => { sent.push({ text }); await new Promise((r) => { release = r; }); return { delivery: { status: "sent" } }; };
+  const first = sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "first" }] });
+  await new Promise((r) => setImmediate(r));
+  const second = await sup.actCard(q.id, { op: "answer_items", items: [{ itemId: a.itemId, answer: "second" }] });
+  assert.equal(second.status, "busy");
+  release();
+  assert.equal((await first).status, "delivered");
+  assert.equal(sent.length, 1);
+  assert.equal(items().find((i) => i.itemId === a.itemId).state.answer, "first");
+});
+
+test("review: a multi-line free-text answer is sent as typed", () => {
+  const items = extractQuestionItems(ASK);
+  const code = "if ready:\n    deploy()\nelse:\n    hold()  # `keep`";
+  const out = composeItemsReply(items, { answers: [{ itemId: items[1].itemId, answer: code }] });
+  assert.ok(out.text.includes(`2. Certificates:\n${code}`), out.text);
+});
+
+test("review: a partially answered ask stays open when the agent replies", async (t) => {
+  const { settledAsk } = await import("../src/fleet/supervisor.js");
+  const base = { kind: "agent-ask", status: "open", agentAskedAt: "2026-11-27T17:00:00Z", createdAt: "2026-11-27T17:00:00Z" };
+  const thread = { lastAgentAt: "2026-11-27T18:30:00Z", lastAgentText: "Thanks, I will use the dark theme. I still need your font choice." };
+  const started = settledAsk({ ...base, meta: { itemAnswers: { "q1-a": { status: "delivered", answer: "Dark" } } } }, { thread });
+  assert.equal(started, null, "kept open while questions remain");
+});
+
+test("review: fully bold questions keep their text and choices", () => {
+  const items = extractQuestionItems("1. **Should we use PostgreSQL?**\n2. **Should we add Redis?**");
+  assert.deepEqual(items.map((i) => i.question), ["Should we use PostgreSQL?", "Should we add Redis?"]);
+  assert.deepEqual(items.map((i) => i.label), [null, null]);
+  assert.deepEqual(items[0].choices, ["Yes", "No"]);
+});
+
+test("review: a suggestion's 'Answer question' is not a blanket answer", () => {
+  assert.equal(GROUP_OPTION_RE.test("Answer question"), false);
+  assert.equal(GROUP_OPTION_RE.test("Answer all questions"), true);
+});

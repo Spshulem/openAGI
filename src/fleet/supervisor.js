@@ -358,6 +358,11 @@ export function settledAsk(question, { thread = null, pr = null, prMissing = fal
   if (question.kind === "ready" && notReady) return `PR no longer ready: ${notReady}`;
   if (question.kind !== "agent-ask") return null;
   if (muted) return "muted by owner";
+  // A multi-question ask the owner has started answering stays open until
+  // every question is delivered: the agent's reply to some answers is not
+  // the agent moving on from the rest.
+  const itemAnswers = question.meta?.itemAnswers;
+  if (itemAnswers && typeof itemAnswers === "object" && Object.keys(itemAnswers).length > 0) return null;
   if (threadGone) return `thread ${thread?.excluded ?? "left the scan"}`;
   const spokeAt = Date.parse(agentReply(thread).at ?? "");
   if (!question.mergeAsk && thread && Number.isFinite(spokeAt) && Number.isFinite(askedAt) && spokeAt > askedAt) return "agent moved on: no longer asks";
@@ -2516,6 +2521,20 @@ export class FleetSupervisor {
   // from these answers, and nothing here merges, deploys or approves a
   // permission: the agent is told so in the reply.
   async answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
+    // One submission per ask at a time: a second device's concurrent send
+    // waits its turn instead of passing the same state check.
+    if (this.answering.has(question.id)) {
+      return { ok: false, kind: "answer_items", status: "busy", detail: "Answers for this card are already being sent; try again in a moment." };
+    }
+    this.answering.add(question.id);
+    try {
+      return await this._answerQuestionItems(question, card, { items, skip, deadlineAt });
+    } finally {
+      this.answering.delete(question.id);
+    }
+  }
+
+  async _answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
     const all = Array.isArray(card?.questionItems) ? card.questionItems : [];
     // Only items still open (unanswered, skipped, failed) can be answered or
     // skipped: a stale device can't resend or downgrade a delivered or
