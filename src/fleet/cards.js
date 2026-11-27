@@ -5,6 +5,7 @@
 
 import { clampTailLines, clampText, clampTextLines, parsePaseoThreadKey, parsePrRef, redactSecrets } from "./contracts.js";
 import { buildDecisionView, alignActionsWithDecisionView, cleanSuggestedReplies, cleanDecisionProse } from "./decision-view.js";
+import { questionItemsFor, withItemState, mainDecisionItem, GROUP_OPTION_RE } from "./decision-items.js";
 import { asksToMergePr } from "./policy.js";
 import { buildDecisionContext, groupItemName, isGenericAsk, renderDecisionContext, shouldHoldForContext } from "./decision-context.js";
 import { buildProgressivePreferenceCards, isSuppressedByQuietCadence, normalizePreferences, SAFE_SLICES } from "./preferences.js";
@@ -1170,7 +1171,47 @@ export function buildSupervisorCard(
     itemName: decisionContext.itemName ?? sessionTitle
   });
   redactStringsInPlace(decisionView);
-  const aligned = alignActionsWithDecisionView(decisionView, { primaryAction, secondaryAction, extraActions });
+  let aligned = alignActionsWithDecisionView(decisionView, { primaryAction, secondaryAction, extraActions });
+
+  // An ask carrying several independent questions is shown as those
+  // questions (each with choices or free text, recommendation and what it
+  // unblocks), answered one at a time in a walkthrough. A blanket "Answer all
+  // questions" / "Approve recommended choices" is never an answer.
+  const itemsEligible = !groupedQuestion && ["agent-ask", "stuck"].includes(String(question.kind ?? ""));
+  const parsedItems = itemsEligible
+    ? questionItemsFor([thread?.lastAgentFull, snap?.agentSummary, question.askContext, question.body]
+      .filter((t) => typeof t === "string").map((t) => redactSecrets(t)))
+    : [];
+  let questionItems = null;
+  if (parsedItems.length >= 2) {
+    const main = mainDecisionItem(decisionContext, parsedItems);
+    const { items, summary } = withItemState(main ? [main, ...parsedItems] : parsedItems, question.meta?.itemAnswers ?? {});
+    redactStringsInPlace(items);
+    questionItems = { items, summary };
+    const review = { op: "review_items", label: `Review ${summary.open || summary.total} question${(summary.open || summary.total) === 1 ? "" : "s"}`, value: question.id, destructive: false };
+    const later = { op: "defer", label: "Later", value: "dismiss", destructive: false };
+    aligned = { primaryAction: review, secondaryAction: later, extraActions: [] };
+    suggestedReplies = [];
+    decisionView.decision = {
+      question: `${summary.total} separate questions need your answers${main ? ", starting with the agent's main decision" : ""}. Answer them one at a time; any you skip stay open.`,
+      options: [],
+      unknown: false
+    };
+    // Recommendations belong to each question; a card-level "approve the
+    // recommended choices" is never an option or an answer.
+    const recText = decisionView.recommendation?.why ?? "";
+    const bulk = !recText || GROUP_OPTION_RE.test(recText) || /recommend(?:ed|ations?)\s+(?:choices|options)|where\s+stated|approve\s+(?:all|the)/i.test(recText);
+    decisionView.recommendation = {
+      option: null,
+      label: null,
+      why: bulk ? "Each question shows the agent's recommendation where it gave one. Nothing is approved in bulk." : recText,
+      unknown: false
+    };
+    decisionView.unknowns = (decisionView.unknowns ?? []).filter((u) => !/^(?:Decision|Consequences|Recommendation):/.test(u));
+  }
+  const cardOptions = Array.isArray(question.options)
+    ? question.options.filter((o) => !(questionItems && GROUP_OPTION_RE.test(String(o))))
+    : [];
   suggestedReplies = cleanSuggestedReplies(suggestedReplies, decisionView);
   for (const field of ["context", "goal", "whatChanged", "whereItStands", "currentState", "decision", "details", "verified", "blocked"]) {
     if (typeof brief[field] === "string" && brief[field]) brief[field] = cleanDecisionProse(brief[field], { max: field === "details" ? 2400 : 1100, keepLines: true }) ?? brief[field];
@@ -1197,6 +1238,7 @@ export function buildSupervisorCard(
     contextStatus: decisionContext.complete ? "complete" : (heldForContext ? "requested" : "incomplete"),
     decisionContext: { ...decisionContext, text: renderDecisionContext(decisionContext, { markdown: true }) },
     decisionView,
+    ...(questionItems ? { questionItems: questionItems.items, questionItemsSummary: questionItems.summary } : {}),
     sessionTitle,
     // A reply that never reached the agent says so first, so the owner does
     // not re-answer blind (an unconfirmed one may already have landed).
@@ -1226,7 +1268,7 @@ export function buildSupervisorCard(
     noticedAt: question.askedAt ?? question.createdAt ?? null,
     answerIn: question.answerIn ?? "here",
     risky: Boolean(question.risky),
-    options: Array.isArray(question.options) ? [...question.options] : [],
+    options: cardOptions,
     primaryAction: aligned.primaryAction,
     secondaryAction: aligned.secondaryAction,
     extraActions: aligned.extraActions,

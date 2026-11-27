@@ -106,6 +106,8 @@ export function parseAgentSuppliedContext(text) {
   const out = {};
   let current = null;
   for (const line of block.split(/\n/)) {
+    // The block ends where the agent restates its earlier questions.
+    if (/^\s*(?:\*\*)?original\s+questions?\b/i.test(line)) break;
     const trimmed = line.replace(/^\s*(?:[-*•]|\d+[.)])?\s*\**/, "").trim();
     if (!trimmed) continue;
     const m = /^([A-Za-z][A-Za-z /']{1,40}?)\**\s*[:\-—]\s*(.*)$/.exec(trimmed);

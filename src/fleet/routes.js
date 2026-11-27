@@ -7,6 +7,7 @@ import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 import { SupervisorWalkthrough, WalkthroughError } from "./walkthrough.js";
 
+const ANSWER_ITEM_MAX = 1200;
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const CARD_ID_PATTERN = /^[A-Za-z0-9:_-]{1,120}$/;
@@ -601,6 +602,14 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
           clarification: typeof body.clarification === "string" ? body.clarification : null,
           instructions: typeof body.instructions === "string" ? body.instructions : null,
           ...(Array.isArray(body.images) ? { images: body.images } : {}),
+          // Answers for an ask with several questions: [{ itemId, answer }]
+          // and the itemIds the owner skipped for now.
+          ...(Array.isArray(body.items) ? {
+            items: body.items.slice(0, 20)
+              .filter((it) => it && typeof it.itemId === "string" && typeof it.answer === "string")
+              .map((it) => ({ itemId: it.itemId.slice(0, 80), answer: it.answer.slice(0, ANSWER_ITEM_MAX) }))
+          } : {}),
+          ...(Array.isArray(body.skip) ? { skip: body.skip.filter((id) => typeof id === "string").slice(0, 20).map((id) => id.slice(0, 80)) } : {}),
           ...sendOptions
         });
         if (!outcome) return fail(404, "Card or question is no longer open.", { state: state() });

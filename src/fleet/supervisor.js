@@ -6,6 +6,7 @@
 // Needs-you questions are raised in every mode. The constructor has no side
 // effects; hosted-interface calls start() on listen and stop() on close.
 
+import { composeItemsReply, withItemState, GROUP_OPTION_RE } from "./decision-items.js";
 import path from "node:path";
 import fs from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
@@ -2505,6 +2506,60 @@ export class FleetSupervisor {
   // The owner's own words to the agent that asked ("Owner says: ..."), for
   // a question canReplyTo allows. Sent or kept for when the Mac can type
   // closes it; blocked or failed leaves it open. null: closed, or no reply.
+  // Partial answers to an ask with several questions, sent to the agent as
+  // one plain-text reply. Each item records queued / delivered / failed;
+  // skipped and unanswered items stay open, and the question closes only
+  // when every item has been delivered. Owner precedents are not recorded
+  // from these answers, and nothing here merges, deploys or approves a
+  // permission: the agent is told so in the reply.
+  async answerQuestionItems(question, card, { items = null, skip = null, deadlineAt = null } = {}) {
+    const all = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    const answers = (Array.isArray(items) ? items : []).filter((it) => it && typeof it.answer === "string" && it.answer.trim());
+    const skipped = Array.isArray(skip) ? skip : [];
+    const composed = composeItemsReply(all, { answers, skipped });
+    if (!composed) return { ok: false, kind: "answer_items", status: "blocked", detail: "Answer or skip at least one question." };
+    const skipUpdates = Object.fromEntries(composed.skipped.map((itemId) => [itemId, { status: "skipped" }]));
+    if (!composed.answered.length) {
+      this.store.recordQuestionItemAnswers(question.id, skipUpdates);
+      this.emitFleet("card-items-skipped");
+      return { ok: true, kind: "answer_items", status: "skipped", detail: "Skipped questions stay open.", items: this.questionItemStates(question.id, all) };
+    }
+    const targetKey = card?.threadKey ?? question.threadKey ?? null;
+    if (!targetKey) return { ok: false, kind: "answer_items", status: "blocked", detail: "No coding session is linked to this card." };
+    const sent = await this.sendOwnerMessage(targetKey, composed.text, { deadlineAt });
+    const status = sent?.delivery?.status === "sent" ? "delivered" : sent?.delivery?.status === "queued" ? "queued" : "failed";
+    const answerById = new Map(answers.map((it) => [it.itemId, it.answer.trim()]));
+    const updates = { ...skipUpdates };
+    for (const itemId of composed.answered) {
+      updates[itemId] = { status, answer: answerById.get(itemId) ?? null, detail: sent?.delivery?.detail ?? null };
+    }
+    this.store.recordQuestionItemAnswers(question.id, updates);
+    const states = this.questionItemStates(question.id, all);
+    if (status !== "failed") {
+      this.recordOwnerActivity();
+      if (states.every((it) => ["delivered", "queued"].includes(it.state.status))) {
+        this.store.answerQuestion(question.id, composed.text);
+        this.resolveOutreach(question, "reply", "acted");
+      }
+    }
+    this.emitFleet("card-items-answered");
+    return {
+      ok: status !== "failed",
+      kind: "answer_items",
+      status,
+      detail: status === "failed"
+        ? (sent?.delivery?.detail ?? "Could not deliver the answers; they are kept to retry.")
+        : `${composed.answered.length} answer${composed.answered.length === 1 ? "" : "s"} ${status === "queued" ? "queued for" : "delivered to"} the agent.`,
+      delivery: sent?.delivery ?? null,
+      items: states
+    };
+  }
+
+  questionItemStates(questionId, items) {
+    const saved = this.store.question(questionId)?.meta?.itemAnswers ?? {};
+    return withItemState(items.map(({ state: _state, ...item }) => item), saved).items;
+  }
+
   async replyQuestion(id, reply, { deadlineAt = null } = {}) {
     const startedAt = Date.now();
     const text = String(reply ?? "").trim();
@@ -4518,7 +4573,7 @@ export class FleetSupervisor {
     return { kind: "admin_merge", ...rest, auditId: intent.id };
   }
 
-  async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
+  async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null, items = null, skip = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
 
@@ -4565,6 +4620,24 @@ export class FleetSupervisor {
     // answer reaches it. Only the owner's own admin-merge route does.
     if (effectiveOp === "admin_merge") {
       return { ok: false, kind: "admin_merge", status: "owner_required", detail: ADMIN_MERGE_OWNER_ONLY };
+    }
+
+    // An ask with several questions is answered question by question.
+    const questionItems = Array.isArray(card?.questionItems) ? card.questionItems : [];
+    if (questionItems.length >= 2) {
+      if (effectiveOp === "review_items") {
+        return { ok: true, kind: "review_items", status: "walkthrough", items: questionItems, summary: card.questionItemsSummary ?? null };
+      }
+      // A blanket answer ("Approve recommended choices", "Answer all
+      // questions") is never sent or turned into any action.
+      if (effectiveOp === "answer" && (GROUP_OPTION_RE.test(String(effectiveValue ?? "")) || !effectiveValue)) {
+        return { ok: false, kind: "answer", status: "blocked", detail: "Answer each question on its own; a blanket answer is not sent." };
+      }
+      if (effectiveOp === "answer_items") {
+        return this.answerQuestionItems(question, card, { items, skip, deadlineAt });
+      }
+    } else if (effectiveOp === "answer_items" || effectiveOp === "review_items") {
+      return { ok: false, kind: effectiveOp, status: "blocked", detail: "This card has a single question." };
     }
 
     if (effectiveOp === "defer" || effectiveOp === "dismiss" || effectiveValue === "dismiss") {

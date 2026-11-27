@@ -859,6 +859,28 @@ export class FleetStore {
 
   // Records how the notifier reached the owner so a later tick neither
   // re-posts the outreach item nor re-pushes the phone.
+  // Per-question answer state for an ask with several questions:
+  // { itemId: { status, answer, at, detail } }. Unanswered items stay open.
+  recordQuestionItemAnswers(id, updates = {}, { now = this.now() } = {}) {
+    const question = this._findQuestion(id);
+    if (!question || question.status !== "open") return null;
+    const at = iso(toMs(now, this.now()));
+    const meta = question.meta && typeof question.meta === "object" ? question.meta : {};
+    const current = meta.itemAnswers && typeof meta.itemAnswers === "object" ? { ...meta.itemAnswers } : {};
+    for (const [itemId, update] of Object.entries(updates ?? {})) {
+      if (typeof itemId !== "string" || !itemId || itemId.length > 80 || !update || typeof update !== "object") continue;
+      current[itemId] = {
+        status: String(update.status ?? "unanswered").slice(0, 20),
+        answer: typeof update.answer === "string" ? clampText(update.answer, 1200) : (current[itemId]?.answer ?? null),
+        at,
+        detail: typeof update.detail === "string" ? clampText(update.detail, 240) : null
+      };
+    }
+    question.meta = { ...meta, itemAnswers: current };
+    this._save();
+    return { ...question };
+  }
+
   markQuestionNotified(id, { outreachId, pushedAt } = {}) {
     const question = this._findQuestion(id);
     if (!question) return null;
