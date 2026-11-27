@@ -814,6 +814,29 @@ export function cleanCardItem(item, limits) {
   };
 }
 
+// What became of an owner's answer or reply to an agent, in one word every
+// surface shows the same way:
+//   delivered  the agent has it (its turn, or the prompt's answer, confirmed)
+//   queued     kept, and sent once the agent's running turn ends
+//   ambiguous  it may have landed, with no confirmation yet; never re-sent
+//              automatically, so the owner checks the chat before answering again
+//   refused    nothing was sent; detail says why
+// null: no delivery to an agent (a dismissal, a dry run).
+export const DELIVERY_OUTCOMES = ["delivered", "queued", "ambiguous", "refused"];
+export function deliveryOutcome(delivery) {
+  if (!delivery || typeof delivery !== "object") return null;
+  if (DELIVERY_OUTCOMES.includes(delivery.outcome)) return delivery.outcome;
+  if (delivery.unconfirmed === true || delivery.status === "unknown") return "ambiguous";
+  if (delivery.status === "sent") return "delivered";
+  if (delivery.status === "queued") return "queued";
+  if (delivery.status === "dry-run" || delivery.status == null) return null;
+  return "refused";
+}
+export function withDeliveryOutcome(delivery) {
+  const outcome = deliveryOutcome(delivery);
+  return outcome ? { ...delivery, outcome } : delivery;
+}
+
 // Collapse whitespace and cut to max chars with an ellipsis.
 export function clampText(value, max) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();

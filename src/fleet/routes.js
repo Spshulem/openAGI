@@ -2,7 +2,8 @@
 // interface's shared authentication/Origin gate. Never touches res: returns
 // { status, body }, or null for paths it does not own.
 
-import { MODES, THREAD_KEY_PATTERN } from "./contracts.js";
+import { randomBytes } from "node:crypto";
+import { MODES, THREAD_KEY_PATTERN, clampText, redactSecrets, withDeliveryOutcome } from "./contracts.js";
 import { FIX_AREAS } from "./feedback.js";
 import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 import { SupervisorWalkthrough, WalkthroughError } from "./walkthrough.js";
@@ -38,6 +39,33 @@ function pathThreadKey(segment) {
 }
 
 const ok = (body) => ({ status: 200, body });
+
+// Something threw inside a fleet route. The daemon log gets the whole
+// error, redacted, with its stack, under one event name (fleet.route_error)
+// and a ref; the reply gets that ref, the error's class and whether anything
+// may have run: a read (GET) changed nothing, a POST may have partly run, so
+// the caller checks before trying again and nothing retries it on its own.
+// Supervisor internals (paths, transcript text) stay out of the reply.
+export function routeError(method, pathname, error) {
+  const ref = `fre_${randomBytes(4).toString("hex")}`;
+  const name = /^[A-Za-z]{1,40}$/.test(String(error?.name ?? "")) ? error.name : "Error";
+  const route = clampText(String(pathname ?? "").split("?")[0], 160);
+  const read = method === "GET";
+  try {
+    console.error(JSON.stringify({ event: "fleet.route_error", ref, method, route, error: name,
+      message: clampText(redactSecrets(String(error?.message ?? error ?? "")), 300),
+      stack: clampText(redactSecrets(String(error?.stack ?? "")), 2000) }));
+  } catch { /* logging never blocks */ }
+  const ran = read ? "no" : "unknown";
+  const consequence = read
+    ? "Nothing was changed."
+    : "It may have partly run: check the card or chat before trying again; it is not retried automatically.";
+  return fail(500, `The fleet supervisor failed on ${method} ${route} (${name}, ref ${ref}). ${consequence} Details are in the daemon log under fleet.route_error ${ref}.`,
+    { errorRef: ref, errorClass: name, ran });
+}
+// An answer's delivery carries its outcome (delivered, queued, ambiguous or
+// refused) for every client, whichever supervisor produced it.
+const outcomeOf = (delivery) => (delivery ? withDeliveryOutcome(delivery) : null);
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
 
 function isPlainObject(value) {
@@ -107,7 +135,7 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
       if (typeof supervisor.replyQuestion !== "function") return fail(503, "Replies are not available.");
       const result = await supervisor.replyQuestion(id, reply, sendOptions);
       if (!result) return fail(409, "Question already closed.");
-      return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
+      return ok({ question: result.question ?? null, delivery: outcomeOf(result.delivery), state: state() });
     }
     const answer = typeof body.answer === "string" ? body.answer.trim() : "";
     if (!answer || answer.length > ANSWER_MAX) return fail(400, "Pick one of the question's options.");
@@ -123,7 +151,7 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
     }
     const result = await supervisor.answerQuestion(id, answer, { ...sendOptions, ...(answer === "Answer question" ? { clarification: body.clarification } : {}) });
     if (!result) return fail(409, "Question already closed.");
-    return ok({ question: result.question ?? null, delivery: result.delivery ?? null,
+    return ok({ question: result.question ?? null, delivery: outcomeOf(result.delivery),
       ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}), state: state() });
   }
 
@@ -910,9 +938,8 @@ export function createFleetRoute({ supervisor, dataDir } = {}) {
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad action id.");
         return await handleSend(parts[1], sendOptions);
       }
-    } catch {
-      // Supervisor internals can carry paths or transcript text; keep them out.
-      return fail(500, "Fleet supervisor error. Check the daemon log.");
+    } catch (error) {
+      return routeError(method, pathname, error);
     }
     return fail(404, "Unknown fleet route.");
   };
