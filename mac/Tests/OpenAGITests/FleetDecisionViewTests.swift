@@ -77,8 +77,9 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertEqual(card.context, "Ship the release notes fix")
     XCTAssertEqual(card.decision, "Should I merge #77 over the required review with your admin rights, or wait for review?")
     XCTAssertTrue(card.secondaryAction?.adminBypass == true)
-    // The hub drops "proceed with the recommended option" when none is recommended.
-    XCTAssertEqual(card.suggestedReplies.count, 2)
+    // The hub drops "proceed with the recommended option" when none is
+    // recommended, and a blanket "Approved" next to an admin bypass.
+    XCTAssertEqual(card.suggestedReplies.count, 1)
     // No decisionView: today's rendering, not the four parts.
     XCTAssertNil(FleetDecisionPresentation.make(question: nil, card: card))
 
@@ -141,7 +142,7 @@ final class FleetDecisionViewTests: XCTestCase {
     XCTAssertFalse(p.buttons.contains(where: \.recommended), "a bypass is never the default unless recommended")
     XCTAssertTrue(try XCTUnwrap(p.buttons.first { $0.value == "merge now" }).adminBypass)
     // Its old generic quick replies are not options, so they stay.
-    XCTAssertEqual(p.quickReplies.count, 2)
+    XCTAssertEqual(p.quickReplies.count, 1)
   }
 
   func testSparseCardHasNoAnswerButtons() throws {

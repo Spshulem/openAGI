@@ -63,9 +63,9 @@ final class DecisionViewDecodingTests: XCTestCase {
         let choices = DecisionContract.choices(for: card)
         XCTAssertFalse(choices.contains(where: \.recommended))
         XCTAssertEqual(choices.first(where: \.adminBypass)?.label, "Merge now")
-        // "Proceed with the recommended option" means nothing without one.
+        // No "proceed with the recommended option" without one, and no
+        // blanket "Approved" next to an admin bypass.
         XCTAssertEqual(DecisionContract.quickReplies(for: card), [
-            "Approved — finish all remaining in-scope items",
             "Hold off — tell me what's still unverified first"
         ])
     }

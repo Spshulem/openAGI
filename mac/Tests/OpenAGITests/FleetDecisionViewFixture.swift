@@ -537,7 +537,6 @@ enum FleetDecisionViewFixture {
    ]
   },
   "suggestedReplies": [
-   "Approved — finish all remaining in-scope items",
    "Hold off — tell me what's still unverified first"
   ],
   "canReply": true,
@@ -1235,7 +1234,6 @@ enum FleetDecisionViewFixture {
     ]
    },
    "suggestedReplies": [
-    "Approved — finish all remaining in-scope items",
     "Hold off — tell me what's still unverified first"
    ],
    "canReply": true,

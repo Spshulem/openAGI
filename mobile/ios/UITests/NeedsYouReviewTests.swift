@@ -276,9 +276,13 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertEqual(pipeTexts(in: app).count, 0, "No raw Markdown table on the decision screen")
         XCTAssertFalse(labelled(app, "paseo:").exists, "No internal routing on the decision screen")
         capture("decision-regression-detail", app: app)
+        // The screen is a lazy List: each section is checked as it scrolls in.
+        for (index, name) in ["Status", "Decision", "Recommendation"].enumerated() {
+            scrollUntilHittable(sections[index + 1], in: app)
+            XCTAssertTrue(sections[index + 1].exists, "\(name) is shown")
+        }
         let detailRecommended = element(app, "needs-you-action-0")
         scrollUntilHittable(detailRecommended, in: app)
-        XCTAssertTrue(sections[1].exists && sections[2].exists && sections[3].exists, "Status, Decision and Recommendation are shown")
         XCTAssertEqual(detailRecommended.label, "Wait for teammate review")
         XCTAssertTrue((detailRecommended.value as? String ?? "").contains("Recommended"))
         let detailBypass = element(app, "needs-you-action-1")

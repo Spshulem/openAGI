@@ -337,6 +337,9 @@ export function cleanSuggestedReplies(replies, view) {
     const text = asText(reply);
     if (!text.trim()) return false;
     if (BYPASS_RE.test(text) || (MERGE_RE.test(text) && /\badmin\b/i.test(text))) return false;
+    // A blanket approval ("Approved — finish all remaining…") on a card that
+    // offers an admin bypass reads as approving the bypass: not offered.
+    if (/^\s*(?:approved?|yes|go ahead|proceed|ship it)\b/i.test(text) && (view?.decision?.options ?? []).some((o) => o.adminBypass)) return false;
     // "Proceed with the recommended option" only when an option is recommended.
     if (/\brecommend(?:ed|ation)\b/i.test(text) && !view?.recommendation?.option) return false;
     const words = normalizeWords(text).join(" ");
