@@ -48,6 +48,7 @@ struct FleetDetailScreen: View {
     let key = question.threadKey
     let detail = key.flatMap { fleet.details[$0] }
     let conversation = detail?.conversation
+    let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id])
 
     if question.risky { FleetRiskyLabel() }
     Text(question.title)
@@ -63,14 +64,19 @@ struct FleetDetailScreen: View {
 
     ScrollView {
       VStack(alignment: .leading, spacing: 4) {
-        if !question.body.isEmpty {
+        if let decision {
+          // The four-part decision replaces the raw ask; the agent's words
+          // stay in the conversation below.
+          NeedsYouDecisionSections(presentation: decision, style: .compact)
+          NeedsYouDecisionEvidence(evidence: decision.evidence, compact: true)
+        } else if !question.body.isEmpty {
           Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
         }
         // The ask's own words: always for a risky ask, else when the chat
         // below can't show them.
-        if let context = question.displayAskContext, question.risky || (conversation?.messages.isEmpty ?? true) {
+        if decision == nil, let context = question.displayAskContext, question.risky || (conversation?.messages.isEmpty ?? true) {
           Text("The agent said:").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
           Text(context).font(.system(size: 11))
             .fixedSize(horizontal: false, vertical: true)

@@ -15,6 +15,7 @@
 // `missing`, so the caller can ask the owning agent for it before surfacing the
 // ask, or label the gap honestly if the agent cannot be reached.
 
+import { iconsToWords, stripEmphasis } from "./decision-view.js";
 import { clampText, parsePrRef, redactSecrets } from "./contracts.js";
 
 // How long a new ask is held back while its owning agent supplies missing
@@ -57,7 +58,9 @@ function prose(value, max = 400) {
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/<\/?[a-z_-]+[^>]*>/gi, "")
     .replace(/\r/g, "")
-    .replace(/[*_]{2,}/g, "")
+    // Emphasis pairs only: "__cache__" in a path or "rm -rf **/build" is
+    // command text the owner must see unchanged.
+    .replace(/[\s\S]*/, (all) => stripEmphasis(all))
     .replace(/\n{2,}/g, "\n")
     .trim();
   const cleaned = stripInternalIds(redactSecrets(raw)).replace(/\n/g, " ").replace(/\s{2,}/g, " ").trim();
@@ -232,8 +235,22 @@ function statusSentences(text) {
   // Only the decision's own choice lists are left out of "where it stands":
   // bullets right after a line asking for a choice, and numbered items that
   // ask something. Other bullets (test results, failures) are status.
-  const prose_ = withoutChoiceLists(text);
-  return splitSentences(prose_.replace(/^-{2,}\s*/gm, "").replace(/\*\*/g, "").replace(/`/g, ""))
+  // Table rows are status in plain words, never pipes: one line per PR row,
+  // each value named by its column.
+  let header = null;
+  const prose_ = withoutChoiceLists(text)
+    .split(/\n/)
+    .flatMap((line) => {
+      if (!/^\s*\|.*\|\s*$/.test(line)) { header = null; return [line]; }
+      const cells = line.trim().slice(1, -1).split("|").map((c) => iconsToWords(stripEmphasis(c).replace(/`/g, "")).trim());
+      if (cells.every((c) => /^:?-{2,}:?$/.test(c) || !c)) return [];
+      if (!header) { header = cells; return []; }
+      if (!/#\d{1,7}\b/.test(cells[0] ?? "")) return [];
+      const facts = cells.slice(1).map((c, i) => (c ? `${header[i + 1] || "Value"}: ${c}` : null)).filter(Boolean);
+      return [`${cells[0]}: ${facts.join(", ")}.`];
+    })
+    .join("\n");
+  return splitSentences(stripEmphasis(prose_.replace(/^-{2,}\s*/gm, "")).replace(/`/g, ""))
     .map((t) => t.replace(/^[-*•]\s+/, "").trim())
     // A clipped excerpt starts mid-sentence ("…eady say"); a lead-in ends in
     // ":" ("Decisions I need from you:"). Neither is a status.
@@ -397,7 +414,7 @@ const OWNER_ACTION_LINE_RE = /^\s*(?:[-*•]\s*)?(?:single\s+)?owner\s+action\s*
 const NOT_NEEDED_RE = /\b(?:no|not|none)\b[^.]{0,30}\b(?:required|needed|necessary)\b|\b(?:already|was)\s+(?:done|completed|handled|applied)\b/i;
 
 function agentOwnerAction(agentSummary, messages) {
-  const text = String(latestAgentText(agentSummary, messages)).replace(/\*\*/g, "");
+  const text = stripEmphasis(String(latestAgentText(agentSummary, messages)));
   const m = OWNER_ACTION_LINE_RE.exec(text);
   if (!m || NOT_NEEDED_RE.test(m[1])) return null;
   return prose(m[1], 200);
