@@ -53,6 +53,23 @@ final class SupervisorFormatTests: XCTestCase {
         XCTAssertEqual(SupervisorFormat.prNumber("local-branch"), "local-branch")
     }
 
+    // The hub's outcome decides an answer's line: four outcomes, four lines.
+    func testCardAnswerOutcomes() throws {
+        func note(_ json: String) throws -> SupervisorFormat.Note {
+            SupervisorFormat.cardActNote(try JSONDecoder().decode(FleetCardActResult.self, from: Data(json.utf8)))
+        }
+        XCTAssertEqual(try note(#"{"result":{"ok":true,"kind":"answer","status":"sent","outcome":"delivered","delivery":{"status":"sent","outcome":"delivered"}}}"#),
+                       .init(text: "Sent to the agent.", isAlert: false))
+        XCTAssertEqual(try note(#"{"result":{"ok":true,"kind":"answer","status":"queued","outcome":"queued","delivery":{"status":"queued","outcome":"queued"}}}"#),
+                       .init(text: "Queued. It goes to the agent once its current turn ends.", isAlert: false))
+        XCTAssertEqual(try note(#"{"result":{"ok":false,"kind":"answer","status":"blocked","outcome":"ambiguous","delivery":{"status":"blocked","outcome":"ambiguous","detail":"turn confirmation timed out"}}}"#),
+                       .init(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isAlert: true))
+        XCTAssertEqual(try note(#"{"result":{"ok":false,"kind":"answer","status":"blocked","outcome":"refused","delivery":{"status":"blocked","outcome":"refused","detail":"the chat is archived; nothing was sent"}}}"#),
+                       .init(text: "Not sent: the chat is archived; nothing was sent", isAlert: true))
+        // An older hub: no outcome, status decides as before.
+        XCTAssertEqual(SupervisorFormat.deliveryNote(FleetDelivery(status: "queued", detail: "Saved."), fallback: "x").isAlert, false)
+    }
+
     func testDeliveryNotesAndFailures() {
         XCTAssertEqual(SupervisorFormat.deliveryNote(FleetDelivery(status: "sent"), fallback: "Answered."),
                        .init(text: "Sent to the agent.", isAlert: false))

@@ -882,18 +882,37 @@ struct FleetDecisionView: Decodable, Equatable {
 struct FleetDelivery: Decodable, Equatable {
   let status: String?
   let detail: String?
+  /// What became of an answer or reply, from the hub: delivered, queued,
+  /// ambiguous (may have landed, not confirmed, never re-sent) or refused.
+  let outcome: String?
 
-  enum CodingKeys: String, CodingKey { case status, detail }
+  enum CodingKeys: String, CodingKey { case status, detail, outcome }
 
-  init(status: String?, detail: String?) {
+  init(status: String?, detail: String?, outcome: String? = nil) {
     self.status = status
     self.detail = detail
+    self.outcome = outcome
   }
 
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     status = try? c.decodeIfPresent(String.self, forKey: .status)
     detail = try? c.decodeIfPresent(String.self, forKey: .detail)
+    outcome = try? c.decodeIfPresent(String.self, forKey: .outcome)
+  }
+
+  /// The line for a hub-stated outcome, or nil (an older hub: status decides).
+  var outcomeNote: FleetNote? {
+    let trimmed = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let shown = trimmed.isEmpty ? nil : String(trimmed.prefix(300))
+    switch outcome {
+    case "delivered": return FleetNote(text: "Sent to the agent.", isError: false)
+    case "queued": return FleetNote(text: "Queued. It goes to the agent once its current turn ends.", isError: false)
+    case "ambiguous":
+      return FleetNote(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isError: true)
+    case "refused": return FleetNote(text: "Not sent: \(shown ?? "refused")", isError: true)
+    default: return nil
+    }
   }
 }
 

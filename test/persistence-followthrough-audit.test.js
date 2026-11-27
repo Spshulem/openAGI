@@ -74,16 +74,12 @@ test("RemoteFleetSupervisor preserves online HTTP errors and reconciles delivere
 
     const remote = new RemoteFleetSupervisor({ runtime, nodeId: "spencer-mac", dataDir: dir });
 
-    // 1. Online node returning 400 must surface exact error, never "Fleet computer unavailable".
-    await assert.rejects(
-      () => remote.answerQuestion("fq_1", "yes"),
-      (err) => {
-        assert.equal(err.reached, true);
-        assert.equal(err.message, "Question already closed.");
-        assert.ok(!/unavailable/i.test(err.message));
-        return true;
-      }
-    );
+    // 1. Online node returning 400 must surface its exact reason, never
+    // "Fleet computer unavailable" (as a refused answer, not a throw).
+    const answered = await remote.answerQuestion("fq_1", "yes");
+    assert.equal(answered.delivery.outcome, "refused");
+    assert.match(answered.delivery.detail, /the fleet computer refused it: Question already closed\./);
+    assert.ok(!/unavailable/i.test(answered.delivery.detail));
 
     // 2. Timeout on /fleet/api/send reconciles state.actions instead of falsely claiming agent offline.
     const sendRes = await remote.sendOwnerMessage("paseo:srv_mac.375e1a66", "Submit BB Recorder 0.4.1 for review");

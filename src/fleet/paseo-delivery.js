@@ -53,11 +53,23 @@ export function confirmedPaseoTurn(history, receipt) {
   const ownTurn = nonEmpty(receiptMessage(history, receipt)?.turnId);
   const acceptedTurn = nonEmpty(receipt?.turnId);
   if (acceptedTurn && ownTurn && acceptedTurn !== ownTurn) return false;
-  const turnId = acceptedTurn ?? ownTurn;
-  if (!turnId) return false;
+  const turnIds = receiptTurnIds(receipt, acceptedTurn ?? ownTurn);
+  if (!turnIds.size) return false;
   const activeTurn = history.agent?.activeTurn;
-  return (activeTurn?.turnId === turnId && history.agent?.status === "running")
-    || entries.some(e => e.item?.type === "assistant_message" && e.turnId === turnId);
+  return (turnIds.has(activeTurn?.turnId) && (history.agent?.status === "running" || Boolean(activeTurn)))
+    || entries.some(e => e.item?.type === "assistant_message" && turnIds.has(e.turnId));
+}
+
+// The turns that are this receipt's own: the accepted or timeline turn ID,
+// and the turn an ACP host (Antigravity through Paseo) names after the
+// message that started it, "acp:<our message ID>". That name is derived from
+// our own ID, so it is exact evidence, unlike timing or text. Such a host
+// queues the message and may start its turn a minute later, never tagging
+// the message entry with the turn.
+function receiptTurnIds(receipt, turnId = null) {
+  const ids = new Set(turnId ? [turnId] : []);
+  for (const id of receiptIds(receipt)) ids.add(`acp:${id}`);
+  return ids;
 }
 
 const ALLOWED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
@@ -702,8 +714,9 @@ export async function reconcilePaseoReceipt(ref, receipt, signal, { deadline = I
         const systemError = failedTurnText(next.item.text);
         return { outcome: "delivered", evidence: { ...evidence, replied: true }, ...(systemError ? { systemError } : {}) };
       }
-      // Nothing newer than our message: a turn running now is its turn.
-      if (!next && (agent?.status === "running" || agent?.activeTurn)) {
+      // Nothing newer than our message: a turn running now is its turn. So is
+      // a turn named after our own message ID (an ACP host's late start).
+      if ((!next && (agent?.status === "running" || agent?.activeTurn)) || (byId && receiptTurnIds(receipt).has(agent?.activeTurn?.turnId))) {
         return { outcome: "running", evidence: { ...evidence, replied: false } };
       }
       return { outcome: "unanswered", evidence: { ...evidence, replied: false } };
@@ -765,16 +778,21 @@ function buildQuestionPermissionAnswers(perm, replyText, ownerChoice = null) {
   return { answers };
 }
 
-async function respondPaseoPermission(api, ref, agentId, requestId, response) {
+// onDispatch: called as the answer is handed to Paseo (from then on a
+// failure may still have answered the prompt).
+async function respondPaseoPermission(api, ref, agentId, requestId, response, onDispatch = () => {}) {
   if (typeof api?.respondToPermissionAndWait === "function") {
+    onDispatch();
     await api.respondToPermissionAndWait(agentId, requestId, response, 10000);
     return;
   }
   if (typeof api?.respondToPermission === "function") {
+    onDispatch();
     await api.respondToPermission(agentId, requestId, response);
     return;
   }
   if (typeof ref?.respondToPermission === "function") {
+    onDispatch();
     await ref.respondToPermission({ requestId, response });
     return;
   }
@@ -822,6 +840,33 @@ function ineligibleAgent(agent, thread, { ownerInitiated = false, silentStuckRec
   if ((thread.meta.paseoCwd != null && agent.cwd !== thread.meta.paseoCwd) || (thread.meta.workspaceId !== undefined && agent.workspaceId !== thread.meta.workspaceId)) return "Paseo chat changed; scan again before sending";
   if (!ownerInitiated && agent.updatedAt !== thread.meta.updatedAt) return "Paseo chat changed; scan again before sending";
   return null;
+}
+
+// Read-only: settles this chat's pending receipt for `messageHash` (the
+// journaled hash of what was sent) once its turn is confirmed, so a send
+// whose turn started late (an ACP host) ends delivered. Never sends.
+// Returns { confirmed, systemError } or { confirmed: false, detail }.
+export async function checkPaseoReceipt({ config, thread, store, messageHash, factory } = {}) {
+  if (!config?.paseo?.enabled || thread?.kind !== "paseo" || !store?.dir || !messageHash) return { confirmed: false, detail: "not a Paseo receipt" };
+  const file = path.join(store.dir, "paseo-deliveries", `${createHash("sha256").update(thread.key).digest("hex")}.json`);
+  let receipt;
+  try { receipt = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return { confirmed: false, detail: "no receipt" }; }
+  if (receipt?.messageHash !== messageHash) return { confirmed: false, detail: "a later send replaced the receipt" };
+  if (!receipt.pending) return { confirmed: receipt.delivered !== false && !receipt.sendError, detail: "already settled" };
+  try {
+    return await withPaseo(config, async (client, signal) => {
+      const api = await hostApi(client, thread.meta.serverId);
+      const ref = api.agents.ref(thread.id);
+      const check = await readPaseoConfirmation(ref, receipt, signal, (next) => writeJsonAtomic(file, next), performance.now() + 10_000, { ownerInitiated: true });
+      if (check.confirmed || check.systemError) {
+        writeJsonAtomic(file, { ...receipt, pending: false, settledLate: true, ...(check.systemError ? { executionError: check.systemError } : {}) });
+        return { confirmed: true, ...(check.systemError ? { systemError: check.systemError } : {}) };
+      }
+      return { confirmed: false, detail: check.sawOwn ? "in the chat; its turn has not started" : "not confirmed yet" };
+    }, factory);
+  } catch (error) {
+    return { confirmed: false, detail: clampText(redactSecrets(String(error?.message ?? error)), 120) };
+  }
 }
 
 // Never imports, reloads, archives or changes settings. Paseo owns the session.
@@ -885,6 +930,9 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
   if (active.has(activeKey)) return blocked("A send to this Paseo chat is already in progress");
   active.add(activeKey);
   let dispatched = false;
+  // A prompt's answer was handed to Paseo: a throw now may have answered it.
+  let answeringPrompt = false;
+  const markPromptDispatched = () => { dispatched = answeringPrompt = true; };
   let sawOwnBeforeAbort = false;
   try {
     return await withPaseo(config, async (client, signal) => {
@@ -1005,7 +1053,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
           await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {
             behavior: "allow",
             updatedInput: { answers: parsedAnswers.answers }
-          });
+          }, markPromptDispatched);
           return { status: "sent", route: "paseo-send", actionId, detail: "Answered Paseo question directly" };
         }
         if (!/^(?:opened|open thread)$/i.test(cleanReply)) {
@@ -1024,7 +1072,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
             await respondPaseoPermission(api, ref, thread.id, String(targetPerm.id), {
               behavior: "allow",
               ...(allowAction?.id ? { selectedActionId: String(allowAction.id) } : {})
-            });
+            }, markPromptDispatched);
             return { status: "sent", route: "paseo-send", actionId, detail: "Approved Paseo permission prompt" };
           }
           const denyAction = exactAction ?? actions.find((a) => a?.behavior === "deny");
@@ -1032,7 +1080,7 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
             behavior: "deny",
             ...(denyAction?.id ? { selectedActionId: String(denyAction.id) } : {}),
             message: cleanReply
-          });
+          }, markPromptDispatched);
           return { status: "sent", route: "paseo-send", actionId, detail: "Sent response to Paseo permission prompt" };
         }
       }
@@ -1214,9 +1262,11 @@ export async function deliverPaseo({ config, thread, text, store, actionId, base
         unconfirmed: true,
         route: "paseo-send",
         actionId,
-        detail: sawOwnBeforeAbort
-          ? `Message accepted by Paseo and visible in timeline; turn confirmation timed out${errMsg}. No automatic resend.`
-          : `Paseo delivery unavailable or uncertain${errMsg}; no provider fallback or automatic resend`
+        detail: answeringPrompt
+          ? `The prompt's answer went to Paseo but was not confirmed${errMsg}. No automatic resend.`
+          : sawOwnBeforeAbort
+            ? `Message accepted by Paseo and visible in timeline; turn confirmation timed out${errMsg}. No automatic resend.`
+            : `Paseo delivery unavailable or uncertain${errMsg}; no provider fallback or automatic resend`
       };
     }
     return blocked(`Paseo delivery unavailable or uncertain${errMsg}; no provider fallback or automatic resend`);

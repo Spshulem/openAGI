@@ -231,7 +231,21 @@ enum SupervisorFormat {
     }
 
     // What happened to an answer or a sent nudge, in one line.
+    // The hub's outcome for an answer or reply, or nil (an older hub).
+    static func outcomeNote(_ outcome: String?, detail rawDetail: String?) -> Note? {
+        let detail = nonBlank(rawDetail?.trimmingCharacters(in: .whitespacesAndNewlines))
+        switch outcome {
+        case "delivered": return Note(text: "Sent to the agent.", isAlert: false)
+        case "queued": return Note(text: "Queued. It goes to the agent once its current turn ends.", isAlert: false)
+        case "ambiguous":
+            return Note(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isAlert: true)
+        case "refused": return Note(text: "Not sent: " + (detail ?? "refused"), isAlert: true)
+        default: return nil
+        }
+    }
+
     static func deliveryNote(_ delivery: FleetDelivery?, fallback: String) -> Note {
+        if let note = outcomeNote(delivery?.outcome, detail: delivery?.detail) { return note }
         let detail = nonBlank(delivery?.detail?.trimmingCharacters(in: .whitespacesAndNewlines))
         switch delivery?.status {
         case "sent": return Note(text: "Sent to the agent.", isAlert: false)
@@ -415,6 +429,7 @@ enum SupervisorFormat {
     }
 
     static func cardActNote(_ result: FleetCardActResult) -> Note {
+        if let note = outcomeNote(result.outcome, detail: result.delivery?.detail ?? result.message) { return note }
         let message = nonBlank(result.message)
         switch result.status {
         case "merged", "already_merged":

@@ -16,7 +16,7 @@ import { resolveDataDir } from "../data-dir.js";
 import { readNodeConfig } from "../cli-client.js";
 import { readOrCreateIdentity } from "../node-registry.js";
 import { appendSharedThreadMessages } from "../shared-conversations.js";
-import { isSelfThread, isWatchOnlyThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, isWatchOnlyThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, deliveryOutcome, withDeliveryOutcome, clampTailLines, clampText, clampTextLines, linkUiHosts, openChatFor, parsePaseoThreadKey, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { diagnoseAgentBlocker, estimateExpectedCheckIn } from "./watchdog.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
@@ -42,7 +42,9 @@ import { buildFleetHierarchy, dispatchManagerGoal, syncThemesToPaseoLabels } fro
 import { buildBugDispatchMessage, collectArchiveThreads, mergeThreadsWithArchives, routeCustomerIssue, searchFleet } from "./search.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, identityToken, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import { archivePaseoAgent, createPaseoSource, dedupeConsecutiveMessages, hostApi, paseoThread, stripAgentInternalMarkup, unarchivePaseoAgent, withPaseo } from "./sources/paseo.js";
-import { failoverPaseoSessionProvider, paseoImagesHash, titlesMatchForFailover } from "./paseo-delivery.js";
+import { checkPaseoReceipt, failoverPaseoSessionProvider, paseoImagesHash, titlesMatchForFailover } from "./paseo-delivery.js";
+// How long an unconfirmed handoff is still checked for a late-starting turn.
+const HANDOFF_SETTLE_MS = 24 * 60 * 60 * 1000;
 import { applyPaseoSessionSettings, parsePaseoSettingsTarget, readPaseoSessionSettings } from "./paseo-settings.js";
 import { OwnerPrecedentStore } from "./precedent-memory.js";
 import * as antigravity from "./sources/antigravity.js";
@@ -1039,6 +1041,7 @@ export class FleetSupervisor {
   // Why an answer or resume has no route, in the owner's words.
   noRouteDetail(thread, delivery) {
     if (!thread) return "thread not seen since restart: scan first";
+    if (thread.archived) return "the chat is archived; nothing was sent";
     if (delivery?.mode === "computer-use") {
       if (!uiTargetFor(thread)) return "no app shows this thread (terminal session): open it to answer";
       if (delivery.ready === false) return `computer use not ready: ${delivery.detail ?? "check Open Computer Use"}`;
@@ -1247,7 +1250,12 @@ export class FleetSupervisor {
     this.running = this._tick(reason, { deferUi })
       // A scan refreshes which chats and hosts are reachable: held handoffs
       // whose host is back go out now (only when the Paseo scan itself succeeded).
-      .then(async (snapshot) => { this.lastError = null; await this.resumeHandoffs(snapshot).catch(() => {}); return snapshot; })
+      .then(async (snapshot) => {
+        this.lastError = null;
+        await this.resumeHandoffs(snapshot).catch(() => {});
+        await this.settleUnconfirmedHandoffs(snapshot).catch(() => {});
+        return snapshot;
+      })
       .catch((error) => {
         this.lastError = clampText(error?.message ?? String(error), 300);
         throw error;
@@ -1280,14 +1288,34 @@ export class FleetSupervisor {
     const lastTickIso = this.lastTickAt ?? store.snapshot?.at ?? null;
     const baseTickMs = Number.isFinite(Date.parse(lastTickIso ?? "")) ? Date.parse(lastTickIso) : this.now();
     const nextTickAt = this.config?.enabled ? new Date(baseTickMs + this.scanIntervalMs).toISOString() : null;
-    const snapshot = this.liveSnapshot(withHealth(store.snapshot), open, { nextTickAt });
+    // Each part below is built from live chats, PRs and tasks. One part (a
+    // row, a question, a card) that cannot be built is left plain or out and
+    // logged (fleet.state_degraded), instead of failing the whole state: the
+    // fleet route, the main's mirror and every answer that reads it first.
+    const degraded = [];
+    const degrade = (part, error, key = null) => { degraded.push(this.noteStateError(part, error, key)); };
+    const snapshot = this.liveSnapshot(withHealth(store.snapshot), open, { nextTickAt, onRowError: (row, error) => degrade("snapshot-row", error, row?.key) });
     for (const r of snapshot?.threads ?? []) if (r?.key) setBounded(this.knownRows, r.key, r);
     const rows = new Map([...this.knownRows, ...(snapshot?.threads ?? []).map((row) => [row?.key, row])]);
-    const blockingResolver = (threadKey) => this.runtime?.tasks?.blockingImpactFor?.({ threadKey })
-      ?? { count: 0, blockingTaskIds: [], blockingTitles: [] };
-    const questions = open.map((question) => this.enrichQuestionView(this.questionView(question, rows), rows, blockingResolver));
+    const blockingResolver = (threadKey) => {
+      try {
+        return this.runtime?.tasks?.blockingImpactFor?.({ threadKey }) ?? { count: 0, blockingTaskIds: [], blockingTitles: [] };
+      } catch (error) {
+        degrade("blocking-impact", error, threadKey);
+        return { count: 0, blockingTaskIds: [], blockingTitles: [] };
+      }
+    };
+    const questions = open.map((question) => {
+      try { return this.enrichQuestionView(this.questionView(question, rows), rows, blockingResolver); }
+      catch (error) {
+        degrade("question", error, question.id);
+        return { ...question, inApp: false, risky: riskyQuestion(question), canReply: canReplyTo(question) };
+      }
+    });
     const actions = store.actions(50);
-    const activityEvents = this.buildActivityEvents({ open, actions, rows, fixes: store.fixes() });
+    let activityEvents = [];
+    try { activityEvents = this.buildActivityEvents({ open, actions, rows, fixes: store.fixes() }); }
+    catch (error) { degrade("activity", error); }
     const baseState = {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
@@ -1333,7 +1361,10 @@ export class FleetSupervisor {
       }
     };
     const projectAliases = store.projectAliases?.() ?? null;
-    const deck = buildSupervisorDeck(baseState, {
+    const part = (name, build, fallback) => {
+      try { return build(); } catch (error) { degrade(name, error); return fallback; }
+    };
+    const deck = part("deck", () => buildSupervisorDeck(baseState, {
       preferences: store.preferences(),
       now: this.now(),
       threadsByKey: new Map([...this.knownThreads, ...this.lastThreads]),
@@ -1341,14 +1372,41 @@ export class FleetSupervisor {
       knownRows: this.knownRows,
       blockingResolver,
       projectAliases,
-      activeGoalResolver: (tKey, prRef) => this.activeWork.findActiveGoalForThread(tKey, prRef)
-    });
-    const watchdog = this.buildWatchdogSummary(snapshot);
-    const precedentsSummary = {
+      activeGoalResolver: (tKey, prRef) => {
+        try { return this.activeWork.findActiveGoalForThread(tKey, prRef); }
+        catch (error) { degrade("active-goal", error, tKey); return null; }
+      },
+      onCardError: (question, error) => degrade("card", error, question?.id)
+    }), { cards: [] });
+    const watchdog = part("watchdog", () => this.buildWatchdogSummary(snapshot), null);
+    const precedentsSummary = part("precedents", () => ({
       total: this.precedentMemory.list().length,
       recentApplications: this.precedentMemory.applications(5)
-    };
-    return { ...baseState, ...deck, lastOwnerAckAt: store.lastOwnerAckAt(), watchdog, precedentsSummary, handoffs: this.handoffs.summary() };
+    }), null);
+    const handoffs = part("handoffs", () => this.handoffs.summary(), []);
+    return { ...baseState, ...deck, lastOwnerAckAt: store.lastOwnerAckAt(), watchdog, precedentsSummary, handoffs,
+      ...(degraded.length ? { degraded: degraded.slice(0, 20) } : {}) };
+  }
+
+  // A part of the state that could not be built: logged once per distinct
+  // failure every 10 minutes, with its stack (redacted), under a stable
+  // event name; the state says which part, without internals.
+  noteStateError(part, error, key = null) {
+    const message = clampText(redactSecrets(String(error?.message ?? error ?? "unknown error")), 200);
+    const name = String(error?.name ?? "Error").slice(0, 40);
+    const signature = `${part}:${name}:${message}`;
+    this._stateErrorLogged ??= new Map();
+    const last = this._stateErrorLogged.get(signature) ?? 0;
+    const at = Date.now();
+    if (at - last >= 10 * MIN) {
+      this._stateErrorLogged.set(signature, at);
+      if (this._stateErrorLogged.size > 200) this._stateErrorLogged.delete(this._stateErrorLogged.keys().next().value);
+      try {
+        console.error(JSON.stringify({ event: "fleet.state_degraded", part, key: key ? clampText(String(key), 160) : null, error: name, message,
+          stack: clampText(redactSecrets(String(error?.stack ?? "")), 1500) }));
+      } catch { /* logging never blocks */ }
+    }
+    return { part, ...(key ? { key: clampText(String(key), 160) } : {}), error: name };
   }
 
     buildWatchdogSummary(snapshot) {
@@ -1544,7 +1602,7 @@ export class FleetSupervisor {
   // "Waiting on you" at once (codex:01a13388 sat there 3 minutes after its
   // only question was dismissed, until the next scan), and a new one puts
   // it in. Each row also says whether the owner muted it, and what opens it.
-  liveSnapshot(snapshot, open, { nextTickAt = null } = {}) {
+  liveSnapshot(snapshot, open, { nextTickAt = null, onRowError = null } = {}) {
     if (!Array.isArray(snapshot?.threads)) return snapshot;
     const askedAt = askTimes(open);
     const closedAt = this.store.closedAtByThread();
@@ -1552,7 +1610,7 @@ export class FleetSupervisor {
     const fallbackNextTick = nextTickAt ?? (this.config?.enabled
       ? new Date((Number.isFinite(Date.parse(this.lastTickAt ?? snapshot?.at ?? "")) ? Date.parse(this.lastTickAt ?? snapshot.at) : this.now()) + this.scanIntervalMs).toISOString()
       : null);
-    const threads = snapshot.threads.map((row) => {
+    const liveRow = (row) => {
       if (!row?.key) return row;
       const muted = this.store.mutedUntil(row.key);
       const watch = liveWatch(row.watch ?? null, { state: row.state, askedAt: askedAt.get(row.key) ?? null, closedAt: closedAt.get(row.key) ?? null, muted });
@@ -1600,6 +1658,10 @@ export class FleetSupervisor {
       return { ...row, lastAgentText: redactSecrets(row.lastAgentText), watch, muted, openChat: openChat ?? null,
         project, actorLabel, subchannel, labels, nextCheckAt, ...(watchdog ? { watchdog } : {}),
         pushPreview: canPush ? { action: "nudge", playbook: preview.playbook, reason: preview.reason, message: preview.message } : null, pushing: this.pushing.has(row.key) };
+    };
+    // A row that cannot be enriched stays as the scan saved it.
+    const threads = snapshot.threads.map((row) => {
+      try { return liveRow(row); } catch (error) { if (!onRowError) throw error; onRowError(row, error); return row; }
     });
     return { ...snapshot, threads, counts: { ...(snapshot.counts ?? {}), byWatch, needsYou: open.filter((question) => needsOwnerDecision(question)).length } };
   }
@@ -2297,6 +2359,8 @@ export class FleetSupervisor {
     if (question.kind === "agent-card" && answer !== "open thread" && !paseoCardAnswer) return null;
     this.answering.add(id);
     if (question.threadKey) this.ownerAnsweredAt.set(question.threadKey, this.now());
+    // What the send got to before anything threw (deliverToAsker fills it).
+    const progress = {};
     try {
       let delivery = null;
       const settling = [];
@@ -2332,9 +2396,9 @@ export class FleetSupervisor {
       // the thread (the card the question was raised for: its stateId).
       if (question.kind === "prompt" && question.threadKey && !["later", "opened"].includes(answer)) {
         if (String(question.threadKey).startsWith("paseo:")) {
-          const sent = await this.deliverToAsker(question, answer, ownerDelivery(answer), { deadlineAt, startedAt, settling, ownerChoice: answer });
+          const sent = await this.deliverToAsker(question, answer, ownerDelivery(answer), { deadlineAt, startedAt, settling, ownerChoice: answer, progress });
           delivery = sent.delivery;
-          if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+          if (delivery.status !== "sent") return { question: this.noteUndeliveredAnswer(id, answer, delivery), delivery };
         } else {
           const clicked = await this.clickThread(question.threadKey, answer, { stateId: question.meta?.promptStateId ?? null, deadlineAt });
           delivery = clicked.delivery;
@@ -2381,7 +2445,17 @@ export class FleetSupervisor {
           }
         }
         const message = retry ? RETRY_DELIVERY : ownerDelivery(deliveredChoice);
-        const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling, ownerChoice: retry ? null : deliveredChoice });
+        const sent = await this.deliverToAsker(question, answer, message, { deadlineAt, startedAt, settling, ownerChoice: retry ? null : deliveredChoice, progress, queueIfBusy: true });
+        if (sent.queuedBehindTurn) {
+          // Answered now; the queued message stays linked to this card and
+          // puts it back if it never reaches the agent (#384).
+          const answered = this.store.answerQuestion(id, answer);
+          this.resolveOutreach(question, answer, "acted");
+          this.applyOverride(question, answer);
+          this.recordOwnerActivity();
+          this.emitFleet("question-answered");
+          return { question: answered ?? this.store.question(id), delivery: sent.delivery };
+        }
         if (sent.queued) {
           this.resolveOutreach(question, answer, "acted");
           this.applyOverride(question, answer);
@@ -2402,7 +2476,8 @@ export class FleetSupervisor {
       // A failed or unreachable delivery remains actionable on every surface.
       if (delivery && delivery.status !== "sent") {
         this.reopenIfUndelivered(id, settling, answer);
-        return { question: this.store.question(id), delivery };
+        const agentBound = question.kind === "agent-ask" || paseoCardAnswer || retry;
+        return { question: agentBound ? this.noteUndeliveredAnswer(id, answer, delivery) : this.store.question(id), delivery };
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
@@ -2426,9 +2501,56 @@ export class FleetSupervisor {
       }
       this.emitFleet("question-answered");
       return { question: answered, delivery };
+    } catch (error) {
+      // Never a bare throw to the route's catch-all ("Fleet supervisor
+      // error"): the owner learns what became of the answer.
+      return this.answerFailed(question, answer, error, progress);
     } finally {
       this.answering.delete(id);
     }
+  }
+
+  // An owner answer that did not reach the agent (refused, or sent with no
+  // confirmation) leaves its card open saying so. Returns the question.
+  noteUndeliveredAnswer(id, answer, delivery, noun = "answer") {
+    const outcome = deliveryOutcome(delivery);
+    const detail = clampText(String(delivery?.detail ?? "").replace(/[.;\s]+$/, ""), 160);
+    const said = clampText(answer, 60);
+    const note = outcome === "ambiguous"
+      ? `Your ${noun} "${said}" may have reached the agent, but its turn was not confirmed. It is not sent again automatically; check the chat before answering again.`
+      : outcome === "refused"
+        ? `Your ${noun} "${said}" was not sent${detail ? `: ${detail}` : "."}`
+        : null;
+    if (note) this.store.noteQuestionDelivery(id, note);
+    return this.store.question(id);
+  }
+
+  // Something threw while answering. A throw after the agent's send was
+  // confirmed keeps that delivery; one while the send was in flight may
+  // have landed, so it is unconfirmed and never sent again; one before it
+  // sent nothing. Either way there is a receipt and a structured result.
+  answerFailed(question, answer, error, progress = {}, noun = "answer") {
+    const reason = clampText(redactSecrets(String(error?.message ?? error ?? "unknown error")), 140) || "unknown error";
+    try { console.error(`[fleet] answer to ${question?.id ?? "question"} failed: ${reason}`); } catch { /* logging never blocks */ }
+    let delivery;
+    if (progress.delivery?.status === "sent") {
+      delivery = progress.delivery;
+    } else if (progress.dispatching || progress.delivery?.unconfirmed === true) {
+      delivery = { status: "blocked", unconfirmed: true, route: progress.delivery?.route ?? null,
+        detail: `the send stopped before it was confirmed (${reason}); it may have reached the agent. Not sent again so it cannot arrive twice` };
+    } else {
+      delivery = { status: "blocked", route: null, detail: `Supervisor error before sending (${reason}); nothing was sent` };
+    }
+    try {
+      const action = this.store.recordAction({ threadKey: question?.threadKey ?? null, playbook: "owner-answer", questionId: question?.id ?? null,
+        status: delivery.status === "sent" ? "done" : "blocked", route: delivery.route ?? null, detail: clampText(delivery.detail ?? reason, 240) });
+      if (action?.id && !delivery.actionId) delivery = { ...delivery, actionId: action.id };
+    } catch { /* the result still says what happened */ }
+    let current = null;
+    try {
+      current = delivery.status === "sent" ? this.store.question(question.id) : this.noteUndeliveredAnswer(question.id, answer, delivery, noun);
+    } catch { /* store unreadable: the delivery alone answers */ }
+    return { question: current, delivery };
   }
 
   // The owner's answer or reply to the one thread that asked. A risky ask
@@ -2471,7 +2593,10 @@ export class FleetSupervisor {
     };
   }
 
-  async deliverToAsker(question, answer, message, { deadlineAt = null, startedAt = Date.now(), settling = [], queueMax, ownerChoice = null } = {}) {
+  // progress: filled in for the caller's error handling. dispatching while
+  // the executor has the message (a throw then may have sent it), delivery
+  // once it reports.
+  async deliverToAsker(question, answer, message, { deadlineAt = null, startedAt = Date.now(), settling = [], queueMax, ownerChoice = null, progress = {}, queueIfBusy = false } = {}) {
     const thread = this.lastThreads.get(question.threadKey)
       ?? this.knownThreads.get(question.threadKey)
       ?? this.syntheticPaseoThread(question.threadKey, question);
@@ -2481,13 +2606,35 @@ export class FleetSupervisor {
     const route = risky && !["computer-use", "paseo-send"].includes(chosen) ? null : chosen;
     const expectedPermissionId = question?.meta?.paseoPermissionId
       ?? (question?.meta?.app === "paseo" && String(question?.meta?.cardId ?? "").startsWith("permission-") ? question.meta.cardId : null);
+    // queueIfBusy (an answer to the agent's own ask): a Paseo agent mid-turn
+    // gets it once that turn ends, as any owner message to it does, instead
+    // of steering into the running turn. An open prompt is still answered
+    // directly (deliverPaseo answers it before it checks for a running turn).
+    const queueBehindTurn = queueIfBusy && route === "paseo-send" && thread?.kind === "paseo";
     let delivery;
     if (!thread || !route) {
       const detail = !thread || !risky ? this.noRouteDetail(thread, deliveryState)
         : typesLater(thread, deliveryState) ? RISKY_WAITS : RISKY_NO_ROUTE;
       delivery = { status: "blocked", route: null, detail };
     } else {
-      delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt, ownerChoice, expectedPermissionId, ...(risky ? { typedOnly: true } : {}) });
+      progress.dispatching = true;
+      delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt, ownerChoice, expectedPermissionId, ...(queueBehindTurn ? { queue: true } : {}), ...(risky ? { typedOnly: true } : {}) });
+      progress.dispatching = false;
+      progress.delivery = delivery;
+      if (queueBehindTurn && delivery?.status === "busy") {
+        // Linked to the card: if it never reaches the agent (expired, chat
+        // archived, send failed or unconfirmed), the card comes back (#384).
+        // Plain prose in the queue: never read as the answer to a prompt
+        // that opens meanwhile (the drain holds while one is open).
+        const queued = this.store.enqueueOwnerMessage({ threadKey: thread.key, message, source: "owner-answer", questionId: question.id, questionAnswer: answer });
+        const detail = queued
+          ? "The agent is mid-turn; your answer is queued and goes to it once that turn ends."
+          : "The agent is mid-turn and your answer could not be queued (queue full or disk write failed); nothing was sent.";
+        const action = this.store.recordAction({ threadKey: thread.key, playbook: "owner-answer", questionId: question.id, status: queued ? "queued" : "blocked", route: "paseo-queue", detail });
+        if (!queued) return { delivery: { status: "blocked", route: "paseo-queue", actionId: action?.id ?? null, detail } };
+        this.scheduleQueuedOwnerMessageDrain();
+        return { queuedBehindTurn: true, delivery: { status: "queued", queued: true, queueId: queued.id ?? null, route: "paseo-queue", actionId: action?.id ?? null, detail } };
+      }
       if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
       // Starts the cooldown but does not spend the no-progress nudge budget.
@@ -2513,10 +2660,18 @@ export class FleetSupervisor {
     if (!question || question.status !== "open" || !canReplyTo(question)) return null;
     this.answering.add(id);
     this.ownerAnsweredAt.set(question.threadKey, this.now());
+    const progress = {};
     try {
       const settling = [];
       const message = ownerReply(text);
-      const sent = await this.deliverToAsker(question, text, message, { deadlineAt, startedAt, settling, queueMax: message.length });
+      const sent = await this.deliverToAsker(question, text, message, { deadlineAt, startedAt, settling, queueMax: message.length, progress, queueIfBusy: true });
+      if (sent.queuedBehindTurn) {
+        const answered = this.store.answerQuestion(id, text);
+        this.resolveOutreach(question, "reply", "acted");
+        this.recordOwnerActivity();
+        this.emitFleet("question-answered");
+        return { question: answered ?? this.store.question(id), delivery: sent.delivery };
+      }
       // A free reply is no option: no override (a "stop" typed to a stuck
       // thread must not mute it).
       if (sent.queued) {
@@ -2525,7 +2680,7 @@ export class FleetSupervisor {
         return { question: sent.queued, delivery: sent.delivery };
       }
       if (sent.delivery.status !== "sent") {
-        return { question: this.store.question(id), delivery: sent.delivery };
+        return { question: this.noteUndeliveredAnswer(id, text, sent.delivery, "reply"), delivery: sent.delivery };
       }
       const answered = this.store.answerQuestion(id, text);
       this.recordOwnerActivity();
@@ -2547,6 +2702,8 @@ export class FleetSupervisor {
       // the question only while that stored answer stands.
       this.reopenIfUndelivered(id, settling, answered?.answer ?? text);
       return { question: answered ?? this.store.question(id), delivery: sent.delivery };
+    } catch (error) {
+      return this.answerFailed(question, text, error, progress, "reply");
     } finally {
       this.answering.delete(id);
     }
@@ -2795,6 +2952,8 @@ export class FleetSupervisor {
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
+    // A throw from the executor (a Paseo client failing mid-send) may have
+    // sent it: unconfirmed, so this approval is never sent again.
     const delivery = await this.executor.deliver({
       thread,
       message: text,
@@ -2808,7 +2967,8 @@ export class FleetSupervisor {
       ...(risky ? { typedOnly: true } : {}),
       ...(ownerChoice != null ? { ownerChoice } : {}),
       ...(resume ? { noPermissionReply: true } : {})
-    });
+    }).catch((error) => ({ status: "blocked", unconfirmed: true, route,
+      detail: `the send stopped before it was confirmed (${clampText(redactSecrets(String(error?.message ?? error ?? "unknown error")), 120)}); it may have reached the agent. Not sent again so it cannot arrive twice` }));
     if (isPaseoSend && effectiveQueue && delivery?.status === "busy") {
       if (resume) {
         return { delivery: { status: "busy", busy: true, route: "paseo-send", detail: delivery?.detail || "Paseo session is mid-turn; held handoff waits until idle." } };
@@ -2894,6 +3054,41 @@ export class FleetSupervisor {
   // chat. Delivered only on a confirmed send; a send Paseo accepted without
   // a confirmed turn is never repeated; one no longer safe to send stops
   // with its reason.
+  // An approved send Paseo took without a confirmed turn stays
+  // "unconfirmed" and is never sent again. An ACP host (Antigravity) can
+  // start that turn a minute later: a later scan reads the chat's receipt
+  // (read-only) and, once the turn is confirmed, records it delivered.
+  async settleUnconfirmedHandoffs(snapshot = null, { limit = 5 } = {}) {
+    if (snapshot?.sourceErrors?.paseo || !this.config.paseo?.enabled) return [];
+    // An injected executor (tests, the dry-run scan) never reaches a live
+    // Paseo here unless a client or check was injected with it.
+    if (this.deps.executor && !this.deps.paseoFactory && !this.deps.checkPaseoReceipt) return [];
+    const check = this.deps.checkPaseoReceipt ?? checkPaseoReceipt;
+    const now = this.now();
+    const settled = [];
+    const candidates = this.handoffs.entries
+      .filter((entry) => entry.status === "unconfirmed" && typeof entry.message === "string" && entry.message
+        && now - (Date.parse(entry.updatedAt ?? entry.createdAt ?? "") || 0) < HANDOFF_SETTLE_MS)
+      .slice(-limit);
+    for (const entry of candidates) {
+      const thread = this.lastThreads.get(entry.threadKey) ?? null;
+      if (!thread || thread.kind !== "paseo") continue;
+      const text = entry.message.trim();
+      const messageHash = shortHash(text.startsWith(SUPERVISOR_PREFIX) ? text : `${SUPERVISOR_PREFIX} ${text}`);
+      let result;
+      try { result = await check({ config: this.config, thread, store: this.store, messageHash, factory: this.deps.paseoFactory }); }
+      catch { continue; }
+      if (!result?.confirmed) continue;
+      const detail = result.systemError
+        ? `delivered; its turn then failed (${result.systemError}); not sent again`
+        : "delivered: its turn started after the send was reported unconfirmed; not sent again";
+      const action = this.store.recordAction({ threadKey: entry.threadKey, playbook: "owner-message", status: "done", route: "paseo-send", detail: `handoff ${entry.key} ${detail}` });
+      this.handoffs.update(entry.key, { status: "delivered", deliveredAt: new Date(now).toISOString(), deliveredActionId: action?.id ?? null, detail });
+      settled.push(entry.key);
+    }
+    return settled;
+  }
+
   async resumeHandoffs(snapshot = null) {
     if (this.resumingHandoffs) return this.resumingHandoffs;
     // Require a fresh Paseo scan before resuming waiting handoffs: if Paseo
@@ -4518,7 +4713,28 @@ export class FleetSupervisor {
     return { kind: "admin_merge", ...rest, auditId: intent.id };
   }
 
-  async actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
+  // Every card action comes back as a result, never a throw (the route's
+  // catch-all only says "Fleet supervisor error"). An answer or reply says
+  // what became of it: outcome delivered, queued, ambiguous or refused.
+  async actCard(cardId, input = {}) {
+    let result;
+    try {
+      result = await this._actCard(cardId, input ?? {});
+    } catch (error) {
+      const reason = clampText(redactSecrets(String(error?.message ?? error ?? "unknown error")), 140) || "unknown error";
+      try { console.error(`[fleet] card action on ${String(cardId ?? "").slice(0, 120)} failed: ${reason}`); } catch { /* logging never blocks */ }
+      // Not known how far it got: treated as possibly done, never retried
+      // here. (Answers and replies catch their own failures with an outcome.)
+      return { ok: false, kind: "error", status: "blocked",
+        detail: `Supervisor error while acting on this card (${reason}). It may or may not have taken effect; check before trying again.` };
+    }
+    if (!result || !["answer", "reply"].includes(result.kind)) return result;
+    const delivery = result.delivery ? withDeliveryOutcome(result.delivery) : null;
+    const outcome = deliveryOutcome(delivery) ?? (result.status === "blocked" ? "refused" : null);
+    return { ...result, ...(delivery ? { delivery } : {}), ...(outcome ? { outcome } : {}) };
+  }
+
+  async _actCard(cardId, { op = "primary", value = null, confirmed = false, clarification = null, instructions = null, images = null, deadlineAt = null } = {}) {
     const id = String(cardId ?? "").trim();
     if (!id) return null;
 
@@ -4776,6 +4992,8 @@ export class FleetSupervisor {
         this.resolveOutreach(question, "reply", "acted");
         this.recordOwnerActivity();
         this.emitFleet("card-replied");
+      } else if (sent?.delivery) {
+        this.noteUndeliveredAnswer(question.id, replyText, sent.delivery, "reply");
       }
       return {
         ok: deliveredOk,

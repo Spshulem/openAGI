@@ -1646,7 +1646,7 @@ export function computeBlockingImpact({
 
 export function buildSupervisorDeck(
   state,
-  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null, activeGoalResolver = null } = {}
+  { preferences = null, now = Date.now(), threadsByKey = new Map(), prsByKey = new Map(), knownRows = new Map(), blockingResolver = null, projectAliases = null, activeGoalResolver = null, onCardError = null } = {}
 ) {
   const prefs = normalizePreferences(preferences ?? state?.preferences);
   const snapshot = state?.snapshot ?? null;
@@ -1659,7 +1659,17 @@ export function buildSupervisorDeck(
 
   const allQuestionCards = questions
     .filter((q) => isQuestionLiveForDeck(q, q.threadKey ? rowsByKey.get(q.threadKey) : null, prefs))
-    .map((q) => buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver, now }))
+    // One card that cannot be built is left out (onCardError hears why);
+    // it never takes the whole deck, and the state route, down with it.
+    .flatMap((q) => {
+      try {
+        return [buildSupervisorCard(q, { rowsByKey, threadsByKey, prsByKey, actions, prefs, blockingResolver, activeGoalResolver, now })];
+      } catch (error) {
+        if (!onCardError) throw error;
+        onCardError(q, error);
+        return [];
+      }
+    })
     .sort((a, b) => a.rank - b.rank || String(b.noticedAt ?? "").localeCompare(String(a.noticedAt ?? "")));
   const questionCards = allQuestionCards.filter((card) => card.needsYou !== false);
 
