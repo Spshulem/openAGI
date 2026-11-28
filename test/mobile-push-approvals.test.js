@@ -13,6 +13,7 @@ import { MobilePush, PUSH_TIMING, approvalNeedsOwner, buildAlert, buildApproval 
 import { MobilePushStore, validatePushRegistration } from "../src/mobile-push-store.js";
 import { openPushEnvelope } from "../src/mobile-push-envelope.js";
 import { PendingActionStore } from "../src/pending-actions.js";
+const FULL = { previews: "full" };
 
 const T0 = Date.parse("2026-11-21T12:00:00.000Z");
 const NODE = "mobile:phone-1";
@@ -29,7 +30,7 @@ function harness(t, { supervisor = null, approvals = true, alerts = true } = {})
   let now = T0;
   const pendingActions = new PendingActionStore({ dir: path.join(dir, "pending"), now: () => now });
   const store = new MobilePushStore({ dir });
-  store.put(NODE, { pass: "p1.pass-one", key: KEY, env: "sandbox", approvals, alerts });
+  store.put(NODE, { pass: "p1.pass-one", key: KEY, env: "sandbox", approvals, alerts, previews: "full" });
   const events = new EventEmitter();
   pendingActions.bindEvents(events);
 
@@ -69,13 +70,13 @@ function harness(t, { supervisor = null, approvals = true, alerts = true } = {})
 }
 
 test("approval plaintext: id, capped summary with a fallback, the spoken code", () => {
-  const plain = buildApproval({ id: "act_1", toolName: "send_email", summary: `  ${"S".repeat(300)} `, confirmCode: "42" });
+  const plain = buildApproval({ id: "act_1", toolName: "send_email", summary: `  ${"S".repeat(300)} `, confirmCode: "42" }, FULL);
   assert.deepEqual(Object.keys(plain), ["actionId", "summary", "code"]);
   assert.equal(plain.actionId, "act_1");
   assert.equal(plain.summary.length, 220);
   assert.ok(plain.summary.endsWith("…"));
   assert.equal(plain.code, "42");
-  assert.deepEqual(buildApproval({ id: "act_2", toolName: "register_mcp_server", summary: " ", confirmCode: null }),
+  assert.deepEqual(buildApproval({ id: "act_2", toolName: "register_mcp_server", summary: " ", confirmCode: null }, FULL),
     { actionId: "act_2", summary: "Run register_mcp_server", code: null });
 });
 
@@ -90,12 +91,12 @@ test("only a pending queue or chat card needs the owner; an owner-mode record al
 });
 
 test("question alerts say when the answer route takes typed text, and never offer an 'Answer question' button", () => {
-  assert.equal(buildAlert({ id: "fq1", title: "t", options: ["yes"], canReply: true }).canReply, true);
-  assert.equal(buildAlert({ id: "fq2", title: "t", options: ["yes"] }).canReply, false);
-  const suggestion = buildAlert({ id: "fq3", kind: "suggestion", title: "t", options: ["Approve", "Answer question", "Skip"] });
+  assert.equal(buildAlert({ id: "fq1", title: "t", options: ["yes"], canReply: true }, FULL).canReply, true);
+  assert.equal(buildAlert({ id: "fq2", title: "t", options: ["yes"] }, FULL).canReply, false);
+  const suggestion = buildAlert({ id: "fq3", kind: "suggestion", title: "t", options: ["Approve", "Answer question", "Skip"] }, FULL);
   assert.equal(suggestion.canReply, true);
   assert.deepEqual(suggestion.options, ["Approve", "Skip"]);
-  assert.equal(buildAlert({ id: "fq4", kind: "agent-ask", title: "t", options: ["Answer question"] }).canReply, false);
+  assert.equal(buildAlert({ id: "fq4", kind: "agent-ask", title: "t", options: ["Answer question"] }, FULL).canReply, false);
 });
 
 test("the phone opts in to approval alerts; anything but a boolean is refused", () => {
@@ -193,4 +194,17 @@ test("PendingActionStore.watch hears each new card once, never an owner record, 
   unwatch();
   store.enqueue(chatCard({ args: { to: "sam@example.com" } }));
   assert.equal(heard.length, 1);
+});
+
+test("lock-screen privacy is the default: no card text, options, thread or approval summary leave main", () => {
+  const question = { id: "fq9", title: "Merge PR #42 in acme/payroll?", body: "Salary table migration is ready.", options: ["Merge", "Skip"], threadKey: "codex:secret", canReply: true };
+  const alert = buildAlert(question);
+  assert.deepEqual(alert, { questionId: "fq9", title: "Supervisor needs you", body: "Open OpenAGI to review it.", options: [], threadKey: null, canReply: false, private: true });
+  assert.doesNotMatch(JSON.stringify(alert), /payroll|Salary|Merge|secret/);
+  const approval = buildApproval({ id: "act_9", toolName: "send_email", summary: "Email Dana the offer letter", confirmCode: "17" });
+  assert.doesNotMatch(approval.summary, /Dana|offer/);
+  assert.equal(approval.actionId, "act_9");
+  assert.equal(validatePushRegistration({ pass: "p1.x", key: KEY, env: "sandbox" }).value.previews, "private");
+  assert.equal(validatePushRegistration({ pass: "p1.x", key: KEY, env: "sandbox", previews: "full" }).value.previews, "full");
+  assert.equal(validatePushRegistration({ pass: "p1.x", key: KEY, env: "sandbox", previews: "loud" }).ok, false);
 });

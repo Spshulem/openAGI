@@ -239,7 +239,7 @@ it('matches wake word boundaries and supports an armed follow-up without trigger
 it('keeps streaming display updates blank and restores the latest page on wake', () => {
   const surface = { show: vi.fn(), initialize: vi.fn(), requestExit: () => Promise.resolve(true) }; const renderer = new OpenAGIGlassesRenderer(surface)
   renderer.home(); renderer.sleep(true); renderer.progress('Thinking', 'Active')
-  expect(surface.show).toHaveBeenLastCalledWith(' ', false)
+  expect(surface.show).toHaveBeenLastCalledWith(' ', false, 'idle')
   renderer.answer('Newest answer', 0, 1); renderer.sleep(false)
   expect(surface.show).toHaveBeenLastCalledWith(expect.stringContaining('Newest answer'), true)
 })

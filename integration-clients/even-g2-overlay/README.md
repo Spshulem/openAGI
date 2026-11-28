@@ -22,6 +22,27 @@ The client pins Even Hub SDK **0.0.16**, requiring Even app **2.2.10** or newer.
 Native wake-word routing, microphone continuity, connected-calendar answers
 and physical display readability still require device acceptance.
 
+### Version 0.5.10: Lifelog consent on glasses, still clock, quiet Supervisor display
+
+- Lifelog consent is actionable on the glasses: swipe down → Give recording
+  consent → confirm. Nothing records before that. Stop Lifelog withdraws consent
+  on main and turns the microphone off. Controls redraw whenever consent changes
+  (consent given on the phone no longer leaves a stale list over a live mic).
+- No background capture: after a locked-phone audio gap Lifelog shows Mic off
+  and resumes on unlock or a glasses gesture.
+- The upper-right status is a still clock. Active capture shows the clock alone;
+  only "Checking…" (real work), "Mic off" or "Paused" are added. No animation and
+  no Listening banner. Checking a cue no longer replaces the screen.
+- Quiet display (clock only): from the phone, or swipe down past the last
+  Supervisor status page. It wakes on tap or swipe (swipe up opens the items),
+  or for a new actionable Supervisor item, never for one already there or
+  already shown. Double-tap at the root stays Even's exit dialog (required).
+- Live cues (needs the matching main): direct questions get the answer itself
+  ("capital of Washington?" → Olympia) within seconds; echoes of the
+  conversation or of glasses instructions, and repeats, stay quiet. "What did we
+  talk about five minutes ago?" uses only consented Lifelog text on main and says
+  so when capture was off or nothing was saved.
+
 ### Version 0.5.0: three modes, consent once
 
 The glasses home has exactly one setting, chosen on the phone:
@@ -36,9 +57,10 @@ A press-and-hold acts like one tap. Ignored gestures show a short notice
 instead of doing nothing, and a microphone that does not open within 8
 seconds fails visibly instead of blocking taps.
 
-Lifelog consent is given once with the phone checkbox and kept (main stores it
-without expiry) until you uncheck it, switch away from Lifelog, or delete
-memory. Leaving the glasses foreground only stops the microphone locally; any
+Lifelog consent is given once, with the phone checkbox or on the glasses
+(swipe down → Give recording consent → confirm), and kept (main stores it
+without expiry) until you uncheck it, choose Stop Lifelog, switch away from
+Lifelog, or delete memory. Leaving the glasses foreground only stops the microphone locally; any
 glasses gesture or foreground return starts it again. The phone screen being
 locked no longer pauses anything. Hold-to-talk, quick-tap highlight, wake
 responses, lock-screen and resume-consent screens are removed; older saved

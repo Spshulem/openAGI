@@ -169,3 +169,17 @@ it('actCard keeps a halted preflight card open and removes it once merged', asyn
   expect(f.client.items).toEqual([])
   f.client.stop()
 })
+
+it('a Supervisor item that arrived while Agents was in the background is surfaced once on return', async () => {
+  vi.useFakeTimers(); const f = fixture(); f.idle.mockReturnValue(true)
+  let items: object[] = []
+  f.api.proactive.mockImplementation(body => Promise.resolve((['notify', 'can-notify'].includes(body.op) ? { notify: true } : { settings: { enabled: false, supervisorOnly: true }, quiet: false, items }) as never))
+  f.client.start(); await vi.advanceTimersByTimeAsync(1)
+  f.client.setForeground(false)
+  items = [{ id: 'card:new', cardId: 'new', title: 'PR ready', summary: '', important: true, seen: false, action: 'act-fleet-card', category: 'approvals', supervisor: true }]
+  expect(f.notify).not.toHaveBeenCalled()
+  f.client.setForeground(true); await vi.advanceTimersByTimeAsync(1)
+  expect(f.notify).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: 'card:new' }))
+  expect(f.api.proactive).toHaveBeenCalledWith({ op: 'notify', id: 'card:new' }, expect.anything())
+  f.client.stop()
+})

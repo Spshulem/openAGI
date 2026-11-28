@@ -107,7 +107,7 @@ export class OpenAGIPhoneCompanion {
           <section id="cue-panel" class="ambient" data-page="listen"><h2>Live cues</h2><button id="toggle-transcript" aria-pressed="false">Show transcript on glasses</button><label><input id="live-cues-enabled" type="checkbox"> Offer brief answers and context while I listen</label><p>Requires consented lifelog. Uses your main model and read-only connected data, at most 20 checks per hour. Suggested tasks need confirmation. Transcript visibility does not change recording.</p><p id="cue-status" role="status">Live cues off.</p><div id="live-cues"></div></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
-          <button id="blank-display">Blank glasses display</button>
+          <button id="blank-display">Quiet display (clock only)</button>
           <section class="ambient" data-page="inbox"><h2>Inbox</h2><details><summary>Notification and retention settings</summary>
             <label><input type="checkbox" id="proactive-enabled"> Show updates from my main</label>
             <div id="proactive-categories">${['approvals', 'tasks', 'discoveries', 'email', 'calendar'].map(c => `<label><input type="checkbox" value="${c}" checked> ${c}</label>`).join('')}</div>
@@ -483,7 +483,7 @@ export class OpenAGIPhoneCompanion {
   speechTiming(text: string): void { const node = this.actionsSection.querySelector('#speech-timing'); if (node) node.textContent = text }
   displaySleeping(sleeping: boolean): void {
     const button = this.actionsSection.querySelector('#blank-display')
-    if (button) button.textContent = sleeping ? 'Wake display (or double-tap glasses)' : 'Blank glasses display'
+    if (button) button.textContent = sleeping ? 'Show display (or tap or swipe on the glasses)' : 'Quiet display (clock only)'
   }
   activity(text: string): void {
     const list = this.actionsSection.querySelector('#activity-log')

@@ -185,6 +185,18 @@ export class G2Proactive {
       default: reject("Unsupported proactive operation");
     }
   }
+  // Recent consented Lifelog text for grounding "what were we just saying?".
+  // Only for the consent that is current on main right now: a revoked or
+  // replaced grant, or no grant, means capture is unavailable.
+  recentHistory(nodeId, consentId, windowMs = 20 * 60_000) {
+    this.prune();
+    const n = this.node(nodeId);
+    if (!n.consent || !consentId || n.consent.id !== consentId) return { available: false };
+    const since = this.now() - windowMs;
+    const segments = n.segments.filter(s => s.endAt >= since).sort((a, b) => a.at - b.at).slice(-40)
+      .map(s => ({ at: s.at, endAt: s.endAt, text: s.text }));
+    return { available: true, since, segments };
+  }
   capture(n, body) {
     if (!n.consent || n.consent.id !== body.consentId) reject("Conversation memory consent is off or was revoked", 403);
     if (typeof body.batchId !== "string" || !/^[a-zA-Z0-9-]{16,80}$/.test(body.batchId)

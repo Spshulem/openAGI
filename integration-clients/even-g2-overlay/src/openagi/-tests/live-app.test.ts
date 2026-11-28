@@ -916,3 +916,131 @@ it('drops an in-flight cue when the glasses leave the foreground', async () => {
     expect(liveCue.mock.calls[0]).toHaveLength(3)
   } finally { await f.app.systemExit() }
 })
+
+// Spencer's repro: "Lifelog needs consent" on the glasses had no glasses
+// action; its controls offered "Resume listening", which only flashed "use the
+// phone", and consent given on the phone left that stale list over a live mic.
+it('Lifelog consent is actionable on the glasses, confirmed explicitly, and nothing records before it', async () => {
+  vi.useFakeTimers()
+  const main = mainConsent()
+  const f = await fixture({ homeMode: 'lifelog', recordingConsent: false }, { proactive: main.proactive })
+  try {
+    expect(f.renderer.lifelogHome).toHaveBeenLastCalledWith('consent', '')
+    expect(f.audio.start).not.toHaveBeenCalled(); expect(consentOps(main)).toHaveLength(0)
+    f.app.scrollDown()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Give recording consent', expect.stringContaining('Confirm everyone present agrees'), false)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    // One tap only asks; nothing is granted or recorded yet.
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Give recording consent', expect.any(String), true)
+    expect(f.audio.start).not.toHaveBeenCalled(); expect(consentOps(main)).toHaveLength(0)
+    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Give recording consent', expect.any(String), false)
+    await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(consentOps(main)).toHaveLength(1); expect(main.state.consent?.id).toBe('grant-1')
+    expect(f.store.snapshot().recordingConsent).toBe(true); expect(f.phone.recordingConsent).toHaveBeenLastCalledWith(true)
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.capturing).toBe(true)
+    expect(f.renderer.passive).toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('consent given on the phone while the glasses show Lifelog controls never leaves a stale list', async () => {
+  const main = mainConsent()
+  const f = await fixture({ homeMode: 'lifelog', recordingConsent: false }, { proactive: main.proactive })
+  try {
+    f.app.scrollDown()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Give recording consent', expect.any(String), false)
+    await f.app.configureRecordingConsent(true)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    const label = String(f.renderer.inboxAction.mock.calls.at(-1)![0])
+    expect(['Mark this moment', 'Pause listening']).toContain(label)
+    expect(f.renderer.inboxAction.mock.calls.at(-1)![1]).toBe('Lifelog')
+  } finally { await f.app.systemExit() }
+})
+
+it('Stop Lifelog on the glasses withdraws consent on main and turns the microphone off', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogFixture()
+  try {
+    expect(f.app.proactive.capturing).toBe(true)
+    f.app.scrollDown()
+    const labels = () => (f.app as unknown as { inboxActions(): { label: string }[] }).inboxActions().map(a => a.label)
+    expect(labels()).toContain('Stop Lifelog · withdraw consent')
+    while (f.renderer.inboxAction.mock.calls.at(-1)![0] !== 'Stop Lifelog · withdraw consent') f.app.scrollUp()
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500)
+    expect(f.main.state.revokes).toBe(0)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.main.state.revokes).toBe(1); expect(f.main.state.consent).toBeNull()
+    expect(f.store.snapshot().recordingConsent).toBe(false); expect(f.app.proactive.capturing).toBe(false)
+    expect(f.audio.stop).toHaveBeenCalled()
+    expect(f.renderer.lifelogHome).toHaveBeenLastCalledWith('consent', '')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('after a locked-phone audio gap, Lifelog stays off and says so until unlock, then resumes with the same consent', async () => {
+  vi.useFakeTimers()
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+  const f = await lifelogFixture()
+  try {
+    visibility.mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange'))
+    f.receive(new Uint8Array(640))
+    await vi.advanceTimersByTimeAsync(12_000)
+    expect(f.app.proactive.capturing).toBe(false)
+    expect(f.renderer.lifelogHome).toHaveBeenLastCalledWith('waiting', expect.stringContaining('Lifelog is off'))
+    const starts = f.audio.start.mock.calls.length
+    // No background capture: nothing reopens the microphone while locked.
+    await vi.advanceTimersByTimeAsync(10 * 60_000)
+    expect(f.audio.start.mock.calls.length).toBe(starts)
+    visibility.mockReturnValue('visible'); document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(500)
+    expect(f.audio.start.mock.calls.length).toBe(starts + 1)
+    f.receive(new Uint8Array(640))
+    expect(f.app.proactive.capturing).toBe(true); expect(f.main.state.grants).toBe(1)
+  } finally { visibility.mockRestore(); await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('quiet Supervisor display wakes only for a new actionable item, and swipes browse instead of exiting', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ homeMode: 'supervisor' })
+  try {
+    const app = f.app as unknown as { showNotice(item: object): void }
+    const canNotify = (f.app.proactive as unknown as { canNotify: (item?: object) => boolean }).canNotify
+    const old = { id: 'card:old', cardId: 'old', title: 'Old card', summary: '', category: 'approvals', action: 'act-fleet-card', important: true, seen: false, supervisor: true }
+    f.app.proactive.items = [old]
+    f.app.toggleDisplay()
+    expect(f.renderer.sleep).toHaveBeenLastCalledWith(true)
+    // Stale (already there when it went quiet), non-actionable, or non-supervisor: stay quiet.
+    expect(canNotify(old)).toBe(false)
+    expect(canNotify({ ...old, id: 'info', cardId: undefined, action: '' })).toBe(false)
+    expect(canNotify({ id: 'task', title: 'Task', summary: '', category: 'tasks', action: 'accept-task', important: true, seen: false })).toBe(false)
+    app.showNotice(old); expect(f.renderer.notice).not.toHaveBeenCalled()
+    const fresh = { ...old, id: 'card:new', cardId: 'new', title: 'Merge #42?' }
+    expect(canNotify(fresh)).toBe(true)
+    app.showNotice(fresh)
+    expect(f.renderer.sleep).toHaveBeenLastCalledWith(false)
+    expect(f.renderer.notice).toHaveBeenLastCalledWith('Supervisor question', 'Merge #42?')
+    // The same item cannot wake it twice.
+    await vi.advanceTimersByTimeAsync(5000); f.app.toggleDisplay()
+    expect(canNotify(fresh)).toBe(false)
+    // Swipe up while quiet wakes and opens the Supervisor items to browse; no exit.
+    f.app.proactive.items = [old, fresh]
+    f.app.scrollUp()
+    expect(f.renderer.sleep).toHaveBeenLastCalledWith(false)
+    expect(f.renderer.inboxList).toHaveBeenCalled()
+    expect(f.renderer.requestExit).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('swiping past the last Supervisor status page enters the quiet display without exiting', async () => {
+  const f = await fixture({ homeMode: 'supervisor' })
+  try {
+    vi.spyOn(f.app.proactive, 'fleetStatus').mockResolvedValueOnce({ counts: { red: 0, yellow: 0, green: 1 }, needsYou: 0, threads: [{ name: 'repo', health: 'green', state: 'ok', reason: '' }] } as never)
+    f.app.scrollDown(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+    expect(f.renderer.fleetStatus).toHaveBeenCalled()
+    f.app.scrollDown()
+    expect(f.renderer.sleep).toHaveBeenLastCalledWith(true)
+    expect(f.renderer.requestExit).not.toHaveBeenCalled()
+    f.app.tap()
+    expect(f.renderer.sleep).toHaveBeenLastCalledWith(false)
+    expect(f.renderer.supervisorHome).toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})

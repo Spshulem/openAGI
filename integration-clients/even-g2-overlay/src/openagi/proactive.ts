@@ -56,7 +56,7 @@ export class G2ProactiveClient {
   }
   // The phone screen does not gate anything; becoming visible just refreshes.
   private visibility = (): void => { if (document.visibilityState !== 'hidden' && this.running && !this.hidden()) void this.refresh() }
-  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: () => boolean, private readonly notify: (item: InboxItem) => void) {}
+  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: (item?: InboxItem) => boolean, private readonly notify: (item: InboxItem) => void) {}
   consentSnapshot(): MainConsent | null { return this.consent ? { ...this.consent } : null }
   /** Stops capture locally and drops unsent text. Consent stays on main. */
   suspendMemory(detail = 'Lifelog paused on this device. Microphone off; consent stays on. Unsent text is not replayed.'): void {
@@ -115,9 +115,9 @@ export class G2ProactiveClient {
       // Do not claim a notification until the app says it can show it safely.
       // Supervisor mode pings for its own questions without the general opt-in.
       const item = this.items.find(i => i.important && !i.seen && !i.notified && (result.settings?.enabled === true || (result.settings?.supervisorOnly === true && i.supervisor === true)))
-      if (item && !result.quiet && this.canNotify()) {
+      if (item && !result.quiet && this.canNotify(item)) {
         const allowed = await this.api.proactive({ op: 'can-notify', id: item.id }, signal)
-        if (!signal.aborted && this.running && allowed.notify && this.canNotify()) {
+        if (!signal.aborted && this.running && allowed.notify && this.canNotify(item)) {
           this.notify(item)
           item.notified = true
           await this.api.proactive({ op: 'notify', id: item.id }, signal)

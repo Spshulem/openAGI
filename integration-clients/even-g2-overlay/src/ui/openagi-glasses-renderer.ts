@@ -37,8 +37,9 @@ export class OpenAGIGlassesRenderer {
   }
   sleep(value: boolean): void {
     this.sleeping = value
-    // Retain the native page and its gestures; this is not hardware power-off.
-    this.surface.show(...(value ? [' ', false] as [string, boolean] : this.latest))
+    // Quiet display: a blank page with only the still clock. The native page
+    // and its gestures stay; this is not hardware power-off.
+    this.surface.show(...(value ? [' ', false, 'idle'] as [string, boolean, G2DisplayPhase] : this.latest))
   }
   /** A short notice for an ignored gesture; the previous screen comes back. */
   flash(title: string, detail: string, ms = 2500): void {
@@ -55,7 +56,8 @@ export class OpenAGIGlassesRenderer {
   transcript(text: string): void { this.liveWords = text; this.show(`${this.showTranscript ? tail(text, 260) : ''}\n\n${this.stopHint()}`, false, 'listening') }
   cue(title: string, brief: string): void { this.show(`${title.slice(0, 60)}\n${brief.slice(0, 180)}\n\nTap: expand`, false, 'listening') }
   cueDetail(text: string, page: number, total: number): void { this.show(`${text}\n\n${page + 1}/${total} · Swipe: read\nDouble-tap: return · Talk on phone`, true, 'listening') }
-  checkingCue(): void { this.show('Checking the conversation…', false, 'checking') }
+  // Only the small status word changes while a cue is checked.
+  checkingCue(): void { this.show(this.showTranscript ? tail(this.liveWords || ' ', 260) : ' ', false, 'checking') }
   unpaired(): void { this.show('OpenAGI\n\n1. Install OpenAGI on your computer.\n2. On your phone, open Agents setup.\n3. Check your server and enter its code.\n\nDouble-tap: exit', true) }
   pairing(): void { this.show('Agents\n\nPair OpenAGI or add\nan agent URL + token\non the phone screen.', true) }
   supervisorHome(questions: number): void {
@@ -70,11 +72,15 @@ export class OpenAGIGlassesRenderer {
   }
   home(device?: string): void { this.show(`Talk${device ? ` · ${device}` : ''}\n\nTap: talk to agent\nTap again: ${this.sendOnStop ? 'send' : 'review'}\n\n${this.inboxLine()}Swipe down: Recent\nDouble-tap: exit`, true) }
   lifelogHome(state: LifelogHomeState, detail = ''): void {
-    const title = state === 'consent' ? 'Lifelog · needs consent' : state === 'paused' ? 'Lifelog paused' : state === 'waiting' ? 'Lifelog · waiting' : 'Lifelog · starting'
-    const body = state === 'consent' ? 'Give recording consent once\nin Agents on the phone.'
-      : state === 'paused' ? 'Microphone off. Consent stays on.'
-        : state === 'waiting' ? tail(detail || 'Resumes automatically.', 140) : 'Opening the microphone…'
-    this.show(`${title}\n\n${body}\n\nTap: talk to agent\n${state === 'paused' ? 'Swipe down: resume' : 'Swipe down: controls'}\n${this.inboxLine()}Double-tap: exit`, true)
+    if (state === 'consent') {
+      this.show(`Lifelog needs your consent\n\nNothing is recorded until you agree.\n\nSwipe down: give consent\nTap: talk to agent\n${this.inboxLine()}Double-tap: exit`, true, 'idle')
+      return
+    }
+    const title = state === 'paused' ? 'Lifelog paused' : state === 'waiting' ? 'Lifelog · mic off' : 'Lifelog'
+    const body = state === 'paused' ? 'Microphone off. Consent stays on.'
+      : state === 'waiting' ? tail(detail || 'Resumes automatically.', 140) : 'Starting the microphone…'
+    const phase: G2DisplayPhase = state === 'paused' ? 'paused' : state === 'waiting' ? 'interrupted' : 'idle'
+    this.show(`${title}\n\n${body}\n\nTap: talk to agent\n${state === 'paused' ? 'Swipe down: resume or stop' : 'Swipe down: controls'}\n${this.inboxLine()}Double-tap: exit`, true, phase)
   }
   recent(question: string, position: number, total: number): void { this.show(`Recent · ${position}/${total}\n\n${question.slice(0, 220)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
   inbox(text: string, item: number, total: number, page: number, pages: number): void {
@@ -103,7 +109,10 @@ export class OpenAGIGlassesRenderer {
     const content = partial || `\n${stage.slice(0, 58)}\n\n${activity || 'Waiting for the next update…'}`
     this.show(`${this.who} · ${detail.split(' · ')[0]}\n${content}\n\nSwipe: read · Tap: text/activity\nDouble-tap: stop? · Cancel on phone`, false, 'thinking')
   }
-  fleetStatus(page: string, pageIndex: number, pages: number): void { this.show(`Supervisor status\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\nTap: talk to supervisor\nDouble-tap: back`, true) }
+  fleetStatus(page: string, pageIndex: number, pages: number): void {
+    const last = pageIndex + 1 >= pages
+    this.show(`Supervisor status\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\nTap: talk to supervisor\n${last ? 'Swipe down: quiet display\n' : ''}Double-tap: back`, true)
+  }
   answer(page: string, pageIndex: number, pages: number): void { this.show(`${this.who}\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\nTap: follow up · Double-tap: back`, true) }
   message(title: string, detail: string): void { this.show(`${title}\n\n${tail(detail, 420)}\n\nTap to continue`, true) }
 }
