@@ -11,7 +11,7 @@ import { LiveSpeech, SpeechStreamError, type SpeechModel, type SpeechCallbacks }
 import type { ConversationThread, HomeMode, OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer, LifelogHomeState } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
-import { G2ProactiveClient, type InboxItem, type MainConsent, type SupervisorWalkthrough } from '../openagi/proactive'
+import { G2ProactiveClient, type AnswerResult, type InboxItem, type MainConsent, type SupervisorWalkthrough } from '../openagi/proactive'
 import type { SharedThreadMessage } from '../openagi/experience-client'
 import { G2VoiceSession, supervisorVoiceFocus, type VoiceCallbacks } from '../openagi/voice-session'
 
@@ -91,6 +91,17 @@ export class OpenAGIG2App {
     return Boolean(item.cardId || item.questionId || item.options?.length || ['act-fleet-card', 'answer-fleet'].includes(item.action))
   }
   private quietSeen = new Set<string>()
+  private answerRequests = new Map<string, string>()
+  // The phone's answer buttons share the glasses' request ids and wording.
+  async answerQuestion(id: string, value: string): Promise<{ ok: boolean; detail: string }> {
+    const key = `${id}\u0000${value}`
+    const requestId = this.answerRequests.get(key) ?? crypto.randomUUID()
+    this.answerRequests.set(key, requestId)
+    const result = await this.proactive.answer(id, value, requestId)
+    if (!result.retry) this.answerRequests.delete(key)
+    const [title, body] = answerReport(value, result)
+    return { ok: result.ok, detail: `${title}. ${body}` }
+  }
   private showNotice(item: InboxItem): void {
     if (this.displaySleeping) {
       if (!this.wakesQuietDisplay(item)) return
@@ -467,10 +478,24 @@ export class OpenAGIG2App {
       return
     }
     if (action.op === 'answer') {
+      const value = action.value ?? ''
+      // One request id per item and choice: a retry of the same tap is the
+      // same request, so the hub never delivers it twice.
+      const key = `${target.id}\u0000${value}`
+      const requestId = this.answerRequests.get(key) ?? crypto.randomUUID()
+      this.answerRequests.set(key, requestId)
       try {
-        const result = await this.proactive.answer(target.id, action.value ?? '')
+        const result = await this.proactive.answer(target.id, value, requestId)
         if (this.exited || !this.foregroundActive) return
-        this.mode = 'message'; this.renderer.message(result.ok ? 'Answered' : 'Not sent yet', result.ok ? `${action.value}. ${result.detail}` : `${result.detail || 'The question stays open.'} Try again later.`)
+        if (!result.retry) this.answerRequests.delete(key)
+        const [title, body] = answerReport(value, result)
+        if (result.retry) {
+          // Keep the item and the chosen answer on screen: tap confirms again.
+          this.mode = 'inbox-confirm'; this.showInboxAction(); this.flash(title, body)
+          this.phone.set(title, body)
+          return
+        }
+        this.mode = 'message'; this.renderer.message(title, body); this.phone.set(title, body)
       } finally { this.navigationBusy = false }
       return
     }
@@ -1144,11 +1169,33 @@ export class OpenAGIG2App {
     const text = 'Voice is off on your hub. Set OPENAGI_VOICE=1.'
     this.renderer.message('Supervisor voice unavailable', text); this.phone.set('Supervisor voice unavailable', text)
   }
+  // A saved earlier question blocks a new one only while main is still
+  // running it. Finished, cancelled, unconfirmed or unknown requests are
+  // settled (kept in Recent) instead of leaving a dead end.
+  private async settleSavedRequest(): Promise<boolean> {
+    let settled: Awaited<ReturnType<NonNullable<OpenAGIApiClient['settlePending']>>> | null
+    try { settled = await this.api.settlePending?.(AbortSignal.timeout(6000)) ?? null } catch { settled = null }
+    if (!settled) {
+      this.phone.pendingQuestion?.('Your hub could not be reached to check your saved question. It will not be sent twice.')
+      this.flash('Saved question waiting', 'Hub not reached to check it. Check it on the phone, or try again.'); return false
+    }
+    if (settled.state === 'working') {
+      this.phone.pendingQuestion?.('Your earlier question is still running on main. Wait for its answer, or cancel it here.')
+      this.flash('Earlier question still running', 'Wait for its answer, or cancel it on the phone.'); return false
+    }
+    const thread = settled.thread ?? 'agent'
+    if (settled.result) await this.store.remember(settled.text ?? settled.result.question, settled.result.reply, thread).catch(() => undefined)
+    else if (settled.unconfirmed && settled.text) await this.store.remember(settled.text, 'Not confirmed by main. Check History before asking it again.', thread).catch(() => undefined)
+    this.phone.pendingQuestion?.(null); this.phone.history?.(this.store.snapshot().history)
+    return true
+  }
   private async beginAsk(): Promise<void> {
     // A lifelog microphone that is opening finishes first, then hands over.
     if (this.lifelogStart) await this.lifelogStart.catch(() => undefined)
     const state = this.store.snapshot()
-    if (state.pendingRequest) { this.phone.pendingQuestion?.('Check your saved question before asking another. Reconnecting will not submit it twice.'); this.flash('Saved question waiting', 'Check it on the phone before asking again.'); return }
+    // Supervisor voice never uses the saved-request slot, so an earlier
+    // question (or a decision on screen) must not block push-to-talk there.
+    if (state.pendingRequest && this.homeMode !== 'supervisor' && !await this.settleSavedRequest()) return
     if (this.mode !== 'review' && state.savedDraft) { this.reviewDraft(state.savedDraft, 'speech'); return }
     if (this.exited) return
     if (this.navigationBusy || this.microphoneOpening || this.requestController) { this.flash('Busy', 'Finish the current question first.'); return }
@@ -1710,4 +1757,20 @@ function createNodeToken(): string {
   let binary = ''
   for (const byte of bytes) binary += String.fromCharCode(byte)
   return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+}
+
+// What happened to an answer tap, in plain words, with the next step.
+export function answerReport(value: string, result: AnswerResult): [string, string] {
+  const said = `"${value}"`
+  switch (result.outcome) {
+    case 'delivered': return ['Answered', `${said} was delivered${result.detail ? ` (${result.detail.replace(/[.\s]+$/, '')})` : ' to the agent'}.`]
+    case 'queued': return ['Answer queued', `${said} will send when the agent's thread is free. Don't answer again.`]
+    case 'ambiguous': return ['Delivery not confirmed', `${said} may have reached the agent. Check the Supervisor chat on your phone before answering again.`]
+    case 'closed': return ['Already closed', 'This question was answered or closed elsewhere.']
+    case 'unconfirmed': return ['Not confirmed', `${said} may be queued behind the agent's messages. Check the Supervisor chat on your phone before answering again.`]
+    case 'unreachable': return result.retry
+      ? ['Hub not reached', `${said} is kept. Tap: try again (it will not send twice). Or answer on your phone.`]
+      : ['Hub not reached', `${said} may not have arrived. Check the Supervisor chat on your phone before answering again.`]
+    default: return ['Not sent', `${result.detail || 'Nothing was sent.'} ${said} is kept. Tap: try again. Or answer on your phone.`]
+  }
 }

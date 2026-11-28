@@ -57,7 +57,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     deleteMemory: () => { void app.deleteMemory() },
     readLifelog: (query, offset) => { void app.readLifelog(query, offset) },
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
-    answerQuestion: (id, answer) => app.proactive.answer(id, answer),
+    answerQuestion: (id, answer) => app.answerQuestion(id, answer),
     actCard: (id, cardOp) => app.proactive.actCard(id, cardOp),
     startSupervisorWalkthrough: () => { void app.startSupervisorWalkthrough() },
     supervisorWalkthroughAction: operation => { void app.supervisorWalkthroughAction(operation) },

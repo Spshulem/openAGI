@@ -138,7 +138,7 @@ it('an answer drops a feed read that started before it and fetches a fresh one',
     return Promise.resolve(snapshot)
   })
   f.client.start(); await vi.advanceTimersByTimeAsync(1)
-  const result = await f.client.answer('fleet-q', 'Starter')
+  const result = await f.client.answer('fleet-q', 'Starter', 'req-starter-1')
   expect(result.ok).toBe(true)
   expect(f.client.items).toEqual([])
   releaseStale!(); await vi.advanceTimersByTimeAsync(1)
@@ -182,4 +182,18 @@ it('a Supervisor item that arrived while Agents was in the background is surface
   expect(f.notify).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: 'card:new' }))
   expect(f.api.proactive).toHaveBeenCalledWith({ op: 'notify', id: 'card:new' }, expect.anything())
   f.client.stop()
+})
+
+it("answer outcomes: an older hub's bare failure is unconfirmed, and offline retries only once receipts are known", async () => {
+  const f = fixture()
+  const original = f.api.proactive.getMockImplementation()!
+  f.api.proactive.mockImplementation(async body => body.op === 'answer' ? { ok: false, detail: '' } as never : original(body))
+  expect(await f.client.answer('question:mock', 'Yes', 'req-1')).toMatchObject({ ok: false, outcome: 'unconfirmed', retry: false })
+  f.api.proactive.mockImplementation(async body => { if (body.op === 'answer') throw new Error('offline'); return original(body) })
+  expect(await f.client.answer('question:mock', 'Yes', 'req-2')).toMatchObject({ outcome: 'unreachable', retry: false })
+  f.api.proactive.mockImplementation(async body => body.op === 'answer' ? { ok: true, outcome: 'queued', retry: false, detail: '' } as never : original(body))
+  expect(await f.client.answer('question:mock', 'Yes', 'req-3')).toMatchObject({ ok: true, outcome: 'queued' })
+  f.api.proactive.mockImplementation(async body => { if (body.op === 'answer') throw new Error('offline'); return original(body) })
+  expect(await f.client.answer('question:mock', 'No', 'req-4')).toMatchObject({ outcome: 'unreachable', retry: true })
+  expect(f.api.proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'answer', id: 'question:mock', answer: 'No', requestId: 'req-4' }), expect.anything())
 })

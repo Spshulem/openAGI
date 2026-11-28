@@ -22,6 +22,21 @@ The client pins Even Hub SDK **0.0.16**, requiring Even app **2.2.10** or newer.
 Native wake-word routing, microphone continuity, connected-calendar answers
 and physical display readability still require device acceptance.
 
+### Version 0.5.11: decisions never block talking; answers say what happened
+
+- A saved earlier question no longer blocks Supervisor hold-to-talk (voice
+  never used it), and in Talk it is checked once: finished, cancelled or
+  unconfirmed questions are settled into Recent; only a still-running one
+  waits, with the real reason.
+- Speaking while a decision is on screen asks about it; answering stays an
+  explicit choice and confirm (spoken actions keep the hub's code check).
+- An answer tap reports Answered, Answer queued (don't answer again),
+  Delivery not confirmed (check the phone), Not sent or Hub not reached. When
+  nothing was sent the item and choice stay on the confirm screen, and a retry
+  reuses the same request id, so an updated hub never delivers it twice.
+  Needs the matching main update for queued/receipt outcomes; an older main's
+  open-question reply is shown as "Not confirmed", never "Not sent".
+
 ### Version 0.5.10: Lifelog consent on glasses, still clock, quiet Supervisor display
 
 - Lifelog consent is actionable on the glasses: swipe down → Give recording

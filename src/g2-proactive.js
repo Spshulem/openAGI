@@ -5,6 +5,7 @@ import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
 import { isSuppressedByQuietCadence } from "./fleet/preferences.js";
 import { SupervisorWalkthrough, WalkthroughError } from "./fleet/walkthrough.js";
+import { deliveryOutcome } from "./fleet/contracts.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -25,6 +26,9 @@ export class G2Proactive {
     this.now = now;
     this.walkthrough = new SupervisorWalkthrough({ dataDir: dataDir ?? path.resolve(this.file, "..", ".."), now });
     this.reviewing = false; this.closed = false; this.reviewController = null;
+    // G2 answer receipts by request id: a retry of the same tap returns the
+    // first outcome instead of delivering the answer again.
+    this.answerReceipts = new Map();
     this.nodes = readJsonFile(this.file, { nodes: {} }).nodes;
     this.prune();
   }
@@ -267,7 +271,31 @@ export class G2Proactive {
   // Answers a supervisor question from the glasses with one of its fixed
   // choices. Same path as the owner's outreach action: the question closes
   // only when the answer reached the agent; otherwise it stays open.
+  // { ok, outcome, retry, detail }. outcome: delivered | queued (accepted,
+  // sends when the agent's thread is free) | ambiguous (may have reached the
+  // agent; never resend blindly) | refused (nothing sent; safe to retry).
   async answerFleet(nodeId, body) {
+    const requestId = typeof body?.requestId === "string" && /^[a-zA-Z0-9-]{8,80}$/.test(body.requestId) ? body.requestId : null;
+    if (!requestId) return this.deliverFleetAnswer(nodeId, body);
+    const now = this.now();
+    for (const [key, receipt] of this.answerReceipts) if (receipt.until < now) this.answerReceipts.delete(key);
+    const key = `${hash(nodeId)}:${requestId}`;
+    const existing = this.answerReceipts.get(key);
+    if (existing) {
+      if (existing.id !== body?.id || existing.answer !== body?.answer) reject("That request id belongs to a different answer", 409);
+      return existing.promise;
+    }
+    if (this.answerReceipts.size >= 500) this.answerReceipts.delete(this.answerReceipts.keys().next().value);
+    const receipt = { id: body?.id, answer: body?.answer, until: now + 15 * 60_000, promise: null };
+    receipt.promise = this.deliverFleetAnswer(nodeId, body).then(result => {
+      // A refused answer sent nothing: let the same request try again.
+      if (result.outcome === "refused") this.answerReceipts.delete(key);
+      return result;
+    }, error => { this.answerReceipts.delete(key); throw error; });
+    this.answerReceipts.set(key, receipt);
+    return receipt.promise;
+  }
+  async deliverFleetAnswer(nodeId, body) {
     if (typeof body?.id !== "string" || typeof body?.answer !== "string") reject("Pick one of the question's choices");
     this.prune();
     const n = this.node(nodeId);
@@ -290,14 +318,24 @@ export class G2Proactive {
     const supervisor = this.runtime?.fleetSupervisor;
     if ((!source && !walkthroughItem) || (source && source.sourceRef?.kind !== "fleet") || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
     const result = await supervisor.answerQuestion(questionId, body.answer);
-    if (!result) reject("Question already closed", 409);
-    if (result.question?.status === "open" || ["refused", "ambiguous"].includes(result.delivery?.outcome)) return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
+    if (!result) return { ok: false, outcome: "closed", retry: false, detail: "This question was already answered or closed." };
+    const outcome = deliveryOutcome(result.delivery) ?? (result.question?.status === "open" ? "refused" : "delivered");
+    const detail = clean(result.delivery?.detail ?? "", 200);
+    if (outcome === "queued") {
+      // Accepted: it sends when the agent's thread is free. Not a failure,
+      // and answering again would queue a duplicate.
+      n.marks[body.id] = { ...(n.marks[body.id] ?? {}), seen: true };
+      this.save();
+      return { ok: true, outcome, retry: false, detail: detail || "Queued; it sends when the agent's thread is free." };
+    }
+    if (outcome === "ambiguous") return { ok: false, outcome, retry: false, detail: detail || "It may have reached the agent, but delivery was not confirmed." };
+    if (outcome === "refused" || result.question?.status === "open") return { ok: false, outcome: "refused", retry: true, detail: detail || "Not sent; the question stays open." };
     if (source) {
       try { this.runtime?.outreach?.resolve?.(source.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
     }
     n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
     this.save();
-    return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
+    return { ok: true, outcome: "delivered", retry: false, detail: detail || "Delivered to the agent." };
   }
   // Acts on an enriched Supervisor card from the glasses (for example safe
   // preflight PR merge, Have agent fix CI, defer, or progressive preference).

@@ -178,3 +178,31 @@ it('talking on Supervisor home focuses the lead PM card automatically without op
     expect(f.sockets[0].frames()).toContainEqual({ type: 'context', focus })
   } finally { await f.app.systemExit() }
 })
+
+// Owner report: holding Tap to talk while viewing a Supervisor decision said
+// "Saved question waiting · check it on the phone before asking again". A
+// stale saved question must not block Supervisor voice, and speaking about a
+// card is a question, never an answer. Disposable mock decision only.
+it('a stale saved question and an open decision never block Supervisor hold-to-talk, and speaking does not answer', async () => {
+  const f = await fixture()
+  try {
+    Object.assign(f.renderer, { flash: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn() })
+    await f.store.update({ pendingRequest: { id: 'old_request', conversationId: crypto.randomUUID(), continuation: null, text: 'An earlier question', origin: 'https://main.example', thread: 'supervisor' } })
+    const answer = vi.spyOn(f.app.proactive, 'answer')
+    const decision = { id: 'question:mock_1', questionId: 'mock_1', title: 'Mock decision: ship it?', summary: 'Disposable test card', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['Yes', 'No'] }
+    f.app.proactive.items = [decision]
+    f.app.scrollUp()
+    expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Mock decision: ship it?', 1, 1)
+    expect(f.app.holdStart()).toBe(true); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.voiceRelay).toHaveBeenCalledOnce()
+    expect((f.renderer as unknown as { flash: ReturnType<typeof vi.fn> }).flash).not.toHaveBeenCalled()
+    await f.ready(); f.receive(new Uint8Array(6400))
+    // The spoken clarification is sent with the card as focus, then committed.
+    expect(JSON.stringify(f.sockets[0].frames())).toContain('mock_1')
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.sockets[0].frames()).toContainEqual({ type: 'commit' })
+    f.sockets[0].event({ type: 'reply.done', text: 'It ships the mock build to staging only.' })
+    expect(answer).not.toHaveBeenCalled()
+    expect(f.app.proactive.items.map(i => i.id)).toEqual(['question:mock_1'])
+  } finally { await f.app.systemExit() }
+})

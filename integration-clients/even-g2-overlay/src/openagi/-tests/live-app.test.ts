@@ -1,4 +1,4 @@
-import { expect, it, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { OpenAGIG2App } from '../../app/openagi-g2-app'
 import { OpenAGIStore, type OpenAGIState } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
@@ -563,7 +563,7 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
   vi.useFakeTimers()
   const f = await fixture()
   try {
-    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, detail: 'typed into Conductor' })
+    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, outcome: 'delivered', retry: false, detail: 'typed into Conductor' })
     const configure = vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
     Object.assign(f.renderer, { supervisorHome: vi.fn() })
     const question = { id: 'o-fleet', title: '#7 ready. Merge?', summary: 'CI green', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['merged', 'later'] }
@@ -588,8 +588,8 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
     // Confirm, then send.
     await tap(); expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: merged', '#7 ready. Merge?', true)
     await tap()
-    expect(answer).toHaveBeenCalledWith('o-fleet', 'merged')
-    expect(f.renderer.message).toHaveBeenLastCalledWith('Answered', 'merged. typed into Conductor')
+    expect(answer).toHaveBeenCalledWith('o-fleet', 'merged', expect.any(String))
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Answered', '"merged" was delivered (typed into Conductor).')
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
@@ -619,7 +619,7 @@ it('routes outreach-backed merge_ready cards through preflight actCard instead o
   const f = await fixture()
   try {
     const actCard = vi.spyOn(f.app.proactive, 'actCard').mockResolvedValue({ ok: true, status: 'merged', detail: 'Merged acme/api#88 via squash' })
-    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, detail: 'typed' })
+    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, outcome: 'delivered', retry: false, detail: 'typed' })
     vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
     Object.assign(f.renderer, { supervisorHome: vi.fn() })
     f.app.proactive.items = [{
@@ -1043,4 +1043,81 @@ it('swiping past the last Supervisor status page enters the quiet display withou
     expect(f.renderer.sleep).toHaveBeenLastCalledWith(false)
     expect(f.renderer.supervisorHome).toHaveBeenCalled()
   } finally { await f.app.systemExit() }
+})
+
+describe('a saved earlier question in Talk', () => {
+  const saved = (f: Awaited<ReturnType<typeof fixture>>) => f.store.update({ pendingRequest: { id: 'old_request', conversationId: f.store.snapshot().conversationId!, continuation: null, text: 'Old question', origin: 'https://main.example.com', thread: 'agent' } })
+  it('is settled instead of blocking when main never confirmed it, and stays in Recent', async () => {
+    vi.useFakeTimers()
+    const f = await fixture(); await saved(f)
+    try {
+      Object.assign(f.api, { settlePending: vi.fn(async () => { await f.store.update({ pendingRequest: null }); return { state: 'clear', unconfirmed: true, text: 'Old question', thread: 'agent' } }) })
+      f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+      expect(f.renderer.flash).not.toHaveBeenCalled()
+      expect(f.audio.start).toHaveBeenCalledOnce()
+      expect(f.store.snapshot().history.at(-1)).toMatchObject({ question: 'Old question', reply: expect.stringContaining('Not confirmed') as unknown })
+    } finally { await f.app.systemExit(); vi.useRealTimers() }
+  })
+  it('still blocks, with the true reason, while main is running it or cannot be reached', async () => {
+    vi.useFakeTimers()
+    const f = await fixture(); await saved(f)
+    try {
+      Object.assign(f.api, { settlePending: vi.fn(() => Promise.resolve({ state: 'working' })) })
+      f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+      expect(f.renderer.flash).toHaveBeenLastCalledWith('Earlier question still running', expect.any(String))
+      expect(f.audio.start).not.toHaveBeenCalled()
+      Object.assign(f.api, { settlePending: vi.fn(() => Promise.reject(new Error('offline'))) })
+      await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+      expect(f.renderer.flash).toHaveBeenLastCalledWith('Saved question waiting', expect.stringContaining('Hub not reached'))
+      expect(f.audio.start).not.toHaveBeenCalled()
+      expect(f.store.snapshot().pendingRequest?.id).toBe('old_request')
+    } finally { await f.app.systemExit(); vi.useRealTimers() }
+  })
+})
+
+// Owner report: an answer tap said "Not sent yet. The question stays open. Try
+// again later." for an answer the hub had queued. Disposable mock decision.
+describe('answering a Supervisor decision from the glasses', () => {
+  async function onConfirm() {
+    const f = await fixture()
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    Object.assign(f.renderer, { supervisorHome: vi.fn() })
+    f.app.proactive.items = [{ id: 'question:mock_2', questionId: 'mock_2', title: 'Mock decision?', summary: 'Disposable', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['Yes', 'No'] }]
+    await f.app.configureHomeMode('supervisor')
+    const tap = async () => { f.app.tap(); await vi.advanceTimersByTimeAsync(500) }
+    f.app.scrollUp(); await tap(); await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: Yes', 'Mock decision?', false)
+    await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: Yes', 'Mock decision?', true)
+    return { f, tap }
+  }
+  it('keeps the item and choice when nothing was sent, and a retry reuses the same request', async () => {
+    vi.useFakeTimers()
+    const { f, tap } = await onConfirm()
+    try {
+      const answer = vi.spyOn(f.app.proactive, 'answer')
+        .mockResolvedValueOnce({ ok: false, outcome: 'refused', retry: true, detail: 'Agent offline.' })
+        .mockResolvedValueOnce({ ok: false, outcome: 'unreachable', retry: true, detail: 'Network error' })
+        .mockResolvedValueOnce({ ok: true, outcome: 'queued', retry: false, detail: '' })
+      await tap()
+      expect(f.renderer.flash).toHaveBeenLastCalledWith('Not sent', expect.stringContaining('"Yes" is kept'))
+      expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: Yes', 'Mock decision?', true)
+      await tap()
+      expect(f.renderer.flash).toHaveBeenLastCalledWith('Hub not reached', expect.stringContaining('will not send twice'))
+      await tap()
+      const ids = answer.mock.calls.map(call => call[2])
+      expect(new Set(ids).size).toBe(1)
+      expect(answer.mock.calls.every(call => call[0] === 'question:mock_2' && call[1] === 'Yes')).toBe(true)
+      expect(f.renderer.message).toHaveBeenLastCalledWith('Answer queued', expect.stringContaining("Don't answer again"))
+    } finally { await f.app.systemExit(); vi.useRealTimers() }
+  })
+  it('an unconfirmed delivery never offers a blind retry and points to the phone', async () => {
+    vi.useFakeTimers()
+    const { f, tap } = await onConfirm()
+    try {
+      vi.spyOn(f.app.proactive, 'answer').mockResolvedValueOnce({ ok: false, outcome: 'ambiguous', retry: false, detail: 'turn not confirmed' })
+      await tap()
+      expect(f.renderer.message).toHaveBeenLastCalledWith('Delivery not confirmed', expect.stringContaining('Check the Supervisor chat on your phone'))
+    } finally { await f.app.systemExit(); vi.useRealTimers() }
+  })
 })

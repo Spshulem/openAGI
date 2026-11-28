@@ -1,6 +1,8 @@
 import type { OpenAGIApiClient } from './api-client'
 import { OpenAGIApiError } from './config'
 
+export type AnswerOutcome = 'delivered' | 'queued' | 'ambiguous' | 'refused' | 'closed' | 'unconfirmed' | 'unreachable'
+export interface AnswerResult { ok: boolean; outcome: AnswerOutcome; retry: boolean; detail: string }
 export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; walkthroughOnly?: boolean; options?: string[]; questionId?: string; threadKey?: string; cardId?: string; cardKind?: string; pmBrief?: string; primaryLabel?: string; prRef?: string; ciState?: string }
 export interface SupervisorWalkthroughItem { id: string; kind: 'card' | 'question'; title: string; summary: string; questionId?: string | null; threadKey?: string | null; cardId?: string | null; cardKind?: string | null; prRef?: string | null; primaryLabel?: string | null; ciState?: string | null; pmBrief?: string | null; options?: string[] }
 export interface SupervisorWalkthrough { active: boolean; paused: boolean; currentId: string | null; total: number; updatedAt?: string | null; current: SupervisorWalkthroughItem | null; items: SupervisorWalkthroughItem[] }
@@ -131,15 +133,29 @@ export class G2ProactiveClient {
   }
   // Answers a supervisor question with one of its fixed choices. ok=false
   // means main kept the question open (the agent was not reached yet).
-  async answer(id: string, answer: string): Promise<{ ok: boolean; detail: string }> {
+  // Whether this hub returns answer outcomes and honors requestId retries.
+  private answerReceipts = false
+  async answer(id: string, answer: string, requestId: string): Promise<AnswerResult> {
+    let result: { ok?: boolean; outcome?: AnswerOutcome; retry?: boolean; detail?: string }
     try {
-      const result = await this.api.proactive({ op: 'answer', id, answer }, this.controller.signal) as unknown as { ok?: boolean; detail?: string }
-      // A feed read that started before the answer must not bring it back.
-      this.feedGeneration++
-      if (result.ok === true) { this.items = this.items.filter(i => i.id !== id); this.view.inbox?.(this.items) }
-      await this.refresh()
-      return { ok: result.ok === true, detail: result.detail ?? '' }
-    } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : 'Main did not answer' } }
+      result = await this.api.proactive({ op: 'answer', id, answer, requestId }, this.controller.signal) as unknown as typeof result
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Main did not answer'
+      if (error instanceof OpenAGIApiError && [404, 409].includes(error.status)) return { ok: false, outcome: 'closed', retry: false, detail }
+      // It may or may not have arrived. Retrying the same request is safe only
+      // on a hub that returns receipts; otherwise check on the phone.
+      return { ok: false, outcome: 'unreachable', retry: this.answerReceipts, detail }
+    }
+    if (result.outcome) this.answerReceipts = true
+    // An older hub says only ok:false while the question is open, which also
+    // covers an answer queued behind the agent's messages: never call that
+    // "not sent", and never offer a blind retry.
+    const outcome: AnswerOutcome = result.outcome ?? (result.ok === true ? 'delivered' : 'unconfirmed')
+    // A feed read that started before the answer must not bring it back.
+    this.feedGeneration++
+    if (result.ok === true) { this.items = this.items.filter(i => i.id !== id); this.view.inbox?.(this.items) }
+    await this.refresh()
+    return { ok: result.ok === true, outcome, retry: result.retry === true, detail: result.detail ?? '' }
   }
   // Acts on an enriched Supervisor PM card (safe preflight PR merge, fix CI,
   // defer, or progressive preference). Halted preflight leaves the card open.
