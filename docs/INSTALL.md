@@ -131,6 +131,49 @@ agent**. Add integrations, devices, or screen access when you need them.
 Reopen **Model & settings** from the sidebar to change models. Existing
 integration and channel settings remain under **Advanced settings**.
 
+## Guided setup with a coding agent
+
+If you use Claude Code or Codex, it can walk you through the rest of setup.
+The versioned skill lives in [`skills/openagi-setup`](../skills/openagi-setup/SKILL.md).
+At the end of a run, `install.sh` offers to install it. You can also run it
+any time from an OpenAGI checkout or portable folder:
+
+```sh
+sh scripts/setup-agent.sh                      # asks what to do
+sh scripts/setup-agent.sh --agent claude       # or: --agent codex | manual
+```
+
+It asks before each change. The default answer is no.
+
+- **Skill install:** copies the skill to `~/.claude/skills/openagi-setup`
+  and/or `~/.codex/skills/openagi-setup` (`$CODEX_HOME` is respected). An
+  identical copy is left alone. A different copy is kept unless you choose to
+  replace it, or pass `--force`, and a timestamped backup is made either way.
+- **Handoff file:** writes `~/.openagi-setup/HANDOFF.md` with the install
+  mode, CLI path and dashboard address. It never contains keys or tokens.
+- **Open the agent:** starts Claude Code or Codex in `~/.openagi-setup` in its
+  normal permission mode. The first prompt names those files and nothing else.
+
+The skill then checks prerequisites with `openagi doctor`. It has you sign in
+with `claude auth login` or `codex login` in your own terminal. It selects
+that sign-in with `openagi provider use claude-cli|codex-cli`, which sends one
+real test prompt and saves the choice only if it gets an answer. It does not
+replace a different working provider unless you add `--replace`. You save the
+dashboard login in the browser. The skill finishes with
+`openagi chat "Reply with exactly: openagi-setup-ok"`.
+
+API keys, ChatGPT sign-in and local models stay in the browser at `/setup`. The
+skill never asks for a key or token.
+
+Without a terminal (CI, provisioning), nothing is installed and the manual
+steps are printed. Installer controls: `OPENAGI_AGENT_SETUP=skip`,
+`OPENAGI_AGENT=claude|codex|manual` and `OPENAGI_NONINTERACTIVE=1`. Run as your
+normal user; as root it only prints the command to run.
+
+A CLI sign-in only works for the OS user the daemon runs as. A system service
+running as `openagi`, or a Docker container, cannot use your personal Claude
+Code or Codex sign-in. Use the browser providers there.
+
 ## Docker
 
 Use the version tag you selected from GitHub Releases, such as the tag shown on

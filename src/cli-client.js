@@ -530,3 +530,118 @@ export async function runDoctor(client) {
 
   return { ok: checks.every((c) => c.ok), checks };
 }
+
+// ---------------------------------------------------------------------------
+// `openagi provider` — the guided-setup path for providers that sign in through
+// a local CLI (Claude Code's `claude`, OpenAI's `codex`). Everything goes
+// through endpoints the daemon already exposes, so the caller never handles a
+// key or the dashboard token:
+//   GET  /admin/provider  what the DAEMON's user can see (CLI + sign-in marker)
+//   POST /setup/test      one real inference against the candidate, no save
+//   POST /setup/save      persist OPENAGI_PROVIDER only after the test passed
+// API-key providers stay in the browser wizard on purpose: a key typed into a
+// command line lands in shell history, process listings and agent transcripts.
+
+export const CLI_SIGN_IN_PROVIDERS = Object.freeze({
+  "claude-cli": Object.freeze({ label: "Claude Code", bin: "claude", availableKey: "claudeCli", signIn: "claude auth login" }),
+  "codex-cli": Object.freeze({ label: "Codex", bin: "codex", availableKey: "codexCli", signIn: "codex login" })
+});
+
+const PROVIDER_CLASS_KIND = Object.freeze({
+  AnthropicProvider: "anthropic",
+  ClaudeCliProvider: "claude-cli",
+  OpenAIResponsesProvider: "openai",
+  CodexCliProvider: "codex-cli",
+  ChatGPTPlanProvider: "chatgpt",
+  LocalModelProvider: "local",
+  OnDeviceModelProvider: "on-device",
+  DeterministicModelProvider: "none"
+});
+
+function describeHttpFailure(res, target) {
+  if (res.status === 401) {
+    return {
+      error: "the daemon rejected this CLI's credential (401)",
+      fix: target?.remote
+        ? "Use the main's owner credential via `openagi pair`; never paste it into chat."
+        : "Run the CLI as the same OS user as the daemon (it reads the token from that user's data directory), or set OPENAGI_DATA_DIR to the daemon's data directory."
+    };
+  }
+  if (res.status === 0) {
+    return {
+      error: `daemon unreachable (${res.error ?? "no response"})`,
+      fix: "Start OpenAGI (the Mac app, `systemctl start openagi`, `docker start openagi`, or `openagi serve`) and retry. Check with `openagi doctor`."
+    };
+  }
+  return { error: `HTTP ${res.status}`, fix: "Check the daemon logs." };
+}
+
+export async function readProviderState(client) {
+  const res = await client.request("GET", "/admin/provider");
+  if (!res.ok) return { ok: false, ...describeHttpFailure(res, client.target) };
+  const j = res.json ?? {};
+  const active = PROVIDER_CLASS_KIND[j.current] ?? (j.current ? String(j.current) : "none");
+  const available = j.available ?? {};
+  return {
+    ok: true,
+    preference: String(j.preference ?? "auto").toLowerCase(),
+    active,
+    model: j.model ?? null,
+    configured: Boolean(j.configured) && active !== "none",
+    cli: Object.fromEntries(Object.entries(CLI_SIGN_IN_PROVIDERS).map(([id, p]) => [id, {
+      label: p.label,
+      ready: Boolean(available[p.availableKey]),
+      signIn: p.signIn
+    }]))
+  };
+}
+
+// Verify, then select, a CLI sign-in provider. Refuses to replace a different
+// working provider unless `replace` is set: setup must never silently swap the
+// model an owner already chose.
+export async function useCliProvider(client, choice, { replace = false } = {}) {
+  const spec = CLI_SIGN_IN_PROVIDERS[choice];
+  if (!spec) {
+    return {
+      ok: false, step: "choice",
+      error: `\`openagi provider use\` only selects a CLI sign-in provider (${Object.keys(CLI_SIGN_IN_PROVIDERS).join(", ")}).`,
+      fix: "Enter API keys (Anthropic, OpenAI) or sign in with ChatGPT in the browser setup page at /setup. Never put a key in chat or on a command line."
+    };
+  }
+  const before = await readProviderState(client);
+  if (!before.ok) return { ...before, step: "daemon" };
+  if (!before.cli[choice].ready) {
+    return {
+      ok: false, step: "sign-in", state: before,
+      error: `the OpenAGI daemon cannot see a signed-in ${spec.label} CLI`,
+      fix: `In your own terminal (as the user the daemon runs as), install ${spec.label} so \`${spec.bin}\` is on PATH and run \`${spec.signIn}\`. Then rerun this command.`
+    };
+  }
+  if (before.configured && before.active !== choice && !replace) {
+    return {
+      ok: false, step: "replace", state: before,
+      error: `a different provider (${before.active}) is already configured`,
+      fix: `Keep it, or rerun with --replace to switch to ${choice} after a successful test.`
+    };
+  }
+  const test = await client.request("POST", "/setup/test", { setupModel: true, OPENAGI_PROVIDER: choice });
+  if (!test.ok || test.json?.ok !== true) {
+    const http = test.status === 0 || test.status === 401 ? describeHttpFailure(test, client.target) : null;
+    return {
+      ok: false, step: "test", state: before,
+      error: http?.error ?? test.json?.message ?? test.json?.error ?? `HTTP ${test.status}`,
+      fix: http?.fix ?? `Run \`${spec.bin}\` once in your own terminal to confirm it answers (re-run \`${spec.signIn}\` if it asks), then retry.`
+    };
+  }
+  const save = await client.request("POST", "/setup/save", { setupModel: true, OPENAGI_PROVIDER: choice });
+  if (!save.ok) return { ok: false, step: "save", state: before, ...describeHttpFailure(save, client.target) };
+  const after = await readProviderState(client);
+  if (!after.ok || after.active !== choice) {
+    return {
+      ok: false, step: "verify", state: after,
+      error: `saved, but the daemon is still using ${after.active ?? "an unknown provider"}`,
+      fix: "Restart OpenAGI, then run `openagi provider` again."
+    };
+  }
+  return { ok: true, step: "done", provider: choice, model: test.json?.model ?? after.model, reply: String(test.json?.reply ?? "").slice(0, 200), state: after };
+}

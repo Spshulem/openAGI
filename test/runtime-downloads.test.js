@@ -11,8 +11,8 @@ function fixture(t) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, "source");
   fs.mkdirSync(root);
-  for (const name of ["bin", "src", "examples", "scripts", "assets", "node_modules/ws", "docs"]) fs.mkdirSync(path.join(root, name), { recursive: true });
-  for (const name of ["package-lock.json", "LICENSE", "README.md", "docs/INSTALL.md", "docs/GETTING_STARTED.md", "src/main.js", "node_modules/ws/LICENSE"]) fs.writeFileSync(path.join(root, name), "public fixture\n");
+  for (const name of ["bin", "src", "examples", "scripts", "assets", "skills/openagi-setup", "node_modules/ws", "docs"]) fs.mkdirSync(path.join(root, name), { recursive: true });
+  for (const name of ["package-lock.json", "LICENSE", "README.md", "docs/INSTALL.md", "docs/GETTING_STARTED.md", "src/main.js", "skills/openagi-setup/SKILL.md", "node_modules/ws/LICENSE"]) fs.writeFileSync(path.join(root, name), "public fixture\n");
   for (const name of [".env", ".openagi", "private-token", "logs"]) fs.writeFileSync(path.join(root, name), "must not ship");
   fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ version: "1.2.3" }));
   const nodeExecutable = path.join(dir, "fake-node"), nodeLicense = path.join(dir, "node-license");
@@ -29,6 +29,7 @@ test("portable Linux bundle includes production code, executable, notices and a 
   assert.equal(result.nodeSha256.length, 64);
   assert.equal(fs.readFileSync(path.join(opts.destination, "node/LICENSE"), "utf8"), "Node and third-party notices");
   assert.ok(fs.existsSync(path.join(opts.destination, "node_modules/ws/LICENSE")));
+  assert.ok(fs.existsSync(path.join(opts.destination, "skills/openagi-setup/SKILL.md")), "the guided-setup skill ships so scripts/setup-agent.sh works offline");
   for (const name of [".env", ".openagi", "private-token", "logs"]) assert.equal(fs.existsSync(path.join(opts.destination, name)), false);
   assert.match(fs.readFileSync(path.join(opts.destination, "start-openagi.sh"), "utf8"), /exec "\$RUNTIME_DIR\/node\/node"/);
   if (process.platform !== "win32") assert.ok(fs.statSync(path.join(opts.destination, "start-openagi.sh")).mode & 0o100);
