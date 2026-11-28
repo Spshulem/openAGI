@@ -52,7 +52,10 @@ struct SupervisorView: View {
     @State private var clearedFocusCardID: String?
     @State private var selectedMessage: UUID?
     @State private var browserThread: ConversationThread = .supervisor
+    // UI tests start expanded so card actions are reachable; pass
+    // --ui-deck-collapsed to start from the collapsed bar a person sees first.
     @State private var isDeckExpanded: Bool = ProcessInfo.processInfo.arguments.contains("--ui-testing")
+        && !ProcessInfo.processInfo.arguments.contains("--ui-deck-collapsed")
     @State private var optimisticallyDismissedCardIDs: Set<String> = []
     @State private var inFlightCardIDs: Set<String> = []
     @State private var toastBanner: SupervisorToast? = nil
@@ -1460,6 +1463,9 @@ struct SupervisorView: View {
         .frame(maxWidth: 720)
         .background(Theme.surface, in: Capsule())
         .overlay(Capsule().strokeBorder(Theme.edge.opacity(0.6), lineWidth: 1))
+        // Contain the children: an identifier on a plain stack is copied onto
+        // every child, which hid the Review button's own identifier.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("supervisor-collapsed-deck-bar")
     }
 
@@ -2222,10 +2228,13 @@ private struct SupervisorCardDeckView: View {
                    idealHeight: min(max(detailsContentHeight, 145), 235),
                    maxHeight: min(max(detailsContentHeight, 145), 235))
 
-            if card.canReply, !card.suggestedReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
+            // An option is offered once, as its button: quick replies that
+            // copy an option, or carry bypass text, are dropped.
+            let quickReplies = DecisionContract.quickReplies(for: card)
+            if card.canReply, !quickReplies.isEmpty, card.kind != "preference", card.kind != "merge_ready", card.kind != "pr_ready" {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(Array(card.suggestedReplies.prefix(3).enumerated()), id: \.offset) { _, quickReply in
+                        ForEach(Array(quickReplies.prefix(3).enumerated()), id: \.offset) { _, quickReply in
                             Button {
                                 onAct(card, SupervisorCardAction(op: "reply", label: quickReply, value: quickReply))
                             } label: {
@@ -2340,108 +2349,185 @@ private struct SupervisorCardDeckView: View {
                     }
                 }
             }
-            if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("GOAL")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Theme.muted)
-                    Text(ctx)
-                        .font(Theme.Typography.caption)
-                        .foregroundStyle(Theme.ink.opacity(0.9))
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                }
-            }
-            if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("WHERE IT IS")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Theme.muted)
-                    Text(stateNow)
-                        .font(Theme.Typography.caption.weight(.medium))
-                        .foregroundStyle(Theme.ink)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                }
-            }
-            let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-                ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-            if let summary = mainSummary {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("WHAT TO KNOW")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Theme.muted)
-                    if summary.contains("\n") || summary.contains("|") {
-                        MarkdownContent(blocks: MarkdownParser.parse(summary))
-                            .lineLimit(nil)
-                    } else {
-                        Text(MarkdownParser.inline(summary))
-                            .font(Theme.Typography.secondary)
-                            .foregroundStyle(Theme.ink.opacity(0.92))
-                            .lineLimit(6)
-                            .multilineTextAlignment(.leading)
-                    }
-                }
-            }
-            if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !decision.isEmpty,
-               decision.caseInsensitiveCompare(card.headline) != .orderedSame {
-                Text("Decision: \(decision)")
-                    .font(Theme.Typography.caption.weight(.medium))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(4)
-                    .multilineTextAlignment(.leading)
-            } else if let nextAction = card.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !nextAction.isEmpty {
-                Text("Question: \(nextAction)")
-                    .font(Theme.Typography.caption.weight(.medium))
-                    .foregroundStyle(Theme.live)
-                    .lineLimit(3)
-                    .multilineTextAlignment(.leading)
+            if let decisionView = card.decisionView {
+                DecisionContractView(view: decisionView, choices: DecisionContract.choices(for: card), style: .compact)
+            } else {
+                legacyBriefContent
             }
             if revealedPlanCardIDs.contains(card.id), let plan = card.plan {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(plan.label ?? "Fix Plan")
-                        .font(Theme.Typography.caption.weight(.semibold))
-                        .foregroundStyle(Theme.ink)
-                    if let next = plan.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty {
-                        Text(next)
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(Theme.ink)
-                    }
-                    if let acc = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acc.isEmpty {
-                        Text("Acceptance: \(acc)")
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(Theme.muted)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                planReveal(plan)
             }
-            if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("RECOMMENDATION")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(Theme.live)
-                    Text(rec)
-                        .font(Theme.Typography.caption.weight(.semibold))
-                        .foregroundStyle(Theme.ink)
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.35), lineWidth: 1))
+            if card.decisionView == nil {
+                legacyRecommendation
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 
+    /// The card's brief from hubs without the decision contract, unchanged.
+    @ViewBuilder
+    private var legacyBriefContent: some View {
+        if let ctx = card.brief?.context?.trimmingCharacters(in: .whitespacesAndNewlines), !ctx.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("GOAL")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Theme.muted)
+                Text(ctx)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.ink.opacity(0.9))
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        if let stateNow = card.brief?.currentState?.trimmingCharacters(in: .whitespacesAndNewlines), !stateNow.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WHERE IT IS")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Theme.muted)
+                Text(stateNow)
+                    .font(Theme.Typography.caption.weight(.medium))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        let mainSummary = (card.brief?.whatChanged?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (card.summary?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        if let summary = mainSummary {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("WHAT TO KNOW")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Theme.muted)
+                if summary.contains("\n") || summary.contains("|") {
+                    MarkdownContent(blocks: MarkdownParser.parse(summary))
+                        .lineLimit(nil)
+                } else {
+                    Text(MarkdownParser.inline(summary))
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.ink.opacity(0.92))
+                        .lineLimit(6)
+                        .multilineTextAlignment(.leading)
+                }
+            }
+        }
+        if let decision = card.brief?.decision?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !decision.isEmpty,
+           decision.caseInsensitiveCompare(card.headline) != .orderedSame {
+            Text("Decision: \(decision)")
+                .font(Theme.Typography.caption.weight(.medium))
+                .foregroundStyle(Theme.ink)
+                .lineLimit(4)
+                .multilineTextAlignment(.leading)
+        } else if let nextAction = card.plan?.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !nextAction.isEmpty {
+            Text("Question: \(nextAction)")
+                .font(Theme.Typography.caption.weight(.medium))
+                .foregroundStyle(Theme.live)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+        }
+    }
+
+    private func planReveal(_ plan: SupervisorSuggestionPlan) -> some View {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(plan.label ?? "Fix Plan")
+                    .font(Theme.Typography.caption.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                if let next = plan.nextAction?.trimmingCharacters(in: .whitespacesAndNewlines), !next.isEmpty {
+                    Text(next)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.ink)
+                }
+                if let acc = plan.acceptance?.trimmingCharacters(in: .whitespacesAndNewlines), !acc.isEmpty {
+                    Text("Acceptance: \(acc)")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var legacyRecommendation: some View {
+        if let rec = card.recommendation?.trimmingCharacters(in: .whitespacesAndNewlines), !rec.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("RECOMMENDATION")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Theme.live)
+                Text(rec)
+                    .font(Theme.Typography.caption.weight(.semibold))
+                    .foregroundStyle(Theme.ink)
+                    .lineLimit(3)
+                    .multilineTextAlignment(.leading)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.canvas, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Theme.live.opacity(0.35), lineWidth: 1))
+        }
+    }
+
     @ViewBuilder
     private var cardActions: some View {
+        let isCompletionOrOpenCard = card.kind == "completed" || card.primaryAction?.op == "open_chat"
+        if DecisionContract.ownsActions(card) && !isCompletionOrOpenCard {
+            contractCardActions
+        } else {
+            legacyCardActions
+        }
+    }
+
+    /// Buttons under the decision contract: each option once (the
+    /// recommended one filled and tagged, a bypass captioned), then Reply,
+    /// Details and Dismiss. Reply opens the Supervisor composer empty.
+    private var contractCardActions: some View {
+        let choices = DecisionContract.choices(for: card)
+        let dismissAction = card.extraActions.first { $0.op == "defer" || $0.op == "dismiss" }
+            .map { SupervisorCardAction(op: $0.op, label: "Dismiss", value: $0.value, destructive: $0.destructive) }
+            ?? SupervisorCardAction(op: "defer", label: "Dismiss", value: "dismiss")
+        return VStack(alignment: .leading, spacing: 8) {
+            if !choices.isEmpty {
+                FlowLayout(spacing: 8) {
+                    ForEach(Array(choices.enumerated()), id: \.element.id) { index, choice in
+                        DecisionChoiceButton(choice: choice, enabled: !isBusy) {
+                            onAct(card, choice.action)
+                        }
+                        .accessibilityIdentifier("supervisor-card-choice-\(index)")
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                if card.canReply || hasThreadContext {
+                    DeckPillButton(title: "Reply", filled: false, enabled: !isBusy) {
+                        onReplyInChat(card)
+                    }
+                    .accessibilityIdentifier("supervisor-card-reply-\(card.id)")
+                }
+                if hasThreadContext {
+                    DeckPillButton(title: "Details", filled: false, enabled: true) {
+                        onOpenContext(card)
+                    }
+                    .accessibilityIdentifier("supervisor-card-review-\(card.id)")
+                }
+                Spacer(minLength: 0)
+                Button(dismissAction.label) {
+                    onAct(card, dismissAction)
+                }
+                .font(Theme.Typography.caption.weight(.medium))
+                .foregroundStyle(Theme.muted)
+                .frame(minHeight: 36)
+                .padding(.horizontal, 6)
+                .disabled(isBusy)
+                .accessibilityIdentifier("supervisor-card-secondary-\(card.id)")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var legacyCardActions: some View {
         let isCompletionOrOpenCard = card.kind == "completed" || card.primaryAction?.op == "open_chat"
         let isExplicitActionCard = card.kind == "merge_ready" || card.kind == "pr_ready"
             || card.kind == "ci_failed" || card.kind == "preference"
@@ -4125,38 +4211,49 @@ private struct ThreadDetailSheet: View {
                     Section("Needs your decision") {
                         let decisionTitle = trimmedNonEmpty(card?.headline) ?? trimmedNonEmpty(question?.title) ?? "Decision"
                         Text(decisionTitle).font(.headline)
-                        if let ctx = trimmedNonEmpty(card?.brief?.context) {
-                            Text("Goal: \(ctx)").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
-                        }
-                        if let stateNow = trimmedNonEmpty(card?.brief?.currentState) {
-                            Text("Where it is: \(stateNow)").font(.footnote.weight(.medium)).foregroundStyle(Theme.ink)
-                        }
-                        let preferredSummary: String? = {
-                            if let briefBody = trimmedNonEmpty(card?.brief?.whatChanged) { return briefBody }
-                            let qBody = trimmedNonEmpty(question?.body)
-                            let cSum = trimmedNonEmpty(card?.summary)
-                            if let cSum, (cSum.count) > (qBody?.count ?? 0) { return cSum }
-                            return qBody ?? cSum
-                        }()
-                        if let text = preferredSummary {
-                            MarkdownContent(blocks: MarkdownParser.parse(text))
-                        }
-                        if let decisionCall = trimmedNonEmpty(card?.brief?.decision),
-                           decisionCall.caseInsensitiveCompare(decisionTitle) != .orderedSame {
-                            Text("Decision needed: \(decisionCall)")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(Theme.ink)
-                        }
-                        if let rec = trimmedNonEmpty(card?.recommendation) {
-                            Text(rec)
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(Theme.live)
+                        if let card, let decisionView = card.decisionView {
+                            // The decision contract replaces the free-form
+                            // brief: Goal, Status, Decision, Recommendation.
+                            DecisionContractView(view: decisionView, choices: DecisionContract.choices(for: card), style: .full)
+                        } else {
+                            if let ctx = trimmedNonEmpty(card?.brief?.context) {
+                                Text("Goal: \(ctx)").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+                            }
+                            if let stateNow = trimmedNonEmpty(card?.brief?.currentState) {
+                                Text("Where it is: \(stateNow)").font(.footnote.weight(.medium)).foregroundStyle(Theme.ink)
+                            }
+                            let preferredSummary: String? = {
+                                if let briefBody = trimmedNonEmpty(card?.brief?.whatChanged) { return briefBody }
+                                let qBody = trimmedNonEmpty(question?.body)
+                                let cSum = trimmedNonEmpty(card?.summary)
+                                if let cSum, (cSum.count) > (qBody?.count ?? 0) { return cSum }
+                                return qBody ?? cSum
+                            }()
+                            if let text = preferredSummary {
+                                MarkdownContent(blocks: MarkdownParser.parse(text))
+                            }
+                            if let decisionCall = trimmedNonEmpty(card?.brief?.decision),
+                               decisionCall.caseInsensitiveCompare(decisionTitle) != .orderedSame {
+                                Text("Decision needed: \(decisionCall)")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(Theme.ink)
+                            }
+                            if let rec = trimmedNonEmpty(card?.recommendation) {
+                                Text(rec)
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(Theme.live)
+                            }
                         }
 
-                        if let card, card.canReply, !card.suggestedReplies.isEmpty, questionIsOpen {
+                        // Quick replies prefill the composer, so a decision-
+                        // contract card offers none: its options are buttons
+                        // and the composer opens empty. Elsewhere, copies of
+                        // an option and bypass text are dropped.
+                        let quickReplies = card.map { DecisionContract.quickReplies(for: $0) } ?? []
+                        if let card, card.decisionView == nil, card.canReply, !quickReplies.isEmpty, questionIsOpen {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 6) {
-                                    ForEach(Array(card.suggestedReplies.prefix(4).enumerated()), id: \.offset) { _, quick in
+                                    ForEach(Array(quickReplies.prefix(4).enumerated()), id: \.offset) { _, quick in
                                         Button {
                                             replyText = quick
                                             replyOpen = true
@@ -4176,7 +4273,11 @@ private struct ThreadDetailSheet: View {
                         }
 
                         if questionIsOpen {
-                            decisionActionBar
+                            if let card, DecisionContract.ownsActions(card) {
+                                contractActionBar(card)
+                            } else {
+                                decisionActionBar
+                            }
                         } else {
                             Text("This question has been handled.").font(.footnote).foregroundStyle(.secondary)
                         }
@@ -4186,6 +4287,7 @@ private struct ThreadDetailSheet: View {
                                 TextField("Send instructions or screenshots to this coding session…", text: $replyText, axis: .vertical)
                                     .lineLimit(2...5)
                                     .textFieldStyle(.roundedBorder)
+                                    .accessibilityIdentifier("thread-reply-field")
                                 replyAttachmentSection(disabled: questionBusy || preparingReplyImages)
                                 HStack(spacing: 10) {
                                     let trimmed = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4222,6 +4324,12 @@ private struct ThreadDetailSheet: View {
                         }
 
                         if let questionNote { NoteLine(note: questionNote) }
+                    }
+                }
+
+                if let evidence = card?.decisionView?.evidence, !evidence.isEmpty {
+                    Section("Evidence") {
+                        DecisionEvidenceLinks(evidence: evidence)
                     }
                 }
 
@@ -4634,6 +4742,39 @@ private struct ThreadDetailSheet: View {
             }
             if options.isEmpty && !isMergeOrCiCard && !isCompletionOrError {
                 Label("Respond in the original app on your Mac. Reading this thread does not send an answer.", systemImage: "macbook")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    /// Options from the decision contract, each once: the recommended one
+    /// filled and tagged, a bypass captioned. Reply opens an empty composer.
+    private func contractActionBar(_ card: SupervisorCard) -> some View {
+        let choices = DecisionContract.choices(for: card)
+        return VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(choices.enumerated()), id: \.element.id) { index, choice in
+                DecisionChoiceButton(choice: choice, enabled: !questionBusy, fullWidth: true) {
+                    if choice.action.op == "answer" {
+                        onAnswer(choice.action.value ?? choice.label)
+                    } else {
+                        onCardPrimary(card, choice.action)
+                    }
+                }
+                .accessibilityIdentifier("thread-decision-choice-\(index)")
+            }
+            FlowLayout(spacing: 8) {
+                DeckPillButton(title: replyOpen ? "Close reply" : "Reply", filled: false, enabled: !questionBusy) {
+                    if !replyOpen { replyText = "" }
+                    replyOpen.toggle()
+                }
+                .accessibilityIdentifier("thread-decision-reply")
+                DeckPillButton(title: "Dismiss", filled: false, enabled: !questionBusy) {
+                    onDefer()
+                }
+            }
+            if choices.isEmpty {
+                Text("No options were offered. Reply with your call, or dismiss.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
         }

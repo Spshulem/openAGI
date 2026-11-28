@@ -166,13 +166,31 @@ struct FleetCardAction: Decodable, Equatable {
   let op: String?
   let label: String?
   let value: String?
+  /// The option the card recommends. False from a hub before it.
+  var recommended: Bool = false
+  /// Merges over a required review with admin rights. False from a hub before it.
+  var adminBypass: Bool = false
+  var destructive: Bool = false
 
-  enum CodingKeys: String, CodingKey { case op, label, value }
+  enum CodingKeys: String, CodingKey { case op, label, value, recommended, adminBypass, destructive }
+
+  init(op: String?, label: String?, value: String?, recommended: Bool = false, adminBypass: Bool = false, destructive: Bool = false) {
+    self.op = op
+    self.label = label
+    self.value = value
+    self.recommended = recommended
+    self.adminBypass = adminBypass
+    self.destructive = destructive
+  }
+
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     op = try? c.decodeIfPresent(String.self, forKey: .op)
     label = try? c.decodeIfPresent(String.self, forKey: .label)
     value = try? c.decodeIfPresent(String.self, forKey: .value)
+    recommended = (try? c.decodeIfPresent(Bool.self, forKey: .recommended)) ?? false
+    adminBypass = (try? c.decodeIfPresent(Bool.self, forKey: .adminBypass)) ?? false
+    destructive = (try? c.decodeIfPresent(Bool.self, forKey: .destructive)) ?? false
   }
 }
 
@@ -566,18 +584,31 @@ struct FleetCardBrief: Decodable, Equatable {
   let prRef: String?
   let prUrl: String?
   let ciState: String?
+  /// Goal / Status / Decision / Recommendation (src/fleet/decision-view.js).
+  /// Nil from a hub before it: the card keeps the older brief rendering.
+  var decisionView: FleetDecisionView? = nil
+  var primaryAction: FleetCardAction? = nil
+  var secondaryAction: FleetCardAction? = nil
+  var extraActions: [FleetCardAction] = []
+  var suggestedReplies: [String] = []
 
   /// The question this card is about.
   var questionKey: String { questionId ?? id }
 
+  /// primary, secondary, then the extras, in the hub's order.
+  var allActions: [FleetCardAction] { [primaryAction, secondaryAction].compactMap { $0 } + extraActions }
+
   enum CodingKeys: String, CodingKey {
     case id, questionId, needsYou, kind, brief, recommendation, prRef, prUrl, ciState
+    case decisionView, primaryAction, secondaryAction, extraActions, suggestedReplies
   }
   private enum BriefKeys: String, CodingKey { case context, currentState, whatChanged, decision }
 
   init(id: String, questionId: String? = nil, needsYou: Bool = true, kind: String? = nil,
        context: String? = nil, currentState: String? = nil, whatChanged: String? = nil, decision: String? = nil,
-       recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil) {
+       recommendation: String? = nil, prRef: String? = nil, prUrl: String? = nil, ciState: String? = nil,
+       decisionView: FleetDecisionView? = nil, primaryAction: FleetCardAction? = nil, secondaryAction: FleetCardAction? = nil,
+       extraActions: [FleetCardAction] = [], suggestedReplies: [String] = []) {
     self.id = id
     self.questionId = questionId
     self.needsYou = needsYou
@@ -590,6 +621,11 @@ struct FleetCardBrief: Decodable, Equatable {
     self.prRef = prRef
     self.prUrl = prUrl
     self.ciState = ciState
+    self.decisionView = decisionView
+    self.primaryAction = primaryAction
+    self.secondaryAction = secondaryAction
+    self.extraActions = extraActions
+    self.suggestedReplies = suggestedReplies
   }
 
   init(from decoder: Decoder) throws {
@@ -613,24 +649,271 @@ struct FleetCardBrief: Decodable, Equatable {
     prRef = try? c.decodeIfPresent(String.self, forKey: .prRef)
     prUrl = try? c.decodeIfPresent(String.self, forKey: .prUrl)
     ciState = try? c.decodeIfPresent(String.self, forKey: .ciState)
+    decisionView = try? c.decodeIfPresent(FleetDecisionView.self, forKey: .decisionView)
+    primaryAction = try? c.decodeIfPresent(FleetCardAction.self, forKey: .primaryAction)
+    secondaryAction = try? c.decodeIfPresent(FleetCardAction.self, forKey: .secondaryAction)
+    extraActions = ((try? c.decodeIfPresent([Lossy<FleetCardAction>].self, forKey: .extraActions)) ?? []).compactMap(\.value)
+    suggestedReplies = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .suggestedReplies)) ?? []).compactMap(\.value)
+  }
+}
+
+/// A card's decision in four parts, in this order: the goal, where it
+/// stands, the exact choice with each option's consequence, and which option
+/// the agent recommends and why. Every part carries `unknown` when the
+/// source never said it: the app labels it "Not stated", never invents it.
+struct FleetDecisionView: Decodable, Equatable {
+  struct Goal: Decodable, Equatable {
+    var title: String? = nil
+    var text: String? = nil
+    var unknown: Bool = true
+
+    enum CodingKeys: String, CodingKey { case title, text, unknown }
+    init(title: String? = nil, text: String? = nil, unknown: Bool = true) {
+      self.title = title
+      self.text = text
+      self.unknown = unknown
+    }
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      title = FleetDecisionView.text(c, .title)
+      text = FleetDecisionView.text(c, .text)
+      unknown = (try? c.decodeIfPresent(Bool.self, forKey: .unknown)) ?? (title == nil && text == nil)
+    }
+  }
+
+  struct PullRequest: Decodable, Equatable, Identifiable {
+    let ref: String
+    var title: String? = nil
+    var facts: [String] = []
+    var id: String { ref }
+
+    enum CodingKeys: String, CodingKey { case ref, title, facts }
+    init(ref: String, title: String? = nil, facts: [String] = []) {
+      self.ref = ref
+      self.title = title
+      self.facts = facts
+    }
+    /// `ref` is required: a PR this build cannot name is not listed.
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      guard let ref = FleetDecisionView.text(c, .ref) else {
+        throw DecodingError.dataCorruptedError(forKey: .ref, in: c, debugDescription: "missing ref")
+      }
+      self.ref = ref
+      title = FleetDecisionView.text(c, .title)
+      facts = FleetDecisionView.strings(c, .facts)
+    }
+  }
+
+  struct Status: Decodable, Equatable {
+    var done: [String] = []
+    var blocked: [String] = []
+    var unverified: [String] = []
+    var prs: [PullRequest] = []
+    var unknown: Bool = true
+
+    var isEmpty: Bool { done.isEmpty && blocked.isEmpty && unverified.isEmpty && prs.isEmpty }
+
+    enum CodingKeys: String, CodingKey { case done, blocked, unverified, prs, unknown }
+    init(done: [String] = [], blocked: [String] = [], unverified: [String] = [], prs: [PullRequest] = [], unknown: Bool = true) {
+      self.done = done
+      self.blocked = blocked
+      self.unverified = unverified
+      self.prs = prs
+      self.unknown = unknown
+    }
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      done = FleetDecisionView.strings(c, .done)
+      blocked = FleetDecisionView.strings(c, .blocked)
+      unverified = FleetDecisionView.strings(c, .unverified)
+      prs = ((try? c.decodeIfPresent([Lossy<PullRequest>].self, forKey: .prs)) ?? []).compactMap(\.value)
+      let empty = done.isEmpty && blocked.isEmpty && unverified.isEmpty && prs.isEmpty
+      unknown = (try? c.decodeIfPresent(Bool.self, forKey: .unknown)) ?? empty
+    }
+  }
+
+  struct Option: Decodable, Equatable {
+    let value: String
+    let label: String
+    var consequence: String? = nil
+    var adminBypass: Bool = false
+    var recommended: Bool = false
+
+    enum CodingKeys: String, CodingKey { case value, label, consequence, adminBypass, recommended }
+    init(value: String, label: String, consequence: String? = nil, adminBypass: Bool = false, recommended: Bool = false) {
+      self.value = value
+      self.label = label
+      self.consequence = consequence
+      self.adminBypass = adminBypass
+      self.recommended = recommended
+    }
+    /// Needs a value or a label; each stands in for the other.
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      let value = FleetDecisionView.text(c, .value)
+      let label = FleetDecisionView.text(c, .label)
+      guard let v = value ?? label, let l = label ?? value else {
+        throw DecodingError.dataCorruptedError(forKey: .value, in: c, debugDescription: "option with no value or label")
+      }
+      self.value = v
+      self.label = l
+      consequence = FleetDecisionView.text(c, .consequence)
+      adminBypass = (try? c.decodeIfPresent(Bool.self, forKey: .adminBypass)) ?? false
+      recommended = (try? c.decodeIfPresent(Bool.self, forKey: .recommended)) ?? false
+    }
+  }
+
+  struct Decision: Decodable, Equatable {
+    var question: String? = nil
+    var options: [Option] = []
+    var unknown: Bool = true
+
+    enum CodingKeys: String, CodingKey { case question, options, unknown }
+    init(question: String? = nil, options: [Option] = [], unknown: Bool = true) {
+      self.question = question
+      self.options = options
+      self.unknown = unknown
+    }
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      question = FleetDecisionView.text(c, .question)
+      options = ((try? c.decodeIfPresent([Lossy<Option>].self, forKey: .options)) ?? []).compactMap(\.value)
+      unknown = (try? c.decodeIfPresent(Bool.self, forKey: .unknown)) ?? (question == nil && options.isEmpty)
+    }
+  }
+
+  struct Recommendation: Decodable, Equatable {
+    var option: String? = nil
+    var label: String? = nil
+    var why: String? = nil
+    var unknown: Bool = true
+
+    enum CodingKeys: String, CodingKey { case option, label, why, unknown }
+    init(option: String? = nil, label: String? = nil, why: String? = nil, unknown: Bool = true) {
+      self.option = option
+      self.label = label
+      self.why = why
+      self.unknown = unknown
+    }
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      option = FleetDecisionView.text(c, .option)
+      label = FleetDecisionView.text(c, .label)
+      why = FleetDecisionView.text(c, .why)
+      unknown = (try? c.decodeIfPresent(Bool.self, forKey: .unknown)) ?? (option == nil && label == nil && why == nil)
+    }
+  }
+
+  struct Evidence: Decodable, Equatable {
+    let label: String
+    let url: String
+
+    enum CodingKeys: String, CodingKey { case label, url }
+    init(label: String, url: String) {
+      self.label = label
+      self.url = url
+    }
+    init(from decoder: Decoder) throws {
+      let c = try decoder.container(keyedBy: CodingKeys.self)
+      guard let url = FleetDecisionView.text(c, .url) else {
+        throw DecodingError.dataCorruptedError(forKey: .url, in: c, debugDescription: "evidence with no url")
+      }
+      self.url = url
+      label = FleetDecisionView.text(c, .label) ?? url
+    }
+
+    /// Only web links open from a card.
+    var link: URL? {
+      guard let parsed = URL(string: url), let scheme = parsed.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+        return nil
+      }
+      return parsed
+    }
+  }
+
+  var version: Int = 1
+  var goal = Goal()
+  var status = Status()
+  var decision = Decision()
+  var recommendation = Recommendation()
+  var unknowns: [String] = []
+  var evidence: [Evidence] = []
+
+  enum CodingKeys: String, CodingKey { case version, goal, status, decision, recommendation, unknowns, evidence }
+
+  init(goal: Goal = Goal(), status: Status = Status(), decision: Decision = Decision(),
+       recommendation: Recommendation = Recommendation(), unknowns: [String] = [], evidence: [Evidence] = []) {
+    self.goal = goal
+    self.status = status
+    self.decision = decision
+    self.recommendation = recommendation
+    self.unknowns = unknowns
+    self.evidence = evidence
+  }
+
+  /// A part this build cannot read is an unknown part, never a lost card.
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    version = (try? c.decodeIfPresent(Int.self, forKey: .version)) ?? 1
+    goal = ((try? c.decodeIfPresent(Goal.self, forKey: .goal)) ?? nil) ?? Goal()
+    status = ((try? c.decodeIfPresent(Status.self, forKey: .status)) ?? nil) ?? Status()
+    decision = ((try? c.decodeIfPresent(Decision.self, forKey: .decision)) ?? nil) ?? Decision()
+    recommendation = ((try? c.decodeIfPresent(Recommendation.self, forKey: .recommendation)) ?? nil) ?? Recommendation()
+    unknowns = Self.strings(c, .unknowns)
+    evidence = ((try? c.decodeIfPresent([Lossy<Evidence>].self, forKey: .evidence)) ?? []).compactMap(\.value)
+  }
+
+  /// A trimmed, non-empty string, else nil.
+  fileprivate static func text<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> String? {
+    guard let raw = (try? c.decodeIfPresent(String.self, forKey: key)) ?? nil else { return nil }
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+
+  /// The readable, non-empty strings of an array; anything else is skipped.
+  fileprivate static func strings<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> [String] {
+    ((try? c.decodeIfPresent([Lossy<String>].self, forKey: key)) ?? [])
+      .compactMap { $0.value?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
   }
 }
 
 struct FleetDelivery: Decodable, Equatable {
   let status: String?
   let detail: String?
+  /// What became of an answer or reply, from the hub: delivered, queued,
+  /// ambiguous (may have landed, not confirmed, never re-sent) or refused.
+  let outcome: String?
 
-  enum CodingKeys: String, CodingKey { case status, detail }
+  enum CodingKeys: String, CodingKey { case status, detail, outcome }
 
-  init(status: String?, detail: String?) {
+  init(status: String?, detail: String?, outcome: String? = nil) {
     self.status = status
     self.detail = detail
+    self.outcome = outcome
   }
 
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     status = try? c.decodeIfPresent(String.self, forKey: .status)
     detail = try? c.decodeIfPresent(String.self, forKey: .detail)
+    outcome = try? c.decodeIfPresent(String.self, forKey: .outcome)
+  }
+
+  /// The line for a hub-stated outcome, or nil (an older hub: status decides).
+  var outcomeNote: FleetNote? {
+    let trimmed = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let shown = trimmed.isEmpty ? nil : String(trimmed.prefix(300))
+    switch outcome {
+    case "delivered": return FleetNote(text: "Sent to the agent.", isError: false)
+    // The hub says why it waits (a running turn, the Mac unable to type).
+    case "queued": return FleetNote(text: shown ?? "Queued. It goes to the agent as soon as it can take it.", isError: false)
+    case "ambiguous":
+      return FleetNote(text: "May have reached the agent; not confirmed yet. Not sent again: check the chat before answering again.", isError: true)
+    case "refused": return FleetNote(text: "Not sent: \(shown ?? "refused")", isError: true)
+    default: return nil
+    }
   }
 }
 

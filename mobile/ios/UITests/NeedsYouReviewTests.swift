@@ -171,4 +171,153 @@ final class NeedsYouReviewTests: XCTestCase {
         XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
         capture("needs-you-detail-ax-xxxl", app: app)
     }
+
+    // MARK: - Decision contract (`--ui-decision-view-fixture`)
+
+    private func pipeTexts(in root: XCUIElement) -> XCUIElementQuery {
+        root.descendants(matching: .staticText).matching(NSPredicate(format: "label CONTAINS %@", "|"))
+    }
+
+    private func scrollUntilHittable(_ target: XCUIElement, in app: XCUIApplication, attempts: Int = 6) {
+        for _ in 0..<attempts where !(target.exists && target.isHittable) { app.swipeUp() }
+    }
+
+    private func backFromDecision(_ app: XCUIApplication) {
+        let duoBack = app.buttons["BackButton"].firstMatch
+        let back = duoBack.exists ? duoBack : app.navigationBars["Decision"].buttons.element(boundBy: 0)
+        XCTAssertTrue(back.waitForExistence(timeout: 5), "Missing Back from Decision")
+        back.tap()
+    }
+
+    /// The regression: a merge-or-wait decision once printed a raw PR table,
+    /// internal routing, a recommendation that contradicted the primary
+    /// button, duplicate option rows and a prefilled bypass reply. The card,
+    /// the Thread sheet and the decision screen now show Goal, Status,
+    /// Decision and Recommendation first, each option once, the recommended
+    /// one tagged, the bypass captioned, and an empty reply composer.
+    func testDecisionContractRegressionCardSparseAndOlderCards() {
+        let app = launch(["--ui-decision-view-fixture"])
+        tab(app, "Chat")
+        openSupervisorConversation(app)
+
+        // The deck card.
+        let deck = element(app, "supervisor-card-deck")
+        XCTAssertTrue(deck.waitForExistence(timeout: 10), "The decision deck is shown")
+        XCTAssertTrue(labelled(app, "merge or wait").waitForExistence(timeout: 5), "The regression card leads")
+        XCTAssertEqual(pipeTexts(in: deck).count, 0, "No raw Markdown table on the card")
+        XCTAssertFalse(labelled(app, "paseo:").exists, "No internal routing on the card")
+        let recommended = element(app, "supervisor-card-choice-0")
+        XCTAssertTrue(recommended.waitForExistence(timeout: 5))
+        XCTAssertEqual(recommended.label, "Wait for teammate review")
+        XCTAssertTrue((recommended.value as? String ?? "").contains("Recommended"), "The recommended option is tagged")
+        let bypass = element(app, "supervisor-card-choice-1")
+        XCTAssertEqual(bypass.label, "Merge both")
+        XCTAssertTrue((bypass.value as? String ?? "").contains("Admin bypass"), "The bypass is labelled plainly")
+        XCTAssertFalse((bypass.value as? String ?? "").contains("Recommended"))
+        // Scoped to this card: a wide layout can show the same decision in a
+        // second pane, which is not a duplicated row on the card.
+        let mergeButtons = deck.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both"))
+        if mergeButtons.count != 1 {
+            let found = mergeButtons.allElementsBoundByIndex.map { "\($0.identifier) | \($0.label) | \($0.frame)" }.joined(separator: "\n")
+            let attachment = XCTAttachment(string: "Merge both buttons on the card:\n\(found)\n\n\(deck.debugDescription)")
+            attachment.name = "decision-regression-card-merge-buttons"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        XCTAssertEqual(mergeButtons.count, 1, "Merge both is offered once on the card")
+        capture("decision-regression-card", app: app)
+
+        // The Thread sheet: the contract, each option once, an empty composer.
+        tapButton(app, "supervisor-card-review-fq_regression")
+        let sheet = element(app, "supervisor-thread-details")
+        XCTAssertTrue(sheet.waitForExistence(timeout: 10), "Details opens the Thread sheet")
+        let contract = element(app, "decision-contract")
+        XCTAssertTrue(contract.waitForExistence(timeout: 5), "The Thread sheet shows the decision contract")
+        XCTAssertEqual(pipeTexts(in: contract).count, 0, "No raw Markdown table in the decision")
+        capture("decision-regression-thread", app: app)
+        let threadRecommended = element(app, "thread-decision-choice-0")
+        scrollUntilHittable(threadRecommended, in: app)
+        XCTAssertEqual(threadRecommended.label, "Wait for teammate review")
+        XCTAssertTrue((threadRecommended.value as? String ?? "").contains("Recommended"))
+        XCTAssertEqual(sheet.buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once in the Thread sheet")
+        let reply = element(app, "thread-decision-reply")
+        scrollUntilHittable(reply, in: app)
+        reply.tap()
+        let field = element(app, "thread-reply-field")
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "Reply opens the composer")
+        let typed = field.value as? String ?? ""
+        XCTAssertTrue(typed.isEmpty || typed == field.placeholderValue, "The reply composer opens empty, got: \(typed)")
+        XCTAssertFalse(typed.localizedCaseInsensitiveContains("bypass"))
+        capture("decision-regression-thread-reply", app: app)
+        // Opening the composer scrolls the sheet: cancel the reply, then
+        // close the sheet from its Done button (scrolled back into view) or
+        // by swiping it down.
+        let cancel = app.buttons["Cancel"].firstMatch
+        if cancel.exists && cancel.isHittable { cancel.tap() }
+        let done = app.buttons["Done"].firstMatch
+        for _ in 0..<4 where !(done.exists && done.isHittable) { sheet.swipeDown() }
+        if done.exists && done.isHittable { done.tap() }
+        XCTAssertTrue(deck.waitForExistence(timeout: 10), "Back on the deck after closing the Thread sheet")
+
+        // The other cards on the deck.
+        for index in 2...4 {
+            let next = app.buttons["Next decision"].firstMatch
+            guard next.waitForExistence(timeout: 5), next.isHittable else { break }
+            next.tap()
+            capture("decision-deck-card-\(index)", app: app)
+        }
+
+        // The decision screens.
+        tapButton(app, "supervisor-channel-needs-you")
+        tapButton(app, "needs-you-row-fq_regression")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        let sections = ["goal", "status", "decision", "recommendation"].map { element(app, "decision-section-\($0)") }
+        XCTAssertTrue(sections[0].waitForExistence(timeout: 5), "Goal comes first")
+        XCTAssertEqual(pipeTexts(in: app).count, 0, "No raw Markdown table on the decision screen")
+        XCTAssertFalse(labelled(app, "paseo:").exists, "No internal routing on the decision screen")
+        capture("decision-regression-detail", app: app)
+        // The screen is a lazy List: each section is checked as it scrolls in.
+        for (index, name) in ["Status", "Decision", "Recommendation"].enumerated() {
+            scrollUntilHittable(sections[index + 1], in: app)
+            XCTAssertTrue(sections[index + 1].exists, "\(name) is shown")
+        }
+        let detailRecommended = element(app, "needs-you-action-0")
+        scrollUntilHittable(detailRecommended, in: app)
+        XCTAssertEqual(detailRecommended.label, "Wait for teammate review")
+        XCTAssertTrue((detailRecommended.value as? String ?? "").contains("Recommended"))
+        let detailBypass = element(app, "needs-you-action-1")
+        XCTAssertEqual(detailBypass.label, "Merge both")
+        XCTAssertTrue((detailBypass.value as? String ?? "").contains("Admin bypass"))
+        XCTAssertEqual(element(app, "needs-you-detail").buttons.matching(NSPredicate(format: "label CONTAINS[c] %@", "Merge both")).count, 1, "Merge both is offered once on the decision screen")
+        XCTAssertFalse(app.textFields["chat-composer"].exists, "Replies go through the Supervisor composer")
+        capture("decision-regression-detail-scrolled", app: app)
+        backFromDecision(app)
+
+        // Sparse: every section is shown and labelled, nothing invented.
+        tapButton(app, "needs-you-row-fq_sparse")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        XCTAssertTrue(element(app, "decision-section-goal").waitForExistence(timeout: 5))
+        XCTAssertTrue(labelled(app, "Not stated").exists, "Unknown sections read Not stated")
+        capture("decision-sparse-detail", app: app)
+        app.swipeUp()
+        capture("decision-sparse-detail-scrolled", app: app)
+        backFromDecision(app)
+
+        // Unknown recommendation: no option is promoted, the bypass is labelled.
+        tapButton(app, "needs-you-row-fq_old")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        capture("decision-older-detail", app: app)
+        let oldFirst = element(app, "needs-you-action-0")
+        scrollUntilHittable(oldFirst, in: app)
+        XCTAssertFalse((oldFirst.value as? String ?? "").contains("Recommended"))
+        XCTAssertFalse((element(app, "needs-you-action-1").value as? String ?? "").contains("Recommended"))
+        capture("decision-older-detail-scrolled", app: app)
+        backFromDecision(app)
+
+        // An older hub (no decisionView): the previous rendering.
+        tapButton(app, "needs-you-row-fq_legacy")
+        XCTAssertTrue(element(app, "needs-you-detail").waitForExistence(timeout: 10))
+        XCTAssertFalse(element(app, "decision-section-goal").exists, "Older cards keep their previous rendering")
+        capture("decision-legacy-detail", app: app)
+    }
 }

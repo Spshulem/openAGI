@@ -323,6 +323,49 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
     }
 
+    // The decision deck starts collapsed for a person. "Review" must expand
+    // it, a horizontal swipe on the card must move one card in each
+    // direction, the arrow buttons must do the same, and "Hide" collapses it.
+    func testSupervisorDeckExpandsAndMovesLeftAndRight() {
+        let app = launch(["--ui-deck-collapsed", "--ui-needs-you-fixture"])
+        tab(app, "Chat")
+        tap(app, "chat-conversations")
+        tap(app, "conversation-supervisor")
+        XCTAssertTrue(app.navigationBars["Supervisor chat"].waitForExistence(timeout: 10))
+
+        XCTAssertTrue(element(app, "supervisor-collapsed-deck-bar").waitForExistence(timeout: 10),
+                      "The deck must start collapsed")
+        capture("deck-collapsed", app: app)
+        tap(app, "supervisor-expand-deck")
+        let deck = element(app, "supervisor-card-deck")
+        XCTAssertTrue(deck.waitForExistence(timeout: 5), "Review must expand the deck")
+        capture("deck-expanded", app: app)
+
+        func position(_ n: Int) -> XCUIElement {
+            app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "· \(n)/")).firstMatch
+        }
+        XCTAssertTrue(position(1).waitForExistence(timeout: 5), "The deck must open on the first card")
+
+        deck.swipeLeft()
+        XCTAssertTrue(position(2).waitForExistence(timeout: 5), "Swiping left must show the next card")
+        capture("deck-swiped-left", app: app)
+        deck.swipeRight()
+        XCTAssertTrue(position(1).waitForExistence(timeout: 5), "Swiping right must show the previous card")
+
+        let next = app.buttons["Next decision"].firstMatch
+        let previous = app.buttons["Previous decision"].firstMatch
+        XCTAssertTrue(next.waitForExistence(timeout: 5) && next.isHittable, "Missing Next decision")
+        next.tap()
+        XCTAssertTrue(position(2).waitForExistence(timeout: 5), "Next must show the next card")
+        XCTAssertTrue(previous.isHittable, "Missing Previous decision")
+        previous.tap()
+        XCTAssertTrue(position(1).waitForExistence(timeout: 5), "Previous must show the previous card")
+
+        tap(app, "supervisor-collapse-deck")
+        XCTAssertTrue(element(app, "supervisor-collapsed-deck-bar").waitForExistence(timeout: 5),
+                      "Hide must collapse the deck")
+    }
+
     func testSupervisorBoardSheetIsReachableFromToolbar() {
         let app = launch()
         tab(app, "Chat")

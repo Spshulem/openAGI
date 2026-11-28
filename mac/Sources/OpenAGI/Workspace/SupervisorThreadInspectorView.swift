@@ -325,6 +325,7 @@ struct SupervisorThreadInspectorView: View {
     let card = fleet.cardBriefs[q.id]
     let digest = q.needsYouDigest(card: card)
     let badge = q.needsYouBadge(card: card)
+    let decision = q.decisionPresentation(card: card)
     return ScrollView {
       VStack(alignment: .leading, spacing: WorkspaceTheme.Spacing.x4) {
         VStack(alignment: .leading, spacing: 6) {
@@ -354,8 +355,13 @@ struct SupervisorThreadInspectorView: View {
           }
         }
 
-        NeedsYouSections(digest: digest, kinds: [.goal, .state, .blocker])
-        NeedsYouSections(digest: digest, kinds: [.decision, .recommendation])
+        if let decision {
+          // Goal, Status, Decision, Recommendation, then the buttons.
+          NeedsYouDecisionSections(presentation: decision, style: .full)
+        } else {
+          NeedsYouSections(digest: digest, kinds: [.goal, .state, .blocker])
+          NeedsYouSections(digest: digest, kinds: [.decision, .recommendation])
+        }
 
         if !q.remainingItemIds.isEmpty {
           Text("More owner questions remain; answer this one before the next is presented.")
@@ -372,6 +378,14 @@ struct SupervisorThreadInspectorView: View {
         if let note = fleet.notes[q.id] {
           FleetNoteRow(note: note) { fleet.clearNote(q.id) }
         }
+        if let decision, q.canReply {
+          NeedsYouQuickReplies(replies: decision.quickReplies) { reply in
+            Task {
+              let note = await fleet.sendWorkspaceQuestionReply(q, message: reply)
+              replyFeedback = note
+            }
+          }
+        }
 
         if let plan = q.plan, planHasDetails(plan) {
           DisclosureGroup(isExpanded: $showPlanDetails) {
@@ -384,7 +398,19 @@ struct SupervisorThreadInspectorView: View {
           }
         }
 
-        NeedsYouSections(digest: digest, kinds: [.evidence])
+        if let decision {
+          // The decision's own links. The agent's raw message stays in the
+          // conversation below, not here.
+          NeedsYouDecisionEvidence(evidence: decision.evidence)
+          if let note = q.reviewNote {
+            Text(note)
+              .font(.caption)
+              .foregroundStyle(WorkspaceTheme.muted)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        } else {
+          NeedsYouSections(digest: digest, kinds: [.evidence])
+        }
         if let url = card?.prUrl.flatMap({ URL(string: $0) }) {
           Link("Open pull request ↗", destination: url)
             .font(.caption)
@@ -658,6 +684,19 @@ struct SupervisorThreadInspectorView: View {
 
   @ViewBuilder
   private func optionButtons(_ q: FleetQuestion, busy: Bool) -> some View {
+    if let decision = q.decisionPresentation(card: fleet.cardBriefs[q.id]) {
+      // One button per option, the recommended one prominent.
+      NeedsYouDecisionButtons(buttons: decision.buttons) { button in
+        Task { await fleet.answer(q, option: button.value) }
+      }
+      .disabled(busy)
+    } else {
+      legacyOptionButtons(q, busy: busy)
+    }
+  }
+
+  @ViewBuilder
+  private func legacyOptionButtons(_ q: FleetQuestion, busy: Bool) -> some View {
     ForEach(Array(q.tappableOptions.prefix(4).enumerated()), id: \.offset) { idx, opt in
       let handlesLocally = opt == "Answer question" || (opt == "Review plan" && q.plan != nil)
       WorkspaceActionButton(prominent: idx == 0 && !q.risky, small: true) {

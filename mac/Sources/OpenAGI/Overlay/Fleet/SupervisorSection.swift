@@ -283,7 +283,10 @@ struct SupervisorSection: View {
       .buttonStyle(.plain)
       .help("Open context and reply")
 
-      if !question.body.isEmpty {
+      if let decision = question.decisionPresentation(card: fleet.cardBriefs[question.id]) {
+        // Goal, Status, Decision, Recommendation before any button.
+        NeedsYouDecisionSections(presentation: decision, style: .compact)
+      } else if !question.body.isEmpty {
         Button {
           fleet.openQuestion(question)
         } label: {

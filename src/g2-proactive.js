@@ -291,7 +291,7 @@ export class G2Proactive {
     if ((!source && !walkthroughItem) || (source && source.sourceRef?.kind !== "fleet") || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
     const result = await supervisor.answerQuestion(questionId, body.answer);
     if (!result) reject("Question already closed", 409);
-    if (result.question?.status === "open") return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
+    if (result.question?.status === "open" || ["refused", "ambiguous"].includes(result.delivery?.outcome)) return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
     if (source) {
       try { this.runtime?.outreach?.resolve?.(source.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
     }

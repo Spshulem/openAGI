@@ -5466,7 +5466,7 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (r.nonResolving && r.plan) return { nonResolving: true, plan: r.plan };
       // Blocked, failed, or "open thread": the agent has no answer yet, so
       // the item stays actionable.
-      if (r.question?.status === "open") throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");
+      if (r.question?.status === "open" || ["refused", "ambiguous"].includes(r.delivery?.outcome)) throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");
       return;
     }
     case "skill-candidate": {
