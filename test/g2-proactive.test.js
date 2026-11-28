@@ -341,10 +341,10 @@ test("answering a supervisor question from the glasses uses its fixed choices", 
   call({ op: "configure", settings: { enabled: true } });
   await assert.rejects(store.answerFleet("one", { id: "o-fleet", answer: "Enterprise" }), /choices/);
   // Not delivered yet: the question stays open and on the glasses.
-  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: false, detail: "owner using Conductor" });
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: false, outcome: "refused", retry: true, detail: "owner using Conductor" });
   assert.ok(call({ op: "feed" }).items.some(i => i.id === "o-fleet"));
   open = false;
-  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: true, detail: "typed into Conductor" });
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: true, outcome: "delivered", retry: false, detail: "typed into Conductor" });
   assert.deepEqual(answered, [["fq_1", "Starter"], ["fq_1", "Starter"]]);
   assert.deepEqual(resolved, [["o-fleet", "Starter", "acted"]]);
   assert.equal(call({ op: "feed" }).items.some(i => i.id === "o-fleet"), false);
@@ -369,7 +369,7 @@ test("walkthrough identities remain actionable after their mirrored alert is sno
   assert.equal(started.currentId, "fq_walk");
   call({ op: "snooze", id: "o-walk" });
   assert.deepEqual(call({ op: "feed" }).items, []);
-  assert.deepEqual(await store.answerFleet("one", { id: "question:fq_walk", answer: "feature" }), { ok: true, detail: "saved" });
+  assert.deepEqual(await store.answerFleet("one", { id: "question:fq_walk", answer: "feature" }), { ok: true, outcome: "delivered", retry: false, detail: "saved" });
   assert.deepEqual(answered, ["fq_walk", "feature"]);
 });
 
@@ -554,4 +554,43 @@ test("supervisor PM cards surface concise brief + actFleetCard halts on failing 
   const status = store.fleetStatus();
   assert.equal(status.cardsCount, 2);
   assert.match(status.catchUpSummary, /2 sessions need you/);
+});
+
+// Owner report: a G2 answer tap said "Not sent yet. The question stays open.
+// Try again later." for an answer the hub had queued behind the agent's
+// messages, inviting a duplicate. Synthetic question only.
+test("G2 answers report delivered, queued, ambiguous, refused and closed, and a retried tap never delivers twice", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  outreach.push({ id: "o-mock", status: "unseen", createdAt: new Date(now()).toISOString(), sourceRef: { kind: "fleet", id: "fq_mock" }, title: "Mock decision?", summary: "", needsDecision: true, actions: ["Yes", "No", "dismiss"] });
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  runtime.outreach.resolve = () => {};
+  let next = null;
+  const answered = [];
+  runtime.fleetSupervisor = { getState: () => ({ questions: [{}], snapshot: { threads: [] } }), answerQuestion: async (id, answer) => { answered.push(answer); return next; } };
+  call({ op: "configure", settings: { enabled: true } });
+  const answer = (requestId, value = "Yes") => store.answerFleet("one", { id: "o-mock", answer: value, ...(requestId ? { requestId } : {}) });
+
+  next = { question: { status: "open" }, delivery: { status: "queued", detail: "" } };
+  assert.deepEqual(await answer("req-queued-1"), { ok: true, outcome: "queued", retry: false, detail: "Queued; it sends when the agent's thread is free." });
+  // The same tap retried (offline, timeout) returns the first receipt; nothing is delivered again.
+  assert.deepEqual((await answer("req-queued-1")).outcome, "queued");
+  assert.equal(answered.length, 1);
+  await assert.rejects(answer("req-queued-1", "No"), { status: 409 });
+
+  next = { question: { status: "open" }, delivery: { status: "sent", unconfirmed: true, detail: "turn not confirmed" } };
+  assert.deepEqual(await answer("req-ambiguous"), { ok: false, outcome: "ambiguous", retry: false, detail: "turn not confirmed" });
+
+  next = { question: { status: "open" }, delivery: { status: "blocked", detail: "agent offline" } };
+  assert.deepEqual(await answer("req-refused"), { ok: false, outcome: "refused", retry: true, detail: "agent offline" });
+  // Refused sent nothing, so the same request may try again and now deliver.
+  next = { question: { status: "answered" }, delivery: { status: "sent", detail: "typed" } };
+  assert.deepEqual(await answer("req-refused"), { ok: true, outcome: "delivered", retry: false, detail: "typed" });
+  assert.equal(answered.length, 4);
+
+  // Closed elsewhere while the tap was in flight.
+  outreach.push({ id: "o-mock2", status: "unseen", createdAt: new Date(now()).toISOString(), sourceRef: { kind: "fleet", id: "fq_mock2" }, title: "Second mock?", summary: "", needsDecision: true, actions: ["Yes", "No"] });
+  next = null;
+  assert.deepEqual(await store.answerFleet("one", { id: "o-mock2", answer: "Yes", requestId: "req-closed" }), { ok: false, outcome: "closed", retry: false, detail: "This question was already answered or closed." });
+  // An answered item is gone from the glasses' list.
+  await assert.rejects(answer("req-after"), { status: 404 });
 });

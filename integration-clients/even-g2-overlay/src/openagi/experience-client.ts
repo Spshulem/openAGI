@@ -72,6 +72,26 @@ export class G2ExperienceClient {
     }
     return this.observe(receipt, progress, signal)
   }
+  // One check of the saved request: clear it when main finished, cancelled,
+  // never confirmed or no longer knows it; keep it only while it still runs.
+  async settle(signal?: AbortSignal): Promise<{ state: 'clear' | 'working'; result?: OpenAGIAskResult; unconfirmed?: boolean; text?: string | null; thread?: ConversationThread | null }> {
+    const pending = this.store.snapshot().pendingRequest
+    if (!pending) return { state: 'clear' }
+    const done = async (extra: { result?: OpenAGIAskResult; unconfirmed?: boolean } = {}) => {
+      if (this.store.snapshot().pendingRequest?.id === pending.id) await this.store.update({ pendingRequest: null })
+      return { state: 'clear' as const, text: pending.text, thread: pending.thread, ...extra }
+    }
+    if (pending.origin !== this.origin()) return done({ unconfirmed: true })
+    let receipt: RequestReceipt
+    try { receipt = await this.send<RequestReceipt>({ op: 'get', id: pending.id }, signal) }
+    catch (error) {
+      if (error instanceof OpenAGIApiError && error.code === 'request_not_found') return done({ unconfirmed: true })
+      throw error
+    }
+    if (receipt.state === 'completed' && receipt.result) return done({ result: receipt.result })
+    if (receipt.state === 'cancelled' || receipt.state === 'unconfirmed') return done({ unconfirmed: receipt.state === 'unconfirmed' })
+    return { state: 'working' }
+  }
   async cancel(): Promise<void> {
     const pending = this.store.snapshot().pendingRequest
     if (!pending || pending.origin !== this.origin()) return

@@ -37,6 +37,10 @@ export class OpenAGIApiClient {
     return this.experienceClient.resume(progress, signal, allowSubmit)
   }
   async cancelPending(): Promise<void> { await this.experienceClient?.cancel() }
+  settlePending(signal?: AbortSignal): ReturnType<G2ExperienceClient['settle']> {
+    if (!this.experienceClient) throw new OpenAGIApiError('recovery_unavailable', 503, 'Reconnect to main to check this saved question.')
+    return this.experienceClient.settle(signal)
+  }
   readHistory(continuation?: string, offset = 0, query = ''): Promise<G2History> {
     return this.json('/nodes/g2/experience', { method: 'POST', body: JSON.stringify({ op: 'history', ...(continuation ? { continuation } : {}), offset, query }), signal: AbortSignal.timeout(10_000) })
   }
